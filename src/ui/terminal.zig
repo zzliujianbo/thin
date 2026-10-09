@@ -1,0 +1,231 @@
+//! Linux terminal mechanics only. Uses a fresh /dev/tty open description, so
+//! nonblocking flags do not modify the parent shell's inherited stdio flags.
+//! 中文：Linux 终端底层操作，包括 /dev/tty 打开、raw 模式切换、备用屏幕控制以及非阻塞读写。
+
+const std = @import("std");
+const c = std.c;
+const abi = @import("../platform/terminal_abi.zig");
+const openpty = abi.openpty;
+
+// openat 以 AT_FDCWD(-100) 打开 /dev/tty；flags: 2=O_RDWR, 0x100=O_NOCTTY(不成为控制终端), 0x80000=O_CLOEXEC。
+extern "c" fn openat(c_int, [*:0]const u8, c_int, c_uint) c_int;
+// 查询终端的前台进程组，用于判断当前进程是否位于前台。
+extern "c" fn tcgetpgrp(c_int) c_int;
+// 当前进程所属的进程组，与 tcgetpgrp 的结果比较。
+extern "c" fn getpgrp() c_int;
+
+// O_NONBLOCK 的 Linux 数值（0x800），使读写不阻塞。
+const nonblock = 0x800;
+
+// 进入 TUI：切换到备用屏幕(1049h)、开启 bracketed paste(2004h)、重置样式、显示光标。
+const enter = "\x1b[?1049h\x1b[?2004h\x1b[0m\x1b[?25h";
+// 退出 TUI：\x18(CAN) 用于中止未完成的转义序列，然后关闭 bracketed paste、显示光标，并切回主屏幕(1049l)。
+const leave = "\x18\x1b[0m\x1b[?2004l\x1b[?25h\x1b[?1049l";
+/// 终端尺寸，单位为列数与行数。
+pub const Size = struct { columns: usize, rows: usize };
+
+/// 终端 fd 的封装：保存原始属性以便恢复，并负责备用屏幕等显示状态。
+pub const Terminal = struct {
+    /// 终端文件描述符（/dev/tty 或测试用的 PTY slave）。
+    fd: c_int,
+    /// 为 true 时 deinit 会关闭 fd：由 open() 打开的 /dev/tty 为 true，外部传入的 fd 为 false。
+    owned: bool,
+    /// 进入 raw 模式前的 termios 快照，恢复时使用。
+    original: abi.Termios,
+    /// 进入前的 fcntl 文件状态标志，恢复时用于还原 O_NONBLOCK。
+    original_flags: c_int,
+    /// 是否仍处于 raw/备用屏幕状态；restore 依赖它保证幂等。
+    active: bool = true,
+
+    /// 打开控制终端 /dev/tty。要求 stdin/stdout 均为 tty，且当前进程位于前台进程组，否则后台写终端会被 SIGTTOU 挂起。
+    pub fn open() !Terminal {
+        if (c.isatty(0) != 1 or c.isatty(1) != 1) return error.TtyRequired;
+        // 使用新的 open 文件描述，使 O_NONBLOCK 不会影响父 shell 继承的 stdio。
+        const fd = openat(-100, "/dev/tty", 2 | nonblock | 0x80000 | 0x100, 0);
+        if (fd < 0) return error.TtyRequired;
+        // 后续任一步失败时关闭刚打开的 fd，避免泄漏。
+        errdefer _ = c.close(fd);
+        // 不在前台则直接拒绝，避免后台进程修改用户终端状态。
+        if (tcgetpgrp(fd) != getpgrp()) return error.ForegroundRequired;
+        return fromFd(fd, true);
+    }
+
+    /// For owned PTY tests, never applied to the harness/user terminal.
+    /// 用给定 fd 建立 Terminal（open() 内部调用，或测试使用 PTY）；会切换到 raw 模式并写入进入序列。
+    pub fn fromFd(fd: c_int, owned: bool) !Terminal {
+        var original: abi.Termios = undefined;
+        if (abi.tcgetattr(fd, &original) != 0) return error.TerminalReadFailed;
+        // F_GETFL(3)：读取文件状态标志，以便失败或恢复时使用。
+        const flags = c.fcntl(fd, 3);
+        if (flags < 0) return error.TerminalReadFailed;
+        // F_SETFL(4)：追加 O_NONBLOCK，使读写不会阻塞 UI 循环。
+        if (c.fcntl(fd, 4, flags | nonblock) < 0) return error.TerminalSetupFailed;
+        // 后续失败时把文件状态标志还原（errdefer 仅在返回错误时执行）。
+        errdefer _ = c.fcntl(fd, 4, flags);
+        // 基于原始属性生成 raw 模式（cfmakeraw 关闭回显、规范模式、信号字符等）。
+        var raw = original;
+        abi.cfmakeraw(&raw);
+        // NOW：立即生效，不等待已排队的输出排空。
+        if (abi.tcsetattr(fd, .NOW, &raw) != 0) return error.TerminalSetupFailed;
+
+        // 此时 raw 模式已生效，之后的失败必须经由 errdefer 回滚。
+        var self: Terminal = .{ .fd = fd, .owned = owned, .original = original, .original_flags = flags };
+        // 进入序列写入失败等错误时，回滚 raw 模式与非阻塞标志。
+        errdefer {
+            _ = self.restore();
+        }
+        // 进入序列的写入次数有上限（50），避免被背压无限阻塞。
+        if (!self.writeBounded(enter, 50)) return error.TerminalSetupFailed;
+        return self;
+    }
+
+    /// 查询终端尺寸。ioctl 失败或尺寸为 0 时回退为 80x24；上限为 512x200，防止异常尺寸撑爆缓冲。
+    pub fn size(self: Terminal) Size {
+        var dimensions = std.mem.zeroes(c.winsize);
+        if (c.ioctl(self.fd, std.os.linux.T.IOCGWINSZ, &dimensions) != 0) return .{ .columns = 80, .rows = 24 };
+        return .{ .columns = if (dimensions.col == 0) 80 else @min(dimensions.col, 512), .rows = if (dimensions.row == 0) 24 else @min(dimensions.row, 200) };
+    }
+
+    /// Reads without waiting; zero means no data currently, not application EOF.
+    pub fn read(self: Terminal, out: []u8) !usize {
+        const n = c.read(self.fd, out.ptr, out.len);
+        if (n >= 0) return @intCast(n);
+        // EINTR(4) 与 EAGAIN(11) 表示暂时无数据或被信号打断，返回 0；其他错误视为终端断开。
+        return switch (c._errno().*) {
+            4, 11 => 0,
+            else => error.TerminalDisconnected,
+        };
+    }
+
+    /// Main loop keeps any unwritten tail and continues input/cancel handling.
+    pub fn write(self: Terminal, bytes: []const u8) !usize {
+        const n = c.write(self.fd, bytes.ptr, bytes.len);
+        if (n >= 0) return @intCast(n);
+        // EINTR(4) 与 EAGAIN(11) 表示暂时写不进去，返回 0 由主循环保留未写部分后重试。
+        return switch (c._errno().*) {
+            4, 11 => 0,
+            else => error.TerminalDisconnected,
+        };
+    }
+
+    /// 用 poll 等待终端可读（want_write 时等待可写），最多等待 ms 毫秒。
+    pub fn wait(self: Terminal, want_write: bool, ms: c_int) !void {
+        // POLLIN(1) 始终监听；want_write 时额外监听 POLLOUT(4)。
+        var descriptors = [_]c.pollfd{.{ .fd = self.fd, .events = @as(c_short, 1) | (if (want_write) @as(c_short, 4) else 0), .revents = 0 }};
+        const result = c.poll(&descriptors, 1, ms);
+        if (result < 0 and c._errno().* != 4) return error.TerminalDisconnected;
+        // revents 中 8=POLLERR、16=POLLHUP、32=POLLNVAL，任一出现即视为断开。
+        if (result > 0 and descriptors[0].revents & (8 | 16 | 32) != 0) return error.TerminalDisconnected;
+    }
+
+    /// 有界写入：最多尝试 attempts 次，写不完时短暂等待可写。返回是否全部写完，永不无限阻塞。
+    fn writeBounded(self: Terminal, data: []const u8, attempts: usize) bool {
+        var offset: usize = 0;
+        for (0..attempts) |_| {
+            offset += self.write(data[offset..]) catch return false;
+            if (offset == data.len) return true;
+            self.wait(true, 2) catch return false;
+        }
+        return false;
+    }
+
+    /// Restoration must not use a canceled Io context. Bounded even if terminal
+    /// output is backpressured; failure is returned, never called success.
+    pub fn restore(self: *Terminal) bool {
+        if (!self.active) return true;
+        self.active = false;
+
+        var attrs_ok = false;
+        // 最多重试 8 次；仅 EINTR(4) 时继续，其他错误直接放弃。
+        for (0..8) |_| {
+            if (abi.tcsetattr(self.fd, .NOW, &self.original) == 0) {
+                attrs_ok = true;
+                break;
+            }
+            if (c._errno().* != 4) break;
+        }
+
+        // 即使属性恢复失败，也要尝试输出离开序列（退出备用屏幕等）；两项结果分别汇总。
+        const display_ok = self.writeBounded(leave, 50);
+        // 无论前面是否成功，都尝试还原 O_NONBLOCK 标志。
+        const flags_ok = c.fcntl(self.fd, 4, self.original_flags) >= 0;
+
+        // 三项都成功才返回 true，任何失败都如实返回 false。
+        return attrs_ok and display_ok and flags_ok;
+    }
+
+    /// 恢复终端状态；owned 为 true 时同时关闭 fd。可重复调用。
+    pub fn deinit(self: *Terminal) void {
+        _ = self.restore();
+        if (self.owned) {
+            _ = c.close(self.fd);
+            self.owned = false;
+        }
+    }
+};
+
+/// 测试辅助：逐项比较两份 termios 的标志位、控制字符与波特率。
+fn expectAttributes(a: abi.Termios, b: abi.Termios) !void {
+    try std.testing.expectEqual(a.iflag, b.iflag);
+    try std.testing.expectEqual(a.oflag, b.oflag);
+    try std.testing.expectEqual(a.cflag, b.cflag);
+    try std.testing.expectEqual(a.lflag, b.lflag);
+    try std.testing.expectEqualSlices(c.cc_t, &a.cc, &b.cc);
+    try std.testing.expectEqual(a.ispeed, b.ispeed);
+    try std.testing.expectEqual(a.ospeed, b.ospeed);
+}
+
+// 测试：raw 模式与标志仅作用于 PTY，恢复后属性与标志与原始一致。
+test "product terminal restores raw attributes and flags on PTY only" {
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
+    defer _ = c.close(master);
+    defer _ = c.close(slave);
+    var original: abi.Termios = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &original));
+    const flags = c.fcntl(slave, 3);
+    var terminal = try Terminal.fromFd(slave, false);
+    defer terminal.deinit();
+    var raw: abi.Termios = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &raw));
+    try std.testing.expect(!raw.lflag.ICANON and !raw.lflag.ECHO);
+    for ([_]u16{ 40, 80, 120 }) |columns| {
+        var size = std.mem.zeroes(c.winsize);
+        size.col = columns;
+        size.row = 24;
+        try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &size));
+        try std.testing.expectEqual(@as(usize, columns), terminal.size().columns);
+    }
+
+    try std.testing.expect(terminal.restore());
+    var restored: abi.Termios = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &restored));
+    try expectAttributes(original, restored);
+    try std.testing.expectEqual(flags, c.fcntl(slave, 3));
+}
+
+// 测试：输出缓冲被写满（背压）时仍保持非阻塞，恢复后属性仍然正确。
+test "backpressured terminal stays nonblocking and reports failed display restoration" {
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
+    defer _ = c.close(master);
+    defer _ = c.close(slave);
+    var terminal = try Terminal.fromFd(slave, false);
+    defer terminal.deinit();
+    const bytes: [4096]u8 = @splat('x');
+    var total: usize = 0;
+    // 持续写入直到内核缓冲区写满（write 返回 0），证明写操作不会阻塞。
+    while (total < 1024 * 1024) {
+        const n = try terminal.write(&bytes);
+        if (n == 0) break;
+        total += n;
+    }
+    try std.testing.expect(total < 1024 * 1024);
+
+    _ = terminal.restore(); // Kernel may make a little extra output space; either is honest.
+    var restored: abi.Termios = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &restored));
+    try expectAttributes(terminal.original, restored);
+}

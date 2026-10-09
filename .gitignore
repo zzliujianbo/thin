@@ -1,0 +1,25 @@
+# Zig build outputs and local caches
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Project-private memory and runtime data
+/.thin/
+
+# Private design documents and plans live outside this repository
+/docs/
+/plans/
+/thin-docs/
+
+# Local agent files
+/.pi
+
+# Local credentials; sanitized templates may be committed
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# OS metadata
+.DS_Store
+Thumbs.db
