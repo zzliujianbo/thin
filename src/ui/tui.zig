@@ -23,6 +23,9 @@ const Kind = enum { user, assistant, reasoning, tool, notice };
 const Record = struct {
     /// 记录种类，决定标题与 Markdown 渲染方式。
     kind: Kind,
+    /// Only a fully written frame commits transcript delivery. Pending survives index shifts.
+    output: bool = false,
+    pending_output: bool = false,
     /// 原始文本（UTF-8），受 record_limit 约束。
     body: std.ArrayList(u8) = .empty,
     /// 文本超过上限被截断；渲染时会附加提示。
@@ -97,7 +100,14 @@ pub const Connection = struct {
     current_fn: *const fn (*anyopaque) State,
     configure_fn: *const fn (*anyopaque, []const u8) anyerror!void,
 
-    pub const State = struct { runtime: ?*r.Runtime, model: []const u8, base_url: []const u8 };
+    pub const State = struct {
+        runtime: ?*r.Runtime,
+        model: []const u8,
+        base_url: []const u8,
+        logging_enabled: bool = true,
+        /// 由应用层以原子状态发布；UI 不读日志文件、不持有其写入器。
+        log_error: ?anyerror = null,
+    };
 
     pub fn current(self: Connection) State {
         return self.current_fn(self.context);
@@ -181,6 +191,7 @@ const Ui = struct {
     mode: ?r.State = null,
     /// 状态栏的提示文本。
     notice: []const u8 = "Ready",
+    log_warning_seen: bool = false,
     /// 上一次运行的终态结果，用于状态栏与用量显示。
     last_terminal: ?r.Terminal = null,
     /// 实际使用的协议；可能因 Responses 不支持而降级为 Chat。
@@ -198,6 +209,15 @@ const Ui = struct {
     frame_offset: usize = 0,
     /// 该帧绘制时展示的审批 id；写完后才成为 displayed_permission。
     frame_permission: ?u64 = null,
+    frame_height: usize = 0,
+    frame_size: terminal_module.Size = .{ .columns = 0, .rows = 0 },
+    frame_fresh: bool = false,
+    frame_clear_end: usize = 0,
+    /// A resize may interrupt even an escape sequence in the reclaim prefix.
+    resize_rescue: []const u8 = "",
+    tail_height: usize = 0,
+    tail_size: terminal_module.Size = .{ .columns = 0, .rows = 0 },
+    abandon_tail: bool = false,
     /// 最近一次读取的终端尺寸。
     size: terminal_module.Size = .{ .columns = 0, .rows = 0 },
 
@@ -532,12 +552,12 @@ const Ui = struct {
             },
             .toggle_reasoning => self.show_reasoning = !self.show_reasoning,
             .page_up, .up => if (self.permission != null) {
-                self.permission_scroll -|= if (event_ == .up) 1 else 10;
+                self.permission_scroll -|= if (event_ == .up) 1 else @max(1, @min(7, self.size.rows -| 6));
             } else {
                 self.scroll +|= if (event_ == .up) 1 else 10;
             },
             .page_down, .down => if (self.permission != null) {
-                self.permission_scroll +|= if (event_ == .down) 1 else 10;
+                self.permission_scroll +|= if (event_ == .down) 1 else @max(1, @min(7, self.size.rows -| 6));
             } else {
                 self.scroll -|= if (event_ == .down) 1 else 10;
             },
@@ -606,6 +626,12 @@ const Ui = struct {
 
             // acquire 与 worker 的 release 配对，确保读到任务结果。
             if (self.busy and self.job.done.load(.acquire)) try self.complete();
+            if (!self.log_warning_seen and self.connection.current().log_error != null) {
+                self.log_warning_seen = true;
+                // 保留 Completed/Failed/Canceled；记录故障由持久 header 单独提示。
+                if (self.last_terminal == null) self.notice = "Session recording failed; records may be incomplete";
+                self.dirty = true;
+            }
 
             // 收到信号（如 SIGINT）：转为退出请求并取消任务。
             if (interrupt.signal() != 0) {
@@ -614,13 +640,13 @@ const Ui = struct {
             }
 
             // 任务结束后才真正退出；若由信号触发，退出码为 128 + 信号编号。
-            if (self.want_exit and !self.busy) return if (interrupt.signal() != 0) 128 + interrupt.signal() else 0;
+            if (self.want_exit and !self.busy) {
+                try self.drainExit();
+                return if (interrupt.signal() != 0) 128 + interrupt.signal() else 0;
+            }
 
             const dimensions = self.terminal.size();
-            if (dimensions.columns != self.size.columns or dimensions.rows != self.size.rows) {
-                self.size = dimensions;
-                self.dirty = true;
-            }
+            self.resize(dimensions);
 
             // 读取终端输入交给 parser；n == 0 表示本轮无输入。
             const n = try self.terminal.read(&buffer);
@@ -631,15 +657,7 @@ const Ui = struct {
 
             // 分段写出待输出的帧：终端可能只接受部分字节，剩余部分在下一轮继续。
             if (self.frame_offset < self.frame.len) {
-                self.frame_offset += try self.terminal.write(self.frame[self.frame_offset..]);
-                if (self.frame_offset == self.frame.len) {
-                    // 整帧写完后才确认该审批已真正显示，按键才会生效。
-                    self.displayed_permission = self.frame_permission;
-                    if (self.frame_arena) |*arena| arena.deinit();
-                    self.frame_arena = null;
-                    self.frame = "";
-                    self.frame_offset = 0;
-                }
+                try self.writeFrame();
             }
 
             // 仅当上一帧已写完、有脉冲标记且距上次绘制超过 33ms（约 30 FPS）时才重绘。
@@ -651,6 +669,63 @@ const Ui = struct {
 
             // 等待终端可读（有待写帧时同时等待可写），最多 16ms，避免忙等。
             try self.terminal.wait(self.frame.len != 0, 16);
+        }
+    }
+
+    fn resize(self: *Ui, dimensions: terminal_module.Size) void {
+        if (dimensions.columns == self.size.columns and dimensions.rows == self.size.rows) return;
+        self.size = dimensions;
+        self.displayed_permission = null;
+        self.frame_fresh = false;
+        if (self.frame.len != 0 and (self.frame_offset < self.frame_clear_end or self.resize_rescue.len != 0)) {
+            // Never finish an old CUU/EL reclaim after reflow. Cancel a partial
+            // escape and continue transcript/tail at a fresh bottom line instead.
+            self.frame_offset = self.frame_clear_end;
+            self.resize_rescue = "\x18\x1b[999B\r\n";
+        }
+        self.abandon_tail = self.tail_height != 0 or self.frame.len != 0;
+        self.dirty = true;
+    }
+
+    fn writeFrame(self: *Ui) !void {
+        if (self.resize_rescue.len != 0) {
+            const n = try self.terminal.write(self.resize_rescue);
+            self.resize_rescue = self.resize_rescue[n..];
+            if (self.resize_rescue.len != 0) return;
+        }
+        self.frame_offset += try self.terminal.write(self.frame[self.frame_offset..]);
+        if (self.frame_offset == self.frame.len) self.finishFrame();
+    }
+
+    fn finishFrame(self: *Ui) void {
+        // Resize invalidation is sticky, even if the window returns to its old size.
+        self.displayed_permission = if (self.frame_fresh) self.frame_permission else null;
+        self.tail_height = self.frame_height;
+        self.tail_size = self.frame_size;
+        for (self.records.items) |*record| {
+            if (record.pending_output) record.output = true;
+            record.pending_output = false;
+        }
+        if (self.frame_arena) |*arena| arena.deinit();
+        self.frame_arena = null;
+        self.frame = "";
+        self.frame_offset = 0;
+        self.resize_rescue = "";
+    }
+
+    /// Exit gets a bounded chance to publish the final canonical reply, never an infinite drain.
+    fn drainExit(self: *Ui) !void {
+        const start = Io.Clock.awake.now(self.io);
+        for (0..128) |_| {
+            self.resize(self.terminal.size());
+            if (self.frame.len == 0) {
+                if (!self.dirty) return;
+                try self.draw();
+                self.dirty = false;
+            }
+            try self.writeFrame();
+            if (start.untilNow(self.io, .awake).toMilliseconds() >= 200) return;
+            if (self.frame.len != 0) try self.terminal.wait(true, 2);
         }
     }
 
@@ -666,31 +741,84 @@ const Ui = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        const cols = if (self.size.columns > 1) self.size.columns - 1 else 1; // Never trigger terminal autowrap.
-        const rows = self.size.rows;
+        const cols = self.size.columns -| 1; // Never trigger terminal autowrap.
         var out: std.Io.Writer.Allocating = .init(a);
         const writer = &out.writer;
+        self.displayed_permission = null;
+        self.frame_permission = null;
 
-        // 隐藏光标并回到左上角，之后整帧覆盖绘制。
-        try writer.writeAll("\x1b[?25l\x1b[H");
+        // Reclaim only our last complete live tail, never the user's earlier rows.
+        try writer.writeAll("\x1b[?25l\r");
+        if (self.abandon_tail or (self.tail_height != 0 and
+            (self.tail_size.columns != self.size.columns or self.tail_size.rows != self.size.rows)))
+        {
+            try writer.writeAll("\x1b[999B\r\n");
+        } else if (self.tail_height != 0) {
+            if (self.tail_height > 1) try writer.print("\x1b[{d}A", .{self.tail_height - 1});
+            for (0..self.tail_height) |line| {
+                if (line != 0) try writer.writeAll("\r\n");
+                try writer.writeAll("\x1b[0m\x1b[2K");
+            }
+            // No LF after the last erased row: that would scroll before CUU.
+            if (self.tail_height > 1) try writer.print("\x1b[{d}A", .{self.tail_height - 1});
+            try writer.writeAll("\r");
+        }
+
+        self.frame_clear_end = out.written().len;
+
+        // Immutable committed records are appended once. Drafts and reasoning are
+        // live previews only; raw model ANSI never reaches the terminal.
+        var lines: std.ArrayList([]const u8) = .empty;
+        const preview = self.scroll != 0 or self.show_reasoning;
+        if (preview) try lines.append(a, "[retained history preview; scrollback unchanged]");
+        for (self.records.items, 0..) |*record, index| {
+            const drafting = self.draft == index or self.reasoning == index;
+            try record.layout(self.allocator, @max(1, cols));
+            const heading = try std.fmt.allocPrint(a, "[{s}{s}{s}]", .{ @tagName(record.kind), if (record.interrupted) " - interrupted draft" else if (drafting) " - draft" else "", if (record.excerpt) " - display excerpt" else "" });
+            if (cols >= 8 and !record.output and !drafting and record.kind != .reasoning) {
+                try putLine(writer, a, 1, heading, cols);
+                try writer.writeAll("\r\n");
+                for (record.lines) |line| {
+                    try putStyled(writer, 1, line);
+                    try writer.writeAll("\r\n");
+                }
+                record.pending_output = true;
+            }
+            if ((preview or drafting) and (record.kind != .reasoning or self.show_reasoning)) {
+                const headings = try markdown.render(a, heading, .{ .columns = @max(1, cols), .max_lines = 32, .markdown = false });
+                try lines.appendSlice(a, headings.lines);
+                try lines.appendSlice(a, record.lines);
+            }
+        }
+        const secret_destination = if (self.secret_mode) blk: {
+            const state = self.connection.current();
+            break :blk try std.fmt.allocPrint(a, "API key for model {s}\nBase URL: {s}\nEnter saves locally; no network request is made here", .{ state.model, state.base_url });
+        } else "";
+        const secret_lines = try markdown.render(a, secret_destination, .{ .columns = @max(1, cols), .max_lines = 8, .markdown = false });
+        const wanted_body = if (self.permission) |permission|
+            @min(8, 1 + @max(1, (try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false })).lines.len))
+        else if (self.secret_mode) secret_lines.lines.len else @min(lines.items.len, 8);
+        const rows = @min(self.size.rows, 5 + wanted_body);
 
         // 终端太小时只显示提示，避免布局越界。
         // 审批标题之外至少留一行正文；尺寸不足不属于永久的 clipped 状态。
         const hides_approval_id = if (self.permission) |permission| !self.approvalFits(permission.id) else false;
-        if (rows < 7 or cols < 8 or hides_approval_id) {
+        if (self.size.rows < 7 or cols < 8 or hides_approval_id) {
             for (0..rows) |row| try putLine(writer, a, row + 1, if (row == 0) "Resize terminal" else "", cols);
+            try writer.writeAll("\r\x1b[?25h");
             self.frame_permission = null;
         } else {
             const state = self.connection.current();
-            const header = try std.fmt.allocPrint(a, "thin | {s} | {s}{s}", .{ state.model, if (state.runtime == null) "not configured: /auth" else if (self.effective_protocol) |protocol| @tagName(protocol) else "configured/auto", if (self.dropped_display) " | older display clipped" else "" });
+            const log_status = if (state.runtime == null) "" else if (state.log_error) |err|
+                try std.fmt.allocPrint(a, " | REC FAILED: {s}", .{@errorName(err)})
+            else if (state.logging_enabled) " | .thin/sessions" else " | recording off";
+            const header = try std.fmt.allocPrint(a, "thin | {s} | {s}{s}{s}", .{ state.model, if (state.runtime == null) "not configured: /auth" else if (self.effective_protocol) |protocol| @tagName(protocol) else "configured/auto", log_status, if (self.dropped_display) " | older display clipped" else "" });
             try putLine(writer, a, 1, header, cols);
 
             // 布局：第 1 行标题，第 2 行审批标题或正文首行，中间为正文，倒数 3 行为状态、用量和快捷键提示，最后一行为输入行。
             const body_rows = rows - 5;
             if (self.secret_mode) {
-                const destination = try std.fmt.allocPrint(a, "API key for model {s}\nBase URL: {s}\nEnter saves locally; no network request is made here", .{ state.model, state.base_url });
-                const lines = try markdown.render(a, destination, .{ .columns = cols, .max_lines = 8192, .markdown = false });
-                for (0..body_rows) |line| try putStyled(writer, 2 + line, if (line < lines.lines.len) lines.lines[line] else "");
+                for (0..body_rows) |line| try putStyled(writer, 2 + line, if (line < secret_lines.lines.len) secret_lines.lines[line] else "");
                 self.frame_permission = null;
             } else if (self.permission) |permission| {
                 // Plain rendering: tool input must not hide behind Markdown formatting.
@@ -713,21 +841,18 @@ const Ui = struct {
                 for (0..body_rows - 1) |line| try putStyled(writer, 3 + line, if (start + line < all.lines.len) all.lines[start + line] else "");
                 self.frame_permission = permission.id;
             } else {
-                // 把所有可见记录展开为一维行列表，再按滚动偏移取窗口。
-                var lines: std.ArrayList([]const u8) = .empty;
-                for (self.records.items) |*record| {
-                    // 推理内容默认隐藏，Ctrl+R 切换显示。
-                    if (record.kind == .reasoning and !self.show_reasoning) continue;
-                    try record.layout(self.allocator, cols);
-                    const heading = try std.fmt.allocPrint(a, "[{s}{s}{s}]", .{ @tagName(record.kind), if (record.interrupted) " - interrupted draft" else "", if (record.excerpt) " - display excerpt" else "" });
-                    try lines.append(a, heading);
-                    try lines.appendSlice(a, record.lines);
-                }
-
+                // 有界 live draft / retained history preview，不重写终端滚屏。
                 // 从底部向上回退 scroll 行，得到显示窗口的结束位置。
                 const end = lines.items.len -| @min(self.scroll, lines.items.len -| body_rows);
                 const start = end -| body_rows;
-                for (0..body_rows) |line| try putStyled(writer, 2 + line, if (start + line < end) lines.items[start + line] else "");
+                for (0..body_rows) |line| {
+                    if (line == 0 and preview) {
+                        try putLine(writer, a, 2 + line, "[history preview; PgUp/PgDn / Ctrl+R]", cols);
+                    } else if (line == 0 and self.draft != null) {
+                        // Resize may leave this preview in scrollback; keep its draft status visible.
+                        try putLine(writer, a, 2 + line, "[streaming draft; not committed]", cols);
+                    } else try putStyled(writer, 2 + line, if (start + line < end) lines.items[start + line] else "");
+                }
                 self.frame_permission = null;
             }
 
@@ -747,7 +872,7 @@ const Ui = struct {
                 const count = @min(self.secret.len, @min(masks.len, cols - 3));
                 const masked = try std.fmt.allocPrint(a, "API key> {s}", .{masks[0..count]});
                 try putLine(writer, a, rows, masked, cols);
-                try writer.print("\x1b[{d};{d}H\x1b[?25h", .{ rows, @min(cols, count + 10) });
+                try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, count + 10) - 1});
             } else {
 
                 // 光标所在逻辑行的起点（以换行为界）。
@@ -772,7 +897,7 @@ const Ui = struct {
                 try putLine(writer, a, rows, input_line, cols);
 
                 // 光标移到输入行并重新显示；+3 为 "> " 提示符占用的列加一列。
-                try writer.print("\x1b[{d};{d}H\x1b[?25h", .{ rows, @min(cols, width + 3) });
+                try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, width + 3) - 1});
             }
         }
 
@@ -780,6 +905,10 @@ const Ui = struct {
         self.frame = out.written();
         self.frame_offset = 0;
         self.frame_arena = arena;
+        self.frame_height = rows;
+        self.frame_size = self.size;
+        self.frame_fresh = true;
+        self.abandon_tail = false;
     }
 };
 
@@ -800,9 +929,10 @@ fn counter(a: std.mem.Allocator, value: ?u64) ![]const u8 {
     return if (value) |n| std.fmt.allocPrint(a, "{d}", .{n}) else "?";
 }
 
-/// 在指定行输出内容：先定位、清行，再输出内容，最后复位样式，避免属性残留到下一行。
+/// 顺序输出一行；row 只区别首行是否换行，不是绝对坐标。清理自身行并复位样式。
 fn putStyled(writer: *Io.Writer, row: usize, line: []const u8) !void {
-    try writer.print("\x1b[{d};1H\x1b[0m\x1b[2K{s}\x1b[0m", .{ row, line });
+    if (row > 1) try writer.writeAll("\r\n");
+    try writer.print("\x1b[0m\x1b[2K{s}\x1b[0m", .{line});
 }
 
 /// 按终端列宽截断一行后输出：先清理控制字符，再按字素簇累计显示宽度，超出列宽即停止。
@@ -833,6 +963,167 @@ const FixtureConnection = struct {
 /// 测试用 Ui 构造器：使用 testing allocator，运行时与终端字段为 undefined（测试中不会访问）。
 fn fixtureUi(bridge: *bridge_module.Bridge, cancel: *p.Cancellation) Ui {
     return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = undefined, .editor = .{ .allocator = std.testing.allocator }, .job = undefined, .size = .{ .columns = 80, .rows = 24 } };
+}
+
+test "regular transcript commits once and keeps a small relative live tail" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.add(.user, "unique committed user");
+    try ui.appendDraft(.assistant, "uncanonical draft");
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "unique committed user") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "streaming draft; not committed") != null);
+    try std.testing.expect(!ui.records.items[0].output);
+    try std.testing.expect(ui.frame_height <= 13);
+    ui.finishFrame();
+    try std.testing.expect(ui.records.items[0].output);
+    try std.testing.expect(!ui.records.items[1].output);
+    try ui.replaceCommitted(&.{.{ .text = "unique canonical reply" }}, false);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "unique committed user") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "uncanonical draft") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") != null);
+    try std.testing.expectEqual(@as(usize, 5), ui.frame_height);
+    ui.finishFrame();
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") == null);
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[4A"));
+    for ([_][]const u8{ "1049", "1047", "\x1b[H", "\x1b[2J", ";1H" }) |forbidden|
+        try std.testing.expect(std.mem.find(u8, ui.frame, forbidden) == null);
+}
+
+test "reasoning stays ephemeral and interrupted drafts are explicitly committed" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.appendDraft(.reasoning, "hidden-reasoning");
+    try ui.appendDraft(.assistant, "partial-answer\x1b[2J");
+    const draft = ui.draft.?;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-reasoning") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
+    ui.finishFrame();
+    try std.testing.expect(!ui.records.items[draft].output);
+    // Same finalization performed by complete after worker join and bridge drain.
+    ui.records.items[draft].interrupted = true;
+    ui.draft = null;
+    ui.reasoning = null;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "interrupted draft") != null);
+    ui.finishFrame();
+    ui.show_reasoning = true;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "history preview") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-reasoning") != null);
+    ui.finishFrame();
+    try std.testing.expect(!ui.records.items[0].output);
+    ui.show_reasoning = false;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "partial-answer") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-reasoning") == null);
+}
+
+test "resize abandons unknown rows and old completed approval cannot authorize" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.permission = .{ .id = 42, .description = try std.testing.allocator.dupe(u8, "safe preview"), .clipped = false };
+    try ui.draw();
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(?u64, 42), ui.displayed_permission);
+    try ui.draw();
+    try std.testing.expect(ui.displayed_permission == null);
+    ui.frame_offset = 1; // Even a partially written reclaim escape is unsafe after reflow.
+    ui.resize(.{ .columns = 70, .rows = 20 });
+    try std.testing.expectEqual(ui.frame_clear_end, ui.frame_offset);
+    try std.testing.expectEqualStrings("\x18\x1b[999B\r\n", ui.resize_rescue);
+    ui.resize(.{ .columns = 80, .rows = 24 });
+    ui.finishFrame();
+    try std.testing.expect(ui.displayed_permission == null);
+    try ui.draw();
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[999B\r\n"));
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[6A") == null);
+    try std.testing.expectEqual(@as(usize, 7), ui.frame_height);
+    try std.testing.expect(ui.displayed_permission == null);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(?u64, 42), ui.displayed_permission);
+}
+
+test "exit drains final canonical transcript on owned PTY without erasing earlier output" {
+    const abi = @import("../platform/terminal_abi.zig");
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), abi.openpty(&master, &slave, null, null, null));
+    defer _ = std.c.close(master);
+    defer _ = std.c.close(slave);
+    _ = std.c.fcntl(master, 4, std.c.fcntl(master, 3) | 0x800);
+    _ = std.c.write(slave, "prior-shell-output\r\n", 20);
+    var terminal = try terminal_module.Terminal.fromFd(slave, false);
+    defer terminal.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.terminal = &terminal;
+    try ui.draw(); // A pending frame when Ctrl+D arrives.
+    _ = try ui.add(.assistant, "final-exit-reply");
+    ui.want_exit = true;
+    try ui.drainExit();
+    try std.testing.expect(ui.frame.len == 0 and !ui.dirty);
+    try std.testing.expect(ui.records.items[0].output);
+    try std.testing.expect(terminal.restore());
+    var buffer: [16384]u8 = undefined;
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const n = std.c.read(master, buffer[used..].ptr, buffer.len - used);
+        if (n <= 0) break;
+        used += @intCast(n);
+    }
+    const output = buffer[0..used];
+    try std.testing.expect(std.mem.find(u8, output, "prior-shell-output") != null);
+    try std.testing.expect(std.mem.find(u8, output, "final-exit-reply") != null);
+    for ([_][]const u8{ "1049", "1047", "\x1b[H", "\x1b[2J" }) |forbidden|
+        try std.testing.expect(std.mem.find(u8, output, forbidden) == null);
+}
+
+test "application log failure and opt-out remain visible without poisoning runtime" {
+    const ConnectionFixture = struct {
+        runtime: r.Runtime = undefined, // 仅借用地址供 ready 状态判断，本测试不调用它。
+        failed: bool,
+
+        fn current(raw: *anyopaque) Connection.State {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{
+                .runtime = &self.runtime,
+                .model = "fixture",
+                .base_url = "http://unused.invalid",
+                .logging_enabled = self.failed,
+                .log_error = if (self.failed) error.NoSpaceLeft else null,
+            };
+        }
+    };
+    for ([_]bool{ false, true }) |failed| {
+        var cancel = p.Cancellation{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var connection = ConnectionFixture{ .failed = failed };
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.connection.context = &connection;
+        ui.connection.current_fn = ConnectionFixture.current;
+        try ui.draw();
+        try std.testing.expect(std.mem.find(u8, ui.frame, if (failed) "REC FAILED: NoSpaceLeft" else "recording off") != null);
+        try std.testing.expect(!ui.poisoned);
+        try std.testing.expect(!cancel.isRequested());
+    }
 }
 
 // 验证：任务完成时 complete 会先排空 bridge 中残留的事件，canonical 内容覆盖草稿，最终结果不丢失。
@@ -1073,7 +1364,7 @@ test "editor tabs expand before clipping and cursor placement but submit unchang
         ui.editor.cursor = case.cursor;
         try ui.draw();
         try std.testing.expect(std.mem.findScalar(u8, ui.frame, '\t') == null);
-        const expected = try std.fmt.allocPrint(std.testing.allocator, "\x1b[7;1H\x1b[0m\x1b[2K{s}\x1b[0m\x1b[7;{d}H\x1b[?25h", .{ case.line, case.column });
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "\r\n\x1b[0m\x1b[2K{s}\x1b[0m\r\x1b[{d}C\x1b[?25h", .{ case.line, case.column - 1 });
         defer std.testing.allocator.free(expected);
         try std.testing.expect(std.mem.endsWith(u8, ui.frame, expected));
         try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);

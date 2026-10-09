@@ -147,6 +147,27 @@ pub const Host = struct {
     }
 };
 
+/// 只读的宿主观察接口；不授予权限、不改变运行结果，也不拥有借用的字符串。
+/// 应用层可用于本地留档，Runtime 不负责文件路径或存储。回调必须自行处理失败。
+pub const Observation = union(enum) {
+    submitted: []const u8,
+    event: Event,
+    decision: struct { id: u64, value: Decision },
+    /// 包括中断时为未执行调用补齐的结果；使用真实协议 call_id，而非 UI 编号。
+    tool_completed: struct { call_id: []const u8, result: Execution },
+};
+
+pub const Observer = struct {
+    context: ?*anyopaque = null,
+    notify_fn: *const fn (?*anyopaque, Observation) void = discard,
+
+    pub fn notify(self: Observer, observation: Observation) void {
+        self.notify_fn(self.context, observation);
+    }
+
+    fn discard(_: ?*anyopaque, _: Observation) void {}
+};
+
 /// Agent 循环状态机：一次 run 处理一条用户输入，循环调用模型、执行工具，直到模型 stop 或出错。
 /// 非线程安全：同一实例同一时刻只允许一个 run（由 busy 保证）。
 pub const Runtime = struct {
@@ -162,6 +183,8 @@ pub const Runtime = struct {
     executor: Executor,
     /// 宿主回调（事件、授权）。
     host: Host,
+    /// 可选只读观察者，由应用层在首次 run 前设置；不参与授权和错误传播。
+    observer: Observer = .{},
     /// 系统提示词：启动时生成后固定不变，以便利用提示词缓存。
     system: []u8,
     /// 持有对话历史及其内容；压缩时整体替换，旧 arena 在提交后释放。
@@ -233,6 +256,8 @@ pub const Runtime = struct {
 
     /// 向宿主发送事件。宿主报错时：若已取消返回 Canceled，否则视为宿主断开。
     fn emit(self: *Runtime, event: Event, cancel: *const p.Cancellation) !void {
+        // 先观察，再交给可能背压/断开的显示宿主；诊断不依赖 UI 队列被消费。
+        self.observer.notify(.{ .event = event });
         self.host.emit_fn(self.host.context, event, cancel) catch {
             if (cancel.isRequested()) return error.Canceled;
             return error.HostDisconnected;
@@ -271,6 +296,7 @@ pub const Runtime = struct {
         // 占用运行权；defer 保证任何退出路径都会释放，防止永久 Busy。
         if (self.busy.swap(true, .acq_rel)) return error.Busy;
         defer self.busy.store(false, .release);
+        self.observer.notify(.{ .submitted = text });
 
         var task = Task{};
         var watchdog = Watchdog{ .io = self.io, .timeout_ms = self.config.limits.task_timeout_ms, .cancel = cancel };
@@ -542,12 +568,18 @@ pub const Runtime = struct {
     fn executeBatch(self: *Runtime, blocks: []const p.Block, cancel: *p.Cancellation, task: *Task) !void {
         // 已处理到的块下标；errdefer 只为之后未处理的 call 补写结果。
         var next_block: usize = 0;
+        // 执行已开始但结果尚未记录时，不得把分配/回填失败误写成“未执行”。
+        var started_call: ?[]const u8 = null;
         errdefer {
             // Once the assistant batch is committed, every call must have a
             // result even if authorization, cancellation or UI delivery fails.
             for (blocks[next_block..]) |block| if (block == .tool_call) {
+                const attempted = if (started_call) |id| std.mem.eql(u8, id, block.tool_call.id) else false;
                 self.appendResult(block.tool_call.id, .{
-                    .text = "Not executed: execution ended before this call completed. Existing side effects are not rolled back.",
+                    .text = if (attempted)
+                        "Result unavailable after execution started: this call may have run. Existing side effects are not rolled back."
+                    else
+                        "Not executed: execution ended before this call started.",
                     .is_error = true,
                     .canceled = cancel.isRequested(),
                 }) catch {
@@ -599,6 +631,7 @@ pub const Runtime = struct {
 
                 // 授权回调返回后再检查取消，避免取消后仍执行工具。
                 const decision = try self.host.authorize_fn(self.host.context, permission, cancel);
+                self.observer.notify(.{ .decision = .{ .id = permission.id, .value = decision } });
                 try checkCanceled(cancel);
                 switch (decision) {
                     .allow_once => {},
@@ -618,6 +651,7 @@ pub const Runtime = struct {
                 try self.emit(.{ .tool_started = .{ .id = host_id, .name = call.name } }, cancel);
 
                 // 执行错误转为 is_error 结果而不是 run 失败；Canceled 标记为 canceled。
+                started_call = call.id;
                 result = self.executeCancelable(a, prepared, cancel) catch |err| .{
                     .text = @errorName(err),
                     .is_error = true,
@@ -631,6 +665,7 @@ pub const Runtime = struct {
             // 超出上下文预算时截断输出。
             result = try self.fitResult(a, call.id, result);
             try self.appendResult(call.id, result);
+            started_call = null;
             next_block += 1;
             try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result } }, cancel);
 
@@ -700,6 +735,7 @@ pub const Runtime = struct {
         } };
 
         try self.history.append(a, .{ .role = .tool, .blocks = blocks });
+        self.observer.notify(.{ .tool_completed = .{ .call_id = id, .result = result } });
     }
 
     /// 若把结果加入历史会超过输入预算，则保留首尾片段并标记截断；否则原样返回。

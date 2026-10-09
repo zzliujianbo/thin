@@ -39,6 +39,8 @@ const Fake = struct {
     decision: r.Decision = .allow_once,
     /// 工具执行返回的文本。
     output: []const u8 = "written",
+    /// 工具返回后触发一次分配失败，验证结果尚未回填时不能谎报“未执行”。
+    fail_after_execution: ?*bool = null,
     /// 执行工具之后触发取消，用于测试"工具已执行但随后取消"的路径。
     cancel_after_execution: ?*p.Cancellation = null,
     /// 审批回调中触发取消。
@@ -162,6 +164,7 @@ const Fake = struct {
         const self: *Fake = @ptrCast(@alignCast(ctx));
         if (cancel.isRequested()) return error.Canceled;
         self.executions += 1;
+        if (self.fail_after_execution) |armed| armed.* = true;
         if (self.cancel_after_execution) |c| c.cancel();
         return .{ .text = self.output, .cleanup_failed = self.cleanup_failure, .is_error = self.cleanup_failure };
     }
@@ -214,6 +217,141 @@ fn smallConfiguration() cfg.Config {
     config.limits.summary_tokens = 100;
     config.limits.safety_tokens = 100;
     return config;
+}
+
+test "Runtime result allocation failure preserves execution uncertainty in history and observer" {
+    const Fault = struct {
+        backing: std.mem.Allocator,
+        armed: bool = false,
+        failed: bool = false,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.armed) {
+                self.armed = false;
+                self.failed = true;
+                return null;
+            }
+            return self.backing.rawAlloc(len, alignment, ra);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backing.rawFree(bytes, alignment, ra);
+        }
+    };
+    const Capture = struct {
+        results: usize = 0,
+        uncertain: bool = false,
+        skipped: bool = false,
+
+        fn notify(raw: ?*anyopaque, observation: r.Observation) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (observation != .tool_completed) return;
+            self.results += 1;
+            const value = observation.tool_completed;
+            if (std.mem.eql(u8, value.call_id, "call-1-0")) {
+                self.uncertain = std.mem.indexOf(u8, value.result.text, "may have run") != null and
+                    !std.mem.startsWith(u8, value.result.text, "Not executed");
+            } else if (std.mem.eql(u8, value.call_id, "call-1-1")) {
+                self.skipped = std.mem.startsWith(u8, value.result.text, "Not executed");
+            }
+        }
+    };
+    var fault = Fault{ .backing = std.testing.allocator };
+    const large: [65536]u8 = @splat('x');
+    var fake = Fake{ .calls_per_response = 2, .output = &large, .fail_after_execution = &fault.armed };
+    var config = configuration();
+    config.model.context_tokens = 1000000;
+    var runtime = try r.Runtime.init(fault.allocator(), std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
+    defer runtime.deinit();
+    var capture = Capture{};
+    runtime.observer = .{ .context = &capture, .notify_fn = Capture.notify };
+    var cancel = p.Cancellation{};
+    const terminal = try runtime.run("Do the task", &cancel);
+    try std.testing.expectEqual(r.Status.failed, terminal.status);
+    try std.testing.expectEqual(error.OutOfMemory, terminal.detail.?);
+    try std.testing.expect(fault.failed);
+    try std.testing.expectEqual(@as(u32, 1), fake.executions);
+    try std.testing.expectEqual(@as(usize, 2), capture.results);
+    try std.testing.expect(capture.uncertain and capture.skipped);
+    var results: usize = 0;
+    for (runtime.history.items) |message| for (message.blocks) |block| {
+        if (block != .tool_result) continue;
+        const result = block.tool_result;
+        if (results == 0) try std.testing.expect(std.mem.indexOf(u8, result.text, "may have run") != null);
+        if (results == 1) try std.testing.expect(std.mem.startsWith(u8, result.text, "Not executed"));
+        results += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), results);
+}
+
+test "Runtime observer sees accepted input and canonical results without granting authority" {
+    const Capture = struct {
+        submitted: usize = 0,
+        finished: usize = 0,
+        decisions: usize = 0,
+        results: usize = 0,
+        errors: usize = 0,
+        ids_valid: bool = true,
+
+        fn notify(raw: ?*anyopaque, observation: r.Observation) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (observation) {
+                .submitted => self.submitted += 1,
+                .decision => self.decisions += 1,
+                .tool_completed => |value| {
+                    self.results += 1;
+                    if (value.result.is_error) self.errors += 1;
+                    // 在回调期间检查借用的 ID，不把它保存到临时 arena 释放之后。
+                    self.ids_valid = self.ids_valid and std.mem.startsWith(u8, value.call_id, "call-");
+                },
+                .event => |event| if (event == .finished) {
+                    self.finished += 1;
+                },
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |disconnect| {
+        var fake = Fake{ .calls_per_response = 3, .disconnect_committed = disconnect };
+        const config = configuration();
+        var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
+        defer runtime.deinit();
+        fake.current_runtime = &runtime;
+        var capture = Capture{};
+        runtime.observer = .{ .context = &capture, .notify_fn = Capture.notify };
+        var cancel = p.Cancellation{};
+        {
+            runtime.busy.store(true, .release);
+            defer runtime.busy.store(false, .release);
+            try std.testing.expectError(error.Busy, runtime.run("not accepted", &cancel));
+            try std.testing.expectEqual(@as(usize, 0), capture.submitted);
+        }
+        const result = try runtime.run("Do the task", &cancel);
+        try std.testing.expectEqual(@as(usize, 1), capture.submitted);
+        try std.testing.expectEqual(@as(usize, 1), capture.finished);
+        try std.testing.expectEqual(@as(usize, 3), capture.results);
+        try std.testing.expect(capture.ids_valid);
+        if (disconnect) {
+            try std.testing.expectEqual(r.Status.failed, result.status);
+            try std.testing.expectEqual(@as(usize, 3), capture.errors);
+            try std.testing.expectEqual(@as(usize, 0), capture.decisions);
+            try std.testing.expectEqual(@as(u32, 0), fake.executions);
+        } else {
+            try std.testing.expectEqual(r.Status.success, result.status);
+            try std.testing.expectEqual(@as(usize, 0), capture.errors);
+            try std.testing.expectEqual(@as(usize, 3), capture.decisions);
+            try std.testing.expectEqual(@as(u32, 3), fake.executions);
+        }
+    }
 }
 
 test "Runtime local budget rejection recovers first and established turns for every protocol" {

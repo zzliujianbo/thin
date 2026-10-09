@@ -70,6 +70,16 @@ fn output(io: std.Io, file: std.Io.File, bytes: []const u8) !void {
     if (write.failure) |err| return err;
 }
 
+/// 留档失败不改变任务成败或重试工具；用独立诊断提示缺失记录。
+fn reportLogFailure(io: std.Io, app: *App) void {
+    // 生产者已 join；收尾也可能发现最后一条记录的写入失败。
+    app.journal.finish();
+    const err = app.journal.failure() orelse return;
+    var buffer: [256]u8 = undefined;
+    const message = std.fmt.bufPrint(&buffer, "thin: session recording disabled: {s}. Records in .thin/sessions may be incomplete.\n", .{@errorName(err)}) catch return;
+    output(io, .stderr(), message) catch {};
+}
+
 /// 主流程：解析参数，处理 --help/--version，然后进入 --print 或 TUI 分支。
 fn run(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -94,6 +104,7 @@ fn run(init: std.process.Init) !u8 {
         defer console.deinit();
         const app = try App.init(init.gpa, init.io, init.environ_map, ".", console.host(), options.trusted);
         defer app.deinit();
+        app.setLogging(options.logging);
 
         var guard = try interrupt.Guard.install();
         defer guard.deinit();
@@ -113,6 +124,7 @@ fn run(init: std.process.Init) !u8 {
         }
         future.await(init.io);
 
+        reportLogFailure(init.io, app);
         const terminal = try job.result();
 
         if (terminal.status == .success) {
@@ -152,9 +164,17 @@ fn run(init: std.process.Init) !u8 {
     // 先建立可处于未配置状态的会话，再进入 TUI；/auth 保存后才发布可用 Runtime。
     var session = try Session.init(init.gpa, init.io, init.environ_map, ".", bridge.host(), options.trusted);
     defer session.deinit();
+    session.setLogging(options.logging);
 
     var guard = try interrupt.Guard.install();
     defer guard.deinit();
 
-    return tui.run(init.gpa, init.io, session.connection(), &bridge, &cancellation);
+    const code = tui.run(init.gpa, init.io, session.connection(), &bridge, &cancellation) catch |err| {
+        // TUI 已清理 producer/终端；错误路径也收尾日志，不让尾部故障静默丢失。
+        if (session.app) |app| reportLogFailure(init.io, app);
+        return err;
+    };
+    // 恢复终端属性后再提示一次，让退出后仍能看到留档失败信息。
+    if (session.app) |app| reportLogFailure(init.io, app);
+    return code;
 }

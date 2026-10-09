@@ -1,6 +1,6 @@
 //! Linux terminal mechanics only. Uses a fresh /dev/tty open description, so
 //! nonblocking flags do not modify the parent shell's inherited stdio flags.
-//! 中文：Linux 终端底层操作，包括 /dev/tty 打开、raw 模式切换、备用屏幕控制以及非阻塞读写。
+//! 中文：Linux 终端底层操作，包括 /dev/tty 打开、raw 模式切换、主缓冲显示状态以及非阻塞读写。
 
 const std = @import("std");
 const c = std.c;
@@ -17,14 +17,14 @@ extern "c" fn getpgrp() c_int;
 // O_NONBLOCK 的 Linux 数值（0x800），使读写不阻塞。
 const nonblock = 0x800;
 
-// 进入 TUI：切换到备用屏幕(1049h)、开启 bracketed paste(2004h)、重置样式、显示光标。
-const enter = "\x1b[?1049h\x1b[?2004h\x1b[0m\x1b[?25h";
-// 退出 TUI：\x18(CAN) 用于中止未完成的转义序列，然后关闭 bracketed paste、显示光标，并切回主屏幕(1049l)。
-const leave = "\x18\x1b[0m\x1b[?2004l\x1b[?25h\x1b[?1049l";
+// 普通主缓冲：保留 shell 与滚屏内容；只管理自身追加的 live tail。
+const enter = "\x1b[?2004h\x1b[0m\x1b[?25h\r\n";
+// CAN 中止未完成的转义序列；不切屏、不清屏，最终输出留在滚屏中。
+const leave = "\x18\x1b[0m\x1b[?2004l\x1b[?25h\r\n";
 /// 终端尺寸，单位为列数与行数。
 pub const Size = struct { columns: usize, rows: usize };
 
-/// 终端 fd 的封装：保存原始属性以便恢复，并负责备用屏幕等显示状态。
+/// 终端 fd 的封装：保存原始属性以便恢复，并负责粘贴、光标等显示状态。
 pub const Terminal = struct {
     /// 终端文件描述符（/dev/tty 或测试用的 PTY slave）。
     fd: c_int,
@@ -34,7 +34,7 @@ pub const Terminal = struct {
     original: abi.Termios,
     /// 进入前的 fcntl 文件状态标志，恢复时用于还原 O_NONBLOCK。
     original_flags: c_int,
-    /// 是否仍处于 raw/备用屏幕状态；restore 依赖它保证幂等。
+    /// 是否仍处于 raw/显示托管状态；restore 依赖它保证幂等。
     active: bool = true,
 
     /// 打开控制终端 /dev/tty。要求 stdin/stdout 均为 tty，且当前进程位于前台进程组，否则后台写终端会被 SIGTTOU 挂起。
@@ -145,7 +145,7 @@ pub const Terminal = struct {
             if (c._errno().* != 4) break;
         }
 
-        // 即使属性恢复失败，也要尝试输出离开序列（退出备用屏幕等）；两项结果分别汇总。
+        // 即使属性恢复失败，也要尝试输出离开序列（复位样式与粘贴模式）；两项结果分别汇总。
         const display_ok = self.writeBounded(leave, 50);
         // 无论前面是否成功，都尝试还原 O_NONBLOCK 标志。
         const flags_ok = c.fcntl(self.fd, 4, self.original_flags) >= 0;

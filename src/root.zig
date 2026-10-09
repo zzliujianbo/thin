@@ -56,12 +56,15 @@ test {
 
     _ = @import("app/cli.zig");
     _ = @import("app/auth_store.zig");
+    _ = @import("app/log_store.zig");
+    _ = @import("app/journal.zig");
     _ = @import("app/session.zig");
     _ = @import("ui/terminal.zig");
     _ = @import("ui/input.zig");
     _ = @import("ui/markdown.zig");
     _ = @import("ui/bridge.zig");
     _ = @import("tests/ui_bridge_test_root.zig");
+    _ = @import("tests/regular_screen.zig");
     _ = @import("ui/tui.zig");
 
     _ = @import("tests/runtime_test.zig");

@@ -39,6 +39,19 @@ test "tools validate containment and Memory namespace before approval" {
         try std.testing.expectError(error.UseMemoryTool, executor.prepare_fn(executor.context, temp, .{ .id = "c", .name = "write_file", .arguments = args }));
     }
 
+    // 新旧会话目录的绝对/相对别名都受保护；直接执行也不能绕过。
+    const session_path = try std.fs.path.join(temp, &.{ root.path, ".thin/sessions/session.jsonl" });
+    const legacy_path = try std.fs.path.join(temp, &.{ root.path, ".thin/logs/session.jsonl" });
+    var cancel = p.Cancellation{};
+    for ([_][]const u8{ ".thin/sessions/session.jsonl", "./.thin//./sessions/session.jsonl", session_path, ".thin/logs/session.jsonl", "./.thin//./logs/session.jsonl", legacy_path }) |path| {
+        const args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\"}}", .{path});
+        try std.testing.expectError(error.ProtectedSessionFile, executor.prepare_fn(executor.context, temp, .{ .id = "session", .name = "read_file", .arguments = args }));
+        const write_args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
+        try std.testing.expectError(error.ProtectedSessionFile, executor.prepare_fn(executor.context, temp, .{ .id = "session", .name = "write_file", .arguments = write_args }));
+        try std.testing.expectError(error.ProtectedSessionFile, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
+        try std.testing.expectError(error.ProtectedSessionFile, tools.execute(temp, .{ .write_file = .{ .path = path, .content = "x" } }, &cancel));
+    }
+
     // 绝对路径超出工具根目录，必须在 prepare 阶段拒绝。
     try std.testing.expectError(error.OutsideRoot, executor.prepare_fn(executor.context, temp, .{
         .id = "c",

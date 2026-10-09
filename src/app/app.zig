@@ -7,6 +7,7 @@ const mem = @import("../tools/memory.zig");
 const tools = @import("../tools/tools.zig");
 const http = @import("../llm/http.zig");
 const r = @import("../core/runtime.zig");
+const Journal = @import("journal.zig").Journal;
 
 /// 应用聚合体：持有配置、项目根目录、记忆存储、工具执行器、HTTP 客户端与 Runtime，
 /// 生命周期与进程一致（--print 或 TUI 会话结束时统一释放）。
@@ -22,6 +23,8 @@ pub const App = struct {
     auth_path: []const u8,
     /// 项目记忆存储，指向上面的 root。
     memory: mem.Store,
+    /// 可选本地会话留档；首次提交才创建文件，不参与 Runtime 的授权或结果判断。
+    journal: Journal,
 
     /// 供工具子进程使用的环境变量副本（由 tools.commandEnvironment 生成）。
     environment: std.process.Environ.Map,
@@ -73,6 +76,9 @@ pub const App = struct {
         self.root = try fs.Root.open(a, io, project);
         errdefer self.root.deinit();
         self.memory = mem.Store.init(&self.root, self.config.value.limits);
+        self.journal = try Journal.init(a, &self.root, key);
+        self.journal.protocol = self.config.value.model.protocol;
+        errdefer self.journal.deinit();
         self.environment = try tools.commandEnvironment(a, environ, self.config.value.provider.api_key_env);
         errdefer self.environment.deinit();
         self.executor = .{ .root = &self.root, .memory = &self.memory, .config = &self.config.value, .environment = &self.environment, .auth_path = self.auth_path };
@@ -82,13 +88,21 @@ pub const App = struct {
         const snapshot = try self.memory.snapshot(a);
         defer a.free(snapshot);
         self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, snapshot, trusted);
+        self.runtime.observer = self.journal.observer();
         return self;
+    }
+
+    /// 只在首次提交前设置；关闭不会读取或删除已有日志。
+    pub fn setLogging(self: *App, enabled: bool) void {
+        std.debug.assert(!self.runtime.busy.load(.acquire));
+        self.journal.setEnabled(enabled);
     }
 
     /// 按创建的逆序释放资源，最后销毁自身。
     pub fn deinit(self: *App) void {
         const a = self.allocator;
         self.runtime.deinit();
+        self.journal.deinit();
         self.client.deinit();
         self.environment.deinit();
         self.root.deinit();

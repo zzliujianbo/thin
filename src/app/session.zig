@@ -15,6 +15,7 @@ pub const Session = struct {
     project: []const u8,
     host: r.Host,
     trusted: bool,
+    logging: bool = true,
     store: Store,
     pending: ?std.json.Parsed(cfg.Config) = null,
     app: ?*App = null,
@@ -56,6 +57,12 @@ pub const Session = struct {
         self.* = undefined;
     }
 
+    /// main 在进入 TUI 前设置，也应用于之后 /auth 创建的候选 App。
+    pub fn setLogging(self: *Session, enabled: bool) void {
+        self.logging = enabled;
+        if (self.app) |app| app.setLogging(enabled);
+    }
+
     pub fn connection(self: *Session) tui.Connection {
         return .{ .context = self, .current_fn = current, .configure_fn = configure };
     }
@@ -67,6 +74,8 @@ pub const Session = struct {
             .runtime = if (self.app) |app| &app.runtime else null,
             .model = config.model.name,
             .base_url = config.provider.base_url,
+            .logging_enabled = self.logging,
+            .log_error = if (self.app) |app| app.journal.failure() else null,
         };
     }
 
@@ -90,6 +99,7 @@ pub const Session = struct {
         const owned = try cfg.parse(self.allocator, encoded[0..writer.end]);
         const candidate = try App.initConfigured(self.allocator, self.io, self.environ, self.project, self.host, self.trusted, owned);
         errdefer candidate.deinit();
+        candidate.setLogging(self.logging);
 
         // 先完成本地对象构建和落盘，再发布 ready。保存失败不激活半配置会话。
         try self.store.save(candidate.config.value);

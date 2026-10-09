@@ -14,6 +14,7 @@ import {tmpdir} from 'node:os';
 import {resolve, join} from 'node:path';
 import assert from 'node:assert/strict';
 import {reviewRegressions} from './review_mock.mjs';
+import {logRegressions} from './log_mock.mjs';
 
 // 命令行参数：第一个是 thin 可执行文件的绝对路径，第二个是 thin-app-pty 驱动的绝对路径。
 const [appArg, ptyArg] = process.argv.slice(2);
@@ -211,6 +212,17 @@ async function scenario(name, protocol, kind, isPty = false) {
         return;
       }
 
+      // Regular inline terminal: two questions in one owned PTY. Long second
+      // reply scrolls the first into history; no external network/tools needed.
+      if (kind === 'regular-two') {
+        assert(requests <= 2, 'regular request bound');
+        const users = body.messages.filter(m => m.role === 'user');
+        assert.equal(users.at(-1)?.content, rounds === 1 ? 'regular-first' : 'regular-second');
+        if (rounds === 2) assert(body.messages.some(m => m.role === 'assistant' && m.content?.includes('regular-answer-one')), 'first answer missing from history');
+        send(res,protocol, rounds === 1 ? 'regular-answer-one' : `${Array.from({length:32}, (_,i)=>`regular filler ${i}`).join('\n')}\nregular-answer-two`);
+        return;
+      }
+
       // 输出超限场景：返回约 240 KiB 的文本，验证输出上限。
       if (kind === 'output') { send(res,protocol,'x'.repeat(240*1024)); return; }
 
@@ -320,9 +332,25 @@ async function scenario(name, protocol, kind, isPty = false) {
       const auth = JSON.parse(await readFile(authPath,'utf8'));
       assert.equal((await stat(authPath)).mode & 0o777, 0o600, 'auth file must be private');
       assert.equal(auth.provider.api_key_env, '');
-      assert(!await exists(join(project,'.thin')));
-      assert.deepEqual((await readdir(project)).sort(), ['seed.txt'], 'unexpected project files');
+      if (kind !== 'auth-activate') {
+        assert(!await exists(join(project,'.thin/sessions')), 'initialization created session records without submission');
+        assert(!await exists(join(project,'.thin')));
+        assert.deepEqual((await readdir(project)).sort(), ['seed.txt'], 'unexpected project files');
+      }
       if (kind === 'auth-activate') {
+        const logs = join(project,'.thin/sessions');
+        const files = (await readdir(logs)).filter(f => f.endsWith('.jsonl'));
+        assert(files.length > 0, 'activation chat did not create logs');
+        let hasUser = false, hasFinished = false;
+        for (const file of files) {
+          const raw = await readFile(join(logs,file),'utf8');
+          assert(!raw.includes(KEY), 'activation key leaked in logs');
+          for (const line of raw.trimEnd().split('\n')) {
+            const row = JSON.parse(line);
+            hasUser ||= row.event === 'user'; hasFinished ||= row.event === 'finished';
+          }
+        }
+        assert(hasUser && hasFinished, 'activation conversation missing');
         assert.equal(auth.provider.api_key, KEY);
         assert.equal(auth.provider.base_url, url, 'activation must preserve loopback endpoint');
         assert.equal(auth.model.name, 'fixture-model');
@@ -365,6 +393,7 @@ async function scenario(name, protocol, kind, isPty = false) {
     if (kind === 'stall') assert.equal(result.code, 130, 'SIGINT must return canceled status');
     // cancel：取消后 CLI 应能继续发起第二轮请求。
     if (kind === 'cancel') assert.equal(rounds,2, 'did not resume after cancel');
+    if (kind === 'regular-two') assert.equal(requests,2, 'regular two-turn request count');
 
     // 场景通过，输出请求数与摘要数（不含内容）。
     console.log(`PASS ${name}: requests=${requests} summaries=${summaries}`);
@@ -387,14 +416,17 @@ try {
   }
 
   // PTY 场景：通过 thin-app-pty 驱动交互式终端，仅使用 chat 协议。
-  for (const kind of ['unicode','approval','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
+  for (const kind of ['unicode','regular-two','approval','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
   await reviewRegressions(app);
+  await logRegressions(app,pty);
   console.log('Application fixture suite passed; PTY tests exercise chat only.');
 
 // 顶层捕获：任何场景失败都打印脱敏后的错误（替换密钥、去除控制字符），并以退出码 1 结束。
 } catch (error) {
   // 中文：不要渲染捕获的终端或模型输出、响应头或请求体。
   // Do not render captured terminal/model output, headers, or request bodies.
-  console.error(`FAIL application acceptance: ${String(error.message).replaceAll(KEY,'[redacted]').replace(/[\x00-\x1f\x7f]/g,'?')}`);
+  const label = /^log\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
+    ? `${error.fixtureCase}: ${error.fixtureCheck}` : 'offline fixture assertion failed (details withheld)';
+  console.error(`FAIL application acceptance: ${label}`);
   process.exitCode = 1;
 }

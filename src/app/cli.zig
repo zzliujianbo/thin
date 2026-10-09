@@ -4,7 +4,7 @@ const std = @import("std");
 
 /// 解析后的选项。prompt 为 null 表示交互模式；非 null 表示 --print 一次性模式。
 /// trusted 对应 --trust，只在本进程内有效。
-pub const Options = struct { prompt: ?[]const u8 = null, trusted: bool = false, help: bool = false, version: bool = false };
+pub const Options = struct { prompt: ?[]const u8 = null, trusted: bool = false, logging: bool = true, help: bool = false, version: bool = false };
 
 /// 解析 argv。args[0] 是程序名，因此从 1 开始遍历。
 /// 无效参数返回错误（InvalidArguments、UnknownOption），由调用方决定如何提示。
@@ -16,7 +16,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         // --print 要求后面紧跟一个 prompt，且不允许重复指定，避免静默覆盖。
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) result.help = true else if (std.mem.eql(u8, arg, "--version")) result.version = true else if (std.mem.eql(u8, arg, "--trust")) result.trusted = true else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) result.help = true else if (std.mem.eql(u8, arg, "--version")) result.version = true else if (std.mem.eql(u8, arg, "--trust")) result.trusted = true else if (std.mem.eql(u8, arg, "--no-log")) result.logging = false else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
             if (result.prompt != null or i + 1 >= args.len) return error.InvalidArguments;
             i += 1;
             result.prompt = args[i];
@@ -30,8 +30,8 @@ pub fn parse(args: []const [:0]const u8) !Options {
 pub const help =
     \\thin - minimal local agent (Linux x86_64, Zig 0.17.0)
     \\
-    \\Usage: thin [--trust]
-    \\       thin --print "prompt" [--trust]
+    \\Usage: thin [--trust] [--no-log]
+    \\       thin --print "prompt" [--trust] [--no-log]
     \\       thin --help | --version
     \\
     \\Configuration: ~/.thin/config.json
@@ -46,15 +46,24 @@ pub const help =
     \\--print requires an already configured file; it does not open the setup UI.
     \\Protocols: auto (Responses then one explicitly supported fallback), responses, chat.
     \\
-    \\Interactive: Enter sends; Ctrl+J adds newline; Ctrl+C cancels; Ctrl+D exits.
+    \\Interactive uses regular terminal scrollback, not an alternate full-screen buffer.
+    \\Committed output remains after exit; only the live input/status area is redrawn.
+    \\Enter sends; Ctrl+J adds newline; Ctrl+C cancels; Ctrl+D exits.
     \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning. Approval: y once, n deny,
     \\t trusts subsequent writes/commands for this process only. Pasting never approves.
     \\--print returns the final committed visible answer and denies privileged tools.
     \\--trust explicitly allows those tools for THIS PROCESS; bash is NOT a sandbox.
     \\
     \\Project Memory: <startup directory>/.thin/mem/*.md, only explicit approved writes.
-    \\No saved conversations, no model probing, no cache warming. Usage is reported
-    \\when available; monetary cost is unknown without provider pricing.
+    \\Session records: <startup directory>/.thin/sessions/*.jsonl (local plaintext, 0600).
+    \\Recording starts on the first submitted message; --no-log disables it for this run.
+    \\Records include messages, tools, stages, usage and errors, not /auth input,
+    \\hidden reasoning or native replay. The configured key is redacted; other sensitive
+    \\content may remain. Records are not restored or automatically sent to the provider.
+    \\Large fields are explicitly truncated/omitted; files rotate without deleting old records.
+    \\View locally with ls -lt .thin/sessions and tail -f <chosen.jsonl>.
+    \\No model probing or cache warming. Usage is reported when available;
+    \\monetary cost is unknown without provider pricing.
     \\
 ;
 
@@ -64,6 +73,9 @@ test "CLI trust is explicit and print requires a prompt" {
     try std.testing.expect(options.trusted);
     try std.testing.expectEqualStrings("hello", options.prompt.?);
     try std.testing.expect(!(try parse(&.{"thin"})).trusted);
+    try std.testing.expect((try parse(&.{"thin"})).logging);
+    try std.testing.expect(!(try parse(&.{ "thin", "--no-log" })).logging);
+    try std.testing.expect(!(try parse(&.{ "thin", "--print", "hello", "--no-log" })).logging);
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--print" }));
     try std.testing.expectError(error.UnknownOption, parse(&.{ "thin", "--config", "other.json" }));
 }

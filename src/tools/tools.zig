@@ -198,8 +198,23 @@ pub const Tools = struct {
     /// 即使启动目录是 HOME 或 HOME 本身是别名，也不能通过模型文件工具泄露凭证。
     auth_path: ?[]const u8 = null,
 
-    fn checkAuthPath(self: *Tools, a: std.mem.Allocator, path: []const u8) !void {
-        _ = try self.root.relative(path);
+    fn checkProtectedPath(self: *Tools, a: std.mem.Allocator, path: []const u8) !void {
+        const relative = try self.root.relative(path);
+        // 会话记录不作为普通模型文件输入，也不允许工具篡改自己的留档。
+        // 跳过点段和重复分隔符，保证绝对/相对路径别名使用同一规则。
+        var parts = std.mem.tokenizeScalar(u8, relative, '/');
+        var in_thin = false;
+        while (parts.next()) |part| {
+            if (std.mem.eql(u8, part, ".")) continue;
+            if (!in_thin) {
+                if (!std.mem.eql(u8, part, ".thin")) break;
+                in_thin = true;
+            } else {
+                // 新档案放在 sessions；旧 logs 留档仍受保护，但不再写入或自动搬迁。
+                if (std.mem.eql(u8, part, "sessions") or std.mem.eql(u8, part, "logs")) return error.ProtectedSessionFile;
+                break;
+            }
+        }
         const protected = self.auth_path orelse return;
         const absolute = try std.fs.path.resolve(a, &.{ self.root.path, path });
         defer a.free(absolute);
@@ -219,10 +234,10 @@ pub const Tools = struct {
         switch (action.*) {
             .read_file => |r| {
                 // relative 做包含检查，确保路径仍位于启动项目根目录内。
-                try self.checkAuthPath(a, r.path);
+                try self.checkProtectedPath(a, r.path);
             },
             .write_file => |w| {
-                try self.checkAuthPath(a, w.path);
+                try self.checkProtectedPath(a, w.path);
                 // 写文件工具不得直接改 .thin/mem，必须走 memory 工具以保证版本与锁语义。
                 const relative = try self.root.relative(w.path);
                 if (isMemoryPath(relative)) return error.UseMemoryTool;
@@ -248,8 +263,8 @@ pub const Tools = struct {
 
         // 直接执行入口也校验，避免绕过 prepare；已批准的任意 bash 仍不属于沙箱。
         switch (action) {
-            .read_file => |read| try self.checkAuthPath(a, read.path),
-            .write_file => |write| try self.checkAuthPath(a, write.path),
+            .read_file => |read| try self.checkProtectedPath(a, read.path),
+            .write_file => |write| try self.checkProtectedPath(a, write.path),
             else => {},
         }
 

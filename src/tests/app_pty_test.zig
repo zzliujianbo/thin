@@ -5,6 +5,7 @@ const std = @import("std");
 const c = std.c;
 const abi = @import("../platform/terminal_abi.zig");
 const openpty = abi.openpty;
+const regular = @import("regular_screen.zig");
 
 // libc 符号声明：fork/exec、信号、进程组与 PTY 控制相关函数。
 extern "c" fn fork() c_int;
@@ -104,6 +105,13 @@ const Driver = struct {
         return error.VisibleTextTimeout;
     }
 
+    /// Fixed-size replay only: resize cases check sequences, not terminal reflow.
+    fn screen(self: *const Driver) !regular.Screen {
+        var result: regular.Screen = .{};
+        try result.replay(self.output[0..self.used]);
+        return result;
+    }
+
     /// 向 master 写入 bytes，最长 2 秒；写缓冲满（写入返回 0）时先 drain，避免与应用互相阻塞。
     fn send(self: *Driver, bytes: []const u8) !void {
         var pos: usize = 0;
@@ -136,6 +144,10 @@ const Driver = struct {
         try check(std.meta.eql(self.original, restored));
         // F_GETFL (3)：确认 slave 的文件状态标志已恢复为启动前的值。
         try check(c.fcntl(self.slave, 3) == self.flags);
+
+        // Regular TUI must never switch buffers, address absolute cells,
+        // erase the display, or install a scrolling region (including resize).
+        try regular.rejectFullscreen(self.output[0..self.used]);
 
         // 安全检查：应用不得输出 OSC 52 剪贴板序列，也不得泄露测试注入的密钥。
         try check(std.mem.indexOf(u8, self.output[0..self.used], "\x1b]52;") == null);
@@ -231,6 +243,13 @@ pub fn main(init: std.process.Init) !void {
 
     // F_SETFL (4) 设置 O_NONBLOCK (0x800)，使 master 读取不会阻塞驱动循环。
     try check(c.fcntl(master, 4, @as(c_int, 0x800)) == 0);
+
+    // Seed pre-existing terminal OUTPUT through the owned slave, never master
+    // input. --print backpressure must wait for genuine application stdout.
+    if (!std.mem.eql(u8, mode, "output")) {
+        const seed = regular.prior ++ "\r\n";
+        try check(c.write(slave, seed.ptr, seed.len) == seed.len);
+    }
 
     // fork 之后子进程只能调用 async-signal-safe 的 libc 函数。
     const pid = fork();
@@ -331,6 +350,50 @@ pub fn main(init: std.process.Init) !void {
         try d.send("fixture-task\r");
         try d.waitText(start, "fixture-answer");
         try d.waitText(start, "Completed");
+    } else if (std.mem.eql(u8, mode, "log-idle")) {
+        // 已配置但尚未提交：Node 检查退出后仍没有日志目录。
+        try d.quiet(150);
+    } else if (std.mem.eql(u8, mode, "date")) {
+        const start = d.used;
+        try d.send("获取时间\r");
+        try d.waitText(start, "Approval #");
+        try d.quiet(150); // Complete approval frame before pressing y.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "date -Ins") != null);
+        const approval_screen = try d.screen();
+        try check(approval_screen.visible("Approval #") and approval_screen.visible("date -Ins"));
+        try d.send("y");
+        try d.waitText(start, "date-completed");
+        try d.waitText(start, "Completed");
+    } else if (std.mem.eql(u8, mode, "regular-two")) {
+        // Same owned PTY, two loopback-only turns. Force the first reply into
+        // scrollback; repeated input-tail redraws must not append it again.
+        for ([_][]const u8{ "regular-first", "regular-second" }, 0..) |prompt, turn| {
+            const start = d.used;
+            try d.send(prompt);
+            try d.send("\r");
+            try d.waitText(start, if (turn == 0) "regular-answer-one" else "regular-answer-two");
+            try d.waitText(start, "Completed");
+            try d.quiet(150);
+            try d.send("tail-refresh");
+            try d.quiet(150);
+            try d.send("\x15");
+            try d.quiet(150);
+            const current = try d.screen();
+            try check(current.count("regular-answer-one") == 1);
+            if (turn == 1) try check(current.count("regular-answer-two") == 1);
+        }
+    } else if (std.mem.eql(u8, mode, "log-failure")) {
+        const start = d.used;
+        try d.send("log-fixture-task\r");
+        try d.waitText(start, "REC FAILED");
+        try d.waitText(start, "log-fixture-answer");
+        try d.waitText(start, "Completed");
+        try d.send("\x04");
+        try d.finish(0);
+        const final = try d.screen();
+        try check(final.count(regular.prior) == 1 and final.count("log-fixture-answer") == 1);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "session recording disabled") != null);
+        return;
     } else if (std.mem.eql(u8, mode, "approval")) {
         // 审批流程：验证 y/n 决策只能由真实按键产生，粘贴内容不能伪造授权。
         var start = d.used;
@@ -398,4 +461,13 @@ pub fn main(init: std.process.Init) !void {
     // Ctrl-D (0x04) 让应用正常退出，期望退出码 0。
     try d.send("\x04");
     try d.finish(0);
+    if (std.mem.eql(u8, mode, "date") or std.mem.eql(u8, mode, "log-idle") or std.mem.eql(u8, mode, "regular-two")) {
+        const final = try d.screen();
+        try check(final.count(regular.prior) == 1);
+        if (std.mem.eql(u8, mode, "date")) try check(final.count("date-completed") == 1);
+        if (std.mem.eql(u8, mode, "regular-two")) {
+            try check(final.count("regular-answer-one") == 1 and final.count("regular-answer-two") == 1);
+            try check(!final.visible("regular-answer-one")); // Actually reached scrollback.
+        }
+    }
 }
