@@ -102,7 +102,7 @@ pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome) ![]co
 
 /// Caption bodies are already sanitized, and spans are renderer-owned offsets.
 /// Clip BEFORE SGR so no partial escapes; mixed outcomes keep independent colors.
-pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize) ![]const u8 {
+pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, active_phase: ?usize) ![]const u8 {
     const safe = try singleLine(a, body, columns);
     defer a.free(safe);
     var out: std.Io.Writer.Allocating = .init(a);
@@ -112,7 +112,10 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         const begin = @min(@max(at, span.start), safe.len);
         const end = @min(@max(begin, span.end), safe.len);
         try out.writer.writeAll(safe[at..begin]);
-        try out.writer.print("{s}{s}{s}", .{ outcomeColor(span.outcome), safe[begin..end], theme.reset });
+        if (span.outcome == .pending and active_phase != null and begin < end) {
+            const prefix_end = @min(text.nextCluster(safe, begin, 0).end, end);
+            try out.writer.print("{s}{s}{s}{s}{s}", .{ theme.command_pulse[active_phase.? % theme.command_pulse.len], safe[begin..prefix_end], theme.muted, safe[prefix_end..end], theme.reset });
+        } else try out.writer.print("{s}{s}{s}", .{ outcomeColor(span.outcome), safe[begin..end], theme.reset });
         at = end;
         if (at == safe.len) break;
     }
@@ -130,52 +133,76 @@ pub const Prompt = struct {
     }
 };
 
-/// Only the model name is decorated. The icon is one cell, and every styled
-/// cluster is followed by a reset before parentheses/marker/editor text.
-pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, busy: bool, now_ms: u64, phase: usize) !Prompt {
-    const context_label = try contextLabel(a, snapshot, columns);
-    defer a.free(context_label);
-    const context_gap = if (context_label.len != 0) try std.fmt.allocPrint(a, "{s} ", .{context_label}) else try a.dupe(u8, "");
-    defer a.free(context_gap);
-    const marker = if (busy) activity.spinner(now_ms) else ">";
-    const reserve: usize = @min(@as(usize, 24), columns / @as(usize, if (context_label.len != 0) 3 else 2));
-    const room = columns -| (reserve + 5 + text.width(context_gap));
+pub const PromptActivity = struct {
+    busy: bool = false,
+    now_ms: u64 = 0,
+    phase: usize = 0,
+    rate_band: shared.activity.RateBand = .unknown,
+    reasoning_effort: shared.ReasoningEffort = .unspecified,
+};
+
+/// Model and percentage share TPS palette/phase. Marker has configured effort
+/// color; parentheses/space/editor remain default and every style is reset.
+pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, motion: PromptActivity) !Prompt {
+    const percentage = try contextLabel(a, snapshot);
+    defer a.free(percentage);
+    const marker = if (motion.busy) activity.spinner(motion.now_ms) else ">";
+    const reserve: usize = @min(@as(usize, 24), columns / 3);
+    const room: usize = columns -| (reserve + 6 + text.width(percentage));
     const label = try singleLine(a, model, if (columns < 12) 0 else room);
     defer a.free(label);
-    const plain = if (label.len == 0) try std.fmt.allocPrint(a, "{s}{s} ", .{ context_gap, marker }) else try std.fmt.allocPrint(a, "({s}) {s}{s} ", .{ label, context_gap, marker });
+    const percent_only = columns >= 12 and label.len == 0 and text.width(percentage) + 5 + reserve <= columns;
+    const plain = if (label.len != 0)
+        try std.fmt.allocPrint(a, "({s} {s}) {s} ", .{ label, percentage, marker })
+    else if (percent_only)
+        try std.fmt.allocPrint(a, "({s}) {s} ", .{ percentage, marker })
+    else
+        try std.fmt.allocPrint(a, "{s} ", .{marker});
     errdefer a.free(plain);
-    if (!busy or label.len == 0) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
+    const marker_color = theme.effortColor(motion.reasoning_effort);
+    if (!motion.busy and std.mem.eql(u8, marker_color, theme.reset)) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
-    try out.writer.writeAll("(");
-    var at: usize = 0;
+    const palette = theme.modelPalette(motion.rate_band);
     var ordinal: usize = 0;
-    while (at < label.len) {
-        const cluster = text.nextCluster(label, at, 0);
-        try out.writer.print("{s}{s}", .{ theme.model_flow[(phase % theme.model_flow.len + ordinal) % theme.model_flow.len], label[at..cluster.end] });
-        at = cluster.end;
-        ordinal += 1;
+    if (label.len != 0 or percent_only) {
+        try out.writer.writeAll("(");
+        if (label.len != 0) {
+            if (motion.busy) {
+                try flowText(&out.writer, label, palette, motion.phase, &ordinal);
+                try out.writer.writeAll(theme.reset);
+            } else try out.writer.writeAll(label);
+            try out.writer.writeAll(" ");
+            ordinal += 1;
+        }
+        if (motion.busy) {
+            try flowText(&out.writer, percentage, palette, motion.phase, &ordinal);
+            try out.writer.writeAll(theme.reset);
+        } else try out.writer.writeAll(percentage);
+        try out.writer.writeAll(") ");
     }
-    try out.writer.print("{s}) {s}{s} ", .{ theme.reset, context_gap, marker });
+    if (std.mem.eql(u8, marker_color, theme.reset)) {
+        try out.writer.print("{s} ", .{marker});
+    } else try out.writer.print("{s}{s}{s} ", .{ marker_color, marker, theme.reset });
     return .{ .plain = plain, .styled = try a.dupe(u8, out.written()) };
 }
 
-/// Occupancy is the calibrated retained-context estimate, including system and
-/// schema, against model capacity. Cached tokens are not subtracted. Small
-/// windows use the percentage only; unknown/invalid capacity never divides zero.
-fn contextLabel(a: std.mem.Allocator, snapshot: ?shared.ContextSnapshot, columns: usize) ![]const u8 {
-    if (snapshot == null or columns < 24) return a.dupe(u8, "");
-    const s = snapshot.?;
-    if (s.limit == 0) return a.dupe(u8, "[ctx ?]");
-    const ratio = shared.state.contextRatio(s).?;
-    const full = try std.fmt.allocPrint(a, "[ctx ~{d}/{d} {d}.{d}%]", .{ s.tokens, s.limit, ratio / 10, ratio % 10 });
-    const editor_reserve: usize = @min(@as(usize, 24), columns / 3);
-    const budget: usize = @min(@as(usize, 36), @max(@as(usize, 8), columns -| (editor_reserve + 13)));
-    if (text.width(full) <= budget) return full;
-    a.free(full);
-    if (ratio > 1000) return a.dupe(u8, if (budget >= 12) "[ctx ~>100%]" else "[~>100%]");
-    if (budget >= 12) return std.fmt.allocPrint(a, "[ctx ~{d}.{d}%]", .{ ratio / 10, ratio % 10 });
-    return std.fmt.allocPrint(a, "[~{d}.{d}%]", .{ ratio / 10, ratio % 10 });
+fn flowText(writer: *std.Io.Writer, bytes: []const u8, palette: []const []const u8, phase: usize, ordinal: *usize) !void {
+    var at: usize = 0;
+    while (at < bytes.len) {
+        const cluster = text.nextCluster(bytes, at, 0);
+        try writer.print("{s}{s}", .{ palette[(phase % palette.len + ordinal.*) % palette.len], bytes[at..cluster.end] });
+        at = cluster.end;
+        ordinal.* += 1;
+    }
+}
+
+/// Retained-context estimate displayed as percentage only. Capacity unknown is
+/// ?%, not 0%; overflow-safe shared arithmetic never wraps an overfull context.
+fn contextLabel(a: std.mem.Allocator, snapshot: ?shared.ContextSnapshot) ![]const u8 {
+    const ratio = shared.state.contextRatio(snapshot orelse return a.dupe(u8, "?%")) orelse return a.dupe(u8, "?%");
+    if (snapshot.?.tokens > snapshot.?.limit) return a.dupe(u8, ">100%");
+    return std.fmt.allocPrint(a, "{d}.{d}%", .{ ratio / 10, ratio % 10 });
 }
 
 test "command captions are bounded single line UTF8 with literal three dots" {
@@ -198,21 +225,21 @@ test "command captions are bounded single line UTF8 with literal three dots" {
     try std.testing.expectEqualStrings("(command unavailable)", incomplete.label);
 }
 
-test "model only prompt has default input colors and real spinner not loading text" {
+test "percent prompt has default input colors and real spinner not loading text" {
     const a = std.testing.allocator;
-    const idle = try prompt(a, "deepseek-flash", null, 79, false, 0, 0);
+    const idle = try prompt(a, "deepseek-flash", null, 79, .{});
     defer idle.deinit(a);
-    try std.testing.expectEqualStrings("(deepseek-flash) > ", idle.plain);
+    try std.testing.expectEqualStrings("(deepseek-flash ?%) > ", idle.plain);
     try std.testing.expectEqualStrings(idle.plain, idle.styled);
-    const active = try prompt(a, "deepseek-flash", null, 79, true, 80, 2);
+    const active = try prompt(a, "deepseek-flash", null, 79, .{ .busy = true, .now_ms = 80, .phase = 2 });
     defer active.deinit(a);
-    try std.testing.expectEqualStrings("(deepseek-flash) ⠙ ", active.plain);
+    try std.testing.expectEqualStrings("(deepseek-flash ?%) ⠙ ", active.plain);
     try std.testing.expect(std.mem.endsWith(u8, active.styled, theme.reset ++ ") ⠙ "));
     try std.testing.expect(std.mem.find(u8, active.styled, "loading") == null);
-    const narrow = try prompt(a, "long model name", null, 7, false, 0, 0);
+    const narrow = try prompt(a, "long model name", null, 7, .{});
     defer narrow.deinit(a);
     try std.testing.expectEqualStrings("> ", narrow.plain);
-    const hostile = try prompt(a, "你\x1b[2J\nname", null, 30, true, 0, 0);
+    const hostile = try prompt(a, "你\x1b[2J\nname", null, 30, .{ .busy = true });
     defer hostile.deinit(a);
     try std.testing.expect(text.width(hostile.plain) < 30);
     try std.testing.expect(std.mem.find(u8, hostile.styled, "\x1b[2J") == null);
@@ -240,30 +267,79 @@ test "file captions expose safe paths and measured counts with unknown not guess
 
 test "context prompt is retained occupancy not cache billing and remains bounded at small widths" {
     const a = std.testing.allocator;
-    const value = try prompt(a, "fixture", .{ .tokens = 16384, .limit = 32768 }, 79, false, 0, 0);
+    const value = try prompt(a, "fixture", .{ .tokens = 16384, .limit = 32768 }, 79, .{});
     defer value.deinit(a);
-    try std.testing.expectEqualStrings("(fixture) [ctx ~16384/32768 50.0%] > ", value.plain);
+    try std.testing.expectEqualStrings("(fixture 50.0%) > ", value.plain);
     try std.testing.expectEqualStrings(value.plain, value.styled);
     for ([_]usize{ 1, 7, 24, 40, 79, 119 }) |width| {
-        const small = try prompt(a, "long-model-name", .{ .tokens = std.math.maxInt(u64), .limit = 1 }, width, true, 80, 1);
+        const small = try prompt(a, "long-model-name", .{ .tokens = std.math.maxInt(u64), .limit = 1 }, width, .{ .busy = true, .now_ms = 80, .phase = 1 });
         defer small.deinit(a);
         try std.testing.expect(text.width(small.plain) <= @max(width, 2));
         try std.testing.expect(std.mem.find(u8, small.styled, "loading") == null);
     }
-    const zero = try prompt(a, "fixture", .{ .tokens = 9000, .limit = 0 }, 79, false, 0, 0);
+    const zero = try prompt(a, "fixture", .{ .tokens = 9000, .limit = 0 }, 79, .{});
     defer zero.deinit(a);
-    try std.testing.expect(std.mem.find(u8, zero.plain, "[ctx ?]") != null);
+    try std.testing.expect(std.mem.find(u8, zero.plain, "?%") != null);
+}
+
+test "TPS wave continues into percentage while configured effort alone colors the marker" {
+    const a = std.testing.allocator;
+    for ([_]shared.activity.RateBand{ .slow, .standard, .fast, .unknown }) |band| {
+        const value = try prompt(a, "model", .{ .tokens = 22807, .limit = 1000000 }, 79, .{ .busy = true, .now_ms = 80, .phase = 2, .rate_band = band, .reasoning_effort = .xhigh });
+        defer value.deinit(a);
+        try std.testing.expectEqualStrings("(model 2.3%) ⠙ ", value.plain);
+        const palette = theme.modelPalette(band);
+        try std.testing.expect(std.mem.find(u8, value.styled, palette[2]) != null);
+        // Five name clusters + one default space: percentage continues phase.
+        const styled_percent = try std.fmt.allocPrint(a, "{s}2{s}.{s}3{s}%{s}) ", .{ palette[8], palette[9], palette[10], palette[11], theme.reset });
+        defer a.free(styled_percent);
+        try std.testing.expect(std.mem.find(u8, value.styled, styled_percent) != null);
+        try std.testing.expect(std.mem.endsWith(u8, value.styled, (comptime theme.effortColor(.xhigh)) ++ "⠙" ++ theme.reset ++ " "));
+        try std.testing.expect(std.mem.find(u8, value.plain, "ctx") == null and std.mem.find(u8, value.plain, "/") == null);
+    }
+    for ([_]shared.ReasoningEffort{ .none, .minimal, .low, .medium, .high, .xhigh }) |effort| {
+        const idle = try prompt(a, "model", .{ .tokens = 1, .limit = 1000 }, 79, .{ .reasoning_effort = effort });
+        defer idle.deinit(a);
+        const tail = try std.fmt.allocPrint(a, "{s}>{s} ", .{ theme.effortColor(effort), theme.reset });
+        defer a.free(tail);
+        try std.testing.expect(std.mem.endsWith(u8, idle.styled, tail));
+        try std.testing.expectEqualStrings("(model 0.1%) > ", idle.plain);
+    }
+}
+
+test "only pending command prefix pulses and completed spans remain static and clipped safely" {
+    const a = std.testing.allocator;
+    const body = "> sleep 1";
+    const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }};
+    const first = try commandLine(a, body, spans, 79, shared.activity.commandStep(0));
+    defer a.free(first);
+    const second = try commandLine(a, body, spans, 79, shared.activity.commandStep(120));
+    defer a.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.find(u8, first, theme.command_pulse[0] ++ ">" ++ theme.muted ++ " sleep 1") != null);
+    for ([_]Outcome{ .success, .failed, .canceled }) |outcome| {
+        const complete = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }};
+        const one = try commandLine(a, body, complete, 79, 0);
+        defer a.free(one);
+        const two = try commandLine(a, body, complete, 79, 1);
+        defer a.free(two);
+        try std.testing.expectEqualStrings(one, two);
+    }
+    const narrow = try commandLine(a, "≡ read_file long-path", &.{CommandSpan{ .start = 0, .end = "≡ read_file long-path".len, .outcome = .pending }}, 4, 1);
+    defer a.free(narrow);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(narrow));
+    try std.testing.expect(std.mem.endsWith(u8, narrow, "..." ++ theme.reset));
 }
 
 test "same row command results retain icons and independent success failure colors" {
     const a = std.testing.allocator;
-    const body = ">_ date [error]  ·  >_ pwd";
-    const line = try commandLine(a, body, &.{ .{ .start = 0, .end = 15, .outcome = .failed }, .{ .start = 21, .end = body.len, .outcome = .success } }, 79);
+    const body = "> date [error]  ·  > pwd";
+    const line = try commandLine(a, body, &.{ .{ .start = 0, .end = 14, .outcome = .failed }, .{ .start = 20, .end = body.len, .outcome = .success } }, 79, null);
     defer a.free(line);
-    try std.testing.expect(std.mem.find(u8, line, theme.failure ++ ">_ date [error]") != null);
+    try std.testing.expect(std.mem.find(u8, line, theme.failure ++ "> date [error]") != null);
     try std.testing.expect(std.mem.find(u8, line, theme.success) != null);
     try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);
-    const clipped = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 10);
+    const clipped = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 10, null);
     defer a.free(clipped);
     try std.testing.expect(std.mem.endsWith(u8, clipped, "..." ++ theme.reset));
 }

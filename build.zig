@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
     run_http.addFileArg(b.path("tests/product/http_mock.mjs"));
     run_http.addArtifactArg(http_tests);
     run_http.setCwd(b.path("."));
-    b.step("test-http", "Run local product HTTP/SSE integration tests (requires Node)").dependOn(&run_http.step);
+    b.step("test-http", "Run local product HTTP/SSE integration tests (requires Node and OpenSSL)").dependOn(&run_http.step);
 
     // 终端 ABI 模块（libc termios 结构体布局）单独成模块，供 probes 测试导入。
     const terminal_abi = b.createModule(.{ .root_source_file = b.path("src/platform/terminal_abi.zig"), .target = target, .optimize = optimize, .link_libc = true });

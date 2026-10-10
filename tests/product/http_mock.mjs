@@ -6,9 +6,10 @@
 // 依赖 Node 内置模块：http 提供本地服务，assert 做断言，child_process 启动被测程序。
 
 import http from 'node:http';
+import https from 'node:https';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawn, execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -24,6 +25,7 @@ const servers = [];
 // 键为 "场景:端点"，值为请求次数；最终与期望值做精确比较。
 const counts = new Map();
 const histories = new Map();
+const idleSockets = new Map();
 const errors = [];
 // interrupted 表示收到信号或看门狗超时；targetHits 统计重定向目标被访问的次数。
 let child, watchdog, interrupted = false, targetHits = 0;
@@ -149,8 +151,8 @@ try {
     res.writeHead(500); res.end();
   }));
 
-  // 主夹具服务器：解析 URL 路径，校验请求，并按场景返回对应的 SSE 或错误响应。
-  const port = await listen(http.createServer((req, res) => {
+  // Shared HTTP/TLS handler; TLS uses only an owned generated loopback cert.
+  const handler = (req, res) => {
     const chunks = [];
     let size = 0;
 
@@ -176,6 +178,21 @@ try {
         // 解析请求体并校验线格式。
         const body = JSON.parse(Buffer.concat(chunks));
         checkWire(req, body, chat);
+
+        if (scenario.startsWith('idle-')) {
+          assert(n <= 2, 'idle checks must not replay POSTs');
+          if (n === 1) idleSockets.set(scenario, req.socket);
+          else if (scenario.startsWith('idle-reuse-')) assert.equal(req.socket, idleSockets.get(scenario), 'healthy short idle socket not reused');
+          else assert.notEqual(req.socket, idleSockets.get(scenario), 'stale idle socket reused');
+          if (n === 1 && scenario.startsWith('idle-close-')) {
+            const socket = req.socket;
+            res.once('finish', () => {
+              const timer = setTimeout(() => socket.end(), 50);
+              socket.once('close', () => clearTimeout(timer));
+            });
+          }
+          return send(res, textStream(chat));
+        }
 
         // auto 场景：第一次 Responses 请求返回 404 不支持，之后应回退到 Chat Completions。
         if (scenario === 'auto' && !chat) {
@@ -264,12 +281,21 @@ try {
         res.end('Fixture assertion failed');
       }
     });
-  }));
+  };
+  const port = await listen(http.createServer(handler));
+  const certPath = join(home, 'fixture-cert.pem');
+  const keyPath = join(home, 'fixture-key.pem');
+  execFileSync('openssl', ['req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=127.0.0.1','-addext','subjectAltName=IP:127.0.0.1','-keyout',keyPath,'-out',certPath], {stdio:'ignore',timeout:10000});
+  // Exercise TLS1.3 by default, including its ordinary session tickets. The
+  // same exact-count/socket-identity cases can be rerun with a TLS1.2 control.
+  const tlsVersion = process.env.THIN_HTTP_TLS_VERSION ?? 'TLSv1.3';
+  assert(['TLSv1.2','TLSv1.3'].includes(tlsVersion), 'unsupported fixture TLS version');
+  const tlsPort = await listen(https.createServer({key:readFileSync(keyPath),cert:readFileSync(certPath),minVersion:tlsVersion,maxVersion:tlsVersion}, handler));
 
   // 以独立进程组启动被测程序，stdout/stderr 继承到父进程；只注入假密钥与本地 URL 等最小环境变量。
   child = spawn(resolve(process.argv[2]), [], { detached: true, stdio: ['ignore', 'inherit', 'inherit'], env: {
     PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', HOME: home,
-    THIN_HTTP_FIXTURE_URL: `http://127.0.0.1:${port}`, THIN_FAKE_KEY: 'fake-local-key',
+    THIN_HTTP_FIXTURE_URL: `http://127.0.0.1:${port}`, THIN_HTTP_TLS_FIXTURE_URL: `https://127.0.0.1:${tlsPort}`, THIN_FAKE_KEY: 'fake-local-key',
   } });
 
   // 60 秒看门狗：超时后标记中断并结束子进程组。
@@ -291,6 +317,12 @@ try {
       for (const scenario of ['missing', 'truncated', 'invalid', 'incomplete', 'redirect']) expected.set(`${scenario}-${protocol}:${endpoint}`, 1);
     }
 
+    for (const transport of ['tcp', 'tls']) for (const protocol of ['chat', 'responses']) {
+      const endpoint = protocol === 'chat' ? 'chat/completions' : 'responses';
+      for (const scenario of ['idle-reuse', 'idle-close', 'idle-expire', 'idle-buffer', 'idle-poll-error']) expected.set(`${scenario}-${transport}-${protocol}:${endpoint}`, 2);
+    }
+    for (const scenario of ['lock-cancel', 'lock-timeout']) expected.set(`${scenario}:chat/completions`, 1);
+
     // auto 场景：Responses 只请求 1 次（404），Chat 请求 2 次。
     expected.set('auto:responses', 1); expected.set('auto:chat/completions', 2);
     for (const status of [404, 400, 401, 429, 503]) expected.set(`error${status}:responses`, 1);
@@ -303,7 +335,7 @@ try {
 
   // 输出夹具内部记录的错误后再报告统计信息。
   for (const error of errors) console.error(error);
-  console.log(`LOCAL_HTTP requests=${[...counts.values()].reduce((a, b) => a + b, 0)} routes=${counts.size} redirect_target_hits=${targetHits} fixture_errors=${errors.length}`);
+  console.log(`LOCAL_HTTP requests=${[...counts.values()].reduce((a, b) => a + b, 0)} routes=${counts.size} redirect_target_hits=${targetHits} fixture_errors=${errors.length} tls_version=${tlsVersion}`);
 
   // 中断返回 124；夹具错误返回 1；否则返回子进程退出码。
   process.exitCode = interrupted ? 124 : errors.length ? 1 : code ?? 1;

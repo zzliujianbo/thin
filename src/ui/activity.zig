@@ -8,7 +8,7 @@ pub const Tool = shared.tools.Kind;
 pub fn icon(kind: Tool) []const u8 {
     return switch (kind) {
         .memory => "▣",
-        .bash => ">_",
+        .bash => ">",
         .read => "≡",
         .write => "✎",
         .other => "⚙",

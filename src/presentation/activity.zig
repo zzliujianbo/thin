@@ -5,6 +5,39 @@
 //! and summary time are excluded. All clocks are supplied for deterministic tests.
 const std = @import("std");
 
+/// UI bands, not provider performance grades. Unknown is not a slow/zero rate.
+pub const RateBand = enum { unknown, slow, standard, fast };
+pub fn rateBand(tenths: ?u64) RateBand {
+    const value = tenths orelse return .unknown;
+    return if (value < 200) .slow else if (value >= 800) .fast else .standard;
+}
+
+/// Configured request option, not measured cognitive depth or proof that a
+/// provider honored the option. Unknown/custom values never guess a level.
+pub const ReasoningEffort = enum {
+    unspecified,
+    none,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+    unknown,
+
+    pub fn fromName(name: ?[]const u8) ReasoningEffort {
+        const value = name orelse return .unspecified;
+        inline for (.{ "none", "minimal", "low", "medium", "high", "xhigh" }) |known| {
+            if (std.mem.eql(u8, value, known)) return @field(ReasoningEffort, known);
+        }
+        return .unknown;
+    }
+};
+
+/// Renderer-independent execution pulse; only active tool presentation uses it.
+pub fn commandStep(now_ms: u64) usize {
+    return @intCast((now_ms / 120) % 8);
+}
+
 /// Continuous UI-owned phase, not absolute now/rate: speed changes must not
 /// jump the highlight backwards. Unknown TPS uses a quiet baseline, never a
 /// fabricated rate. A bounded catch-up prevents suspend/clock jumps flashing.
@@ -150,6 +183,25 @@ fn rate(tokens: ?u64, ms: u64) ?u64 {
     const n = tokens orelse return null;
     if (ms == 0) return null;
     return @intCast(@min(@as(u128, n) * 10000 / ms, std.math.maxInt(u64)));
+}
+
+test "rate bands and configured effort have explicit unknown and stable mapping" {
+    try std.testing.expectEqual(RateBand.unknown, rateBand(null));
+    try std.testing.expectEqual(RateBand.slow, rateBand(0));
+    try std.testing.expectEqual(RateBand.slow, rateBand(199));
+    try std.testing.expectEqual(RateBand.standard, rateBand(200));
+    try std.testing.expectEqual(RateBand.standard, rateBand(799));
+    try std.testing.expectEqual(RateBand.fast, rateBand(800));
+    try std.testing.expectEqual(RateBand.fast, rateBand(std.math.maxInt(u64)));
+    try std.testing.expectEqual(ReasoningEffort.unspecified, ReasoningEffort.fromName(null));
+    try std.testing.expectEqual(ReasoningEffort.unknown, ReasoningEffort.fromName("provider-custom"));
+    try std.testing.expectEqual(ReasoningEffort.unknown, ReasoningEffort.fromName("HIGH"));
+    inline for (.{ "none", "minimal", "low", "medium", "high", "xhigh" }) |name| {
+        try std.testing.expectEqual(@field(ReasoningEffort, name), ReasoningEffort.fromName(name));
+    }
+    try std.testing.expect(commandStep(0) != commandStep(120));
+    try std.testing.expectEqual(commandStep(0), commandStep(960));
+    try std.testing.expect(commandStep(std.math.maxInt(u64)) < 8);
 }
 
 test "model flow speeds up with TPS without backwards rate-change jumps" {

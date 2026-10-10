@@ -105,9 +105,51 @@ const Driver = struct {
         return error.VisibleTextTimeout;
     }
 
-    /// Completion has no status label: the unstyled idle marker follows join.
+    /// Completion has no label. Match the percentage+idle marker only in new
+    /// output, including all configured-effort colors and reset.
     fn waitIdle(self: *Driver, start: usize) !void {
-        try self.waitText(start, "] > ");
+        const until = now() + 10000;
+        while (now() < until) {
+            try self.drain(20);
+            const bytes = self.output[start..self.used];
+            for ([_][]const u8{
+                "%) > ",
+                "%) \x1b[38;5;245m>\x1b[0m ",
+                "%) \x1b[38;5;117m>\x1b[0m ",
+                "%) \x1b[38;5;114m>\x1b[0m ",
+                "%) \x1b[38;5;214m>\x1b[0m ",
+                "%) \x1b[38;5;75m>\x1b[0m ",
+                "%) \x1b[38;5;171m>\x1b[0m ",
+            }) |idle| if (std.mem.indexOf(u8, bytes, idle) != null) return;
+            if (!self.owned) return error.EarlyExit;
+        }
+        return error.VisibleTextTimeout;
+    }
+
+    /// Busy evidence requires a percentage prefix, a renderer-owned braille
+    /// marker and the subsequent completed-frame cursor acknowledgement.
+    fn waitBusy(self: *Driver, start: usize) !void {
+        const until = now() + 10000;
+        while (now() < until) {
+            try self.drain(20);
+            const bytes = self.output[start..self.used];
+            var from: usize = 0;
+            const busy_prefix = "%\x1b[0m) "; // Animated percentage resets before closing parenthesis.
+            while (std.mem.indexOfPos(u8, bytes, from, busy_prefix)) |prefix| {
+                from = prefix + busy_prefix.len;
+                var marker = from;
+                if (std.mem.startsWith(u8, bytes[marker..], "\x1b[")) {
+                    const end = std.mem.indexOfScalar(u8, bytes[marker..], 'm') orelse continue;
+                    if (end > 24) continue;
+                    marker += end + 1;
+                }
+                for ([_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }) |icon| {
+                    if (std.mem.startsWith(u8, bytes[marker..], icon) and std.mem.indexOf(u8, bytes[marker + icon.len ..], "\x1b[?25h") != null) return;
+                }
+            }
+            if (!self.owned) return error.EarlyExit;
+        }
+        return error.VisibleTextTimeout;
     }
 
     /// Fixed-size replay only: resize cases check sequences, not terminal reflow.
@@ -401,7 +443,7 @@ pub fn main(init: std.process.Init) !void {
         stage = try d.screen();
         try check(stage.visible("thinking-new-five") and stage.visible("thinking-new-six") and stage.visible("reasoning-stage-two"));
         try check(!stage.visible("reasoning-stage-one") and !stage.visible("thinking-old-two"));
-        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model) [ctx ~") != null and std.mem.indexOf(u8, &stage.grid[23], "] ~") != null and stage.row == 23);
+        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &stage.grid[23], "%) ~") != null and stage.row == 23);
         for (stage.grid[22]) |byte| try check(byte == ' ');
         try check(!stage.visible("TPS:") and !stage.visible("tokens in:"));
         try d.waitText(start, "stream-stage-one");
@@ -422,12 +464,15 @@ pub fn main(init: std.process.Init) !void {
         try check(stage.count("reasoning-stage-one") == 0 and stage.count("reasoning-stage-two") == 0);
         try check(stage.count("thinking-new-five") == 0 and stage.count("stream-final-answer") == 1);
         try check(!stage.visible("TPS:") and !stage.visible("tokens in:") and !stage.visible("Completed"));
-        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model) [ctx ~") != null);
-        try check(stage.count("=> Final answer") == 1);
+        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &stage.grid[23], "%) >") != null);
+        try check(stage.count("Final answer") == 0 and !stage.visible("ctx ~"));
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;75m>\x1b[0m ") != null); // Configured high, not stream duration.
         for (stage.grid[22]) |byte| try check(byte == ' ');
         try check(stage.row == 23);
     } else if (std.mem.eql(u8, mode, "tool-icons")) {
         const start = d.used;
+        // Startup already shows configured high despite no reasoning delta.
+        try check(std.mem.indexOf(u8, d.output[0..start], "\x1b[38;5;75m>\x1b[0m ") != null);
         try d.send("tool-icon-task\r");
         try d.waitText(start, "sleep 1; cat r.json");
         const animation_start = d.used;
@@ -435,7 +480,7 @@ pub fn main(init: std.process.Init) !void {
         const first = try d.screen();
         try d.quiet(240);
         const second = try d.screen();
-        try check(first.visible(">_ sleep 1; cat r.json") and second.visible(">_ sleep 1; cat r.json"));
+        try check(first.visible("> sleep 1; cat r.json") and second.visible("> sleep 1; cat r.json"));
         // The ASCII VT fixture maps non-ASCII glyphs to '~'; inspect only these
         // renderer-owned braille symbols, not a general Unicode-width claim.
         var frames: usize = 0;
@@ -443,8 +488,16 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.indexOf(u8, d.output[animation_start..d.used], icon) != null) frames += 1;
         }
         try check(frames >= 2);
+        var pulses: usize = 0;
+        for ([_][]const u8{ "\x1b[38;5;173m", "\x1b[38;5;208m", "\x1b[38;5;214m", "\x1b[38;5;220m", "\x1b[38;5;223m" }) |color| {
+            var pattern: [96]u8 = undefined;
+            const effect = try std.fmt.bufPrint(&pattern, "{s}>\x1b[38;5;245m sleep 1; cat r.json", .{color});
+            if (std.mem.indexOf(u8, d.output[animation_start..d.used], effect) != null) pulses += 1;
+        }
+        try check(pulses >= 2); // Distinct prefix shades, not repeated glyph/text.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], ">_") == null);
         try check(first.row == 23 and second.row == 23);
-        try check(std.mem.indexOf(u8, &first.grid[23], "(fixture-model) [ctx ~") != null and std.mem.indexOf(u8, &first.grid[23], "] ~") != null);
+        try check(std.mem.indexOf(u8, &first.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &first.grid[23], "%) ~") != null);
         for (first.grid[22]) |byte| try check(byte == ' ');
         try d.waitText(start, "tool-icon-final-answer");
         try d.waitIdle(start);
@@ -452,12 +505,12 @@ pub fn main(init: std.process.Init) !void {
         const final = try d.screen();
         try check(final.count("tool-icon-final-answer") == 1);
         var same_line = false;
-        for (final.grid) |line| if (std.mem.indexOf(u8, &line, ">_ sleep 1;") != null and std.mem.indexOf(u8, &line, ">_ printf ok") != null and std.mem.indexOf(u8, &line, ">_ false [error]") != null) {
+        for (final.grid) |line| if (std.mem.indexOf(u8, &line, "> sleep 1;") != null and std.mem.indexOf(u8, &line, "> printf ok") != null and std.mem.indexOf(u8, &line, "> false [error]") != null) {
             same_line = true;
         };
         try check(same_line);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;114m>_ printf ok") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;203m>_ false [error]") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;114m> printf ok") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;203m> false [error]") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "bash #") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "tool-json-hidden-marker") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Running bash") == null);
@@ -468,15 +521,26 @@ pub fn main(init: std.process.Init) !void {
         try d.waitText(start, "file-stats-final-answer");
         try d.waitIdle(start);
         const final = try d.screen();
-        for ([_][]const u8{ "write_file stats.txt  ~0 +5 -0 lines", "write_file stats.txt  ~1 +1 -1 lines", "read_file stats.txt  5 lines", "read_file stats.txt  2 lines [partial]", "write_file stats.txt  ~0 +0 -5 lines", "write_file stats.txt [error]" }) |caption| try check(final.count(caption) == 1);
-        try check(final.count("=> Final answer") == 1 and final.count("file-stats-final-answer") == 1);
-        var header: ?usize = null;
-        for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, "=> Final answer") != null) {
-            header = row;
+        var previous: ?usize = null;
+        for ([_][]const u8{ "write_file stats.txt  ~0 +5 -0 lines", "write_file stats.txt  ~1 +1 -1 lines", "read_file stats.txt  5 lines", "read_file stats.txt  2 lines [partial]", "write_file stats.txt  ~0 +0 -5 lines", "write_file stats.txt [error]" }) |caption| {
+            try check(final.count(caption) == 1);
+            var found: ?usize = null;
+            for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, caption) != null) {
+                found = row;
+            };
+            try check(found != null);
+            if (previous) |row| try check(found.? == row + 1);
+            previous = found;
+        }
+        try check(final.count("Final answer") == 0 and final.count("file-stats-final-answer") == 1);
+        var answer: ?usize = null;
+        for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, "file-stats-final-answer") != null) {
+            answer = row;
         };
-        try check(header != null and header.? > 0);
-        for (final.grid[header.? - 1]) |byte| try check(byte == ' ');
-        try check(std.mem.indexOf(u8, &final.grid[23], "(fixture-model) [ctx ~") != null);
+        try check(answer != null and answer.? == previous.? + 2);
+        for (final.grid[answer.? - 1]) |byte| try check(byte == ' ');
+        try check(std.mem.indexOf(u8, &final.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &final.grid[23], "%) >") != null);
+        try check(!final.visible("ctx ~"));
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\"written_bytes\"") == null);
     } else if (std.mem.eql(u8, mode, "log-failure")) {
         const start = d.used;
@@ -504,7 +568,7 @@ pub fn main(init: std.process.Init) !void {
         // cancel / term：等待输入行模型流动色后的reset，证明任务已经启动。
         const start = d.used;
         try d.send("stall\r");
-        try d.waitText(start, "\x1b[0m) ");
+        try d.waitBusy(start);
         try d.quiet(250);
 
         if (std.mem.eql(u8, mode, "term")) {

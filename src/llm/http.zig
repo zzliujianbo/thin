@@ -8,10 +8,12 @@ const j = @import("../util/json.zig");
 const chat = @import("chat.zig");
 const responses = @import("responses.zig");
 const common = @import("common.zig");
+const pool = @import("http_pool.zig");
 const Io = std.Io;
 
 /// 模型客户端：持有 API 密钥的 Authorization 头副本与底层 std.http.Client。
-/// 同一个 Client 的 deinit 必须在所有请求结束后调用。
+/// 同一个 Client 的请求在 worker 中串行化（锁等待也可取消/计入预算）；
+/// sink 不得重入同一 Client。deinit 仍须等所有调用及 worker 结束。
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -21,6 +23,9 @@ pub const Client = struct {
     authorization: []u8,
     /// 底层 HTTP 客户端，内部连接池随 Client 生命周期存在。
     http: std.http.Client,
+    /// Guards request ownership and the timestamp, not merely pool traversal.
+    request_mutex: Io.Mutex = .init,
+    last_request_finish: ?Io.Timestamp = null,
 
     /// 创建客户端并校验密钥。密钥需非空、长度不超过 16KB，且不含控制字符（防止 HTTP 头注入）。
     pub fn init(allocator: std.mem.Allocator, io: Io, config: *const cfg.Config, key: []const u8) !Client {
@@ -64,11 +69,11 @@ pub const Client = struct {
         // job 与 worker 共享，必须保证 worker 结束后才能让 job 失效。
         var job = Job{ .client = self, .allocator = allocator, .request = request, .sink = sink };
         // 网络 I/O 放入并发任务执行，避免阻塞取消与超时检查。
+        const start = Io.Clock.awake.now(self.io);
         var future = try Io.concurrent(self.io, perform, .{&job});
         // 无论从哪个分支返回，都要取消并 join worker，保证 job 与 arena 不会被提前释放。
         defer _ = future.cancel(self.io) catch {};
 
-        const start = Io.Clock.awake.now(self.io);
         // 每 5ms 轮询一次 worker 完成标志，同时检查取消与请求超时。
         while (!job.done.load(.acquire)) {
             if (request.cancellation) |cancel| {
@@ -140,6 +145,8 @@ pub const Client = struct {
         // 无论成功失败都要标记完成，否则主协程会一直轮询。
         defer job.done.store(true, .release);
         const self = job.client;
+        try self.request_mutex.lock(self.io);
+        defer self.request_mutex.unlock(self.io);
         // 请求体、URL 等临时数据放在 scratch arena 中，函数返回时一并释放。
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
@@ -159,6 +166,10 @@ pub const Client = struct {
             base, if (protocol == .chat) "/chat/completions" else "/responses",
         });
 
+        // Before acquiring a socket, drop expired/closed/unread idle connections.
+        // This sends nothing and never retries a POST. boot includes suspend time.
+        try pool.prune(&self.http, self.last_request_finish, Io.Clock.boot.now(self.io));
+
         // 禁止自动跟随重定向（否则 Authorization 头可能被发送到其他主机）；要求不压缩，便于逐块解析 SSE。
         var request = try self.http.request(.POST, try std.Uri.parse(address), .{
             .redirect_behavior = .unhandled,
@@ -169,7 +180,10 @@ pub const Client = struct {
             },
             .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
         });
-        defer request.deinit();
+        defer {
+            request.deinit(); // Release/destroy socket before recording idle time.
+            self.last_request_finish = Io.Clock.boot.now(self.io);
+        }
 
         // 请求体已完整编码，使用固定 Content-Length 而不是分块传输。
         request.transfer_encoding = .{ .content_length = payload.len };

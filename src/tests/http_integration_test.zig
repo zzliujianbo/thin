@@ -5,6 +5,7 @@ const p = @import("../core/protocol.zig");
 const cfg = @import("../core/config.zig");
 const Client = @import("../llm/http.zig").Client;
 const Selector = @import("../llm/llm.zig").Selector;
+const idle_pool = @import("../llm/http_pool.zig");
 const t = std.testing;
 const Io = std.Io;
 
@@ -16,7 +17,11 @@ const initial = [_]p.Message{.{ .role = .user, .blocks = &.{.{ .text = "hello fi
 
 /// 根据 fixture 基础地址与场景名构造配置；场景名拼接在 URL 路径中，由夹具服务器分派。
 fn config(a: std.mem.Allocator, scenario: []const u8, protocol: p.Protocol) !cfg.Config {
-    const base = std.testing.environ.getPosix("THIN_HTTP_FIXTURE_URL") orelse return error.MissingFixtureEnvironment;
+    return configBase(a, scenario, protocol, "THIN_HTTP_FIXTURE_URL", "http");
+}
+
+fn configBase(a: std.mem.Allocator, scenario: []const u8, protocol: p.Protocol, env_name: []const u8, scheme: []const u8) !cfg.Config {
+    const base = std.testing.environ.getPosix(env_name) orelse return error.MissingFixtureEnvironment;
 
     // Accept only a literal IPv4 loopback authority, never DNS/userinfo/redirects.
     const uri = try std.Uri.parse(base);
@@ -26,7 +31,7 @@ fn config(a: std.mem.Allocator, scenario: []const u8, protocol: p.Protocol) !cfg
     };
 
     // 拒绝：非 http scheme、非 127.0.0.1 主机、缺端口，以及带 userinfo/query/fragment/路径的 URL。
-    if (!std.mem.eql(u8, uri.scheme, "http") or !std.mem.eql(u8, host_text, "127.0.0.1") or
+    if (!std.mem.eql(u8, uri.scheme, scheme) or !std.mem.eql(u8, host_text, "127.0.0.1") or
         uri.port == null or uri.port == 0 or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null or !uri.path.isEmpty()) return error.UnsafeFixtureUrl;
 
     return .{ .provider = .{ .base_url = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, scenario }), .api_key_env = "THIN_FAKE_KEY" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = protocol }, .limits = .{ .request_timeout_ms = 10000 } };
@@ -223,6 +228,97 @@ test "integration: missing terminal truncated HTTP invalid args and redirects fa
             try t.expect(out == .failure);
             if (std.mem.eql(u8, scenario, "truncated")) try t.expectEqual(p.FailureKind.transport, out.failure.kind);
         }
+    }
+}
+
+fn failedPoll(_: []std.c.pollfd) c_int {
+    return -1; // Deterministic EINTR/inspection failure: drop idle, not retry.
+}
+
+// Two genuine requests on one Client. The server also checks same/different
+// sockets and exact counts, so successful replay cannot conceal a duplicate POST.
+test "integration: idle HTTP and TLS connections refresh before send and healthy sockets reuse" {
+    var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });
+    defer backend.deinit();
+    const io = backend.io();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |tls| {
+        for ([_]p.Protocol{ .chat, .responses }) |protocol| {
+            for ([_][]const u8{ "idle-reuse", "idle-close", "idle-expire", "idle-buffer", "idle-poll-error" }) |scenario| {
+                const name = try std.fmt.allocPrint(a, "{s}-{s}-{s}", .{ scenario, if (tls) "tls" else "tcp", @tagName(protocol) });
+                var c = try configBase(a, name, protocol, if (tls) "THIN_HTTP_TLS_FIXTURE_URL" else "THIN_HTTP_FIXTURE_URL", if (tls) "https" else "http");
+                var client = try Client.init(t.allocator, io, &c, "fake-local-key");
+                defer client.deinit();
+                if (tls) {
+                    // Only the owned mock's self-signed certificate; no system
+                    // trust changes or real configuration/credential reads.
+                    const home = std.testing.environ.getPosix("HOME") orelse return error.MissingFixtureEnvironment;
+                    const cert = try std.fmt.allocPrint(a, "{s}/fixture-cert.pem", .{home});
+                    const now = Io.Clock.real.now(io);
+                    try client.http.ca_bundle.addCertsFromFilePathAbsolute(t.allocator, io, now, cert);
+                    client.http.now = now;
+                }
+                _ = try success(try client.model().call(a, request(c, protocol), .{}));
+                try t.expectEqual(@as(usize, 1), client.http.connection_pool.free_len);
+                try t.expect(client.last_request_finish != null);
+                if (std.mem.eql(u8, scenario, "idle-close")) {
+                    try Io.sleep(io, .fromMilliseconds(200), .awake); // Mock closes at50ms.
+                } else if (std.mem.eql(u8, scenario, "idle-expire")) {
+                    client.last_request_finish = Io.Clock.boot.now(io).subDuration(.fromMilliseconds(idle_pool.idle_limit_ms));
+                } else if (std.mem.eql(u8, scenario, "idle-buffer")) {
+                    const connection: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", client.http.connection_pool.free.first.?));
+                    const reader = connection.reader();
+                    try t.expectEqual(@as(usize, 0), reader.bufferedLen());
+                    reader.seek = 0;
+                    reader.end = 1;
+                    reader.buffer[0] = 0x7f; // Unsolicited already-buffered byte, no socket read.
+                } else if (std.mem.eql(u8, scenario, "idle-poll-error")) {
+                    try idle_pool.pruneWith(&client.http, client.last_request_finish, Io.Clock.boot.now(io), failedPoll);
+                    try t.expectEqual(@as(usize, 0), client.http.connection_pool.free_len);
+                }
+                _ = try success(try client.model().call(a, request(c, protocol), .{}));
+                try t.expectEqual(@as(usize, 1), client.http.connection_pool.free_len);
+            }
+        }
+    }
+}
+
+// Parent's timeout/cancel must join a worker waiting for the request mutex,
+// without unlocking someone else's ownership or sending a queued POST.
+test "integration: timeout and cancellation while queued leave client ownership and recovery intact" {
+    var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });
+    defer backend.deinit();
+    const io = backend.io();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |cancel_test| {
+        var c = try config(a, if (cancel_test) "lock-cancel" else "lock-timeout", .chat);
+        c.limits.request_timeout_ms = if (cancel_test) 5000 else 150;
+        var client = try Client.init(t.allocator, io, &c, "fake-local-key");
+        defer client.deinit();
+        try client.request_mutex.lock(io);
+        var held = true;
+        defer if (held) client.request_mutex.unlock(io);
+        var cancel: p.Cancellation = .{};
+        var future = try Io.concurrent(io, cancelLater, .{ io, &cancel });
+        defer future.cancel(io) catch {};
+        var req = request(c, .chat);
+        req.cancellation = if (cancel_test) &cancel else null;
+        const start = Io.Clock.awake.now(io);
+        const out = try client.model().call(a, req, .{});
+        try t.expect(out == .failure);
+        try t.expectEqual(if (cancel_test) p.FailureKind.canceled else p.FailureKind.timeout, out.failure.kind);
+        try t.expect(start.untilNow(io, .awake).toMilliseconds() < 2000);
+        try t.expect(client.last_request_finish == null and client.http.connection_pool.used.first == null);
+        try t.expect(!client.request_mutex.tryLock());
+        client.request_mutex.unlock(io);
+        held = false;
+        req.cancellation = null;
+        c.limits.request_timeout_ms = 5000;
+        _ = try success(try client.model().call(a, req, .{}));
     }
 }
 

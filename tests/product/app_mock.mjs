@@ -160,7 +160,7 @@ async function scenario(name, protocol, kind, isPty = false) {
   if (kind === 'tool-icons') await writeFile(join(project,'r.json'), '{"tool-json-hidden-marker":1}');
 
   // 场景计数器：请求数、对话轮次、摘要次数，以及压缩后标记。
-  let requests = 0, rounds = 0, summaries = 0, afterSummary = false, stable, fixtureError;
+  let requests = 0, rounds = 0, summaries = 0, afterSummary = false, stable, fixtureError, idleSocket;
 
   // stalled 表示已到达挂起点；signalChild 与 ownsChild 来自 execute 回调，非 PTY 取消时用于发送 SIGINT。
   let stalled, signalChild, ownsChild;
@@ -180,6 +180,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       // 请求体上限 1 MiB，然后解析 JSON。
       for await (const chunk of req) { bytes += chunk.length; assert(bytes < 1024*1024); data += chunk; }
       const body = JSON.parse(data);
+      if (kind === 'stream-markdown' || kind === 'tool-icons') assert.equal(body.reasoning_effort, 'high');
       if (kind === 'auth-activate') {
         // DeepSeek 兼容选项必须真实影响线路参数，避免后端忽略输出上限。
         assert.equal(body.max_tokens, 100);
@@ -240,6 +241,23 @@ async function scenario(name, protocol, kind, isPty = false) {
         await new Promise(resolve=>setTimeout(resolve,200));
         res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\ndata: ${JSON.stringify({id:'stream_fixture',choices:[],usage:{prompt_tokens:12,completion_tokens:90,total_tokens:102,prompt_tokens_details:{cached_tokens:9},completion_tokens_details:{reasoning_tokens:30}}})}\n\ndata: [DONE]\n\n`);
         res.end();
+        return;
+      }
+
+      if (kind === 'idle-peer') {
+        assert(rounds <= 2, 'idle peer request bound; do not replay a POST');
+        if (rounds === 1) {
+          idleSocket = req.socket;
+          res.once('finish', () => {
+            const timer = setTimeout(() => idleSocket.end(), 50);
+            idleSocket.once('close', () => clearTimeout(timer));
+          });
+          send(res,protocol,'',[tool('idle_command','bash',{command:'sleep 0.3; printf idle-peer-command-once'})]);
+        } else {
+          assert.notEqual(req.socket, idleSocket, 'closed idle connection reused');
+          assert(outputs.get('idle_command')?.includes('idle-peer-command-once'), 'actual tool result lost');
+          send(res,protocol,'fixture-answer idle-peer-final-answer');
+        }
         return;
       }
 
@@ -344,7 +362,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       const filename = kind === 'legacy-config' ? 'auth.json' : 'config.json';
       // 空白文件走交互初始化；待激活配置始终使用回环服务，绝不向公共端点发送密钥或消息。
       const provider = kind === 'auth-activate' ? {base_url:url, api_key_env:'', api_key:null, chat_max_tokens:true} : {base_url:url, api_key_env:'THIN_FIXTURE_KEY'};
-      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({provider, model:{name:'fixture-model',protocol,context_tokens:kind==='compact'?6000:32768}, limits:{max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({provider, model:{name:'fixture-model',protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['stream-markdown','tool-icons'].includes(kind)?'high':undefined}, limits:{max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
       await writeFile(join(home,'.thin',filename), content);
     }
 
@@ -461,6 +479,11 @@ async function scenario(name, protocol, kind, isPty = false) {
     if (kind === 'regular-two') assert.equal(requests,2, 'regular two-turn request count');
     if (kind === 'tool-icons') assert.equal(requests,2, 'tool icon request count');
     if (kind === 'file-stats') assert.equal(requests,2, 'file stats request count');
+    if (kind === 'idle-peer') {
+      assert.equal(requests,2, 'idle peer must issue exactly the two intended calls');
+      assert(result.output.includes('idle-peer-final-answer'), 'idle peer final body missing');
+      assert(!result.output.includes('ModelRequestFailed'), 'idle peer transport still failed');
+    }
 
     // 场景通过，输出请求数与摘要数（不含内容）。
     console.log(`PASS ${name}: requests=${requests} summaries=${summaries}`);
@@ -479,7 +502,7 @@ try {
 
   // 对两种协议分别运行全部通用场景。
   for (const protocol of ['chat','responses']) {
-    for (const kind of ['plain','auto','trust','compact','malformed','truncated','stall']) await scenario(`${protocol}/${kind}`,protocol,kind);
+    for (const kind of ['plain','auto','trust','compact','malformed','truncated','stall','idle-peer']) await scenario(`${protocol}/${kind}`,protocol,kind);
   }
 
   // PTY 场景：通过 thin-app-pty 驱动交互式终端，仅使用 chat 协议。

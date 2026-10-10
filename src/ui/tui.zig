@@ -116,7 +116,7 @@ const Record = struct {
         const temp = arena.allocator();
 
         if (self.command_row) {
-            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns);
+            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns, null);
             self.lines = try temp.dupe([]const u8, &.{line});
             self.excerpt = false; // Commands indicate clipping with ... only.
             self.columns = columns;
@@ -150,6 +150,8 @@ pub const Connection = struct {
         /// Immutable app-prepared startup snapshot; no runtime dereference in draw.
         initial_context: ?r.ContextSnapshot = null,
         model: []const u8,
+        /// Immutable configured request option, not inferred from stream time.
+        reasoning_effort: shared.ReasoningEffort = .unspecified,
         base_url: []const u8,
         /// 应用层的启动策略快照，不读取工作线程可变的 Runtime.trusted。
         tools_trusted: bool = false,
@@ -385,7 +387,7 @@ const Ui = struct {
         defer spans.deinit(a);
         if (prior) |record| try spans.appendSlice(a, record.command_spans.items);
         try spans.append(a, .{ .start = if (prior) |record| record.body.items.len + "  ·  ".len else 0, .end = body.len, .outcome = .pending });
-        return presentation.commandLine(a, body, spans.items, columns);
+        return presentation.commandLine(a, body, spans.items, columns, shared.activity.commandStep(self.clock_ms));
     }
 
     /// Only actionable notices/errors use a temporary hint row. Completed,
@@ -937,14 +939,21 @@ const Ui = struct {
         const preview = self.scroll != 0;
         var active_shown = false;
         var transcript_rows: usize = 0;
+        var previous_kind: ?Kind = null;
         for (self.records.items, 0..) |*record, index| {
             if (record.kind == .reasoning) continue;
             const drafting = self.draft == index or self.command_group == index;
             try record.layout(self.allocator, @max(1, cols));
-            const heading = if (record.interrupted) "Interrupted response — preview" else if (record.final_answer and record.excerpt) "=> Final answer · display excerpt" else if (record.final_answer) "=> Final answer" else if (record.excerpt) "Display excerpt" else "";
+            const heading = if (record.interrupted) "Interrupted response — preview" else if (record.excerpt) "Display excerpt" else "";
             if (cols >= 8 and !record.output and !drafting) {
+                // Leading gaps work even when the prior command was committed
+                // in an earlier frame. Tool -> tool is always contiguous.
+                if (previous_kind) |prior| if (prior != .tool or record.kind != .tool) {
+                    try writer.writeAll("\r\n");
+                    transcript_rows += 1;
+                };
                 if (heading.len != 0) {
-                    try putToneLine(writer, a, 1, heading, cols, if (record.final_answer) theme.heading else theme.muted);
+                    try putToneLine(writer, a, 1, heading, cols, theme.muted);
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
                 }
@@ -953,13 +962,10 @@ const Ui = struct {
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
                 }
-                // Separate command records from prose; grouped bash still
-                // occupies one record/row, not one row per result.
-                try writer.writeAll("\r\n");
-                transcript_rows += 1;
                 record.pending_output = true;
             }
             if (preview or drafting) {
+                if (previous_kind) |prior| if (prior != .tool or record.kind != .tool) try lines.append(a, "");
                 if (heading.len != 0) {
                     const headings = try markdown.render(a, heading, .{ .columns = @max(1, cols), .max_lines = 32, .markdown = false, .tone = .muted });
                     try lines.appendSlice(a, headings.lines);
@@ -968,8 +974,8 @@ const Ui = struct {
                     try lines.append(a, try self.pendingCommand(a, record, @max(1, cols)));
                     active_shown = true;
                 } else try lines.appendSlice(a, record.lines);
-                if (record.kind == .tool) try lines.append(a, "");
             }
+            previous_kind = record.kind;
         }
         if (!preview and !active_shown and self.active_tool != null) try lines.append(a, try self.pendingCommand(a, null, @max(1, cols)));
         const thinking = if (self.show_reasoning and !preview and self.draft == null) self.reasoning else null;
@@ -988,6 +994,7 @@ const Ui = struct {
         // App-prepared immutable value, including local /auth activation.
         // Draw never dereferences Runtime, not even a fixture/idle pointer.
         self.display.seed(state.initial_context);
+        self.display.setEffort(state.reasoning_effort);
         const hint_line = try self.hint(a, state);
         // Always reserve one EMPTY row between conversation and composer.
         const footer_rows: usize = 2 + @as(usize, @intFromBool(hint_line.len != 0));
@@ -1081,7 +1088,7 @@ const Ui = struct {
                 const working = self.busy or self.mode != null or self.active_tool != null;
                 const view = self.display.view(self.clock_ms);
                 self.model_flow.advance(self.clock_ms, working, view.live_tps_tenths);
-                const decoration = try presentation.prompt(a, state.model, view.context, cols, working, self.clock_ms, self.model_flow.step());
+                const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .now_ms = self.clock_ms, .phase = self.model_flow.step(), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort });
                 const decoration_width = text.width(decoration.plain);
                 const prefix = try editorDisplay(a, visible[begin..cursor]);
                 var start: usize = 0;
@@ -1200,7 +1207,7 @@ test "regular transcript starts at top and keeps composer at bottom without role
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     try std.testing.expect(std.mem.find(u8, &screen.grid[0], "unique committed user") != null);
     try std.testing.expect(!ui.records.items[0].output);
-    try std.testing.expectEqual(@as(usize, 22), ui.frame_height);
+    try std.testing.expectEqual(@as(usize, 23), ui.frame_height); // One committed user row, no trailing gap.
     ui.finishFrame();
     try std.testing.expect(ui.records.items[0].output);
     try std.testing.expect(!ui.records.items[1].output);
@@ -1209,7 +1216,7 @@ test "regular transcript starts at top and keeps composer at bottom without role
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique committed user") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "uncanonical draft") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") != null);
-    try std.testing.expectEqual(@as(usize, 19), ui.frame_height);
+    try std.testing.expectEqual(@as(usize, 21), ui.frame_height); // Leading gap + canonical body, no title.
     try screen.replay(ui.frame);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     ui.finishFrame();
@@ -1218,7 +1225,7 @@ test "regular transcript starts at top and keeps composer at bottom without role
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     try std.testing.expectEqual(@as(usize, 1), screen.count("unique canonical reply"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") == null);
-    try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[18A"));
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[20A"));
     for ([_][]const u8{ "1049", "1047", "\x1b[H", "\x1b[2J", ";1H" }) |forbidden|
         try std.testing.expect(std.mem.find(u8, ui.frame, forbidden) == null);
 }
@@ -1246,7 +1253,7 @@ test "growing a compact live tail keeps replaceable drafts out of scrollback" {
         try ui.draw();
         try screen.replay(ui.frame);
         ui.finishFrame();
-        try std.testing.expectEqual(@as(usize, 6), ui.tail_height);
+        try std.testing.expectEqual(@as(usize, 7), ui.tail_height); // Live leading separator is part of our replaceable tail.
         try std.testing.expectEqual(@as(usize, 23), screen.row);
         for (screen.history[0..screen.history_len]) |line| try std.testing.expect(std.mem.find(u8, &line, "growth-draft-marker") == null);
 
@@ -1414,15 +1421,15 @@ test "consecutive bash captions share one row and prepare failures preserve FIFO
     try ui.event(item);
     item.deinit();
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expectEqualStrings(">_ date [error]  ·  >_ pwd", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("> date [error]  ·  > pwd", ui.records.items[0].body.items);
     try ui.draw();
     try std.testing.expect(!ui.records.items[0].pending_output);
     ui.finishFrame();
     ui.command_group = null; // The next calling_model / completion seals the group.
     try ui.draw();
     try std.testing.expectEqual(@as(usize, 1), ui.records.items[0].lines.len);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.failure ++ ">_ date [error]") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ ">_ pwd") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.failure ++ "> date [error]") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ "> pwd") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-") == null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
@@ -1480,7 +1487,7 @@ test "tool only reasoning only and empty canonical bodies remove a previously vi
     }
 }
 
-test "file observation captions and final answer heading separate prose and context changes by value" {
+test "file captions are contiguous but separated from final prose and percent context changes by value" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -1499,17 +1506,95 @@ test "file observation captions and final answer heading separate prose and cont
     try std.testing.expect(std.mem.find(u8, ui.frame, "write_file src/main.zig  ~1 +2 -3 lines") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "raw-json-must-stay-hidden") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "do-not-show-body") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture) [ctx ~16384/32768 50.0%] > ") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture 50.0%) > ") != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    try std.testing.expect(screen.visible("=> Final answer") and screen.visible("final-body-marker"));
+    try std.testing.expect(!screen.visible("Final answer") and screen.visible("final-body-marker"));
     for (screen.grid[1]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     ui.finishFrame();
     try ui.draw();
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 1), screen.count("=> Final answer"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("=> Final answer"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("final-body-marker"));
+    ui.finishFrame();
+}
+
+test "sequential tool records from different frames have no gaps then final prose has one gap" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    for ([_][]const u8{ "one.txt", "two.txt", "three.txt" }, 0..) |path, i| {
+        const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+        defer std.testing.allocator.free(args);
+        const caption = try presentation.caption(std.testing.allocator, "read_file", args);
+        defer caption.deinit(std.testing.allocator);
+        try ui.toolCompleted(caption, .{ .text = "hidden-result", .file_stats = .{ .read = 1 } });
+        try ui.draw();
+        try screen.replay(ui.frame);
+        try std.testing.expect(std.mem.find(u8, &screen.grid[i], path) != null);
+        ui.finishFrame();
+    }
+    try ui.replaceCommitted(&.{.{ .text = "answer-without-heading" }}, false, true);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    for (screen.grid[3]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[4], "answer-without-heading") != null);
+    try std.testing.expectEqual(@as(usize, 0), screen.count("Final answer"));
+    ui.finishFrame();
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("answer-without-heading"));
+    for ([_][]const u8{ "one.txt", "two.txt", "three.txt" }) |path| try std.testing.expectEqual(@as(usize, 1), screen.count(path));
+    ui.finishFrame();
+}
+
+test "configured effort colors composer before any reasoning and remains independent of TPS and duration" {
+    const Owner = struct {
+        effort: shared.ReasoningEffort,
+        fn current(raw: *anyopaque) Connection.State {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var state = FixtureConnection.current(raw);
+            state.reasoning_effort = self.effort;
+            return state;
+        }
+    };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var owner: Owner = .{ .effort = .high };
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = .{ .context = &owner, .current_fn = Owner.current, .configure_fn = FixtureConnection.configure };
+    _ = try ui.editor.insert("input-default");
+    // Idle startup, without any delta or mutable Runtime reads.
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, (comptime theme.effortColor(.high)) ++ ">" ++ theme.reset ++ " input-default") != null);
+    ui.finishFrame();
+    ui.mode = .calling_model;
+    ui.display.reset(0);
+    ui.display.observe(.{ .state = .calling_model }, 0);
+    for ([_]u64{ 1100, 3100, 9100 }) |now| {
+        ui.clock_ms = now;
+        try ui.draw();
+        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s} input-default", .{ theme.effortColor(.high), activity.spinner(now), theme.reset });
+        defer std.testing.allocator.free(marker);
+        try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
+        ui.finishFrame();
+    }
+    ui.display.observe(.{ .reasoning = "late thought" }, 9100);
+    ui.display.finish(.{ .status = .success }, 9200);
+    ui.mode = null;
+    owner.effort = .low;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, (comptime theme.effortColor(.low)) ++ ">" ++ theme.reset ++ " input-default") != null);
+    ui.finishFrame();
+    owner.effort = .unspecified;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture ?%) > input-default") != null);
     ui.finishFrame();
 }
 
@@ -1527,10 +1612,10 @@ test "model only default color prompt has no headers cache or status and preserv
     try std.testing.expect(std.mem.find(u8, ui.frame, "thin |") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "tools trusted") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, ".thin/sessions") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture) > hello    你") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture ?%) > hello    你") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "90.0%") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "(fixture)") == null);
-    const decoration = "(fixture) > ";
+    const decoration = "(fixture ?%) > ";
     const position = try std.fmt.allocPrint(std.testing.allocator, "\r\x1b[{d}C\x1b[?25h", .{text.width(decoration) + text.width("hello    你")});
     defer std.testing.allocator.free(position);
     try std.testing.expect(std.mem.endsWith(u8, ui.frame, position));
@@ -1560,7 +1645,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("visible-body"));
     for (screen.grid[22]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
-    try std.testing.expect(std.mem.find(u8, &screen.grid[23], "(fixture) ~ typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[23], "(fixture ?%) ~ typed-default-color") != null);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     ui.finishFrame();
     ui.clock_ms = 680;
@@ -1572,7 +1657,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     ui.notice = "Completed"; // Even old application success notices cannot add a row.
     ui.last_terminal = .{ .status = .success, .usage = .{ .normal_calls = 1, .normal = .{ .input_tokens = 10562, .output_tokens = 873, .cached_input_tokens = 9600 } } };
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture) > typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture ?%) > typed-default-color") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Completed") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "tokens in:") == null);
     ui.finishFrame();
@@ -1593,8 +1678,8 @@ test "flow model prefix clips long editor suffix without wrap or changing raw cu
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "(fixture) ~ x"));
-    try std.testing.expect(std.mem.endsWith(u8, ui.frame, "\r\x1b[13C\x1b[?25h"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "(fixture ?%) ~ x"));
+    try std.testing.expect(std.mem.endsWith(u8, ui.frame, "\r\x1b[16C\x1b[?25h"));
     for (screen.grid[22]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
     try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
     ui.finishFrame();

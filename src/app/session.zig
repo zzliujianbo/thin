@@ -7,6 +7,7 @@ const r = @import("../core/runtime.zig");
 const App = @import("app.zig").App;
 const Store = @import("auth_store.zig").Store;
 const tui = @import("../ui/tui.zig");
+const presentation = @import("../presentation.zig");
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
@@ -77,6 +78,7 @@ pub const Session = struct {
             .runtime = if (self.app) |app| &app.runtime else null,
             .initial_context = self.initial_context,
             .model = config.model.name,
+            .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .base_url = config.provider.base_url,
             .tools_trusted = self.trusted,
             .logging_enabled = self.logging,
@@ -129,11 +131,14 @@ test "pending session activates locally without a request and protects auth from
     try env.put("HOME", home);
     var session = try Session.init(a, io, &env, home, .{}, true);
     defer session.deinit();
+    session.pending.?.value.model.reasoning_effort = "high";
     const connection = session.connection();
+    try std.testing.expectEqual(presentation.ReasoningEffort.high, connection.current().reasoning_effort);
     try std.testing.expect(connection.current().runtime == null);
     try std.testing.expect(connection.current().tools_trusted);
     try connection.configure("fake-inline-session-key");
     try std.testing.expect(connection.current().runtime != null);
+    try std.testing.expectEqual(presentation.ReasoningEffort.high, connection.current().reasoning_effort);
     try std.testing.expectEqualDeep(session.app.?.runtime.contextSnapshot(), connection.current().initial_context.?);
     try std.testing.expect(connection.current().runtime.?.trusted);
     try std.testing.expect(connection.current().tools_trusted);
@@ -145,6 +150,7 @@ test "pending session activates locally without a request and protects auth from
     var reopened = try Session.init(a, io, &env, home, .{}, true);
     defer reopened.deinit();
     try std.testing.expect(reopened.connection().current().runtime != null);
+    try std.testing.expectEqual(presentation.ReasoningEffort.high, reopened.connection().current().reasoning_effort);
     try std.testing.expect(reopened.connection().current().runtime.?.trusted);
 
     var arena = std.heap.ArenaAllocator.init(a);
