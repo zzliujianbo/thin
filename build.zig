@@ -17,6 +17,16 @@ pub fn build(b: *std.Build) void {
         @panic("ThinAgent v1 supports Linux x86_64 only");
     const optimize = b.standardOptimizeOption(.{});
 
+    // 可供其他前端直接导入；不链接TTY/libc宽度/Markdown C parser。
+    const presentation = b.addModule("presentation", .{
+        .root_source_file = b.path("src/presentation.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const presentation_tests = b.addTest(.{ .use_llvm = false, .root_module = presentation });
+    const run_presentation = b.addRunArtifact(presentation_tests);
+    b.step("test-presentation", "Run frontend-neutral presentation tests without terminal or libc").dependOn(&run_presentation.step);
+
     // 主程序 thin。use_llvm = false 表示使用 Zig 自有后端而非 LLVM。
     const exe = b.addExecutable(.{
         .name = "thin",
@@ -114,6 +124,7 @@ pub fn build(b: *std.Build) void {
     // 聚合步骤 `zig build test`：依次挂载所有离线测试（不含需要真实 API 的内容）。
     const test_all = b.step("test", "Run all offline unit, transport, application and foundation tests");
     test_all.dependOn(&run_unit.step);
+    test_all.dependOn(&run_presentation.step);
     test_all.dependOn(&run_http.step);
     test_all.dependOn(&run_app.step);
     test_all.dependOn(&run.step);

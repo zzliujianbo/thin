@@ -280,7 +280,7 @@ pub const Tools = struct {
                 try j.put(a, &value, "file_bytes", try j.number(result.total_bytes));
                 try j.put(a, &value, "truncated", .{ .bool = result.truncated });
                 try j.put(a, &value, "content", j.str(result.data));
-                return .{ .text = try j.encode(a, value), .truncated = result.truncated };
+                return .{ .text = try j.encode(a, value), .truncated = result.truncated, .file_stats = .{ .read = @import("../util/line_stats.zig").count(result.data), .partial = r.offset != 0 or result.truncated } };
             },
 
             .write_file => |w| {
@@ -290,8 +290,8 @@ pub const Tools = struct {
                 const encoded = try j.encode(a, value);
                 errdefer a.free(encoded);
                 // 原子写入以及“已存在需 overwrite=true”的检查由 Root.write 负责。
-                try self.root.write(w.path, w.content, w.overwrite);
-                return .{ .text = encoded };
+                const changes = try self.root.writeObserved(w.path, w.content, w.overwrite);
+                return .{ .text = encoded, .file_stats = .{ .changes = changes } };
             },
 
             .bash => |b| {

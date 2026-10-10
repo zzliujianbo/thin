@@ -14,6 +14,59 @@ const configuration = cfg.Config{
     .model = .{ .name = "fake", .context_tokens = 32768 },
 };
 
+test "file observations reflect actual returned ranges and pre-write snapshot changes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(a, io, buffer[0..n]);
+    defer root.deinit();
+    var store = mem.Store.init(&root, .{});
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = &environment };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    var cancel = p.Cancellation{};
+    const Stats = @import("../util/line_stats.zig");
+    const initial = "a\nb\nc\nd\ne\n";
+    const create = try tools.execute(temp, .{ .write_file = .{ .path = "lines.txt", .content = initial } }, &cancel);
+    try std.testing.expectEqualDeep(Stats.Changes{ .added = 5 }, create.file_stats.?.changes.?);
+    const read = try tools.execute(temp, .{ .read_file = .{ .path = "lines.txt" } }, &cancel);
+    try std.testing.expectEqual(@as(?u64, 5), read.file_stats.?.read);
+    try std.testing.expect(!read.file_stats.?.partial);
+    const range = try tools.execute(temp, .{ .read_file = .{ .path = "lines.txt", .offset = 1, .limit = 2 } }, &cancel);
+    try std.testing.expectEqual(@as(?u64, 2), range.file_stats.?.read);
+    try std.testing.expect(range.file_stats.?.partial); // "\nb": two returned line fragments.
+    const update = try tools.execute(temp, .{ .write_file = .{ .path = "lines.txt", .content = "a\nB\nx\nc\ne\n", .overwrite = true } }, &cancel);
+    try std.testing.expectEqualDeep(Stats.Changes{ .modified = 1, .added = 1, .removed = 1 }, update.file_stats.?.changes.?);
+    const same = try tools.execute(temp, .{ .write_file = .{ .path = "lines.txt", .content = "a\nB\nx\nc\ne\n", .overwrite = true } }, &cancel);
+    try std.testing.expectEqualDeep(Stats.Changes{}, same.file_stats.?.changes.?);
+    try std.testing.expectError(error.PathAlreadyExists, tools.execute(temp, .{ .write_file = .{ .path = "lines.txt", .content = "not committed" } }, &cancel));
+    cancel.cancel();
+    const canceled = try tools.execute(temp, .{ .write_file = .{ .path = "lines.txt", .content = "not committed", .overwrite = true } }, &cancel);
+    try std.testing.expect(canceled.canceled and canceled.file_stats == null);
+    const contents = try root.read(temp, "lines.txt", 0, 100);
+    try std.testing.expectEqualStrings("a\nB\nx\nc\ne\n", contents.data);
+
+    // Observation OOM is non-authoritative and occurs before the actual commit.
+    for ([_]usize{ 1, 4 }) |fail_index| {
+        try root.write("lines.txt", "a\nB\nx\nc\ne\n", true);
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        // parent(0), snapshot(1), before/after lines(2/3), LCS table(4).
+        root.allocator = failing.allocator();
+        defer root.allocator = a;
+        const unavailable = try root.writeObserved("lines.txt", "new\n", true);
+        root.allocator = a;
+        try std.testing.expect(unavailable == null);
+        const committed = try root.read(temp, "lines.txt", 0, 100);
+        try std.testing.expectEqualStrings("new\n", committed.data);
+    }
+}
+
 // 验证：写入 .thin 或 memory 目录被拒绝（UseMemoryTool），越界路径被拒绝（OutsideRoot），合法 memory 写入只生成待审批描述且不落盘。
 test "tools validate containment and Memory namespace before approval" {
     const a = std.testing.allocator;

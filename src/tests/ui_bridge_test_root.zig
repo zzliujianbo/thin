@@ -134,6 +134,25 @@ test "bridge owns every borrowed payload after source arena is freed" {
     item.deinit();
 }
 
+test "file statistics survive clipped result JSON and context snapshots copy by value" {
+    var cancel = p.Cancellation{};
+    var bridge = b.Bridge.init(t.allocator, t.io, &cancel);
+    defer bridge.deinit();
+    const big = try t.allocator.alloc(u8, b.item_budget + 100);
+    defer t.allocator.free(big);
+    @memset(big, 'x');
+    try send(&bridge, .{ .tool_result = .{ .id = 9, .name = "read_file", .result = .{ .text = big, .file_stats = .{ .read = 20000, .partial = true } } } });
+    try send(&bridge, .{ .context_snapshot = .{ .tokens = 700, .limit = 32768 } });
+    var item = bridge.pop().?;
+    try t.expect(item.display_truncated);
+    try t.expectEqual(@as(?u64, 20000), item.event.tool_result.result.file_stats.?.read);
+    try t.expect(item.event.tool_result.result.file_stats.?.partial);
+    item.deinit();
+    item = bridge.pop().?;
+    try t.expectEqual(@as(u64, 700), item.event.context_snapshot.tokens);
+    item.deinit();
+}
+
 // 队列满时，独立的取消请求应使阻塞的可靠生产者返回 Canceled，且队列长度不变。
 test "full queue independent cancellation unblocks reliable result producer" {
     var env = Env.init();

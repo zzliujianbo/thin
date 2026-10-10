@@ -33,6 +33,9 @@ pub const memory = @import("tools/memory.zig");
 /// 工具集合与分发。
 pub const tools = @import("tools/tools.zig");
 
+/// 前端共享展示数据/状态；不包含终端帧或权限决策。
+pub const presentation = @import("presentation.zig");
+
 // 引用各模块以便 `zig build test-unit` 编译并运行它们的测试；
 // 集成测试与 UI 测试也在此统一挂载（build.zig 的 test-unit 步骤声明为离线运行，不需要网络或凭据）。
 test {
@@ -50,6 +53,7 @@ test {
     _ = filesystem;
     _ = memory;
     _ = tools;
+    _ = presentation;
 
     _ = @import("tests/tools_integration_test.zig");
     _ = @import("tests/headless_integration_test.zig");

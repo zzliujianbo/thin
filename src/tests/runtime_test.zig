@@ -71,6 +71,14 @@ const Fake = struct {
     failed_summary_preserved: bool = false,
     /// 首次请求时的 system 提示；之后每次请求都必须与它一致。
     first_system: ?[]const u8 = null,
+    snapshots: usize = 0,
+    last_context: ?r.ContextSnapshot = null,
+    nonzero_usage: bool = false,
+    fail_prepare: bool = false,
+    disconnect_snapshot: ?usize = null,
+    file_stats: ?@import("../util/line_stats.zig").File = null,
+    last_file_stats: ?@import("../util/line_stats.zig").File = null,
+    fitted_result: bool = false,
 
     /// 返回模型接口，调用分发到 call。
     fn model(self: *Fake) p.Model {
@@ -102,6 +110,7 @@ const Fake = struct {
             return .{ .failure = .{ .kind = .canceled, .message = "canceled fixture" } };
         }
 
+        const input: ?u64 = if (self.nonzero_usage) @intCast(context.rawTokens(req.system, req.tools, req.messages)) else null;
         if (req.purpose == .summary) {
             // 摘要请求：最后一条必须是 user 消息，且历史中须包含原始任务文本。
             self.summary_calls += 1;
@@ -122,7 +131,7 @@ const Fake = struct {
             return .{ .success = .{
                 .message = .{ .role = .assistant, .blocks = &.{.{ .text = "Earlier tool steps completed; continue the requested work." }} },
                 .finish = .stop,
-                .usage = .{ .output_tokens = 10 },
+                .usage = .{ .input_tokens = input, .output_tokens = 10 },
             } };
         }
 
@@ -138,7 +147,7 @@ const Fake = struct {
             return .{ .success = .{
                 .message = .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} },
                 .finish = .stop,
-                .usage = .{ .output_tokens = 1 },
+                .usage = .{ .input_tokens = input, .output_tokens = 1 },
             } };
         }
 
@@ -149,13 +158,14 @@ const Fake = struct {
             .name = "write_file",
             .arguments = "{}",
         } };
-        return .{ .success = .{ .message = .{ .role = .assistant, .blocks = blocks }, .finish = .tool_calls, .usage = .{ .output_tokens = 1 } } };
+        return .{ .success = .{ .message = .{ .role = .assistant, .blocks = blocks }, .finish = .tool_calls, .usage = .{ .input_tokens = input, .output_tokens = 1 } } };
     }
 
     /// 准备阶段：校验工具名，并返回是否需要审批。
     fn prepare(ctx: *anyopaque, _: std.mem.Allocator, call_: p.ToolCall) !r.Prepared {
         const self: *Fake = @ptrCast(@alignCast(ctx));
         if (!std.mem.eql(u8, call_.name, "write_file")) return error.UnexpectedTool;
+        if (self.fail_prepare) return error.InvalidFixtureArguments;
         return .{ .payload = ctx, .description = "write fixture", .requires_approval = self.requires_approval };
     }
 
@@ -166,7 +176,7 @@ const Fake = struct {
         self.executions += 1;
         if (self.fail_after_execution) |armed| armed.* = true;
         if (self.cancel_after_execution) |c| c.cancel();
-        return .{ .text = self.output, .cleanup_failed = self.cleanup_failure, .is_error = self.cleanup_failure };
+        return .{ .text = self.output, .cleanup_failed = self.cleanup_failure, .is_error = self.cleanup_failure, .file_stats = self.file_stats };
     }
 
     /// 宿主事件回调：记录计数、已提交文本与压缩状态；配置了 disconnect 时返回 Disconnected，模拟宿主断开。
@@ -179,11 +189,24 @@ const Fake = struct {
                     self.committed_text = block.text;
                 };
             },
+            .context_snapshot => |value| {
+                self.snapshots += 1;
+                self.last_context = value;
+                if (self.current_runtime) |runtime| try std.testing.expectEqualDeep(runtime.contextSnapshot(), value);
+                if (self.disconnect_snapshot == self.snapshots) return error.Disconnected;
+            },
+            .tool_result => |value| {
+                self.last_file_stats = value.result.file_stats;
+                self.fitted_result = value.result.truncated;
+            },
             .finished => self.terminals += 1,
             .compacted => self.compactions += 1,
             // 进入压缩前记录 token 估算值，供后续比较。
-            .state => |state| if (state == .compacting) {
-                self.before_summary_tokens = self.current_runtime.?.estimatedTokens();
+            .state => |state| {
+                if (state == .compacting) self.before_summary_tokens = self.current_runtime.?.estimatedTokens();
+                if (state == .awaiting_permission or state == .executing_tool) {
+                    if (self.current_runtime) |runtime| try std.testing.expectEqualDeep(runtime.contextSnapshot(), self.last_context.?);
+                }
             },
             // 压缩失败后 token 数应与压缩前一致，说明历史未被破坏。
             .compaction_failed => self.failed_summary_preserved = self.before_summary_tokens == self.current_runtime.?.estimatedTokens(),
@@ -217,6 +240,78 @@ fn smallConfiguration() cfg.Config {
     config.limits.summary_tokens = 100;
     config.limits.safety_tokens = 100;
     return config;
+}
+
+test "owner publishes retained context snapshots across tools and compaction not cumulative usage" {
+    const a = std.testing.allocator;
+    var fake: Fake = .{ .output = &long_output, .stop_after = 7, .nonzero_usage = true };
+    var config = smallConfiguration();
+    // Nonzero usage raises the safety multiplier; leave room for the summary
+    // instruction as well as retained input, instead of an invalid late trigger.
+    config.limits.compaction_trigger_percent = 70;
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "system", true);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    const initial = runtime.contextSnapshot();
+    var cancel = p.Cancellation{};
+    const result = try runtime.run("Do the task", &cancel);
+    if (result.status != .success) std.debug.print("context fixture detail: {s}\n", .{if (result.detail) |err| @errorName(err) else "unknown"});
+    try std.testing.expectEqual(r.Status.success, result.status);
+    try std.testing.expect(fake.compactions > 0 and fake.snapshots > fake.executions);
+    try std.testing.expectEqualDeep(runtime.contextSnapshot(), fake.last_context.?);
+    try std.testing.expectEqual(@as(u64, 3000), fake.last_context.?.limit);
+    try std.testing.expect(initial.tokens < fake.last_context.?.tokens);
+    try std.testing.expect(result.usage.normal.input_tokens.? > 0);
+    try std.testing.expect(fake.last_context.?.tokens != result.usage.normal.input_tokens.?);
+    try std.testing.expectEqualDeep(runtime.contextSnapshot(), result.context_snapshot.?);
+}
+
+test "context publication failure inside committed batch still pairs every unstarted tool" {
+    var fake: Fake = .{ .calls_per_response = 2, .disconnect_snapshot = 2 };
+    var config = configuration();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "system", false);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    var cancel = p.Cancellation{};
+    const result = try runtime.run("task", &cancel);
+    try std.testing.expectEqual(r.Status.failed, result.status);
+    try std.testing.expectEqual(@as(u32, 0), fake.executions);
+    var calls: usize = 0;
+    var results: usize = 0;
+    for (runtime.messages()) |msg| for (msg.blocks) |block| switch (block) {
+        .tool_call => calls += 1,
+        .tool_result => |value| {
+            results += 1;
+            try std.testing.expect(std.mem.startsWith(u8, value.text, "Not executed:"));
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), calls);
+    try std.testing.expectEqual(calls, results);
+    try std.testing.expectEqualDeep(runtime.contextSnapshot(), result.context_snapshot.?);
+}
+
+test "file metadata survives actual result fitting and prepare errors publish retained snapshots" {
+    const large: [20000]u8 = @splat('x');
+    var config = smallConfiguration();
+    var fake: Fake = .{ .output = &large, .file_stats = .{ .changes = .{ .modified = 2, .added = 3, .removed = 4 } } };
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "system", false);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    var cancel = p.Cancellation{};
+    const result = try runtime.run("task", &cancel);
+    try std.testing.expectEqual(r.Status.success, result.status);
+    try std.testing.expect(fake.fitted_result);
+    try std.testing.expectEqualDeep(fake.file_stats, fake.last_file_stats);
+    var denied: Fake = .{ .fail_prepare = true };
+    var next = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, denied.model(), denied.executor(), denied.host(), "system", false);
+    defer next.deinit();
+    denied.current_runtime = &next;
+    const failed_prepare = try next.run("task", &cancel);
+    try std.testing.expectEqual(r.Status.success, failed_prepare.status);
+    try std.testing.expectEqual(@as(u32, 0), denied.executions);
+    try std.testing.expectEqual(@as(usize, 5), denied.snapshots);
+    try std.testing.expectEqualDeep(next.contextSnapshot(), failed_prepare.context_snapshot.?);
 }
 
 test "Runtime result allocation failure preserves execution uncertainty in history and observer" {

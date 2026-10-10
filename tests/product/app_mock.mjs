@@ -157,6 +157,7 @@ async function scenario(name, protocol, kind, isPty = false) {
   // 约 1800 字节的种子文件，供 read_file 读取；压缩后仍应能看到其真实内容。
   const seed = 'seed-content-'.repeat(138) + 'end\n'; // ~1800 UTF-8 bytes
   await writeFile(join(project,'seed.txt'), seed);
+  if (kind === 'tool-icons') await writeFile(join(project,'r.json'), '{"tool-json-hidden-marker":1}');
 
   // 场景计数器：请求数、对话轮次、摘要次数，以及压缩后标记。
   let requests = 0, rounds = 0, summaries = 0, afterSummary = false, stable, fixtureError;
@@ -229,14 +230,54 @@ async function scenario(name, protocol, kind, isPty = false) {
         assert.equal(protocol, 'chat');
         res.writeHead(200, {'content-type':'text/event-stream', 'cache-control':'no-cache'});
         const chunk = delta => res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta,finish_reason:null}]})}\n\n`);
-        chunk({reasoning_content:'reasoning-stage-one **visible reasoning**'});
+        chunk({reasoning_content:'thinking-old-one\nthinking-old-two\nthinking-old-three\nreasoning-stage-one'});
+        await new Promise(resolve=>setTimeout(resolve,450));
+        chunk({reasoning_content:'\nthinking-new-five\nthinking-new-six\nreasoning-stage-two'});
         await new Promise(resolve=>setTimeout(resolve,600));
         chunk({content:'# Orange heading\n\n**stream-stage-one** and [link](https://example.org)\n\n'});
         await new Promise(resolve=>setTimeout(resolve,600));
         chunk({content:'```zig\nconst value = 1;\n```\n\n| Item | State |\n| --- | --- |\n| fixture | ready |\n\nstream-final-answer'});
         await new Promise(resolve=>setTimeout(resolve,200));
-        res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`);
+        res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\ndata: ${JSON.stringify({id:'stream_fixture',choices:[],usage:{prompt_tokens:12,completion_tokens:90,total_tokens:102,prompt_tokens_details:{cached_tokens:9},completion_tokens_details:{reasoning_tokens:30}}})}\n\ndata: [DONE]\n\n`);
         res.end();
+        return;
+      }
+
+      if (kind === 'tool-icons') {
+        assert.equal(protocol, 'chat');
+        assert(rounds <= 2, 'tool icon request bound');
+        if (rounds === 1) {
+          send(res,protocol,'',[
+            tool('icon_shell','bash',{command:'sleep 1; cat r.json'}),
+            tool('icon_second','bash',{command:'printf ok'}),
+            tool('icon_failure','bash',{command:'false'})
+          ]);
+        } else {
+          assert(outputs.get('icon_shell')?.includes('tool-json-hidden-marker'), 'tool result absent from protocol history');
+          assert(outputs.get('icon_second')?.includes('ok'), 'second tool result absent from protocol history');
+          assert(outputs.has('icon_failure'), 'failed command result absent from protocol history');
+          send(res,protocol,'tool-icon-final-answer');
+        }
+        return;
+      }
+
+      if (kind === 'file-stats') {
+        assert.equal(protocol,'chat');
+        assert(rounds <= 2, 'file stats request bound');
+        if (rounds === 1) send(res,protocol,'',[
+          tool('file_create','write_file',{path:'stats.txt',content:'a\nb\nc\nd\ne\n'}),
+          tool('file_update','write_file',{path:'stats.txt',content:'a\nB\nx\nc\ne\n',overwrite:true}),
+          tool('file_read','read_file',{path:'stats.txt'}),
+          tool('file_range','read_file',{path:'stats.txt',offset:1,limit:2}),
+          tool('file_clear','write_file',{path:'stats.txt',content:'',overwrite:true}),
+          tool('file_failed','write_file',{path:'stats.txt',content:'must-not-write'})
+        ]); else {
+          for (const id of ['file_create','file_update','file_read','file_range','file_clear','file_failed']) assert(outputs.has(id), 'file tool result absent');
+          assert.equal(JSON.parse(outputs.get('file_read')).content,'a\nB\nx\nc\ne\n');
+          assert.equal(JSON.parse(outputs.get('file_range')).content,'\nB');
+          assert.equal(await readFile(join(project,'stats.txt'),'utf8'),'');
+          send(res,protocol,'file-stats-final-answer');
+        }
         return;
       }
 
@@ -418,6 +459,8 @@ async function scenario(name, protocol, kind, isPty = false) {
     // cancel：取消后 CLI 应能继续发起第二轮请求。
     if (kind === 'cancel') assert.equal(rounds,2, 'did not resume after cancel');
     if (kind === 'regular-two') assert.equal(requests,2, 'regular two-turn request count');
+    if (kind === 'tool-icons') assert.equal(requests,2, 'tool icon request count');
+    if (kind === 'file-stats') assert.equal(requests,2, 'file stats request count');
 
     // 场景通过，输出请求数与摘要数（不含内容）。
     console.log(`PASS ${name}: requests=${requests} summaries=${summaries}`);
@@ -440,7 +483,7 @@ try {
   }
 
   // PTY 场景：通过 thin-app-pty 驱动交互式终端，仅使用 chat 协议。
-  for (const kind of ['unicode','regular-two','stream-markdown','auto-tools','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
+  for (const kind of ['unicode','regular-two','stream-markdown','tool-icons','file-stats','auto-tools','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
   await reviewRegressions(app);
   await logRegressions(app,pty);
   console.log('Application fixture suite passed; PTY tests exercise chat only.');

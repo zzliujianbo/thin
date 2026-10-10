@@ -10,3 +10,13 @@ pub const link = "\x1b[4m\x1b[38;5;75m";
 pub const code = "\x1b[38;5;223m\x1b[48;5;235m";
 pub const user = "\x1b[38;5;255m\x1b[48;2;52;36;24m";
 pub const user_background = "\x1b[48;2;52;36;24m";
+
+pub const success = "\x1b[38;5;114m";
+pub const failure = "\x1b[38;5;203m";
+pub const caution = "\x1b[38;5;214m";
+/// Foreground only: the editor/background remain the terminal's defaults.
+pub const model_flow = [_][]const u8{
+    "\x1b[38;5;242m", "\x1b[38;5;246m", "\x1b[38;5;250m", "\x1b[38;5;255m",
+    "\x1b[38;5;223m", "\x1b[38;5;215m", "\x1b[38;5;214m", "\x1b[38;5;208m",
+    "\x1b[38;5;173m", "\x1b[38;5;137m", "\x1b[38;5;245m", "\x1b[38;5;243m",
+};

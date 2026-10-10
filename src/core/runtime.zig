@@ -20,6 +20,9 @@ pub const Execution = struct {
     truncated: bool = false,
     /// 进程组清理失败：会使 Runtime poisoned，之后拒绝继续运行。
     cleanup_failed: bool = false,
+    /// Optional measured file observations, copied by value across Host/Bridge.
+    /// No content/authority; absent remains unknown, including synthetic errors.
+    file_stats: ?@import("../util/line_stats.zig").File = null,
 };
 
 /// prepare_fn 的产物：只解析与校验参数、不产生副作用，供授权与执行阶段使用。
@@ -94,12 +97,18 @@ pub const Terminal = struct {
     /// 最后一次模型请求的 HTTP 状态码（若有）。
     http_status: ?u16 = null,
     usage: UsageTotals = .{},
+    context_snapshot: ?ContextSnapshot = null,
 };
+
+/// Estimated retained context (system/schema/history), not cumulative billing.
+/// Only the owner calls contextSnapshot while running; consumers get values.
+pub const ContextSnapshot = struct { tokens: u64, limit: u64 };
 
 /// 发给宿主的运行时事件，按发生顺序同步送达 Host.emit_fn。
 pub const Event = union(enum) {
     /// 阶段切换。
     state: State,
+    context_snapshot: ContextSnapshot,
     /// 可见文本增量。
     text: []const u8,
     /// 推理内容增量。
@@ -254,6 +263,16 @@ pub const Runtime = struct {
         return self.estimator.tokens(context.rawTokens(self.system, self.executor.schemas, self.history.items));
     }
 
+    /// Startup/after-join callers may read this; NEVER query during another
+    /// thread's run. Streaming consumers use context_snapshot value events.
+    pub fn contextSnapshot(self: *const Runtime) ContextSnapshot {
+        return .{ .tokens = @intCast(self.estimatedTokens()), .limit = @intCast(self.config.model.context_tokens) };
+    }
+
+    fn emitContext(self: *Runtime, cancel: *const p.Cancellation) !void {
+        try self.emit(.{ .context_snapshot = self.contextSnapshot() }, cancel);
+    }
+
     /// 向宿主发送事件。宿主报错时：若已取消返回 Canceled，否则视为宿主断开。
     fn emit(self: *Runtime, event: Event, cancel: *const p.Cancellation) !void {
         // 先观察，再交给可能背压/断开的显示宿主；诊断不依赖 UI 队列被消费。
@@ -303,7 +322,7 @@ pub const Runtime = struct {
 
         // 看门狗无法启动时直接以 failed 结束，不进入模型循环。
         var timer = Io.concurrent(self.io, Watchdog.run, .{&watchdog}) catch |err| {
-            const terminal = Terminal{ .status = .failed, .detail = err };
+            const terminal = Terminal{ .status = .failed, .detail = err, .context_snapshot = self.contextSnapshot() };
             self.emit(.{ .finished = terminal }, cancel) catch {};
             return terminal;
         };
@@ -328,6 +347,7 @@ pub const Runtime = struct {
 
         // Exactly one terminal result per accepted run, including failures. A
         // disconnected host need not receive it, but the caller still gets it.
+        task.terminal.context_snapshot = self.contextSnapshot();
         self.emit(.{ .finished = task.terminal }, cancel) catch {};
         return task.terminal;
     }
@@ -365,6 +385,7 @@ pub const Runtime = struct {
             // 轮数上限防止模型无限调用工具；计数在发请求前递增。
             if (task.rounds >= self.config.limits.max_rounds) return error.RoundLimit;
             task.rounds += 1;
+            try self.emitContext(cancel);
             try self.emit(.{ .state = .calling_model }, cancel);
 
             // 单轮临时 arena：响应解析结果只在本轮有效，入历史前需要 clone。
@@ -401,6 +422,7 @@ pub const Runtime = struct {
 
             // stop：提交可见块并结束；否则（tool_calls）进入工具批次。
             if (response.finish == .stop) {
+                try self.emitContext(cancel);
                 try self.emit(.{ .assistant_committed = message.blocks }, cancel);
                 return;
             }
@@ -591,6 +613,8 @@ pub const Runtime = struct {
 
         // Install the result-completion guard before publishing a committed
         // tool batch: a disconnected UI must not leave orphaned call IDs.
+        // History + usage calibration changed before approval or a long tool.
+        try self.emitContext(cancel);
         try self.emit(.{ .assistant_committed = blocks }, cancel);
 
         while (next_block < blocks.len) {
@@ -618,6 +642,7 @@ pub const Runtime = struct {
                 try self.appendResult(call.id, result);
                 next_block += 1;
                 try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result } }, cancel);
+                try self.emitContext(cancel);
                 continue;
             };
 
@@ -668,6 +693,7 @@ pub const Runtime = struct {
             started_call = null;
             next_block += 1;
             try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result } }, cancel);
+            try self.emitContext(cancel);
 
             // 先写入结果并通知宿主，再因清理失败终止批次。
             if (result.cleanup_failed) {

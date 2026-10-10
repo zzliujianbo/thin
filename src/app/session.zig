@@ -19,6 +19,8 @@ pub const Session = struct {
     store: Store,
     pending: ?std.json.Parsed(cfg.Config) = null,
     app: ?*App = null,
+    /// Computed before publication; callbacks never read worker-owned history.
+    initial_context: ?r.ContextSnapshot = null,
 
     /// 只做本地初始化；缺少凭证时保持 pending，不发起试探请求。
     pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, trusted: bool) !Session {
@@ -46,6 +48,7 @@ pub const Session = struct {
         const parsed = self.pending.?;
         self.pending = null;
         self.app = try App.initConfigured(a, io, environ, project, host, trusted, parsed);
+        self.initial_context = self.app.?.runtime.contextSnapshot();
         return self;
     }
 
@@ -72,6 +75,7 @@ pub const Session = struct {
         const config = if (self.app) |app| app.config.value else self.pending.?.value;
         return .{
             .runtime = if (self.app) |app| &app.runtime else null,
+            .initial_context = self.initial_context,
             .model = config.model.name,
             .base_url = config.provider.base_url,
             .tools_trusted = self.trusted,
@@ -106,6 +110,7 @@ pub const Session = struct {
         try self.store.save(candidate.config.value);
         if (self.pending) |*pending| cfg.release(pending);
         self.pending = null;
+        self.initial_context = candidate.runtime.contextSnapshot();
         self.app = candidate;
     }
 };
@@ -129,6 +134,7 @@ test "pending session activates locally without a request and protects auth from
     try std.testing.expect(connection.current().tools_trusted);
     try connection.configure("fake-inline-session-key");
     try std.testing.expect(connection.current().runtime != null);
+    try std.testing.expectEqualDeep(session.app.?.runtime.contextSnapshot(), connection.current().initial_context.?);
     try std.testing.expect(connection.current().runtime.?.trusted);
     try std.testing.expect(connection.current().tools_trusted);
     try std.testing.expect(std.mem.find(u8, session.app.?.runtime.system, "fake-inline-session-key") == null);

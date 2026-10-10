@@ -11,6 +11,9 @@ const input = @import("input.zig");
 const text = @import("text.zig");
 const markdown = @import("markdown.zig");
 const theme = @import("theme.zig");
+const activity = @import("activity.zig");
+const presentation = @import("presentation.zig");
+const shared = @import("../presentation.zig");
 const bridge_module = @import("bridge.zig");
 const Io = std.Io;
 
@@ -24,6 +27,10 @@ const Kind = enum { user, assistant, reasoning, tool, notice };
 const Record = struct {
     /// 记录种类，决定标题与 Markdown 渲染方式。
     kind: Kind,
+    /// Adjacent bash captions share a compact line, not a raw result block.
+    command_row: bool = false,
+    final_answer: bool = false,
+    command_spans: std.ArrayList(presentation.CommandSpan) = .empty,
     /// Only a fully written frame commits transcript delivery. Pending survives index shifts.
     output: bool = false,
     pending_output: bool = false,
@@ -53,10 +60,39 @@ const Record = struct {
     fn deinit(self: *Record, a: std.mem.Allocator) void {
         self.invalidate();
         self.body.deinit(a);
+        self.command_spans.deinit(a);
+    }
+
+    fn appendCommand(self: *Record, a: std.mem.Allocator, caption: presentation.Caption, outcome: presentation.Outcome) !void {
+        const label = try presentation.commandText(a, caption, outcome);
+        defer a.free(label);
+        try self.command_spans.ensureUnusedCapacity(a, 1);
+        if (self.body.items.len != 0) try self.append(a, "  ·  ");
+        const start = self.body.items.len;
+        try self.append(a, label);
+        self.command_row = true;
+        self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome });
     }
 
     /// 追加文本。超出 record_limit 时截断，并在截断后忽略后续追加。
     fn append(self: *Record, a: std.mem.Allocator, bytes: []const u8) !void {
+        if (self.kind == .reasoning) {
+            // Thinking is a bounded rolling window, not a permanent transcript.
+            // Keep the newest UTF-8 suffix even after the first display limit.
+            var start = bytes.len -| record_limit;
+            while (start < bytes.len and bytes[start] & 0xc0 == 0x80) start += 1;
+            const suffix = bytes[start..];
+            var drop = self.body.items.len + suffix.len -| record_limit;
+            while (drop < self.body.items.len and self.body.items[drop] & 0xc0 == 0x80) drop += 1;
+            if (drop != 0) {
+                std.mem.copyForwards(u8, self.body.items, self.body.items[drop..]);
+                self.body.items.len -= drop;
+            }
+            try self.body.appendSlice(a, suffix);
+            self.clipped = self.clipped or start != 0 or drop != 0;
+            self.invalidate();
+            return;
+        }
         if (self.clipped) return;
         var end = @min(record_limit - self.body.items.len, bytes.len);
 
@@ -79,11 +115,19 @@ const Record = struct {
         errdefer arena.deinit();
         const temp = arena.allocator();
 
+        if (self.command_row) {
+            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns);
+            self.lines = try temp.dupe([]const u8, &.{line});
+            self.excerpt = false; // Commands indicate clipping with ... only.
+            self.columns = columns;
+            self.cache = arena;
+            return;
+        }
         // 截断时追加提示，但提示只用于显示，模型历史保持不变。
-        const data = if (self.clipped) try std.fmt.allocPrint(temp, "{s}\n[display clipped; model history is unchanged]", .{self.body.items}) else self.body.items;
+        const data = if (self.clipped and self.kind != .reasoning) try std.fmt.allocPrint(temp, "{s}\n[display clipped; model history is unchanged]", .{self.body.items}) else self.body.items;
         const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = 4096, .markdown = self.kind == .assistant or self.kind == .reasoning, .tone = if (self.kind == .user) .user else if (self.kind == .reasoning or self.kind == .notice) .muted else .normal });
         self.lines = rendered.lines;
-        self.excerpt = rendered.truncated or rendered.degraded or rendered.total_lines > rendered.lines.len;
+        self.excerpt = self.clipped or rendered.truncated or rendered.degraded or rendered.total_lines > rendered.lines.len;
         self.columns = columns;
 
         // arena 所有权转移给 Record；之后由 invalidate 统一释放。
@@ -103,6 +147,8 @@ pub const Connection = struct {
 
     pub const State = struct {
         runtime: ?*r.Runtime,
+        /// Immutable app-prepared startup snapshot; no runtime dereference in draw.
+        initial_context: ?r.ContextSnapshot = null,
         model: []const u8,
         base_url: []const u8,
         /// 应用层的启动策略快照，不读取工作线程可变的 Runtime.trusted。
@@ -167,7 +213,7 @@ const Ui = struct {
     draft: ?usize = null,
     /// 正在流式接收的推理记录索引。
     reasoning: ?usize = null,
-    /// 默认流式显示供应商提供的可见推理，Ctrl+R 可隐藏后续/历史预览。
+    /// 默认在三行临时窗口显示可见推理；正文开始后丢弃，不进入滚屏/历史。
     /// 不推断或解密供应商未公开的隐藏推理。
     show_reasoning: bool = true,
     /// 当前待审批的请求；null 表示没有审批。
@@ -191,15 +237,23 @@ const Ui = struct {
     poisoned: bool = false,
     /// 是否需要重绘，由事件与按键置位。
     dirty: bool = true,
-    /// 运行时当前状态，用于状态栏显示。
+    /// UI接收状态：用于计时/忙碌标记，不显示常驻mode文字。
     mode: ?r.State = null,
-    /// 状态栏的提示文本。
+    /// 仅必要的错误、设置和隔离提示使用临时hint。
     notice: []const u8 = "Ready",
     log_warning_seen: bool = false,
-    /// 上一次运行的终态结果，用于状态栏与用量显示。
+    /// UI receipt clock and bounded statistics; never read worker-owned timing.
+    clock_ms: u64 = 0,
+    animation_tick: u64 = 0,
+    display: shared.State = .{},
+    model_flow: activity.Flow = .{},
+    active_tool: ?struct { id: u64, caption: presentation.Caption } = null,
+    /// Shared canonical FIFO; renderer adds terminal widths/icons later.
+    tool_calls: shared.tools.Queue = .{},
+    /// Replaceable until the batch ends; consecutive bash captions share a row.
+    command_group: ?usize = null,
+    /// 上一次终态用于失败详情和cleanup安全检查，不显示统计栏。
     last_terminal: ?r.Terminal = null,
-    /// 实际使用的协议；可能因 Responses 不支持而降级为 Chat。
-    effective_protocol: ?p.Protocol = null,
     /// 后台任务描述与结果；只在 submit 中赋值。
     job: task.Job,
     /// 后台 worker 的 future；非 null 表示任务已启动，complete 时 await。
@@ -234,6 +288,9 @@ const Ui = struct {
         if (self.future) |*future| future.await(self.io);
         if (self.prompt) |prompt| self.allocator.free(prompt);
         self.clearPermission();
+        self.clearActiveTool();
+        self.clearToolCaptions();
+        self.tool_calls.deinit(self.allocator);
         if (self.frame_arena) |*arena| arena.deinit();
         for (self.records.items) |*record| record.deinit(self.allocator);
         self.records.deinit(self.allocator);
@@ -262,6 +319,7 @@ const Ui = struct {
             removed.deinit(self.allocator);
             if (self.draft) |i| self.draft = if (i == 0) null else i - 1;
             if (self.reasoning) |i| self.reasoning = if (i == 0) null else i - 1;
+            if (self.command_group) |i| self.command_group = if (i == 0) null else i - 1;
             self.dropped_display = true;
         }
 
@@ -272,66 +330,148 @@ const Ui = struct {
         return index;
     }
 
-    /// 将文本追加到当前流式草稿（助手正文或推理）；没有草稿时新建一条。
+    fn removeRecord(self: *Ui, index: usize) void {
+        var removed = self.records.orderedRemove(index);
+        removed.deinit(self.allocator);
+        if (self.draft) |i| self.draft = if (i == index) null else if (i > index) i - 1 else i;
+        if (self.reasoning) |i| self.reasoning = if (i == index) null else if (i > index) i - 1 else i;
+        if (self.command_group) |i| self.command_group = if (i == index) null else if (i > index) i - 1 else i;
+    }
+
+    fn discardReasoning(self: *Ui) void {
+        self.removeRecord(self.reasoning orelse return);
+    }
+
+    fn clearActiveTool(self: *Ui) void {
+        if (self.active_tool) |active| active.caption.deinit(self.allocator);
+        self.active_tool = null;
+    }
+
+    fn clearToolCaptions(self: *Ui) void {
+        self.tool_calls.clear(self.allocator);
+    }
+
+    fn captureToolCaptions(self: *Ui, blocks: []const p.Block) !void {
+        self.command_group = null;
+        try self.tool_calls.capture(self.allocator, blocks);
+    }
+
+    fn nextToolCaption(self: *Ui, name: []const u8) !presentation.Caption {
+        const call = try self.tool_calls.take(name, self.allocator);
+        defer call.deinit(self.allocator);
+        return presentation.fromCall(self.allocator, call);
+    }
+
+    fn toolCompleted(self: *Ui, caption: presentation.Caption, result: r.Execution) !void {
+        const completion = shared.tools.Completion.fromExecution(result);
+        const outcome = completion.outcome;
+        const observed = if (outcome == .success) try presentation.completed(self.allocator, caption, completion.file_stats) else presentation.Caption{ .kind = caption.kind, .label = try self.allocator.dupe(u8, caption.label) };
+        defer observed.deinit(self.allocator);
+        if (caption.kind == .bash and self.command_group != null) {
+            try self.records.items[self.command_group.?].appendCommand(self.allocator, observed, outcome);
+            return;
+        }
+        self.command_group = null;
+        const index = try self.add(.tool, "");
+        try self.records.items[index].appendCommand(self.allocator, observed, outcome);
+        if (caption.kind == .bash) self.command_group = index;
+    }
+
+    /// An active command is replaceable, never a success transcript row.
+    fn pendingCommand(self: *Ui, a: std.mem.Allocator, prior: ?*Record, columns: usize) ![]const u8 {
+        const label = try presentation.commandText(a, self.active_tool.?.caption, .pending);
+        const body = if (prior) |record| try std.fmt.allocPrint(a, "{s}  ·  {s}", .{ record.body.items, label }) else label;
+        var spans: std.ArrayList(presentation.CommandSpan) = .empty;
+        defer spans.deinit(a);
+        if (prior) |record| try spans.appendSlice(a, record.command_spans.items);
+        try spans.append(a, .{ .start = if (prior) |record| record.body.items.len + "  ·  ".len else 0, .end = body.len, .outcome = .pending });
+        return presentation.commandLine(a, body, spans.items, columns);
+    }
+
+    /// Only actionable notices/errors use a temporary hint row. Completed,
+    /// mode, usage and performance have no rows; the composer owns activity.
+    fn hint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
+        if (self.secret_quarantine) return std.fmt.allocPrint(a, "{s} | Ctrl+U resume; Ctrl+D exit", .{if (std.mem.eql(u8, self.notice, "Saved locally; send a message to connect")) self.notice else "Secret paste drained"});
+        if (self.secret_mode) return "Enter save | Ctrl+U erase | Ctrl+C cancel | Ctrl+D exit";
+        var notice: []const u8 = "";
+        if (self.last_terminal) |result| {
+            if (result.status != .success) notice = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ self.notice, if (result.detail != null) ": " else "", if (result.detail) |err| @errorName(err) else "", if (result.model_failure != null) " / " else "", if (result.model_failure) |failure| @tagName(failure) else "" });
+        }
+        if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
+        if (notice.len == 0 and state.runtime == null) notice = "Not configured: /auth";
+        if (state.log_error) |err| return std.fmt.allocPrint(a, "{s}{s}REC FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
+        if (!state.logging_enabled) return std.fmt.allocPrint(a, "{s}{s}recording off", .{ notice, if (notice.len != 0) " | " else "" });
+        return notice;
+    }
+
+    /// 正文的首个非空增量替换三行思考；迟到的推理不再抢回正文区域。
     fn appendDraft(self: *Ui, kind: Kind, value: []const u8) !void {
+        if (value.len == 0) return;
+        if (kind == .reasoning and self.draft != null) return;
+        if (kind == .assistant) self.discardReasoning();
         const prior = if (kind == .reasoning) self.reasoning else self.draft;
         const index = prior orelse try self.add(kind, "");
         try self.records.items[index].append(self.allocator, value);
         if (kind == .reasoning) self.reasoning = index else self.draft = index;
     }
 
-    /// 用运行时最终确认的内容替换流式草稿，使显示与模型历史一致（canonical）。
-    fn replaceCommitted(self: *Ui, blocks: []const p.Block, clipped: bool) !void {
-        // 先清空现有草稿的内容，再用 canonical 块重新填充。
+    /// Canonical visible body replaces the draft. Reasoning is deliberately not
+    /// retained in UI history; Runtime protocol history remains untouched.
+    fn replaceCommitted(self: *Ui, blocks: []const p.Block, clipped: bool, blocks_complete: bool) !void {
+        self.command_group = null;
+        self.discardReasoning();
         if (self.draft) |i| {
             self.records.items[i].body.clearRetainingCapacity();
             self.records.items[i].clipped = false;
             self.records.items[i].invalidate();
         }
-        if (self.reasoning) |i| {
-            self.records.items[i].body.clearRetainingCapacity();
-            self.records.items[i].clipped = false;
-            self.records.items[i].invalidate();
-        }
-
         for (blocks) |block| switch (block) {
             .text => |v| try self.appendDraft(.assistant, v),
-            .reasoning => |v| try self.appendDraft(.reasoning, v),
             else => {},
         };
-
-        // 显示被截断时只在草稿上标记 clipped，canonical 内容本身不受影响。
         if (clipped) {
-            for ([_]?usize{ self.draft, self.reasoning }) |index| if (index) |i| {
+            if (self.draft) |i| {
                 self.records.items[i].clipped = true;
                 self.records.items[i].invalidate();
-            };
+            }
         }
-
+        if (self.draft) |i| {
+            if (self.records.items[i].body.items.len == 0) {
+                self.removeRecord(i);
+            } else {
+                self.records.items[i].final_answer = shared.answer.classify(blocks, blocks_complete) == .final;
+            }
+        }
         self.draft = null;
-        self.reasoning = null;
     }
 
     /// 把一个 bridge 事件应用到 UI 状态：追加文本、更新状态、插入审批或工具记录等。
     fn event(self: *Ui, item: bridge_module.Item) !void {
         self.dirty = true;
+        self.display.observe(item.event, self.clock_ms);
         switch (item.event) {
-            .state => |state| self.mode = state,
+            .state => |state| {
+                self.mode = state;
+                if (state == .calling_model or state == .compacting) self.command_group = null;
+            },
             .text => |v| {
                 try self.appendDraft(.assistant, v);
-                if (item.display_truncated) {
+                if (item.display_truncated and self.draft != null) {
                     self.records.items[self.draft.?].clipped = true;
                     self.records.items[self.draft.?].invalidate();
                 }
             },
             .reasoning => |v| {
                 try self.appendDraft(.reasoning, v);
-                if (item.display_truncated) {
+                if (item.display_truncated and self.reasoning != null) {
                     self.records.items[self.reasoning.?].clipped = true;
                     self.records.items[self.reasoning.?].invalidate();
                 }
             },
-            .assistant_committed => |blocks| try self.replaceCommitted(blocks, item.display_truncated),
+            .assistant_committed => |blocks| {
+                try self.captureToolCaptions(blocks);
+                try self.replaceCommitted(blocks, item.display_truncated, item.canonical_complete);
+            },
             .permission => |permission| {
                 // 新审批到来时先释放旧的；粘贴标记沿用到这次请求。
                 self.clearPermission();
@@ -340,20 +480,27 @@ const Ui = struct {
                 self.permission_scroll = 0;
             },
             .tool_started => |tool| {
-                const title = try std.fmt.allocPrint(self.allocator, "Running {s} (#{d})", .{ tool.name, tool.id });
-                defer self.allocator.free(title);
-                _ = try self.add(.notice, title);
+                self.clearActiveTool();
+                self.active_tool = .{ .id = tool.id, .caption = try self.nextToolCaption(tool.name) };
             },
             .tool_result => |tool| {
-                const title = try std.fmt.allocPrint(self.allocator, "{s} #{d}: {s}\n{s}", .{ tool.name, tool.id, if (tool.result.is_error) "error" else "completed", tool.result.text });
-                defer self.allocator.free(title);
-                const i = try self.add(.tool, title);
-                self.records.items[i].clipped = self.records.items[i].clipped or item.display_truncated;
+                // FIFO also covers prepare failures/denials without a start.
+                // Raw results stay in Runtime/archives, never UI JSON.
+                if (self.active_tool) |active| {
+                    if (active.id == tool.id) {
+                        try self.toolCompleted(active.caption, tool.result);
+                        self.clearActiveTool();
+                    }
+                } else {
+                    const caption = try self.nextToolCaption(tool.name);
+                    defer caption.deinit(self.allocator);
+                    try self.toolCompleted(caption, tool.result);
+                }
             },
-            .usage => |usage| self.effective_protocol = usage.protocol,
+            .context_snapshot => {},
+            .usage => {},
             .fallback => {
                 // Responses 不支持时仅降级一次，之后本进程都使用 Chat。
-                self.effective_protocol = .chat;
                 _ = try self.add(.notice, "Responses unsupported: switched once to Chat for this process.");
             },
             .compacted => |v| {
@@ -365,7 +512,8 @@ const Ui = struct {
                 _ = try self.add(.notice, @errorName(err));
             },
             // 这些事件对 UI 没有需要展示的内容。
-            .finished, .tool_preview => {},
+            .finished => {},
+            .tool_preview => {},
         }
     }
 
@@ -427,6 +575,10 @@ const Ui = struct {
         self.mode = .calling_model;
         self.last_terminal = null;
         self.notice = "Running";
+        self.display.reset(self.clock_ms);
+        self.clearActiveTool();
+        self.clearToolCaptions();
+        self.command_group = null;
         self.scroll = 0;
         self.editor.clear();
     }
@@ -596,21 +748,25 @@ const Ui = struct {
         self.allocator.free(self.prompt.?);
         self.prompt = null;
         self.last_terminal = try self.job.result();
+        // Shared state applies owner-produced terminal context after join.
+        self.display.finish(self.last_terminal.?, self.clock_ms);
         const result = self.last_terminal.?;
 
         // 清理失败或无法安全继续时进入 poisoned，禁止再次提交。
         self.poisoned = if (result.detail) |detail| detail == error.CleanupFailed or detail == error.UnsafeToContinue else false;
         self.notice = switch (result.status) {
-            .success => "Completed",
+            .success => "Ready",
             .canceled => "Canceled; prior side effects remain",
             .failed => "Failed",
         };
 
         // 任务结束时仍未收到 canonical 内容的草稿，标记为中断。
         if (self.draft) |i| self.records.items[i].interrupted = true;
-        if (self.reasoning) |i| self.records.items[i].interrupted = true;
+        self.discardReasoning();
         self.draft = null;
-        self.reasoning = null;
+        self.clearActiveTool();
+        self.clearToolCaptions();
+        self.command_group = null;
         self.mode = null;
         self.dirty = true;
     }
@@ -621,6 +777,11 @@ const Ui = struct {
         var buffer: [4096]u8 = undefined;
         defer std.crypto.secureZero(u8, &buffer);
         while (true) {
+            self.clock_ms = @intCast(@max(0, Io.Clock.awake.now(self.io).toMilliseconds()));
+            if (self.busy and self.animation_tick != self.clock_ms / 80) {
+                self.animation_tick = self.clock_ms / 80;
+                self.dirty = true;
+            }
             // 每轮最多处理 64 个事件，避免大量输出阻塞输入与绘制。
             for (0..64) |_| {
                 var item = self.bridge.pop() orelse break;
@@ -632,7 +793,7 @@ const Ui = struct {
             if (self.busy and self.job.done.load(.acquire)) try self.complete();
             if (!self.log_warning_seen and self.connection.current().log_error != null) {
                 self.log_warning_seen = true;
-                // 保留 Completed/Failed/Canceled；记录故障由持久 header 单独提示。
+                // 记录故障有独立临时hint，不改变Runtime任务结果。
                 if (self.last_terminal == null) self.notice = "Session recording failed; records may be incomplete";
                 self.dirty = true;
             }
@@ -774,15 +935,16 @@ const Ui = struct {
         // replaceable preview until canonical commit; model ANSI is never emitted.
         var lines: std.ArrayList([]const u8) = .empty;
         const preview = self.scroll != 0;
+        var active_shown = false;
         var transcript_rows: usize = 0;
         for (self.records.items, 0..) |*record, index| {
-            if (record.kind == .reasoning and !self.show_reasoning) continue;
-            const drafting = self.draft == index or self.reasoning == index;
+            if (record.kind == .reasoning) continue;
+            const drafting = self.draft == index or self.command_group == index;
             try record.layout(self.allocator, @max(1, cols));
-            const heading = if (record.interrupted) "Interrupted response — preview" else if (record.kind == .reasoning) "Thinking" else if (record.excerpt) "Display excerpt" else "";
+            const heading = if (record.interrupted) "Interrupted response — preview" else if (record.final_answer and record.excerpt) "=> Final answer · display excerpt" else if (record.final_answer) "=> Final answer" else if (record.excerpt) "Display excerpt" else "";
             if (cols >= 8 and !record.output and !drafting) {
                 if (heading.len != 0) {
-                    try putToneLine(writer, a, 1, heading, cols, theme.muted);
+                    try putToneLine(writer, a, 1, heading, cols, if (record.final_answer) theme.heading else theme.muted);
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
                 }
@@ -791,6 +953,8 @@ const Ui = struct {
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
                 }
+                // Separate command records from prose; grouped bash still
+                // occupies one record/row, not one row per result.
                 try writer.writeAll("\r\n");
                 transcript_rows += 1;
                 record.pending_output = true;
@@ -800,24 +964,43 @@ const Ui = struct {
                     const headings = try markdown.render(a, heading, .{ .columns = @max(1, cols), .max_lines = 32, .markdown = false, .tone = .muted });
                     try lines.appendSlice(a, headings.lines);
                 }
-                try lines.appendSlice(a, record.lines);
+                if (!preview and self.command_group == index and self.active_tool != null and self.active_tool.?.caption.kind == .bash) {
+                    try lines.append(a, try self.pendingCommand(a, record, @max(1, cols)));
+                    active_shown = true;
+                } else try lines.appendSlice(a, record.lines);
+                if (record.kind == .tool) try lines.append(a, "");
             }
+        }
+        if (!preview and !active_shown and self.active_tool != null) try lines.append(a, try self.pendingCommand(a, null, @max(1, cols)));
+        const thinking = if (self.show_reasoning and !preview and self.draft == null) self.reasoning else null;
+        var thinking_lines: []const []const u8 = &.{};
+        if (thinking) |index| {
+            const record = &self.records.items[index];
+            try record.layout(self.allocator, @max(1, cols));
+            thinking_lines = record.lines[record.lines.len -| 3..];
         }
         const secret_destination = if (self.secret_mode) blk: {
             const state = self.connection.current();
             break :blk try std.fmt.allocPrint(a, "API key for model {s}\nBase URL: {s}\nEnter saves locally; no network request is made here", .{ state.model, state.base_url });
         } else "";
         const secret_lines = try markdown.render(a, secret_destination, .{ .columns = @max(1, cols), .max_lines = 8, .markdown = false });
-        const body_limit = self.size.rows -| 5;
+        const state = self.connection.current();
+        // App-prepared immutable value, including local /auth activation.
+        // Draw never dereferences Runtime, not even a fixture/idle pointer.
+        self.display.seed(state.initial_context);
+        const hint_line = try self.hint(a, state);
+        // Always reserve one EMPTY row between conversation and composer.
+        const footer_rows: usize = 2 + @as(usize, @intFromBool(hint_line.len != 0));
+        const body_limit = self.size.rows -| footer_rows;
         const wanted_body = if (self.permission) |permission|
             @min(body_limit, 1 + @max(1, (try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false })).lines.len))
-        else if (self.secret_mode) secret_lines.lines.len else @min(lines.items.len + @as(usize, @intFromBool(preview or self.draft != null or self.reasoning != null)), body_limit);
+        else if (self.secret_mode) secret_lines.lines.len else if (thinking != null) @min(3, body_limit) else @min(lines.items.len + @as(usize, @intFromBool(preview or self.draft != null)), body_limit);
         // Initial blank space keeps the first conversation at the top. Each
         // immutable row consumes it; expanding drafts scroll old content upward.
         // Never shrink a tail without replacing it by committed rows: the editor
         // therefore stays on the physical bottom row, without absolute positioning.
         const available = if (self.tail_height == 0 or self.abandon_tail) self.size.rows else self.tail_height;
-        const rows = @min(self.size.rows, @max(5 + wanted_body, available -| transcript_rows));
+        const rows = @min(self.size.rows, @max(footer_rows + wanted_body, available -| transcript_rows));
 
         // 终端太小时只显示提示，避免布局越界。
         // 审批标题之外至少留一行正文；尺寸不足不属于永久的 clipped 状态。
@@ -827,15 +1010,7 @@ const Ui = struct {
             try writer.writeAll("\r\x1b[?25h");
             self.frame_permission = null;
         } else {
-            const state = self.connection.current();
-            const log_status = if (state.runtime == null) "" else if (state.log_error) |err|
-                try std.fmt.allocPrint(a, " | REC FAILED: {s}", .{@errorName(err)})
-            else if (state.logging_enabled) " | .thin/sessions" else " | recording off";
-            const header = try std.fmt.allocPrint(a, "thin | {s} | {s}{s}{s}{s}", .{ state.model, if (state.runtime == null) "not configured: /auth" else if (self.effective_protocol) |protocol| @tagName(protocol) else "configured/auto", if (state.runtime != null and state.tools_trusted) " | tools trusted" else "", log_status, if (self.dropped_display) " | older display clipped" else "" });
-
-            // 正文从拥有的尾区顶部开始；底部依次为主题栏、状态、用量、
-            // 快捷键和输入行。已提交内容继续向终端滚屏追加，不重复输出。
-            const body_rows = rows - 5;
+            const body_rows = rows - footer_rows;
             if (self.secret_mode) {
                 for (0..body_rows) |line| try putStyled(writer, 1 + line, if (line < secret_lines.lines.len) secret_lines.lines[line] else "");
                 self.frame_permission = null;
@@ -859,10 +1034,16 @@ const Ui = struct {
                 const start = @min(self.permission_scroll, all.lines.len -| (body_rows - 1));
                 for (0..body_rows - 1) |line| try putStyled(writer, 2 + line, if (start + line < all.lines.len) all.lines[start + line] else "");
                 self.frame_permission = permission.id;
+            } else if (thinking != null) {
+                // Latest THREE content rows, without any title/prefix.
+                const visible_rows = @min(3, body_rows);
+                const start = thinking_lines.len -| visible_rows;
+                for (0..body_rows) |line| try putStyled(writer, 1 + line, if (line < visible_rows and start + line < thinking_lines.len) thinking_lines[start + line] else "");
+                self.frame_permission = null;
             } else {
                 // 有界 live draft / retained history preview，不重写终端滚屏。
                 // 从底部向上回退 scroll 行，得到显示窗口的结束位置。
-                const live = self.draft != null or self.reasoning != null;
+                const live = self.draft != null;
                 const has_title = preview or live;
                 const content_rows = body_rows -| @as(usize, @intFromBool(has_title));
                 const end = lines.items.len -| @min(self.scroll, lines.items.len -| content_rows);
@@ -878,17 +1059,8 @@ const Ui = struct {
                 self.frame_permission = null;
             }
 
-            try putToneLine(writer, a, rows - 4, header, cols, theme.accent);
-
-            // 状态栏：有运行态时加前缀 mode，有终态时附加错误信息。
-            var status: []const u8 = self.notice;
-            if (self.mode) |mode| status = try std.fmt.allocPrint(a, "{s} | {s}", .{ @tagName(mode), self.notice });
-            if (self.last_terminal) |result| status = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ self.notice, if (result.detail != null) ": " else "", if (result.detail) |err| @errorName(err) else "", if (result.model_failure != null) " / " else "", if (result.model_failure) |failure| @tagName(failure) else "" });
-            try putToneLine(writer, a, rows - 3, status, cols, theme.accent);
-
-            const usage_line = if (self.last_terminal) |result| try std.fmt.allocPrint(a, "tokens normal in:{s} out:{s} cached:{s} | summary in:{s} out:{s} | cost:unknown", .{ try counter(a, result.usage.normal.input_tokens), try counter(a, result.usage.normal.output_tokens), try counter(a, result.usage.normal.cached_input_tokens), try counter(a, result.usage.summary.input_tokens), try counter(a, result.usage.summary.output_tokens) }) else "Usage pending | cost:unknown | Ctrl+R toggles visible reasoning";
-            try putToneLine(writer, a, rows - 2, usage_line, cols, theme.muted);
-            try putLine(writer, a, rows - 1, if (self.secret_quarantine) "Secret paste drained: Ctrl+U to resume | Ctrl+D exit" else if (self.secret_mode) "Enter save | Ctrl+U erase | Ctrl+C cancel | Ctrl+D exit" else if (state.runtime == null) "/auth setup (no key argument) | Ctrl+C clear | Ctrl+D exit" else "Enter send | Ctrl+J newline | Ctrl+C cancel | Ctrl+D exit | PgUp/PgDn scroll", cols);
+            if (hint_line.len != 0) try putToneLine(writer, a, rows - 2, hint_line, cols, theme.muted);
+            try putLine(writer, a, rows - 1, "", cols);
 
             if (self.secret_mode or self.secret_quarantine) {
                 // Only a bounded mask is copied to the frame; never format secret bytes.
@@ -906,22 +1078,30 @@ const Ui = struct {
                 const visible: []const u8 = if (hide_arguments) "/auth [arguments hidden; no key argument]" else self.editor.bytes.items;
                 const cursor = if (hide_arguments) visible.len else self.editor.cursor;
                 const begin = if (std.mem.findScalarLast(u8, visible[0..cursor], '\n')) |index| index + 1 else 0;
+                const working = self.busy or self.mode != null or self.active_tool != null;
+                const view = self.display.view(self.clock_ms);
+                self.model_flow.advance(self.clock_ms, working, view.live_tps_tenths);
+                const decoration = try presentation.prompt(a, state.model, view.context, cols, working, self.clock_ms, self.model_flow.step());
+                const decoration_width = text.width(decoration.plain);
                 const prefix = try editorDisplay(a, visible[begin..cursor]);
                 var start: usize = 0;
                 var width = text.width(prefix);
                 // 输入过长时从左侧裁剪，保证光标所在位置可见。
-                while (width > cols - 3 and start < prefix.len) {
+                while (width > cols -| (decoration_width + 1) and start < prefix.len) {
                     const cluster = text.nextCluster(prefix, start, 0);
                     width -|= cluster.width;
                     start = cluster.end;
                 }
                 const tail = visible[cursor..];
                 const suffix = try editorDisplay(a, tail[0..(std.mem.findScalar(u8, tail, '\n') orelse tail.len)]);
-                const input_line = try std.fmt.allocPrint(a, "> {s}{s}", .{ prefix[start..], suffix });
-                try putToneLine(writer, a, rows, input_line, cols, theme.accent);
+                const suffix_end = fittingBytes(suffix, cols -| (decoration_width + width));
+                // Only model letters carry SGR; marker/editor are default colors.
+                const input_line = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ decoration.styled, prefix[start..], suffix[0..suffix_end] });
+                try putStyled(writer, rows, input_line);
 
-                // 光标移到输入行并重新显示；+3 为 "> " 提示符占用的列加一列。
-                try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, width + 3) - 1});
+                // Decoration participates in clipping AND cursor positioning;
+                // editing/submitted raw bytes remain untouched.
+                try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, width + decoration_width + 1) - 1});
             }
         }
 
@@ -948,9 +1128,16 @@ fn editorDisplay(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     return out.toOwnedSlice(a);
 }
 
-/// 把可选计数格式化为十进制字符串；未知值显示为 "?"。
-fn counter(a: std.mem.Allocator, value: ?u64) ![]const u8 {
-    return if (value) |n| std.fmt.allocPrint(a, "{d}", .{n}) else "?";
+fn fittingBytes(bytes: []const u8, columns: usize) usize {
+    var at: usize = 0;
+    var cells: usize = 0;
+    while (at < bytes.len) {
+        const cluster = text.nextCluster(bytes, at, cells);
+        if (cells + cluster.width > columns) break;
+        cells += cluster.width;
+        at = cluster.end;
+    }
+    return at;
 }
 
 /// 顺序输出一行；row 只区别首行是否换行，不是绝对坐标。清理自身行并复位样式。
@@ -1017,12 +1204,12 @@ test "regular transcript starts at top and keeps composer at bottom without role
     ui.finishFrame();
     try std.testing.expect(ui.records.items[0].output);
     try std.testing.expect(!ui.records.items[1].output);
-    try ui.replaceCommitted(&.{.{ .text = "unique canonical reply" }}, false);
+    try ui.replaceCommitted(&.{.{ .text = "unique canonical reply" }}, false, true);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique committed user") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "uncanonical draft") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") != null);
-    try std.testing.expectEqual(@as(usize, 20), ui.frame_height);
+    try std.testing.expectEqual(@as(usize, 19), ui.frame_height);
     try screen.replay(ui.frame);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     ui.finishFrame();
@@ -1031,12 +1218,12 @@ test "regular transcript starts at top and keeps composer at bottom without role
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     try std.testing.expectEqual(@as(usize, 1), screen.count("unique canonical reply"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") == null);
-    try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[19A"));
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[18A"));
     for ([_][]const u8{ "1049", "1047", "\x1b[H", "\x1b[2J", ";1H" }) |forbidden|
         try std.testing.expect(std.mem.find(u8, ui.frame, forbidden) == null);
 }
 
-test "growing a five row live tail keeps replaceable drafts out of scrollback" {
+test "growing a compact live tail keeps replaceable drafts out of scrollback" {
     for ([_]bool{ false, true }) |same_final| {
         var cancel: p.Cancellation = .{};
         var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -1052,18 +1239,18 @@ test "growing a five row live tail keeps replaceable drafts out of scrollback" {
         try ui.draw();
         try screen.replay(ui.frame);
         ui.finishFrame();
-        try std.testing.expectEqual(@as(usize, 5), ui.tail_height);
+        try std.testing.expectEqual(@as(usize, 3), ui.tail_height);
         try std.testing.expectEqual(@as(usize, 23), screen.row);
 
         try ui.appendDraft(.assistant, "growth-draft-marker\nsecond-draft-line");
         try ui.draw();
         try screen.replay(ui.frame);
         ui.finishFrame();
-        try std.testing.expectEqual(@as(usize, 8), ui.tail_height);
+        try std.testing.expectEqual(@as(usize, 6), ui.tail_height);
         try std.testing.expectEqual(@as(usize, 23), screen.row);
         for (screen.history[0..screen.history_len]) |line| try std.testing.expect(std.mem.find(u8, &line, "growth-draft-marker") == null);
 
-        try ui.replaceCommitted(&.{.{ .text = if (same_final) "growth-draft-marker" else "different-final-marker" }}, false);
+        try ui.replaceCommitted(&.{.{ .text = if (same_final) "growth-draft-marker" else "different-final-marker" }}, false, true);
         try ui.draw();
         try screen.replay(ui.frame);
         ui.finishFrame();
@@ -1074,40 +1261,350 @@ test "growing a five row live tail keeps replaceable drafts out of scrollback" {
     }
 }
 
-test "visible reasoning streams by default and interrupted drafts remain explicit" {
+test "thinking scrolls in three rows and body replaces it without retaining reasoning" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    try ui.appendDraft(.reasoning, "provider-visible-reasoning");
-    try ui.appendDraft(.assistant, "partial-answer\x1b[2J");
-    const draft = ui.draft.?;
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.appendDraft(.reasoning, "think-one\nthink-two\nthink-three\nthink-four");
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "provider-visible-reasoning") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Thinking") != null);
+    try screen.replay(ui.frame);
+    try std.testing.expect(!screen.visible("think-one"));
+    for ([_][]const u8{ "think-two", "think-three", "think-four" }) |marker| try std.testing.expect(screen.visible(marker));
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    ui.finishFrame();
+    try std.testing.expect(!ui.records.items[0].output);
+    try ui.appendDraft(.reasoning, "\nthink-five\nthink-six");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expect(!screen.visible("think-two") and !screen.visible("think-three"));
+    for ([_][]const u8{ "think-four", "think-five", "think-six" }) |marker| try std.testing.expect(screen.visible(marker));
+    for (screen.history[0..screen.history_len]) |line| try std.testing.expect(std.mem.find(u8, &line, "think-") == null);
+    ui.finishFrame();
+
+    try ui.appendDraft(.assistant, "partial-answer\x1b[2J");
+    try ui.appendDraft(.reasoning, "late-reasoning");
+    try std.testing.expect(ui.reasoning == null);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expect(!screen.visible("Thinking"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("think-"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("late-reasoning"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
     ui.finishFrame();
+    const draft = ui.draft.?;
     try std.testing.expect(!ui.records.items[draft].output);
-    // Same finalization performed by complete after worker join and bridge drain.
+    // Cancellation keeps only the unfinished visible answer, explicitly marked.
     ui.records.items[draft].interrupted = true;
     ui.draft = null;
-    ui.reasoning = null;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Interrupted response") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "provider-visible-reasoning") != null);
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("Interrupted response"));
     ui.finishFrame();
-    try std.testing.expect(ui.records.items[0].output);
     ui.scroll = 1;
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "History preview") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "provider-visible-reasoning") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "think-") == null);
     ui.finishFrame();
-    ui.scroll = 0;
+}
+
+test "rolling thinking keeps latest bounded UTF8 suffix and can be hidden" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const large = try std.testing.allocator.alloc(u8, 3 * (record_limit / 3 + 10));
+    defer std.testing.allocator.free(large);
+    for (0..large.len / 3) |i| @memcpy(large[i * 3 ..][0..3], "你");
+    try ui.appendDraft(.reasoning, large);
+    try ui.appendDraft(.reasoning, "\nnewest-thinking");
+    const record = &ui.records.items[ui.reasoning.?];
+    try std.testing.expect(record.body.items.len <= record_limit);
+    try std.testing.expect(record.clipped);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(record.body.items));
+    try std.testing.expect(std.mem.endsWith(u8, record.body.items, "newest-thinking"));
     ui.show_reasoning = false;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "partial-answer") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "provider-visible-reasoning") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "newest-thinking") == null);
+    ui.finishFrame();
+    ui.show_reasoning = true;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "newest-thinking") != null);
+    ui.finishFrame();
+    ui.discardReasoning(); // Same cancellation cleanup as complete.
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "newest-thinking") == null);
+    ui.finishFrame();
+}
+
+test "tool animation is transient and raw tool JSON never enters displayed records" {
+    for ([_][]const u8{ "memory", "bash" }) |name| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.mode = .executing_tool;
+        const host = bridge.host();
+        try ui.captureToolCaptions(&.{.{ .tool_call = .{ .id = "fixture-call", .name = name, .arguments = "{\"command\":\"date\"}" } }});
+        try host.emit_fn(host.context, .{ .tool_started = .{ .id = 7, .name = name } }, &cancel);
+        var item = bridge.pop().?;
+        try ui.event(item);
+        item.deinit();
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+        try ui.draw();
+        try std.testing.expect(std.mem.find(u8, ui.frame, activity.spinner(0)) != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, if (std.mem.eql(u8, name, "bash")) "date" else "memory") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "#7") == null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "Running memory") == null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "Running bash") == null);
+        ui.finishFrame();
+        ui.clock_ms = 120;
+        try ui.draw();
+        try std.testing.expect(std.mem.find(u8, ui.frame, activity.spinner(120)) != null);
+        ui.finishFrame();
+        try host.emit_fn(host.context, .{ .tool_preview = .{ .index = 0, .arguments = "{\"hidden-tool-argument\":1}" } }, &cancel);
+        item = bridge.pop().?;
+        try ui.event(item);
+        item.deinit();
+        try host.emit_fn(host.context, .{ .tool_result = .{ .id = 7, .name = name, .result = .{ .text = "{\"hidden-tool-output\":1}" } } }, &cancel);
+        item = bridge.pop().?;
+        try ui.event(item);
+        item.deinit();
+        try std.testing.expect(ui.active_tool == null);
+        try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+        try ui.replaceCommitted(&.{.{ .text = "{\"requested-answer\":1}" }}, false, true);
+        try ui.draw();
+        try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-tool-") == null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "requested-answer") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "completed") == null);
+        ui.finishFrame();
+    }
+}
+
+test "consecutive bash captions share one row and prepare failures preserve FIFO labels" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .assistant_committed = &.{
+        .{ .tool_call = .{ .id = "one", .name = "bash", .arguments = "{\"command\":\"date\"}" } },
+        .{ .tool_call = .{ .id = "two", .name = "bash", .arguments = "{\"command\":\"pwd\"}" } },
+    } }, &cancel);
+    var item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    // A preparation failure without started consumes only its own caption.
+    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 1, .name = "bash", .result = .{ .text = "hidden-error-json", .is_error = true } } }, &cancel);
+    item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    try host.emit_fn(host.context, .{ .tool_started = .{ .id = 2, .name = "bash" } }, &cancel);
+    item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    try std.testing.expectEqualStrings("pwd", ui.active_tool.?.caption.label);
+    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 2, .name = "bash", .result = .{ .text = "hidden-output-json" } } }, &cancel);
+    item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqualStrings(">_ date [error]  ·  >_ pwd", ui.records.items[0].body.items);
+    try ui.draw();
+    try std.testing.expect(!ui.records.items[0].pending_output);
+    ui.finishFrame();
+    ui.command_group = null; // The next calling_model / completion seals the group.
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items[0].lines.len);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.failure ++ ">_ date [error]") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ ">_ pwd") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-") == null);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    var shared_row = false;
+    for (screen.grid) |line| if (std.mem.find(u8, &line, "date") != null and std.mem.find(u8, &line, "pwd") != null) {
+        shared_row = true;
+    };
+    try std.testing.expect(shared_row);
+    ui.finishFrame();
+}
+
+test "incomplete canonical block tails cannot publish a false final heading" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var blocks: [bridge_module.block_limit + 1]p.Block = @splat(.{ .text = "" });
+    blocks[0] = .{ .text = "intermediate-body" };
+    blocks[bridge_module.block_limit] = .{ .tool_call = .{ .id = "tail-tool", .name = "bash", .arguments = "{\"command\":\"pwd\"}" } };
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .assistant_committed = &blocks }, &cancel);
+    var item = bridge.pop().?;
+    defer item.deinit();
+    try std.testing.expect(item.display_truncated and !item.canonical_complete);
+    try ui.event(item);
+    try std.testing.expect(!ui.records.items[0].final_answer);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Final answer") == null);
+    ui.finishFrame();
+}
+
+test "tool only reasoning only and empty canonical bodies remove a previously visible draft" {
+    for ([_]p.Block{
+        .{ .tool_call = .{ .id = "id", .name = "bash", .arguments = "{}" } },
+        .{ .reasoning = "not-visible-canonical" },
+        .{ .text = "" },
+    }) |block| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        _ = try ui.add(.user, "retained-user");
+        try ui.appendDraft(.assistant, "provisional-body");
+        try ui.draw();
+        ui.finishFrame();
+        try ui.replaceCommitted(&.{block}, false, true);
+        try std.testing.expect(ui.draft == null and ui.records.items.len == 1);
+        try std.testing.expectEqual(Kind.user, ui.records.items[0].kind);
+        try ui.draw();
+        try std.testing.expect(std.mem.find(u8, ui.frame, "Final answer") == null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "provisional-body") == null);
+        ui.finishFrame();
+    }
+}
+
+test "file observation captions and final answer heading separate prose and context changes by value" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const cap = try presentation.caption(std.testing.allocator, "write_file", "{\"path\":\"src/main.zig\",\"content\":\"do-not-show-body\"}");
+    defer cap.deinit(std.testing.allocator);
+    try ui.toolCompleted(cap, .{ .text = "raw-json-must-stay-hidden", .file_stats = .{ .changes = .{ .modified = 1, .added = 2, .removed = 3 } } });
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .context_snapshot = .{ .tokens = 16384, .limit = 32768 } }, &cancel);
+    var item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    try ui.replaceCommitted(&.{.{ .text = "final-body-marker" }}, false, true);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "write_file src/main.zig  ~1 +2 -3 lines") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "raw-json-must-stay-hidden") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "do-not-show-body") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture) [ctx ~16384/32768 50.0%] > ") != null);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("=> Final answer") and screen.visible("final-body-marker"));
+    for (screen.grid[1]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    ui.finishFrame();
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("=> Final answer"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("final-body-marker"));
+    ui.finishFrame();
+}
+
+test "model only default color prompt has no headers cache or status and preserves cursor" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.editor.insert("hello\t你");
+    ui.display.normal_usage = .{ .input_tokens = 100, .cached_input_tokens = 90 };
+    try ui.appendDraft(.reasoning, "unprefixed-thought");
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Thinking") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "thin |") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "tools trusted") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, ".thin/sessions") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture) > hello    你") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "90.0%") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "(fixture)") == null);
+    const decoration = "(fixture) > ";
+    const position = try std.fmt.allocPrint(std.testing.allocator, "\r\x1b[{d}C\x1b[?25h", .{text.width(decoration) + text.width("hello    你")});
+    defer std.testing.allocator.free(position);
+    try std.testing.expect(std.mem.endsWith(u8, ui.frame, position));
+    try std.testing.expectEqualStrings("hello\t你", ui.editor.bytes.items);
+    ui.finishFrame();
+}
+
+test "single composer hides statistics and completion and uses flow and exact braille spinner" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.mode = .calling_model;
+    ui.display.meter.reset(0);
+    ui.display.meter.beginCall(0);
+    ui.display.meter.observe(100, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    ui.model_flow.advance(0, true, null);
+    ui.clock_ms = 600;
+    try ui.appendDraft(.assistant, "visible-body");
+    _ = try ui.editor.insert("typed-default-color");
+    try ui.draw();
+    for ([_][]const u8{ "TPS:", "TTFT:", "tokens in:", "summary in:", "cost:", "loading", "Completed", "calling_model" }) |removed| try std.testing.expect(std.mem.find(u8, ui.frame, removed) == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ ") " ++ "⠧ typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.model_flow[ui.model_flow.step()]) != null);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("visible-body"));
+    for (screen.grid[22]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[23], "(fixture) ~ typed-default-color") != null);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    ui.finishFrame();
+    ui.clock_ms = 680;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "⠇ typed-default-color") != null);
+    ui.finishFrame();
+    ui.mode = null;
+    ui.draft = null;
+    ui.notice = "Completed"; // Even old application success notices cannot add a row.
+    ui.last_terminal = .{ .status = .success, .usage = .{ .normal_calls = 1, .normal = .{ .input_tokens = 10562, .output_tokens = 873, .cached_input_tokens = 9600 } } };
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture) > typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Completed") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "tokens in:") == null);
+    ui.finishFrame();
+}
+
+test "flow model prefix clips long editor suffix without wrap or changing raw cursor bytes" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const raw: [200]u8 = @splat('x');
+    _ = try ui.editor.insert(&raw);
+    ui.editor.cursor = 1;
+    ui.mode = .calling_model;
+    ui.clock_ms = 80;
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "(fixture) ~ x"));
+    try std.testing.expect(std.mem.endsWith(u8, ui.frame, "\r\x1b[13C\x1b[?25h"));
+    for (screen.grid[22]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
+    try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
+    ui.finishFrame();
+    ui.editor.cursor = raw.len;
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    try std.testing.expect(std.mem.endsWith(u8, ui.frame, "\r\x1b[78C\x1b[?25h"));
+    try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
+    ui.finishFrame();
 }
 
 test "resize abandons unknown rows and old completed approval cannot authorize" {
@@ -1322,7 +1819,7 @@ test "paste terminator injection cannot authorize the visible permission" {
 }
 
 // 验证：canonical 推理内容保留显式的显示截断标记。
-test "canonical reasoning retains an explicit display clipping marker" {
+test "canonical reasoning is discarded even when clipped and body remains canonical" {
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -1330,9 +1827,14 @@ test "canonical reasoning retains an explicit display clipping marker" {
     defer ui.deinit();
 
     try ui.appendDraft(.reasoning, "old reasoning");
-    try ui.replaceCommitted(&.{.{ .reasoning = "bounded canonical reasoning" }}, true);
+    try ui.replaceCommitted(&.{ .{ .reasoning = "bounded canonical reasoning" }, .{ .text = "canonical body" } }, true, true);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqual(Kind.assistant, ui.records.items[0].kind);
     try std.testing.expect(ui.records.items[0].clipped);
-    try std.testing.expectEqualStrings("bounded canonical reasoning", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("canonical body", ui.records.items[0].body.items);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "reasoning") == null);
+    ui.finishFrame();
 }
 
 test "six-row approval cannot authorize and recovers after a complete visible frame" {
@@ -1446,7 +1948,7 @@ test "editor tabs expand before clipping and cursor placement but submit unchang
         ui.editor.cursor = case.cursor;
         try ui.draw();
         try std.testing.expect(std.mem.findScalar(u8, ui.frame, '\t') == null);
-        const expected = try std.fmt.allocPrint(std.testing.allocator, "\r\n\x1b[0m\x1b[2K{s}{s}\x1b[0m\r\x1b[{d}C\x1b[?25h", .{ theme.accent, case.line, case.column - 1 });
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "\r\n\x1b[0m\x1b[2K{s}\x1b[0m\r\x1b[{d}C\x1b[?25h", .{ case.line, case.column - 1 });
         defer std.testing.allocator.free(expected);
         try std.testing.expect(std.mem.endsWith(u8, ui.frame, expected));
         try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);
@@ -1594,6 +2096,11 @@ test "configure enables same-process submit without sending secrets or commands"
     try ui.parser.feed("\x1b[200~sk-fixture-secret\x1b[201~", sink);
     try ui.parser.feed("\rsecret-tail", sink);
     try std.testing.expectEqualStrings("Saved locally; send a message to connect", ui.notice);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Saved locally; send a message to connect") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Ctrl+U resume") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "sk-fixture-secret") == null);
+    ui.finishFrame();
     try std.testing.expectEqual(@as(usize, 1), fixture.saves);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);

@@ -3,6 +3,7 @@
 //! 中文：本模块只处理项目根目录内的 UTF-8 文本文件。所有访问都从已打开的目录 fd 出发，逐段 openat 解析路径，不依赖可被替换的绝对路径。
 
 const std = @import("std");
+const line_stats = @import("../util/line_stats.zig");
 
 /// 文本读取结果：data 为截取后的内容（由 allocator 复制），total_bytes 为文件总字节数，truncated 表示之后仍有未返回的内容。
 pub const ReadResult = struct { data: []const u8, total_bytes: u64, truncated: bool };
@@ -219,6 +220,32 @@ pub const Root = struct {
     /// Explicit mode is used by Memory; ordinary writes retain rwx bits only.
     /// 中文：原子写入流程：先写同目录临时文件，再 rename 覆盖或 linkat 仅在不存在时创建，目标文件要么是旧内容要么是完整新内容。
     pub fn writeMode(self: *Root, path: []const u8, content: []const u8, overwrite: bool, forced_mode: ?u32) !void {
+        try self.writeImpl(path, content, overwrite, forced_mode, null);
+    }
+
+    /// Optional line diff uses the SAME anchored old fd, before any mutation.
+    /// This is a snapshot observation, not a lock/CAS against external writers.
+    /// Stats allocation/read/complexity failure stays unknown, not write failure.
+    pub fn writeObserved(self: *Root, path: []const u8, content: []const u8, overwrite: bool) !?line_stats.Changes {
+        var changes: ?line_stats.Changes = null;
+        try self.writeImpl(path, content, overwrite, null, &changes);
+        return changes; // Value only: no fallible work after rename/link commit.
+    }
+
+    fn observeChanges(self: *Root, old: c_int, size: u64, content: []const u8) !?line_stats.Changes {
+        if (size > line_stats.max_bytes or content.len > line_stats.max_bytes) return null;
+        const before = self.allocator.alloc(u8, @intCast(size)) catch return null;
+        defer self.allocator.free(before);
+        const n = fileFromFd(old).readPositionalAll(self.io, before, 0) catch |err| {
+            if (err == error.Canceled) return err;
+            return null;
+        };
+        if (n != before.len) return null;
+        validateText(before) catch return null;
+        return line_stats.compare(self.allocator, before, content) catch null;
+    }
+
+    fn writeImpl(self: *Root, path: []const u8, content: []const u8, overwrite: bool, forced_mode: ?u32, observed: ?*?line_stats.Changes) !void {
         // 先校验文本，避免写入临时文件后才发现内容非法。
         try validateText(content);
         var p = try self.parent(path);
@@ -234,7 +261,10 @@ pub const Root = struct {
             const stat = try fileFromFd(old).stat(self.io);
             if (stat.kind != .file) return error.NotRegularFile;
             if (forced_mode == null) mode = stat.permissions.toMode() & 0o777;
-        } else if (std.c._errno().* != 2) return osError();
+            if (observed) |out| out.* = try self.observeChanges(old, stat.size, content);
+        } else if (std.c._errno().* != 2) return osError() else if (observed) |out| {
+            out.* = .{ .added = line_stats.count(content) };
+        }
 
         // 临时文件名形如 .thin-tmp-<32 位十六进制随机数>，80 字节缓冲区足够容纳。
         var name_buffer: [80]u8 = undefined;

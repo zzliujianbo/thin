@@ -105,6 +105,11 @@ const Driver = struct {
         return error.VisibleTextTimeout;
     }
 
+    /// Completion has no status label: the unstyled idle marker follows join.
+    fn waitIdle(self: *Driver, start: usize) !void {
+        try self.waitText(start, "] > ");
+    }
+
     /// Fixed-size replay only: resize cases check sequences, not terminal reflow.
     fn screen(self: *const Driver) !regular.Screen {
         var result: regular.Screen = .{};
@@ -306,8 +311,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // 等待启动界面出现 "Ctrl+D exit"，作为应用已就绪的信号。
-    try d.waitText(0, "Ctrl+D exit");
+    // A complete composer frame shows the cursor; no statistics/status footer.
+    try d.waitText(0, "\x1b[?25h");
     if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
         // 初始化只验证待配置界面；不输入密钥或发送消息，避免连接默认公共端点。
         try d.waitText(0, "/auth");
@@ -349,7 +354,7 @@ pub fn main(init: std.process.Init) !void {
         start = d.used;
         try d.send("fixture-task\r");
         try d.waitText(start, "fixture-answer");
-        try d.waitText(start, "Completed");
+        try d.waitIdle(start);
     } else if (std.mem.eql(u8, mode, "log-idle")) {
         // 已配置但尚未提交：Node 检查退出后仍没有日志目录。
         try d.quiet(150);
@@ -358,9 +363,9 @@ pub fn main(init: std.process.Init) !void {
         try d.send("获取时间\r");
         // 默认直接运行真实 date，不发送 y/n/t；无响应会由驱动截止时间判失败。
         try d.waitText(start, "date-completed");
-        try d.waitText(start, "Completed");
+        try d.waitIdle(start);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "tools trusted") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
     } else if (std.mem.eql(u8, mode, "regular-two")) {
         // Same owned PTY, two loopback-only turns. Force the first reply into
         // scrollback; repeated input-tail redraws must not append it again.
@@ -369,7 +374,7 @@ pub fn main(init: std.process.Init) !void {
             try d.send(prompt);
             try d.send("\r");
             try d.waitText(start, if (turn == 0) "regular-answer-one" else "regular-answer-two");
-            try d.waitText(start, "Completed");
+            try d.waitIdle(start);
             try d.quiet(150);
             try d.send("tail-refresh");
             try d.quiet(150);
@@ -387,27 +392,98 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
         var stage = try d.screen();
         try check(stage.visible("reasoning-stage-one") and stage.row == 23);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Thinking") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "thin |") == null);
+        try check(!stage.visible("thinking-old-one"));
+        try check(stage.visible("thinking-old-two") and stage.visible("thinking-old-three"));
+        try d.waitText(start, "reasoning-stage-two");
+        try d.quiet(100);
+        stage = try d.screen();
+        try check(stage.visible("thinking-new-five") and stage.visible("thinking-new-six") and stage.visible("reasoning-stage-two"));
+        try check(!stage.visible("reasoning-stage-one") and !stage.visible("thinking-old-two"));
+        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model) [ctx ~") != null and std.mem.indexOf(u8, &stage.grid[23], "] ~") != null and stage.row == 23);
+        for (stage.grid[22]) |byte| try check(byte == ' ');
+        try check(!stage.visible("TPS:") and !stage.visible("tokens in:"));
         try d.waitText(start, "stream-stage-one");
         try d.quiet(100);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
         stage = try d.screen();
         try check(stage.visible("Orange heading") and stage.visible("stream-stage-one") and stage.row == 23);
+        try check(!stage.visible("reasoning-stage-two") and !stage.visible("Thinking"));
+        try check(!stage.visible("Enter send") and !stage.visible("Ctrl+J newline"));
         try check(std.mem.indexOf(u8, d.output[start..d.used], "[user]") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "[assistant") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;208m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[48;2;52;36;24m") != null);
         try d.waitText(start, "stream-final-answer");
-        try d.waitText(start, "Completed");
+        try d.waitIdle(start);
         try d.quiet(100);
         stage = try d.screen();
-        try check(stage.count("reasoning-stage-one") == 1 and stage.count("stream-final-answer") == 1);
+        try check(stage.count("reasoning-stage-one") == 0 and stage.count("reasoning-stage-two") == 0);
+        try check(stage.count("thinking-new-five") == 0 and stage.count("stream-final-answer") == 1);
+        try check(!stage.visible("TPS:") and !stage.visible("tokens in:") and !stage.visible("Completed"));
+        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model) [ctx ~") != null);
+        try check(stage.count("=> Final answer") == 1);
+        for (stage.grid[22]) |byte| try check(byte == ' ');
         try check(stage.row == 23);
+    } else if (std.mem.eql(u8, mode, "tool-icons")) {
+        const start = d.used;
+        try d.send("tool-icon-task\r");
+        try d.waitText(start, "sleep 1; cat r.json");
+        const animation_start = d.used;
+        try d.quiet(120);
+        const first = try d.screen();
+        try d.quiet(240);
+        const second = try d.screen();
+        try check(first.visible(">_ sleep 1; cat r.json") and second.visible(">_ sleep 1; cat r.json"));
+        // The ASCII VT fixture maps non-ASCII glyphs to '~'; inspect only these
+        // renderer-owned braille symbols, not a general Unicode-width claim.
+        var frames: usize = 0;
+        for ([_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }) |icon| {
+            if (std.mem.indexOf(u8, d.output[animation_start..d.used], icon) != null) frames += 1;
+        }
+        try check(frames >= 2);
+        try check(first.row == 23 and second.row == 23);
+        try check(std.mem.indexOf(u8, &first.grid[23], "(fixture-model) [ctx ~") != null and std.mem.indexOf(u8, &first.grid[23], "] ~") != null);
+        for (first.grid[22]) |byte| try check(byte == ' ');
+        try d.waitText(start, "tool-icon-final-answer");
+        try d.waitIdle(start);
+        try d.quiet(100);
+        const final = try d.screen();
+        try check(final.count("tool-icon-final-answer") == 1);
+        var same_line = false;
+        for (final.grid) |line| if (std.mem.indexOf(u8, &line, ">_ sleep 1;") != null and std.mem.indexOf(u8, &line, ">_ printf ok") != null and std.mem.indexOf(u8, &line, ">_ false [error]") != null) {
+            same_line = true;
+        };
+        try check(same_line);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;114m>_ printf ok") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;203m>_ false [error]") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "bash #") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "tool-json-hidden-marker") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Running bash") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Enter send") == null);
+    } else if (std.mem.eql(u8, mode, "file-stats")) {
+        const start = d.used;
+        try d.send("file-stats-task\r");
+        try d.waitText(start, "file-stats-final-answer");
+        try d.waitIdle(start);
+        const final = try d.screen();
+        for ([_][]const u8{ "write_file stats.txt  ~0 +5 -0 lines", "write_file stats.txt  ~1 +1 -1 lines", "read_file stats.txt  5 lines", "read_file stats.txt  2 lines [partial]", "write_file stats.txt  ~0 +0 -5 lines", "write_file stats.txt [error]" }) |caption| try check(final.count(caption) == 1);
+        try check(final.count("=> Final answer") == 1 and final.count("file-stats-final-answer") == 1);
+        var header: ?usize = null;
+        for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, "=> Final answer") != null) {
+            header = row;
+        };
+        try check(header != null and header.? > 0);
+        for (final.grid[header.? - 1]) |byte| try check(byte == ' ');
+        try check(std.mem.indexOf(u8, &final.grid[23], "(fixture-model) [ctx ~") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\"written_bytes\"") == null);
     } else if (std.mem.eql(u8, mode, "log-failure")) {
         const start = d.used;
         try d.send("log-fixture-task\r");
         try d.waitText(start, "REC FAILED");
         try d.waitText(start, "log-fixture-answer");
-        try d.waitText(start, "Completed");
+        try d.waitIdle(start);
         try d.send("\x04");
         try d.finish(0);
         const final = try d.screen();
@@ -421,15 +497,14 @@ pub fn main(init: std.process.Init) !void {
             try d.send(prompt);
             try d.send("\r");
             try d.waitText(start, "fixture-answer");
-            try d.waitText(start, "Completed");
+            try d.waitIdle(start);
             try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
-            try check(std.mem.indexOf(u8, d.output[start..d.used], "tools trusted") != null);
         }
     } else if (std.mem.eql(u8, mode, "cancel") or std.mem.eql(u8, mode, "term")) {
-        // cancel / term 模式：等待模型调用进行中（calling_model），再发送取消或终止信号。
+        // cancel / term：等待输入行模型流动色后的reset，证明任务已经启动。
         const start = d.used;
         try d.send("stall\r");
-        try d.waitText(start, "calling_model");
+        try d.waitText(start, "\x1b[0m) ");
         try d.quiet(250);
 
         if (std.mem.eql(u8, mode, "term")) {
@@ -442,25 +517,26 @@ pub fn main(init: std.process.Init) !void {
         // cancel 模式：发送 Ctrl-C（0x03），由应用取消当前任务。
         try d.send("\x03");
         try d.waitText(start, "Canceled");
+        try d.waitIdle(start);
 
         // 取消后应能继续使用：再次提交 resume 并等待完成。
         const next = d.used;
         try d.send("resume\r");
-        try d.waitText(next, "Completed");
+        try d.waitIdle(next);
     } else {
         // 默认（交互）模式：验证 Unicode 输出，并在终端尺寸变化后界面仍能重绘。
         const start = d.used;
         try d.send("unicode\r");
-        try d.waitText(start, "Completed");
+        try d.waitIdle(start);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "世界") != null);
 
-        // 依次把列宽改为 40/80/120；每次都要求界面重新绘制出 "Enter send"。
+        // 依次把列宽改为40/80/120；每次确认模型输入前缀被重绘。
         for ([_]u16{ 40, 80, 120 }) |width| {
             size.col = width;
             const mark = d.used;
             // IOCSWINSZ 设置窗口尺寸，内核会向前台进程组发送 SIGWINCH，触发应用重绘。
             try check(c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &size) == 0);
-            try d.waitText(mark, "Enter send");
+            try d.waitText(mark, "> ");
         }
     }
 

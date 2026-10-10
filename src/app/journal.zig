@@ -293,6 +293,8 @@ pub const Journal = struct {
                 .permission => |v| try self.record(a, "permission", .{ .id = v.id, .tool_name = (try self.jsonText(a, v.tool_name)).text, .description = Text{ .text = omitted, .source_bytes = v.description.len, .truncated = true, .omitted = true } }),
                 .tool_started => |v| try self.record(a, "tool_started", .{ .host_id = v.id, .name = (try self.jsonText(a, v.name)).text }),
                 .tool_result => |v| try self.record(a, "tool_status", .{ .host_id = v.id, .name = (try self.jsonText(a, v.name)).text, .is_error = v.result.is_error, .canceled = v.result.canceled, .truncated = v.result.truncated, .cleanup_failed = v.result.cleanup_failed }),
+                // Display-only estimate: no duplicate archive accounting path.
+                .context_snapshot => {},
                 .usage => |v| try self.record(a, "usage", v),
                 .fallback => |v| try self.record(a, "fallback", .{ .protocol = v }),
                 .compacted => |v| try self.record(a, "compacted", v),

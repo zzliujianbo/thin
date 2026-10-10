@@ -27,6 +27,9 @@ pub const Item = struct {
     event: r.Event,
     /// 文本是否因预算被截断，UI 可据此提示。
     display_truncated: bool,
+    /// Text clipping and a missing block tail are distinct semantic facts.
+    /// Incomplete canonical arrays cannot prove absence of tool calls.
+    canonical_complete: bool = true,
     /// 本 Item 独占的拷贝内存，deinit 时释放。
     storage: Storage,
     /// 所属的桥，deinit 时用于回收 bytes 与 outstanding 计数。
@@ -57,6 +60,7 @@ const Copy = struct {
     used: usize = 0,
     /// 是否发生过截断。
     clipped: bool = false,
+    canonical_complete: bool = true,
 
     /// 拷贝一段字符串，超出 item_budget 的部分截断。
     fn text(self: *Copy, src: []const u8) []const u8 {
@@ -107,7 +111,8 @@ const Copy = struct {
             },
             .assistant_committed => |blocks| blk: {
                 const n: usize = @min(blocks.len, block_limit);
-                self.clipped = blocks.len > n;
+                self.canonical_complete = blocks.len == n;
+                self.clipped = !self.canonical_complete;
                 // 中文：Block 数组本身存放在 storage 开头，此处先按元数据大小计入预算。
                 self.used = n * @sizeOf(p.Block);
                 // 中文：测量阶段 storage 为 null，dst 为空切片，仅用于计算需求。
@@ -283,7 +288,7 @@ pub const Bridge = struct {
         defer self.unlock();
         // 中文：分配期间 UI 可能已断开或被取消，入队前必须再检查一次。
         if (self.stopped(cancel)) return error.Canceled;
-        self.queue[(self.head + self.len) % queue_capacity] = .{ .event = owned, .display_truncated = copy.clipped, .storage = storage, .owner = self };
+        self.queue[(self.head + self.len) % queue_capacity] = .{ .event = owned, .display_truncated = copy.clipped, .canonical_complete = copy.canonical_complete, .storage = storage, .owner = self };
         self.len += 1;
         self.outstanding += 1;
     }
