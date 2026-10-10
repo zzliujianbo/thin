@@ -10,6 +10,7 @@ const terminal_module = @import("terminal.zig");
 const input = @import("input.zig");
 const text = @import("text.zig");
 const markdown = @import("markdown.zig");
+const theme = @import("theme.zig");
 const bridge_module = @import("bridge.zig");
 const Io = std.Io;
 
@@ -80,9 +81,9 @@ const Record = struct {
 
         // 截断时追加提示，但提示只用于显示，模型历史保持不变。
         const data = if (self.clipped) try std.fmt.allocPrint(temp, "{s}\n[display clipped; model history is unchanged]", .{self.body.items}) else self.body.items;
-        const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = 4096, .markdown = self.kind == .assistant });
+        const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = 4096, .markdown = self.kind == .assistant or self.kind == .reasoning, .tone = if (self.kind == .user) .user else if (self.kind == .reasoning or self.kind == .notice) .muted else .normal });
         self.lines = rendered.lines;
-        self.excerpt = rendered.truncated or rendered.total_lines > rendered.lines.len;
+        self.excerpt = rendered.truncated or rendered.degraded or rendered.total_lines > rendered.lines.len;
         self.columns = columns;
 
         // arena 所有权转移给 Record；之后由 invalidate 统一释放。
@@ -104,6 +105,8 @@ pub const Connection = struct {
         runtime: ?*r.Runtime,
         model: []const u8,
         base_url: []const u8,
+        /// 应用层的启动策略快照，不读取工作线程可变的 Runtime.trusted。
+        tools_trusted: bool = false,
         logging_enabled: bool = true,
         /// 由应用层以原子状态发布；UI 不读日志文件、不持有其写入器。
         log_error: ?anyerror = null,
@@ -164,8 +167,9 @@ const Ui = struct {
     draft: ?usize = null,
     /// 正在流式接收的推理记录索引。
     reasoning: ?usize = null,
-    /// 是否显示推理内容，Ctrl+R 切换。
-    show_reasoning: bool = false,
+    /// 默认流式显示供应商提供的可见推理，Ctrl+R 可隐藏后续/历史预览。
+    /// 不推断或解密供应商未公开的隐藏推理。
+    show_reasoning: bool = true,
     /// 当前待审批的请求；null 表示没有审批。
     permission: ?Permission = null,
     /// 最近一次真正写出到屏幕上的审批 id。只有它与 permission 一致时按键才生效，
@@ -766,27 +770,36 @@ const Ui = struct {
 
         self.frame_clear_end = out.written().len;
 
-        // Immutable committed records are appended once. Drafts and reasoning are
-        // live previews only; raw model ANSI never reaches the terminal.
+        // Commit each finalized record once. Live Markdown/reasoning remains a
+        // replaceable preview until canonical commit; model ANSI is never emitted.
         var lines: std.ArrayList([]const u8) = .empty;
-        const preview = self.scroll != 0 or self.show_reasoning;
-        if (preview) try lines.append(a, "[retained history preview; scrollback unchanged]");
+        const preview = self.scroll != 0;
+        var transcript_rows: usize = 0;
         for (self.records.items, 0..) |*record, index| {
+            if (record.kind == .reasoning and !self.show_reasoning) continue;
             const drafting = self.draft == index or self.reasoning == index;
             try record.layout(self.allocator, @max(1, cols));
-            const heading = try std.fmt.allocPrint(a, "[{s}{s}{s}]", .{ @tagName(record.kind), if (record.interrupted) " - interrupted draft" else if (drafting) " - draft" else "", if (record.excerpt) " - display excerpt" else "" });
-            if (cols >= 8 and !record.output and !drafting and record.kind != .reasoning) {
-                try putLine(writer, a, 1, heading, cols);
-                try writer.writeAll("\r\n");
+            const heading = if (record.interrupted) "Interrupted response — preview" else if (record.kind == .reasoning) "Thinking" else if (record.excerpt) "Display excerpt" else "";
+            if (cols >= 8 and !record.output and !drafting) {
+                if (heading.len != 0) {
+                    try putToneLine(writer, a, 1, heading, cols, theme.muted);
+                    try writer.writeAll("\r\n");
+                    transcript_rows += 1;
+                }
                 for (record.lines) |line| {
                     try putStyled(writer, 1, line);
                     try writer.writeAll("\r\n");
+                    transcript_rows += 1;
                 }
+                try writer.writeAll("\r\n");
+                transcript_rows += 1;
                 record.pending_output = true;
             }
-            if ((preview or drafting) and (record.kind != .reasoning or self.show_reasoning)) {
-                const headings = try markdown.render(a, heading, .{ .columns = @max(1, cols), .max_lines = 32, .markdown = false });
-                try lines.appendSlice(a, headings.lines);
+            if (preview or drafting) {
+                if (heading.len != 0) {
+                    const headings = try markdown.render(a, heading, .{ .columns = @max(1, cols), .max_lines = 32, .markdown = false, .tone = .muted });
+                    try lines.appendSlice(a, headings.lines);
+                }
                 try lines.appendSlice(a, record.lines);
             }
         }
@@ -795,10 +808,16 @@ const Ui = struct {
             break :blk try std.fmt.allocPrint(a, "API key for model {s}\nBase URL: {s}\nEnter saves locally; no network request is made here", .{ state.model, state.base_url });
         } else "";
         const secret_lines = try markdown.render(a, secret_destination, .{ .columns = @max(1, cols), .max_lines = 8, .markdown = false });
+        const body_limit = self.size.rows -| 5;
         const wanted_body = if (self.permission) |permission|
-            @min(8, 1 + @max(1, (try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false })).lines.len))
-        else if (self.secret_mode) secret_lines.lines.len else @min(lines.items.len, 8);
-        const rows = @min(self.size.rows, 5 + wanted_body);
+            @min(body_limit, 1 + @max(1, (try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false })).lines.len))
+        else if (self.secret_mode) secret_lines.lines.len else @min(lines.items.len + @as(usize, @intFromBool(preview or self.draft != null or self.reasoning != null)), body_limit);
+        // Initial blank space keeps the first conversation at the top. Each
+        // immutable row consumes it; expanding drafts scroll old content upward.
+        // Never shrink a tail without replacing it by committed rows: the editor
+        // therefore stays on the physical bottom row, without absolute positioning.
+        const available = if (self.tail_height == 0 or self.abandon_tail) self.size.rows else self.tail_height;
+        const rows = @min(self.size.rows, @max(5 + wanted_body, available -| transcript_rows));
 
         // 终端太小时只显示提示，避免布局越界。
         // 审批标题之外至少留一行正文；尺寸不足不属于永久的 clipped 状态。
@@ -812,13 +831,13 @@ const Ui = struct {
             const log_status = if (state.runtime == null) "" else if (state.log_error) |err|
                 try std.fmt.allocPrint(a, " | REC FAILED: {s}", .{@errorName(err)})
             else if (state.logging_enabled) " | .thin/sessions" else " | recording off";
-            const header = try std.fmt.allocPrint(a, "thin | {s} | {s}{s}{s}", .{ state.model, if (state.runtime == null) "not configured: /auth" else if (self.effective_protocol) |protocol| @tagName(protocol) else "configured/auto", log_status, if (self.dropped_display) " | older display clipped" else "" });
-            try putLine(writer, a, 1, header, cols);
+            const header = try std.fmt.allocPrint(a, "thin | {s} | {s}{s}{s}{s}", .{ state.model, if (state.runtime == null) "not configured: /auth" else if (self.effective_protocol) |protocol| @tagName(protocol) else "configured/auto", if (state.runtime != null and state.tools_trusted) " | tools trusted" else "", log_status, if (self.dropped_display) " | older display clipped" else "" });
 
-            // 布局：第 1 行标题，第 2 行审批标题或正文首行，中间为正文，倒数 3 行为状态、用量和快捷键提示，最后一行为输入行。
+            // 正文从拥有的尾区顶部开始；底部依次为主题栏、状态、用量、
+            // 快捷键和输入行。已提交内容继续向终端滚屏追加，不重复输出。
             const body_rows = rows - 5;
             if (self.secret_mode) {
-                for (0..body_rows) |line| try putStyled(writer, 2 + line, if (line < secret_lines.lines.len) secret_lines.lines[line] else "");
+                for (0..body_rows) |line| try putStyled(writer, 1 + line, if (line < secret_lines.lines.len) secret_lines.lines[line] else "");
                 self.frame_permission = null;
             } else if (self.permission) |permission| {
                 // Plain rendering: tool input must not hide behind Markdown formatting.
@@ -834,36 +853,41 @@ const Ui = struct {
                     try std.fmt.allocPrint(a, "Approval #{d} [preview clipped; deny only]: n deny", .{permission.id})
                 else
                     try std.fmt.allocPrint(a, "Approval #{d}: y once / n deny / t TRUST THIS PROCESS", .{permission.id});
-                try putLine(writer, a, 2, title, cols);
+                try putToneLine(writer, a, 1, title, cols, theme.accent);
 
                 // 滚动位置限制在内容末尾，防止滚出空白区域。
                 const start = @min(self.permission_scroll, all.lines.len -| (body_rows - 1));
-                for (0..body_rows - 1) |line| try putStyled(writer, 3 + line, if (start + line < all.lines.len) all.lines[start + line] else "");
+                for (0..body_rows - 1) |line| try putStyled(writer, 2 + line, if (start + line < all.lines.len) all.lines[start + line] else "");
                 self.frame_permission = permission.id;
             } else {
                 // 有界 live draft / retained history preview，不重写终端滚屏。
                 // 从底部向上回退 scroll 行，得到显示窗口的结束位置。
-                const end = lines.items.len -| @min(self.scroll, lines.items.len -| body_rows);
-                const start = end -| body_rows;
+                const live = self.draft != null or self.reasoning != null;
+                const has_title = preview or live;
+                const content_rows = body_rows -| @as(usize, @intFromBool(has_title));
+                const end = lines.items.len -| @min(self.scroll, lines.items.len -| content_rows);
+                const start = end -| content_rows;
                 for (0..body_rows) |line| {
-                    if (line == 0 and preview) {
-                        try putLine(writer, a, 2 + line, "[history preview; PgUp/PgDn / Ctrl+R]", cols);
-                    } else if (line == 0 and self.draft != null) {
-                        // Resize may leave this preview in scrollback; keep its draft status visible.
-                        try putLine(writer, a, 2 + line, "[streaming draft; not committed]", cols);
-                    } else try putStyled(writer, 2 + line, if (start + line < end) lines.items[start + line] else "");
+                    if (line == 0 and has_title) {
+                        try putToneLine(writer, a, 1, if (preview) "History preview · PgUp/PgDn" else "Streaming · preview", cols, theme.accent);
+                    } else {
+                        const index = line -| @as(usize, @intFromBool(has_title));
+                        try putStyled(writer, 1 + line, if (start + index < end) lines.items[start + index] else "");
+                    }
                 }
                 self.frame_permission = null;
             }
+
+            try putToneLine(writer, a, rows - 4, header, cols, theme.accent);
 
             // 状态栏：有运行态时加前缀 mode，有终态时附加错误信息。
             var status: []const u8 = self.notice;
             if (self.mode) |mode| status = try std.fmt.allocPrint(a, "{s} | {s}", .{ @tagName(mode), self.notice });
             if (self.last_terminal) |result| status = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ self.notice, if (result.detail != null) ": " else "", if (result.detail) |err| @errorName(err) else "", if (result.model_failure != null) " / " else "", if (result.model_failure) |failure| @tagName(failure) else "" });
-            try putLine(writer, a, rows - 3, status, cols);
+            try putToneLine(writer, a, rows - 3, status, cols, theme.accent);
 
             const usage_line = if (self.last_terminal) |result| try std.fmt.allocPrint(a, "tokens normal in:{s} out:{s} cached:{s} | summary in:{s} out:{s} | cost:unknown", .{ try counter(a, result.usage.normal.input_tokens), try counter(a, result.usage.normal.output_tokens), try counter(a, result.usage.normal.cached_input_tokens), try counter(a, result.usage.summary.input_tokens), try counter(a, result.usage.summary.output_tokens) }) else "Usage pending | cost:unknown | Ctrl+R toggles visible reasoning";
-            try putLine(writer, a, rows - 2, usage_line, cols);
+            try putToneLine(writer, a, rows - 2, usage_line, cols, theme.muted);
             try putLine(writer, a, rows - 1, if (self.secret_quarantine) "Secret paste drained: Ctrl+U to resume | Ctrl+D exit" else if (self.secret_mode) "Enter save | Ctrl+U erase | Ctrl+C cancel | Ctrl+D exit" else if (state.runtime == null) "/auth setup (no key argument) | Ctrl+C clear | Ctrl+D exit" else "Enter send | Ctrl+J newline | Ctrl+C cancel | Ctrl+D exit | PgUp/PgDn scroll", cols);
 
             if (self.secret_mode or self.secret_quarantine) {
@@ -894,7 +918,7 @@ const Ui = struct {
                 const tail = visible[cursor..];
                 const suffix = try editorDisplay(a, tail[0..(std.mem.findScalar(u8, tail, '\n') orelse tail.len)]);
                 const input_line = try std.fmt.allocPrint(a, "> {s}{s}", .{ prefix[start..], suffix });
-                try putLine(writer, a, rows, input_line, cols);
+                try putToneLine(writer, a, rows, input_line, cols, theme.accent);
 
                 // 光标移到输入行并重新显示；+3 为 "> " 提示符占用的列加一列。
                 try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, width + 3) - 1});
@@ -937,6 +961,10 @@ fn putStyled(writer: *Io.Writer, row: usize, line: []const u8) !void {
 
 /// 按终端列宽截断一行后输出：先清理控制字符，再按字素簇累计显示宽度，超出列宽即停止。
 fn putLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, line: []const u8, columns: usize) !void {
+    try putToneLine(writer, a, row, line, columns, "");
+}
+
+fn putToneLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, line: []const u8, columns: usize, tone: []const u8) !void {
     const safe = try text.sanitize(a, line, 65536);
     var pos: usize = 0;
     var width: usize = 0;
@@ -947,7 +975,8 @@ fn putLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, line: []const u
         width += cluster.width;
         pos = cluster.end;
     }
-    try putStyled(writer, row, safe[0..pos]);
+    const styled = try std.fmt.allocPrint(a, "{s}{s}", .{ tone, safe[0..pos] });
+    try putStyled(writer, row, styled);
 }
 
 const FixtureConnection = struct {
@@ -965,7 +994,7 @@ fn fixtureUi(bridge: *bridge_module.Bridge, cancel: *p.Cancellation) Ui {
     return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = undefined, .editor = .{ .allocator = std.testing.allocator }, .job = undefined, .size = .{ .columns = 80, .rows = 24 } };
 }
 
-test "regular transcript commits once and keeps a small relative live tail" {
+test "regular transcript starts at top and keeps composer at bottom without role tags" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -975,9 +1004,16 @@ test "regular transcript commits once and keeps a small relative live tail" {
     try ui.appendDraft(.assistant, "uncanonical draft");
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique committed user") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "streaming draft; not committed") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Streaming · preview") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "[user]") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "[assistant") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.user_background) != null);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[0], "unique committed user") != null);
     try std.testing.expect(!ui.records.items[0].output);
-    try std.testing.expect(ui.frame_height <= 13);
+    try std.testing.expectEqual(@as(usize, 22), ui.frame_height);
     ui.finishFrame();
     try std.testing.expect(ui.records.items[0].output);
     try std.testing.expect(!ui.records.items[1].output);
@@ -986,26 +1022,70 @@ test "regular transcript commits once and keeps a small relative live tail" {
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique committed user") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "uncanonical draft") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") != null);
-    try std.testing.expectEqual(@as(usize, 5), ui.frame_height);
+    try std.testing.expectEqual(@as(usize, 20), ui.frame_height);
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
     ui.finishFrame();
     try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("unique canonical reply"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") == null);
-    try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[4A"));
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[19A"));
     for ([_][]const u8{ "1049", "1047", "\x1b[H", "\x1b[2J", ";1H" }) |forbidden|
         try std.testing.expect(std.mem.find(u8, ui.frame, forbidden) == null);
 }
 
-test "reasoning stays ephemeral and interrupted drafts are explicitly committed" {
+test "growing a five row live tail keeps replaceable drafts out of scrollback" {
+    for ([_]bool{ false, true }) |same_final| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        var old: std.ArrayList(u8) = .empty;
+        defer old.deinit(std.testing.allocator);
+        for (0..20) |_| try old.appendSlice(std.testing.allocator, "older-row\n");
+        try old.appendSlice(std.testing.allocator, "last-older-row");
+        _ = try ui.add(.assistant, old.items);
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        try ui.draw();
+        try screen.replay(ui.frame);
+        ui.finishFrame();
+        try std.testing.expectEqual(@as(usize, 5), ui.tail_height);
+        try std.testing.expectEqual(@as(usize, 23), screen.row);
+
+        try ui.appendDraft(.assistant, "growth-draft-marker\nsecond-draft-line");
+        try ui.draw();
+        try screen.replay(ui.frame);
+        ui.finishFrame();
+        try std.testing.expectEqual(@as(usize, 8), ui.tail_height);
+        try std.testing.expectEqual(@as(usize, 23), screen.row);
+        for (screen.history[0..screen.history_len]) |line| try std.testing.expect(std.mem.find(u8, &line, "growth-draft-marker") == null);
+
+        try ui.replaceCommitted(&.{.{ .text = if (same_final) "growth-draft-marker" else "different-final-marker" }}, false);
+        try ui.draw();
+        try screen.replay(ui.frame);
+        ui.finishFrame();
+        try std.testing.expectEqual(@as(usize, @intFromBool(same_final)), screen.count("growth-draft-marker"));
+        try std.testing.expectEqual(@as(usize, @intFromBool(!same_final)), screen.count("different-final-marker"));
+        try std.testing.expectEqual(@as(usize, 0), screen.count("second-draft-line"));
+        try std.testing.expectEqual(@as(usize, 23), screen.row);
+    }
+}
+
+test "visible reasoning streams by default and interrupted drafts remain explicit" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    try ui.appendDraft(.reasoning, "hidden-reasoning");
+    try ui.appendDraft(.reasoning, "provider-visible-reasoning");
     try ui.appendDraft(.assistant, "partial-answer\x1b[2J");
     const draft = ui.draft.?;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-reasoning") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "provider-visible-reasoning") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Thinking") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
     ui.finishFrame();
     try std.testing.expect(!ui.records.items[draft].output);
@@ -1014,18 +1094,20 @@ test "reasoning stays ephemeral and interrupted drafts are explicitly committed"
     ui.draft = null;
     ui.reasoning = null;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "interrupted draft") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Interrupted response") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "provider-visible-reasoning") != null);
     ui.finishFrame();
-    ui.show_reasoning = true;
+    try std.testing.expect(ui.records.items[0].output);
+    ui.scroll = 1;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "history preview") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-reasoning") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "History preview") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "provider-visible-reasoning") != null);
     ui.finishFrame();
-    try std.testing.expect(!ui.records.items[0].output);
+    ui.scroll = 0;
     ui.show_reasoning = false;
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "partial-answer") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-reasoning") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "provider-visible-reasoning") == null);
 }
 
 test "resize abandons unknown rows and old completed approval cannot authorize" {
@@ -1050,7 +1132,7 @@ test "resize abandons unknown rows and old completed approval cannot authorize" 
     try ui.draw();
     try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[999B\r\n"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[6A") == null);
-    try std.testing.expectEqual(@as(usize, 7), ui.frame_height);
+    try std.testing.expectEqual(@as(usize, 24), ui.frame_height);
     try std.testing.expect(ui.displayed_permission == null);
     ui.finishFrame();
     try std.testing.expectEqual(@as(?u64, 42), ui.displayed_permission);
@@ -1364,7 +1446,7 @@ test "editor tabs expand before clipping and cursor placement but submit unchang
         ui.editor.cursor = case.cursor;
         try ui.draw();
         try std.testing.expect(std.mem.findScalar(u8, ui.frame, '\t') == null);
-        const expected = try std.fmt.allocPrint(std.testing.allocator, "\r\n\x1b[0m\x1b[2K{s}\x1b[0m\r\x1b[{d}C\x1b[?25h", .{ case.line, case.column - 1 });
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "\r\n\x1b[0m\x1b[2K{s}{s}\x1b[0m\r\x1b[{d}C\x1b[?25h", .{ theme.accent, case.line, case.column - 1 });
         defer std.testing.allocator.free(expected);
         try std.testing.expect(std.mem.endsWith(u8, ui.frame, expected));
         try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);

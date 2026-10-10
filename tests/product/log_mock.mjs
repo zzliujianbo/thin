@@ -114,9 +114,9 @@ async function scenario(app, pty, kind) {
   const sockets = new Set();
   const date = kind === 'date' || kind === 'date-pty';
   const redact = kind === 'redact' || kind === 'redact-json';
-  const memoryDeny = kind === 'memory-deny';
-  const denied = kind === 'deny' || memoryDeny;
-  const usesTool = date || denied || redact;
+  const memoryAuto = kind === 'memory-auto';
+  const writeAuto = kind === 'write-auto';
+  const usesTool = date || memoryAuto || writeAuto || redact;
   const user = redact ? `user ${key}` : kind === 'date-pty' ? '获取时间' : 'log-fixture-task';
   const answer = redact ? `assistant ${key}` : date ? 'date-completed' : 'log-fixture-answer';
   const server = http.createServer(async (req,res) => {
@@ -130,9 +130,9 @@ async function scenario(app, pty, kind) {
       const body = JSON.parse(data);
       assert(body.messages.some(m => m.role === 'user' && m.content === user), 'submitted user absent');
       if (requests === 1 && usesTool) {
-        const call = memoryDeny ? {id:'fixture-call', name:'memory', args:{action:'write', topic:'core', content:JSON.stringify({secret:key}).replaceAll('-', '\\u002d')}} :
+        const call = memoryAuto ? {id:'fixture-call', name:'memory', args:{action:'write', topic:'core', content:JSON.stringify({secret:key}).replaceAll('-', '\\u002d')}} :
           redact ? {id:'fixture-call', name:'read_file', args:{path:`secret-${key}.json`}} :
-          {id:'fixture-call', name:'bash', args:{command:kind === 'deny' ? 'printf forbidden > forbidden.txt' : 'date -Ins'}};
+          {id:'fixture-call', name:'bash', args:{command:writeAuto ? 'printf automatic > automatic.txt' : 'date -Ins'}};
         send(res,'',call); return;
       }
       if (requests === 2) {
@@ -140,7 +140,7 @@ async function scenario(app, pty, kind) {
         assert(results.length === 1 && results[0].tool_call_id === 'fixture-call', 'canonical result association');
         const output = results[0].content;
         if (date) { actualDate = output.match(datePattern)?.[0]; assert(actualDate, 'real date output absent'); }
-        if (denied) assert(/denied/i.test(output), 'denial missing');
+        if (memoryAuto || writeAuto) assert(!/denied/i.test(output), 'default execution denied');
         if (redact) assert(output.includes(JSON.stringify(key).slice(1,-1)), 'JSON tool fixture not returned');
       }
       send(res,answer);
@@ -162,7 +162,7 @@ async function scenario(app, pty, kind) {
       THIN_APP_BIN:app, THIN_APP_TEST_HOME:home, THIN_APP_TEST_PROJECT:project, THIN_APP_TEST_URL:url,
       THIN_APP_TEST_MODE:kind === 'date-pty' ? 'date' : kind === 'failure-pty' ? 'log-failure' : 'log-idle'};
     const isPty = ['date-pty','failure-pty','idle'].includes(kind);
-    const args = kind === 'help' ? ['--help'] : kind === 'version' ? ['--version'] : ['--print',user, ...(kind === 'date' ? ['--trust'] : []), ...(kind === 'no-log' ? ['--no-log'] : [])];
+    const args = kind === 'help' ? ['--help'] : kind === 'version' ? ['--version'] : ['--print',user, ...(kind === 'no-log' ? ['--no-log'] : [])];
     const began = Date.now();
     const result = await execute(isPty?pty:app, isPty?[]:args, env, project);
     const ended = Date.now();
@@ -199,18 +199,18 @@ async function scenario(app, pty, kind) {
       if (usesTool) {
         const calls = events('tool_call'), results = events('tool_result');
         assert(calls.length === 1 && results.length === 1 && calls[0].call_id === 'fixture-call' && results[0].call_id === calls[0].call_id, 'logged call/result pairing');
-        assert(calls[0].name === (memoryDeny?'memory':redact?'read_file':'bash') && 'arguments' in calls[0], 'call metadata missing');
+        assert(calls[0].name === (memoryAuto?'memory':redact?'read_file':'bash') && 'arguments' in calls[0], 'call metadata missing');
         assert(['is_error','canceled','truncated','cleanup_failed'].every(k => typeof results[0][k] === 'boolean'), 'result flags missing');
         if (date) assert(results[0].text.includes(actualDate) && !results[0].is_error, 'real time missing from log');
         if (redact) assert(results[0].text.includes('[redacted]'), 'JSON result not redacted');
-        if (denied) { assert(/denied/i.test(results[0].text) && results[0].is_error, 'denied result missing'); assert(!await exists(join(project,memoryDeny?'.thin/mem/core.md':'forbidden.txt')), 'denied tool executed'); }
-        if (denied || kind === 'date-pty') {
-          const permissions = events('permission'), decisions = events('decision');
-          assert(permissions.length === 1 && decisions.length === 1, 'approval records missing');
-          assert(permissions[0].id != null && permissions[0].id === decisions[0].id, 'approval id association missing');
-          assert(permissions[0].tool_name === (memoryDeny?'memory':'bash') && 'description' in permissions[0], 'permission metadata missing');
-          assert(permissions[0].description.omitted === true && permissions[0].description.text === '[omitted]', 'approval body must not duplicate raw arguments');
-          assert(decisions[0].value === (denied?'deny':'allow_once'), 'approval decision incorrect');
+        assert(!results[0].is_error && !results[0].canceled, 'default tool execution failed');
+        assert(events('permission').length === 0 && events('decision').length === 0, 'default execution asked approval');
+        assert(!events('state').some(d=>d.state==='awaiting_permission'), 'default execution waited for approval');
+        assert(events('tool_started').length === 1, 'default execution did not start');
+        if (writeAuto) assert(await readFile(join(project,'automatic.txt'),'utf8') === 'automatic', 'shell write did not execute');
+        if (memoryAuto) {
+          assert(JSON.parse(await readFile(join(project,'.thin/mem/core.md'),'utf8')).secret === key, 'memory write did not execute');
+          assert(calls[0].arguments.content.includes('[redacted]'), 'encoded memory content leaked in archive');
         }
       }
     }
@@ -229,5 +229,5 @@ async function scenario(app, pty, kind) {
 }
 
 export async function logRegressions(app, pty) {
-  for (const kind of ['plain','no-log','help','version','idle','date','deny','memory-deny','redact','redact-json','failure','date-pty','failure-pty']) await scenario(app,pty,kind);
+  for (const kind of ['plain','no-log','help','version','idle','date','write-auto','memory-auto','redact','redact-json','failure','date-pty','failure-pty']) await scenario(app,pty,kind);
 }

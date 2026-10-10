@@ -130,7 +130,7 @@ fn run(init: std.process.Init) !u8 {
         if (terminal.status == .success) {
             // 提示信息走 stderr，保证 stdout 只包含模型的回答内容。
             if (console.fallback) try output(init.io, .stderr(), "thin: Responses explicitly unsupported; using Chat for this process.\n");
-            if (console.denied > 0) try output(init.io, .stderr(), "thin: privileged tools denied in --print mode; --trust is an explicit process-wide grant, not a sandbox.\n");
+            if (console.denied > 0) try output(init.io, .stderr(), "thin: tool calls were denied by the host.\n");
 
             // 对回答做清洗并限制为 256 KiB，与 Console 中的截断上限保持一致。
             const safe = try text.sanitize(init.gpa, console.answer.items, 256 * 1024);
@@ -157,7 +157,8 @@ fn run(init: std.process.Init) !u8 {
         return code;
     }
 
-    // 交互模式分支：Bridge 把 Runtime 事件转发给 TUI，由 TUI 负责渲染与审批。
+    // 交互模式分支：Bridge 把 Runtime 事件转发给 TUI。CLI 默认信任工具，
+    // 不进入人工审批；Bridge 的授权接口仍可供其他宿主策略使用。
     var bridge = Bridge.init(init.gpa, init.io, &cancellation);
     defer bridge.deinit();
 

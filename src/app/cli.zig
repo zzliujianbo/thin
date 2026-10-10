@@ -3,8 +3,9 @@
 const std = @import("std");
 
 /// 解析后的选项。prompt 为 null 表示交互模式；非 null 表示 --print 一次性模式。
-/// trusted 对应 --trust，只在本进程内有效。
-pub const Options = struct { prompt: ?[]const u8 = null, trusted: bool = false, logging: bool = true, help: bool = false, version: bool = false };
+/// 当前 CLI 默认信任本进程的工具调用，不逐次审批；--trust 仅保留兼容。
+/// 这不是命令风险分类或沙箱，Runtime 的授权接口仍保留给嵌入调用方。
+pub const Options = struct { prompt: ?[]const u8 = null, trusted: bool = true, logging: bool = true, help: bool = false, version: bool = false };
 
 /// 解析 argv。args[0] 是程序名，因此从 1 开始遍历。
 /// 无效参数返回错误（InvalidArguments、UnknownOption），由调用方决定如何提示。
@@ -49,12 +50,13 @@ pub const help =
     \\Interactive uses regular terminal scrollback, not an alternate full-screen buffer.
     \\Committed output remains after exit; only the live input/status area is redrawn.
     \\Enter sends; Ctrl+J adds newline; Ctrl+C cancels; Ctrl+D exits.
-    \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning. Approval: y once, n deny,
-    \\t trusts subsequent writes/commands for this process only. Pasting never approves.
-    \\--print returns the final committed visible answer and denies privileged tools.
-    \\--trust explicitly allows those tools for THIS PROCESS; bash is NOT a sandbox.
+    \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning.
+    \\Tool calls are trusted for THIS PROCESS and run without approval prompts.
+    \\Commands run with your account permissions; bash is NOT a sandbox.
+    \\No automatic command-risk classifier is enabled. --trust is a compatibility flag.
+    \\--print returns the final committed visible answer with the same tool policy.
     \\
-    \\Project Memory: <startup directory>/.thin/mem/*.md, only explicit approved writes.
+    \\Project Memory: <startup directory>/.thin/mem/*.md, changed through memory tools.
     \\Session records: <startup directory>/.thin/sessions/*.jsonl (local plaintext, 0600).
     \\Recording starts on the first submitted message; --no-log disables it for this run.
     \\Records include messages, tools, stages, usage and errors, not /auth input,
@@ -67,12 +69,15 @@ pub const help =
     \\
 ;
 
-// 验证 --trust 仅在显式传入时生效，--print 必须提供 prompt，以及未知选项被拒绝。
-test "CLI trust is explicit and print requires a prompt" {
+// 交互与 --print 默认均不审批，--trust 保持兼容；错误参数仍拒绝。
+test "CLI tools are trusted by default and print requires a prompt" {
     const options = try parse(&.{ "thin", "--print", "hello", "--trust" });
     try std.testing.expect(options.trusted);
     try std.testing.expectEqualStrings("hello", options.prompt.?);
-    try std.testing.expect(!(try parse(&.{"thin"})).trusted);
+    try std.testing.expect((try parse(&.{"thin"})).trusted);
+    try std.testing.expect((try parse(&.{ "thin", "--print", "hello" })).trusted);
+    try std.testing.expect((try parse(&.{ "thin", "--no-log" })).trusted);
+    try std.testing.expect(std.mem.indexOf(u8, help, "run without approval prompts") != null);
     try std.testing.expect((try parse(&.{"thin"})).logging);
     try std.testing.expect(!(try parse(&.{ "thin", "--no-log" })).logging);
     try std.testing.expect(!(try parse(&.{ "thin", "--print", "hello", "--no-log" })).logging);

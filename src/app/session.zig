@@ -74,6 +74,7 @@ pub const Session = struct {
             .runtime = if (self.app) |app| &app.runtime else null,
             .model = config.model.name,
             .base_url = config.provider.base_url,
+            .tools_trusted = self.trusted,
             .logging_enabled = self.logging,
             .log_error = if (self.app) |app| app.journal.failure() else null,
         };
@@ -121,20 +122,24 @@ test "pending session activates locally without a request and protects auth from
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.init(a, io, &env, home, .{}, false);
+    var session = try Session.init(a, io, &env, home, .{}, true);
     defer session.deinit();
     const connection = session.connection();
     try std.testing.expect(connection.current().runtime == null);
+    try std.testing.expect(connection.current().tools_trusted);
     try connection.configure("fake-inline-session-key");
     try std.testing.expect(connection.current().runtime != null);
+    try std.testing.expect(connection.current().runtime.?.trusted);
+    try std.testing.expect(connection.current().tools_trusted);
     try std.testing.expect(std.mem.find(u8, session.app.?.runtime.system, "fake-inline-session-key") == null);
     try std.testing.expectEqual(@as(usize, 0), session.app.?.runtime.messages().len);
     try std.testing.expectError(error.AlreadyConfigured, connection.configure("replacement"));
 
     // 重开会话可使用已保存的内联凭证；仍然不发送网络请求。
-    var reopened = try Session.init(a, io, &env, home, .{}, false);
+    var reopened = try Session.init(a, io, &env, home, .{}, true);
     defer reopened.deinit();
     try std.testing.expect(reopened.connection().current().runtime != null);
+    try std.testing.expect(reopened.connection().current().runtime.?.trusted);
 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

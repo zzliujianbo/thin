@@ -356,14 +356,11 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, mode, "date")) {
         const start = d.used;
         try d.send("获取时间\r");
-        try d.waitText(start, "Approval #");
-        try d.quiet(150); // Complete approval frame before pressing y.
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "date -Ins") != null);
-        const approval_screen = try d.screen();
-        try check(approval_screen.visible("Approval #") and approval_screen.visible("date -Ins"));
-        try d.send("y");
+        // 默认直接运行真实 date，不发送 y/n/t；无响应会由驱动截止时间判失败。
         try d.waitText(start, "date-completed");
         try d.waitText(start, "Completed");
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "tools trusted") != null);
     } else if (std.mem.eql(u8, mode, "regular-two")) {
         // Same owned PTY, two loopback-only turns. Force the first reply into
         // scrollback; repeated input-tail redraws must not append it again.
@@ -382,6 +379,29 @@ pub fn main(init: std.process.Init) !void {
             try check(current.count("regular-answer-one") == 1);
             if (turn == 1) try check(current.count("regular-answer-two") == 1);
         }
+    } else if (std.mem.eql(u8, mode, "stream-markdown")) {
+        const start = d.used;
+        try d.send("stream-task\r");
+        try d.waitText(start, "reasoning-stage-one");
+        try d.quiet(100);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
+        var stage = try d.screen();
+        try check(stage.visible("reasoning-stage-one") and stage.row == 23);
+        try d.waitText(start, "stream-stage-one");
+        try d.quiet(100);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
+        stage = try d.screen();
+        try check(stage.visible("Orange heading") and stage.visible("stream-stage-one") and stage.row == 23);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "[user]") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "[assistant") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;208m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[48;2;52;36;24m") != null);
+        try d.waitText(start, "stream-final-answer");
+        try d.waitText(start, "Completed");
+        try d.quiet(100);
+        stage = try d.screen();
+        try check(stage.count("reasoning-stage-one") == 1 and stage.count("stream-final-answer") == 1);
+        try check(stage.row == 23);
     } else if (std.mem.eql(u8, mode, "log-failure")) {
         const start = d.used;
         try d.send("log-fixture-task\r");
@@ -394,31 +414,17 @@ pub fn main(init: std.process.Init) !void {
         try check(final.count(regular.prior) == 1 and final.count("log-fixture-answer") == 1);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "session recording disabled") != null);
         return;
-    } else if (std.mem.eql(u8, mode, "approval")) {
-        // 审批流程：验证 y/n 决策只能由真实按键产生，粘贴内容不能伪造授权。
-        var start = d.used;
-        try d.send("approve-one\r");
-        try d.waitText(start, "Approval #");
-        try d.quiet(150); // Complete frame, not just header prefix.
-        start = d.used;
-
-        // 通过 bracketed paste 发送的 y 不能作为审批决定：此后输出中不应出现 "Decision sent"。
-        try d.send("\x1b[200~y\x1b[201~");
-        try d.send("\x1b[200~\x1b[201~yt\x1b[201~"); // Embedded paste terminator must not turn y/t into authority.
-        try d.quiet(350);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "Decision sent") == null);
-
-        // 按键 n 拒绝第一次审批，等待任务 Completed。
-        try d.send("n");
-        try d.waitText(start, "Completed");
-
-        // 第二个审批请求：按键 y 批准。
-        start = d.used;
-        try d.send("approve-two\r");
-        try d.waitText(start, "Approval #");
-        try d.quiet(150);
-        try d.send("y");
-        try d.waitText(start, "Completed");
+    } else if (std.mem.eql(u8, mode, "auto-tools")) {
+        // 同一终端两轮写入均无需审批；只提交任务并等待执行结果。
+        for ([_][]const u8{ "auto-one", "auto-two" }) |prompt| {
+            const start = d.used;
+            try d.send(prompt);
+            try d.send("\r");
+            try d.waitText(start, "fixture-answer");
+            try d.waitText(start, "Completed");
+            try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
+            try check(std.mem.indexOf(u8, d.output[start..d.used], "tools trusted") != null);
+        }
     } else if (std.mem.eql(u8, mode, "cancel") or std.mem.eql(u8, mode, "term")) {
         // cancel / term 模式：等待模型调用进行中（calling_model），再发送取消或终止信号。
         const start = d.used;

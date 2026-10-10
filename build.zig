@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    addMarkdown(b, exe.root_module);
     b.installArtifact(exe);
 
     // `zig build run -- [参数]`：先编译再运行 thin，参数写在 `--` 之后传给程序，类似 cargo run。
@@ -46,6 +47,9 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    addMarkdown(b, unit.root_module);
+    // Test-only parser copy with allocation injection; never linked into thin.
+    unit.root_module.addCSourceFile(.{ .file = b.path("src/tests/md4c_fault_test.c"), .flags = &.{"-std=c11"} });
     const run_unit = b.addRunArtifact(unit);
     b.step("test-unit", "Run product unit tests without network or credentials").dependOn(&run_unit.step);
 
@@ -113,4 +117,12 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_http.step);
     test_all.dependOn(&run_app.step);
     test_all.dependOn(&run.step);
+}
+
+/// Vendored CommonMark/GFM parser: builds offline, no system package/runtime
+/// library requirement. Zig code keeps using the native backend; C uses zig cc.
+fn addMarkdown(b: *std.Build, module: *std.Build.Module) void {
+    for ([_][]const u8{ "md4c.c", "entity.c", "abi.c" }) |file| {
+        module.addCSourceFile(.{ .file = b.path(b.fmt("src/vendor/md4c/{s}", .{file})), .flags = &.{"-std=c11"} });
+    }
 }

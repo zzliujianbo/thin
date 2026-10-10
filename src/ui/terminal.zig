@@ -18,7 +18,7 @@ extern "c" fn getpgrp() c_int;
 const nonblock = 0x800;
 
 // 普通主缓冲：保留 shell 与滚屏内容；只管理自身追加的 live tail。
-const enter = "\x1b[?2004h\x1b[0m\x1b[?25h\r\n";
+const enter = "\x1b[?2004h\x1b[0m\x1b[?25l";
 // CAN 中止未完成的转义序列；不切屏、不清屏，最终输出留在滚屏中。
 const leave = "\x18\x1b[0m\x1b[?2004l\x1b[?25h\r\n";
 /// 终端尺寸，单位为列数与行数。
@@ -76,6 +76,19 @@ pub const Terminal = struct {
         }
         // 进入序列的写入次数有上限（50），避免被背压无限阻塞。
         if (!self.writeBounded(enter, 50)) return error.TerminalSetupFailed;
+        // Push earlier terminal output into scrollback, without clearing it or
+        // entering an alternate buffer. Relative movement then starts our owned
+        // blank area at the top; the composer will stay on the bottom row.
+        const rows = self.size().rows;
+        var start: [432]u8 = undefined; // At most 200 CRLFs plus relative CUU.
+        for (0..rows) |i| {
+            start[2 * i] = '\r';
+            start[2 * i + 1] = '\n';
+        }
+        const suffix = try std.fmt.bufPrint(start[rows * 2 ..], "\x1b[{d}A\r", .{rows -| 1});
+        // CSI 0 A means one row, so a one-row terminal needs no movement.
+        const length = if (rows > 1) rows * 2 + suffix.len else rows * 2;
+        if (!self.writeBounded(start[0..length], 50)) return error.TerminalSetupFailed;
         return self;
     }
 
@@ -203,6 +216,36 @@ test "product terminal restores raw attributes and flags on PTY only" {
     try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &restored));
     try expectAttributes(original, restored);
     try std.testing.expectEqual(flags, c.fcntl(slave, 3));
+}
+
+test "initial terminal scrolls prior output into history and starts at top" {
+    const regular = @import("../tests/regular_screen.zig");
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
+    defer _ = c.close(master);
+    defer _ = c.close(slave);
+    _ = c.fcntl(master, 4, c.fcntl(master, 3) | nonblock);
+    var dimensions = std.mem.zeroes(c.winsize);
+    dimensions.col = 80;
+    dimensions.row = 24;
+    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &dimensions));
+    const previous = regular.prior ++ "\r\n";
+    try std.testing.expectEqual(@as(isize, previous.len), c.write(slave, previous.ptr, previous.len));
+    var terminal = try Terminal.fromFd(slave, false);
+    defer terminal.deinit();
+    var buffer: [2048]u8 = undefined;
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const n = c.read(master, buffer[used..].ptr, buffer.len - used);
+        if (n <= 0) break;
+        used += @intCast(n);
+    }
+    var screen: regular.Screen = .{};
+    try screen.replay(buffer[0..used]);
+    try std.testing.expectEqual(@as(usize, 0), screen.row);
+    try std.testing.expect(!screen.visible(regular.prior));
+    try std.testing.expectEqual(@as(usize, 1), screen.count(regular.prior));
 }
 
 // 测试：输出缓冲被写满（背压）时仍保持非阻塞，恢复后属性仍然正确。

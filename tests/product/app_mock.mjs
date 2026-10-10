@@ -145,7 +145,7 @@ async function execute(bin, args, env, cwd, onChild, timeout = 30000) {
 /**
  * 运行一个应用验收场景：创建临时 HOME 与项目目录，启动伪造 OpenAI 兼容服务（chat 或 responses），
  * 写入 config.json，然后运行 CLI 或 PTY 驱动，并按 kind 断言结果。
- * kind 取值：help、no-config、legacy-config、plain、deny、trust、compact、malformed、truncated、stall、approval、
+ * kind 取值：help、no-config、legacy-config、plain、auto、trust、compact、malformed、truncated、stall、auto-tools、
  * cancel、term、output、unicode、auth-missing、auth-empty、auth-activate。场景结束时关闭服务器并删除临时目录。
  */
 async function scenario(name, protocol, kind, isPty = false) {
@@ -223,6 +223,23 @@ async function scenario(name, protocol, kind, isPty = false) {
         return;
       }
 
+      // Split visible reasoning and Markdown over time. PTY must display both
+      // before [DONE], not merely repaint the final committed answer.
+      if (kind === 'stream-markdown') {
+        assert.equal(protocol, 'chat');
+        res.writeHead(200, {'content-type':'text/event-stream', 'cache-control':'no-cache'});
+        const chunk = delta => res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta,finish_reason:null}]})}\n\n`);
+        chunk({reasoning_content:'reasoning-stage-one **visible reasoning**'});
+        await new Promise(resolve=>setTimeout(resolve,600));
+        chunk({content:'# Orange heading\n\n**stream-stage-one** and [link](https://example.org)\n\n'});
+        await new Promise(resolve=>setTimeout(resolve,600));
+        chunk({content:'```zig\nconst value = 1;\n```\n\n| Item | State |\n| --- | --- |\n| fixture | ready |\n\nstream-final-answer'});
+        await new Promise(resolve=>setTimeout(resolve,200));
+        res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`);
+        res.end();
+        return;
+      }
+
       // 输出超限场景：返回约 240 KiB 的文本，验证输出上限。
       if (kind === 'output') { send(res,protocol,'x'.repeat(240*1024)); return; }
 
@@ -238,8 +255,8 @@ async function scenario(name, protocol, kind, isPty = false) {
         send(res,protocol,'',[tool(`read_${rounds}`,'read_file',{path:'seed.txt'})]); return;
       }
 
-      // 权限场景：第 1 轮让模型同时请求写文件、写记忆和执行 shell。deny 时都应被拒绝；trust 时应真实执行，且 shell 的子进程看不到假密钥。
-      if ((kind === 'deny' || kind === 'trust') && rounds === 1) {
+      // 默认信任与兼容 --trust：真实执行写文件、Memory 与 shell，且子进程看不到假密钥。
+      if ((kind === 'auto' || kind === 'trust') && rounds === 1) {
         send(res,protocol,'',[
           tool('write','write_file',{path:'written.txt',content:'actual-write'}),
           tool('memory','memory',{action:'write',topic:'acceptance',content:'actual-memory'}),
@@ -247,22 +264,19 @@ async function scenario(name, protocol, kind, isPty = false) {
         ]); return;
       }
 
-      // 审批场景：第 1、3 轮请求写文件，由 PTY 输入 y/n 决定批准或拒绝。
-      if (kind === 'approval' && (rounds === 1 || rounds === 3)) {
-        send(res,protocol,'',[tool(`approval_${rounds}`,'write_file',{path:rounds===1?'denied.txt':'allowed.txt',content:'approved'})]); return;
+      // 同一 PTY 两轮自动写入，驱动不会发送任何审批按键。
+      if (kind === 'auto-tools' && (rounds === 1 || rounds === 3)) {
+        send(res,protocol,'',[tool(`auto_${rounds}`,'write_file',{path:rounds===1?'auto-one.txt':'auto-two.txt',content:'executed'})]); return;
       }
 
-      // trust 第 2 轮：断言三个工具结果与磁盘副作用均已发生。
-      if (kind === 'trust' && rounds === 2) {
+      // 第 2 轮：断言三个工具结果与磁盘副作用均已发生。
+      if ((kind === 'auto' || kind === 'trust') && rounds === 2) {
         assert.equal(outputs.size, 3);
         assert(outputs.get('shell').includes('child-key-omitted'), 'shell saw key or did not run');
         assert.equal(await readFile(join(project,'written.txt'),'utf8'),'actual-write');
         assert.equal(await readFile(join(project,'shell.txt'),'utf8'),'actual-shell');
         assert((await readFile(join(project,'.thin/mem/acceptance.md'),'utf8')).includes('actual-memory'));
       }
-
-      // deny 第 2 轮：断言三个工具结果都包含 denied 文本。
-      if (kind === 'deny' && rounds === 2) { assert.equal(outputs.size, 3); for (const value of outputs.values()) assert(/denied/i.test(value)); }
 
       // 默认回复：包含 Unicode、Markdown 与 OSC 52 注入，用于验证渲染与净化。
       send(res,protocol,`**世界** café\n\n- fixture-answer\n${injection}`);
@@ -374,16 +388,26 @@ async function scenario(name, protocol, kind, isPty = false) {
       for (let i=1;i<=8;i++) assert(observations.get(`read_${i}`)?.includes('seed-content-'), `read ${i} result missing`);
     }
 
-    // 拒绝、畸形与截断场景不得产生任何副作用文件。
-    if (kind === 'deny' || kind==='malformed' || kind==='truncated') {
+    // 畸形与截断的工具调用仍不得执行，即使默认信任。
+    if (kind==='malformed' || kind==='truncated') {
       for (const path of ['written.txt','shell.txt','forbidden.txt','.thin/mem/acceptance.md']) assert(!await exists(join(project,path)), `unexpected effect: ${path}`);
     }
 
-    // 审批场景：denied.txt 不得存在（拒绝），allowed.txt 必须存在（批准），共 4 轮。
-    if (kind === 'approval') {
-      assert(!await exists(join(project,'denied.txt')), 'pasted y approved or n failed');
-      assert.equal(await readFile(join(project,'allowed.txt'),'utf8'),'approved');
-      assert.equal(rounds,4);
+    // 默认执行不进入审批；文件、shell 与 Memory 的真实结果仍正确回填。
+    if (kind === 'auto' || kind === 'trust' || kind === 'auto-tools') {
+      assert(!result.output.includes('Approval #'), 'default tool execution requested approval');
+      assert(!result.output.includes('privileged tools denied'), 'default tool execution denied');
+      if (kind === 'auto-tools') {
+        assert.equal(await readFile(join(project,'auto-one.txt'),'utf8'),'executed');
+        assert.equal(await readFile(join(project,'auto-two.txt'),'utf8'),'executed');
+        assert.equal(rounds,4);
+      }
+      const files = (await readdir(join(project,'.thin/sessions'))).filter(f=>f.endsWith('.jsonl'));
+      for (const file of files) {
+        const events = (await readFile(join(project,'.thin/sessions',file),'utf8')).trimEnd().split('\n').map(line=>JSON.parse(line));
+        assert(!events.some(row=>row.event==='permission'||row.event==='decision'||(row.event==='state'&&row.data.state==='awaiting_permission')), 'default execution entered authorization');
+        assert(events.some(row=>row.event==='tool_started'), 'real tool execution did not start');
+      }
     }
 
     // 取消类场景必须确实到达挂起点。
@@ -412,11 +436,11 @@ try {
 
   // 对两种协议分别运行全部通用场景。
   for (const protocol of ['chat','responses']) {
-    for (const kind of ['plain','deny','trust','compact','malformed','truncated','stall']) await scenario(`${protocol}/${kind}`,protocol,kind);
+    for (const kind of ['plain','auto','trust','compact','malformed','truncated','stall']) await scenario(`${protocol}/${kind}`,protocol,kind);
   }
 
   // PTY 场景：通过 thin-app-pty 驱动交互式终端，仅使用 chat 协议。
-  for (const kind of ['unicode','regular-two','approval','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
+  for (const kind of ['unicode','regular-two','stream-markdown','auto-tools','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
   await reviewRegressions(app);
   await logRegressions(app,pty);
   console.log('Application fixture suite passed; PTY tests exercise chat only.');
