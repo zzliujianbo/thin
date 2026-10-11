@@ -24,14 +24,49 @@ pub const ReasoningEffort = enum {
     xhigh,
     unknown,
 
-    pub fn fromName(name: ?[]const u8) ReasoningEffort {
-        const value = name orelse return .unspecified;
+    pub fn fromName(configured: ?[]const u8) ReasoningEffort {
+        const value = configured orelse return .unspecified;
         inline for (.{ "none", "minimal", "low", "medium", "high", "xhigh" }) |known| {
             if (std.mem.eql(u8, value, known)) return @field(ReasoningEffort, known);
         }
         return .unknown;
     }
+
+    /// Request-option cycle only; no provider capability or hidden-depth claim.
+    pub fn next(self: ReasoningEffort) ReasoningEffort {
+        return switch (self) {
+            .unspecified, .unknown, .xhigh => .none,
+            .none => .minimal,
+            .minimal => .low,
+            .low => .medium,
+            .medium => .high,
+            .high => .xhigh,
+        };
+    }
+    pub fn name(self: ReasoningEffort) ?[]const u8 {
+        return switch (self) {
+            .unspecified, .unknown => null,
+            .none => "none",
+            .minimal => "minimal",
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+            .xhigh => "xhigh",
+        };
+    }
 };
+
+test "request effort cycle is explicit wraps and never guesses custom levels" {
+    var effort: ReasoningEffort = .none;
+    for ([_]ReasoningEffort{ .minimal, .low, .medium, .high, .xhigh, .none }) |expected| {
+        effort = effort.next();
+        try std.testing.expectEqual(expected, effort);
+        try std.testing.expectEqual(effort, ReasoningEffort.fromName(effort.name()));
+    }
+    try std.testing.expectEqual(ReasoningEffort.none, ReasoningEffort.unspecified.next());
+    try std.testing.expectEqual(ReasoningEffort.none, ReasoningEffort.unknown.next());
+    try std.testing.expectEqual(@as(?[]const u8, null), ReasoningEffort.unknown.name());
+}
 
 /// Renderer-independent execution pulse; only active tool presentation uses it.
 pub fn commandStep(now_ms: u64) usize {

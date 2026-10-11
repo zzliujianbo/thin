@@ -17,9 +17,11 @@ fn forbidden(c: u21) bool {
         (c >= 0x2066 and c <= 0x206f) or c == 0x2028 or c == 0x2029;
 }
 
-/// Owned UTF-8, capped including the marker. Invalid/control scalars become
-/// replacement characters; LF/TAB remain text. CRLF counts as one LF.
-pub fn sanitize(a: std.mem.Allocator, input: []const u8, max_bytes: usize) ![]const u8 {
+pub const Prefix = struct { text: []u8, truncated: bool };
+
+/// Owned bounded safe prefix, without a text marker. The flag is metadata so
+/// a renderer can discard a possibly incomplete final cluster before clipping.
+pub fn sanitizePrefix(a: std.mem.Allocator, input: []const u8, max_bytes: usize) !Prefix {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     var i: usize = 0;
@@ -35,7 +37,16 @@ pub fn sanitize(a: std.mem.Allocator, input: []const u8, max_bytes: usize) ![]co
         try out.appendSlice(a, buf[0..n]);
         i = r.end;
     }
-    if (i < input.len) {
+    return .{ .text = try out.toOwnedSlice(a), .truncated = i < input.len };
+}
+
+/// Owned UTF-8, capped including the marker. Invalid/control scalars become
+/// replacement characters; LF/TAB remain text. CRLF counts as one LF.
+pub fn sanitize(a: std.mem.Allocator, input: []const u8, max_bytes: usize) ![]const u8 {
+    const prefix = try sanitizePrefix(a, input, max_bytes);
+    var out = std.ArrayList(u8).fromOwnedSlice(prefix.text);
+    errdefer out.deinit(a);
+    if (prefix.truncated) {
         const marker = "[truncated]";
         const m = @min(max_bytes, marker.len);
         while (out.items.len > max_bytes - m) {
@@ -48,6 +59,23 @@ pub fn sanitize(a: std.mem.Allocator, input: []const u8, max_bytes: usize) ![]co
         }
     }
     return out.toOwnedSlice(a);
+}
+
+test "safe prefixes carry truncation as metadata and preserve literal markers" {
+    const a = std.testing.allocator;
+    const input = "é[truncated]\r\n\x1b";
+    for (0..32) |limit| {
+        const prefix = try sanitizePrefix(a, input, limit);
+        defer a.free(prefix.text);
+        try std.testing.expect(prefix.text.len <= limit);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(prefix.text));
+        try std.testing.expectEqual(exceedsSanitizedLimit(input, limit), prefix.truncated);
+        try std.testing.expect(std.mem.indexOfScalar(u8, prefix.text, '\x1b') == null);
+    }
+    const prefix = try sanitizePrefix(a, "literal[truncated]file", 512);
+    defer a.free(prefix.text);
+    try std.testing.expect(!prefix.truncated);
+    try std.testing.expectEqualStrings("literal[truncated]file", prefix.text);
 }
 
 pub fn exceedsSanitizedLimit(input: []const u8, max_bytes: usize) bool {

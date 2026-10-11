@@ -105,6 +105,20 @@ const Driver = struct {
         return error.VisibleTextTimeout;
     }
 
+    /// A visible menu fragment is not an acknowledged complete owned frame.
+    fn waitFrame(self: *Driver, start: usize, needle: []const u8) !void {
+        const until = now() + 10000;
+        while (now() < until) {
+            try self.drain(20);
+            const bytes = self.output[start..self.used];
+            if (std.mem.indexOf(u8, bytes, needle)) |at| {
+                if (std.mem.indexOf(u8, bytes[at + needle.len ..], "\x1b[?25h") != null) return;
+            }
+            if (!self.owned) return error.EarlyExit;
+        }
+        return error.VisibleTextTimeout;
+    }
+
     /// Completion has no label. Match the percentage+idle marker only in new
     /// output, including all configured-effort colors and reset.
     fn waitIdle(self: *Driver, start: usize) !void {
@@ -120,7 +134,9 @@ const Driver = struct {
                 "%) \x1b[38;5;214m>\x1b[0m ",
                 "%) \x1b[38;5;75m>\x1b[0m ",
                 "%) \x1b[38;5;171m>\x1b[0m ",
-            }) |idle| if (std.mem.indexOf(u8, bytes, idle) != null) return;
+            }) |idle| if (std.mem.indexOf(u8, bytes, idle)) |marker| {
+                if (std.mem.indexOf(u8, bytes[marker + idle.len ..], "\x1b[?25h") != null) return;
+            };
             if (!self.owned) return error.EarlyExit;
         }
         return error.VisibleTextTimeout;
@@ -150,6 +166,22 @@ const Driver = struct {
             if (!self.owned) return error.EarlyExit;
         }
         return error.VisibleTextTimeout;
+    }
+
+    /// One actual blank retained row between the sent message and live content.
+    fn checkGap(screen_value: *const regular.Screen, before: []const u8, after: []const u8) !void {
+        var first: ?usize = null;
+        var second: ?usize = null;
+        for (0..screen_value.history_len + screen_value.grid.len) |i| {
+            const line = if (i < screen_value.history_len) &screen_value.history[i] else &screen_value.grid[i - screen_value.history_len];
+            if (first == null and std.mem.indexOf(u8, line, before) != null) first = i;
+            if (second == null and std.mem.indexOf(u8, line, after) != null) second = i;
+        }
+        try check(first != null and second != null);
+        try check(second.? == first.? + 2);
+        const gap = first.? + 1;
+        const line = if (gap < screen_value.history_len) &screen_value.history[gap] else &screen_value.grid[gap - screen_value.history_len];
+        for (line) |byte| try check(byte == ' ');
     }
 
     /// Fixed-size replay only: resize cases check sequences, not terminal reflow.
@@ -199,6 +231,23 @@ const Driver = struct {
         // 安全检查：应用不得输出 OSC 52 剪贴板序列，也不得泄露测试注入的密钥。
         try check(std.mem.indexOf(u8, self.output[0..self.used], "\x1b]52;") == null);
         try check(std.mem.indexOf(u8, self.output[0..self.used], "fixture-secret-never-log") == null);
+        const prefix = "Session ID: ";
+        const bytes = self.output[0..self.used];
+        const at = std.mem.indexOf(u8, bytes, prefix);
+        if (expected == 0) {
+            try check(at != null and at.? + prefix.len + 32 <= bytes.len);
+            const id = bytes[at.? + prefix.len ..][0..32];
+            for (id) |byte| try check((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'));
+            try check(std.mem.indexOf(u8, bytes[at.? + prefix.len + 32 ..], prefix) == null);
+            const leave = "\x18\x1b[0m\x1b[?2004l\x1b[?25h\r\n";
+            // Restored OPOST/ONLCR may add an extra CR before LF.
+            const translated_leave = "\x18\x1b[0m\x1b[?2004l\x1b[?25h\r\r\n";
+            const exit_at = std.mem.lastIndexOf(u8, bytes[0..at.?], leave) orelse std.mem.lastIndexOf(u8, bytes[0..at.?], translated_leave);
+            try check(exit_at != null);
+            try check(std.mem.indexOfScalar(u8, bytes[at.?..], 0x1b) == null);
+            // Only validated immutable metadata leaves this capture buffer.
+            std.debug.print("PTY_SESSION_ID={s}\n", .{id});
+        } else try check(at == null); // Signal/headless exits do not announce it.
     }
 
     /// 清理：若子进程仍归本驱动器所有，则 SIGKILL 进程组与进程本身，并在 2 秒内尝试回收；最后关闭两端 fd。
@@ -264,8 +313,9 @@ pub fn main(init: std.process.Init) !void {
 
     const interactive_argv = [_:null]?[*:0]const u8{bin};
     const print_argv = [_:null]?[*:0]const u8{ bin, "--print", "large-output" };
+    const no_log_argv = [_:null]?[*:0]const u8{ bin, "--no-log" };
     // output 模式直接执行 --print 大输出；其余模式启动交互式界面。
-    const argv: [*:null]const ?[*:0]const u8 = if (std.mem.eql(u8, mode, "output")) &print_argv else &interactive_argv;
+    const argv: [*:null]const ?[*:0]const u8 = if (std.mem.eql(u8, mode, "output")) &print_argv else if (std.mem.eql(u8, mode, "exit-no-log")) &no_log_argv else &interactive_argv;
 
     var master: c_int = undefined;
     var slave: c_int = undefined;
@@ -358,6 +408,24 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
         // 初始化只验证待配置界面；不输入密钥或发送消息，避免连接默认公共端点。
         try d.waitText(0, "/auth");
+    } else if (std.mem.eql(u8, mode, "exit-no-submit") or std.mem.eql(u8, mode, "exit-unconfigured") or std.mem.eql(u8, mode, "exit-batched")) {
+        try d.quiet(100);
+    } else if (std.mem.eql(u8, mode, "exit-secret")) {
+        const start = d.used;
+        try d.send("/auth\r");
+        try d.waitFrame(start, "API key");
+        try d.send("fixture-secret-never-log");
+        try d.quiet(100);
+    } else if (std.mem.eql(u8, mode, "exit-no-log")) {
+        const start = d.used;
+        try d.send("fixture-task\r");
+        try d.waitText(start, "fixture-answer");
+        try d.waitIdle(start);
+    } else if (std.mem.eql(u8, mode, "exit-busy") or std.mem.eql(u8, mode, "exit-busy-tool")) {
+        const start = d.used;
+        try d.send("exit-busy-task\r");
+        if (std.mem.eql(u8, mode, "exit-busy-tool")) try d.waitFrame(start, "sleep 30") else try d.waitBusy(start);
+        // Ctrl+D at the shared tail below cancels and joins before restoration.
     } else if (std.mem.eql(u8, mode, "auth-activate")) {
         // 待激活配置指向本地 fixture。/auth 使用独立的掩码输入，取消不能保存或污染聊天输入。
         try d.waitText(0, "/auth");
@@ -434,6 +502,7 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
         var stage = try d.screen();
         try check(stage.visible("reasoning-stage-one") and stage.row == 23);
+        try Driver.checkGap(&stage, "stream-task", "thinking-old-two");
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Thinking") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "thin |") == null);
         try check(!stage.visible("thinking-old-one"));
@@ -443,6 +512,7 @@ pub fn main(init: std.process.Init) !void {
         stage = try d.screen();
         try check(stage.visible("thinking-new-five") and stage.visible("thinking-new-six") and stage.visible("reasoning-stage-two"));
         try check(!stage.visible("reasoning-stage-one") and !stage.visible("thinking-old-two"));
+        try Driver.checkGap(&stage, "stream-task", "thinking-new-five");
         try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &stage.grid[23], "%) ~") != null and stage.row == 23);
         for (stage.grid[22]) |byte| try check(byte == ' ');
         try check(!stage.visible("TPS:") and !stage.visible("tokens in:"));
@@ -451,24 +521,54 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
         stage = try d.screen();
         try check(stage.visible("Orange heading") and stage.visible("stream-stage-one") and stage.row == 23);
+        try Driver.checkGap(&stage, "stream-task", "Orange heading");
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Streaming") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "History preview") == null);
         try check(!stage.visible("reasoning-stage-two") and !stage.visible("Thinking"));
         try check(!stage.visible("Enter send") and !stage.visible("Ctrl+J newline"));
         try check(std.mem.indexOf(u8, d.output[start..d.used], "[user]") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "[assistant") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;208m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[48;2;52;36;24m") != null);
-        try d.waitText(start, "stream-final-answer");
-        try d.waitIdle(start);
+        // Do not satisfy completion with the old idle composer emitted before
+        // this request. Wait for an acknowledged frame after the final delta.
+        const final_start = d.used;
+        try d.waitText(final_start, "stream-final-answer");
+        try d.waitIdle(final_start);
         try d.quiet(100);
         stage = try d.screen();
         try check(stage.count("reasoning-stage-one") == 0 and stage.count("reasoning-stage-two") == 0);
         try check(stage.count("thinking-new-five") == 0 and stage.count("stream-final-answer") == 1);
+        try Driver.checkGap(&stage, "stream-task", "Orange heading");
         try check(!stage.visible("TPS:") and !stage.visible("tokens in:") and !stage.visible("Completed"));
         try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &stage.grid[23], "%) >") != null);
         try check(stage.count("Final answer") == 0 and !stage.visible("ctx ~"));
+        // Real streamed Markdown uses independent semantic colors and a boxed
+        // grid with a second body row, not just its old header-only rule.
+        const markdown_output = d.output[start..d.used];
+        for ([_][]const u8{ "\x1b[38;5;11m", "\x1b[38;5;13m", "\x1b[39m\x1b[2m", "\x1b[1m", "\x1b[38;5;10m", "┌", "├", "┼", "└", "second-row", "exit_code=124", "exit_code=0" }, 0..) |part, part_index| {
+            const found = std.mem.indexOf(u8, markdown_output, part) != null;
+            if (!found) std.debug.print("Markdown assertion index: {d}\n", .{part_index}); // Safe index, never captured bytes.
+            try check(found);
+        }
+        // The independent model-name flow may legitimately contain orange.
+        try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;215m\x1b[1mstream-stage-one") == null);
+        try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;13minline-marker\x1b[0m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;75m>\x1b[0m ") != null); // Configured high, not stream duration.
         for (stage.grid[22]) |byte| try check(byte == ' ');
         try check(stage.row == 23);
+    } else if (std.mem.eql(u8, mode, "architecture-table")) {
+        const start = d.used;
+        try d.send("architecture-table-task\r");
+        try d.waitText(start, "architecture-table-final-answer");
+        try d.waitIdle(start);
+        const final = try d.screen();
+        try check(final.count("architecture-table-final-answer") == 1 and final.row == 23);
+        const raw = d.output[start..d.used];
+        for ([_][]const u8{ "┌", "┬", "┼", "└", "┴", "app/", "core/", "llm/", "platform/", "util/" }) |marker| try check(std.mem.indexOf(u8, raw, marker) != null);
+        try check(std.mem.indexOf(u8, raw, "|---|---|") == null);
+        try check(std.mem.indexOf(u8, raw, "Markdown complexity limit") == null);
+        try check(std.mem.indexOf(u8, raw, "Streaming") == null);
     } else if (std.mem.eql(u8, mode, "tool-icons")) {
         const start = d.used;
         // Startup already shows configured high despite no reasoning delta.
@@ -480,7 +580,9 @@ pub fn main(init: std.process.Init) !void {
         const first = try d.screen();
         try d.quiet(240);
         const second = try d.screen();
-        try check(first.visible("> sleep 1; cat r.json") and second.visible("> sleep 1; cat r.json"));
+        try check(first.visible("~ sleep 1; cat r.json") and second.visible("~ sleep 1; cat r.json"));
+        try Driver.checkGap(&first, "tool-icon-task", "~ sleep 1; cat r.json");
+        try Driver.checkGap(&second, "tool-icon-task", "~ sleep 1; cat r.json");
         // The ASCII VT fixture maps non-ASCII glyphs to '~'; inspect only these
         // renderer-owned braille symbols, not a general Unicode-width claim.
         var frames: usize = 0;
@@ -490,31 +592,69 @@ pub fn main(init: std.process.Init) !void {
         try check(frames >= 2);
         var pulses: usize = 0;
         for ([_][]const u8{ "\x1b[38;5;173m", "\x1b[38;5;208m", "\x1b[38;5;214m", "\x1b[38;5;220m", "\x1b[38;5;223m" }) |color| {
-            var pattern: [96]u8 = undefined;
-            const effect = try std.fmt.bufPrint(&pattern, "{s}>\x1b[38;5;245m sleep 1; cat r.json", .{color});
-            if (std.mem.indexOf(u8, d.output[animation_start..d.used], effect) != null) pulses += 1;
+            var present = false;
+            for ([_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }) |icon| {
+                var pattern: [96]u8 = undefined;
+                const effect = try std.fmt.bufPrint(&pattern, "{s}{s}\x1b[38;5;245m sleep 1; cat r.json", .{ color, icon });
+                present = present or std.mem.indexOf(u8, d.output[animation_start..d.used], effect) != null;
+            }
+            if (present) pulses += 1;
         }
         try check(pulses >= 2); // Distinct prefix shades, not repeated glyph/text.
         try check(std.mem.indexOf(u8, d.output[start..d.used], ">_") == null);
         try check(first.row == 23 and second.row == 23);
         try check(std.mem.indexOf(u8, &first.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &first.grid[23], "%) ~") != null);
         for (first.grid[22]) |byte| try check(byte == ' ');
+        try d.waitText(start, "sleep 0.6; printf ok");
+        const next_pending = try d.screen();
+        var completed_row: ?usize = null;
+        var next_row: ?usize = null;
+        for (next_pending.grid, 0..) |line, row| {
+            if (std.mem.indexOf(u8, &line, "> sleep 1; cat r.json") != null) completed_row = row;
+            if (std.mem.indexOf(u8, &line, "~ sleep 0.6; printf ok") != null) next_row = row;
+        }
+        try check(completed_row != null and next_row != null);
+        try check(next_row.? == completed_row.? + 1 and next_pending.row == 23);
         try d.waitText(start, "tool-icon-final-answer");
         try d.waitIdle(start);
         try d.quiet(100);
         const final = try d.screen();
         try check(final.count("tool-icon-final-answer") == 1);
-        var same_line = false;
-        for (final.grid) |line| if (std.mem.indexOf(u8, &line, "> sleep 1;") != null and std.mem.indexOf(u8, &line, "> printf ok") != null and std.mem.indexOf(u8, &line, "> false [error]") != null) {
-            same_line = true;
-        };
-        try check(same_line);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;114m> printf ok") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;203m> false [error]") != null);
+        var command_rows: [3]?usize = @splat(null);
+        const markers = [_][]const u8{ "> sleep 1; cat r.json", "> sleep 0.6; printf ok", "> false; #" };
+        for (final.grid, 0..) |line, row| {
+            var calls_on_row: usize = 0;
+            for (markers, 0..) |marker, index| if (std.mem.indexOf(u8, &line, marker) != null) {
+                command_rows[index] = row;
+                calls_on_row += 1;
+            };
+            try check(calls_on_row <= 1);
+        }
+        try check(command_rows[0] != null and command_rows[1] != null and command_rows[2] != null);
+        try check(command_rows[1].? == command_rows[0].? + 1 and command_rows[2].? == command_rows[1].? + 1);
+        try check(final.count(markers[0]) == 1 and final.count(markers[1]) == 1 and final.count(markers[2]) == 1);
+        try check(final.row == 23);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m>\x1b[38;5;245m sleep 0.6; printf ok") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m>\x1b[38;5;203m false; #") != null); // Default prefix; long third summary clips at80% in its true failure color.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "...\x1b[0m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "·") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "bash #") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "tool-json-hidden-marker") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Running bash") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Enter send") == null);
+    } else if (std.mem.eql(u8, mode, "memory-summary")) {
+        const start = d.used;
+        try d.send("memory-summary-task\r");
+        try d.waitText(start, "memory-summary-final-answer");
+        try d.waitIdle(start);
+        const final = try d.screen();
+        for ([_][]const u8{ "m write caption-note", "m read caption-note", "m list core/index", "m delete caption-note" }) |caption| {
+            try check(final.count(caption) == 1);
+        }
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "memory-summary-hidden-body") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "expected_version") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0mm\x1b[38;5;245m read caption-note") != null);
+        try check(final.count("memory-summary-final-answer") == 1 and final.row == 23);
     } else if (std.mem.eql(u8, mode, "file-stats")) {
         const start = d.used;
         try d.send("file-stats-task\r");
@@ -522,7 +662,7 @@ pub fn main(init: std.process.Init) !void {
         try d.waitIdle(start);
         const final = try d.screen();
         var previous: ?usize = null;
-        for ([_][]const u8{ "write_file stats.txt  ~0 +5 -0 lines", "write_file stats.txt  ~1 +1 -1 lines", "read_file stats.txt  5 lines", "read_file stats.txt  2 lines [partial]", "write_file stats.txt  ~0 +0 -5 lines", "write_file stats.txt [error]" }) |caption| {
+        for ([_][]const u8{ "w stats.txt  ~0 +5 -0 lines", "w stats.txt  ~1 +1 -1 lines", "r stats.txt  5 lines", "r stats.txt  2 lines [partial]", "w stats.txt  ~0 +0 -5 lines", "w stats.txt [error]" }) |caption| {
             try check(final.count(caption) == 1);
             var found: ?usize = null;
             for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, caption) != null) {
@@ -533,6 +673,10 @@ pub fn main(init: std.process.Init) !void {
             previous = found;
         }
         try check(final.count("Final answer") == 0 and final.count("file-stats-final-answer") == 1);
+        try Driver.checkGap(&final, "file-stats-task", "w stats.txt");
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;2m+1\x1b[38;5;245m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;1m-1\x1b[38;5;245m") != null);
+        for ([_][]const u8{ "read_file ", "write_file ", "memory read " }) |old_label| try check(std.mem.indexOf(u8, d.output[start..d.used], old_label) == null);
         var answer: ?usize = null;
         for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, "file-stats-final-answer") != null) {
             answer = row;
@@ -542,6 +686,55 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, &final.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &final.grid[23], "%) >") != null);
         try check(!final.visible("ctx ~"));
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\"written_bytes\"") == null);
+    } else if (std.mem.eql(u8, mode, "model-select")) {
+        var start = d.used;
+        try d.send("selection-first\r");
+        try d.waitBusy(start);
+        // Neither the effort shortcut nor direct command may mutate a live
+        // request. The server checks exact first/continuation wire options.
+        try d.send("\x1b[Z/model rejected-busy\r");
+        try d.waitText(start, "selection-answer-one");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("/model\r");
+        try d.waitFrame(start, "Search> ");
+        start = d.used;
+        try d.send("\x1b[B");
+        try d.waitFrame(start, "Search> ");
+        start = d.used;
+        try d.send("\r");
+        try d.waitIdle(start);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "fixture-next") != null);
+        start = d.used;
+        try d.send("\x1b[Z"); // Configured low -> medium, not a visual-only label.
+        try d.waitIdle(start);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;214m>\x1b[0m") != null);
+        start = d.used;
+        try d.send("selection-second\r");
+        try d.waitText(start, "selection-answer-two");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("/model\r");
+        try d.waitFrame(start, "Search> ");
+        start = d.used;
+        try d.send("\x1b"); // Owned ambiguity timeout for standalone Escape.
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("/model fixture-custom\r");
+        try d.waitIdle(start);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "fixture-custom") != null);
+        start = d.used;
+        try d.send("\x1b[Z");
+        try d.waitIdle(start);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;75m>\x1b[0m") != null);
+        start = d.used;
+        try d.send("selection-third\r");
+        try d.waitText(start, "selection-answer-three");
+        try d.waitIdle(start);
+        const final = try d.screen();
+        try check(final.count("selection-answer-one") == 1 and final.count("selection-answer-two") == 1 and final.count("selection-answer-three") == 1);
+        try check(final.count("selection-first") == 1 and final.count("selection-second") == 1 and final.count("selection-third") == 1);
+        try check(final.row == 23 and final.count("/model") == 0);
     } else if (std.mem.eql(u8, mode, "log-failure")) {
         const start = d.used;
         try d.send("log-fixture-task\r");
@@ -604,8 +797,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Ctrl-D (0x04) 让应用正常退出，期望退出码 0。
-    try d.send("\x04");
+    // Remainder of the SAME read after Ctrl+D must not submit anything.
+    try d.send(if (std.mem.eql(u8, mode, "exit-batched")) "\x04post-quit-must-not-submit\r" else "\x04");
     try d.finish(0);
     if (std.mem.eql(u8, mode, "date") or std.mem.eql(u8, mode, "log-idle") or std.mem.eql(u8, mode, "regular-two")) {
         const final = try d.screen();

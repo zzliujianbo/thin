@@ -92,6 +92,13 @@ pub const App = struct {
         return self;
     }
 
+    /// Interactive owner pins the immutable ID before the first submission.
+    /// Headless callers retain lazy ID generation and need not call this.
+    pub fn pinSessionID(self: *App, id: [32]u8) !void {
+        if (self.runtime.busy.load(.acquire)) return error.Busy;
+        try self.journal.pinSessionID(id);
+    }
+
     /// 只在首次提交前设置；关闭不会读取或删除已有日志。
     pub fn setLogging(self: *App, enabled: bool) void {
         std.debug.assert(!self.runtime.busy.load(.acquire));

@@ -46,49 +46,89 @@ fn extend(c: u21) bool {
 /// the SUM of constituent widths (safe on terminals without ligature support).
 /// Flags and modifiers likewise budget their unligated display widths.
 pub fn nextCluster(s: []const u8, start: usize, column: usize) Cluster {
-    if (start >= s.len) return .{ .end = s.len, .width = 0 };
-    const first = rune(s, start);
+    return cluster(s, start, column, false);
+}
+
+/// Renderer-owned SGR is transparent to cluster boundaries and cell widths.
+/// This is not an escape interpreter and never accepts cursor movement.
+pub fn nextStyledCluster(s: []const u8, start: usize, column: usize) Cluster {
+    return cluster(s, start, column, true);
+}
+
+fn visibleRune(s: []const u8, start: usize, styled: bool) ?clean.Rune {
+    if (start >= s.len) return null;
+    var i = start;
+    if (styled) {
+        while (i + 1 < s.len and s[i] == 0x1b and s[i + 1] == '[') {
+            var end = i + 2;
+            while (end < s.len and (std.ascii.isDigit(s[end]) or s[end] == ';')) : (end += 1) {}
+            if (end == s.len or s[end] != 'm') break;
+            i = end + 1;
+        }
+    }
+    return if (i < s.len) rune(s, i) else null;
+}
+
+/// Incremental conservative cluster state. Renderer SGR must not be fed here.
+/// Not UAX #29: joined scalars, modifiers and flags retain constituent SUMs.
+pub const ClusterState = struct {
+    width: usize,
+    regional_pair: bool,
+    awaitZWJ: bool = false,
+
+    pub fn init(cp: u21, column: usize) ClusterState {
+        return .{
+            .width = if (cp == 9) 4 - column % 4 else if (cp == 10) 0 else if (regional(cp)) @max(2, scalarWidth(cp)) else scalarWidth(cp),
+            .regional_pair = regional(cp),
+        };
+    }
+
+    pub fn accept(self: *ClusterState, cp: u21) bool {
+        if (cp == 9 or cp == 10) return false;
+        // A scalar immediately after ZWJ takes the joined branch even when
+        // it is itself an extension. Controls never satisfy the join.
+        if (self.awaitZWJ) {
+            if (cp < 32 or (cp >= 0x7f and cp <= 0x9f)) return false;
+            self.width += scalarWidth(cp);
+            self.awaitZWJ = false;
+            return true;
+        }
+        if (extend(cp)) {
+            if (cp == 0xfe0f) self.width = @max(self.width, 2);
+            if (modifier(cp)) self.width += scalarWidth(cp);
+            return true;
+        }
+        if (self.regional_pair and regional(cp)) {
+            self.width = @max(4, self.width + @max(2, scalarWidth(cp)));
+            self.regional_pair = false;
+            return true;
+        }
+        if (cp == 0x200d) {
+            self.awaitZWJ = true;
+            return true;
+        }
+        return false;
+    }
+};
+
+fn cluster(s: []const u8, start: usize, column: usize, styled: bool) Cluster {
+    const first = visibleRune(s, start, styled) orelse return .{ .end = s.len, .width = 0 };
     // TAB 按到下一个 4 列制表位计算宽度。
     if (first.cp == 9) return .{ .end = first.end, .width = 4 - column % 4 };
     // LF 不占显示列。
     if (first.cp == 10) return .{ .end = first.end, .width = 0 };
 
     var end = first.end;
-    // 区域指示符至少按 2 列计，国旗合计至少 4 列。
-    var w = if (regional(first.cp)) @max(@as(usize, 2), scalarWidth(first.cp)) else scalarWidth(first.cp);
-    // flag 表示下一个区域指示符可以与之配对组成国旗。
-    var flag = regional(first.cp);
-
-    // 持续吸收后续码点，直到遇到无法合并的字符。
+    var state = ClusterState.init(first.cp, column);
     while (end < s.len) {
-        const r = rune(s, end);
-        if (r.cp == 9 or r.cp == 10) break;
-        // 扩展字符不增加基础簇的边界，只调整宽度。
-        if (extend(r.cp)) {
-            // 变体选择符 FE0F（emoji 呈现）至少按 2 列计。
-            if (r.cp == 0xfe0f) w = @max(w, 2);
-            // 肤色修饰符额外增加其自身宽度。
-            if (modifier(r.cp)) w += scalarWidth(r.cp);
-            end = r.end;
-            // 第二个区域指示符：与前一个组成国旗，合计至少 4 列，之后不再配对。
-        } else if (flag and regional(r.cp)) {
-            w += @max(@as(usize, 2), scalarWidth(r.cp));
-            w = @max(w, 4);
-            end = r.end;
-            flag = false;
-            // ZWJ 连接下一个码点：按各自宽度求和（不假设终端支持连字），宁可高估也不低估。
-        } else if (r.cp == 0x200d) {
-            end = r.end;
-            if (end < s.len) {
-                const joined = rune(s, end);
-                // ZWJ 之后若是 TAB/LF，则停止，不把控制字符吸进簇。
-                if (joined.cp == 9 or joined.cp == 10) break;
-                w += scalarWidth(joined.cp);
-                end = joined.end;
-            }
-        } else break;
+        const r = visibleRune(s, end, styled) orelse {
+            end = s.len;
+            break;
+        };
+        if (!state.accept(r.cp)) break;
+        end = r.end;
     }
-    return .{ .end = end, .width = w };
+    return .{ .end = end, .width = state.width };
 }
 
 /// 计算字符串的显示列数。TAB 的宽度依赖当前列位置，因此逐簇累加。
@@ -142,4 +182,39 @@ test "libc widths and conservative cluster edges" {
     }
     try std.testing.expect(width("👩‍💻") >= 4);
     try std.testing.expect(width("🇺🇸") >= 4);
+}
+
+test "incremental state matches conservative styled and plain traversal" {
+    try initLocale();
+    const cases = [_][]const u8{ "❤️", "é", "👍🏽", "👩‍💻", "🇺🇸", "a‍🏽", "a‍️", "a‍‍" };
+    for (cases) |s| {
+        const first = rune(s, 0);
+        var state = ClusterState.init(first.cp, 0);
+        var i = first.end;
+        while (i < s.len) {
+            const r = rune(s, i);
+            try std.testing.expect(state.accept(r.cp));
+            i = r.end;
+        }
+        try std.testing.expectEqual(nextCluster(s, 0, 0).width, state.width);
+        try std.testing.expect(!state.accept(9));
+        try std.testing.expect(!state.accept(10));
+    }
+    var joined = ClusterState.init('a', 0);
+    try std.testing.expect(joined.accept(0x200d));
+    try std.testing.expect(!joined.accept(27));
+    try std.testing.expect(joined.awaitZWJ);
+    try std.testing.expect(joined.accept(0xfe0f));
+    // Joined FE0F is a scalar SUM, not ordinary FE0F max(2).
+    try std.testing.expectEqual(@as(usize, 1), joined.width);
+    const flags = "🇺🇸🇨";
+    const pair = nextCluster(flags, 0, 0);
+    try std.testing.expectEqual(@as(usize, 8), pair.end);
+    try std.testing.expectEqual(@as(usize, 4), pair.width);
+    try std.testing.expectEqual(@as(usize, 2), nextCluster(flags, pair.end, pair.width).width);
+    const styled = "\x1b[31m❤\x1b[1m️\x1b[0m";
+    try std.testing.expectEqual(styled.len, nextStyledCluster(styled, 0, 0).end);
+    try std.testing.expectEqual(@as(usize, 2), nextStyledCluster(styled, 0, 0).width);
+    const control = "a‍\x1b[31m\n";
+    try std.testing.expectEqual(@as(usize, 4), nextStyledCluster(control, 0, 0).end);
 }

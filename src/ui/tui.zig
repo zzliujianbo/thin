@@ -4,10 +4,12 @@
 const std = @import("std");
 const r = @import("../core/runtime.zig");
 const p = @import("../core/protocol.zig");
+const core_config = @import("../core/config.zig");
 const task = @import("../core/task.zig");
 const interrupt = @import("../platform/interrupt.zig");
 const terminal_module = @import("terminal.zig");
 const input = @import("input.zig");
+const picker_module = @import("model_picker.zig");
 const text = @import("text.zig");
 const markdown = @import("markdown.zig");
 const theme = @import("theme.zig");
@@ -27,7 +29,7 @@ const Kind = enum { user, assistant, reasoning, tool, notice };
 const Record = struct {
     /// 记录种类，决定标题与 Markdown 渲染方式。
     kind: Kind,
-    /// Adjacent bash captions share a compact line, not a raw result block.
+    /// Every completed call owns one compact row, never a raw result block.
     command_row: bool = false,
     final_answer: bool = false,
     command_spans: std.ArrayList(presentation.CommandSpan) = .empty,
@@ -63,15 +65,15 @@ const Record = struct {
         self.command_spans.deinit(a);
     }
 
-    fn appendCommand(self: *Record, a: std.mem.Allocator, caption: presentation.Caption, outcome: presentation.Outcome) !void {
+    fn setCommand(self: *Record, a: std.mem.Allocator, caption: presentation.Caption, outcome: presentation.Outcome) !void {
+        std.debug.assert(self.body.items.len == 0 and self.command_spans.items.len == 0);
         const label = try presentation.commandText(a, caption, outcome);
         defer a.free(label);
         try self.command_spans.ensureUnusedCapacity(a, 1);
-        if (self.body.items.len != 0) try self.append(a, "  ·  ");
         const start = self.body.items.len;
         try self.append(a, label);
         self.command_row = true;
-        self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome });
+        self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome, .write_marks = if (caption.write_marks) |marks| marks.shifted(start + activity.icon(caption.kind).len + 1) else null });
     }
 
     /// 追加文本。超出 record_limit 时截断，并在截断后忽略后续追加。
@@ -144,12 +146,20 @@ pub const Connection = struct {
     context: *anyopaque,
     current_fn: *const fn (*anyopaque) State,
     configure_fn: *const fn (*anyopaque, []const u8) anyerror!void,
+    /// Idle, joined-owner callbacks; no network calls or default persistence.
+    select_model_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    set_effort_fn: ?*const fn (*anyopaque, shared.ReasoningEffort) anyerror!void = null,
 
     pub const State = struct {
         runtime: ?*r.Runtime,
         /// Immutable app-prepared startup snapshot; no runtime dereference in draw.
         initial_context: ?r.ContextSnapshot = null,
         model: []const u8,
+        /// Immutable owner snapshot, valid even without a journal submission.
+        session_id: ?[32]u8 = null,
+        /// Metadata-only catalog for this endpoint; never a credential catalog.
+        models: []const core_config.Model = &.{},
+        context_limit: u32 = 0,
         /// Immutable configured request option, not inferred from stream time.
         reasoning_effort: shared.ReasoningEffort = .unspecified,
         base_url: []const u8,
@@ -167,10 +177,23 @@ pub const Connection = struct {
     pub fn configure(self: Connection, key: []const u8) !void {
         try self.configure_fn(self.context, key);
     }
+    pub fn selectModel(self: Connection, name: []const u8) !void {
+        const callback = self.select_model_fn orelse return error.SelectionUnavailable;
+        try callback(self.context, name);
+    }
+    pub fn setEffort(self: Connection, effort: shared.ReasoningEffort) !void {
+        const callback = self.set_effort_fn orelse return error.SelectionUnavailable;
+        try callback(self.context, effort);
+    }
 };
 
 /// TUI 入口：打开终端，运行事件循环直到退出，并恢复终端属性。返回进程退出码。
 pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge_module.Bridge, cancel: *p.Cancellation) !u8 {
+    // Snapshot immutable identity BEFORE the loop; never inspect writer Store.
+    const session_id = connection.current().session_id;
+    if (session_id) |id| for (id) |byte| {
+        if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidSessionID;
+    };
     // Caller initialized the C.UTF-8 width locale before starting application I/O.
     // 打开终端并进入 TUI 模式；终端属性由 terminal 模块保存，退出时恢复。
     var terminal = try terminal_module.Terminal.open();
@@ -185,9 +208,39 @@ pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge
         return err;
     };
 
-    // 正常退出时显式恢复终端；恢复失败必须报告给调用方，而不是静默忽略。
+    return finishExit(&terminal, ui.ctrl_d_exit, result, session_id, interrupt.signal);
+}
+
+const ExitSignal = struct {
+    read: *const fn () u8,
+    fn stopped(ctx: ?*const anyopaque) bool {
+        const self: *const ExitSignal = @ptrCast(@alignCast(ctx.?));
+        return self.read() != 0;
+    }
+};
+
+// The private reader seam permits exact post-restore/pre-write boundary tests.
+// Production always reads the process-local signal handler's atomic value.
+fn finishExit(terminal: *terminal_module.Terminal, ctrl_d: bool, result: u8, id: ?[32]u8, read_signal: *const fn () u8) !u8 {
     if (!terminal.restore()) return error.TerminalRestoreFailed;
-    return result;
+    const signal = read_signal();
+    if (signal != 0) return 128 + signal;
+    if (ctrl_d and result == 0) {
+        if (id) |value| {
+            var line: [64]u8 = undefined;
+            const bytes = try std.fmt.bufPrint(&line, "Session ID: {s}\r\n", .{value});
+            const guard = ExitSignal{ .read = read_signal };
+            terminal.writeAfterRestoreStopped(bytes, .{ .context = &guard, .stopped_fn = ExitSignal.stopped }) catch |err| {
+                if (err == error.Canceled) {
+                    const caught = read_signal();
+                    if (caught != 0) return 128 + caught;
+                }
+                return err;
+            };
+        }
+    }
+    const final_signal = read_signal();
+    return if (final_signal != 0) 128 + final_signal else result;
 }
 
 /// TUI 的全部状态。只在 UI 线程（run/loop）中访问；后台 Job 只通过 bridge 与之通信。
@@ -209,6 +262,14 @@ const Ui = struct {
     editor: input.Editor,
     /// 终端输入解析器，处理转义序列与粘贴边界。
     parser: input.Parser = .{},
+    editor_pasted: bool = false,
+    model_picker: ?picker_module.Picker = null,
+    model_epoch: u64 = 0,
+    displayed_model_epoch: ?u64 = null,
+    displayed_model_generation: ?u64 = null,
+    frame_model_epoch: ?u64 = null,
+    frame_model_generation: ?u64 = null,
+    last_input_ms: u64 = 0,
     /// 对话显示记录；超过 64 条或约 1 MiB 时丢弃最旧的。
     records: std.ArrayList(Record) = .empty,
     /// 正在流式接收的助手正文记录索引；null 表示没有草稿。
@@ -235,6 +296,7 @@ const Ui = struct {
     busy: bool = false,
     /// 用户请求退出；若任务仍在运行，会等它结束后再退出。
     want_exit: bool = false,
+    ctrl_d_exit: bool = false,
     /// 清理未确认（CleanupFailed 等），禁止再次提交，只允许退出并检查。
     poisoned: bool = false,
     /// 是否需要重绘，由事件与按键置位。
@@ -252,8 +314,6 @@ const Ui = struct {
     active_tool: ?struct { id: u64, caption: presentation.Caption } = null,
     /// Shared canonical FIFO; renderer adds terminal widths/icons later.
     tool_calls: shared.tools.Queue = .{},
-    /// Replaceable until the batch ends; consecutive bash captions share a row.
-    command_group: ?usize = null,
     /// 上一次终态用于失败详情和cleanup安全检查，不显示统计栏。
     last_terminal: ?r.Terminal = null,
     /// 后台任务描述与结果；只在 submit 中赋值。
@@ -297,6 +357,7 @@ const Ui = struct {
         for (self.records.items) |*record| record.deinit(self.allocator);
         self.records.deinit(self.allocator);
         self.secret.deinit();
+        self.closeModelPicker();
         self.parser.secretMode(false);
         self.wipeEditor();
         self.editor.deinit();
@@ -321,7 +382,6 @@ const Ui = struct {
             removed.deinit(self.allocator);
             if (self.draft) |i| self.draft = if (i == 0) null else i - 1;
             if (self.reasoning) |i| self.reasoning = if (i == 0) null else i - 1;
-            if (self.command_group) |i| self.command_group = if (i == 0) null else i - 1;
             self.dropped_display = true;
         }
 
@@ -337,7 +397,6 @@ const Ui = struct {
         removed.deinit(self.allocator);
         if (self.draft) |i| self.draft = if (i == index) null else if (i > index) i - 1 else i;
         if (self.reasoning) |i| self.reasoning = if (i == index) null else if (i > index) i - 1 else i;
-        if (self.command_group) |i| self.command_group = if (i == index) null else if (i > index) i - 1 else i;
     }
 
     fn discardReasoning(self: *Ui) void {
@@ -354,7 +413,6 @@ const Ui = struct {
     }
 
     fn captureToolCaptions(self: *Ui, blocks: []const p.Block) !void {
-        self.command_group = null;
         try self.tool_calls.capture(self.allocator, blocks);
     }
 
@@ -369,25 +427,15 @@ const Ui = struct {
         const outcome = completion.outcome;
         const observed = if (outcome == .success) try presentation.completed(self.allocator, caption, completion.file_stats) else presentation.Caption{ .kind = caption.kind, .label = try self.allocator.dupe(u8, caption.label) };
         defer observed.deinit(self.allocator);
-        if (caption.kind == .bash and self.command_group != null) {
-            try self.records.items[self.command_group.?].appendCommand(self.allocator, observed, outcome);
-            return;
-        }
-        self.command_group = null;
         const index = try self.add(.tool, "");
-        try self.records.items[index].appendCommand(self.allocator, observed, outcome);
-        if (caption.kind == .bash) self.command_group = index;
+        try self.records.items[index].setCommand(self.allocator, observed, outcome);
     }
 
-    /// An active command is replaceable, never a success transcript row.
-    fn pendingCommand(self: *Ui, a: std.mem.Allocator, prior: ?*Record, columns: usize) ![]const u8 {
+    /// Only the currently running call is replaceable; every result owns a row.
+    fn pendingCommand(self: *Ui, a: std.mem.Allocator, columns: usize) ![]const u8 {
         const label = try presentation.commandText(a, self.active_tool.?.caption, .pending);
-        const body = if (prior) |record| try std.fmt.allocPrint(a, "{s}  ·  {s}", .{ record.body.items, label }) else label;
-        var spans: std.ArrayList(presentation.CommandSpan) = .empty;
-        defer spans.deinit(a);
-        if (prior) |record| try spans.appendSlice(a, record.command_spans.items);
-        try spans.append(a, .{ .start = if (prior) |record| record.body.items.len + "  ·  ".len else 0, .end = body.len, .outcome = .pending });
-        return presentation.commandLine(a, body, spans.items, columns, shared.activity.commandStep(self.clock_ms));
+        defer a.free(label);
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, self.clock_ms);
     }
 
     /// Only actionable notices/errors use a temporary hint row. Completed,
@@ -395,6 +443,7 @@ const Ui = struct {
     fn hint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
         if (self.secret_quarantine) return std.fmt.allocPrint(a, "{s} | Ctrl+U resume; Ctrl+D exit", .{if (std.mem.eql(u8, self.notice, "Saved locally; send a message to connect")) self.notice else "Secret paste drained"});
         if (self.secret_mode) return "Enter save | Ctrl+U erase | Ctrl+C cancel | Ctrl+D exit";
+        if (self.model_picker) |picker| return if (picker.pasted) "Pasted selection: Ctrl+U clears; Esc cancels" else "Up/Down select; Enter confirm; Esc/Ctrl+C cancel";
         var notice: []const u8 = "";
         if (self.last_terminal) |result| {
             if (result.status != .success) notice = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ self.notice, if (result.detail != null) ": " else "", if (result.detail) |err| @errorName(err) else "", if (result.model_failure != null) " / " else "", if (result.model_failure) |failure| @tagName(failure) else "" });
@@ -420,7 +469,6 @@ const Ui = struct {
     /// Canonical visible body replaces the draft. Reasoning is deliberately not
     /// retained in UI history; Runtime protocol history remains untouched.
     fn replaceCommitted(self: *Ui, blocks: []const p.Block, clipped: bool, blocks_complete: bool) !void {
-        self.command_group = null;
         self.discardReasoning();
         if (self.draft) |i| {
             self.records.items[i].body.clearRetainingCapacity();
@@ -452,10 +500,7 @@ const Ui = struct {
         self.dirty = true;
         self.display.observe(item.event, self.clock_ms);
         switch (item.event) {
-            .state => |state| {
-                self.mode = state;
-                if (state == .calling_model or state == .compacting) self.command_group = null;
-            },
+            .state => |state| self.mode = state,
             .text => |v| {
                 try self.appendDraft(.assistant, v);
                 if (item.display_truncated and self.draft != null) {
@@ -475,6 +520,7 @@ const Ui = struct {
                 try self.replaceCommitted(blocks, item.display_truncated, item.canonical_complete);
             },
             .permission => |permission| {
+                self.closeModelPicker();
                 // 新审批到来时先释放旧的；粘贴标记沿用到这次请求。
                 self.clearPermission();
                 self.approval_paste_seen = self.approval_paste_seen or self.parser.pasted;
@@ -519,9 +565,149 @@ const Ui = struct {
         }
     }
 
+    fn requestQuit(self: *Ui) void {
+        self.ctrl_d_exit = true;
+        self.want_exit = true;
+        self.parser.stop_feed = true;
+        if (self.busy) self.cancel.cancel();
+    }
+    fn settingsIdle(self: *const Ui) bool {
+        return !self.busy and self.future == null and self.permission == null and !self.poisoned and !self.want_exit and !self.secret_mode and !self.secret_quarantine and !self.parser.pasted;
+    }
+    fn closeModelPicker(self: *Ui) void {
+        if (self.model_picker) |*picker| picker.deinit();
+        self.model_picker = null;
+        self.displayed_model_epoch = null;
+        self.displayed_model_generation = null;
+    }
+    fn openModelPicker(self: *Ui) void {
+        self.closeModelPicker();
+        self.model_epoch +%= 1;
+        self.model_picker = picker_module.Picker.init(self.allocator);
+        self.notice = "Select a configured model or type a custom ID";
+    }
+    fn selectModel(self: *Ui, name: []const u8) !void {
+        if (!self.settingsIdle()) return error.Busy;
+        // Completed producers have joined and complete() drained every event.
+        // A reset error occurs BEFORE configuration publication.
+        try self.bridge.reset();
+        const before = self.connection.current();
+        var inherited = !std.mem.eql(u8, before.model, name);
+        for (before.models) |profile| if (std.mem.eql(u8, profile.name, name)) {
+            inherited = false;
+            break;
+        };
+        try self.connection.selectModel(name);
+        const state = self.connection.current();
+        self.display = .{ .context = state.initial_context, .reasoning_effort = state.reasoning_effort };
+        self.model_flow = .{};
+        self.mode = null;
+        self.last_terminal = null;
+        self.closeModelPicker();
+        self.notice = if (inherited) "Selected for this session; inherited context budget; defaults unchanged" else "Selected for this session; defaults unchanged";
+        self.dirty = true;
+    }
+    fn cycleEffort(self: *Ui) void {
+        if (!self.settingsIdle() or self.editor_pasted or self.model_picker != null) {
+            self.notice = "Thinking selection requires an idle, non-pasted session";
+            return;
+        }
+        self.bridge.reset() catch {
+            self.notice = "Thinking selection requires a drained session bridge";
+            return;
+        };
+        const next = self.connection.current().reasoning_effort.next();
+        self.connection.setEffort(next) catch {
+            self.notice = "Could not change thinking request option";
+            return;
+        };
+        self.display.setEffort(next);
+        self.notice = switch (next) {
+            .none => "Thinking request: none (session only)",
+            .minimal => "Thinking request: minimal (session only)",
+            .low => "Thinking request: low (session only)",
+            .medium => "Thinking request: medium (session only)",
+            .high => "Thinking request: high (session only)",
+            .xhigh => "Thinking request: xhigh (session only)",
+            else => unreachable,
+        };
+    }
+    fn modelKey(self: *Ui, event_: input.Event) !void {
+        const picker = &self.model_picker.?;
+        switch (event_) {
+            .escape, .cancel => {
+                self.closeModelPicker();
+                self.notice = "Ready";
+            },
+            .quit => self.requestQuit(),
+            .paste_start => {
+                picker.pasted = true;
+                picker.generation +%= 1;
+            },
+            .text => |value| {
+                if (std.mem.indexOfScalar(u8, value.value, '\n') != null) return;
+                if (!try picker.insert(value.value, value.pasted)) self.notice = "Search limit: 1024 bytes";
+            },
+            .clear => picker.clear(),
+            .backspace => {
+                picker.query.backspace();
+                picker.changed();
+            },
+            .delete => {
+                picker.query.delete();
+                picker.changed();
+            },
+            .left => picker.query.left(),
+            .right => picker.query.right(),
+            .home => picker.query.cursor = 0,
+            .end => picker.query.cursor = picker.query.bytes.items.len,
+            .kill_end => {
+                picker.query.bytes.items.len = picker.query.cursor;
+                picker.changed();
+            },
+            .up, .down, .page_up, .page_down, .enter => {
+                const state = self.connection.current();
+                const choices = try picker.choices(self.allocator, state.model, state.context_limit, state.models);
+                defer self.allocator.free(choices);
+                if (event_ == .enter) {
+                    if (picker.pasted or choices.len == 0 or self.displayed_model_epoch != self.model_epoch or self.displayed_model_generation != picker.generation) return;
+                    const choice = choices[@min(picker.selected, choices.len - 1)];
+                    self.selectModel(choice.name) catch {
+                        self.notice = "Could not switch; selection is unchanged";
+                    };
+                } else picker.move(event_ == .down or event_ == .page_down, choices.len);
+            },
+            else => {},
+        }
+    }
+
     /// 提交当前输入并启动后台任务。忙碀或已 poisoned 时拒绝；提交不排队。
     fn submit(self: *Ui) !void {
+        if (self.want_exit) return;
         const command = std.mem.trim(u8, self.editor.bytes.items, " \t\r\n");
+        if (modelCommand(command)) {
+            if (!self.settingsIdle() or self.editor_pasted) {
+                self.wipeEditor();
+                self.notice = "Model selection requires an idle, non-pasted session";
+                return;
+            }
+            const name = std.mem.trim(u8, command["/model".len..], " \t");
+            if (name.len == 0) {
+                self.wipeEditor();
+                self.openModelPicker();
+            } else if (!picker_module.manualName(name)) {
+                self.wipeEditor();
+                self.notice = "Usage: /model or /model exact-id (one token)";
+            } else {
+                self.selectModel(name) catch {
+                    self.wipeEditor();
+                    self.notice = "Could not switch; selection is unchanged";
+                    return;
+                };
+                self.wipeEditor();
+            }
+            return;
+        }
         if (std.mem.startsWith(u8, command, "/")) {
             const auth = std.mem.eql(u8, command, "/auth");
             self.wipeEditor();
@@ -580,7 +766,6 @@ const Ui = struct {
         self.display.reset(self.clock_ms);
         self.clearActiveTool();
         self.clearToolCaptions();
-        self.command_group = null;
         self.scroll = 0;
         self.editor.clear();
     }
@@ -588,6 +773,7 @@ const Ui = struct {
     fn wipeEditor(self: *Ui) void {
         // clear 在 Debug 模式会 poison 原 items；最后再擦除，确保整个保留缓冲区为零。
         self.editor.clear();
+        self.editor_pasted = false;
         std.crypto.secureZero(u8, self.editor.bytes.allocatedSlice());
     }
 
@@ -616,7 +802,7 @@ const Ui = struct {
             },
             .quit => {
                 self.endSecret();
-                self.want_exit = true;
+                self.requestQuit();
             },
             .enter => {
                 const key_bytes = self.secret.value() orelse {
@@ -647,6 +833,7 @@ const Ui = struct {
     /// 键盘事件回调（由 input.Parser 调用）。审批可见时优先处理审批按键；粘贴内容永远不能用于批准。
     fn key(ctx: *anyopaque, event_: input.Event) !void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        if (self.want_exit) return;
         self.dirty = true;
         if (self.secret_mode) {
             self.secretKey(event_);
@@ -658,15 +845,20 @@ const Ui = struct {
                     self.secret_quarantine = false;
                     self.parser.secretMode(false);
                 },
-                .quit => self.want_exit = true,
+                .quit => self.requestQuit(),
                 else => {},
             }
             return;
         }
 
+        if (self.model_picker != null and self.permission == null) return self.modelKey(event_);
         switch (event_) {
-            .paste_start => self.blockPastedApproval(),
+            .paste_start => {
+                self.editor_pasted = true;
+                self.blockPastedApproval();
+            },
             .text => |v| {
+                self.editor_pasted = self.editor_pasted or v.pasted;
                 if (self.permission) |permission| {
                     if (v.pasted) {
                         self.blockPastedApproval();
@@ -704,11 +896,10 @@ const Ui = struct {
                 }
             },
             // 退出：若任务仍在运行则先取消，等 loop 中 complete 完成后才真正退出。
-            .quit => {
-                self.want_exit = true;
-                if (self.busy) self.cancel.cancel();
-            },
+            .quit => self.requestQuit(),
             .toggle_reasoning => self.show_reasoning = !self.show_reasoning,
+            .cycle_effort => self.cycleEffort(),
+            .escape => {},
             .page_up, .up => if (self.permission != null) {
                 self.permission_scroll -|= if (event_ == .up) 1 else @max(1, @min(7, self.size.rows -| 6));
             } else {
@@ -725,7 +916,10 @@ const Ui = struct {
             .right => self.editor.right(),
             .home => self.editor.cursor = 0,
             .end => self.editor.cursor = self.editor.bytes.items.len,
-            .clear => self.editor.clear(),
+            .clear => {
+                self.editor.clear();
+                self.editor_pasted = false;
+            },
             .kill_end => self.editor.bytes.items.len = self.editor.cursor,
         }
     }
@@ -768,7 +962,6 @@ const Ui = struct {
         self.draft = null;
         self.clearActiveTool();
         self.clearToolCaptions();
-        self.command_group = null;
         self.mode = null;
         self.dirty = true;
     }
@@ -819,7 +1012,10 @@ const Ui = struct {
             const n = try self.terminal.read(&buffer);
             if (n > 0) {
                 defer std.crypto.secureZero(u8, &buffer);
+                self.last_input_ms = self.clock_ms;
                 try self.parser.feed(buffer[0..n], .{ .context = self, .emit_fn = key });
+            } else if (self.clock_ms -| self.last_input_ms >= 150) {
+                try self.parser.expireEscape(.{ .context = self, .emit_fn = key });
             }
 
             // 分段写出待输出的帧：终端可能只接受部分字节，剩余部分在下一轮继续。
@@ -843,6 +1039,8 @@ const Ui = struct {
         if (dimensions.columns == self.size.columns and dimensions.rows == self.size.rows) return;
         self.size = dimensions;
         self.displayed_permission = null;
+        self.displayed_model_epoch = null;
+        self.displayed_model_generation = null;
         self.frame_fresh = false;
         if (self.frame.len != 0 and (self.frame_offset < self.frame_clear_end or self.resize_rescue.len != 0)) {
             // Never finish an old CUU/EL reclaim after reflow. Cancel a partial
@@ -867,6 +1065,8 @@ const Ui = struct {
     fn finishFrame(self: *Ui) void {
         // Resize invalidation is sticky, even if the window returns to its old size.
         self.displayed_permission = if (self.frame_fresh) self.frame_permission else null;
+        self.displayed_model_epoch = if (self.frame_fresh) self.frame_model_epoch else null;
+        self.displayed_model_generation = if (self.frame_fresh) self.frame_model_generation else null;
         self.tail_height = self.frame_height;
         self.tail_size = self.frame_size;
         for (self.records.items) |*record| {
@@ -937,12 +1137,11 @@ const Ui = struct {
         // replaceable preview until canonical commit; model ANSI is never emitted.
         var lines: std.ArrayList([]const u8) = .empty;
         const preview = self.scroll != 0;
-        var active_shown = false;
         var transcript_rows: usize = 0;
         var previous_kind: ?Kind = null;
         for (self.records.items, 0..) |*record, index| {
             if (record.kind == .reasoning) continue;
-            const drafting = self.draft == index or self.command_group == index;
+            const drafting = self.draft == index;
             try record.layout(self.allocator, @max(1, cols));
             const heading = if (record.interrupted) "Interrupted response — preview" else if (record.excerpt) "Display excerpt" else "";
             if (cols >= 8 and !record.output and !drafting) {
@@ -970,14 +1169,14 @@ const Ui = struct {
                     const headings = try markdown.render(a, heading, .{ .columns = @max(1, cols), .max_lines = 32, .markdown = false, .tone = .muted });
                     try lines.appendSlice(a, headings.lines);
                 }
-                if (!preview and self.command_group == index and self.active_tool != null and self.active_tool.?.caption.kind == .bash) {
-                    try lines.append(a, try self.pendingCommand(a, record, @max(1, cols)));
-                    active_shown = true;
-                } else try lines.appendSlice(a, record.lines);
+                try lines.appendSlice(a, record.lines);
             }
             previous_kind = record.kind;
         }
-        if (!preview and !active_shown and self.active_tool != null) try lines.append(a, try self.pendingCommand(a, null, @max(1, cols)));
+        if (!preview and self.active_tool != null) {
+            if (previous_kind) |prior| if (prior != .tool) try lines.append(a, "");
+            try lines.append(a, try self.pendingCommand(a, @max(1, cols)));
+        }
         const thinking = if (self.show_reasoning and !preview and self.draft == null) self.reasoning else null;
         var thinking_lines: []const []const u8 = &.{};
         if (thinking) |index| {
@@ -985,6 +1184,12 @@ const Ui = struct {
             try record.layout(self.allocator, @max(1, cols));
             thinking_lines = record.lines[record.lines.len -| 3..];
         }
+        // Transient reasoning follows the transcript without committing a gap
+        // or reasoning text to scrollback. Its gap does not consume the latest3.
+        const thinking_gap: usize = @intFromBool(thinking != null and thinking_lines.len != 0 and previous_kind != null);
+        // A live draft already has one leading gap in lines. Keep it outside
+        // the scrollable slice so a long draft cannot clip it next to the user.
+        const live_gap: usize = @intFromBool(!preview and lines.items.len != 0 and lines.items[0].len == 0);
         const secret_destination = if (self.secret_mode) blk: {
             const state = self.connection.current();
             break :blk try std.fmt.allocPrint(a, "API key for model {s}\nBase URL: {s}\nEnter saves locally; no network request is made here", .{ state.model, state.base_url });
@@ -999,9 +1204,12 @@ const Ui = struct {
         // Always reserve one EMPTY row between conversation and composer.
         const footer_rows: usize = 2 + @as(usize, @intFromBool(hint_line.len != 0));
         const body_limit = self.size.rows -| footer_rows;
+        const picker_rows = if (self.model_picker) |*picker| try picker.rows(a, state.model, state.context_limit, state.models, cols, body_limit) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
+        self.frame_model_epoch = null;
+        self.frame_model_generation = null;
         const wanted_body = if (self.permission) |permission|
             @min(body_limit, 1 + @max(1, (try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false })).lines.len))
-        else if (self.secret_mode) secret_lines.lines.len else if (thinking != null) @min(3, body_limit) else @min(lines.items.len + @as(usize, @intFromBool(preview or self.draft != null)), body_limit);
+        else if (self.secret_mode) secret_lines.lines.len else if (self.model_picker != null) picker_rows.lines.len else if (thinking != null) @min(thinking_gap + @min(3, thinking_lines.len), body_limit) else @min(lines.items.len, body_limit);
         // Initial blank space keeps the first conversation at the top. Each
         // immutable row consumes it; expanding drafts scroll old content upward.
         // Never shrink a tail without replacing it by committed rows: the editor
@@ -1041,27 +1249,32 @@ const Ui = struct {
                 const start = @min(self.permission_scroll, all.lines.len -| (body_rows - 1));
                 for (0..body_rows - 1) |line| try putStyled(writer, 2 + line, if (start + line < all.lines.len) all.lines[start + line] else "");
                 self.frame_permission = permission.id;
+            } else if (self.model_picker) |picker| {
+                for (0..body_rows) |line| try putLine(writer, a, 1 + line, if (line < picker_rows.lines.len) picker_rows.lines[line] else "", cols);
+                self.frame_permission = null;
+                if (picker_rows.can_confirm and picker_rows.lines.len <= body_rows) {
+                    self.frame_model_epoch = self.model_epoch;
+                    self.frame_model_generation = picker.generation;
+                }
             } else if (thinking != null) {
                 // Latest THREE content rows, without any title/prefix.
-                const visible_rows = @min(3, body_rows);
+                const visible_rows = @min(3, body_rows -| thinking_gap);
                 const start = thinking_lines.len -| visible_rows;
-                for (0..body_rows) |line| try putStyled(writer, 1 + line, if (line < visible_rows and start + line < thinking_lines.len) thinking_lines[start + line] else "");
+                for (0..body_rows) |line| {
+                    const index = line -| thinking_gap;
+                    try putStyled(writer, 1 + line, if (line >= thinking_gap and index < visible_rows and start + index < thinking_lines.len) thinking_lines[start + index] else "");
+                }
                 self.frame_permission = null;
             } else {
                 // 有界 live draft / retained history preview，不重写终端滚屏。
                 // 从底部向上回退 scroll 行，得到显示窗口的结束位置。
-                const live = self.draft != null;
-                const has_title = preview or live;
-                const content_rows = body_rows -| @as(usize, @intFromBool(has_title));
-                const end = lines.items.len -| @min(self.scroll, lines.items.len -| content_rows);
+                const content = lines.items[live_gap..];
+                const content_rows = body_rows -| live_gap;
+                const end = content.len -| @min(self.scroll, content.len -| content_rows);
                 const start = end -| content_rows;
                 for (0..body_rows) |line| {
-                    if (line == 0 and has_title) {
-                        try putToneLine(writer, a, 1, if (preview) "History preview · PgUp/PgDn" else "Streaming · preview", cols, theme.accent);
-                    } else {
-                        const index = line -| @as(usize, @intFromBool(has_title));
-                        try putStyled(writer, 1 + line, if (start + index < end) lines.items[start + index] else "");
-                    }
+                    const index = line -| live_gap;
+                    try putStyled(writer, 1 + line, if (line >= live_gap and start + index < end) content[start + index] else "");
                 }
                 self.frame_permission = null;
             }
@@ -1076,12 +1289,28 @@ const Ui = struct {
                 const masked = try std.fmt.allocPrint(a, "API key> {s}", .{masks[0..count]});
                 try putLine(writer, a, rows, masked, cols);
                 try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, count + 10) - 1});
+            } else if (self.model_picker) |picker| {
+                const decorated = "Search> ";
+                const prefix = try editorDisplay(a, picker.query.bytes.items[0..picker.query.cursor]);
+                var start: usize = 0;
+                var width = text.width(prefix);
+                while (width > cols -| (decorated.len + 1) and start < prefix.len) {
+                    const cluster = text.nextCluster(prefix, start, 0);
+                    width -|= cluster.width;
+                    start = cluster.end;
+                }
+                const suffix = try editorDisplay(a, picker.query.bytes.items[picker.query.cursor..]);
+                const end = fittingBytes(suffix, cols -| (decorated.len + width));
+                const line = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ decorated, prefix[start..], suffix[0..end] });
+                try putLine(writer, a, rows, line, cols);
+                try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, decorated.len + width + 1) - 1});
             } else {
 
                 // 光标所在逻辑行的起点（以换行为界）。
                 // Slash arguments can be accidental credentials: never render them, even before Enter.
                 const trimmed = std.mem.trimStart(u8, self.editor.bytes.items, " \t\r\n");
-                const hide_arguments = std.mem.startsWith(u8, trimmed, "/") and (std.mem.findScalar(u8, trimmed, ' ') != null or std.mem.findScalar(u8, trimmed, '\t') != null or std.mem.findScalar(u8, trimmed, '\r') != null or std.mem.findScalar(u8, trimmed, '\n') != null);
+                const safe_model = modelCommand(trimmed) and picker_module.manualName(std.mem.trim(u8, trimmed["/model".len..], " \t"));
+                const hide_arguments = !safe_model and std.mem.startsWith(u8, trimmed, "/") and (std.mem.findScalar(u8, trimmed, ' ') != null or std.mem.findScalar(u8, trimmed, '\t') != null or std.mem.findScalar(u8, trimmed, '\r') != null or std.mem.findScalar(u8, trimmed, '\n') != null);
                 const visible: []const u8 = if (hide_arguments) "/auth [arguments hidden; no key argument]" else self.editor.bytes.items;
                 const cursor = if (hide_arguments) visible.len else self.editor.cursor;
                 const begin = if (std.mem.findScalarLast(u8, visible[0..cursor], '\n')) |index| index + 1 else 0;
@@ -1122,6 +1351,10 @@ const Ui = struct {
         self.abandon_tail = false;
     }
 };
+
+fn modelCommand(command: []const u8) bool {
+    return std.mem.eql(u8, command, "/model") or std.mem.startsWith(u8, command, "/model ") or std.mem.startsWith(u8, command, "/model\t");
+}
 
 /// 输入行的显示副本：Tab 固定展开为四个空格，测宽、裁剪与输出共用；不修改提交字节。
 fn editorDisplay(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
@@ -1198,7 +1431,8 @@ test "regular transcript starts at top and keeps composer at bottom without role
     try ui.appendDraft(.assistant, "uncanonical draft");
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique committed user") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Streaming · preview") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Streaming") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "History preview") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "[user]") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "[assistant") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.user_background) != null);
@@ -1253,7 +1487,7 @@ test "growing a compact live tail keeps replaceable drafts out of scrollback" {
         try ui.draw();
         try screen.replay(ui.frame);
         ui.finishFrame();
-        try std.testing.expectEqual(@as(usize, 7), ui.tail_height); // Live leading separator is part of our replaceable tail.
+        try std.testing.expectEqual(@as(usize, 6), ui.tail_height); // Gap + two draft rows + hinted footer; no preview-title row.
         try std.testing.expectEqual(@as(usize, 23), screen.row);
         for (screen.history[0..screen.history_len]) |line| try std.testing.expect(std.mem.find(u8, &line, "growth-draft-marker") == null);
 
@@ -1265,6 +1499,76 @@ test "growing a compact live tail keeps replaceable drafts out of scrollback" {
         try std.testing.expectEqual(@as(usize, @intFromBool(!same_final)), screen.count("different-final-marker"));
         try std.testing.expectEqual(@as(usize, 0), screen.count("second-draft-line"));
         try std.testing.expectEqual(@as(usize, 23), screen.row);
+    }
+}
+
+/// Check actual retained rows, including user output pushed into scrollback.
+fn expectTranscriptGap(screen: *const @import("../tests/regular_screen.zig").Screen, before: []const u8, after: []const u8) !void {
+    var first: ?usize = null;
+    var second: ?usize = null;
+    for (0..screen.history_len + screen.grid.len) |i| {
+        const line = if (i < screen.history_len) &screen.history[i] else &screen.grid[i - screen.history_len];
+        if (first == null and std.mem.indexOf(u8, line, before) != null) first = i;
+        if (second == null and std.mem.indexOf(u8, line, after) != null) second = i;
+    }
+    try std.testing.expect(first != null and second != null);
+    try std.testing.expectEqual(first.? + 2, second.?);
+    const gap = first.? + 1;
+    const line = if (gap < screen.history_len) &screen.history[gap] else &screen.grid[gap - screen.history_len];
+    for (line) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
+}
+
+test "user thinking short long and canonical replies keep one gap without preview titles" {
+    for ([_]usize{ 80, 20 }) |columns| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.size.columns = columns;
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        _ = try ui.add(.user, "user-row-one\nuser-row-end");
+        try ui.appendDraft(.reasoning, "old-think\nthink-first\nthink-second\nthink-last");
+        try ui.draw();
+        try screen.replay(ui.frame);
+        try expectTranscriptGap(&screen, "user-row-end", "think-first");
+        for ([_][]const u8{ "think-first", "think-second", "think-last" }) |marker| try std.testing.expect(screen.visible(marker));
+        try std.testing.expect(!screen.visible("old-think"));
+        try std.testing.expectEqual(@as(usize, 23), screen.row);
+        ui.finishFrame();
+        try ui.appendDraft(.reasoning, "\nthink-new\nthink-new-last");
+        try ui.draw();
+        try screen.replay(ui.frame);
+        try expectTranscriptGap(&screen, "user-row-end", "think-last");
+        ui.finishFrame();
+        try ui.appendDraft(.assistant, "live-start\nlive-end");
+        try ui.draw();
+        try screen.replay(ui.frame);
+        try expectTranscriptGap(&screen, "user-row-end", "live-start");
+        try std.testing.expectEqual(@as(usize, 0), screen.count("think-"));
+        try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Streaming") == null);
+        try std.testing.expect(std.mem.indexOf(u8, ui.frame, "History preview") == null);
+        ui.finishFrame();
+        // Clipping the start of a long live draft cannot consume its leading gap.
+        for (0..60) |i| {
+            const delta = try std.fmt.allocPrint(std.testing.allocator, "\nlive-line-{d}", .{i});
+            defer std.testing.allocator.free(delta);
+            try ui.appendDraft(.assistant, delta);
+        }
+        try ui.draw();
+        try screen.replay(ui.frame);
+        try expectTranscriptGap(&screen, "user-row-end", "live-line-");
+        try std.testing.expectEqual(@as(usize, 23), screen.row);
+        ui.finishFrame();
+        try ui.replaceCommitted(&.{.{ .text = "formal-final" }}, false, true);
+        try ui.draw();
+        try screen.replay(ui.frame);
+        try expectTranscriptGap(&screen, "user-row-end", "formal-final");
+        try std.testing.expectEqual(@as(usize, 1), screen.count("formal-final"));
+        try std.testing.expectEqual(@as(usize, 0), screen.count("live-line-"));
+        try std.testing.expectEqual(@as(usize, 1), screen.count("user-row-end"));
+        try std.testing.expectEqual(@as(usize, 23), screen.row);
+        ui.finishFrame();
     }
 }
 
@@ -1312,7 +1616,7 @@ test "thinking scrolls in three rows and body replaces it without retaining reas
     ui.finishFrame();
     ui.scroll = 1;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "History preview") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "History preview") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "think-") == null);
     ui.finishFrame();
 }
@@ -1348,7 +1652,7 @@ test "rolling thinking keeps latest bounded UTF8 suffix and can be hidden" {
 }
 
 test "tool animation is transient and raw tool JSON never enters displayed records" {
-    for ([_][]const u8{ "memory", "bash" }) |name| {
+    for ([_][]const u8{ "memory", "bash", "read_file", "write_file" }) |name| {
         var cancel: p.Cancellation = .{};
         var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
         defer bridge.deinit();
@@ -1356,7 +1660,8 @@ test "tool animation is transient and raw tool JSON never enters displayed recor
         defer ui.deinit();
         ui.mode = .executing_tool;
         const host = bridge.host();
-        try ui.captureToolCaptions(&.{.{ .tool_call = .{ .id = "fixture-call", .name = name, .arguments = "{\"command\":\"date\"}" } }});
+        const arguments = if (std.mem.eql(u8, name, "bash")) "{\"command\":\"date\"}" else if (std.mem.eql(u8, name, "memory")) "{\"action\":\"read\",\"topic\":\"core\"}" else "{\"path\":\"src/example.zig\"}";
+        try ui.captureToolCaptions(&.{.{ .tool_call = .{ .id = "fixture-call", .name = name, .arguments = arguments } }});
         try host.emit_fn(host.context, .{ .tool_started = .{ .id = 7, .name = name } }, &cancel);
         var item = bridge.pop().?;
         try ui.event(item);
@@ -1364,7 +1669,8 @@ test "tool animation is transient and raw tool JSON never enters displayed recor
         try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
         try ui.draw();
         try std.testing.expect(std.mem.find(u8, ui.frame, activity.spinner(0)) != null);
-        try std.testing.expect(std.mem.find(u8, ui.frame, if (std.mem.eql(u8, name, "bash")) "date" else "memory") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, if (std.mem.eql(u8, name, "bash")) "date" else if (std.mem.eql(u8, name, "memory")) "read core" else "src/example.zig") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, theme.command_pulse[0] ++ "⠋" ++ theme.muted) != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "#7") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "Running memory") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "Running bash") == null);
@@ -1392,7 +1698,49 @@ test "tool animation is transient and raw tool JSON never enters displayed recor
     }
 }
 
-test "consecutive bash captions share one row and prepare failures preserve FIFO labels" {
+test "first pending tool follows user gap then tools stay contiguous" {
+    for ([_][]const u8{ "bash", "read_file", "write_file", "memory" }) |name| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        _ = try ui.add(.user, "tool-user-end");
+        try ui.draw();
+        try screen.replay(ui.frame);
+        ui.finishFrame();
+        const args = if (std.mem.eql(u8, name, "bash")) "{\"command\":\"target-one\"}" else if (std.mem.eql(u8, name, "memory")) "{\"action\":\"read\",\"topic\":\"target-one\"}" else "{\"path\":\"target-one\"}";
+        try ui.captureToolCaptions(&.{.{ .tool_call = .{ .id = "gap-one", .name = name, .arguments = args } }});
+        ui.active_tool = .{ .id = 1, .caption = try ui.nextToolCaption(name) };
+        try ui.draw();
+        try screen.replay(ui.frame);
+        try expectTranscriptGap(&screen, "tool-user-end", "target-one");
+        ui.finishFrame();
+        try ui.toolCompleted(ui.active_tool.?.caption, .{ .text = "{}" });
+        ui.clearActiveTool();
+        try ui.draw();
+        try screen.replay(ui.frame);
+        try expectTranscriptGap(&screen, "tool-user-end", "target-one");
+        ui.finishFrame();
+        const second: presentation.Caption = .{ .kind = .read, .label = "target-two" };
+        ui.active_tool = .{ .id = 2, .caption = .{ .kind = .read, .label = try std.testing.allocator.dupe(u8, second.label) } };
+        try ui.draw();
+        try screen.replay(ui.frame);
+        var first_row: ?usize = null;
+        var second_row: ?usize = null;
+        for (screen.grid, 0..) |line, row| {
+            if (std.mem.indexOf(u8, &line, "target-one") != null) first_row = row;
+            if (std.mem.indexOf(u8, &line, "target-two") != null) second_row = row;
+        }
+        try std.testing.expect(first_row != null and second_row != null);
+        try std.testing.expectEqual(first_row.? + 1, second_row.?);
+        try std.testing.expectEqual(@as(usize, 23), screen.row);
+        ui.finishFrame();
+    }
+}
+
+test "same batch bash calls own contiguous pending and result rows with FIFO labels" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -1416,29 +1764,49 @@ test "consecutive bash captions share one row and prepare failures preserve FIFO
     try ui.event(item);
     item.deinit();
     try std.testing.expectEqualStrings("pwd", ui.active_tool.?.caption.label);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    var failed_row: ?usize = null;
+    var pending_row: ?usize = null;
+    for (screen.grid, 0..) |line, row| {
+        if (std.mem.find(u8, &line, "date [error]") != null) failed_row = row;
+        if (std.mem.find(u8, &line, "pwd") != null) pending_row = row;
+    }
+    try std.testing.expect(failed_row != null and pending_row != null);
+    try std.testing.expectEqual(failed_row.? + 1, pending_row.?);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    ui.finishFrame();
     try host.emit_fn(host.context, .{ .tool_result = .{ .id = 2, .name = "bash", .result = .{ .text = "hidden-output-json" } } }, &cancel);
     item = bridge.pop().?;
     try ui.event(item);
     item.deinit();
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expectEqualStrings("> date [error]  ·  > pwd", ui.records.items[0].body.items);
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expectEqualStrings("> date [error]", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("> pwd", ui.records.items[1].body.items);
     try ui.draw();
+    try std.testing.expect(ui.records.items[0].output);
     try std.testing.expect(!ui.records.items[0].pending_output);
-    ui.finishFrame();
-    ui.command_group = null; // The next calling_model / completion seals the group.
-    try ui.draw();
+    try std.testing.expect(ui.records.items[1].pending_output);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items[0].lines.len);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.failure ++ "> date [error]") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ "> pwd") != null);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items[1].lines.len);
+    try std.testing.expect(std.mem.find(u8, ui.frame, " date [error]") == null); // The previous result is not rewritten.
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ ">" ++ theme.muted ++ " pwd") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-") == null);
-    var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    var shared_row = false;
-    for (screen.grid) |line| if (std.mem.find(u8, &line, "date") != null and std.mem.find(u8, &line, "pwd") != null) {
-        shared_row = true;
-    };
-    try std.testing.expect(shared_row);
+    failed_row = null;
+    pending_row = null;
+    for (screen.grid, 0..) |line, row| {
+        if (std.mem.find(u8, &line, "date [error]") != null) failed_row = row;
+        if (std.mem.find(u8, &line, "> pwd") != null) pending_row = row;
+    }
+    try std.testing.expect(failed_row != null and pending_row != null);
+    try std.testing.expectEqual(failed_row.? + 1, pending_row.?);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
     ui.finishFrame();
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, " date [error]") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, " pwd") == null);
 }
 
 test "incomplete canonical block tails cannot publish a false final heading" {
@@ -1503,7 +1871,7 @@ test "file captions are contiguous but separated from final prose and percent co
     item.deinit();
     try ui.replaceCommitted(&.{.{ .text = "final-body-marker" }}, false, true);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "write_file src/main.zig  ~1 +2 -3 lines") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "w" ++ theme.muted ++ " src/main.zig  ~1 " ++ theme.diff_added ++ "+2" ++ theme.muted ++ " " ++ theme.diff_removed ++ "-3" ++ theme.muted ++ " lines") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "raw-json-must-stay-hidden") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "do-not-show-body") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture 50.0%) > ") != null);
@@ -2048,6 +2416,259 @@ test "editor tabs expand before clipping and cursor placement but submit unchang
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expectEqualStrings(raw, runtime.messages()[0].blocks[0].text);
     try std.testing.expectEqualStrings(raw, ui.records.items[0].body.items);
+}
+
+const SelectionFixture = struct {
+    name: []const u8 = "fixture-old",
+    owned: ?[]u8 = null,
+    limit: u32 = 32768,
+    effort: shared.ReasoningEffort = .none,
+    selections: usize = 0,
+    cycles: usize = 0,
+    fail: bool = false,
+    const profiles = [_]core_config.Model{.{ .name = "fixture-next", .context_tokens = 65536 }};
+    fn connection(self: *@This()) Connection {
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .select_model_fn = select, .set_effort_fn = setEffort };
+    }
+    fn current(raw: *anyopaque) Connection.State {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return .{ .runtime = null, .model = self.name, .models = &profiles, .context_limit = self.limit, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort };
+    }
+    fn configure(_: *anyopaque, _: []const u8) !void {
+        return error.TestSelectionOnly;
+    }
+    fn select(raw: *anyopaque, name: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.fail) return error.TestSelectionFailure;
+        const copy = try std.testing.allocator.dupe(u8, name);
+        if (self.owned) |old| std.testing.allocator.free(old);
+        self.owned = copy;
+        self.name = copy;
+        self.selections += 1;
+        if (std.mem.eql(u8, copy, "fixture-next")) self.limit = 65536;
+    }
+    fn setEffort(raw: *anyopaque, effort: shared.ReasoningEffort) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.fail) return error.TestSelectionFailure;
+        self.effort = effort;
+        self.cycles += 1;
+    }
+    fn deinit(self: *@This()) void {
+        if (self.owned) |name| std.testing.allocator.free(name);
+    }
+};
+
+test "model picker confirms acknowledged epoch and revision preserving transcript and context" {
+    try text.initLocale();
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = SelectionFixture{};
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.size = .{ .columns = 80, .rows = 24 };
+    _ = try ui.add(.user, "retained user");
+    _ = try ui.add(.assistant, "retained answer");
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("/model\r\x1b[B\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Select model") != null);
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqualStrings("fixture-next", fixture.name);
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expectEqual(@as(u32, 65536), ui.display.context.?.limit);
+    try std.testing.expect(ui.model_picker == null);
+    // An old in-flight menu may finish after close/reopen with revision 1.
+    // Epoch acknowledgement prevents that frame authorizing the new menu.
+    ui.openModelPicker();
+    try ui.draw();
+    try ui.modelKey(.cancel);
+    ui.openModelPicker();
+    ui.finishFrame();
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.selections);
+    try ui.draw();
+    ui.resize(.{ .columns = 40, .rows = 12 });
+    ui.finishFrame();
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.selections);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 2), fixture.selections);
+}
+
+test "selection guards paste secret busy joined future poison and rollback" {
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = SelectionFixture{};
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b[200~/model pasted-id\x1b[201~\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+    try ui.parser.feed("/model fixture-next\r", sink);
+    try std.testing.expectEqualStrings("fixture-next", fixture.name);
+    try ui.parser.feed("\x1b[Z", sink);
+    try std.testing.expectEqual(shared.ReasoningEffort.minimal, fixture.effort);
+    ui.busy = true;
+    try ui.parser.feed("\x1b[Z/model busy-id\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.selections);
+    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    ui.busy = false;
+    ui.future = ui.io.async(struct {
+        fn noop() void {}
+    }.noop, .{});
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    ui.future.?.await(ui.io);
+    ui.future = null;
+    ui.poisoned = true;
+    try std.testing.expectError(error.Busy, ui.selectModel("poisoned"));
+    ui.poisoned = false;
+    fixture.fail = true;
+    try std.testing.expectError(error.TestSelectionFailure, ui.selectModel("rejected"));
+    try std.testing.expectEqualStrings("fixture-next", fixture.name);
+    fixture.fail = false;
+    ui.secret_quarantine = true;
+    try ui.parser.feed("\x1b[Z", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    ui.secret_quarantine = false;
+    ui.secret_mode = true;
+    ui.parser.secretMode(true);
+    try ui.parser.feed("\x1b[Z", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    ui.secret_mode = false;
+    ui.parser.secretMode(false);
+    ui.openModelPicker();
+    try ui.modelKey(.paste_start);
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.selections);
+    try ui.modelKey(.clear);
+    try std.testing.expect(!ui.model_picker.?.pasted);
+    try ui.modelKey(.escape);
+    try std.testing.expect(ui.model_picker == null);
+}
+
+test "effort shortcut waits for queued and borrowed bridge items" {
+    for ([_]bool{ false, true }) |borrowed| {
+        var cancel = p.Cancellation{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var fixture = SelectionFixture{};
+        defer fixture.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.connection = fixture.connection();
+        const host = bridge.host();
+        try host.emit_fn(host.context, .{ .context_snapshot = .{ .tokens = 12, .limit = 32768 } }, &cancel);
+        var held = if (borrowed) bridge.pop() else null;
+        defer if (held) |*item| item.deinit();
+        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+        try ui.parser.feed("\x1b[Z", sink);
+        try std.testing.expectEqual(@as(usize, 0), fixture.cycles);
+        try std.testing.expectEqual(shared.ReasoningEffort.none, fixture.effort);
+        if (held) |*item| {
+            item.deinit();
+            held = null;
+        } else {
+            var item = bridge.pop().?;
+            item.deinit();
+        }
+        try ui.parser.feed("\x1b[Z", sink);
+        try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+        try std.testing.expectEqual(shared.ReasoningEffort.minimal, fixture.effort);
+    }
+}
+
+test "shutdown signals after restoration and before announcement suppress identity" {
+    const c = std.c;
+    const abi = @import("../platform/terminal_abi.zig");
+    const Reader = struct {
+        var terminal: *terminal_module.Terminal = undefined;
+        var calls: usize = 0;
+        var later: bool = false;
+        fn read() u8 {
+            std.debug.assert(terminal.restored and !terminal.active);
+            calls += 1;
+            return if (later and calls == 1) 0 else if (later) 2 else 15;
+        }
+    };
+    for ([_]bool{ false, true }) |later| {
+        var master: c_int = undefined;
+        var slave: c_int = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), abi.openpty(&master, &slave, null, null, null));
+        defer _ = c.close(master);
+        defer _ = c.close(slave);
+        const flags = c.fcntl(slave, 3);
+        try std.testing.expect(c.fcntl(master, 4, c.fcntl(master, 3) | 0x800) >= 0);
+        var terminal = try terminal_module.Terminal.fromFd(slave, false);
+        defer terminal.deinit();
+        Reader.terminal = &terminal;
+        Reader.calls = 0;
+        Reader.later = later;
+        try std.testing.expectEqual(@as(u8, if (later) 130 else 143), try finishExit(&terminal, true, 0, @as([32]u8, @splat('a')), Reader.read));
+        try std.testing.expectEqual(flags, c.fcntl(slave, 3));
+        var bytes: [4096]u8 = undefined;
+        const n = c.read(master, &bytes, bytes.len);
+        try std.testing.expect(n > 0);
+        try std.testing.expect(std.mem.indexOf(u8, bytes[0..@intCast(n)], "Session ID:") == null);
+    }
+}
+
+test "CtrlD discards the remainder and all subsequent input before submission" {
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const previous_notice = ui.notice;
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x04hello\r", sink);
+    try std.testing.expect(ui.want_exit and ui.ctrl_d_exit);
+    try std.testing.expectEqualStrings(previous_notice, ui.notice);
+    try ui.parser.feed("another\r", sink);
+    try std.testing.expectEqualStrings(previous_notice, ui.notice);
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+    try std.testing.expect(ui.future == null and !ui.busy and ui.records.items.len == 0);
+}
+
+test "CtrlD exit reason survives secret quarantine picker and busy cancellation" {
+    for (0..5) |mode_| {
+        var cancel = p.Cancellation{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        switch (mode_) {
+            1 => {
+                ui.secret_mode = true;
+                ui.parser.secretMode(true);
+                ui.secret.insert("fake-exit-secret");
+            },
+            2 => ui.secret_quarantine = true,
+            3 => ui.openModelPicker(),
+            4 => ui.busy = true,
+            else => {},
+        }
+        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+        try ui.parser.feed("\x04", sink);
+        try std.testing.expect(ui.want_exit and ui.ctrl_d_exit);
+        if (mode_ == 4) try std.testing.expect(cancel.requested.load(.acquire));
+        if (mode_ == 1) {
+            try std.testing.expect(!ui.secret_mode and ui.secret.len == 0);
+            for (ui.secret.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+        }
+    }
 }
 
 const AuthFixture = struct {

@@ -15,6 +15,7 @@ const limit = 256 * 1024;
 const Frame = struct { kind: c_int, style: Style, prefix: []const u8, continuation: ?[]const u8, next: usize = 1, children: usize = 0 };
 const Cell = struct { lines: []const []const u8, alignment: c_int };
 const Row = struct { cells: []const Cell, header: bool };
+const TableEdge = enum { top, middle, bottom };
 const Table = struct {
     main: Writer,
     columns: usize,
@@ -34,6 +35,20 @@ const Renderer = struct {
     span_depth: usize = 0,
     table: ?Table = null,
     failure: ?anyerror = null,
+    pending_text: std.ArrayList(u8) = .empty,
+
+    // Text/entity callbacks are transport chunks, not grapheme boundaries.
+    // Buffer a style run so FE0F/combining/ZWJ decode exactly like literal text.
+    fn bufferText(self: *Renderer, s: []const u8) !void {
+        try self.step(s.len);
+        try self.pending_text.appendSlice(self.w.a, s);
+    }
+
+    fn flushText(self: *Renderer) !void {
+        if (self.pending_text.items.len == 0) return;
+        try self.w.emit(self.pending_text.items);
+        self.pending_text.clearRetainingCapacity();
+    }
 
     fn detail(comptime T: type, raw: ?*anyopaque) *const T {
         return @ptrCast(@alignCast(raw.?));
@@ -49,6 +64,7 @@ const Renderer = struct {
     }
 
     fn enterBlock(self: *Renderer, kind: c_int, raw: ?*anyopaque) !void {
+        try self.flushText();
         try self.step(1);
         if (kind == 7) {
             const code = detail(md.Code, raw);
@@ -59,7 +75,7 @@ const Renderer = struct {
         // items or table cells. Empty parent items still need a visible bullet.
         if (self.depth != 0 and (kind == 1 or kind == 2 or kind == 3 or kind == 5 or kind == 6 or kind == 7 or kind == 9 or kind == 10)) {
             const parent = &self.blocks[self.depth - 1];
-            if (parent.kind == 4 and kind != 9 and self.w.continuation != null and self.w.col == 0) try self.w.emit(" ");
+            if (parent.kind == 4 and kind != 9 and self.w.continuation != null and !self.w.hasContent()) try self.w.emit(" ");
             if (parent.kind == 0 or parent.kind == 1 or parent.kind == 4) {
                 if (parent.children != 0) {
                     try self.w.boundary();
@@ -104,11 +120,12 @@ const Renderer = struct {
             },
             5 => { // thematic break
                 try self.w.boundary();
+                try self.w.setStyle(.{ .tone = .rule });
                 for (0..self.w.columns -| @min(text.width(self.w.prefix), self.w.columns - 1)) |_| try self.w.emit("-");
             },
             6 => {
                 try self.w.boundary();
-                try self.w.setStyle(.{ .tone = .heading, .bold = true });
+                try self.w.setStyle(.{ .tone = .heading, .bold = true, .underline = detail(md.H, raw).level == 1 });
             },
             7 => {
                 try self.w.boundary();
@@ -136,13 +153,14 @@ const Renderer = struct {
                 const table = &self.table.?;
                 table.header = kind == 14;
                 table.alignment = detail(md.Td, raw).alignment;
-                self.w = .{ .a = table.main.a, .columns = table.cell_width, .ansi = table.main.ansi, .base = table.main.base, .style = if (kind == 14) .{ .tone = .heading, .bold = true } else .{}, .budget = table.main.budget };
+                self.w = .{ .a = table.main.a, .columns = table.cell_width, .ansi = table.main.ansi, .base = table.main.base, .style = if (kind == 14) .{ .tone = .table_header, .bold = true } else .{}, .budget = table.main.budget };
             },
             else => return error.InvalidMarkdownBlock,
         }
     }
 
     fn leaveBlock(self: *Renderer, kind: c_int) !void {
+        try self.flushText();
         try self.step(1);
         if (self.depth == 0) return error.InvalidMarkdownBlock;
         self.depth -= 1;
@@ -167,7 +185,7 @@ const Renderer = struct {
             10 => try self.flushTable(),
             11, 12 => {},
             4 => {
-                if (self.w.continuation != null and self.w.col == 0) try self.w.emit(" ");
+                if (self.w.continuation != null and !self.w.hasContent()) try self.w.emit(" ");
                 try self.w.boundary();
             },
             else => try self.w.boundary(),
@@ -199,11 +217,14 @@ const Renderer = struct {
             };
             return;
         }
-        for (table.rows.items) |row| {
+        if (table.rows.items.len == 0) return;
+        try self.tableRule(widths[0..table.columns], .top, false);
+        for (table.rows.items, 0..) |row, row_index| {
+            try self.w.setStyle(.{ .tone = .border });
             var height: usize = 1;
             for (row.cells) |cell| height = @max(height, cell.lines.len);
             for (0..height) |line_index| {
-                try self.w.emit("| ");
+                try self.w.emit("│ ");
                 for (row.cells, 0..) |cell, col| {
                     const line = if (line_index < cell.lines.len) cell.lines[line_index] else "";
                     const padding = widths[col] - output.displayWidth(line);
@@ -211,22 +232,36 @@ const Renderer = struct {
                     for (0..before) |_| try self.w.emit(" ");
                     try self.w.emitStyled(line);
                     for (0..padding - before) |_| try self.w.emit(" ");
-                    try self.w.emit(" |");
+                    try self.w.emit(" │");
                     if (col + 1 < row.cells.len) try self.w.emit(" ");
                 }
                 try self.w.finish();
             }
-            if (row.header) {
-                try self.w.setStyle(.{ .tone = .quote });
-                try self.w.emit("|");
-                for (widths[0..table.columns]) |width| {
-                    for (0..width + 2) |_| try self.w.emit("-");
-                    try self.w.emit("|");
-                }
-                try self.w.finish();
-                try self.w.setStyle(.{});
-            }
+            // Separate logical rows, not every physical line of a wrapped cell.
+            try self.tableRule(widths[0..table.columns], if (row_index + 1 == table.rows.items.len) .bottom else .middle, row.header);
         }
+    }
+
+    fn tableRule(self: *Renderer, widths: []const usize, edge: TableEdge, bold: bool) !void {
+        try self.w.setStyle(.{ .tone = .border, .bold = bold });
+        try self.w.emit(switch (edge) {
+            .top => "┌",
+            .middle => "├",
+            .bottom => "└",
+        });
+        for (widths, 0..) |width, col| {
+            for (0..width + 2) |_| try self.w.emit("─");
+            try self.w.emit(if (col + 1 < widths.len) switch (edge) {
+                .top => "┬",
+                .middle => "┼",
+                .bottom => "┴",
+            } else switch (edge) {
+                .top => "┐",
+                .middle => "┤",
+                .bottom => "┘",
+            });
+        }
+        try self.w.finish();
     }
 
     fn spanAttributeWork(self: *Renderer, kind: c_int, raw: ?*anyopaque) !void {
@@ -244,6 +279,7 @@ const Renderer = struct {
     }
 
     fn enterSpan(self: *Renderer, kind: c_int, raw: ?*anyopaque) !void {
+        try self.flushText();
         try self.step(1);
         try self.spanAttributeWork(kind, raw);
         if (self.span_depth == self.spans.len) return error.MarkdownDepthLimit;
@@ -261,7 +297,7 @@ const Renderer = struct {
                 style.tone = .muted;
                 try self.w.emit("[image: ");
             },
-            4, 6, 7 => style.tone = .code,
+            4, 6, 7 => style.tone = .inline_code,
             5 => style.strike = true,
             8 => style.tone = .link,
             9 => style.underline = true,
@@ -274,6 +310,7 @@ const Renderer = struct {
     }
 
     fn leaveSpan(self: *Renderer, kind: c_int, raw: ?*anyopaque) !void {
+        try self.flushText();
         try self.step(1);
         try self.spanAttributeWork(kind, raw);
         if (self.span_depth == 0) return error.InvalidMarkdownSpan;
@@ -282,6 +319,7 @@ const Renderer = struct {
         if ((kind == 2 and detail(md.Link, raw).autolink == 0) or kind == 3) {
             const target = if (kind == 2) detail(md.Link, raw).href else detail(md.Image, raw).src;
             if (target.size != 0) {
+                try self.w.setStyle(.{ .tone = .link_url });
                 try self.w.emit(" (");
                 try self.attribute(target);
                 try self.w.emit(")");
@@ -291,24 +329,24 @@ const Renderer = struct {
         try self.w.setStyle(self.spans[self.span_depth]);
     }
 
-    fn codepoint(self: *Renderer, value: u32) !void {
+    fn codepoint(self: *Renderer, value: u32, buffered: bool) !void {
         const cp: u21 = if (value == 0 or value > 0x10ffff or (value >= 0xd800 and value <= 0xdfff)) 0xfffd else @intCast(value);
         var buffer: [4]u8 = undefined;
         const n = try std.unicode.utf8Encode(cp, &buffer);
         // Entity decoding must not reintroduce ESC, bidi or other controls.
         const safe = try text.sanitize(self.w.a, buffer[0..n], 12);
-        try self.w.emit(safe);
+        if (buffered) try self.bufferText(safe) else try self.w.emit(safe);
     }
 
-    fn entity(self: *Renderer, s: []const u8) !void {
+    fn entity(self: *Renderer, s: []const u8, buffered: bool) !void {
         if (s.len > 3 and s[1] == '#') {
             const hex = s[2] == 'x' or s[2] == 'X';
             const n = std.fmt.parseInt(u32, s[if (hex) @as(usize, 3) else 2 .. s.len - 1], if (hex) 16 else 10) catch 0xfffd;
-            try self.codepoint(n);
+            try self.codepoint(n, buffered);
         } else if (md.entity_lookup(s.ptr, s.len)) |value| {
-            try self.codepoint(value.codepoints[0]);
-            if (value.codepoints[1] != 0) try self.codepoint(value.codepoints[1]);
-        } else try self.w.emit(s);
+            try self.codepoint(value.codepoints[0], buffered);
+            if (value.codepoints[1] != 0) try self.codepoint(value.codepoints[1], buffered);
+        } else if (buffered) try self.bufferText(s) else try self.w.emit(s);
     }
 
     fn attribute(self: *Renderer, value: md.Attribute) !void {
@@ -317,17 +355,20 @@ const Renderer = struct {
         var i: usize = 0;
         while (value.offsets.?[i] < value.size) : (i += 1) {
             const part = s[value.offsets.?[i]..value.offsets.?[i + 1]];
-            if (value.types.?[i] == 4) try self.entity(part) else if (value.types.?[i] == 1) try self.w.emit("�") else try self.w.emit(part);
+            if (value.types.?[i] == 4) try self.entity(part, false) else if (value.types.?[i] == 1) try self.w.emit("�") else try self.w.emit(part);
         }
     }
 
     fn content(self: *Renderer, kind: c_int, s: []const u8) !void {
         try self.step(1);
         switch (kind) {
-            1 => try self.w.emit("�"),
-            2, 3 => try self.w.finish(),
-            4 => try self.entity(s),
-            else => try self.w.emit(s),
+            1 => try self.bufferText("�"),
+            2, 3 => {
+                try self.flushText();
+                try self.w.finish();
+            },
+            4 => try self.entity(s, true),
+            else => try self.bufferText(s),
         }
     }
 
@@ -376,6 +417,144 @@ const Renderer = struct {
     }
 };
 
+fn tableCells(line: []const u8, delimiter: bool) ?usize {
+    var indent: usize = 0;
+    for (line) |byte| {
+        if (byte == ' ') indent += 1 else if (byte == '\t') indent += 4 - indent % 4 else break;
+        if (indent > 3) return null;
+    }
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len < 3 or trimmed[0] != '|' or trimmed[trimmed.len - 1] != '|') return null;
+    if (!delimiter) {
+        var count: usize = 0;
+        var escaped = false;
+        for (trimmed) |byte| {
+            if (escaped) {
+                escaped = false;
+            } else if (byte == '\\') {
+                escaped = true;
+            } else if (byte == '|') count += 1;
+        }
+        return if (count >= 2 and count <= 33) count - 1 else null;
+    }
+    var parts = std.mem.splitScalar(u8, trimmed[1 .. trimmed.len - 1], '|');
+    var count: usize = 0;
+    while (parts.next()) |part| {
+        var marks = std.mem.trim(u8, part, " \t");
+        if (marks.len != 0 and marks[0] == ':') marks = marks[1..];
+        if (marks.len != 0 and marks[marks.len - 1] == ':') marks = marks[0 .. marks.len - 1];
+        if (marks.len < 3) return null;
+        for (marks) |byte| if (byte != '-') return null;
+        count += 1;
+        if (count > 32) return null;
+    }
+    return if (count != 0) count else null;
+}
+
+const TableCandidate = struct { start: usize, end: usize, protected: bool = false };
+
+/// Use the parser's actual container grammar, not a second fence/list parser.
+/// CODE/HTML text and existing TABLE cells protect intersecting candidate lines.
+/// Callback source pointers are inspected only when they lie in this input;
+/// synthetic spaces/newlines supplied by MD4C are never dereferenced here.
+const TableGuard = struct {
+    source: []const u8,
+    candidates: []TableCandidate,
+    budget: *output.Budget,
+    candidate_index: usize = 0,
+    table_depth: usize = 0,
+    failure: ?anyerror = null,
+
+    fn selfFrom(raw: ?*anyopaque) *TableGuard {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn failed(self: *TableGuard, err: anyerror) c_int {
+        if (self.failure == null) self.failure = err;
+        return 1;
+    }
+    fn enterBlock(kind: c_int, _: ?*anyopaque, raw: ?*anyopaque) callconv(.c) c_int {
+        const self = selfFrom(raw);
+        self.budget.step(1) catch |err| return self.failed(err);
+        if (kind == 10) self.table_depth += 1;
+        return 0;
+    }
+    fn leaveBlock(kind: c_int, _: ?*anyopaque, raw: ?*anyopaque) callconv(.c) c_int {
+        const self = selfFrom(raw);
+        self.budget.step(1) catch |err| return self.failed(err);
+        if (kind == 10) self.table_depth -= 1;
+        return 0;
+    }
+    fn span(_: c_int, _: ?*anyopaque, raw: ?*anyopaque) callconv(.c) c_int {
+        const self = selfFrom(raw);
+        self.budget.step(1) catch |err| return self.failed(err);
+        return 0;
+    }
+    fn content(kind: c_int, ptr: [*]const u8, size: c_uint, raw: ?*anyopaque) callconv(.c) c_int {
+        const self = selfFrom(raw);
+        self.budget.step(@as(usize, size) + 1) catch |err| return self.failed(err);
+        if (self.table_depth == 0 and kind != 5 and kind != 6) return 0;
+        const base = @intFromPtr(self.source.ptr);
+        const address = @intFromPtr(ptr);
+        if (address < base or address - base >= self.source.len) return 0;
+        const start = address - base;
+        if (size == 0 or size > self.source.len - start) return 0;
+        const end = start + size;
+        // Parser text traverses CODE/HTML/TABLE source in document order.
+        while (self.candidate_index < self.candidates.len and self.candidates[self.candidate_index].end <= start) self.candidate_index += 1;
+        var i = self.candidate_index;
+        while (i < self.candidates.len and self.candidates[i].start < end) : (i += 1) {
+            self.budget.step(1) catch |err| return self.failed(err);
+            self.candidates[i].protected = true;
+        }
+        return 0;
+    }
+};
+
+/// Pi recognizes pipe tables directly after prose. Normalize only strict flat
+/// pairs outside parser-confirmed code/HTML/existing tables; history is untouched.
+/// Candidates and output are bounded by the 256 KiB input, with linear scanning
+/// and all parser callbacks charged to the unchanged shared work budget.
+fn tableBreaks(a: Allocator, source: []const u8, budget: *output.Budget) ![]const u8 {
+    try budget.step(source.len);
+    var candidates: std.ArrayList(TableCandidate) = .empty;
+    defer candidates.deinit(a);
+    var position: usize = 0;
+    var previous: []const u8 = "";
+    while (position < source.len) {
+        const end = if (std.mem.indexOfScalar(u8, source[position..], '\n')) |offset| position + offset else source.len;
+        const line = source[position..end];
+        const next = end + @intFromBool(end < source.len);
+        const next_end = if (std.mem.indexOfScalar(u8, source[next..], '\n')) |offset| next + offset else source.len;
+        if (std.mem.trim(u8, previous, " \t").len != 0) {
+            if (tableCells(line, false)) |cells| {
+                if (tableCells(source[next..next_end], true)) |delimiters| {
+                    if (cells == delimiters) try candidates.append(a, .{ .start = position, .end = next_end });
+                }
+            }
+        }
+        previous = line;
+        position = next;
+    }
+    if (candidates.items.len == 0) return a.dupe(u8, source);
+    var guard = TableGuard{ .source = source, .candidates = candidates.items, .budget = budget };
+    const parser: md.Parser = .{ .enter_block = TableGuard.enterBlock, .leave_block = TableGuard.leaveBlock, .enter_span = TableGuard.span, .leave_span = TableGuard.span, .text = TableGuard.content };
+    const parsed = md.md_parse(source.ptr, @intCast(source.len), &parser, &guard);
+    if (parsed == -1) return error.OutOfMemory;
+    if (guard.failure) |failure| return failure;
+    if (parsed != 0) return error.MarkdownRenderLimit;
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(a);
+    position = 0;
+    for (candidates.items) |candidate| {
+        if (candidate.protected) continue;
+        try result.appendSlice(a, source[position..candidate.start]);
+        try result.append(a, '\n');
+        position = candidate.start;
+    }
+    try result.appendSlice(a, source[position..]);
+    return result.toOwnedSlice(a);
+}
+
 /// Parsing/render work is bounded by input AND shared generation budgets, not
 /// merely by viewport size. Repeated reference URLs/cells count before storage. C
 /// parser callbacks never let a Zig error cross the ABI. Only renderer-owned
@@ -393,7 +572,12 @@ pub fn render(a: Allocator, input: []const u8, options: Options) !Rendered {
     var clipped = false;
     if (options.markdown) {
         const parser: md.Parser = .{ .enter_block = Renderer.enterBlockCb, .leave_block = Renderer.leaveBlockCb, .enter_span = Renderer.enterSpanCb, .leave_span = Renderer.leaveSpanCb, .text = Renderer.textCb };
-        const result = md.md_parse(clean.ptr, @intCast(clean.len), &parser, &renderer);
+        const normalized = tableBreaks(scratch, clean, &budget) catch |err| blk: {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            renderer.failure = err;
+            break :blk clean;
+        };
+        const result = if (renderer.failure != null) @as(c_int, 1) else md.md_parse(normalized.ptr, @intCast(normalized.len), &parser, &renderer);
         if (result != 0) {
             if (renderer.failure) |failure| {
                 if (failure == error.OutOfMemory) return error.OutOfMemory;
@@ -439,8 +623,7 @@ fn emitPlain(w: *Writer, clean: []const u8) !bool {
         break :blk false;
     };
     if (clipped) {
-        w.line = .empty;
-        w.col = 0;
+        w.discardLine();
         var notice: Writer = .{ .a = w.a, .columns = w.columns, .ansi = w.ansi, .base = w.base };
         try notice.emit("[Display render limit; remaining text omitted]");
         try notice.finish();
@@ -496,7 +679,7 @@ test "opaque link titles and code metadata consume the work budget" {
 test "table cells and main writer share one generation budget" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var budget: output.Budget = .{ .max_work = 14 };
+    var budget: output.Budget = .{ .max_work = 20 }; // Decoded buffering + emit are both charged; the second cell still fails.
     var renderer: Renderer = .{ .w = .{ .a = arena.allocator(), .columns = 40, .ansi = false, .budget = &budget } };
     var table: md.Table = .{ .columns = 2, .head_rows = 1, .body_rows = 1 };
     var cell: md.Td = .{ .alignment = 0 };
@@ -595,8 +778,288 @@ test "Markdown uses distinct heading emphasis code quote and link colors" {
     defer release(a, r);
     const s = try joined(a, r);
     defer a.free(s);
-    for ([_][]const u8{ theme.heading, theme.strong, theme.code, theme.quote, theme.link }) |color| try std.testing.expect(std.mem.indexOf(u8, s, color) != null);
+    for ([_][]const u8{ theme.heading, theme.strong, theme.inline_code, theme.code, theme.quote, theme.link }) |color| try std.testing.expect(std.mem.indexOf(u8, s, color) != null);
     try @import("../tests/regular_screen.zig").rejectFullscreen(s);
+}
+
+test "ordinary and emphasized text stay neutral while inline code is foreground only" {
+    const theme = @import("theme.zig");
+    const a = std.testing.allocator;
+    const r = try render(a, "ordinary **bold** `exit_code=124` after\n\n$literal_math$", .{ .columns = 80, .max_lines = 20 });
+    defer release(a, r);
+    const s = try joined(a, r);
+    defer a.free(s);
+    try std.testing.expect(std.mem.startsWith(u8, r.lines[0], theme.reset ++ "ordinary "));
+    try std.testing.expect(std.mem.indexOf(u8, s, theme.strong) != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, theme.inline_code ++ "exit_code=124") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, theme.inline_code ++ "$literal_math$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "48;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, theme.heading) == null);
+    try std.testing.expect(output.displayWidth(r.lines[0]) < 80);
+    try std.testing.expect(std.mem.indexOf(u8, s, theme.reset ++ " after") != null);
+}
+
+test "Pi code colors follow block syntax without Markdown background or row padding" {
+    const theme = @import("theme.zig");
+    const a = std.testing.allocator;
+    const source = "exit_code=124\n/root/thin\nexit_code=0\n\n```text\nexit_code=124\n/root/thin\nexit_code=0\n```\n\nafter";
+    const r = try render(a, source, .{ .columns = 40, .max_lines = 30 });
+    defer release(a, r);
+    var code_rows: usize = 0;
+    for (r.lines) |line| {
+        if (std.mem.indexOf(u8, line, theme.code) != null) {
+            code_rows += 1;
+            try std.testing.expect(output.displayWidth(line) < 40);
+        }
+        try std.testing.expect(std.mem.endsWith(u8, line, theme.reset));
+        try std.testing.expect(std.mem.indexOf(u8, line, theme.user_background) == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "48;") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 3), code_rows);
+    try std.testing.expect(std.mem.indexOf(u8, r.lines[0], "48;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.lines[r.lines.len - 1], "48;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.lines[r.lines.len - 1], "after") != null);
+}
+
+test "tables have outer and per logical row rules with Pi bold neutral headers" {
+    try text.initLocale();
+    const theme = @import("theme.zig");
+    const a = std.testing.allocator;
+    const source = "| Name | Amount |\n| :--- | ---: |\n| alpha | 12 |\n| beta | 345 |";
+    const r = try render(a, source, .{ .columns = 40, .max_lines = 30, .ansi = false });
+    defer release(a, r);
+    try std.testing.expectEqual(@as(usize, 7), r.lines.len);
+    try std.testing.expectEqualStrings("┌───────┬────────┐", r.lines[0]);
+    try std.testing.expectEqualStrings("├───────┼────────┤", r.lines[2]);
+    try std.testing.expectEqualStrings(r.lines[2], r.lines[4]);
+    try std.testing.expectEqualStrings("└───────┴────────┘", r.lines[6]);
+    try std.testing.expectEqualStrings("│ alpha │     12 │", r.lines[3]);
+    for (r.lines) |line| try std.testing.expectEqual(@as(usize, 18), output.displayWidth(line));
+    const styled = try render(a, source, .{ .columns = 40, .max_lines = 30 });
+    defer release(a, styled);
+    try std.testing.expect(std.mem.indexOf(u8, styled.lines[1], theme.table_header) != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled.lines[3], theme.table_header) == null);
+    try std.testing.expect(std.mem.indexOf(u8, styled.lines[3], theme.heading) == null);
+    for (styled.lines) |line| {
+        try std.testing.expect(std.mem.endsWith(u8, line, theme.reset));
+        try std.testing.expect(std.mem.indexOf(u8, line, "48;") == null);
+    }
+    const page = try render(a, source, .{ .columns = 40, .max_lines = 2, .scroll_from_end = 1, .ansi = false });
+    defer release(a, page);
+    try std.testing.expectEqual(@as(usize, 7), page.total_lines);
+    try std.testing.expectEqualStrings(r.lines[4], page.lines[0]);
+    try std.testing.expectEqualStrings(r.lines[5], page.lines[1]);
+}
+
+test "wrapped nested and narrow tables retain cells without rules inside a logical row" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    for ([_]usize{ 20, 32 }) |cols| {
+        const r = try render(a, "> | Key | Details |\n> | --- | --- |\n> | a | long wrapped é text 中文 |\n> | b | done |", .{ .columns = cols, .max_lines = 100, .ansi = false });
+        defer release(a, r);
+        var middle: usize = 0;
+        for (r.lines) |line| {
+            if (std.mem.indexOf(u8, line, "├") != null) middle += 1;
+            try std.testing.expect(output.displayWidth(line) <= cols);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+            try std.testing.expect(std.mem.startsWith(u8, line, "> "));
+        }
+        try std.testing.expectEqual(@as(usize, 2), middle);
+        try std.testing.expect(r.lines.len > 7);
+        const s = try joined(a, r);
+        defer a.free(s);
+        try std.testing.expect(std.mem.indexOf(u8, s, "done") != null);
+    }
+    const narrow = try render(a, "| A | B |\n|---|---|\n| alpha | beta |", .{ .columns = 10, .max_lines = 100, .ansi = false });
+    defer release(a, narrow);
+    const s = try joined(a, narrow);
+    defer a.free(s);
+    try std.testing.expect(std.mem.indexOf(u8, s, "┌") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "alpha") != null and std.mem.indexOf(u8, s, "beta") != null);
+}
+
+test "architecture table immediately after paragraph matches Pi table recognition" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    const source = @embedFile("../tests/architecture_table.md");
+    for ([_]usize{ 40, 80, 120 }) |columns| {
+        const r = try render(a, source, .{ .columns = columns, .max_lines = 500 });
+        defer release(a, r);
+        try std.testing.expect(!r.degraded);
+        var top: usize = 0;
+        var middle: usize = 0;
+        var bottom: usize = 0;
+        var grid_width: ?usize = null;
+        for (r.lines) |line| {
+            const width = output.displayWidth(line);
+            try std.testing.expect(width <= columns);
+            if (std.mem.indexOf(u8, line, "┌") != null) {
+                top += 1;
+                grid_width = width;
+            }
+            if (std.mem.indexOf(u8, line, "├") != null) middle += 1;
+            if (std.mem.indexOf(u8, line, "└") != null) bottom += 1;
+            if (grid_width != null and (std.mem.indexOf(u8, line, "│") != null or std.mem.indexOf(u8, line, "┼") != null or std.mem.indexOf(u8, line, "┴") != null)) try std.testing.expectEqual(grid_width.?, width);
+        }
+        try std.testing.expectEqual(@as(usize, 1), top);
+        try std.testing.expectEqual(@as(usize, 8), middle);
+        try std.testing.expectEqual(@as(usize, 1), bottom);
+        const s = try joined(a, r);
+        defer a.free(s);
+        try std.testing.expect(std.mem.indexOf(u8, s, "|---|---|") == null);
+    }
+    for ([_][]const u8{ "```text\nintro\n| A |\n|---|\n| literal |\n```", "intro\n    | A |\n    |---|\n    | literal |" }) |code| {
+        const r = try render(a, code, .{ .columns = 80, .max_lines = 100, .ansi = false });
+        defer release(a, r);
+        const s = try joined(a, r);
+        defer a.free(s);
+        try std.testing.expect(std.mem.indexOf(u8, s, "┌") == null);
+    }
+}
+
+test "table compatibility never inserts breaks in mixed space tab code indentation" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "    intro\n \t|a|\n \t|---|\n \t|body|\n", "    intro\n  \t|a|\n  \t|---|\n", "intro\n|a|\n \t|---|\n", "```\nintro\n|a|\n|---|\n```\n" }) |source| {
+        var budget: output.Budget = .{};
+        const normalized = try tableBreaks(a, source, &budget);
+        defer a.free(normalized);
+        try std.testing.expectEqualStrings(source, normalized);
+    }
+}
+
+test "list fenced table shapes remain unchanged and following flat tables normalize" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "-", "*", "+", "1.", "23)" }) |marker| for ([_][]const u8{ "```", "~~~" }) |fence| {
+        const padding = try a.alloc(u8, marker.len + 1);
+        defer a.free(padding);
+        @memset(padding, ' ');
+        const source = try std.fmt.allocPrint(a, "{s} {s}\n{s}intro\n{s}|a|\n{s}|---|\n{s}{s}\n\nAfter\n|b|\n|---|\n|c|\n", .{ marker, fence, padding, padding, padding, padding, fence });
+        defer a.free(source);
+        const expected = try std.fmt.allocPrint(a, "{s} {s}\n{s}intro\n{s}|a|\n{s}|---|\n{s}{s}\n\nAfter\n\n|b|\n|---|\n|c|\n", .{ marker, fence, padding, padding, padding, padding, fence });
+        defer a.free(expected);
+        var budget: output.Budget = .{};
+        const normalized = try tableBreaks(a, source, &budget);
+        defer a.free(normalized);
+        try std.testing.expectEqualStrings(expected, normalized);
+    };
+    for ([_][]const u8{ "```\n- ```\n|a|\n|---|\n```\n", "- ```\n\tintro\n  |a|\n  |---|\n  ```\n" }) |source| {
+        var budget: output.Budget = .{};
+        const normalized = try tableBreaks(a, source, &budget);
+        defer a.free(normalized);
+        try std.testing.expectEqualStrings(source, normalized);
+    }
+}
+
+test "parser confirmed continuation and nested containers preserve code and release following tables" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "- item\n  ```\n  intro\n  |literal|\n  |---|\n\n",
+        "- item\n  ~~~\n  intro\n  |literal|\n  |---|\n  ~~~\n\n",
+        "- outer\n  - inner\n    ```\n    intro\n    |literal|\n    |---|\n\n",
+        "1. item\n   ```\n   intro\n   |literal|\n   |---|\n\n",
+        "> ```\n> intro\n> |literal|\n> |---|\n\n",
+        "- item\nlazy continuation\n  ```\n  intro\n  |literal|\n  |---|\n\n",
+    }) |prefix| {
+        const source = try std.fmt.allocPrint(a, "{s}After\n|a|\n|---|\n|b|\n", .{prefix});
+        defer a.free(source);
+        const expected = try std.fmt.allocPrint(a, "{s}After\n\n|a|\n|---|\n|b|\n", .{prefix});
+        defer a.free(expected);
+        var budget: output.Budget = .{};
+        const normalized = try tableBreaks(a, source, &budget);
+        defer a.free(normalized);
+        try std.testing.expectEqualStrings(expected, normalized);
+        for ([_]bool{ false, true }) |ansi| {
+            const rendered = try render(a, source, .{ .columns = 40, .max_lines = 128, .ansi = ansi });
+            defer release(a, rendered);
+            const visible = try joined(a, rendered);
+            defer a.free(visible);
+            try std.testing.expect(!rendered.degraded);
+            try std.testing.expect(std.mem.indexOf(u8, visible, "┌") != null);
+            for (rendered.lines) |line| try std.testing.expect(output.displayWidth(line) <= 40);
+        }
+    }
+}
+
+test "normalization preserves existing tables and inline code while HTML remains literal" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "intro\n\n| H |\n| --- |\n| --- |\n| --- |\n",
+        "intro `\n|a|\n|---|\n` end\n",
+    }) |source| {
+        var budget: output.Budget = .{};
+        const normalized = try tableBreaks(a, source, &budget);
+        defer a.free(normalized);
+        try std.testing.expectEqualStrings(source, normalized);
+    }
+    // NOHTMLBLOCKS/NOHTMLSPANS deliberately make tags ordinary safe text,
+    // not opaque browser containers. Markdown inside them remains Markdown.
+    const html = "<div>\nintro\n|a|\n|---|\n|b|\n</div>\n";
+    var budget: output.Budget = .{};
+    const normalized = try tableBreaks(a, html, &budget);
+    defer a.free(normalized);
+    try std.testing.expectEqualStrings("<div>\nintro\n\n|a|\n|---|\n|b|\n</div>\n", normalized);
+    const rendered = try render(a, html, .{ .columns = 40, .max_lines = 128, .ansi = false });
+    defer release(a, rendered);
+    const visible = try joined(a, rendered);
+    defer a.free(visible);
+    try std.testing.expect(!rendered.degraded);
+    try std.testing.expect(std.mem.indexOf(u8, visible, "<div>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, visible, "</div>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, visible, "┌") != null);
+}
+
+fn normalizationAllocationCheck(a: Allocator) !void {
+    var budget: output.Budget = .{};
+    const result = try tableBreaks(a, "- item\n  ```\n  |literal|\n  |---|\n\nAfter\n|a|\n|---|\n|b|\n", &budget);
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "After\n\n|a|") != null);
+}
+
+test "normalization candidate ownership survives every allocator failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, normalizationAllocationCheck, .{});
+}
+
+test "style and entity boundaries preserve conservative cluster wrapping widths" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "x❤**&#xfe0f;**", "x❤**&#xfe0f;**y", "x👩**&#x200d;**💻", "x👍**&#x1f3fd;**", "x🇨**🇳**🇯", "xe**&#x301;**", "&#xfe0f;", "&#x200d;A", "> ❤**&#xfe0f;**", "- ❤**&#xfe0f;**", "| H |\n|---|\n| x❤**&#xfe0f;** |" }) |source| {
+        for ([_]usize{ 1, 2, 3, 4, 8, 20 }) |columns| for ([_]bool{ false, true }) |ansi| {
+            const rendered = try render(a, source, .{ .columns = columns, .max_lines = 100, .ansi = ansi });
+            defer release(a, rendered);
+            try std.testing.expect(!rendered.degraded);
+            for (rendered.lines) |line| try std.testing.expect(output.displayWidth(line) <= columns);
+        };
+    }
+    for ([_]bool{ false, true }) |ansi| {
+        const rendered = try render(a, "x❤**&#xfe0f;**", .{ .columns = 2, .max_lines = 100, .ansi = ansi });
+        defer release(a, rendered);
+        try std.testing.expectEqual(@as(usize, 2), rendered.lines.len);
+        const visible = try joined(a, rendered);
+        defer a.free(visible);
+        try std.testing.expect(std.mem.indexOf(u8, visible, "❤") != null and std.mem.indexOf(u8, visible, "️") != null);
+    }
+}
+
+test "table geometry is unchanged by SGR trailing ZWJ and decoded variation entities" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 1), output.displayWidth("a‍\x1b[0m"));
+    try std.testing.expectEqual(@as(usize, 2), output.displayWidth("❤\x1b[1m️\x1b[0m"));
+    for ([_]bool{ false, true }) |ansi| {
+        const r = try render(a, "| H |\n|---|\n| a‍ |", .{ .columns = 12, .max_lines = 100, .ansi = ansi });
+        defer release(a, r);
+        try std.testing.expect(!r.degraded);
+        for (r.lines) |line| try std.testing.expectEqual(@as(usize, 5), output.displayWidth(line));
+        const one = try render(a, "| H |\n|---|\n| ❤️xyz |", .{ .columns = 8, .max_lines = 100, .ansi = ansi });
+        defer release(a, one);
+        const two = try render(a, "| H |\n|---|\n| ❤&#xfe0f;xyz |", .{ .columns = 8, .max_lines = 100, .ansi = ansi });
+        defer release(a, two);
+        try std.testing.expect(!one.degraded and !two.degraded);
+        try std.testing.expectEqual(one.lines.len, two.lines.len);
+        for (one.lines, two.lines) |literal, decoded| try std.testing.expectEqualStrings(literal, decoded);
+    }
 }
 
 test "Markdown depth limit degrades visibly without exposing entity controls" {

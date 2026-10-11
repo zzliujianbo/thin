@@ -1,15 +1,27 @@
-//! Shared warm-orange terminal palette. Only our renderer emits SGR;
+//! Bright Pi-style Markdown semantics, with local orange UI accents.
+//! ANSI bright variants keep code/inline/link colors legible on dark terminals;
+//! there is no terminal RGB probing or universal contrast guarantee.
+//! Only our renderer emits SGR;
 //! model/user bytes are sanitized separately, never interpreted as escapes.
 const activity = @import("../presentation/activity.zig");
 
 pub const reset = "\x1b[0m";
 pub const accent = "\x1b[38;5;208m";
-pub const heading = "\x1b[1m\x1b[38;5;214m";
-pub const strong = "\x1b[1m\x1b[38;5;215m";
+pub const heading = "\x1b[1m\x1b[38;5;11m";
+/// Bold terminal-default foreground, readable on light and dark themes.
+pub const strong = "\x1b[1m";
 pub const muted = "\x1b[38;5;245m";
-pub const quote = "\x1b[38;5;180m";
-pub const link = "\x1b[4m\x1b[38;5;75m";
-pub const code = "\x1b[38;5;223m\x1b[48;5;235m";
+pub const md_dim = "\x1b[39m\x1b[2m";
+pub const quote = md_dim ++ "\x1b[3m";
+pub const link = "\x1b[4m\x1b[38;5;12m";
+/// Pi has no Markdown-specific background, even for fenced/indented code.
+pub const inline_code = "\x1b[38;5;13m";
+pub const code = "\x1b[38;5;10m";
+pub const table_header = "\x1b[1m";
+pub const bullet = "\x1b[38;5;13m";
+/// File-change counts are independent of Markdown brightness.
+pub const diff_added = "\x1b[38;5;2m";
+pub const diff_removed = "\x1b[38;5;1m";
 pub const user = "\x1b[38;5;255m\x1b[48;2;52;36;24m";
 pub const user_background = "\x1b[48;2;52;36;24m";
 
@@ -59,3 +71,16 @@ pub const command_pulse = [_][]const u8{
     "\x1b[38;5;173m", "\x1b[38;5;208m", "\x1b[38;5;214m", "\x1b[38;5;220m",
     "\x1b[38;5;223m", "\x1b[38;5;220m", "\x1b[38;5;214m", "\x1b[38;5;208m",
 };
+
+test "bright Markdown palette keeps tool counts and configured effort independent" {
+    const testing = @import("std").testing;
+    try testing.expectEqualStrings("\x1b[38;5;10m", code);
+    try testing.expectEqualStrings("\x1b[38;5;13m", inline_code);
+    try testing.expectEqualStrings(inline_code, bullet);
+    try testing.expectEqualStrings("\x1b[1m\x1b[38;5;11m", heading);
+    try testing.expectEqualStrings("\x1b[4m\x1b[38;5;12m", link);
+    try testing.expectEqualStrings("\x1b[38;5;2m", diff_added);
+    try testing.expectEqualStrings("\x1b[38;5;1m", diff_removed);
+    try testing.expectEqualStrings("\x1b[38;5;75m", effortColor(.high));
+    try testing.expectEqualStrings("\x1b[38;5;171m", effortColor(.xhigh));
+}

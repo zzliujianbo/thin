@@ -24,6 +24,19 @@ const leave = "\x18\x1b[0m\x1b[?2004l\x1b[?25h\r\n";
 /// 终端尺寸，单位为列数与行数。
 pub const Size = struct { columns: usize, rows: usize };
 
+/// Optional owner stop check, not used for mandatory terminal restoration.
+/// Once bytes are written they cannot be retracted; check before each attempt.
+pub const Stop = struct {
+    context: ?*const anyopaque = null,
+    stopped_fn: *const fn (?*const anyopaque) bool = never,
+    fn never(_: ?*const anyopaque) bool {
+        return false;
+    }
+    fn stopped(self: Stop) bool {
+        return self.stopped_fn(self.context);
+    }
+};
+
 /// 终端 fd 的封装：保存原始属性以便恢复，并负责粘贴、光标等显示状态。
 pub const Terminal = struct {
     /// 终端文件描述符（/dev/tty 或测试用的 PTY slave）。
@@ -36,6 +49,7 @@ pub const Terminal = struct {
     original_flags: c_int,
     /// 是否仍处于 raw/显示托管状态；restore 依赖它保证幂等。
     active: bool = true,
+    restored: bool = false,
 
     /// 打开控制终端 /dev/tty。要求 stdin/stdout 均为 tty，且当前进程位于前台进程组，否则后台写终端会被 SIGTTOU 挂起。
     pub fn open() !Terminal {
@@ -133,8 +147,13 @@ pub const Terminal = struct {
 
     /// 有界写入：最多尝试 attempts 次，写不完时短暂等待可写。返回是否全部写完，永不无限阻塞。
     fn writeBounded(self: Terminal, data: []const u8, attempts: usize) bool {
+        return self.writeBoundedStopped(data, attempts, .{}) catch unreachable;
+    }
+
+    fn writeBoundedStopped(self: Terminal, data: []const u8, attempts: usize, stop: Stop) error{Canceled}!bool {
         var offset: usize = 0;
         for (0..attempts) |_| {
+            if (stop.stopped()) return error.Canceled;
             offset += self.write(data[offset..]) catch return false;
             if (offset == data.len) return true;
             self.wait(true, 2) catch return false;
@@ -145,7 +164,7 @@ pub const Terminal = struct {
     /// Restoration must not use a canceled Io context. Bounded even if terminal
     /// output is backpressured; failure is returned, never called success.
     pub fn restore(self: *Terminal) bool {
-        if (!self.active) return true;
+        if (!self.active) return self.restored;
         self.active = false;
 
         var attrs_ok = false;
@@ -164,7 +183,27 @@ pub const Terminal = struct {
         const flags_ok = c.fcntl(self.fd, 4, self.original_flags) >= 0;
 
         // 三项都成功才返回 true，任何失败都如实返回 false。
-        return attrs_ok and display_ok and flags_ok;
+        self.restored = attrs_ok and display_ok and flags_ok;
+        return self.restored;
+    }
+
+    /// Plain bounded lifecycle output only AFTER successful restoration. The
+    /// fresh tty description remains private; fixture borrowed blocking flags
+    /// are temporarily nonblocking and restored even on a short/failed write.
+    pub fn writeAfterRestore(self: *Terminal, data: []const u8) !void {
+        try self.writeAfterRestoreStopped(data, .{});
+    }
+
+    pub fn writeAfterRestoreStopped(self: *Terminal, data: []const u8, stop: Stop) !void {
+        if (self.active or !self.restored) return error.TerminalNotRestored;
+        if (data.len > 256) return error.TerminalWriteLimit;
+        const flags = c.fcntl(self.fd, 3);
+        if (flags < 0 or c.fcntl(self.fd, 4, flags | nonblock) < 0) return error.TerminalWriteFailed;
+        // Preserve the error until AFTER temporary flags have been restored.
+        const complete = self.writeBoundedStopped(data, 50, stop);
+        const flags_ok = c.fcntl(self.fd, 4, flags) >= 0;
+        if (!flags_ok) return error.TerminalRestoreFailed;
+        if (!try complete) return error.TerminalWriteFailed;
     }
 
     /// 恢复终端状态；owned 为 true 时同时关闭 fd。可重复调用。
@@ -211,11 +250,70 @@ test "product terminal restores raw attributes and flags on PTY only" {
         try std.testing.expectEqual(@as(usize, columns), terminal.size().columns);
     }
 
+    try std.testing.expectError(error.TerminalNotRestored, terminal.writeAfterRestore("premature"));
+    try std.testing.expect(terminal.restore());
+    try terminal.writeAfterRestore("Session ID: 00000000000000000000000000000000\r\n");
     try std.testing.expect(terminal.restore());
     var restored: abi.Termios = undefined;
     try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &restored));
     try expectAttributes(original, restored);
     try std.testing.expectEqual(flags, c.fcntl(slave, 3));
+}
+
+test "post restoration stop on a backpressured retry still restores descriptor flags" {
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
+    defer _ = c.close(master);
+    defer _ = c.close(slave);
+    var terminal = try Terminal.fromFd(slave, false);
+    defer terminal.deinit();
+    try std.testing.expect(terminal.restore());
+    const flags = c.fcntl(slave, 3);
+    try std.testing.expect(c.fcntl(slave, 4, flags | nonblock) >= 0);
+    const fill: [4096]u8 = @splat('x');
+    for (0..1024) |_| {
+        const n = c.write(slave, &fill, fill.len);
+        if (n < 0) {
+            try std.testing.expectEqual(@as(c_int, 11), c._errno().*);
+            break;
+        }
+    } else return error.PtyDidNotBackpressure;
+    // Fill even a sub-block remainder before the small announcement attempt.
+    for (0..8192) |_| {
+        const n = c.write(slave, "x", 1);
+        if (n < 0) {
+            try std.testing.expectEqual(@as(c_int, 11), c._errno().*);
+            break;
+        }
+    } else return error.PtyDidNotBackpressure;
+    try std.testing.expect(c.fcntl(slave, 4, flags) >= 0);
+    const Reader = struct {
+        fn stopped(ctx: ?*const anyopaque) bool {
+            const immutable: *const usize = @ptrCast(@alignCast(ctx.?));
+            const count = @constCast(immutable);
+            count.* += 1;
+            return count.* >= 2;
+        }
+    };
+    var calls: usize = 0;
+    try std.testing.expectError(error.Canceled, terminal.writeAfterRestoreStopped("bounded-report", .{ .context = &calls, .stopped_fn = Reader.stopped }));
+    try std.testing.expectEqual(@as(usize, 2), calls);
+    try std.testing.expectEqual(flags, c.fcntl(slave, 3));
+    try std.testing.expect(terminal.restore());
+}
+
+test "failed restoration never becomes success or allows exit identity output" {
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
+    defer _ = c.close(master);
+    var terminal = try Terminal.fromFd(slave, false);
+    defer terminal.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), c.close(slave));
+    try std.testing.expect(!terminal.restore());
+    try std.testing.expect(!terminal.restore());
+    try std.testing.expectError(error.TerminalNotRestored, terminal.writeAfterRestore("must not print"));
 }
 
 test "initial terminal scrolls prior output into history and starts at top" {

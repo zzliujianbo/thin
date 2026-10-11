@@ -177,8 +177,80 @@ pub const Observer = struct {
     fn discard(_: ?*anyopaque, _: Observation) void {}
 };
 
-/// Agent 循环状态机：一次 run 处理一条用户输入，循环调用模型、执行工具，直到模型 stop 或出错。
-/// 非线程安全：同一实例同一时刻只允许一个 run（由 busy 保证）。
+test "selection preserves canonical history and closes retained auto fallback" {
+    const Stub = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            return error.UnexpectedRequest;
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !Prepared {
+            return error.UnexpectedTool;
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: Prepared, _: *const p.Cancellation) !Execution {
+            return error.UnexpectedTool;
+        }
+    };
+    var dummy: u8 = 0;
+    var config: cfg.Config = .{ .provider = .{ .base_url = "http://unused.invalid" }, .model = .{ .name = "old", .context_tokens = 32768, .protocol = .chat } };
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "", false);
+    defer runtime.deinit();
+    const source: p.Message = .{ .role = .assistant, .blocks = &.{ .{ .reasoning = "native-only summary" }, .{ .text = "retained" }, .{ .tool_call = .{ .id = "id", .item_id = "old-native-item", .name = "test", .arguments = "{}" } } }, .replay = .{ .scope = .{ .connection = "c", .model = "old", .protocol = .chat }, .json = "[]" } };
+    try runtime.history.append(runtime.arena.allocator(), try p.cloneMessage(runtime.arena.allocator(), source));
+    try runtime.history.append(runtime.arena.allocator(), try p.cloneMessage(runtime.arena.allocator(), .{ .role = .assistant, .blocks = &.{.{ .reasoning = "native-only message" }}, .replay = source.replay }));
+    try runtime.history.append(runtime.arena.allocator(), try p.cloneMessage(runtime.arena.allocator(), .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "id", .text = "ok" } }} }));
+    runtime.protected_index = 2;
+    runtime.estimator.per_mille = 2200;
+    var next = config.model;
+    next.reasoning_effort = "high";
+    next.context_tokens = 65536;
+    try runtime.prepareSelection(next);
+    try std.testing.expect(runtime.history.items[0].replay != null);
+    try std.testing.expectEqual(@as(u64, 2200), runtime.estimator.per_mille);
+    config.model = next;
+    next.name = "new";
+    runtime.busy.store(true, .release);
+    try std.testing.expectError(error.Busy, runtime.prepareSelection(next));
+    runtime.busy.store(false, .release);
+    runtime.poisoned = true;
+    try std.testing.expectError(error.UnsafeToContinue, runtime.prepareSelection(next));
+    runtime.poisoned = false;
+    try std.testing.expect(runtime.history.items[0].replay != null);
+    next.protocol = .auto;
+    try runtime.prepareSelection(next);
+    try std.testing.expect(runtime.history.items[0].replay == null);
+    try std.testing.expectEqual(@as(usize, 2), runtime.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.protected_index);
+    try std.testing.expectEqualStrings("retained", runtime.history.items[0].blocks[0].text);
+    try std.testing.expect(runtime.history.items[0].blocks[1].tool_call.item_id == null);
+    try std.testing.expectEqualStrings("id", runtime.history.items[1].blocks[0].tool_result.call_id);
+    for ([_]p.Protocol{ .chat, .responses }) |protocol| {
+        const request_: p.Request = .{ .scope = .{ .connection = "c", .model = next.name, .protocol = protocol }, .system = runtime.system, .tools = &.{}, .messages = runtime.messages(), .max_output_tokens = 512 };
+        const encoded = if (protocol == .chat) try @import("../llm/chat.zig").encode(std.testing.allocator, request_) else try @import("../llm/responses.zig").encode(std.testing.allocator, request_);
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "old-native-item") == null);
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "native-only") == null);
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "retained") != null);
+    }
+    try std.testing.expectEqual(@as(u64, 1000), runtime.estimator.per_mille);
+    try std.testing.expectEqual(p.Protocol.chat, runtime.selector.selected.?);
+    try std.testing.expect(runtime.selector.initial_attempted);
+    config.model = next;
+    next.name = "another";
+    const selector = runtime.selector;
+    try runtime.prepareSelection(next);
+    try std.testing.expectEqualDeep(selector, runtime.selector);
+    config.model = next;
+    next.protocol = .responses;
+    try runtime.prepareSelection(next);
+    try std.testing.expectEqual(p.Protocol.responses, runtime.selector.selected.?);
+    config.model = next;
+    runtime.history.clearRetainingCapacity();
+    next.protocol = .auto;
+    try runtime.prepareSelection(next);
+    try std.testing.expect(runtime.selector.selected == null);
+    try std.testing.expect(!runtime.selector.initial_attempted);
+}
+
+/// Agent loop; owner serializes selection and worker execution.
 pub const Runtime = struct {
     /// 长期分配器；压缩的临时数据与单轮结果都从它派生 arena。
     allocator: std.mem.Allocator,
@@ -251,6 +323,65 @@ pub const Runtime = struct {
         std.debug.assert(!self.busy.load(.acquire));
         self.arena.deinit();
         self.allocator.free(self.system);
+    }
+
+    /// Owner must have joined the worker. Publication belongs to Session;
+    /// every possible error precedes replay/selector/calibration mutation.
+    pub fn prepareSelection(self: *Runtime, next: cfg.Model) !void {
+        if (self.busy.load(.acquire)) return error.Busy;
+        if (self.poisoned) return error.UnsafeToContinue;
+        var candidate = self.config.*;
+        candidate.model = next;
+        try cfg.validate(candidate);
+        const protocol_changed = next.protocol != self.config.model.protocol;
+        const name_changed = !std.mem.eql(u8, next.name, self.config.model.name);
+        if (name_changed or protocol_changed) {
+            self.discardNativeReplay();
+            self.estimator = .{};
+        }
+        if (protocol_changed) {
+            const previous = self.selector.effective();
+            self.selector = llm.Selector.init(next.protocol);
+            if (next.protocol == .auto and self.history.items.len != 0) {
+                self.selector.selected = previous;
+                self.selector.initial_attempted = true;
+            }
+        }
+    }
+
+    /// Canonical blocks are owned by this arena (cloneMessage/appendResult).
+    /// Clear native-only identity/reasoning in place without a fallible step
+    /// after selection preparation; keep visible text and exact call/result IDs.
+    fn discardNativeReplay(self: *Runtime) void {
+        var kept_messages: usize = 0;
+        const old_protected = self.protected_index;
+        var protected = old_protected;
+        for (self.history.items, 0..) |*message, index| {
+            message.replay = null;
+            const blocks = @constCast(message.blocks);
+            var kept_blocks: usize = 0;
+            for (blocks) |block| {
+                var canonical = block;
+                switch (canonical) {
+                    .reasoning => continue,
+                    .tool_call => |*call| call.item_id = null,
+                    else => {},
+                }
+                blocks[kept_blocks] = canonical;
+                kept_blocks += 1;
+            }
+            message.blocks = blocks[0..kept_blocks];
+            // An entirely native-only assistant item is not a fabricated empty
+            // visible answer. Removing it cannot orphan a call/result pair.
+            if (message.role == .assistant and kept_blocks == 0) {
+                if (index < old_protected) protected -|= 1;
+                continue;
+            }
+            self.history.items[kept_messages] = message.*;
+            kept_messages += 1;
+        }
+        self.history.items.len = kept_messages;
+        self.protected_index = @min(protected, kept_messages);
     }
 
     /// 只读访问当前对话历史；返回切片在下一次 run 或压缩后失效。

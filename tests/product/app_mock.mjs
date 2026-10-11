@@ -8,6 +8,7 @@
 // 依赖 Node 内置模块：http 提供伪造服务，child_process 启动 CLI 与 PTY 驱动，assert 做断言。
 
 import http from 'node:http';
+import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {mkdtemp, mkdir, writeFile, readFile, rm, access, stat, readdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -23,6 +24,7 @@ const [appArg, ptyArg] = process.argv.slice(2);
 assert(appArg && ptyArg, 'usage: app_mock.mjs <thin executable> <PTY executable>');
 // 转为绝对路径，避免子进程切换 cwd 后相对路径失效。
 const app = resolve(appArg), pty = resolve(ptyArg);
+const architectureTable = await readFile(new URL('../../src/tests/architecture_table.md', import.meta.url), 'utf8');
 
 // 假 API 密钥：通过 Authorization 头发送给伪造服务，并断言它不会出现在任何捕获的输出中。
 const KEY = 'fixture-secret-never-log';
@@ -65,7 +67,7 @@ function associations(body, protocol) {
  * 以 SSE 格式向客户端发送一条伪造回复：文本、工具调用，或截断（只发送开头，不结束流）。
  * Chat 与 Responses 的事件结构不同，因此按 protocol 分别构造。
  */
-function send(res, protocol, text, calls = [], truncated = false) {
+function send(res, protocol, text, calls = [], truncated = false, nativeReasoning = false) {
   // SSE 响应头，禁止缓存。
   res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'});
 
@@ -83,6 +85,7 @@ function send(res, protocol, text, calls = [], truncated = false) {
   } else {
     // Responses：工具调用生成 function_call 条目，否则生成 assistant 消息。
     const output = calls.length ? calls.map(t => ({id:`item_${t.id}`, type:'function_call', call_id:t.id, name:t.name, arguments:t.arguments, status:'completed'})) : [{id:'message_fixture', type:'message', role:'assistant', content:[{type:'output_text', text}], status:'completed'}];
+    if (nativeReasoning) output.unshift({id:'selection-reasoning-item', type:'reasoning', summary:[{type:'summary_text',text:'selection-transient-reasoning'}], encrypted_content:'fixture-opaque-native-reasoning'});
 
     // 截断时只发送第一个输出项，不发送 response.completed。
     if (truncated) {
@@ -161,6 +164,7 @@ async function scenario(name, protocol, kind, isPty = false) {
 
   // 场景计数器：请求数、对话轮次、摘要次数，以及压缩后标记。
   let requests = 0, rounds = 0, summaries = 0, afterSummary = false, stable, fixtureError, idleSocket;
+  let selectionStage = 0;
 
   // stalled 表示已到达挂起点；signalChild 与 ownsChild 来自 execute 回调，非 PTY 取消时用于发送 SIGINT。
   let stalled, signalChild, ownsChild;
@@ -207,10 +211,47 @@ async function scenario(name, protocol, kind, isPty = false) {
       rounds++;
 
       // 挂起场景：返回 SSE 响应头后不再发送数据；非 PTY 时发送 SIGINT 以测试取消。
-      if (kind === 'stall' || (isPty && (kind === 'cancel' || kind === 'term') && rounds === 1)) {
+      if (kind === 'stall' || kind === 'exit-busy' || (isPty && (kind === 'cancel' || kind === 'term') && rounds === 1)) {
         stalled = true;
         res.writeHead(200, {'content-type':'text/event-stream'}); res.flushHeaders();
         if (!isPty && ownsChild()) signalChild.kill('SIGINT');
+        return;
+      }
+
+      if (kind === 'exit-busy-tool') {
+        assert.equal(requests,1, 'Ctrl+D busy tool must not start another request');
+        send(res,protocol,'',[tool('exit-busy-command','bash',{command:'sleep 30; printf must-not-complete'})]);
+        return;
+      }
+
+      if (kind === 'model-select') {
+        selectionStage = 1;
+        assert(rounds <= 4, 'session selection request bound; no discovery requests');
+        selectionStage = 2;
+        assert.equal(body.model, rounds <= 2 ? 'fixture-model' : rounds === 3 ? 'fixture-next' : 'fixture-custom');
+        selectionStage = 3;
+        assert.equal(protocol === 'chat' ? body.reasoning_effort : body.reasoning?.effort, rounds <= 2 ? 'none' : rounds === 3 ? 'medium' : 'high');
+        const serialized = JSON.stringify(protocol === 'chat' ? body.messages : body.input);
+        selectionStage = 4;
+        assert(serialized.includes(rounds <= 2 ? 'selection-first' : rounds === 3 ? 'selection-second' : 'selection-third'));
+        selectionStage = 5;
+        assert(!serialized.includes('/model') && !serialized.includes('rejected-busy'), 'local settings leaked into conversation');
+        selectionStage = 6;
+        if (rounds >= 2) assert(outputs.get('selection-read')?.includes('seed-content-'), 'paired read result lost across selection');
+        if (rounds >= 3) {
+          selectionStage = 7;
+          assert(serialized.includes('selection-answer-one'), 'canonical first answer lost across model change');
+          selectionStage = 8;
+          if (protocol === 'responses') {
+            assert(!body.input.some(item => item.id === 'message_fixture' || item.id === 'item_selection-read' || item.type === 'reasoning'), 'old native replay retained under new model');
+            assert(!serialized.includes('fixture-opaque-native-reasoning') && !serialized.includes('selection-transient-reasoning'), 'native-only reasoning reconstructed after switch');
+          }
+        }
+        if (rounds === 1) {
+          // Observation window only; production requests are never delayed for UI.
+          await new Promise(resolve => setTimeout(resolve, 500));
+          send(res, protocol, '', [tool('selection-read','read_file',{path:'seed.txt'})], false, protocol === 'responses');
+        } else send(res, protocol, rounds === 2 ? 'selection-answer-one' : rounds === 3 ? 'selection-answer-two' : 'selection-answer-three');
         return;
       }
 
@@ -235,12 +276,17 @@ async function scenario(name, protocol, kind, isPty = false) {
         await new Promise(resolve=>setTimeout(resolve,450));
         chunk({reasoning_content:'\nthinking-new-five\nthinking-new-six\nreasoning-stage-two'});
         await new Promise(resolve=>setTimeout(resolve,600));
-        chunk({content:'# Orange heading\n\n**stream-stage-one** and [link](https://example.org)\n\n'});
+        chunk({content:'# Orange heading\n\n**stream-stage-one** and [link](https://example.org) with `inline-marker`\n\n> quote-marker\n\n'});
         await new Promise(resolve=>setTimeout(resolve,600));
-        chunk({content:'```zig\nconst value = 1;\n```\n\n| Item | State |\n| --- | --- |\n| fixture | ready |\n\nstream-final-answer'});
+        chunk({content:'```text\nconst value = 1;\nexit_code=124\n/root/thin\nexit_code=0\n```\n\n| Item | State |\n| --- | --- |\n| fixture | ready |\n| second-row | verified |\n\nstream-final-answer'});
         await new Promise(resolve=>setTimeout(resolve,200));
         res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\ndata: ${JSON.stringify({id:'stream_fixture',choices:[],usage:{prompt_tokens:12,completion_tokens:90,total_tokens:102,prompt_tokens_details:{cached_tokens:9},completion_tokens_details:{reasoning_tokens:30}}})}\n\ndata: [DONE]\n\n`);
         res.end();
+        return;
+      }
+
+      if (kind === 'architecture-table') {
+        send(res, protocol, `${architectureTable}\narchitecture-table-final-answer`);
         return;
       }
 
@@ -267,14 +313,34 @@ async function scenario(name, protocol, kind, isPty = false) {
         if (rounds === 1) {
           send(res,protocol,'',[
             tool('icon_shell','bash',{command:'sleep 1; cat r.json'}),
-            tool('icon_second','bash',{command:'printf ok'}),
-            tool('icon_failure','bash',{command:'false'})
+            tool('icon_second','bash',{command:'sleep 0.6; printf ok'}),
+            tool('icon_failure','bash',{command:'false; # failure-caption-long-enough-to-exercise-80-percent-clipping'})
           ]);
         } else {
           assert(outputs.get('icon_shell')?.includes('tool-json-hidden-marker'), 'tool result absent from protocol history');
           assert(outputs.get('icon_second')?.includes('ok'), 'second tool result absent from protocol history');
           assert(outputs.has('icon_failure'), 'failed command result absent from protocol history');
           send(res,protocol,'tool-icon-final-answer');
+        }
+        return;
+      }
+
+      if (kind === 'memory-summary') {
+        assert.equal(protocol,'chat');
+        assert(rounds <= 2, 'memory summary request bound');
+        const content = 'memory-summary-hidden-body';
+        const version = createHash('sha256').update(content).digest('hex');
+        if (rounds === 1) send(res,protocol,'',[
+          tool('mem_write','memory',{action:'write',topic:'caption-note',content}),
+          tool('mem_read','memory',{action:'read',topic:'caption-note'}),
+          tool('mem_list','memory',{action:'list'}),
+          tool('mem_delete','memory',{action:'delete',topic:'caption-note',expected_version:version})
+        ]); else {
+          for (const id of ['mem_write','mem_read','mem_list','mem_delete']) assert(outputs.has(id), 'memory paired result absent');
+          assert.equal(JSON.parse(outputs.get('mem_read')).content,content);
+          assert.equal(JSON.parse(outputs.get('mem_read')).version,version);
+          assert.equal(await exists(join(project,'.thin','mem','caption-note.md')),false);
+          send(res,protocol,'memory-summary-final-answer');
         }
         return;
       }
@@ -340,7 +406,14 @@ async function scenario(name, protocol, kind, isPty = false) {
       // 默认回复：包含 Unicode、Markdown 与 OSC 52 注入，用于验证渲染与净化。
       send(res,protocol,`**世界** café\n\n- fixture-answer\n${injection}`);
     // 伪造服务内部断言失败：记录错误并返回 500，由场景末尾统一抛出。
-    } catch (error) { fixtureError ??= error; res.writeHead(500); res.end('fixture assertion failed'); }
+    } catch (error) {
+      if (kind === 'model-select') {
+        error.fixtureCase = `selection/${protocol}`;
+        error.fixtureCheck = `stage-${selectionStage} request-${requests}`;
+      }
+      fixtureError ??= error;
+      res.writeHead(500); res.end('fixture assertion failed');
+    }
   });
 
   // 登记连接，便于场景结束时销毁。
@@ -361,8 +434,8 @@ async function scenario(name, protocol, kind, isPty = false) {
       await mkdir(join(home,'.thin'));
       const filename = kind === 'legacy-config' ? 'auth.json' : 'config.json';
       // 空白文件走交互初始化；待激活配置始终使用回环服务，绝不向公共端点发送密钥或消息。
-      const provider = kind === 'auth-activate' ? {base_url:url, api_key_env:'', api_key:null, chat_max_tokens:true} : {base_url:url, api_key_env:'THIN_FIXTURE_KEY'};
-      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({provider, model:{name:'fixture-model',protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['stream-markdown','tool-icons'].includes(kind)?'high':undefined}, limits:{max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+      const provider = ['auth-activate','exit-unconfigured','exit-secret'].includes(kind) ? {base_url:url, api_key_env:'', api_key:null, chat_max_tokens:true} : {base_url:url, api_key_env:'THIN_FIXTURE_KEY'};
+      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({provider, model:{name:'fixture-model',protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:kind==='model-select'?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined}, models:kind==='model-select'?[{name:'fixture-next',protocol,context_tokens:65536,reasoning_effort:'low'}]:undefined, limits:{max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
       await writeFile(join(home,'.thin',filename), content);
     }
 
@@ -381,6 +454,36 @@ async function scenario(name, protocol, kind, isPty = false) {
       // 只提取 thin:/error: 后的标识符作为诊断信息，不输出原始内容。
       const codes = [...result.output.matchAll(/(?:thin:|error:)\s+[A-Za-z_][A-Za-z0-9_]*/g)].slice(-3).map(m=>m[0]).join(', ');
       assert.equal(result.code, 0, `${name}: exit ${result.code}; ${codes || 'no safe error code'}; captured ${result.output.length} bytes (not rendered)`);
+    }
+
+    if (isPty && !['term','output'].includes(kind)) {
+      const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
+      assert.equal(ids.length,1, 'Ctrl+D must announce exactly one restored session identity');
+      const announced = ids[0][1];
+      const logDir = join(project,'.thin/sessions');
+      if (await exists(logDir) && (await stat(logDir)).isDirectory()) {
+        for (const file of (await readdir(logDir)).filter(name=>name.endsWith('.jsonl'))) {
+          assert(file.includes(`-${announced}-`), 'archive filename differs from announced identity');
+          for (const line of (await readFile(join(logDir,file),'utf8')).trimEnd().split('\n').filter(Boolean)) assert.equal(JSON.parse(line).session,announced, 'record identity differs from immutable owner identity');
+        }
+      }
+    }
+    if (['exit-no-submit','exit-unconfigured','exit-secret','exit-batched'].includes(kind)) {
+      assert.equal(requests,0, 'exit identity must not send a request');
+      assert(!await exists(join(project,'.thin')), 'identity/no-submission created project storage');
+      if (['exit-unconfigured','exit-secret'].includes(kind)) {
+        const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
+        assert.equal(disk.provider.api_key,null, 'Ctrl+D secret exit must not save input');
+      }
+    }
+    if (kind === 'exit-no-log') {
+      assert.equal(requests,1);
+      assert(!await exists(join(project,'.thin/sessions')), 'disabled recording created archives for exit identity');
+    }
+    if (['exit-busy','exit-busy-tool'].includes(kind)) {
+      assert.equal(requests,1);
+      assert(!result.output.includes('must-not-complete'));
+      if (kind === 'exit-busy') assert(stalled);
     }
 
     // help 与 no-config 不应发起任何请求，也不应创建 .thin 目录；非失败场景还要检查输出内容。
@@ -476,6 +579,15 @@ async function scenario(name, protocol, kind, isPty = false) {
     if (kind === 'stall') assert.equal(result.code, 130, 'SIGINT must return canceled status');
     // cancel：取消后 CLI 应能继续发起第二轮请求。
     if (kind === 'cancel') assert.equal(rounds,2, 'did not resume after cancel');
+    if (kind === 'model-select') {
+      assert.equal(requests,4, 'selection issued discovery or extra requests');
+      const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
+      assert.equal(disk.model.name,'fixture-model');
+      assert.equal(disk.model.reasoning_effort,'none');
+      assert.equal(disk.model.context_tokens,32768);
+      assert.equal(disk.models[0].name,'fixture-next');
+      assert.equal(disk.models[0].reasoning_effort,'low');
+    }
     if (kind === 'regular-two') assert.equal(requests,2, 'regular two-turn request count');
     if (kind === 'tool-icons') assert.equal(requests,2, 'tool icon request count');
     if (kind === 'file-stats') assert.equal(requests,2, 'file stats request count');
@@ -496,6 +608,9 @@ async function scenario(name, protocol, kind, isPty = false) {
 }
 try {
   // 运行全部场景：先测无配置的 help 与 print，再对 chat 与 responses 运行通用场景，最后运行 PTY 场景（仅 chat）。
+  await scenario('PTY model/effort selection chat','chat','model-select',true);
+  await scenario('PTY model/effort selection responses','responses','model-select',true);
+  for (const kind of ['exit-batched','exit-no-submit','exit-no-log','exit-unconfigured','exit-secret','exit-busy','exit-busy-tool']) await scenario(`PTY/${kind}`,'chat',kind,true);
   await scenario('help without configuration','chat','help');
   await scenario('print without configuration','chat','no-config');
   await scenario('legacy configuration is not loaded','chat','legacy-config');
@@ -506,16 +621,16 @@ try {
   }
 
   // PTY 场景：通过 thin-app-pty 驱动交互式终端，仅使用 chat 协议。
-  for (const kind of ['unicode','regular-two','stream-markdown','tool-icons','file-stats','auto-tools','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
+  for (const kind of ['unicode','regular-two','stream-markdown','architecture-table','tool-icons','file-stats','memory-summary','auto-tools','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
   await reviewRegressions(app);
   await logRegressions(app,pty);
-  console.log('Application fixture suite passed; PTY tests exercise chat only.');
+  console.log('Application fixture suite passed; general PTY tests exercise chat, model selection also covers responses.');
 
 // 顶层捕获：任何场景失败都打印脱敏后的错误（替换密钥、去除控制字符），并以退出码 1 结束。
 } catch (error) {
   // 中文：不要渲染捕获的终端或模型输出、响应头或请求体。
   // Do not render captured terminal/model output, headers, or request bodies.
-  const label = /^log\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
+  const label = /^(?:log|selection)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
     ? `${error.fixtureCase}: ${error.fixtureCheck}` : 'offline fixture assertion failed (details withheld)';
   console.error(`FAIL application acceptance: ${label}`);
   process.exitCode = 1;

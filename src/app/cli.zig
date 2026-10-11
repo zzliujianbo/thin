@@ -50,7 +50,14 @@ pub const help =
     \\Interactive uses regular terminal scrollback, not an alternate full-screen buffer.
     \\Committed output remains after exit; only the live input/status area is redrawn.
     \\Enter sends; Ctrl+J adds newline; Ctrl+C cancels; Ctrl+D exits.
-    \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning.
+    \\After Ctrl+D and successful terminal restoration, the current session ID is printed.
+    \\An ID alone creates no records; --no-log and no-submission exits still have an ID.
+    \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning; Shift+Tab cycles request effort.
+    \\/model opens a searchable picker; /model exact-id selects directly while idle.
+    \\Selections are session-only; startup defaults are not rewritten. No model discovery.
+    \\Optional models:[{name,context_tokens,protocol,reasoning_effort}] profiles share
+    \\the configured endpoint (maximum 64); a custom ID inherits current context/options.
+    \\Effort cycles none/minimal/low/medium/high/xhigh; provider support is not inferred.
     \\Tool calls are trusted for THIS PROCESS and run without approval prompts.
     \\Commands run with your account permissions; bash is NOT a sandbox.
     \\No automatic command-risk classifier is enabled. --trust is a compatibility flag.

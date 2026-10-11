@@ -25,6 +25,8 @@ pub const Event = union(enum) {
     page_up,
     page_down,
     toggle_reasoning,
+    cycle_effort,
+    escape,
 };
 
 /// 事件接收端。用函数指针回调代替泛型，便于在测试中替换。
@@ -79,6 +81,14 @@ pub const Parser = struct {
 
     fn invalid(self: *Parser, sink: Sink) !void {
         if (self.secret) try sink.emit(.{ .text = .{ .value = "\x00", .pasted = self.pasted } });
+    }
+
+    /// UI-owned ambiguity timeout for a standalone Escape. Never turns a
+    /// partial CSI, secret or pasted escape into a command/approval event.
+    pub fn expireEscape(self: *Parser, sink: Sink) !void {
+        if (self.escape_len != 1 or self.pasted or self.secret) return;
+        self.escape_len = 0;
+        try sink.emit(.escape);
     }
 
     /// 逐字节解析输入。
@@ -141,17 +151,19 @@ pub const Parser = struct {
 
             // 中文：常见光标与编辑键映射，同时兼容 SS3 与 CSI 两种编码。
             const keys = .{
-                .{ "\x1bOH", Event.home },       .{ "\x1bOF", Event.end },
-                .{ "\x1bOA", Event.up },         .{ "\x1bOB", Event.down },
-                .{ "\x1bOC", Event.right },      .{ "\x1bOD", Event.left },
-                .{ "\x1b[D", Event.left },       .{ "\x1b[C", Event.right },
-                .{ "\x1b[A", Event.up },         .{ "\x1b[B", Event.down },
-                .{ "\x1b[H", Event.home },       .{ "\x1b[F", Event.end },
-                .{ "\x1b[1~", Event.home },      .{ "\x1b[4~", Event.end },
-                .{ "\x1b[3~", Event.delete },    .{ "\x1b[5~", Event.page_up },
-                .{ "\x1b[6~", Event.page_down },
+                .{ "\x1bOH", Event.home },            .{ "\x1bOF", Event.end },
+                .{ "\x1bOA", Event.up },              .{ "\x1bOB", Event.down },
+                .{ "\x1bOC", Event.right },           .{ "\x1bOD", Event.left },
+                .{ "\x1b[D", Event.left },            .{ "\x1b[C", Event.right },
+                .{ "\x1b[A", Event.up },              .{ "\x1b[B", Event.down },
+                .{ "\x1b[H", Event.home },            .{ "\x1b[F", Event.end },
+                .{ "\x1b[1~", Event.home },           .{ "\x1b[4~", Event.end },
+                .{ "\x1b[3~", Event.delete },         .{ "\x1b[5~", Event.page_up },
+                .{ "\x1b[6~", Event.page_down },      .{ "\x1b[Z", Event.cycle_effort },
+                .{ "\x1b[1;2Z", Event.cycle_effort }, .{ "\x1b[9;2u", Event.cycle_effort },
             };
             inline for (keys) |key| if (std.mem.eql(u8, seq, key[0])) {
+                if (self.secret and key[1] == .cycle_effort) return;
                 try sink.emit(key[1]);
                 return;
             };
@@ -355,6 +367,8 @@ const Record = struct {
     enters: usize = 0,
     cancels: usize = 0,
     pasted: usize = 0,
+    cycles: usize = 0,
+    escapes: usize = 0,
 
     fn event(ctx: *anyopaque, ev: Event) !void {
         const self: *Record = @ptrCast(@alignCast(ctx));
@@ -367,6 +381,8 @@ const Record = struct {
             },
             .enter => self.enters += 1,
             .cancel => self.cancels += 1,
+            .cycle_effort => self.cycles += 1,
+            .escape => self.escapes += 1,
             else => {},
         }
     }
@@ -385,6 +401,30 @@ test "split UTF8 and bracketed paste cannot submit, cancel or authorize" {
     try std.testing.expectEqual(@as(usize, 1), record.enters);
     try std.testing.expectEqual(@as(usize, 1), record.cancels);
     try std.testing.expect(record.pasted > 0);
+}
+
+test "split ShiftTab and Escape expiry never activate pasted or secret settings" {
+    var record = Record{};
+    var parser = Parser{};
+    const sink = Sink{ .context = &record, .emit_fn = Record.event };
+    for ("\x1b[Z\x1b[1;2Z\x1b[9;2u") |byte| try parser.feed(&.{byte}, sink);
+    try std.testing.expectEqual(@as(usize, 3), record.cycles);
+    try parser.feed("\x1b[200~\x1b[Z\x1b[201~", sink);
+    try std.testing.expectEqual(@as(usize, 3), record.cycles);
+    try parser.feed("\x1b[", sink);
+    try parser.expireEscape(sink);
+    try std.testing.expectEqual(@as(usize, 0), record.escapes);
+    try parser.feed("Z", sink);
+    try std.testing.expectEqual(@as(usize, 4), record.cycles);
+    try parser.feed("\x1b", sink);
+    try parser.expireEscape(sink);
+    try std.testing.expectEqual(@as(usize, 1), record.escapes);
+    parser.secretMode(true);
+    try parser.feed("\x1b[Z", sink);
+    try parser.feed("\x1b", sink);
+    try parser.expireEscape(sink);
+    try std.testing.expectEqual(@as(usize, 4), record.cycles);
+    try std.testing.expectEqual(@as(usize, 1), record.escapes);
 }
 
 // 验证 Editor 的字形簇边界与输入长度上限。

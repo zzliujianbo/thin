@@ -5,6 +5,7 @@ pub const Attribute = extern struct { text: ?[*]const u8, size: c_uint, types: ?
 pub const Ul = extern struct { tight: c_int, mark: u8 };
 pub const Ol = extern struct { start: c_uint, tight: c_int, delimiter: u8 };
 pub const Li = extern struct { task: c_int, mark: u8, offset: c_uint };
+pub const H = extern struct { level: c_uint };
 pub const Code = extern struct { info: Attribute, lang: Attribute, fence: u8 };
 pub const Table = extern struct { columns: c_uint, head_rows: c_uint, body_rows: c_uint };
 pub const Td = extern struct { alignment: c_int };

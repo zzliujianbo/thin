@@ -2,6 +2,7 @@
 //! 单线程调用；成功 append 表示完整行已交给内核，不表示 fsync 持久化。
 const std = @import("std");
 const filesystem = @import("../platform/filesystem.zig");
+const ids = @import("session_id.zig");
 
 pub const Limits = struct {
     /// 输入 JSON 的字节上限，不含附加的换行。
@@ -16,6 +17,9 @@ pub const Store = struct {
     limits: Limits,
     /// 仅在 start 成功后有效。
     session_id: [32]u8 = undefined,
+    /// Set by the interactive lifecycle owner before the writer starts. The UI
+    /// keeps its OWN immutable copy, never reads this worker-owned Store.
+    pinned_id: ?ids.Id = null,
     part: u32 = 0,
     timestamp_ms: i64 = 0,
     logs_fd: ?c_int = null,
@@ -28,6 +32,14 @@ pub const Store = struct {
     /// 无 I/O；root 必须稳定存活到 Store.deinit 之后。
     pub fn init(allocator: std.mem.Allocator, root: *filesystem.Root, limits: Limits) Store {
         return .{ .allocator = allocator, .root = root, .limits = limits };
+    }
+
+    /// No I/O, no archive creation; called only before writer ownership begins.
+    pub fn pinSessionID(self: *Store, id: ids.Id) !void {
+        if (!ids.valid(id)) return error.InvalidSessionID;
+        if (self.failed or self.file_fd != null or self.logs_fd != null) return error.SessionIDAlreadyStarted;
+        if (self.pinned_id) |old| if (!std.mem.eql(u8, &old, &id)) return error.SessionIDAlreadyPinned;
+        self.pinned_id = id;
     }
 
     /// 返回借用切片；start 前为空，下一次轮转会使旧切片失效。
@@ -93,6 +105,12 @@ pub const Store = struct {
     }
 
     pub fn start(self: *Store) !void {
+        try self.startTimestamp(null);
+    }
+
+    // Explicit timestamp is a private fixture seam for deterministic collision
+    // checks. Normal callers always use the real clock.
+    fn startTimestamp(self: *Store, supplied_timestamp: ?i64) !void {
         if (self.failed) return error.LogStoreFailed;
         if (self.file_fd != null) return;
         if (self.limits.record_bytes == 0 or self.limits.file_bytes == 0) return error.InvalidLimits;
@@ -106,17 +124,19 @@ pub const Store = struct {
         if (stat.permissions.toMode() & 0o077 != 0) return error.UnsafeLogDirectory;
         try self.ensureIgnore(logs_fd);
 
-        const timestamp = std.Io.Clock.real.now(self.root.io).toMilliseconds();
+        const timestamp = supplied_timestamp orelse std.Io.Clock.real.now(self.root.io).toMilliseconds();
         var buffer: [96]u8 = undefined;
         for (0..32) |_| {
-            var random: [16]u8 = undefined;
-            try self.root.io.randomSecure(&random);
-            const id = std.fmt.bytesToHex(random, .lower);
+            const id = self.pinned_id orelse try ids.generate(self.root.io);
             const filename = try name(&buffer, timestamp, id, 0);
             var path_buffer: [128]u8 = undefined;
             const relative = try std.fmt.bufPrint(&path_buffer, ".thin/sessions/{s}", .{filename});
             const fd = self.createFile(logs_fd, filename) catch |err| {
-                if (err == error.PathAlreadyExists) continue;
+                if (err == error.PathAlreadyExists) {
+                    // Never replace an identity already announced by its owner.
+                    if (self.pinned_id != null) return error.LogNameExhausted;
+                    continue;
+                }
                 return err;
             };
             self.session_id = id;
@@ -205,6 +225,35 @@ fn expectContent(root: *filesystem.Root, path: []const u8, expected: []const u8)
     defer std.testing.allocator.free(result.data);
     try std.testing.expect(!result.truncated);
     try std.testing.expectEqualStrings(expected, result.data);
+}
+
+test "pinned identity is lazy immutable and collision never substitutes another identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const id: ids.Id = @splat('b');
+    var store = Store.init(std.testing.allocator, &root, .{});
+    defer store.deinit();
+    var invalid = id;
+    invalid[0] = '\n';
+    try std.testing.expectError(error.InvalidSessionID, store.pinSessionID(invalid));
+    try std.testing.expect(store.pinned_id == null);
+    try store.pinSessionID(id);
+    try store.pinSessionID(id);
+    try std.testing.expectError(error.SessionIDAlreadyPinned, store.pinSessionID(@splat('c')));
+    try std.testing.expectError(error.FileNotFound, filesystem.openDirectory(root.dir.handle, ".thin"));
+    try store.startTimestamp(1234);
+    try std.testing.expectEqualSlices(u8, &id, &store.session_id);
+    try std.testing.expectError(error.SessionIDAlreadyStarted, store.pinSessionID(id));
+    try store.append("{}");
+    var collision = Store.init(std.testing.allocator, &root, .{});
+    defer collision.deinit();
+    try collision.pinSessionID(id);
+    try std.testing.expectError(error.LogNameExhausted, collision.startTimestamp(1234));
+    try std.testing.expect(collision.file_fd == null and collision.logs_fd == null);
+    try std.testing.expectEqualSlices(u8, &id, &collision.pinned_id.?);
+    try expectContent(&root, store.path(), "{}\n");
 }
 
 test "log store lazy init private modes ordered compact lines and independent sessions" {

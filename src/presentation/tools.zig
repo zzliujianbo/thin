@@ -32,20 +32,38 @@ pub const Call = struct {
 
     pub fn init(a: std.mem.Allocator, name: []const u8, arguments: []const u8) !Call {
         const kind = Kind.fromName(name);
-        if (kind != .bash and kind != .read and kind != .write) return .{ .kind = kind };
+        if (kind == .other) return .{ .kind = kind };
         if (arguments.len > 64 * 1024) return .{ .kind = kind };
         const parsed = std.json.parseFromSlice(std.json.Value, a, arguments, .{ .allocate = .alloc_if_needed, .max_value_len = 64 * 1024 }) catch |err| {
             if (err == error.OutOfMemory) return err;
             return .{ .kind = kind };
         };
         defer parsed.deinit();
-        const value = if (parsed.value == .object) parsed.value.object.get(if (kind == .bash) "command" else "path") else null;
-        if (value == null or value.? != .string) return .{ .kind = kind };
-        const detail = @constCast(try clean.sanitize(a, value.?.string, 512));
-        for (detail) |*byte| if (byte.* == '\n' or byte.* == '\t') {
+        if (parsed.value != .object) return .{ .kind = kind };
+        if (kind == .memory) {
+            const action_value = parsed.value.object.get("action") orelse return .{ .kind = kind };
+            if (action_value != .string) return .{ .kind = kind };
+            const action = action_value.string;
+            if (!std.mem.eql(u8, action, "list") and !std.mem.eql(u8, action, "read") and !std.mem.eql(u8, action, "write") and !std.mem.eql(u8, action, "delete")) return .{ .kind = kind };
+            const topic = parsed.value.object.get("topic");
+            const target = if (std.mem.eql(u8, action, "list")) "core/index" else if (topic != null and topic.? == .string) topic.?.string else "(topic unavailable)";
+            // Only known action and target metadata, never content or versions.
+            // This description is not argument validation or permission policy.
+            const raw = try std.fmt.allocPrint(a, "{s} {s}", .{ action, target });
+            defer a.free(raw);
+            return fromDetail(a, kind, raw);
+        }
+        const value = parsed.value.object.get(if (kind == .bash) "command" else "path") orelse return .{ .kind = kind };
+        if (value != .string) return .{ .kind = kind };
+        return fromDetail(a, kind, value.string);
+    }
+
+    fn fromDetail(a: std.mem.Allocator, kind: Kind, bytes: []const u8) !Call {
+        const prefix = try clean.sanitizePrefix(a, bytes, 512);
+        for (prefix.text) |*byte| if (byte.* == '\n' or byte.* == '\t') {
             byte.* = ' ';
         };
-        return .{ .kind = kind, .detail = detail, .truncated = clean.exceedsSanitizedLimit(value.?.string, 512) };
+        return .{ .kind = kind, .detail = prefix.text, .truncated = prefix.truncated };
     }
 
     pub fn deinit(self: Call, a: std.mem.Allocator) void {
@@ -97,6 +115,38 @@ pub const Queue = struct {
         return Call.init(a, name, "");
     }
 };
+
+test "memory descriptions include known action and topic without bodies versions or styles" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "read", "write", "delete" }) |action| {
+        const args = try std.fmt.allocPrint(a, "{{\"action\":\"{s}\",\"topic\":\"core\",\"content\":\"private-body\",\"expected_version\":\"private-version\"}}", .{action});
+        defer a.free(args);
+        const call = try Call.init(a, "memory", args);
+        defer call.deinit(a);
+        const expected = try std.fmt.allocPrint(a, "{s} core", .{action});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, call.detail.?);
+        try std.testing.expect(!call.truncated);
+    }
+    const list = try Call.init(a, "memory", "{\"action\":\"list\"}");
+    defer list.deinit(a);
+    try std.testing.expectEqualStrings("list core/index", list.detail.?);
+    const unsafe = try Call.init(a, "memory", "{\"action\":\"write\",\"topic\":\"topic\\u001b[2J\\nend\"}");
+    defer unsafe.deinit(a);
+    try std.testing.expect(std.mem.findScalar(u8, unsafe.detail.?, '\x1b') == null);
+    try std.testing.expect(std.mem.findScalar(u8, unsafe.detail.?, '\n') == null);
+    for ([_][]const u8{ "{\"action\":\"invented\"}", "{\"action\":\"read\",\"topic\":", "[]" }) |args| {
+        const unknown = try Call.init(a, "memory", args);
+        defer unknown.deinit(a);
+        try std.testing.expect(unknown.detail == null);
+    }
+    const long_topic: [600]u8 = @splat('a');
+    const long_args = try std.fmt.allocPrint(a, "{{\"action\":\"read\",\"topic\":\"{s}\"}}", .{long_topic[0..]});
+    defer a.free(long_args);
+    const long = try Call.init(a, "memory", long_args);
+    defer long.deinit(a);
+    try std.testing.expect(long.truncated and long.detail.?.len <= 512);
+}
 
 test "shared tools expose structured safe detail observations and bounded FIFO without styles" {
     const a = std.testing.allocator;

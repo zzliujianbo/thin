@@ -196,6 +196,12 @@ pub const Journal = struct {
         self.key = &.{};
     }
 
+    /// Lifecycle owner only, before any producer/writer starts. No storage I/O.
+    pub fn pinSessionID(self: *Journal, id: [32]u8) !void {
+        if (self.started or self.worker != null or self.seq != 0) return error.SessionIDAlreadyStarted;
+        try self.store.pinSessionID(id);
+    }
+
     /// 仅在 Runtime.run 之前调用，不与生产者并发。
     pub fn setEnabled(self: *Journal, enabled: bool) void {
         self.enabled = enabled;
@@ -587,6 +593,9 @@ test "journal structured records redaction turns and first response" {
     var journal = try Journal.init(std.testing.allocator, &root, key);
     defer journal.deinit();
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
+    const fixed_id: [32]u8 = @splat('a');
+    try journal.pinSessionID(fixed_id);
+    try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
     const observer = journal.observer();
     observer.notify(.{ .submitted = "hello fake\"\\secret" });
     observer.notify(.{ .event = .{ .state = .calling_model } });
@@ -613,8 +622,11 @@ test "journal structured records redaction turns and first response" {
     observer.notify(.{ .event = .{ .finished = .{ .status = .success } } });
     journal.flush();
     try std.testing.expectEqual(null, journal.failure());
+    try std.testing.expectError(error.SessionIDAlreadyStarted, journal.pinSessionID(fixed_id));
+    try std.testing.expectEqualSlices(u8, &fixed_id, &journal.store.session_id);
     const content = try root.read(std.testing.allocator, journal.store.path(), 0, record_limit);
     defer std.testing.allocator.free(content.data);
+    try std.testing.expect(std.mem.indexOf(u8, content.data, "\"session\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"") != null);
     for ([_][]const u8{ key, "fake", "NEVER_", "STREAM_ONLY" }) |secret| try std.testing.expect(std.mem.indexOf(u8, content.data, secret) == null);
     var lines = std.mem.splitScalar(u8, content.data, '\n');
     var seq: i64 = 0;

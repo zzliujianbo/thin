@@ -82,6 +82,8 @@ pub const Limits = struct {
 pub const Config = struct {
     provider: Provider,
     model: Model,
+    /// Same-provider profiles; no discovery or credential overrides.
+    models: []const Model = &.{},
     /// 未配置时使用 Limits 中的默认值。
     limits: Limits = .{},
 };
@@ -219,11 +221,6 @@ pub fn validate(config: Config) !void {
     try validateUrl(config.provider.base_url);
     try validateKeySource(config.provider);
 
-    if (!validText(config.model.name, 1024)) return error.InvalidModel;
-    if (config.model.reasoning_effort) |effort| {
-        if (!validText(effort, 128)) return error.InvalidReasoningEffort;
-    }
-
     const l = config.limits;
     // 编译期遍历 Limits 的所有字段，任何字段为 0 都视为非法。
     inline for (@typeInfo(Limits).@"struct".field_names) |field| {
@@ -246,12 +243,29 @@ pub fn validate(config: Config) !void {
         l.cleanup_timeout_ms > 60000 or l.max_rounds > 4096 or l.max_tool_calls > 4096) return error.InvalidLimit;
 
     // 预算检查：输出与安全余量之和必须小于上下文窗口，否则输入预算为负数；摘要预算也不能超过输出上限。
-    if (config.model.context_tokens == 0 or config.model.context_tokens > 16 * mib or
-        l.max_output_tokens > mib or l.safety_tokens > mib or l.summary_tokens > l.max_output_tokens or
-        @as(u64, l.max_output_tokens) + l.safety_tokens >= config.model.context_tokens) return error.InvalidBudget;
+    try validateModel(config.model, l);
+    if (config.models.len > 64) return error.TooManyModels;
+    for (config.models, 0..) |model, i| {
+        try validateModel(model, l);
+        for (config.models[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, model.name)) return error.DuplicateModel;
+        }
+    }
 
     // 压缩目标必须低于触发阈值，且触发阈值必须小于 100%，否则压缩永远无法生效或立即触发。
     if (!(l.compaction_target_percent < l.compaction_trigger_percent and l.compaction_trigger_percent < 100)) return error.InvalidCompactionRatio;
+}
+
+/// Shared profile validation uses the same limits as the selected model.
+pub fn validateModel(model: Model, l: Limits) !void {
+    if (!validText(model.name, 1024)) return error.InvalidModel;
+    if (model.reasoning_effort) |effort| {
+        if (!validText(effort, 128)) return error.InvalidReasoningEffort;
+    }
+    const mib = 1024 * 1024;
+    if (model.context_tokens == 0 or model.context_tokens > 16 * mib or
+        l.max_output_tokens > mib or l.safety_tokens > mib or l.summary_tokens > l.max_output_tokens or
+        @as(u64, l.max_output_tokens) + l.safety_tokens >= model.context_tokens) return error.InvalidBudget;
 }
 
 /// Reads only the explicit file; never consults environment variables.
@@ -302,6 +316,24 @@ fn testConfig() Config {
 }
 
 // 验证：省略的字段使用默认值，且解析结果不依赖输入缓冲区（释放输入后仍可读）。
+test "profiles use shared budgets and exact unique names with a bounded catalog" {
+    var config: Config = .{ .provider = .{ .base_url = "http://unused.invalid" }, .model = .{ .name = "a", .context_tokens = 32768 } };
+    const profile: Model = .{ .name = "a", .context_tokens = 32768 };
+    config.models = &.{profile};
+    try validate(config); // Selected name may also appear in the catalog.
+    config.models = &.{ profile, profile };
+    try std.testing.expectError(error.DuplicateModel, validate(config));
+    config.models = &.{.{ .name = "small", .context_tokens = 6144 }};
+    try std.testing.expectError(error.InvalidBudget, validate(config));
+    var too_many: [65]Model = undefined;
+    @memset(&too_many, profile);
+    config.models = &too_many;
+    try std.testing.expectError(error.TooManyModels, validate(config));
+    const a = std.testing.allocator;
+    const unknown = "{\"provider\":{\"base_url\":\"http://unused.invalid\"},\"model\":{\"name\":\"a\",\"context_tokens\":32768},\"models\":[{\"name\":\"b\",\"context_tokens\":32768,\"api_key\":\"forbidden\"}]}";
+    try std.testing.expectError(error.UnknownField, parse(a, unknown));
+}
+
 test "minimal JSON uses defaults and owns strings" {
     const a = std.testing.allocator;
     const input = try a.dupe(u8, fixture);

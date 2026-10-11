@@ -166,6 +166,8 @@ async function scenario(app, pty, kind) {
     const began = Date.now();
     const result = await execute(isPty?pty:app, isPty?[]:args, env, project);
     const ended = Date.now();
+    const announced = isPty ? [...(result.stdout + '\n' + result.stderr).matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)] : [];
+    if (isPty) assert.equal(announced.length,1,'PTY exit identity missing');
     assert(!fixtureFailed, 'loopback fixture failed');
     if (kind === 'help') {
       assert(result.stdout.includes('.thin/sessions/*.jsonl') && !result.stdout.includes('.thin/logs'), 'session path missing from help');
@@ -185,6 +187,7 @@ async function scenario(app, pty, kind) {
     } else {
       assert(requests === (usesTool ? 2 : 1), 'unexpected conversation length');
       const rows = await records(project,began,ended,key);
+      if (isPty) assert(rows.every(row => row.session === announced[0][1]), 'announced/archive session identity differs');
       const events = name => rows.filter(r => r.event === name).map(r => r.data);
       const users = events('user'), assistants = events('assistant'), finished = events('finished');
       assert(users.length === 1 && users[0].source_bytes === Buffer.byteLength(user) && users[0].truncated === false, 'user metadata missing');

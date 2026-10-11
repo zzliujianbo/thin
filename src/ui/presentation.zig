@@ -13,28 +13,61 @@ pub fn singleLine(a: std.mem.Allocator, bytes: []const u8, columns: usize) ![]co
 }
 
 fn singleLineImpl(a: std.mem.Allocator, bytes: []const u8, columns: usize, source_clipped: bool) ![]const u8 {
-    // sanitize returns an immutable view of a fresh owned allocation.
-    const safe = @constCast(try text.sanitize(a, bytes, 512));
-    defer a.free(safe);
+    return boundedLine(a, bytes, columns, source_clipped, 512);
+}
+
+fn boundedLine(a: std.mem.Allocator, bytes: []const u8, columns: usize, source_clipped: bool, max_bytes: usize) ![]const u8 {
+    const prefix = try @import("../util/display_text.zig").sanitizePrefix(a, bytes, max_bytes);
+    defer a.free(prefix.text);
+    const safe = prefix.text;
     for (safe) |*byte| if (byte.* == '\n' or byte.* == '\t') {
         byte.* = ' ';
     };
-    const clipped = source_clipped or text.exceedsSanitizedLimit(bytes, 512) or text.width(safe) > columns;
+    // A byte-capped safe prefix may end inside the original cluster. Its last
+    // cluster must not be advertised as complete; truncation is metadata, not
+    // a marker searched/replaced in a potentially legitimate file name.
+    var stop = safe.len;
+    if (source_clipped or prefix.truncated) {
+        stop = 0;
+        var at: usize = 0;
+        var col: usize = 0;
+        while (at < safe.len) {
+            const cluster = text.nextCluster(safe, at, col);
+            if (cluster.end == safe.len) break;
+            stop = cluster.end;
+            col += cluster.width;
+            at = cluster.end;
+        }
+    }
+    const clipped = source_clipped or prefix.truncated or text.width(safe) > columns;
     const room = columns -| @min(columns, @as(usize, if (clipped) 3 else 0));
+    const byte_room = max_bytes -| @as(usize, if (clipped) 3 else 0);
     var end: usize = 0;
     var cells: usize = 0;
-    while (end < safe.len) {
+    while (end < stop) {
         const cluster = text.nextCluster(safe, end, cells);
-        if (cells + cluster.width > room) break;
+        if (cluster.end > byte_room or cells + cluster.width > room) break;
         cells += cluster.width;
         end = cluster.end;
     }
-    return if (clipped) std.fmt.allocPrint(a, "{s}{s}", .{ safe[0..end], "..."[0..@min(columns, 3)] }) else a.dupe(u8, safe[0..end]);
+    return if (clipped) std.fmt.allocPrint(a, "{s}{s}", .{ safe[0..end], "..."[0..@min(@min(columns, 3), max_bytes)] }) else a.dupe(u8, safe[0..end]);
 }
+
+pub const Range = struct { start: usize, end: usize };
+/// Renderer-owned byte ranges, not text patterns extracted from a file path.
+pub const WriteMarks = struct {
+    added: Range,
+    removed: Range,
+
+    pub fn shifted(self: WriteMarks, offset: usize) WriteMarks {
+        return .{ .added = .{ .start = self.added.start + offset, .end = self.added.end + offset }, .removed = .{ .start = self.removed.start + offset, .end = self.removed.end + offset } };
+    }
+};
 
 pub const Caption = struct {
     kind: activity.Tool,
     label: []const u8,
+    write_marks: ?WriteMarks = null,
 
     pub fn deinit(self: Caption, a: std.mem.Allocator) void {
         a.free(self.label);
@@ -52,19 +85,24 @@ pub fn caption(a: std.mem.Allocator, name: []const u8, arguments: []const u8) !C
 /// Terminal widths and labels adapt shared structured data; no JSON parsing here.
 pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
     const kind = call.kind;
-    if (kind != .bash and kind != .read and kind != .write) return .{ .kind = kind, .label = try a.dupe(u8, if (kind == .memory) "memory" else "tool") };
-    const unavailable = if (kind == .bash) "(command unavailable)" else if (kind == .read) "read_file (file unavailable)" else "write_file (file unavailable)";
+    if (kind == .other) return .{ .kind = kind, .label = try a.dupe(u8, "tool") };
+    const unavailable = switch (kind) {
+        .bash => "(command unavailable)",
+        .read, .write => "(file unavailable)",
+        .memory => "(operation unavailable)",
+        .other => unreachable,
+    };
     const detail = call.detail orelse return .{ .kind = kind, .label = try a.dupe(u8, unavailable) };
-    if (kind == .bash) return .{ .kind = kind, .label = try singleLineImpl(a, detail, 72, call.truncated) };
-    const path = try singleLineImpl(a, detail, 32, call.truncated);
-    defer a.free(path);
-    return .{ .kind = kind, .label = try std.fmt.allocPrint(a, "{s} {s}", .{ if (kind == .read) "read_file" else "write_file", path }) };
+    // Preserve bounded detail until frame-time width is known; no old 32/72
+    // cell path/command cutoff before applying the actual 80% row limit.
+    return .{ .kind = kind, .label = try singleLineImpl(a, detail, 512, call.truncated) };
 }
 
 /// Numeric observations survive Bridge text clipping. Missing is ?, not zero.
 /// This helper is called for successful results only; failures retain the path
 /// but must not claim any uncompleted read/write or requested-content line count.
 pub fn completed(a: std.mem.Allocator, value: Caption, stats: ?line_stats.File) !Caption {
+    var marks: ?WriteMarks = null;
     const label = switch (value.kind) {
         .read => if (stats != null and stats.?.read != null)
             try std.fmt.allocPrint(a, "{s}  {d} lines{s}", .{ value.label, stats.?.read.?, if (stats.?.partial) " [partial]" else "" })
@@ -72,11 +110,21 @@ pub fn completed(a: std.mem.Allocator, value: Caption, stats: ?line_stats.File) 
             try std.fmt.allocPrint(a, "{s}  lines ?", .{value.label}),
         .write => if (stats != null and stats.?.changes != null) blk: {
             const c = stats.?.changes.?;
+            const added = value.label.len + "  ~".len + decimalLength(c.modified) + 1;
+            const removed = added + 1 + decimalLength(c.added) + 1;
+            marks = .{ .added = .{ .start = added, .end = added + 1 + decimalLength(c.added) }, .removed = .{ .start = removed, .end = removed + 1 + decimalLength(c.removed) } };
             break :blk try std.fmt.allocPrint(a, "{s}  ~{d} +{d} -{d} lines", .{ value.label, c.modified, c.added, c.removed });
         } else try std.fmt.allocPrint(a, "{s}  changes ?", .{value.label}),
         else => try a.dupe(u8, value.label),
     };
-    return .{ .kind = value.kind, .label = label };
+    return .{ .kind = value.kind, .label = label, .write_marks = marks };
+}
+
+fn decimalLength(value: u64) usize {
+    var n = value;
+    var length: usize = 1;
+    while (n >= 10) : (n /= 10) length += 1;
+    return length;
 }
 
 pub const Outcome = shared.tools.Outcome;
@@ -84,13 +132,13 @@ pub const Outcome = shared.tools.Outcome;
 fn outcomeColor(outcome: Outcome) []const u8 {
     return switch (outcome) {
         .pending => theme.muted,
-        .success => theme.success,
+        .success => theme.muted,
         .failed => theme.failure,
         .canceled => theme.caution,
     };
 }
 
-pub const CommandSpan = struct { start: usize, end: usize, outcome: Outcome };
+pub const CommandSpan = struct { start: usize, end: usize, outcome: Outcome, write_marks: ?WriteMarks = null };
 
 pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome) ![]const u8 {
     return std.fmt.allocPrint(a, "{s} {s}{s}", .{ activity.icon(value.kind), value.label, switch (outcome) {
@@ -102,8 +150,15 @@ pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome) ![]co
 
 /// Caption bodies are already sanitized, and spans are renderer-owned offsets.
 /// Clip BEFORE SGR so no partial escapes; mixed outcomes keep independent colors.
-pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, active_phase: ?usize) ![]const u8 {
-    const safe = try singleLine(a, body, columns);
+pub fn commandColumns(columns: usize) usize {
+    // Overflow-safe floor(80%), including very narrow frames.
+    return if (columns == 0) 0 else @max(1, columns / 5 * 4 + columns % 5 * 4 / 5);
+}
+
+pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, active_time_ms: ?u64) ![]const u8 {
+    // Detail stays <=512 bytes; allow its prefix and bounded observed counts
+    // without sanitizing/truncating the same path a second time at512 bytes.
+    const safe = try boundedLine(a, body, commandColumns(columns), false, 640);
     defer a.free(safe);
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
@@ -112,10 +167,31 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         const begin = @min(@max(at, span.start), safe.len);
         const end = @min(@max(begin, span.end), safe.len);
         try out.writer.writeAll(safe[at..begin]);
-        if (span.outcome == .pending and active_phase != null and begin < end) {
-            const prefix_end = @min(text.nextCluster(safe, begin, 0).end, end);
-            try out.writer.print("{s}{s}{s}{s}{s}", .{ theme.command_pulse[active_phase.? % theme.command_pulse.len], safe[begin..prefix_end], theme.muted, safe[prefix_end..end], theme.reset });
-        } else try out.writer.print("{s}{s}{s}", .{ outcomeColor(span.outcome), safe[begin..end], theme.reset });
+        const prefix_end = if (begin < end) @min(text.nextCluster(safe, begin, 0).end, end) else begin;
+        // Never turn clipped ellipsis bytes into a phantom running tool icon.
+        const has_prefix = begin == span.start and begin < body.len and std.mem.eql(u8, safe[begin..prefix_end], body[begin..text.nextCluster(body, begin, 0).end]);
+        if (span.outcome == .pending and active_time_ms != null and has_prefix) {
+            const now_ms = active_time_ms.?;
+            try out.writer.print("{s}{s}{s}{s}{s}", .{ theme.command_pulse[shared.activity.commandStep(now_ms)], activity.spinner(now_ms), theme.muted, safe[prefix_end..end], theme.reset });
+        } else {
+            if (has_prefix) try out.writer.print("{s}{s}", .{ theme.reset, safe[begin..prefix_end] });
+            const summary_start = if (has_prefix) prefix_end else begin;
+            const color = outcomeColor(span.outcome);
+            try out.writer.writeAll(color);
+            var cursor = summary_start;
+            if (span.write_marks) |marks| {
+                const ranges = [_]Range{ marks.added, marks.removed };
+                const colors = [_][]const u8{ theme.diff_added, theme.diff_removed };
+                for (ranges, colors) |range, tone| {
+                    // Only complete, actually retained numeric tokens get a diff
+                    // color. Never color ellipsis or a matching substring in a path.
+                    if (range.start < cursor or range.end < range.start or range.end > end or range.end > body.len or !std.mem.eql(u8, safe[range.start..range.end], body[range.start..range.end])) continue;
+                    try out.writer.print("{s}{s}{s}{s}", .{ safe[cursor..range.start], tone, safe[range.start..range.end], color });
+                    cursor = range.end;
+                }
+            }
+            try out.writer.print("{s}{s}", .{ safe[cursor..end], theme.reset });
+        }
         at = end;
         if (at == safe.len) break;
     }
@@ -251,18 +327,44 @@ test "file captions expose safe paths and measured counts with unknown not guess
     defer read.deinit(a);
     const done = try completed(a, read, .{ .read = 12, .partial = true });
     defer done.deinit(a);
-    try std.testing.expectEqualStrings("read_file src/main.zig  12 lines [partial]", done.label);
+    try std.testing.expectEqualStrings("src/main.zig  12 lines [partial]", done.label);
     const write = try caption(a, "write_file", "{\"path\":\"a.zig\",\"content\":\"secret-body-not-a-caption\"}");
     defer write.deinit(a);
     const changed = try completed(a, write, .{ .changes = .{ .modified = 3, .added = 5, .removed = 2 } });
     defer changed.deinit(a);
-    try std.testing.expectEqualStrings("write_file a.zig  ~3 +5 -2 lines", changed.label);
+    try std.testing.expectEqualStrings("a.zig  ~3 +5 -2 lines", changed.label);
     const unknown = try completed(a, write, null);
     defer unknown.deinit(a);
-    try std.testing.expectEqualStrings("write_file a.zig  changes ?", unknown.label);
+    try std.testing.expectEqualStrings("a.zig  changes ?", unknown.label);
     const bad = try caption(a, "write_file", "{\"path\":\"unfinished");
     defer bad.deinit(a);
-    try std.testing.expectEqualStrings("write_file (file unavailable)", bad.label);
+    try std.testing.expectEqualStrings("(file unavailable)", bad.label);
+}
+
+test "write count colors use numeric metadata not patterns in a hostile path" {
+    const a = std.testing.allocator;
+    const value: Caption = .{ .kind = .write, .label = "path +99 -88 中文" };
+    const done = try completed(a, value, .{ .changes = .{ .modified = 4, .added = 12, .removed = 34 } });
+    defer done.deinit(a);
+    const body = try commandText(a, done, .success);
+    defer a.free(body);
+    const span: CommandSpan = .{ .start = 0, .end = body.len, .outcome = .success, .write_marks = done.write_marks.?.shifted(2) };
+    const line = try commandLine(a, body, &.{span}, 200, null);
+    defer a.free(line);
+    try std.testing.expect(std.mem.startsWith(u8, line, theme.reset ++ "w" ++ theme.muted ++ " path +99 -88 中文  ~4 "));
+    try std.testing.expect(std.mem.indexOf(u8, line, theme.diff_added ++ "+12" ++ theme.muted) != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, theme.diff_removed ++ "-34" ++ theme.muted) != null);
+    for ([_]usize{ 1, 4, 20, 45, 55 }) |columns| {
+        const clipped = try commandLine(a, body, &.{span}, columns, null);
+        defer a.free(clipped);
+        try std.testing.expect(@import("markdown_writer.zig").displayWidth(clipped) <= commandColumns(columns));
+        try std.testing.expect(std.unicode.utf8ValidateSlice(clipped));
+        try std.testing.expect(std.mem.indexOf(u8, clipped, theme.diff_added ++ "...") == null);
+        try std.testing.expect(std.mem.indexOf(u8, clipped, theme.diff_removed ++ "...") == null);
+    }
+    const unknown = try completed(a, value, null);
+    defer unknown.deinit(a);
+    try std.testing.expect(unknown.write_marks == null);
 }
 
 test "context prompt is retained occupancy not cache billing and remains bounded at small widths" {
@@ -307,16 +409,80 @@ test "TPS wave continues into percentage while configured effort alone colors th
     }
 }
 
+test "all four tool prefixes rotate80ms while preserving independent120ms warm pulse" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    for ([_]activity.Tool{ .bash, .read, .write, .memory }) |kind| {
+        const value: Caption = .{ .kind = kind, .label = "operation target" };
+        const body = try commandText(a, value, .pending);
+        defer a.free(body);
+        const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }};
+        for ([_]u64{ 0, 80, 120 }) |time| {
+            const line = try commandLine(a, body, spans, 100, time);
+            defer a.free(line);
+            const prefix = try std.fmt.allocPrint(a, "{s}{s}{s} operation target{s}", .{ theme.command_pulse[shared.activity.commandStep(time)], activity.spinner(time), theme.muted, theme.reset });
+            defer a.free(prefix);
+            try std.testing.expectEqualStrings(prefix, line);
+        }
+        const done = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .success }}, 100, 120);
+        defer a.free(done);
+        const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ theme.reset, activity.icon(kind), theme.muted, body[activity.icon(kind).len..], theme.reset });
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, done);
+    }
+    try std.testing.expectEqualStrings("r", activity.icon(.read));
+    try std.testing.expectEqualStrings("w", activity.icon(.write));
+    try std.testing.expectEqualStrings("m", activity.icon(.memory));
+}
+
+test "tool details survive old cutoffs and rows clip at80percent with complete clusters and dots" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    const output = @import("markdown_writer.zig");
+    for ([_][]const u8{ "bash", "read_file", "write_file", "memory" }) |name| {
+        const long_detail: [160]u8 = @splat('a');
+        const args = if (std.mem.eql(u8, name, "bash")) try std.fmt.allocPrint(a, "{{\"command\":\"{s}\"}}", .{long_detail[0..]}) else if (std.mem.eql(u8, name, "memory")) try std.fmt.allocPrint(a, "{{\"action\":\"read\",\"topic\":\"{s}\"}}", .{long_detail[0..]}) else try std.fmt.allocPrint(a, "{{\"path\":\"{s}\"}}", .{long_detail[0..]});
+        defer a.free(args);
+        const value = try caption(a, name, args);
+        defer value.deinit(a);
+        try std.testing.expect(value.label.len >= 160);
+        const body = try commandText(a, value, .pending);
+        defer a.free(body);
+        for ([_]usize{ 0, 1, 4, 10, 80, 200, 512 }) |columns| {
+            const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, columns, 80);
+            defer a.free(line);
+            try std.testing.expect(output.displayWidth(line) <= commandColumns(columns));
+            try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+            if (columns >= 10 and columns <= 200) try std.testing.expect(std.mem.endsWith(u8, line, "..." ++ theme.reset));
+        }
+    }
+    const body = "r 中文é repeated-path 中文é repeated-path 中文é repeated-path";
+    const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, 80, 120);
+    defer a.free(line);
+    try std.testing.expect(output.displayWidth(line) <= 64);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+    try std.testing.expectEqual(@as(usize, 80), commandColumns(100));
+    try std.testing.expectEqual(@as(usize, 63), commandColumns(79));
+    for (0..128) |columns| try std.testing.expectEqual(if (columns == 0) @as(usize, 0) else @max(@as(usize, 1), columns * 4 / 5), commandColumns(columns));
+    try std.testing.expect(commandColumns(std.math.maxInt(usize)) <= std.math.maxInt(usize));
+    const memory = try caption(a, "memory", "{\"action\":\"write\",\"topic\":\"core\",\"content\":\"hidden-body\"}");
+    defer memory.deinit(a);
+    try std.testing.expectEqualStrings("write core", memory.label);
+    const missing = try caption(a, "memory", "{\"action\":\"invented\"}");
+    defer missing.deinit(a);
+    try std.testing.expectEqualStrings("(operation unavailable)", missing.label);
+}
+
 test "only pending command prefix pulses and completed spans remain static and clipped safely" {
     const a = std.testing.allocator;
     const body = "> sleep 1";
     const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }};
-    const first = try commandLine(a, body, spans, 79, shared.activity.commandStep(0));
+    const first = try commandLine(a, body, spans, 79, 0);
     defer a.free(first);
-    const second = try commandLine(a, body, spans, 79, shared.activity.commandStep(120));
+    const second = try commandLine(a, body, spans, 79, 120);
     defer a.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
-    try std.testing.expect(std.mem.find(u8, first, theme.command_pulse[0] ++ ">" ++ theme.muted ++ " sleep 1") != null);
+    try std.testing.expect(std.mem.find(u8, first, theme.command_pulse[0] ++ "⠋" ++ theme.muted ++ " sleep 1") != null);
     for ([_]Outcome{ .success, .failed, .canceled }) |outcome| {
         const complete = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }};
         const one = try commandLine(a, body, complete, 79, 0);
@@ -325,20 +491,53 @@ test "only pending command prefix pulses and completed spans remain static and c
         defer a.free(two);
         try std.testing.expectEqualStrings(one, two);
     }
-    const narrow = try commandLine(a, "≡ read_file long-path", &.{CommandSpan{ .start = 0, .end = "≡ read_file long-path".len, .outcome = .pending }}, 4, 1);
+    const narrow = try commandLine(a, "r long-path", &.{CommandSpan{ .start = 0, .end = "r long-path".len, .outcome = .pending }}, 4, 1);
     defer a.free(narrow);
     try std.testing.expect(std.unicode.utf8ValidateSlice(narrow));
-    try std.testing.expect(std.mem.endsWith(u8, narrow, "..." ++ theme.reset));
+    try std.testing.expectEqualStrings(theme.muted ++ "..." ++ theme.reset, narrow);
 }
 
-test "same row command results retain icons and independent success failure colors" {
+test "long byte capped paths use complete clusters and only ascii truncation dots" {
+    try text.initLocale();
     const a = std.testing.allocator;
-    const body = "> date [error]  ·  > pwd";
-    const line = try commandLine(a, body, &.{ .{ .start = 0, .end = 14, .outcome = .failed }, .{ .start = 20, .end = body.len, .outcome = .success } }, 79, null);
+    const suffix: [30]u8 = @splat('b');
+    for ([_]usize{ 497, 510, 511 }) |count| {
+        const start = try a.alloc(u8, count);
+        defer a.free(start);
+        @memset(start, 'a');
+        const args = try std.fmt.allocPrint(a, "{{\"path\":\"{s}é{s}\"}}", .{ start, suffix[0..] });
+        defer a.free(args);
+        const value = try caption(a, "read_file", args);
+        defer value.deinit(a);
+        try std.testing.expect(value.label.len <= 512);
+        const body = try commandText(a, value, .success);
+        defer a.free(body);
+        const row = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .success }}, 1000, null);
+        defer a.free(row);
+        try std.testing.expect(std.mem.indexOf(u8, row, "[truncated]") == null);
+        try std.testing.expect(std.mem.indexOf(u8, row, "e...") == null);
+        try std.testing.expect(std.mem.indexOf(u8, row, "...") != null);
+        if (count == 497) try std.testing.expect(std.mem.indexOf(u8, row, "é") != null);
+    }
+    const literal = try caption(a, "read_file", "{\"path\":\"literal[truncated]file\"}");
+    defer literal.deinit(a);
+    try std.testing.expectEqualStrings("literal[truncated]file", literal.label);
+}
+
+test "individual command rows retain default icons and their own outcome colors" {
+    const a = std.testing.allocator;
+    const body = "> date [error]";
+    const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 79, null);
     defer a.free(line);
-    try std.testing.expect(std.mem.find(u8, line, theme.failure ++ "> date [error]") != null);
-    try std.testing.expect(std.mem.find(u8, line, theme.success) != null);
+    const success = "> pwd";
+    const success_line = try commandLine(a, success, &.{.{ .start = 0, .end = success.len, .outcome = .success }}, 79, null);
+    defer a.free(success_line);
+    try std.testing.expect(std.mem.find(u8, line, theme.reset ++ ">" ++ theme.failure ++ " date [error]") != null);
+    try std.testing.expect(std.mem.find(u8, success_line, theme.reset ++ ">" ++ theme.muted ++ " pwd") != null);
+    try std.testing.expect(std.mem.find(u8, line, "pwd") == null);
+    try std.testing.expect(std.mem.find(u8, success_line, "date") == null);
     try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, success_line, '\n') == null);
     const clipped = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 10, null);
     defer a.free(clipped);
     try std.testing.expect(std.mem.endsWith(u8, clipped, "..." ++ theme.reset));
