@@ -49,6 +49,11 @@ const Fake = struct {
     cancel_summary: ?*p.Cancellation = null,
     /// 为 true 时摘要响应中夹带工具调用，用于验证它不会被执行。
     bad_summary: bool = false,
+    throw_summary: bool = false,
+    summary_usage: ?p.Usage = null,
+    cancel_compaction_failure: ?*p.Cancellation = null,
+    compaction_error: ?anyerror = null,
+    before_summary_context: ?r.ContextSnapshot = null,
     /// 为 true 时模型调用阻塞，直到被取消（用于测试超时）。
     block_model: bool = false,
     /// 为 true 时执行结果标记为清理失败。
@@ -73,6 +78,8 @@ const Fake = struct {
     first_system: ?[]const u8 = null,
     snapshots: usize = 0,
     last_context: ?r.ContextSnapshot = null,
+    last_actual_total: ?u64 = null,
+    last_summary_total: ?u64 = null,
     nonzero_usage: bool = false,
     fail_prepare: bool = false,
     disconnect_snapshot: ?usize = null,
@@ -121,17 +128,19 @@ const Fake = struct {
             };
             try std.testing.expect(found_task);
 
+            if (self.throw_summary) return error.FixtureSummaryFailed;
             // 摘要生成过程中触发取消，验证旧历史被保留。
             if (self.cancel_summary) |cancel| cancel.cancel();
             // bad_summary：摘要里夹带工具调用，应被拒绝且不执行。
             if (self.bad_summary) return .{ .success = .{
                 .message = .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "forbidden", .name = "bash", .arguments = "{}" } }} },
                 .finish = .tool_calls,
+                .usage = self.summary_usage orelse .{},
             } };
             return .{ .success = .{
                 .message = .{ .role = .assistant, .blocks = &.{.{ .text = "Earlier tool steps completed; continue the requested work." }} },
                 .finish = .stop,
-                .usage = .{ .input_tokens = input, .output_tokens = 10 },
+                .usage = self.summary_usage orelse .{ .input_tokens = input, .output_tokens = 10 },
             } };
         }
 
@@ -195,21 +204,44 @@ const Fake = struct {
                 if (self.current_runtime) |runtime| try std.testing.expectEqualDeep(runtime.contextSnapshot(), value);
                 if (self.disconnect_snapshot == self.snapshots) return error.Disconnected;
             },
+            .usage => |usage| {
+                self.last_actual_total = usage.value.total();
+                if (usage.purpose == .summary) self.last_summary_total = self.last_actual_total;
+                if (self.current_runtime) |runtime| {
+                    // Like the presentation consumer, update at the usage event,
+                    // without adding a new fallible context-event boundary.
+                    self.last_context = runtime.contextSnapshot();
+                    try std.testing.expectEqual(self.last_actual_total != null, self.last_context.?.known);
+                    try std.testing.expectEqual(self.last_actual_total orelse 0, self.last_context.?.tokens);
+                }
+            },
             .tool_result => |value| {
                 self.last_file_stats = value.result.file_stats;
                 self.fitted_result = value.result.truncated;
             },
             .finished => self.terminals += 1,
-            .compacted => self.compactions += 1,
+            .compacted => {
+                self.compactions += 1;
+                if (self.current_runtime) |runtime| try std.testing.expectEqual(self.last_summary_total, runtime.last_context_tokens);
+            },
             // 进入压缩前记录 token 估算值，供后续比较。
             .state => |state| {
-                if (state == .compacting) self.before_summary_tokens = self.current_runtime.?.estimatedTokens();
+                if (state == .compacting) {
+                    self.before_summary_tokens = self.current_runtime.?.estimatedTokens();
+                    self.before_summary_context = self.current_runtime.?.contextSnapshot();
+                }
                 if (state == .awaiting_permission or state == .executing_tool) {
                     if (self.current_runtime) |runtime| try std.testing.expectEqualDeep(runtime.contextSnapshot(), self.last_context.?);
                 }
             },
             // 压缩失败后 token 数应与压缩前一致，说明历史未被破坏。
-            .compaction_failed => self.failed_summary_preserved = self.before_summary_tokens == self.current_runtime.?.estimatedTokens(),
+            .compaction_failed => |err| {
+                self.compaction_error = err;
+                self.failed_summary_preserved = self.before_summary_tokens == self.current_runtime.?.estimatedTokens();
+                // Stop the fixture before another normal call can overwrite
+                // the summary's display result; don't change production logic.
+                if (self.cancel_compaction_failure) |cancel| cancel.cancel();
+            },
             .text => if (self.disconnect_text) {
                 return error.Disconnected;
             },
@@ -242,7 +274,7 @@ fn smallConfiguration() cfg.Config {
     return config;
 }
 
-test "owner publishes retained context snapshots across tools and compaction not cumulative usage" {
+test "owner publishes actual request snapshots across tools and compaction not cumulative usage" {
     const a = std.testing.allocator;
     var fake: Fake = .{ .output = &long_output, .stop_after = 7, .nonzero_usage = true };
     var config = smallConfiguration();
@@ -253,6 +285,9 @@ test "owner publishes retained context snapshots across tools and compaction not
     defer runtime.deinit();
     fake.current_runtime = &runtime;
     const initial = runtime.contextSnapshot();
+    try std.testing.expect(initial.known);
+    try std.testing.expectEqual(@as(u64, 0), initial.tokens);
+    try std.testing.expect(runtime.estimatedTokens() > 0);
     var cancel = p.Cancellation{};
     const result = try runtime.run("Do the task", &cancel);
     if (result.status != .success) std.debug.print("context fixture detail: {s}\n", .{if (result.detail) |err| @errorName(err) else "unknown"});
@@ -260,9 +295,11 @@ test "owner publishes retained context snapshots across tools and compaction not
     try std.testing.expect(fake.compactions > 0 and fake.snapshots > fake.executions);
     try std.testing.expectEqualDeep(runtime.contextSnapshot(), fake.last_context.?);
     try std.testing.expectEqual(@as(u64, 3000), fake.last_context.?.limit);
-    try std.testing.expect(initial.tokens < fake.last_context.?.tokens);
+    try std.testing.expect(fake.last_context.?.known);
+    try std.testing.expectEqual(fake.last_actual_total.?, fake.last_context.?.tokens);
+    try std.testing.expect(runtime.estimator.per_mille > 1000);
     try std.testing.expect(result.usage.normal.input_tokens.? > 0);
-    try std.testing.expect(fake.last_context.?.tokens != result.usage.normal.input_tokens.?);
+    try std.testing.expect(fake.last_context.?.tokens != result.usage.normal.total().?);
     try std.testing.expectEqualDeep(runtime.contextSnapshot(), result.context_snapshot.?);
 }
 
@@ -688,6 +725,43 @@ test "cancel during summary preserves old history and does not resume model call
     try std.testing.expectEqual(@as(u32, 0), fake.compactions);
     try std.testing.expectEqual(fake.before_summary_tokens, runtime.estimatedTokens());
     try std.testing.expectEqual(@as(u32, 1), fake.terminals);
+}
+
+test "actual summary context distinguishes thrown request from rejected atomic commit" {
+    for ([_]bool{ true, false }) |throws| {
+        var cancel: p.Cancellation = .{};
+        var fake: Fake = .{
+            .stop_after = 20,
+            .output = &long_output,
+            .nonzero_usage = true,
+            .throw_summary = throws,
+            .bad_summary = !throws,
+            .summary_usage = .{ .input_tokens = 12, .output_tokens = 34, .total_tokens = 46 },
+            .cancel_compaction_failure = &cancel,
+        };
+        var config = smallConfiguration();
+        // Leave room for the summary instruction after real-input calibration;
+        // the production trigger/budgets are unchanged.
+        config.limits.compaction_trigger_percent = 70;
+        var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", true);
+        defer runtime.deinit();
+        fake.current_runtime = &runtime;
+        const terminal = try runtime.run("Do the task", &cancel);
+        try std.testing.expectEqual(r.Status.canceled, terminal.status);
+        if (fake.summary_calls == 0) std.debug.print("Summary fixture pre-call failure: {s}\n", .{@errorName(fake.compaction_error.?)});
+        try std.testing.expectEqual(@as(u32, 1), fake.summary_calls);
+        try std.testing.expect(fake.before_summary_context.?.known and fake.before_summary_context.?.tokens > 0);
+        try std.testing.expect(fake.failed_summary_preserved);
+        try std.testing.expectEqual(fake.before_summary_tokens, runtime.estimatedTokens());
+        try std.testing.expectEqual(@as(u32, 0), fake.compactions);
+        try std.testing.expectEqual(fake.normal_calls, fake.executions);
+        const snapshot = terminal.context_snapshot.?;
+        try std.testing.expectEqual(!throws, snapshot.known);
+        try std.testing.expectEqual(@as(u64, if (throws) 0 else 46), snapshot.tokens);
+        try std.testing.expectEqualDeep(runtime.contextSnapshot(), snapshot);
+        try std.testing.expectEqual(@as(u32, if (throws) 0 else 1), terminal.usage.summary_calls);
+        for (runtime.messages()) |message| try std.testing.expect(message.role != .context);
+    }
 }
 
 // 任务超时必须能打断阻塞中的模型调用，且与是否有输出无关。

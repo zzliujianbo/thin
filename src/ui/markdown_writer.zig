@@ -620,5 +620,11 @@ fn allocationScenario(a: Allocator) !void {
 
 test "allocation failures release detached clusters and owned finished rows" {
     try text.initLocale();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
+    // SafeAllocator may extend the last bucket allocation in place depending
+    // on earlier tests/bucket fill. Exhaustive allocation-index injection needs
+    // a stable path: reject resize/remap optimization, exercising EVERY fallback
+    // allocation+copy instead. Other tests still use ordinary resizing allocators.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), allocationScenario, .{});
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
 }

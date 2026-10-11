@@ -130,7 +130,7 @@ pub const Session = struct {
         const config = if (self.app) |app| app.config.value else self.pending.?.value;
         return .{
             .runtime = if (self.app) |app| &app.runtime else null,
-            .initial_context = self.initial_context,
+            .initial_context = self.initial_context orelse .{ .tokens = 0, .limit = @intCast(config.model.context_tokens) },
             .model = config.model.name,
             .session_id = self.session_id,
             .models = config.models,
@@ -164,7 +164,12 @@ pub const Session = struct {
         const config = self.mutableConfig();
         // The current picker row represents the ACTUAL transient options, not
         // a same-named startup profile. Re-selecting it must not undo Shift+Tab.
-        if (std.mem.eql(u8, name, config.model.name)) return;
+        if (std.mem.eql(u8, name, config.model.name)) {
+            // Owner-only idle path: preserve the latest actual value even when
+            // the picker republishes a same-name no-op connection snapshot.
+            if (self.app) |app| self.initial_context = app.runtime.contextSnapshot();
+            return;
+        }
         var candidate = config.*;
         // Unknown names inherit explicit current options, never guessed defaults.
         candidate.model.name = name;
@@ -288,6 +293,8 @@ test "pending session activates locally without a request and protects auth from
     try std.testing.expect(ids.valid(initial_id));
     try std.testing.expectEqual(presentation.ReasoningEffort.high, connection.current().reasoning_effort);
     try std.testing.expect(connection.current().runtime == null);
+    try std.testing.expect(connection.current().initial_context.?.known);
+    try std.testing.expectEqual(@as(u64, 0), connection.current().initial_context.?.tokens);
     try std.testing.expect(connection.current().tools_trusted);
     try connection.configure("fake-inline-session-key");
     try std.testing.expectEqualSlices(u8, &initial_id, &connection.current().session_id.?);
@@ -295,6 +302,8 @@ test "pending session activates locally without a request and protects auth from
     try std.testing.expect(connection.current().runtime != null);
     try std.testing.expectEqual(presentation.ReasoningEffort.high, connection.current().reasoning_effort);
     try std.testing.expectEqualDeep(session.app.?.runtime.contextSnapshot(), connection.current().initial_context.?);
+    try std.testing.expectEqual(@as(u64, 0), connection.current().initial_context.?.tokens);
+    try std.testing.expect(session.app.?.runtime.estimatedTokens() > 0);
     try std.testing.expect(connection.current().runtime.?.trusted);
     try std.testing.expect(connection.current().tools_trusted);
     try std.testing.expect(std.mem.find(u8, session.app.?.runtime.system, "fake-inline-session-key") == null);

@@ -101,9 +101,10 @@ pub const Terminal = struct {
     context_snapshot: ?ContextSnapshot = null,
 };
 
-/// Estimated retained context (system/schema/history), not cumulative billing.
+/// Latest request's provider-reported total, not an estimate or cumulative bill.
+/// A fresh session is known zero; missing usage is unknown, never invented zero.
 /// Only the owner calls contextSnapshot while running; consumers get values.
-pub const ContextSnapshot = struct { tokens: u64, limit: u64 };
+pub const ContextSnapshot = struct { tokens: u64, limit: u64, known: bool = true };
 
 /// 发给宿主的运行时事件，按发生顺序同步送达 Host.emit_fn。
 pub const Event = union(enum) {
@@ -319,8 +320,11 @@ pub const Runtime = struct {
     history: std.ArrayList(p.Message) = .empty,
     /// 协议选择与降级（chat / responses）。
     selector: llm.Selector,
-    /// token 估算器，会用真实 usage 校准。
+    /// token 估算器，会用真实 usage 校准；仅用于安全预算和压缩。
     estimator: context.Estimator = .{},
+    /// Display only: latest individual request total (normal OR summary).
+    /// null means unreported/overflow; cached/reasoning tokens aren't added again.
+    last_context_tokens: ?u64 = 0,
     /// 运行中标志：run 入口 swap 置位，defer 清除，防止重入。
     busy: std.atomic.Value(bool) = .init(false),
     /// 已信任：为 true 后不再弹出权限询问。
@@ -396,10 +400,12 @@ pub const Runtime = struct {
             selector.selected = .chat;
             selector.initial_attempted = true;
         }
+        const scope_changed = name_changed or protocol_changed or selector.effective() != self.selector.effective();
         if (name_changed or protocol_changed) {
             self.discardNativeReplay();
             self.estimator = .{};
         }
+        if (scope_changed) self.last_context_tokens = if (self.history.items.len == 0) 0 else null;
         self.selector = selector;
     }
 
@@ -449,9 +455,10 @@ pub const Runtime = struct {
     }
 
     /// Startup/after-join callers may read this; NEVER query during another
-    /// thread's run. Streaming consumers use context_snapshot value events.
+    /// thread's run. Streaming consumers use value events, not mutable history.
+    /// The estimator above remains the ONLY source for safety/compaction checks.
     pub fn contextSnapshot(self: *const Runtime) ContextSnapshot {
-        return .{ .tokens = @intCast(self.estimatedTokens()), .limit = @intCast(self.config.model.context_tokens) };
+        return .{ .tokens = self.last_context_tokens orelse 0, .limit = @intCast(self.config.model.context_tokens), .known = self.last_context_tokens != null };
     }
 
     fn emitContext(self: *Runtime, cancel: *const p.Cancellation) !void {
@@ -582,7 +589,10 @@ pub const Runtime = struct {
             var forward = Forward{ .runtime = self, .cancel = cancel };
             // 调用模型；协议选择与降级由 selector 处理。
             normal_started = true;
-            const result = try self.selector.call(self.model, result_arena.allocator(), self.request(.normal, self.history.items, cancel), forward.sink());
+            const result = self.selector.call(self.model, result_arena.allocator(), self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
+                self.last_context_tokens = null;
+                return err;
+            };
 
             // 无论成功还是失败都先记账，保证用量不丢失。
             try self.account(result, .normal, raw, task, cancel);
@@ -666,6 +676,9 @@ pub const Runtime = struct {
 
         // calls 为 0 表示没有真正发出请求，不计入用量与估算校准。
         if (result.calls != 0) {
+            // Store the FINAL attempt before any fallible host notification.
+            // A fallback's first attempt is accounted, not added to this display.
+            self.last_context_tokens = usage.total();
             task.terminal.usage.add(purpose, usage);
             // 用真实 input_tokens 校准估算。
             self.estimator.observe(raw, usage.input_tokens);
@@ -722,7 +735,10 @@ pub const Runtime = struct {
         try self.emit(.{ .state = .compacting }, cancel);
 
         // 摘要请求只使用 scratch arena，不影响主历史。
-        const result = try self.selector.call(self.model, a, self.request(.summary, messages_, cancel), .{});
+        const result = self.selector.call(self.model, a, self.request(.summary, messages_, cancel), .{}) catch |err| {
+            self.last_context_tokens = null;
+            return err;
+        };
         try self.account(result, .summary, raw, task, cancel);
         try checkCanceled(cancel);
         const response = switch (result.outcome) {

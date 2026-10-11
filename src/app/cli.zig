@@ -50,6 +50,8 @@ pub const help =
     \\
     \\Interactive uses regular terminal scrollback, not an alternate full-screen buffer.
     \\Committed output remains after exit; only the live input/status area is redrawn.
+    \\Context percentage shows the latest provider-reported request total, not cumulative use.
+    \\A fresh session starts at 0.0%; unreported usage shows ?. Safety budgets still use estimates.
     \\Enter sends; Ctrl+J adds newline; Ctrl+C cancels; Ctrl+D exits.
     \\After Ctrl+D and successful terminal restoration, the current session ID is printed.
     \\An ID alone creates no records; --no-log and no-submission exits still have an ID.

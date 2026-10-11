@@ -7,10 +7,10 @@ const activity = @import("activity.zig");
 
 pub const ContextSnapshot = r.ContextSnapshot;
 
-/// 当前保留上下文的估算比例(千分比=百分比的小数一位、四舍五入)，不是billing/cache比例。
-/// u128中间值防止输入极值溢出；无容量为unknown，而非0%。
+/// 最近一次请求的实际占用比例(千分比=百分比的小数一位、四舍五入)，不累计/不减cached。
+/// u128中间值防止输入极值溢出；缺usage/容量为unknown，而非虚构0%。
 pub fn contextRatio(snapshot: ContextSnapshot) ?u128 {
-    if (snapshot.limit == 0) return null;
+    if (!snapshot.known or snapshot.limit == 0) return null;
     return (@as(u128, snapshot.tokens) * 1000 + snapshot.limit / 2) / snapshot.limit;
 }
 
@@ -19,7 +19,7 @@ pub const View = struct {
     phase: ?r.State,
     status: ?r.Status,
     context: ?ContextSnapshot,
-    context_estimated: bool = true,
+    context_estimated: bool = false,
     protocol: ?p.Protocol,
     live_tps_tenths: ?u64,
     rate_band: activity.RateBand,
@@ -64,6 +64,10 @@ pub const State = struct {
             .tool_preview => |delta| self.meter.observe(now_ms, delta.arguments),
             .usage => |usage| {
                 self.protocol = usage.protocol;
+                if (self.context) |snapshot| {
+                    const total = usage.value.total();
+                    self.context = .{ .tokens = total orelse 0, .limit = snapshot.limit, .known = total != null };
+                }
                 if (usage.purpose == .normal) {
                     self.normal_usage = usage.value;
                     self.meter.endCall(now_ms);
@@ -117,7 +121,7 @@ test "configured effort is visible before output and independent of time deltas 
     try std.testing.expectEqual(activity.ReasoningEffort.unspecified, state.view(300000).reasoning_effort);
 }
 
-test "shared receipt state drives context and throughput without terminal or billing inference" {
+test "shared receipt state drives actual request context and throughput without cumulative billing" {
     var state: State = .{};
     state.seed(.{ .tokens = 100, .limit = 1000 });
     state.reset(0);
@@ -125,13 +129,16 @@ test "shared receipt state drives context and throughput without terminal or bil
     state.observe(.{ .text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, 100);
     try std.testing.expectEqual(@as(?u64, 400), state.view(350).live_tps_tenths);
     state.observe(.{ .usage = .{ .protocol = .chat, .purpose = .normal, .value = .{ .input_tokens = 900, .cached_input_tokens = 800, .output_tokens = 20 } } }, 1000);
-    state.observe(.{ .context_snapshot = .{ .tokens = 600, .limit = 1000 } }, 1000);
-    try std.testing.expectEqual(@as(u64, 600), state.view(1000).context.?.tokens);
+    try std.testing.expectEqual(@as(u64, 920), state.view(1000).context.?.tokens);
+    try std.testing.expect(!state.view(1000).context_estimated);
+    state.observe(.{ .context_snapshot = .{ .tokens = 920, .limit = 1000 } }, 1000);
     state.observe(.{ .state = .executing_tool }, 1000);
     try std.testing.expect(state.view(5000).live_tps_tenths == null);
+    state.observe(.{ .usage = .{ .protocol = .chat, .purpose = .summary, .value = .{ .input_tokens = 290, .output_tokens = 10 } } }, 5000);
     state.observe(.{ .context_snapshot = .{ .tokens = 300, .limit = 1000 } }, 5000);
     state.observe(.{ .state = .calling_model }, 6000);
     state.observe(.{ .reasoning = "received" }, 6100);
+    state.observe(.{ .usage = .{ .protocol = .chat, .purpose = .normal, .value = .{ .input_tokens = 230, .output_tokens = 20 } } }, 7000);
     state.finish(.{ .status = .canceled, .context_snapshot = .{ .tokens = 250, .limit = 1000 }, .usage = .{ .normal = .{ .output_tokens = 40 } } }, 7000);
     const view = state.view(7000);
     try std.testing.expectEqual(@as(?u64, 200), view.average_tps_tenths);
@@ -143,4 +150,36 @@ test "shared receipt state drives context and throughput without terminal or bil
     state.reset(8000);
     try std.testing.expectEqual(@as(u64, 250), state.view(8000).context.?.tokens);
     try std.testing.expect(state.view(8000).average_tps_tenths == null);
+}
+
+test "actual context waits for reported usage and never estimates text or adds caches twice" {
+    for ([_]p.Protocol{ .chat, .responses }) |protocol| {
+        var state: State = .{};
+        state.seed(.{ .tokens = 0, .limit = 100000 });
+        state.reset(0);
+        state.observe(.{ .state = .calling_model }, 0);
+        state.observe(.{ .text = "unreported text and tool output cannot invent token counts" }, 1);
+        try std.testing.expectEqual(@as(?u128, 0), contextRatio(state.context.?));
+        state.observe(.{ .usage = .{ .protocol = protocol, .purpose = .normal, .value = .{ .input_tokens = 9000, .output_tokens = 1000, .cached_input_tokens = 8500, .reasoning_tokens = 800, .total_tokens = 17000 } } }, 2);
+        try std.testing.expectEqual(@as(u64, 17000), state.context.?.tokens);
+        state.observe(.{ .text = "more text" }, 3);
+        state.observe(.{ .compacted = .{ .before = 80000, .after = 2000 } }, 4);
+        try std.testing.expectEqual(@as(u64, 17000), state.context.?.tokens);
+        state.observe(.{ .usage = .{ .protocol = protocol, .purpose = .summary, .value = .{ .input_tokens = 100, .output_tokens = 10, .cached_input_tokens = 80, .reasoning_tokens = 3 } } }, 5);
+        try std.testing.expectEqual(@as(u64, 110), state.context.?.tokens);
+        state.observe(.{ .usage = .{ .protocol = protocol, .purpose = .normal, .value = .{ .input_tokens = 100 } } }, 6);
+        try std.testing.expect(!state.context.?.known);
+        try std.testing.expect(contextRatio(state.context.?) == null);
+        // Terminal cumulative billing is NOT a replacement for missing usage.
+        state.finish(.{ .status = .failed, .usage = .{ .normal = .{ .total_tokens = 500000 } } }, 7);
+        try std.testing.expect(!state.context.?.known);
+        state.reset(8);
+        try std.testing.expect(!state.context.?.known);
+        state.observe(.{ .usage = .{ .protocol = protocol, .purpose = .normal, .value = .{ .total_tokens = 0 } } }, 9);
+        try std.testing.expect(state.context.?.known);
+        try std.testing.expectEqual(@as(?u128, 0), contextRatio(state.context.?));
+        state.observe(.{ .usage = .{ .protocol = protocol, .purpose = .normal, .value = .{ .input_tokens = std.math.maxInt(u64), .output_tokens = 1 } } }, 10);
+        try std.testing.expect(!state.context.?.known);
+        try std.testing.expect(!state.view(10).context_estimated);
+    }
 }

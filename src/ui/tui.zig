@@ -1908,6 +1908,34 @@ test "file captions are contiguous but separated from final prose and percent co
     ui.finishFrame();
 }
 
+test "composer displays startup zero and latest actual usage or unknown without billing accumulation" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.display.seed(.{ .tokens = 0, .limit = 1000000 });
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture 0.0%) > ") != null);
+    ui.finishFrame();
+    const Case = struct { purpose: p.Purpose, usage: p.Usage, prefix: []const u8 };
+    const host = bridge.host();
+    for ([_]Case{
+        .{ .purpose = .normal, .usage = .{ .input_tokens = 12000, .output_tokens = 1000, .cached_input_tokens = 10000, .reasoning_tokens = 300 }, .prefix = "(fixture 1.3%) > " },
+        .{ .purpose = .summary, .usage = .{ .total_tokens = 1000 }, .prefix = "(fixture 0.1%) > " },
+        .{ .purpose = .normal, .usage = .{ .input_tokens = 12 }, .prefix = "(fixture ?%) > " },
+        .{ .purpose = .normal, .usage = .{ .total_tokens = 0 }, .prefix = "(fixture 0.0%) > " },
+    }) |case| {
+        try host.emit_fn(host.context, .{ .usage = .{ .purpose = case.purpose, .protocol = .chat, .value = case.usage } }, &cancel);
+        var item = bridge.pop().?;
+        try ui.event(item);
+        item.deinit();
+        try ui.draw();
+        try std.testing.expect(std.mem.find(u8, ui.frame, case.prefix) != null);
+        ui.finishFrame();
+    }
+}
+
 test "sequential tool records from different frames have no gaps then final prose has one gap" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);

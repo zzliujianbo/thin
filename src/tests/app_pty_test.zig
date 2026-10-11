@@ -498,6 +498,9 @@ pub fn main(init: std.process.Init) !void {
             if (turn == 1) try check(current.count("regular-answer-two") == 1);
         }
     } else if (std.mem.eql(u8, mode, "stream-markdown")) {
+        try d.waitIdle(0);
+        const initial = try d.screen();
+        try check(std.mem.indexOf(u8, &initial.grid[23], "(fixture-model 0.0%) >") != null);
         const start = d.used;
         try d.send("stream-task\r");
         try d.waitText(start, "reasoning-stage-one");
@@ -519,6 +522,7 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &stage.grid[23], "%) ~") != null and stage.row == 23);
         for (stage.grid[22]) |byte| try check(byte == ' ');
         try check(!stage.visible("TPS:") and !stage.visible("tokens in:"));
+        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model 0.0%) ~") != null);
         try d.waitText(start, "stream-stage-one");
         try d.quiet(100);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
@@ -546,21 +550,24 @@ pub fn main(init: std.process.Init) !void {
         try check(!stage.visible("TPS:") and !stage.visible("tokens in:") and !stage.visible("Completed"));
         try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &stage.grid[23], "%) >") != null);
         try check(stage.count("Final answer") == 0 and !stage.visible("ctx ~"));
+        // Loopback provider reported 12 input + 90 output = 102 total: 0.3%.
+        // Cached9/reasoning30 already belong to those counts, not extra context.
+        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model 0.3%) >") != null);
         // Real streamed Markdown uses independent semantic colors and a boxed
         // grid with a second body row, not just its old header-only rule.
         const markdown_output = d.output[start..d.used];
-        for ([_][]const u8{ "\x1b[1m\x1b[38;5;3m", "\x1b[1m\x1b[38;5;5m", "\x1b[39m\x1b[2m", "\x1b[1m", "\x1b[1m\x1b[38;5;2m", "┌", "├", "┼", "└", "second-row", "exit_code=124", "exit_code=0" }, 0..) |part, part_index| {
+        for ([_][]const u8{ "\x1b[1m\x1b[38;5;3m", "\x1b[38;5;5m", "\x1b[39m\x1b[2m", "\x1b[1m", "\x1b[38;5;2m", "┌", "├", "┼", "└", "second-row", "exit_code=124", "exit_code=0" }, 0..) |part, part_index| {
             const found = std.mem.indexOf(u8, markdown_output, part) != null;
             if (!found) std.debug.print("Markdown assertion index: {d}\n", .{part_index}); // Safe index, never captured bytes.
             try check(found);
         }
         // The independent model-name flow may legitimately contain orange.
         try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;215m\x1b[1mstream-stage-one") == null);
-        try check(std.mem.indexOf(u8, markdown_output, "\x1b[1m\x1b[38;5;5minline-marker\x1b[0m") != null);
+        try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;5minline-marker\x1b[0m") != null);
         for ([_][]const u8{ "38;5;11m", "38;5;12m", "38;5;13m", "38;5;10m" }) |rejected| try check(std.mem.indexOf(u8, markdown_output, rejected) == null);
         // Code remains foreground-only and unpadded; user background is separate.
         for ([_][]const u8{ "exit_code=124", "exit_code=0" }) |code| {
-            const expected = try std.fmt.allocPrint(a, "\x1b[1m\x1b[38;5;2m{s}\x1b[0m", .{code});
+            const expected = try std.fmt.allocPrint(a, "\x1b[38;5;2m{s}\x1b[0m", .{code});
             defer a.free(expected);
             try check(std.mem.indexOf(u8, markdown_output, expected) != null);
         }

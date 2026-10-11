@@ -1,7 +1,7 @@
-//! Historical Pi-style Markdown hues, with local orange UI accents.
-//! Colored Markdown uses SGR 1 intensity, which may also appear bold. Contrast
-//! depends on the terminal's custom palette; this is not an exact RGB or pure
-//! brightness guarantee. Palette indices stay 3/4/5/2, not bright variants.
+//! Historical Markdown palette, restored to the user's old screenshots.
+//! Heading yellow, links blue, inline/bullets purple, block code green.
+//! Use terminal palette slots again, without RGB lightening or added bold.
+//! The terminal owns those colors; no palette probing or brightness guarantee.
 //! Only our renderer emits SGR;
 //! model/user bytes are sanitized separately, never interpreted as escapes.
 const activity = @import("../presentation/activity.zig");
@@ -14,12 +14,12 @@ pub const strong = "\x1b[1m";
 pub const muted = "\x1b[38;5;245m";
 pub const md_dim = "\x1b[39m\x1b[2m";
 pub const quote = md_dim ++ "\x1b[3m";
-pub const link = "\x1b[4m\x1b[1m\x1b[38;5;4m";
-/// Pi has no Markdown-specific background, even for fenced/indented code.
-pub const inline_code = "\x1b[1m\x1b[38;5;5m";
-pub const code = "\x1b[1m\x1b[38;5;2m";
+pub const link = "\x1b[4m\x1b[38;5;4m";
+/// Foreground only, even for fenced/indented code; no row background or padding.
+pub const inline_code = "\x1b[38;5;5m";
+pub const code = "\x1b[38;5;2m";
 pub const table_header = "\x1b[1m";
-pub const bullet = "\x1b[1m\x1b[38;5;5m";
+pub const bullet = inline_code;
 /// File-change counts are independent of Markdown brightness.
 pub const diff_added = "\x1b[38;5;2m";
 pub const diff_removed = "\x1b[38;5;1m";
@@ -74,19 +74,19 @@ pub const command_pulse = [_][]const u8{
     "\x1b[38;5;223m", "\x1b[38;5;220m", "\x1b[38;5;214m", "\x1b[38;5;208m",
 };
 
-test "intense Markdown retains historical hues and independent tool and effort colors" {
-    const testing = @import("std").testing;
-    try testing.expectEqualStrings("\x1b[1m\x1b[38;5;2m", code);
-    try testing.expectEqualStrings("\x1b[1m\x1b[38;5;5m", inline_code);
-    try testing.expectEqualStrings(inline_code, bullet);
+test "Markdown restores old screenshot palette and original font styles" {
+    const std = @import("std");
+    const testing = std.testing;
     try testing.expectEqualStrings("\x1b[1m\x1b[38;5;3m", heading);
-    try testing.expectEqualStrings("\x1b[4m\x1b[1m\x1b[38;5;4m", link);
+    try testing.expectEqualStrings("\x1b[4m\x1b[38;5;4m", link);
+    try testing.expectEqualStrings("\x1b[38;5;5m", inline_code);
+    try testing.expectEqualStrings("\x1b[38;5;2m", code);
+    try testing.expectEqualStrings(inline_code, bullet);
+    try testing.expectEqualStrings("\x1b[1m", strong);
     for ([_][]const u8{ heading, link, inline_code, code, bullet }) |style| {
-        try testing.expect(@import("std").mem.indexOf(u8, style, "\x1b[1m") != null);
-        for ([_][]const u8{ "38;5;11m", "38;5;12m", "38;5;13m", "38;5;10m", "48;", "38;2;" }) |rejected| {
-            try testing.expect(@import("std").mem.indexOf(u8, style, rejected) == null);
-        }
+        for ([_][]const u8{ "38;2;", "48;", "38;5;11m", "38;5;12m", "38;5;13m", "38;5;10m" }) |rejected| try testing.expect(std.mem.indexOf(u8, style, rejected) == null);
     }
+    for ([_][]const u8{ link, inline_code, code, bullet }) |style| try testing.expect(std.mem.indexOf(u8, style, "\x1b[1m") == null);
     try testing.expectEqualStrings("\x1b[38;5;2m", diff_added);
     try testing.expectEqualStrings("\x1b[38;5;1m", diff_removed);
     try testing.expectEqualStrings("\x1b[38;5;75m", effortColor(.high));

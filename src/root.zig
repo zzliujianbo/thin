@@ -65,9 +65,11 @@ test {
     _ = @import("app/session.zig");
     _ = @import("tests/settings_session_test.zig");
     _ = @import("tests/thinking_contract_test.zig");
+    _ = @import("tests/context_usage_test.zig");
     _ = @import("ui/terminal.zig");
     _ = @import("ui/input.zig");
     _ = @import("ui/markdown.zig");
+    _ = @import("tests/markdown_colors_test.zig");
     _ = @import("ui/bridge.zig");
     _ = @import("tests/ui_bridge_test_root.zig");
     _ = @import("tests/regular_screen.zig");

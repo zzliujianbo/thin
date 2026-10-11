@@ -779,9 +779,10 @@ test "Markdown uses distinct heading emphasis code quote and link colors" {
     const s = try joined(a, r);
     defer a.free(s);
     for ([_][]const u8{ theme.heading, theme.strong, theme.inline_code, theme.code, theme.quote, theme.link, theme.bullet }) |color| try std.testing.expect(std.mem.indexOf(u8, s, color) != null);
-    // Historical hue indices plus intensity; H1 and link keep underline.
-    for ([_][]const u8{ "\x1b[1m\x1b[38;5;3m\x1b[1m\x1b[4mHeading", "\x1b[4m\x1b[1m\x1b[38;5;4mlabel", "\x1b[1m\x1b[38;5;5minline", "\x1b[1m\x1b[38;5;2mcode", "\x1b[1m\x1b[38;5;5m-" }) |style| try std.testing.expect(std.mem.indexOf(u8, s, style) != null);
-    for ([_][]const u8{ "38;5;11m", "38;5;12m", "38;5;13m", "38;5;10m", "48;", "38;2;" }) |rejected| try std.testing.expect(std.mem.indexOf(u8, s, rejected) == null);
+    // Match old screenshot colors on actual glyphs, not theme-to-theme equality.
+    // H1/link keep underline; code/inline/list markers do not gain extra bold.
+    for ([_][]const u8{ "\x1b[1m\x1b[38;5;3m\x1b[1m\x1b[4mHeading", "\x1b[4m\x1b[38;5;4mlabel", "\x1b[38;5;5minline", "\x1b[38;5;2mcode", "\x1b[38;5;5m-" }) |style| try std.testing.expect(std.mem.indexOf(u8, s, style) != null);
+    for ([_][]const u8{ "38;2;", "48;", "38;5;11m", "38;5;12m", "38;5;13m", "38;5;10m" }) |rejected| try std.testing.expect(std.mem.indexOf(u8, s, rejected) == null);
     try @import("../tests/regular_screen.zig").rejectFullscreen(s);
 }
 

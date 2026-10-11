@@ -154,6 +154,41 @@ test "pending auth and preference writes retain the original project directory a
     try std.testing.expectEqual(effort.max, session.connection().current().reasoning_effort);
 }
 
+test "same name idle selection republishes latest known or unknown actual context not startup zero" {
+    const Reply = struct {
+        calls: usize = 0,
+        usage: p.Usage = .{ .total_tokens = 1000 },
+        fn call(raw: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} }, .finish = .stop, .usage = self.usage } };
+        }
+    };
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var session = try fixture.session(fixture.project);
+    defer session.deinit();
+    const connection = session.connection();
+    try connection.configure("fake-context-session-key");
+    var reply: Reply = .{};
+    const runtime = &session.app.?.runtime;
+    // Replace the transport before any request: this fixture never uses HTTP.
+    runtime.model = .{ .context = &reply, .call_fn = Reply.call };
+    try std.testing.expectEqual(@as(u64, 0), connection.current().initial_context.?.tokens);
+    for ([_]p.Usage{ .{ .total_tokens = 1000 }, .{} }) |usage| {
+        reply.usage = usage;
+        var cancel: p.Cancellation = .{};
+        const terminal = try runtime.run("owned context fixture", &cancel);
+        try std.testing.expectEqual(@import("../core/runtime.zig").Status.success, terminal.status);
+        try std.testing.expect(!runtime.busy.load(.acquire));
+        try connection.selectModel(connection.current().model);
+        try std.testing.expectEqualDeep(runtime.contextSnapshot(), connection.current().initial_context.?);
+        try std.testing.expectEqual(usage.total() != null, connection.current().initial_context.?.known);
+        try std.testing.expectEqual(usage.total() orelse 0, connection.current().initial_context.?.tokens);
+    }
+    try std.testing.expectEqual(@as(usize, 2), reply.calls);
+}
+
 test "anchored auth keeps credential protection when HOME and project pathname are replaced" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
