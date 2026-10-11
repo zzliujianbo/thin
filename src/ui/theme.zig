@@ -1,24 +1,25 @@
-//! Bright Pi-style Markdown semantics, with local orange UI accents.
-//! ANSI bright variants keep code/inline/link colors legible on dark terminals;
-//! there is no terminal RGB probing or universal contrast guarantee.
+//! Historical Pi-style Markdown hues, with local orange UI accents.
+//! Colored Markdown uses SGR 1 intensity, which may also appear bold. Contrast
+//! depends on the terminal's custom palette; this is not an exact RGB or pure
+//! brightness guarantee. Palette indices stay 3/4/5/2, not bright variants.
 //! Only our renderer emits SGR;
 //! model/user bytes are sanitized separately, never interpreted as escapes.
 const activity = @import("../presentation/activity.zig");
 
 pub const reset = "\x1b[0m";
 pub const accent = "\x1b[38;5;208m";
-pub const heading = "\x1b[1m\x1b[38;5;11m";
+pub const heading = "\x1b[1m\x1b[38;5;3m";
 /// Bold terminal-default foreground, readable on light and dark themes.
 pub const strong = "\x1b[1m";
 pub const muted = "\x1b[38;5;245m";
 pub const md_dim = "\x1b[39m\x1b[2m";
 pub const quote = md_dim ++ "\x1b[3m";
-pub const link = "\x1b[4m\x1b[38;5;12m";
+pub const link = "\x1b[4m\x1b[1m\x1b[38;5;4m";
 /// Pi has no Markdown-specific background, even for fenced/indented code.
-pub const inline_code = "\x1b[38;5;13m";
-pub const code = "\x1b[38;5;10m";
+pub const inline_code = "\x1b[1m\x1b[38;5;5m";
+pub const code = "\x1b[1m\x1b[38;5;2m";
 pub const table_header = "\x1b[1m";
-pub const bullet = "\x1b[38;5;13m";
+pub const bullet = "\x1b[1m\x1b[38;5;5m";
 /// File-change counts are independent of Markdown brightness.
 pub const diff_added = "\x1b[38;5;2m";
 pub const diff_removed = "\x1b[38;5;1m";
@@ -57,12 +58,13 @@ pub fn modelPalette(band: activity.RateBand) []const []const u8 {
 pub fn effortColor(effort: activity.ReasoningEffort) []const u8 {
     return switch (effort) {
         .unspecified, .unknown => reset,
-        .none => muted,
+        .off, .none => muted,
         .minimal => "\x1b[38;5;117m",
         .low => success,
         .medium => caution,
         .high => "\x1b[38;5;75m",
         .xhigh => "\x1b[38;5;171m",
+        .max => "\x1b[38;5;177m", // Distinct brighter violet for maximum effort.
     };
 }
 
@@ -72,13 +74,19 @@ pub const command_pulse = [_][]const u8{
     "\x1b[38;5;223m", "\x1b[38;5;220m", "\x1b[38;5;214m", "\x1b[38;5;208m",
 };
 
-test "bright Markdown palette keeps tool counts and configured effort independent" {
+test "intense Markdown retains historical hues and independent tool and effort colors" {
     const testing = @import("std").testing;
-    try testing.expectEqualStrings("\x1b[38;5;10m", code);
-    try testing.expectEqualStrings("\x1b[38;5;13m", inline_code);
+    try testing.expectEqualStrings("\x1b[1m\x1b[38;5;2m", code);
+    try testing.expectEqualStrings("\x1b[1m\x1b[38;5;5m", inline_code);
     try testing.expectEqualStrings(inline_code, bullet);
-    try testing.expectEqualStrings("\x1b[1m\x1b[38;5;11m", heading);
-    try testing.expectEqualStrings("\x1b[4m\x1b[38;5;12m", link);
+    try testing.expectEqualStrings("\x1b[1m\x1b[38;5;3m", heading);
+    try testing.expectEqualStrings("\x1b[4m\x1b[1m\x1b[38;5;4m", link);
+    for ([_][]const u8{ heading, link, inline_code, code, bullet }) |style| {
+        try testing.expect(@import("std").mem.indexOf(u8, style, "\x1b[1m") != null);
+        for ([_][]const u8{ "38;5;11m", "38;5;12m", "38;5;13m", "38;5;10m", "48;", "38;2;" }) |rejected| {
+            try testing.expect(@import("std").mem.indexOf(u8, style, rejected) == null);
+        }
+    }
     try testing.expectEqualStrings("\x1b[38;5;2m", diff_added);
     try testing.expectEqualStrings("\x1b[38;5;1m", diff_removed);
     try testing.expectEqualStrings("\x1b[38;5;75m", effortColor(.high));

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const thinking = @import("thinking.zig");
 
 /// 单一配置文件名；路径构造、交互存储和文件工具保护共用，避免名称漂移。
 pub const file_name = "config.json";
@@ -29,6 +30,8 @@ pub const Model = struct {
     protocol: protocol.Protocol = .auto,
     /// 推理强度（可选），仅在提供方支持时使用。
     reasoning_effort: ?[]const u8 = null,
+    /// Explicit capability/wire map for custom endpoints, owned by the parse arena.
+    reasoning: ?thinking.Declaration = null,
 };
 
 /// Implementation defaults are adjustable; only the agreed timeout, read/output
@@ -244,9 +247,11 @@ pub fn validate(config: Config) !void {
 
     // 预算检查：输出与安全余量之和必须小于上下文窗口，否则输入预算为负数；摘要预算也不能超过输出上限。
     try validateModel(config.model, l);
+    try validateReasoningProtocol(config.provider.base_url, config.model);
     if (config.models.len > 64) return error.TooManyModels;
     for (config.models, 0..) |model, i| {
         try validateModel(model, l);
+        try validateReasoningProtocol(config.provider.base_url, model);
         for (config.models[0..i]) |previous| {
             if (std.mem.eql(u8, previous.name, model.name)) return error.DuplicateModel;
         }
@@ -256,11 +261,46 @@ pub fn validate(config: Config) !void {
     if (!(l.compaction_target_percent < l.compaction_trigger_percent and l.compaction_trigger_percent < 100)) return error.InvalidCompactionRatio;
 }
 
+test "thinking declarations strict owned config validation and protocol incompatibility" {
+    const t = std.testing;
+    var parsed = try parse(t.allocator,
+        \\{"provider":{"base_url":"https://proxy/v1"},"model":{"name":"custom","context_tokens":32768,"reasoning":{"map":{"off":"disabled","high":"own-wire"}}}}
+    );
+    defer release(&parsed);
+    try t.expectEqualStrings("own-wire", parsed.value.model.reasoning.?.map.high.?);
+    try t.expectError(error.MissingField, parse(t.allocator,
+        \\{"provider":{"base_url":"https://proxy/v1"},"model":{"name":"custom","context_tokens":32768,"reasoning":{}}}
+    ));
+    try t.expectError(error.InvalidReasoningMap, parse(t.allocator,
+        \\{"provider":{"base_url":"https://proxy/v1"},"model":{"name":"custom","context_tokens":32768,"reasoning":{"map":{}}}}
+    ));
+    try t.expectError(error.UnknownField, parse(t.allocator,
+        \\{"provider":{"base_url":"https://proxy/v1"},"model":{"name":"custom","context_tokens":32768,"reasoning":{"map":{"ultra":"x"}}}}
+    ));
+    var config = parsed.value;
+    config.model.reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } };
+    config.model.protocol = .responses;
+    try t.expectError(error.IncompatibleReasoningProtocol, validate(config));
+    config.model.protocol = .auto;
+    try validate(config);
+    config.provider.base_url = "https://api.deepseek.com";
+    config.model = .{ .name = "deepseek-flash", .context_tokens = 32768, .protocol = .responses };
+    try t.expectError(error.IncompatibleReasoningProtocol, validate(config));
+}
+
+fn validateReasoningProtocol(base_url: []const u8, model: Model) !void {
+    if (model.protocol == .responses and thinking.resolve(base_url, model.name, model.reasoning).format == .deepseek) return error.IncompatibleReasoningProtocol;
+}
+
 /// Shared profile validation uses the same limits as the selected model.
 pub fn validateModel(model: Model, l: Limits) !void {
     if (!validText(model.name, 1024)) return error.InvalidModel;
     if (model.reasoning_effort) |effort| {
         if (!validText(effort, 128)) return error.InvalidReasoningEffort;
+    }
+    if (model.reasoning) |declaration| {
+        try declaration.validate();
+        if (model.protocol == .responses and declaration.format == .deepseek) return error.IncompatibleReasoningProtocol;
     }
     const mib = 1024 * 1024;
     if (model.context_tokens == 0 or model.context_tokens > 16 * mib or

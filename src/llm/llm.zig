@@ -128,7 +128,7 @@ pub const Selector = struct {
 
 /// 判断历史中是否已有与协议绑定的内容（非用户消息、回放块、工具调用/结果或推理块）。
 /// 有则不允许 auto 为这次请求重新选择协议。
-fn hasModelHistory(messages: []const p.Message) bool {
+pub fn hasModelHistory(messages: []const p.Message) bool {
     for (messages) |message| {
         // 回放块或非用户消息说明会话已与某个协议绑定，不能切换。
         if (message.replay != null or message.role != .user) return true;

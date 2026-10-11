@@ -181,7 +181,11 @@ pub const Request = struct {
     tools: []const ToolSchema,
     messages: []const Message,
     max_output_tokens: u32,
+    /// Already mapped wire string, not the logical UI effort.
     reasoning_effort: ?[]const u8 = null,
+    thinking: ?bool = null,
+    /// Retained even for unspecified effort so incompatible adapters reject early.
+    reasoning_format: @import("thinking.zig").Format = .standard,
     purpose: Purpose = .normal,
     /// Local control only, never a provider request field.
     /// 中文：仅用于本地控制，不会作为字段发送给提供方。

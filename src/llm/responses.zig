@@ -103,6 +103,31 @@ test "responses native request opaque replay scope and summary stability" {
 }
 
 // 测试：交错的多个 function_call 通过真实 id 关联，以 completed 中的 output 为准，并正确统计 usage 与加密推理内容。
+test "thinking actual responses mapping and rejects deepseek including unspecified" {
+    const thinking = @import("../core/thinking.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var req = test_support.request(.responses);
+    const standard = thinking.resolve("https://api.openai.com/v1", "gpt-6-sol", null);
+    req.reasoning_effort = standard.wire("off").effort;
+    var v = try j.parse(a, try encode(a, req));
+    try std.testing.expectEqualStrings("none", try c.text(j.get(v, "reasoning").?, "effort"));
+    req.reasoning_effort = standard.wire("max").effort;
+    v = try j.parse(a, try encode(a, req));
+    try std.testing.expectEqualStrings("max", try c.text(j.get(v, "reasoning").?, "effort"));
+    const custom = thinking.resolve("https://proxy", "custom", .{ .map = .{ .high = "own-wire" } });
+    req.reasoning_effort = custom.wire("medium").effort;
+    v = try j.parse(a, try encode(a, req));
+    try std.testing.expectEqualStrings("own-wire", try c.text(j.get(v, "reasoning").?, "effort"));
+    req.reasoning_effort = null;
+    req.reasoning_format = .deepseek;
+    try std.testing.expectError(error.IncompatibleReasoningProtocol, encode(a, req));
+    req.reasoning_format = .standard;
+    req.thinking = false;
+    try std.testing.expectError(error.IncompatibleReasoningProtocol, encode(a, req));
+}
+
 test "responses interleaved real IDs authoritative native output and usage" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

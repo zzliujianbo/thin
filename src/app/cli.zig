@@ -46,23 +46,31 @@ pub const help =
     \\Use either provider.api_key_env (environment variable) or provider.api_key, not both.
     \\--print requires an already configured file; it does not open the setup UI.
     \\Protocols: auto (Responses then one explicitly supported fallback), responses, chat.
+    \\Known DeepSeek thinking format selects Chat locally; it never probes Responses.
     \\
     \\Interactive uses regular terminal scrollback, not an alternate full-screen buffer.
     \\Committed output remains after exit; only the live input/status area is redrawn.
     \\Enter sends; Ctrl+J adds newline; Ctrl+C cancels; Ctrl+D exits.
     \\After Ctrl+D and successful terminal restoration, the current session ID is printed.
     \\An ID alone creates no records; --no-log and no-submission exits still have an ID.
-    \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning; Shift+Tab cycles request effort.
+    \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning; Shift+Tab cycles supported effort.
     \\/model opens a searchable picker; /model exact-id selects directly while idle.
-    \\Selections are session-only; startup defaults are not rewritten. No model discovery.
-    \\Optional models:[{name,context_tokens,protocol,reasoning_effort}] profiles share
-    \\the configured endpoint (maximum 64); a custom ID inherits current context/options.
-    \\Effort cycles none/minimal/low/medium/high/xhigh; provider support is not inferred.
+    \\Model selection is session-only. Effort is saved per startup project, not globally.
+    \\Optional models:[{name,context_tokens,protocol,reasoning_effort,reasoning}] profiles
+    \\share the endpoint (maximum 64); a custom ID inherits current context/options.
+    \\Logical levels: off/minimal/low/medium/high/xhigh/max; only supported levels cycle.
+    \\Legacy none means off. Unknown model capabilities keep fixed configured options.
+    \\Custom/proxy models can declare reasoning:{format:"standard",map:{off:"none",high:"high"}}.
+    \\A null/missing mapping is unsupported; DeepSeek format uses thinking.type (Chat only).
+    \\No model discovery, trial requests or automatic changes to global defaults.
     \\Tool calls are trusted for THIS PROCESS and run without approval prompts.
     \\Commands run with your account permissions; bash is NOT a sandbox.
     \\No automatic command-risk classifier is enabled. --trust is a compatibility flag.
     \\--print returns the final committed visible answer with the same tool policy.
     \\
+    \\Project settings: <startup directory>/.thin/settings.json (last logical effort, 0600).
+    \\Missing settings create nothing; explicit effort saves even with --no-log.
+    \\An unsupported saved level is adjusted effectively without rewriting the preference.
     \\Project Memory: <startup directory>/.thin/mem/*.md, changed through memory tools.
     \\Session records: <startup directory>/.thin/sessions/*.jsonl (local plaintext, 0600).
     \\Recording starts on the first submitted message; --no-log disables it for this run.

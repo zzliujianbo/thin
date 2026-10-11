@@ -5,6 +5,7 @@ const std = @import("std");
 const p = @import("../core/protocol.zig");
 const cfg = @import("../core/config.zig");
 const fs = @import("../platform/filesystem.zig");
+const settings = @import("../app/settings_store.zig");
 const mem = @import("memory.zig");
 const process = @import("../platform/process.zig");
 const j = @import("../util/json.zig");
@@ -210,6 +211,17 @@ pub const Tools = struct {
                 if (!std.mem.eql(u8, part, ".thin")) break;
                 in_thin = true;
             } else {
+                // Exact project settings path only; ignore dot/slash aliases.
+                if (std.mem.eql(u8, part, settings.file_name)) {
+                    var exact = true;
+                    while (parts.next()) |rest| {
+                        if (!std.mem.eql(u8, rest, ".")) {
+                            exact = false;
+                            break;
+                        }
+                    }
+                    if (exact) return error.ProtectedSettingsFile;
+                }
                 // 新档案放在 sessions；旧 logs 留档仍受保护，但不再写入或自动搬迁。
                 if (std.mem.eql(u8, part, "sessions") or std.mem.eql(u8, part, "logs")) return error.ProtectedSessionFile;
                 break;
@@ -453,4 +465,35 @@ test "command environment excludes fake credentials even under a normally allowe
     try std.testing.expect(filtered.get("PATH") == null);
     try std.testing.expect(filtered.get("OTHER_API_KEY") == null);
     try std.testing.expectEqualStrings("C.UTF-8", filtered.get("LANG").?);
+}
+
+test "project settings exact aliases protected at prepare and direct execute" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, io, buffer[0..n]);
+    defer root.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = undefined };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const absolute = try std.fs.path.join(a, &.{ root.path, ".thin/./settings.json" });
+    var cancel: p.Cancellation = .{};
+    for ([_][]const u8{ settings.relative_path, "./.thin//./settings.json", ".thin/./settings.json/.", absolute }) |path| {
+        try std.testing.expectError(error.ProtectedSettingsFile, tools.checkProtectedPath(a, path));
+        try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .read_file = .{ .path = path } }, &cancel));
+        try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .write_file = .{ .path = path, .content = "x" } }, &cancel));
+        const read_args = try std.fmt.allocPrint(a, "{{\"path\":\"{s}\"}}", .{path});
+        const write_args = try std.fmt.allocPrint(a, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
+        try std.testing.expectError(error.ProtectedSettingsFile, Tools.prepare(&tools, a, .{ .id = "r", .name = "read_file", .arguments = read_args }));
+        try std.testing.expectError(error.ProtectedSettingsFile, Tools.prepare(&tools, a, .{ .id = "w", .name = "write_file", .arguments = write_args }));
+    }
+    for ([_][]const u8{ ".thin/settings.jsonfoo", ".thin/sub/settings.json", "settings.json", ".thin/settings.json/child" }) |path| {
+        try tools.checkProtectedPath(a, path);
+    }
+    try std.testing.expectError(error.ProtectedSessionFile, tools.checkProtectedPath(a, ".thin/sessions/x"));
+    try std.testing.expectError(error.ProtectedSessionFile, tools.checkProtectedPath(a, ".thin/logs/x"));
 }

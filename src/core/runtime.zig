@@ -4,6 +4,7 @@
 const std = @import("std");
 const p = @import("protocol.zig");
 const cfg = @import("config.zig");
+const thinking = @import("thinking.zig");
 const llm = @import("../llm/llm.zig");
 const context = @import("context.zig");
 const Io = std.Io;
@@ -177,6 +178,39 @@ pub const Observer = struct {
     fn discard(_: ?*anyopaque, _: Observation) void {}
 };
 
+test "thinking runtime normal and summary requests map current model" {
+    const Stub = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            return error.UnexpectedRequest;
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !Prepared {
+            return error.UnexpectedTool;
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: Prepared, _: *const p.Cancellation) !Execution {
+            return error.UnexpectedTool;
+        }
+    };
+    var dummy: u8 = 0;
+    var config: cfg.Config = .{ .provider = .{ .base_url = "https://api.deepseek.com" }, .model = .{ .name = "deepseek-flash", .context_tokens = 32768, .protocol = .chat, .reasoning_effort = "medium" } };
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "", false);
+    defer runtime.deinit();
+    const cancel: p.Cancellation = .{};
+    for ([_]p.Purpose{ .normal, .summary }) |purpose| {
+        const req = runtime.request(purpose, &.{}, &cancel);
+        try std.testing.expectEqualStrings("high", req.reasoning_effort.?);
+        try std.testing.expect(req.thinking.?);
+        try std.testing.expectEqual(thinking.Format.deepseek, req.reasoning_format);
+    }
+    config.model.reasoning_effort = null;
+    try std.testing.expect(runtime.request(.summary, &.{}, &cancel).thinking == null);
+    config.provider.base_url = "https://proxy";
+    config.model.reasoning = .{ .map = .{ .off = "none", .max = "own-wire" } };
+    config.model.reasoning_effort = "high";
+    const req = runtime.request(.normal, &.{}, &cancel);
+    try std.testing.expectEqualStrings("own-wire", req.reasoning_effort.?);
+    try std.testing.expect(req.thinking == null);
+}
+
 test "selection preserves canonical history and closes retained auto fallback" {
     const Stub = struct {
         fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
@@ -250,6 +284,17 @@ test "selection preserves canonical history and closes retained auto fallback" {
     try std.testing.expect(!runtime.selector.initial_attempted);
 }
 
+fn initialSelector(config: cfg.Config) llm.Selector {
+    var selector = llm.Selector.init(config.model.protocol);
+    if (config.model.protocol == .auto and thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning).format == .deepseek) {
+        // Declared Chat-only format is local metadata, not a failed POST or
+        // an opportunity to probe Responses. Even unspecified effort uses it.
+        selector.selected = .chat;
+        selector.initial_attempted = true;
+    }
+    return selector;
+}
+
 /// Agent loop; owner serializes selection and worker execution.
 pub const Runtime = struct {
     /// 长期分配器；压缩的临时数据与单轮结果都从它派生 arena。
@@ -313,7 +358,7 @@ pub const Runtime = struct {
             .host = host,
             .system = system,
             .arena = std.heap.ArenaAllocator.init(a),
-            .selector = llm.Selector.init(config.model.protocol),
+            .selector = initialSelector(config.*),
             .trusted = trusted,
         };
     }
@@ -335,18 +380,27 @@ pub const Runtime = struct {
         try cfg.validate(candidate);
         const protocol_changed = next.protocol != self.config.model.protocol;
         const name_changed = !std.mem.eql(u8, next.name, self.config.model.name);
+        var selector = self.selector;
+        if (protocol_changed) {
+            selector = llm.Selector.init(next.protocol);
+            if (next.protocol == .auto and self.history.items.len != 0) {
+                selector.selected = self.selector.effective();
+                selector.initial_attempted = true;
+            }
+        }
+        if (next.protocol == .auto and thinking.resolve(candidate.provider.base_url, next.name, next.reasoning).format == .deepseek) {
+            // Preserve the SAME canonical-history boundary as auto fallback.
+            // Refuse before native replay/calibration changes; never retry a
+            // retained Responses conversation to accommodate this declaration.
+            if (llm.hasModelHistory(self.messages()) and self.selector.effective() != .chat) return error.IncompatibleReasoningProtocol;
+            selector.selected = .chat;
+            selector.initial_attempted = true;
+        }
         if (name_changed or protocol_changed) {
             self.discardNativeReplay();
             self.estimator = .{};
         }
-        if (protocol_changed) {
-            const previous = self.selector.effective();
-            self.selector = llm.Selector.init(next.protocol);
-            if (next.protocol == .auto and self.history.items.len != 0) {
-                self.selector.selected = previous;
-                self.selector.initial_attempted = true;
-            }
-        }
+        self.selector = selector;
     }
 
     /// Canonical blocks are owned by this arena (cloneMessage/appendResult).
@@ -564,13 +618,17 @@ pub const Runtime = struct {
 
     /// 构造模型请求。摘要请求使用 summary_tokens 限制输出，其余使用 max_output_tokens。
     fn request(self: *Runtime, purpose: p.Purpose, messages_: []const p.Message, cancel: *const p.Cancellation) p.Request {
+        const capabilities = thinking.resolve(self.config.provider.base_url, self.config.model.name, self.config.model.reasoning);
+        const wire = capabilities.wire(self.config.model.reasoning_effort);
         return .{
             .scope = .{ .connection = self.config.provider.base_url, .model = self.config.model.name, .protocol = self.selector.effective() },
             .system = self.system,
             .tools = self.executor.schemas,
             .messages = messages_,
             .max_output_tokens = if (purpose == .summary) self.config.limits.summary_tokens else self.config.limits.max_output_tokens,
-            .reasoning_effort = self.config.model.reasoning_effort,
+            .reasoning_effort = wire.effort,
+            .thinking = wire.thinking,
+            .reasoning_format = capabilities.format,
             .purpose = purpose,
             .cancellation = cancel,
         };

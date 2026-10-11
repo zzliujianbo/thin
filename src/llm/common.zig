@@ -128,7 +128,9 @@ pub fn validateRequest(req: p.Request, proto: p.Protocol) !void {
     if (req.scope.protocol != proto) return error.ReplayScopeMismatch;
     if (req.messages.len > max_items or req.tools.len > max_tools or req.system.len > max_bytes) return error.InputLimit;
     // size 累计 system、模型名、推理强度、工具与消息内容的字节数，共用 max_bytes 上限。
-    var size: usize = req.system.len + req.scope.model.len + (if (req.reasoning_effort) |s| s.len else @as(usize, 0));
+    // Include the bounded thinking object when present; mapped effort strings
+    // already contribute their actual byte length, not a canonical-name guess.
+    var size: usize = req.system.len + req.scope.model.len + (if (req.reasoning_effort) |s| s.len else @as(usize, 0)) + (if (req.thinking != null) @as(usize, 32) else 0);
     if (size > max_bytes) return error.InputLimit;
     var block_count: usize = 0;
 
@@ -251,7 +253,13 @@ pub fn tools(a: std.mem.Allocator, schemas: []const p.ToolSchema, chat: bool) !V
 
 /// 构造 Chat 或 Responses 请求体的公共部分（模型、流式开关、输出上限、工具与推理强度）。
 pub fn base(a: std.mem.Allocator, req: p.Request, chat: bool) !V {
+    if (!chat and (req.thinking != null or req.reasoning_format == .deepseek)) return error.IncompatibleReasoningProtocol;
     var v = object(a);
+    if (req.thinking) |enabled| {
+        var thinking = object(a);
+        try put(a, &thinking, "type", j.str(if (enabled) "enabled" else "disabled"));
+        try put(a, &v, "thinking", thinking);
+    }
     try put(a, &v, "model", j.str(req.scope.model));
     try put(a, &v, "stream", .{ .bool = true });
     try put(a, &v, if (chat) "max_completion_tokens" else "max_output_tokens", try j.number(req.max_output_tokens));
@@ -262,6 +270,8 @@ pub fn base(a: std.mem.Allocator, req: p.Request, chat: bool) !V {
 
     // Chat 把 reasoning_effort 放在顶层，Responses 则放在 reasoning 对象中。
     if (req.reasoning_effort) |s| {
+        // Runtime has already applied the declared logical-to-wire map.
+        // A literal wire "off" may be intentional; never normalize it again.
         if (chat) try put(a, &v, "reasoning_effort", j.str(s)) else {
             var r = object(a);
             try put(a, &r, "effort", j.str(s));

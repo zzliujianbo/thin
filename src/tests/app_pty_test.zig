@@ -119,8 +119,9 @@ const Driver = struct {
         return error.VisibleTextTimeout;
     }
 
-    /// Completion has no label. Match the percentage+idle marker only in new
-    /// output, including all configured-effort colors and reset.
+    /// Completion has no label. Match the idle prefix's percentage tail only
+    /// in new output: colored text resets before the neutral parentheses and
+    /// marker; unconfigured text needs no SGR. Keep the full-frame cursor ACK.
     fn waitIdle(self: *Driver, start: usize) !void {
         const until = now() + 10000;
         while (now() < until) {
@@ -128,12 +129,7 @@ const Driver = struct {
             const bytes = self.output[start..self.used];
             for ([_][]const u8{
                 "%) > ",
-                "%) \x1b[38;5;245m>\x1b[0m ",
-                "%) \x1b[38;5;117m>\x1b[0m ",
-                "%) \x1b[38;5;114m>\x1b[0m ",
-                "%) \x1b[38;5;214m>\x1b[0m ",
-                "%) \x1b[38;5;75m>\x1b[0m ",
-                "%) \x1b[38;5;171m>\x1b[0m ",
+                "%\x1b[0m) > ",
             }) |idle| if (std.mem.indexOf(u8, bytes, idle)) |marker| {
                 if (std.mem.indexOf(u8, bytes[marker + idle.len ..], "\x1b[?25h") != null) return;
             };
@@ -153,12 +149,7 @@ const Driver = struct {
             const busy_prefix = "%\x1b[0m) "; // Animated percentage resets before closing parenthesis.
             while (std.mem.indexOfPos(u8, bytes, from, busy_prefix)) |prefix| {
                 from = prefix + busy_prefix.len;
-                var marker = from;
-                if (std.mem.startsWith(u8, bytes[marker..], "\x1b[")) {
-                    const end = std.mem.indexOfScalar(u8, bytes[marker..], 'm') orelse continue;
-                    if (end > 24) continue;
-                    marker += end + 1;
-                }
+                const marker = from; // No effort color (or other SGR) before neutral braille.
                 for ([_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }) |icon| {
                     if (std.mem.startsWith(u8, bytes[marker..], icon) and std.mem.indexOf(u8, bytes[marker + icon.len ..], "\x1b[?25h") != null) return;
                 }
@@ -285,6 +276,18 @@ fn required(init: std.process.Init, key: []const u8) ![]const u8 {
     return init.environ_map.get(key) orelse error.FixtureEnvironmentRequired;
 }
 
+/// Exact configured-effort hues, not a visual guess from an animated request.
+fn settingsColor(d: *const Driver, start: usize, level: []const u8) !void {
+    const color: []const u8 = if (std.mem.eql(u8, level, "off")) "\x1b[38;5;245m" else if (std.mem.eql(u8, level, "low")) "\x1b[38;5;114m" else if (std.mem.eql(u8, level, "high")) "\x1b[38;5;75m" else if (std.mem.eql(u8, level, "max")) "\x1b[38;5;177m" else return error.UnknownSettingsLevel;
+    const bytes = d.output[start..d.used];
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, from, color)) |at| {
+        from = at + color.len;
+        if (std.mem.startsWith(u8, bytes[from..], "fixture-model\x1b[0m ") and std.mem.startsWith(u8, bytes[from + "fixture-model\x1b[0m ".len ..], color)) return;
+    }
+    return error.SettingsColorMismatch;
+}
+
 /// 验收入口：从环境变量读取二进制、项目目录、HOME 与测试 URL，创建 PTY 并 fork 启动应用，再按 THIN_APP_TEST_MODE 驱动对应的交互场景。
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
@@ -315,7 +318,7 @@ pub fn main(init: std.process.Init) !void {
     const print_argv = [_:null]?[*:0]const u8{ bin, "--print", "large-output" };
     const no_log_argv = [_:null]?[*:0]const u8{ bin, "--no-log" };
     // output 模式直接执行 --print 大输出；其余模式启动交互式界面。
-    const argv: [*:null]const ?[*:0]const u8 = if (std.mem.eql(u8, mode, "output")) &print_argv else if (std.mem.eql(u8, mode, "exit-no-log")) &no_log_argv else &interactive_argv;
+    const argv: [*:null]const ?[*:0]const u8 = if (std.mem.eql(u8, mode, "output")) &print_argv else if (std.mem.eql(u8, mode, "exit-no-log") or std.mem.startsWith(u8, mode, "settings-")) &no_log_argv else &interactive_argv;
 
     var master: c_int = undefined;
     var slave: c_int = undefined;
@@ -546,15 +549,23 @@ pub fn main(init: std.process.Init) !void {
         // Real streamed Markdown uses independent semantic colors and a boxed
         // grid with a second body row, not just its old header-only rule.
         const markdown_output = d.output[start..d.used];
-        for ([_][]const u8{ "\x1b[38;5;11m", "\x1b[38;5;13m", "\x1b[39m\x1b[2m", "\x1b[1m", "\x1b[38;5;10m", "┌", "├", "┼", "└", "second-row", "exit_code=124", "exit_code=0" }, 0..) |part, part_index| {
+        for ([_][]const u8{ "\x1b[1m\x1b[38;5;3m", "\x1b[1m\x1b[38;5;5m", "\x1b[39m\x1b[2m", "\x1b[1m", "\x1b[1m\x1b[38;5;2m", "┌", "├", "┼", "└", "second-row", "exit_code=124", "exit_code=0" }, 0..) |part, part_index| {
             const found = std.mem.indexOf(u8, markdown_output, part) != null;
             if (!found) std.debug.print("Markdown assertion index: {d}\n", .{part_index}); // Safe index, never captured bytes.
             try check(found);
         }
         // The independent model-name flow may legitimately contain orange.
         try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;215m\x1b[1mstream-stage-one") == null);
-        try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;13minline-marker\x1b[0m") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;75m>\x1b[0m ") != null); // Configured high, not stream duration.
+        try check(std.mem.indexOf(u8, markdown_output, "\x1b[1m\x1b[38;5;5minline-marker\x1b[0m") != null);
+        for ([_][]const u8{ "38;5;11m", "38;5;12m", "38;5;13m", "38;5;10m" }) |rejected| try check(std.mem.indexOf(u8, markdown_output, rejected) == null);
+        // Code remains foreground-only and unpadded; user background is separate.
+        for ([_][]const u8{ "exit_code=124", "exit_code=0" }) |code| {
+            const expected = try std.fmt.allocPrint(a, "\x1b[1m\x1b[38;5;2m{s}\x1b[0m", .{code});
+            defer a.free(expected);
+            try check(std.mem.indexOf(u8, markdown_output, expected) != null);
+        }
+        try check(std.mem.indexOf(u8, markdown_output, "(\x1b[38;5;75mfixture-model\x1b[0m \x1b[38;5;75m") != null); // Configured high idle prefix, not stream duration.
+        try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;75m>\x1b[0m") == null);
         for (stage.grid[22]) |byte| try check(byte == ' ');
         try check(stage.row == 23);
     } else if (std.mem.eql(u8, mode, "architecture-table")) {
@@ -571,8 +582,10 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, raw, "Streaming") == null);
     } else if (std.mem.eql(u8, mode, "tool-icons")) {
         const start = d.used;
-        // Startup already shows configured high despite no reasoning delta.
-        try check(std.mem.indexOf(u8, d.output[0..start], "\x1b[38;5;75m>\x1b[0m ") != null);
+        // Startup already shows configured high on idle text, not the marker.
+        try check(std.mem.indexOf(u8, d.output[0..start], "(\x1b[38;5;75mfixture-model\x1b[0m \x1b[38;5;75m") != null);
+        try check(std.mem.indexOf(u8, d.output[0..start], "%\x1b[0m) > ") != null);
+        try check(std.mem.indexOf(u8, d.output[0..start], "\x1b[38;5;75m>\x1b[0m") == null);
         try d.send("tool-icon-task\r");
         try d.waitText(start, "sleep 1; cat r.json");
         const animation_start = d.used;
@@ -686,6 +699,71 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, &final.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &final.grid[23], "%) >") != null);
         try check(!final.visible("ctx ~"));
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\"written_bytes\"") == null);
+    } else if (std.mem.startsWith(u8, mode, "settings-")) {
+        // All settings processes are real owned PTYs with --no-log. Check an
+        // acknowledged initial frame before typing; startup alone never saves.
+        try d.waitIdle(0);
+        if (std.mem.eql(u8, mode, "settings-initial")) try settingsColor(&d, 0, "off");
+        if (std.mem.eql(u8, mode, "settings-cycle") or std.mem.eql(u8, mode, "settings-map")) {
+            try settingsColor(&d, 0, "off");
+            const levels: []const []const u8 = if (std.mem.eql(u8, mode, "settings-cycle")) &.{ "low", "high", "max", "off" } else &.{ "low", "high", "off" };
+            for (levels) |level| {
+                var start = d.used;
+                try d.send("\x1b[Z");
+                try d.waitIdle(start);
+                try settingsColor(&d, start, level);
+                start = d.used;
+                try d.send("settings-task\r");
+                try d.waitText(start, "settings-answer");
+                try d.waitIdle(start);
+            }
+            if (std.mem.eql(u8, mode, "settings-cycle")) {
+                // Leave max saved without another HTTP call.
+                for ([_][]const u8{ "low", "high", "max" }) |level| {
+                    const start = d.used;
+                    try d.send("\x1b[Z");
+                    try d.waitIdle(start);
+                    try settingsColor(&d, start, level);
+                }
+            }
+        } else if (std.mem.eql(u8, mode, "settings-pending-auth")) {
+            try d.waitText(0, "/auth");
+            var start = d.used;
+            try d.send("\x1b[Z");
+            // Pending configuration still acknowledges its complete frame.
+            try d.waitFrame(start, "> ");
+            start = d.used;
+            try d.send("/auth\r");
+            try d.waitFrame(start, "API key");
+            start = d.used;
+            try d.send("fixture-secret-never-log\r");
+            try d.waitText(start, "Saved locally; send a message to connect");
+            try d.waitIdle(start);
+            try settingsColor(&d, start, "low");
+            start = d.used;
+            try d.send("settings-task\r");
+            try d.waitText(start, "settings-answer");
+            try d.waitIdle(start);
+        } else if (!std.mem.eql(u8, mode, "settings-initial")) {
+            const blocked = std.mem.eql(u8, mode, "settings-blocked-low") or std.mem.eql(u8, mode, "settings-unknown-low");
+            const clamped = std.mem.startsWith(u8, mode, "settings-clamp-");
+            const level = if (blocked) "low" else if (clamped or std.mem.startsWith(u8, mode, "settings-probe-")) mode[15..] else return error.UnknownSettingsMode;
+            try settingsColor(&d, 0, level);
+            if (clamped) try d.waitText(0, "Saved thinking level adjusted");
+            if (std.mem.eql(u8, mode, "settings-unknown-low")) try d.waitText(0, "Saved thinking level not applied");
+            if (blocked) {
+                const start = d.used;
+                try d.send("\x1b[Z");
+                try d.waitIdle(start);
+                try settingsColor(&d, start, level);
+            }
+            const start = d.used;
+            try d.send("settings-task\r");
+            try d.waitText(start, "settings-answer");
+            try d.waitIdle(start);
+        }
+        const final = try d.screen();
+        try check(final.row == 23 and final.count(regular.prior) == 1);
     } else if (std.mem.eql(u8, mode, "model-select")) {
         var start = d.used;
         try d.send("selection-first\r");
@@ -708,7 +786,8 @@ pub fn main(init: std.process.Init) !void {
         start = d.used;
         try d.send("\x1b[Z"); // Configured low -> medium, not a visual-only label.
         try d.waitIdle(start);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;214m>\x1b[0m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;214mfixture-next\x1b[0m \x1b[38;5;214m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;214m>\x1b[0m") == null);
         start = d.used;
         try d.send("selection-second\r");
         try d.waitText(start, "selection-answer-two");
@@ -726,7 +805,8 @@ pub fn main(init: std.process.Init) !void {
         start = d.used;
         try d.send("\x1b[Z");
         try d.waitIdle(start);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;75m>\x1b[0m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;75mfixture-custom\x1b[0m \x1b[38;5;75m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;75m>\x1b[0m") == null);
         start = d.used;
         try d.send("selection-third\r");
         try d.waitText(start, "selection-answer-three");

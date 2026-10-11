@@ -16,6 +16,7 @@ import {resolve, join} from 'node:path';
 import assert from 'node:assert/strict';
 import {reviewRegressions} from './review_mock.mjs';
 import {logRegressions} from './log_mock.mjs';
+import {settingsRegressions} from './settings_mock.mjs';
 
 // 命令行参数：第一个是 thin 可执行文件的绝对路径，第二个是 thin-app-pty 驱动的绝对路径。
 const [appArg, ptyArg] = process.argv.slice(2);
@@ -435,7 +436,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       const filename = kind === 'legacy-config' ? 'auth.json' : 'config.json';
       // 空白文件走交互初始化；待激活配置始终使用回环服务，绝不向公共端点发送密钥或消息。
       const provider = ['auth-activate','exit-unconfigured','exit-secret'].includes(kind) ? {base_url:url, api_key_env:'', api_key:null, chat_max_tokens:true} : {base_url:url, api_key_env:'THIN_FIXTURE_KEY'};
-      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({provider, model:{name:'fixture-model',protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:kind==='model-select'?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined}, models:kind==='model-select'?[{name:'fixture-next',protocol,context_tokens:65536,reasoning_effort:'low'}]:undefined, limits:{max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({provider, model:{name:'fixture-model',protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:kind==='model-select'?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:kind==='model-select'?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined}, models:kind==='model-select'?[{name:'fixture-next',protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}]:undefined, limits:{max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
       await writeFile(join(home,'.thin',filename), content);
     }
 
@@ -587,6 +588,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert.equal(disk.model.context_tokens,32768);
       assert.equal(disk.models[0].name,'fixture-next');
       assert.equal(disk.models[0].reasoning_effort,'low');
+      assert.deepEqual(JSON.parse(await readFile(join(project,'.thin/settings.json'),'utf8')), {version:1,reasoning_effort:'high'});
     }
     if (kind === 'regular-two') assert.equal(requests,2, 'regular two-turn request count');
     if (kind === 'tool-icons') assert.equal(requests,2, 'tool icon request count');
@@ -624,13 +626,14 @@ try {
   for (const kind of ['unicode','regular-two','stream-markdown','architecture-table','tool-icons','file-stats','memory-summary','auto-tools','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
   await reviewRegressions(app);
   await logRegressions(app,pty);
+  await settingsRegressions({app,pty,execute,send});
   console.log('Application fixture suite passed; general PTY tests exercise chat, model selection also covers responses.');
 
 // 顶层捕获：任何场景失败都打印脱敏后的错误（替换密钥、去除控制字符），并以退出码 1 结束。
 } catch (error) {
   // 中文：不要渲染捕获的终端或模型输出、响应头或请求体。
   // Do not render captured terminal/model output, headers, or request bodies.
-  const label = /^(?:log|selection)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
+  const label = /^(?:log|selection|settings)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
     ? `${error.fixtureCase}: ${error.fixtureCheck}` : 'offline fixture assertion failed (details withheld)';
   console.error(`FAIL application acceptance: ${label}`);
   process.exitCode = 1;

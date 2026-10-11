@@ -774,11 +774,14 @@ test "Markdown paragraphs and empty list items remain structurally visible" {
 test "Markdown uses distinct heading emphasis code quote and link colors" {
     const theme = @import("theme.zig");
     const a = std.testing.allocator;
-    const r = try render(a, "# Heading\n\n**bold** `inline` [label](https://example.org)\n\n> quote\n\n```\ncode\n```", .{ .columns = 80, .max_lines = 100 });
+    const r = try render(a, "# Heading\n\n**bold** `inline` [label](https://example.org)\n\n> quote\n\n- item\n\n```\ncode\n```", .{ .columns = 80, .max_lines = 100 });
     defer release(a, r);
     const s = try joined(a, r);
     defer a.free(s);
-    for ([_][]const u8{ theme.heading, theme.strong, theme.inline_code, theme.code, theme.quote, theme.link }) |color| try std.testing.expect(std.mem.indexOf(u8, s, color) != null);
+    for ([_][]const u8{ theme.heading, theme.strong, theme.inline_code, theme.code, theme.quote, theme.link, theme.bullet }) |color| try std.testing.expect(std.mem.indexOf(u8, s, color) != null);
+    // Historical hue indices plus intensity; H1 and link keep underline.
+    for ([_][]const u8{ "\x1b[1m\x1b[38;5;3m\x1b[1m\x1b[4mHeading", "\x1b[4m\x1b[1m\x1b[38;5;4mlabel", "\x1b[1m\x1b[38;5;5minline", "\x1b[1m\x1b[38;5;2mcode", "\x1b[1m\x1b[38;5;5m-" }) |style| try std.testing.expect(std.mem.indexOf(u8, s, style) != null);
+    for ([_][]const u8{ "38;5;11m", "38;5;12m", "38;5;13m", "38;5;10m", "48;", "38;2;" }) |rejected| try std.testing.expect(std.mem.indexOf(u8, s, rejected) == null);
     try @import("../tests/regular_screen.zig").rejectFullscreen(s);
 }
 

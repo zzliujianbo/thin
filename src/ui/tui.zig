@@ -146,7 +146,8 @@ pub const Connection = struct {
     context: *anyopaque,
     current_fn: *const fn (*anyopaque) State,
     configure_fn: *const fn (*anyopaque, []const u8) anyerror!void,
-    /// Idle, joined-owner callbacks; no network calls or default persistence.
+    /// Idle, joined-owner callbacks; no network calls. Model selection stays
+    /// local; effort saves the project preference, never global defaults.
     select_model_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     set_effort_fn: ?*const fn (*anyopaque, shared.ReasoningEffort) anyerror!void = null,
 
@@ -162,6 +163,10 @@ pub const Connection = struct {
         context_limit: u32 = 0,
         /// Immutable configured request option, not inferred from stream time.
         reasoning_effort: shared.ReasoningEffort = .unspecified,
+        /// Capability metadata prepared by the owner; zero means unknown.
+        effort_levels: shared.activity.EffortSet = .{},
+        settings_error: ?anyerror = null,
+        settings_notice: ?[]const u8 = null,
         base_url: []const u8,
         /// 应用层的启动策略快照，不读取工作线程可变的 Runtime.trusted。
         tools_trusted: bool = false,
@@ -450,6 +455,11 @@ const Ui = struct {
         }
         if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
         if (notice.len == 0 and state.runtime == null) notice = "Not configured: /auth";
+        if (state.settings_error) |err| {
+            notice = try std.fmt.allocPrint(a, "{s}{s}SETTINGS FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
+        } else if (state.settings_notice) |warning| {
+            notice = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ notice, if (notice.len != 0) " | " else "", warning });
+        }
         if (state.log_error) |err| return std.fmt.allocPrint(a, "{s}{s}REC FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
         if (!state.logging_enabled) return std.fmt.allocPrint(a, "{s}{s}recording off", .{ notice, if (notice.len != 0) " | " else "" });
         return notice;
@@ -616,21 +626,31 @@ const Ui = struct {
             self.notice = "Thinking selection requires a drained session bridge";
             return;
         };
-        const next = self.connection.current().reasoning_effort.next();
+        const state = self.connection.current();
+        const next = state.effort_levels.next(state.reasoning_effort) orelse {
+            self.notice = "Thinking capabilities unknown: declare model reasoning levels in configuration";
+            return;
+        };
+        if (next == state.reasoning_effort.canonical()) {
+            self.notice = "This model has no other supported thinking level";
+            return;
+        }
         self.connection.setEffort(next) catch {
-            self.notice = "Could not change thinking request option";
+            self.notice = "Could not save thinking option; previous option kept";
             return;
         };
         self.display.setEffort(next);
         self.notice = switch (next) {
-            .none => "Thinking request: none (session only)",
-            .minimal => "Thinking request: minimal (session only)",
-            .low => "Thinking request: low (session only)",
-            .medium => "Thinking request: medium (session only)",
-            .high => "Thinking request: high (session only)",
-            .xhigh => "Thinking request: xhigh (session only)",
+            .off, .none => "Thinking request: off (saved for this project)",
+            .minimal => "Thinking request: minimal (saved for this project)",
+            .low => "Thinking request: low (saved for this project)",
+            .medium => "Thinking request: medium (saved for this project)",
+            .high => "Thinking request: high (saved for this project)",
+            .xhigh => "Thinking request: xhigh (saved for this project)",
+            .max => "Thinking request: max (saved for this project)",
             else => unreachable,
         };
+        self.dirty = true;
     }
     fn modelKey(self: *Ui, event_: input.Event) !void {
         const picker = &self.model_picker.?;
@@ -1920,7 +1940,7 @@ test "sequential tool records from different frames have no gaps then final pros
     ui.finishFrame();
 }
 
-test "configured effort colors composer before any reasoning and remains independent of TPS and duration" {
+test "configured effort colors idle prefix before reasoning but never the busy marker" {
     const Owner = struct {
         effort: shared.ReasoningEffort,
         fn current(raw: *anyopaque) Connection.State {
@@ -1940,7 +1960,7 @@ test "configured effort colors composer before any reasoning and remains indepen
     _ = try ui.editor.insert("input-default");
     // Idle startup, without any delta or mutable Runtime reads.
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, (comptime theme.effortColor(.high)) ++ ">" ++ theme.reset ++ " input-default") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.high)) ++ "fixture" ++ theme.reset ++ " " ++ (comptime theme.effortColor(.high)) ++ "?%" ++ theme.reset ++ ") > input-default") != null);
     ui.finishFrame();
     ui.mode = .calling_model;
     ui.display.reset(0);
@@ -1948,9 +1968,11 @@ test "configured effort colors composer before any reasoning and remains indepen
     for ([_]u64{ 1100, 3100, 9100 }) |now| {
         ui.clock_ms = now;
         try ui.draw();
-        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s} input-default", .{ theme.effortColor(.high), activity.spinner(now), theme.reset });
+        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}) {s} input-default", .{ theme.reset, activity.spinner(now) });
         defer std.testing.allocator.free(marker);
         try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, theme.effortColor(.high)) == null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, theme.model_flow[ui.model_flow.step()]) != null);
         ui.finishFrame();
     }
     ui.display.observe(.{ .reasoning = "late thought" }, 9100);
@@ -1958,7 +1980,7 @@ test "configured effort colors composer before any reasoning and remains indepen
     ui.mode = null;
     owner.effort = .low;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, (comptime theme.effortColor(.low)) ++ ">" ++ theme.reset ++ " input-default") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.low)) ++ "fixture" ++ theme.reset ++ " " ++ (comptime theme.effortColor(.low)) ++ "?%" ++ theme.reset ++ ") > input-default") != null);
     ui.finishFrame();
     owner.effort = .unspecified;
     try ui.draw();
@@ -2423,6 +2445,7 @@ const SelectionFixture = struct {
     owned: ?[]u8 = null,
     limit: u32 = 32768,
     effort: shared.ReasoningEffort = .none,
+    levels: shared.activity.EffortSet = .{ .mask = 0x3f },
     selections: usize = 0,
     cycles: usize = 0,
     fail: bool = false,
@@ -2432,7 +2455,7 @@ const SelectionFixture = struct {
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .models = &profiles, .context_limit = self.limit, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort };
+        return .{ .runtime = null, .model = self.name, .models = &profiles, .context_limit = self.limit, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;
@@ -2457,6 +2480,36 @@ const SelectionFixture = struct {
         if (self.owned) |name| std.testing.allocator.free(name);
     }
 };
+
+test "effort shortcut follows declared levels and unknown or singleton sets never publish" {
+    var fixture: SelectionFixture = .{ .effort = .off, .levels = .{} };
+    defer fixture.deinit();
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 0), fixture.cycles);
+    try std.testing.expectEqual(shared.ReasoningEffort.off, fixture.effort);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "capabilities unknown") != null);
+    fixture.levels = .{ .mask = 1 };
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 0), fixture.cycles);
+    fixture.levels = .{ .mask = 0x55 }; // off / low / high / max, not a six-level cycle.
+    for ([_]shared.ReasoningEffort{ .low, .high, .max, .off }) |expected| {
+        ui.cycleEffort();
+        try std.testing.expectEqual(expected, fixture.effort);
+    }
+    try std.testing.expectEqual(@as(usize, 4), fixture.cycles);
+    // The preset deliberately leaves effort unspecified. Its FIRST shortcut
+    // must choose the first supported value, not claim capabilities unknown.
+    fixture.effort = .unspecified;
+    ui.cycleEffort();
+    try std.testing.expectEqual(shared.ReasoningEffort.off, fixture.effort);
+    try std.testing.expectEqual(@as(usize, 5), fixture.cycles);
+}
 
 test "model picker confirms acknowledged epoch and revision preserving transcript and context" {
     try text.initLocale();
@@ -2520,6 +2573,9 @@ test "selection guards paste secret busy joined future poison and rollback" {
     try std.testing.expectEqualStrings("fixture-next", fixture.name);
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expectEqual(shared.ReasoningEffort.minimal, fixture.effort);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.minimal)) ++ "fixture-next" ++ theme.reset ++ " " ++ (comptime theme.effortColor(.minimal)) ++ "1.5%" ++ theme.reset ++ ") > ") != null);
+    ui.finishFrame();
     ui.busy = true;
     try ui.parser.feed("\x1b[Z/model busy-id\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.selections);

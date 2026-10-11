@@ -8,6 +8,8 @@ const tools = @import("../tools/tools.zig");
 const http = @import("../llm/http.zig");
 const r = @import("../core/runtime.zig");
 const Journal = @import("journal.zig").Journal;
+const Settings = @import("settings_store.zig").Store;
+const thinking = @import("../core/thinking.zig");
 
 /// 应用聚合体：持有配置、项目根目录、记忆存储、工具执行器、HTTP 客户端与 Runtime，
 /// 生命周期与进程一致（--print 或 TUI 会话结束时统一释放）。
@@ -44,12 +46,43 @@ pub const App = struct {
         const home = environ.get("HOME") orelse return error.MissingHome;
         const path = try cfg.defaultPath(a, home);
         defer a.free(path);
-        const parsed = try cfg.load(a, io, path);
-        return initConfigured(a, io, environ, project, host, trusted, parsed);
+        var parsed = try cfg.load(a, io, path);
+        // Missing preferences are read-only. Headless entry uses the same
+        // project choice, without changing the global configuration on disk.
+        var settings = Settings.open(a, io, project) catch |err| {
+            cfg.release(&parsed);
+            return err;
+        };
+        defer settings.deinit();
+        const saved = settings.load() catch |err| {
+            cfg.release(&parsed);
+            return err;
+        };
+        const capabilities = thinking.resolve(parsed.value.provider.base_url, parsed.value.model.name, parsed.value.model.reasoning);
+        if (saved) |effort| {
+            if (capabilities.known) parsed.value.model.reasoning_effort = capabilities.effective(effort.name());
+        }
+        return initConfiguredAnchored(a, io, environ, &settings.root, host, trusted, parsed);
     }
 
     /// 接管 parsed（成功或失败均接管），供交互配置准备候选 App；此过程不发送模型请求。
     pub fn initConfigured(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, trusted: bool, parsed: std.json.Parsed(cfg.Config)) !*App {
+        return initConfiguredRoot(a, io, environ, project, null, null, host, trusted, parsed);
+    }
+
+    /// Duplicate an already anchored project; never re-open its replaceable
+    /// pathname during activation. parsed is consumed on success AND failure.
+    pub fn initConfiguredAnchored(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, host: r.Host, trusted: bool, parsed: std.json.Parsed(cfg.Config)) !*App {
+        return initConfiguredRoot(a, io, environ, root.path, root, null, host, trusted, parsed);
+    }
+
+    /// Delayed activation must retain the Auth Store's startup pathname in the
+    /// SAME lexical namespace as root, not rediscover a replaced HOME path.
+    pub fn initConfiguredAnchoredAuth(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, protected_auth: []const u8, host: r.Host, trusted: bool, parsed: std.json.Parsed(cfg.Config)) !*App {
+        return initConfiguredRoot(a, io, environ, root.path, root, protected_auth, host, trusted, parsed);
+    }
+
+    fn initConfiguredRoot(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, anchored: ?*const fs.Root, protected_auth: ?[]const u8, host: r.Host, trusted: bool, parsed: std.json.Parsed(cfg.Config)) !*App {
         var owned = parsed;
         errdefer cfg.release(&owned);
         const self = try a.create(App);
@@ -57,14 +90,17 @@ pub const App = struct {
         self.allocator = a;
         self.config = owned;
 
-        const home = environ.get("HOME") orelse return error.MissingHome;
-        const configured_path = try cfg.defaultPath(a, home);
-        defer a.free(configured_path);
-        // 配置加载可能经过 HOME 或文件本身的符号链接。工具根是 realPath，
-        // 保护路径也必须指向真实文件，不能只做词法 resolve 后比较两个别名。
-        var path_buffer: [4096]u8 = undefined;
-        const path_len = try std.Io.Dir.cwd().realPathFile(io, configured_path, &path_buffer);
-        self.auth_path = try a.dupe(u8, path_buffer[0..path_len]);
+        self.auth_path = if (protected_auth) |path| try a.dupe(u8, path) else blk: {
+            const home = environ.get("HOME") orelse return error.MissingHome;
+            const configured_path = try cfg.defaultPath(a, home);
+            defer a.free(configured_path);
+            // Ordinary loading may follow HOME/file aliases; preserve actual
+            // canonical protection. Delayed anchored activation uses the
+            // explicit startup namespace instead of this pathname lookup.
+            var path_buffer: [4096]u8 = undefined;
+            const path_len = try std.Io.Dir.cwd().realPathFile(io, configured_path, &path_buffer);
+            break :blk try a.dupe(u8, path_buffer[0..path_len]);
+        };
         errdefer a.free(self.auth_path);
 
         const key = try cfg.resolveApiKey(a, self.config.value, environ);
@@ -73,7 +109,7 @@ pub const App = struct {
             a.free(key);
         }
 
-        self.root = try fs.Root.open(a, io, project);
+        self.root = if (anchored) |root| try root.duplicate() else try fs.Root.open(a, io, project);
         errdefer self.root.deinit();
         self.memory = mem.Store.init(&self.root, self.config.value.limits);
         self.journal = try Journal.init(a, &self.root, key);

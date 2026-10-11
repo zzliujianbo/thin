@@ -9,6 +9,8 @@ const Store = @import("auth_store.zig").Store;
 const tui = @import("../ui/tui.zig");
 const presentation = @import("../presentation.zig");
 const ids = @import("session_id.zig");
+const Settings = @import("settings_store.zig").Store;
+const thinking = @import("../core/thinking.zig");
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
@@ -21,6 +23,11 @@ pub const Session = struct {
     /// Generated once before activation/logging; never read from the writer.
     session_id: ids.Id,
     store: Store,
+    /// Owned by value, so pending-to-/auth activation preserves the same fd.
+    settings: Settings,
+    preferred_effort: ?presentation.ReasoningEffort = null,
+    settings_error: ?anyerror = null,
+    settings_notice: ?[]const u8 = null,
     pending: ?std.json.Parsed(cfg.Config) = null,
     app: ?*App = null,
     /// Separate from the parsed arena; selected config may borrow this name.
@@ -34,6 +41,11 @@ pub const Session = struct {
     pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, trusted: bool) !Session {
         const home = environ.get("HOME") orelse return error.MissingHome;
         const id = try ids.generate(io);
+        var settings = try Settings.open(a, io, project);
+        const auth_store = Store.open(a, io, home) catch |err| {
+            settings.deinit();
+            return err;
+        };
         var self: Session = .{
             .allocator = a,
             .io = io,
@@ -42,10 +54,27 @@ pub const Session = struct {
             .host = host,
             .trusted = trusted,
             .session_id = id,
-            .store = try Store.open(a, io, home),
+            .store = auth_store,
+            .settings = settings,
         };
         errdefer self.deinit();
         self.pending = try self.store.loadOrInitialize();
+        // Capture GLOBAL defaults before any project overlay or capability
+        // clamp. /auth must never persist a repository's transient choice.
+        self.pending_base_model = self.pending.?.value.model;
+        self.preferred_effort = self.settings.load() catch |err| blk: {
+            self.settings_error = err;
+            break :blk null;
+        };
+        const config = &self.pending.?.value;
+        const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
+        if (self.preferred_effort) |saved| {
+            if (capabilities.known) {
+                config.model.reasoning_effort = capabilities.effective(saved.name());
+                if (presentation.ReasoningEffort.fromName(config.model.reasoning_effort) != saved)
+                    self.settings_notice = "Saved thinking level adjusted for this model; preference unchanged";
+            } else self.settings_notice = "Saved thinking level not applied: model capabilities unknown";
+        } else config.model.reasoning_effort = capabilities.effective(config.model.reasoning_effort);
 
         const key = cfg.resolveApiKey(a, self.pending.?.value, environ) catch |err| {
             if (err == error.ApiKeyNotFound) return self;
@@ -57,10 +86,23 @@ pub const Session = struct {
         }
         const parsed = self.pending.?;
         self.pending = null;
-        self.app = try App.initConfigured(a, io, environ, project, host, trusted, parsed);
+        self.pending_base_model = null;
+        self.app = try self.prepareApp(parsed);
         try self.app.?.pinSessionID(self.session_id);
         self.initial_context = self.app.?.runtime.contextSnapshot();
         return self;
+    }
+
+    /// Consumes parsed on every path. Auth and project roots were opened at
+    /// startup; this protection name must remain in their retained namespace.
+    fn prepareApp(self: *Session, parsed: std.json.Parsed(cfg.Config)) !*App {
+        const protected = std.fs.path.join(self.allocator, &.{ self.store.root.path, cfg.file_name }) catch |err| {
+            var owned = parsed;
+            cfg.release(&owned);
+            return err;
+        };
+        defer self.allocator.free(protected);
+        return App.initConfiguredAnchoredAuth(self.allocator, self.io, self.environ, &self.settings.root, protected, self.host, self.trusted, parsed);
     }
 
     /// 必须等 TUI 取消并 join worker 后再释放；Connection 不得比 Session 活得更久。
@@ -69,6 +111,7 @@ pub const Session = struct {
         if (self.selected_name) |name| self.allocator.free(name);
         if (self.pending) |*pending| cfg.release(pending);
         self.store.deinit();
+        self.settings.deinit();
         self.* = undefined;
     }
 
@@ -93,6 +136,9 @@ pub const Session = struct {
             .models = config.models,
             .context_limit = config.model.context_tokens,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
+            .effort_levels = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning).levels,
+            .settings_error = self.settings_error,
+            .settings_notice = self.settings_notice,
             .base_url = config.provider.base_url,
             .tools_trusted = self.trusted,
             .logging_enabled = self.logging,
@@ -128,6 +174,16 @@ pub const Session = struct {
                 break;
             }
         }
+        const capabilities = thinking.resolve(candidate.provider.base_url, candidate.model.name, candidate.model.reasoning);
+        var preference_notice: ?[]const u8 = null;
+        if (self.preferred_effort) |saved| {
+            if (capabilities.known) {
+                candidate.model.reasoning_effort = capabilities.effective(saved.name());
+                if (presentation.ReasoningEffort.fromName(candidate.model.reasoning_effort) != saved)
+                    preference_notice = "Saved thinking level adjusted for this model; preference unchanged";
+            } else preference_notice = "Saved thinking level not applied: model capabilities unknown";
+        }
+        candidate.model.reasoning_effort = capabilities.effective(candidate.model.reasoning_effort);
         try cfg.validate(candidate);
         const owned_name = try self.allocator.dupe(u8, candidate.model.name);
         errdefer self.allocator.free(owned_name);
@@ -138,6 +194,7 @@ pub const Session = struct {
         const previous = self.selected_name;
         config.model = candidate.model;
         self.selected_name = owned_name;
+        self.settings_notice = preference_notice;
         if (previous) |old| self.allocator.free(old);
         if (self.app) |app| self.initial_context = app.runtime.contextSnapshot();
     }
@@ -145,21 +202,25 @@ pub const Session = struct {
     fn setEffort(raw: *anyopaque, effort: presentation.ReasoningEffort) !void {
         const self: *Session = @ptrCast(@alignCast(raw));
         try self.guardSelection();
-        const name: []const u8 = switch (effort) {
-            .none => "none",
-            .minimal => "minimal",
-            .low => "low",
-            .medium => "medium",
-            .high => "high",
-            .xhigh => "xhigh",
-            else => return error.InvalidReasoningEffort,
-        };
+        const canonical = effort.canonical();
+        const name = canonical.name() orelse return error.InvalidReasoningEffort;
         const config = self.mutableConfig();
+        const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
+        if (!capabilities.levels.contains(canonical)) return error.UnsupportedReasoningEffort;
         var candidate = config.*;
         candidate.model.reasoning_effort = name;
         try cfg.validate(candidate);
+        // No effective option, baseline, replay or estimator mutation until
+        // the bounded atomic save has succeeded. No fallible work follows it.
+        self.settings.save(canonical) catch |err| {
+            self.settings_error = err;
+            return err;
+        };
         if (self.pending != null and self.pending_base_model == null) self.pending_base_model = config.model;
         config.model = candidate.model;
+        self.preferred_effort = canonical;
+        self.settings_error = null;
+        self.settings_notice = null;
     }
 
     fn configure(raw: *anyopaque, key: []const u8) !void {
@@ -180,7 +241,7 @@ pub const Session = struct {
         var writer = std.Io.Writer.fixed(encoded);
         std.json.Stringify.value(next, .{}, &writer) catch return error.ConfigTooLarge;
         const owned = try cfg.parse(self.allocator, encoded[0..writer.end]);
-        const candidate = try App.initConfigured(self.allocator, self.io, self.environ, self.project, self.host, self.trusted, owned);
+        const candidate = try self.prepareApp(owned);
         errdefer candidate.deinit();
         try candidate.pinSessionID(self.session_id);
         candidate.setLogging(self.logging);
@@ -201,6 +262,10 @@ pub const Session = struct {
     }
 };
 
+fn testReasoning() thinking.Declaration {
+    return .{ .map = .{ .off = "none", .minimal = "minimal", .low = "low", .medium = "medium", .high = "high", .xhigh = "xhigh", .max = "max" } };
+}
+
 // 全部使用临时 HOME/项目与假密钥；仅构造 HTTP 客户端，绝不调用它。
 test "pending session activates locally without a request and protects auth from tools" {
     const a = std.testing.allocator;
@@ -216,6 +281,8 @@ test "pending session activates locally without a request and protects auth from
     var session = try Session.init(a, io, &env, home, .{}, true);
     defer session.deinit();
     session.pending.?.value.model.reasoning_effort = "high";
+    // This direct test-fixture mutation represents the global startup value.
+    session.pending_base_model = session.pending.?.value.model;
     const connection = session.connection();
     const initial_id = connection.current().session_id.?;
     try std.testing.expect(ids.valid(initial_id));
@@ -278,7 +345,7 @@ test "transient pending selection owns names and auth saves original options" {
     const original_effort = if (original.reasoning_effort) |value| try a.dupe(u8, value) else null;
     defer if (original_effort) |value| a.free(value);
     original.reasoning_effort = original_effort;
-    session.pending.?.value.models = &.{.{ .name = "configured", .context_tokens = 65536, .protocol = .chat, .reasoning_effort = "low" }};
+    session.pending.?.value.models = &.{.{ .name = "configured", .context_tokens = 65536, .protocol = .chat, .reasoning_effort = "low", .reasoning = testReasoning() }};
     try Session.selectModel(&session, "configured");
     try std.testing.expectEqual(@as(u32, 65536), session.connection().current().context_limit);
     try std.testing.expectEqual(presentation.ReasoningEffort.low, session.connection().current().reasoning_effort);
@@ -343,7 +410,8 @@ test "transient pending selection owns names and auth saves original options" {
     try std.testing.expectEqualStrings("live", app.config.value.model.name);
     try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
     try Session.setEffort(&session, .none);
-    try std.testing.expectEqualStrings("none", app.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqualStrings("off", app.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqual(presentation.ReasoningEffort.off, (try session.settings.load()).?);
 }
 
 test "configuration conflict does not publish an app" {
@@ -360,6 +428,7 @@ test "configuration conflict does not publish an app" {
     var session = try Session.init(a, io, &env, home, .{}, false);
     defer session.deinit();
     // 模拟用户在 TUI 输入期间从另一进程修改配置；不得被保存动作覆盖。
+    session.pending.?.value.model.reasoning = testReasoning();
     try Session.selectModel(&session, "conflicting-transient");
     try Session.setEffort(&session, .high);
     try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data = "changed externally" });

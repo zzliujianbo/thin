@@ -103,6 +103,14 @@ pub const Root = struct {
         return .{ .dir = dir, .path = try allocator.dupe(u8, buffer[0..n]), .io = io, .allocator = allocator };
     }
 
+    /// Independent open description anchored to this inode, not the stored path.
+    /// Caller owns the result. Never retain a pointer to a movable Root value.
+    pub fn duplicate(self: *const Root) !Root {
+        const fd = try openDirectory(self.dir.handle, ".");
+        errdefer closeFd(fd);
+        return .{ .dir = .{ .handle = fd }, .path = try self.allocator.dupe(u8, self.path), .io = self.io, .allocator = self.allocator };
+    }
+
     /// 关闭根 fd，释放 path，并把 self 置为 undefined 以防误用。
     pub fn deinit(self: *Root) void {
         closeFd(self.dir.handle);
@@ -358,6 +366,36 @@ test "root reads writes ranges text and failed overwrite" {
     try tmp.dir.writeFile(io, .{ .sub_path = "invalid", .data = "\xff" });
     try std.testing.expectError(error.BinaryFile, root.read(a, "binary", 0, 100));
     try std.testing.expectError(error.InvalidUtf8, root.read(a, "invalid", 0, 100));
+}
+
+test "root duplicate retains replaced inode and independent ownership" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(tmp.dir.handle, "project", 0o700));
+    var parent_root = try testRoot(a, io, tmp.dir);
+    defer parent_root.deinit();
+    const project = try std.fs.path.join(a, &.{ parent_root.path, "project" });
+    defer a.free(project);
+    var root = try Root.open(a, io, project);
+    try root.write("original", "old", false);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.renameat(tmp.dir.handle, "project", tmp.dir.handle, "retired"));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(tmp.dir.handle, "project", 0o700));
+    var copy = try root.duplicate();
+    defer copy.deinit();
+    try std.testing.expectEqualStrings(root.path, copy.path);
+    try std.testing.expect(root.path.ptr != copy.path.ptr);
+    try std.testing.expect(root.dir.handle != copy.dir.handle);
+    root.deinit();
+    const result = try copy.read(a, "original", 0, 100);
+    defer a.free(result.data);
+    try std.testing.expectEqualStrings("old", result.data);
+    try copy.write("new", "anchored", false);
+    try std.testing.expectError(error.FileNotFound, parent_root.read(a, "project/new", 0, 100));
+    const anchored = try parent_root.read(a, "retired/new", 0, 100);
+    defer a.free(anchored.data);
+    try std.testing.expectEqualStrings("anchored", anchored.data);
 }
 
 /// libc 的 mkfifoat，测试用它在根目录下创建 FIFO，验证非普通文件会被拒绝且不阻塞。

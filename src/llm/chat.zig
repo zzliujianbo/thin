@@ -108,6 +108,38 @@ test "chat finish sentinel bounds replay and history association guards" {
 }
 
 // 验证：真实请求的稳定前缀（system、tools、历史）在总结请求中保持一致，有利于缓存命中。
+test "thinking actual chat standard and deepseek mapping" {
+    const thinking = @import("../core/thinking.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var req = test_support.request(.chat);
+    const cases = [_]struct { model: []const u8, effort: ?[]const u8, expected: ?[]const u8, enabled: ?bool }{
+        .{ .model = "deepseek-flash", .effort = null, .expected = null, .enabled = null },
+        .{ .model = "deepseek-flash", .effort = "none", .expected = null, .enabled = false },
+        .{ .model = "deepseek-flash", .effort = "medium", .expected = "high", .enabled = true },
+        .{ .model = "deepseek-v4-pro", .effort = "max", .expected = "max", .enabled = true },
+    };
+    for (cases) |case| {
+        const cap = thinking.resolve("https://api.deepseek.com", case.model, null);
+        const wire = cap.wire(case.effort);
+        req.reasoning_effort = wire.effort;
+        req.thinking = wire.thinking;
+        req.reasoning_format = cap.format;
+        const v = try j.parse(a, try encode(a, req));
+        if (case.expected) |expected| try std.testing.expectEqualStrings(expected, try c.text(v, "reasoning_effort")) else try std.testing.expect(j.get(v, "reasoning_effort") == null);
+        if (case.enabled) |enabled| try std.testing.expectEqualStrings(if (enabled) "enabled" else "disabled", try c.text(j.get(v, "thinking").?, "type")) else try std.testing.expect(j.get(v, "thinking") == null);
+    }
+    const cap = thinking.resolve("https://api.openai.com/v1", "gpt-5.2", null);
+    req.reasoning_effort = cap.wire("off").effort;
+    req.thinking = null;
+    req.reasoning_format = cap.format;
+    try std.testing.expectEqualStrings("none", try c.text(try j.parse(a, try encode(a, req)), "reasoning_effort"));
+    const custom = thinking.resolve("https://proxy", "custom", .{ .map = .{ .high = "custom-wire" } });
+    req.reasoning_effort = custom.wire("low").effort;
+    try std.testing.expectEqualStrings("custom-wire", try c.text(try j.parse(a, try encode(a, req)), "reasoning_effort"));
+}
+
 test "chat real request stable system tools history and summary" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -217,8 +217,9 @@ pub const PromptActivity = struct {
     reasoning_effort: shared.ReasoningEffort = .unspecified,
 };
 
-/// Model and percentage share TPS palette/phase. Marker has configured effort
-/// color; parentheses/space/editor remain default and every style is reset.
+/// Idle model and percentage use configured effort; busy text keeps the TPS
+/// palette/phase/ordinal. Parentheses, spaces and marker stay terminal-default,
+/// as does the editor after every style is reset. No prefix means no color.
 pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, motion: PromptActivity) !Prompt {
     const percentage = try contextLabel(a, snapshot);
     defer a.free(percentage);
@@ -235,8 +236,8 @@ pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Context
     else
         try std.fmt.allocPrint(a, "{s} ", .{marker});
     errdefer a.free(plain);
-    const marker_color = theme.effortColor(motion.reasoning_effort);
-    if (!motion.busy and std.mem.eql(u8, marker_color, theme.reset)) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
+    const idle_color = theme.effortColor(motion.reasoning_effort);
+    if ((label.len == 0 and !percent_only) or (!motion.busy and std.mem.eql(u8, idle_color, theme.reset))) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     const palette = theme.modelPalette(motion.rate_band);
@@ -247,19 +248,17 @@ pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Context
             if (motion.busy) {
                 try flowText(&out.writer, label, palette, motion.phase, &ordinal);
                 try out.writer.writeAll(theme.reset);
-            } else try out.writer.writeAll(label);
+            } else try out.writer.print("{s}{s}{s}", .{ idle_color, label, theme.reset });
             try out.writer.writeAll(" ");
             ordinal += 1;
         }
         if (motion.busy) {
             try flowText(&out.writer, percentage, palette, motion.phase, &ordinal);
             try out.writer.writeAll(theme.reset);
-        } else try out.writer.writeAll(percentage);
+        } else try out.writer.print("{s}{s}{s}", .{ idle_color, percentage, theme.reset });
         try out.writer.writeAll(") ");
     }
-    if (std.mem.eql(u8, marker_color, theme.reset)) {
-        try out.writer.print("{s} ", .{marker});
-    } else try out.writer.print("{s}{s}{s} ", .{ marker_color, marker, theme.reset });
+    try out.writer.print("{s} ", .{marker});
     return .{ .plain = plain, .styled = try a.dupe(u8, out.written()) };
 }
 
@@ -384,28 +383,59 @@ test "context prompt is retained occupancy not cache billing and remains bounded
     try std.testing.expect(std.mem.find(u8, zero.plain, "?%") != null);
 }
 
-test "TPS wave continues into percentage while configured effort alone colors the marker" {
+test "idle effort colors only prefix text and all busy TPS waves ignore effort" {
     const a = std.testing.allocator;
+    const efforts = [_]shared.ReasoningEffort{ .unspecified, .unknown, .none, .minimal, .low, .medium, .high, .xhigh };
     for ([_]shared.activity.RateBand{ .slow, .standard, .fast, .unknown }) |band| {
-        const value = try prompt(a, "model", .{ .tokens = 22807, .limit = 1000000 }, 79, .{ .busy = true, .now_ms = 80, .phase = 2, .rate_band = band, .reasoning_effort = .xhigh });
-        defer value.deinit(a);
-        try std.testing.expectEqualStrings("(model 2.3%) ⠙ ", value.plain);
         const palette = theme.modelPalette(band);
-        try std.testing.expect(std.mem.find(u8, value.styled, palette[2]) != null);
-        // Five name clusters + one default space: percentage continues phase.
-        const styled_percent = try std.fmt.allocPrint(a, "{s}2{s}.{s}3{s}%{s}) ", .{ palette[8], palette[9], palette[10], palette[11], theme.reset });
-        defer a.free(styled_percent);
-        try std.testing.expect(std.mem.find(u8, value.styled, styled_percent) != null);
-        try std.testing.expect(std.mem.endsWith(u8, value.styled, (comptime theme.effortColor(.xhigh)) ++ "⠙" ++ theme.reset ++ " "));
-        try std.testing.expect(std.mem.find(u8, value.plain, "ctx") == null and std.mem.find(u8, value.plain, "/") == null);
+        for ([_]usize{ 0, 2, 11, std.math.maxInt(usize) }) |phase| {
+            for ([_]u64{ 0, 80, 120 }) |now| {
+                // Capture the exact historical wave, including the default space
+                // occupying an ordinal between name and percentage.
+                var expected: std.Io.Writer.Allocating = .init(a);
+                defer expected.deinit();
+                try expected.writer.writeAll("(");
+                for ("model 2.3%", 0..) |byte, ordinal| {
+                    if (byte == ' ') {
+                        try expected.writer.writeAll(theme.reset ++ " ");
+                    } else try expected.writer.print("{s}{c}", .{ palette[(phase % palette.len + ordinal) % palette.len], byte });
+                }
+                try expected.writer.print("{s}) {s} ", .{ theme.reset, activity.spinner(now) });
+                for (efforts) |effort| {
+                    const value = try prompt(a, "model", .{ .tokens = 22807, .limit = 1000000 }, 79, .{ .busy = true, .now_ms = now, .phase = phase, .rate_band = band, .reasoning_effort = effort });
+                    defer value.deinit(a);
+                    try std.testing.expectEqualStrings(expected.written(), value.styled);
+                    const plain = try std.fmt.allocPrint(a, "(model 2.3%) {s} ", .{activity.spinner(now)});
+                    defer a.free(plain);
+                    try std.testing.expectEqualStrings(plain, value.plain);
+                    try std.testing.expect(std.mem.find(u8, value.plain, "ctx") == null and std.mem.find(u8, value.plain, "/") == null);
+                }
+            }
+        }
     }
-    for ([_]shared.ReasoningEffort{ .none, .minimal, .low, .medium, .high, .xhigh }) |effort| {
+    for (efforts) |effort| {
+        const color = theme.effortColor(effort);
+        const uncolored = std.mem.eql(u8, color, theme.reset);
         const idle = try prompt(a, "model", .{ .tokens = 1, .limit = 1000 }, 79, .{ .reasoning_effort = effort });
         defer idle.deinit(a);
-        const tail = try std.fmt.allocPrint(a, "{s}>{s} ", .{ theme.effortColor(effort), theme.reset });
-        defer a.free(tail);
-        try std.testing.expect(std.mem.endsWith(u8, idle.styled, tail));
+        const expected = if (uncolored) try a.dupe(u8, idle.plain) else try std.fmt.allocPrint(a, "({s}model{s} {s}0.1%{s}) > ", .{ color, theme.reset, color, theme.reset });
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, idle.styled);
         try std.testing.expectEqualStrings("(model 0.1%) > ", idle.plain);
+        const percent = try prompt(a, "", null, 79, .{ .reasoning_effort = effort });
+        defer percent.deinit(a);
+        const percent_expected = if (uncolored) try a.dupe(u8, percent.plain) else try std.fmt.allocPrint(a, "({s}?%{s}) > ", .{ color, theme.reset });
+        defer a.free(percent_expected);
+        try std.testing.expectEqualStrings("(?%) > ", percent.plain);
+        try std.testing.expectEqualStrings(percent_expected, percent.styled);
+        for (0..12) |columns| {
+            for ([_]bool{ false, true }) |busy| {
+                const narrow = try prompt(a, "model", null, columns, .{ .busy = busy, .now_ms = 80, .reasoning_effort = effort });
+                defer narrow.deinit(a);
+                try std.testing.expectEqualStrings(if (busy) "⠙ " else "> ", narrow.plain);
+                try std.testing.expectEqualStrings(narrow.plain, narrow.styled);
+            }
+        }
     }
 }
 

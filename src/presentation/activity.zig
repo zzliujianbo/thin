@@ -16,56 +16,143 @@ pub fn rateBand(tenths: ?u64) RateBand {
 /// provider honored the option. Unknown/custom values never guess a level.
 pub const ReasoningEffort = enum {
     unspecified,
-    none,
+    none, // Legacy source alias; canonical spelling is off.
+    off,
     minimal,
     low,
     medium,
     high,
     xhigh,
+    max,
     unknown,
 
     pub fn fromName(configured: ?[]const u8) ReasoningEffort {
         const value = configured orelse return .unspecified;
-        inline for (.{ "none", "minimal", "low", "medium", "high", "xhigh" }) |known| {
+        if (std.mem.eql(u8, value, "none")) return .off;
+        inline for (.{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |known| {
             if (std.mem.eql(u8, value, known)) return @field(ReasoningEffort, known);
         }
         return .unknown;
     }
 
-    /// Request-option cycle only; no provider capability or hidden-depth claim.
-    pub fn next(self: ReasoningEffort) ReasoningEffort {
-        return switch (self) {
-            .unspecified, .unknown, .xhigh => .none,
-            .none => .minimal,
-            .minimal => .low,
-            .low => .medium,
-            .medium => .high,
-            .high => .xhigh,
-        };
+    pub fn canonical(self: ReasoningEffort) ReasoningEffort {
+        return if (self == .none) .off else self;
     }
     pub fn name(self: ReasoningEffort) ?[]const u8 {
         return switch (self) {
             .unspecified, .unknown => null,
-            .none => "none",
+            .none, .off => "off",
             .minimal => "minimal",
             .low => "low",
             .medium => "medium",
             .high => "high",
             .xhigh => "xhigh",
+            .max => "max",
         };
     }
 };
 
-test "request effort cycle is explicit wraps and never guesses custom levels" {
-    var effort: ReasoningEffort = .none;
-    for ([_]ReasoningEffort{ .minimal, .low, .medium, .high, .xhigh, .none }) |expected| {
-        effort = effort.next();
-        try std.testing.expectEqual(expected, effort);
-        try std.testing.expectEqual(effort, ReasoningEffort.fromName(effort.name()));
+/// Canonical order is shared by capability selection and Pi-style clamping.
+pub const effort_order = [_]ReasoningEffort{ .off, .minimal, .low, .medium, .high, .xhigh, .max };
+pub const EffortSet = struct {
+    mask: u8 = 0,
+
+    pub fn contains(self: EffortSet, effort: ReasoningEffort) bool {
+        for (effort_order, 0..) |level, i| {
+            if (level == effort.canonical()) return self.mask & (@as(u8, 1) << @intCast(i)) != 0;
+        }
+        return false;
     }
-    try std.testing.expectEqual(ReasoningEffort.none, ReasoningEffort.unspecified.next());
-    try std.testing.expectEqual(ReasoningEffort.none, ReasoningEffort.unknown.next());
-    try std.testing.expectEqual(@as(?[]const u8, null), ReasoningEffort.unknown.name());
+    pub fn first(self: EffortSet) ?ReasoningEffort {
+        for (effort_order) |level| if (self.contains(level)) return level;
+        return null;
+    }
+    pub fn count(self: EffortSet) usize {
+        return @popCount(self.mask & 0x7f);
+    }
+    pub fn next(self: EffortSet, current: ReasoningEffort) ?ReasoningEffort {
+        for (effort_order, 0..) |level, i| {
+            if (level == current.canonical()) {
+                for (1..effort_order.len + 1) |delta| {
+                    const candidate = effort_order[(i + delta) % effort_order.len];
+                    if (self.contains(candidate)) return candidate;
+                }
+                return null;
+            }
+        }
+        // A known set can start from an unspecified/custom current option.
+        // This is an explicit user choice; startup itself still emits no level.
+        return self.first();
+    }
+    /// Prefer the next stronger supported level, then the nearest weaker one.
+    pub fn clamp(self: EffortSet, requested: ReasoningEffort) ?ReasoningEffort {
+        for (effort_order, 0..) |level, i| {
+            if (level == requested.canonical()) {
+                for (effort_order[i..]) |candidate| if (self.contains(candidate)) return candidate;
+                var n = i;
+                while (n > 0) {
+                    n -= 1;
+                    if (self.contains(effort_order[n])) return effort_order[n];
+                }
+                return null;
+            }
+        }
+        return null;
+    }
+};
+
+test "effort sets canonical aliases bounded cycle and upward first clamp" {
+    const t = std.testing;
+    const set: EffortSet = .{ .mask = 1 | 4 | 16 | 64 };
+    try t.expectEqual(ReasoningEffort.off, ReasoningEffort.fromName("none"));
+    try t.expectEqualStrings("off", ReasoningEffort.none.name().?);
+    try t.expect(set.contains(.none));
+    try t.expectEqual(@as(usize, 4), set.count());
+    try t.expectEqual(ReasoningEffort.low, set.next(.none).?);
+    try t.expectEqual(ReasoningEffort.off, set.next(.max).?);
+    try t.expectEqual(ReasoningEffort.high, set.clamp(.medium).?);
+    try t.expectEqual(ReasoningEffort.max, set.clamp(.xhigh).?);
+    try t.expectEqual(ReasoningEffort.high, (EffortSet{ .mask = 16 }).clamp(.max).?);
+    try t.expectEqual(ReasoningEffort.high, (EffortSet{ .mask = 16 }).next(.high).?);
+    try t.expect((EffortSet{}).next(.high) == null);
+    try t.expect((EffortSet{}).first() == null);
+    try t.expect(set.clamp(.unknown) == null);
+    try t.expectEqual(ReasoningEffort.off, set.next(.unknown).?);
+    try t.expectEqual(ReasoningEffort.off, set.next(.unspecified).?);
+    try t.expect((EffortSet{}).next(.unspecified) == null);
+    // Every canonical subset: clamping picks upward first, cycling remains in
+    // the declared set and wraps in exactly count() supported transitions.
+    for (0..128) |bits| {
+        const subset: EffortSet = .{ .mask = @intCast(bits) };
+        for (effort_order, 0..) |requested, i| {
+            var expected: ?ReasoningEffort = null;
+            for (effort_order[i..]) |candidate| {
+                if (subset.contains(candidate)) {
+                    expected = candidate;
+                    break;
+                }
+            }
+            if (expected == null) {
+                var n = i;
+                while (n > 0) {
+                    n -= 1;
+                    if (subset.contains(effort_order[n])) {
+                        expected = effort_order[n];
+                        break;
+                    }
+                }
+            }
+            try t.expectEqual(expected, subset.clamp(requested));
+            if (subset.contains(requested)) {
+                var current = requested;
+                for (0..subset.count()) |_| {
+                    current = subset.next(current).?;
+                    try t.expect(subset.contains(current));
+                }
+                try t.expectEqual(requested, current);
+            }
+        }
+    }
 }
 
 /// Renderer-independent execution pulse; only active tool presentation uses it.
@@ -231,8 +318,8 @@ test "rate bands and configured effort have explicit unknown and stable mapping"
     try std.testing.expectEqual(ReasoningEffort.unspecified, ReasoningEffort.fromName(null));
     try std.testing.expectEqual(ReasoningEffort.unknown, ReasoningEffort.fromName("provider-custom"));
     try std.testing.expectEqual(ReasoningEffort.unknown, ReasoningEffort.fromName("HIGH"));
-    inline for (.{ "none", "minimal", "low", "medium", "high", "xhigh" }) |name| {
-        try std.testing.expectEqual(@field(ReasoningEffort, name), ReasoningEffort.fromName(name));
+    inline for (.{ "none", "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |name| {
+        try std.testing.expectEqual((@field(ReasoningEffort, name)).canonical(), ReasoningEffort.fromName(name));
     }
     try std.testing.expect(commandStep(0) != commandStep(120));
     try std.testing.expectEqual(commandStep(0), commandStep(960));
