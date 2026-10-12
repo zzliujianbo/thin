@@ -375,44 +375,41 @@ const Renderer = struct {
     fn selfFrom(raw: ?*anyopaque) *Renderer {
         return @ptrCast(@alignCast(raw.?));
     }
+    // Keep native -1 exclusively for parser OOM; callbacks carry their Zig
+    // error separately and never allow later callbacks to overwrite it.
+    const callback_abort: c_int = -2;
+    fn failed(self: *Renderer, err: anyerror) c_int {
+        if (self.failure == null) self.failure = err;
+        return callback_abort;
+    }
     fn enterBlockCb(kind: c_int, raw: ?*anyopaque, context: ?*anyopaque) callconv(.c) c_int {
         const self = selfFrom(context);
-        self.enterBlock(kind, raw) catch |err| {
-            self.failure = err;
-            return 1;
-        };
+        if (self.failure != null) return callback_abort;
+        self.enterBlock(kind, raw) catch |err| return self.failed(err);
         return 0;
     }
     fn leaveBlockCb(kind: c_int, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) c_int {
         const self = selfFrom(context);
-        self.leaveBlock(kind) catch |err| {
-            self.failure = err;
-            return 1;
-        };
+        if (self.failure != null) return callback_abort;
+        self.leaveBlock(kind) catch |err| return self.failed(err);
         return 0;
     }
     fn enterSpanCb(kind: c_int, raw: ?*anyopaque, context: ?*anyopaque) callconv(.c) c_int {
         const self = selfFrom(context);
-        self.enterSpan(kind, raw) catch |err| {
-            self.failure = err;
-            return 1;
-        };
+        if (self.failure != null) return callback_abort;
+        self.enterSpan(kind, raw) catch |err| return self.failed(err);
         return 0;
     }
     fn leaveSpanCb(kind: c_int, raw: ?*anyopaque, context: ?*anyopaque) callconv(.c) c_int {
         const self = selfFrom(context);
-        self.leaveSpan(kind, raw) catch |err| {
-            self.failure = err;
-            return 1;
-        };
+        if (self.failure != null) return callback_abort;
+        self.leaveSpan(kind, raw) catch |err| return self.failed(err);
         return 0;
     }
     fn textCb(kind: c_int, ptr: [*]const u8, size: c_uint, context: ?*anyopaque) callconv(.c) c_int {
         const self = selfFrom(context);
-        self.content(kind, ptr[0..size]) catch |err| {
-            self.failure = err;
-            return 1;
-        };
+        if (self.failure != null) return callback_abort;
+        self.content(kind, ptr[0..size]) catch |err| return self.failed(err);
         return 0;
     }
 };
@@ -577,8 +574,8 @@ pub fn render(a: Allocator, input: []const u8, options: Options) !Rendered {
             renderer.failure = err;
             break :blk clean;
         };
-        const result = if (renderer.failure != null) @as(c_int, 1) else md.md_parse(normalized.ptr, @intCast(normalized.len), &parser, &renderer);
-        if (result != 0) {
+        const result = if (renderer.failure != null) Renderer.callback_abort else md.md_parse(normalized.ptr, @intCast(normalized.len), &parser, &renderer);
+        if (result != 0 or renderer.failure != null) {
             if (renderer.failure) |failure| {
                 if (failure == error.OutOfMemory) return error.OutOfMemory;
             }
@@ -639,6 +636,35 @@ pub fn release(a: Allocator, rendered: Rendered) void {
 
 fn joined(a: Allocator, rendered: Rendered) ![]const u8 {
     return std.mem.join(a, "\n", rendered.lines);
+}
+
+test "Markdown callback OOM and complexity failures stay sticky and abort native parsing" {
+    for ([_]bool{ false, true }) |oom| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        const a = failing.allocator();
+        var budget: output.Budget = .{ .max_work = if (oom) 1024 else 0 };
+        var renderer: Renderer = .{ .w = .{ .a = a, .columns = 80, .ansi = false, .budget = &budget } };
+        defer renderer.w.deinit();
+        defer renderer.pending_text.deinit(a);
+        const parser: md.Parser = .{ .enter_block = Renderer.enterBlockCb, .leave_block = Renderer.leaveBlockCb, .enter_span = Renderer.enterSpanCb, .leave_span = Renderer.leaveSpanCb, .text = Renderer.textCb };
+        const source = "hello";
+        try std.testing.expectEqual(@as(c_int, -2), md.md_parse(source.ptr, source.len, &parser, &renderer));
+        const expected = if (oom) error.OutOfMemory else error.MarkdownRenderLimit;
+        try std.testing.expectEqual(expected, renderer.failure.?);
+        const depth = renderer.depth;
+        const work = budget.work;
+        // Invalid details would crash if a callback proceeded past the guard.
+        try std.testing.expectEqual(@as(c_int, -2), Renderer.enterBlockCb(7, null, &renderer));
+        try std.testing.expectEqual(@as(c_int, -2), Renderer.leaveBlockCb(999, null, &renderer));
+        try std.testing.expectEqual(@as(c_int, -2), Renderer.enterSpanCb(2, null, &renderer));
+        try std.testing.expectEqual(@as(c_int, -2), Renderer.leaveSpanCb(2, null, &renderer));
+        try std.testing.expectEqual(@as(c_int, -2), Renderer.textCb(0, source.ptr, source.len, &renderer));
+        try std.testing.expectEqual(expected, renderer.failure.?);
+        try std.testing.expectEqual(depth, renderer.depth);
+        try std.testing.expectEqual(work, budget.work);
+        try std.testing.expectEqual(@as(usize, 0), renderer.pending_text.items.len);
+        try std.testing.expectEqual(@as(usize, 0), renderer.w.lines.items.len);
+    }
 }
 
 test "reference destinations and opaque titles fall back before viewport selection" {

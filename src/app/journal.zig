@@ -29,6 +29,7 @@ pub const Journal = struct {
     first: bool = false,
 
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    wake: std.Io.Event = .unset,
     queue: [queue_limit][]u8 = undefined,
     head: usize = 0,
     count: usize = 0,
@@ -53,6 +54,7 @@ pub const Journal = struct {
         self.lock();
         self.stopping = true;
         self.unlock();
+        self.wake.set(self.root.io);
     }
 
     fn accepting(self: *Journal) bool {
@@ -74,7 +76,12 @@ pub const Journal = struct {
     fn pop(self: *Journal) ?[]u8 {
         self.lock();
         defer self.unlock();
-        if (self.count == 0) return null;
+        if (self.count == 0) {
+            // Only the single consumer resets, after its previous wait returned.
+            // Reset under the queue lock so enqueue cannot lose its wakeup.
+            self.wake.reset();
+            return null;
+        }
         const data = self.queue[self.head];
         self.head = (self.head + 1) % queue_limit;
         self.count -= 1;
@@ -93,6 +100,7 @@ pub const Journal = struct {
         self.outstanding += 1;
         self.bytes += data.len;
         self.unlock();
+        self.wake.set(self.root.io);
     }
 
     fn writeRecord(self: *Journal, data: []const u8) !void {
@@ -134,7 +142,7 @@ pub const Journal = struct {
                 };
             } else {
                 if (!self.accepting()) return;
-                std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake) catch |err| {
+                self.wake.wait(self.root.io) catch |err| {
                     self.fail(err);
                     return;
                 };
@@ -155,6 +163,7 @@ pub const Journal = struct {
         self.lock();
         self.stopping = true;
         self.unlock();
+        self.wake.set(self.root.io);
         self.wait(true);
     }
 
@@ -229,16 +238,25 @@ pub const Journal = struct {
     }
 
     fn record(self: *Journal, a: std.mem.Allocator, event: []const u8, data: anytype) !void {
-        const buffer = try a.alloc(u8, record_limit - 64);
-        defer a.free(buffer);
-        var writer = std.Io.Writer.fixed(buffer);
+        var small: [4096]u8 = undefined;
+        defer std.crypto.secureZero(u8, &small);
+        var large: ?[]u8 = null;
+        defer if (large) |buffer| a.free(buffer);
+        var writer = std.Io.Writer.fixed(&small);
         const timestamp = std.Io.Clock.real.now(self.root.io).toMilliseconds();
         const elapsed = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() - self.began_ms);
         const next = try std.math.add(u64, self.seq, 1);
-        std.json.Stringify.value(.{ .schema = 1, .seq = next, .turn = self.turn, .timestamp_ms = timestamp, .elapsed_ms = elapsed, .event = event, .data = data }, .{}, &writer) catch {
-            // 固定缓冲写满不产生半行，也不终止日志；保留 envelope 与省略原因。
-            writer = std.Io.Writer.fixed(buffer);
-            try std.json.Stringify.value(.{ .schema = 1, .seq = next, .turn = self.turn, .timestamp_ms = timestamp, .elapsed_ms = elapsed, .event = event, .data = .{ .omitted = true, .reason = "record_limit" } }, .{}, &writer);
+        const envelope = .{ .schema = 1, .seq = next, .turn = self.turn, .timestamp_ms = timestamp, .elapsed_ms = elapsed, .event = event, .data = data };
+        std.json.Stringify.value(envelope, .{}, &writer) catch {
+            // Fixed writers only fail when full. Retry once at the original cap;
+            // the observation's wiping arena owns this uncommon allocation.
+            large = try a.alloc(u8, record_limit - 64);
+            writer = std.Io.Writer.fixed(large.?);
+            std.json.Stringify.value(envelope, .{}, &writer) catch {
+                // 固定缓冲写满不产生半行，也不终止日志；保留 envelope 与省略原因。
+                writer = std.Io.Writer.fixed(large.?);
+                try std.json.Stringify.value(.{ .schema = 1, .seq = next, .turn = self.turn, .timestamp_ms = timestamp, .elapsed_ms = elapsed, .event = event, .data = .{ .omitted = true, .reason = "record_limit" } }, .{}, &writer);
+            };
         };
         const owned = try self.allocator.dupe(u8, writer.buffered());
         errdefer {
@@ -551,7 +569,80 @@ test "journal omits duplicated permission body and redacts JSON encoded call ide
     try std.testing.expectEqual(@as(usize, 2), ids);
 }
 
-fn canceledWriterSleep(_: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+test "journal small records use stack scratch and large retry preserves envelope" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
+    defer journal.deinit();
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var wiping = WipingAllocator{ .backing = counted.allocator() };
+    var arena = std.heap.ArenaAllocator.init(wiping.allocator());
+    defer arena.deinit();
+    journal.began_ms = std.Io.Clock.awake.now(root.io).toMilliseconds();
+    try journal.record(arena.allocator(), "state", .{ .state = r.State.calling_model });
+    try journal.record(arena.allocator(), "usage", p.Usage{ .input_tokens = 123 });
+    try std.testing.expectEqual(@as(usize, 0), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+
+    const payload: [8192]u8 = @splat('x');
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, journal.record(failing.allocator(), "large", .{ .text = &payload }));
+    try std.testing.expectEqual(@as(u64, 2), journal.seq);
+    try journal.record(arena.allocator(), "large", .{ .text = &payload });
+    try std.testing.expect(counted.allocated_bytes >= record_limit - 64);
+    journal.flush();
+    try std.testing.expectEqual(null, journal.failure());
+    const content = try root.read(std.testing.allocator, journal.store.path(), 0, record_limit);
+    defer std.testing.allocator.free(content.data);
+    var lines = std.mem.splitScalar(u8, content.data, '\n');
+    var seq: i64 = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        defer parsed.deinit();
+        seq += 1;
+        try std.testing.expectEqual(seq, parsed.value.object.get("seq").?.integer);
+        if (seq == 3) try std.testing.expectEqualStrings(&payload, parsed.value.object.get("data").?.object.get("text").?.string);
+    }
+    try std.testing.expectEqual(@as(i64, 3), seq);
+}
+
+fn expectWriterWaiting(journal: *Journal) !void {
+    const start = std.Io.Clock.awake.now(std.testing.io);
+    while (@atomicLoad(std.Io.Event, &journal.wake, .acquire) != .waiting) {
+        try std.testing.expectEqual(null, journal.failure());
+        try std.testing.expect(start.untilNow(std.testing.io, .awake).toMilliseconds() < 1000);
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+}
+
+test "journal enqueue wakes idle consumer and finish wakes empty consumer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
+    defer journal.deinit();
+    journal.observer().notify(.{ .submitted = "first" });
+    journal.flush();
+    for (0..16) |_| {
+        try expectWriterWaiting(&journal);
+        const previous = journal.seq;
+        journal.observer().notify(.{ .event = .{ .state = .calling_model } });
+        journal.flush();
+        try std.testing.expectEqual(previous + 1, journal.seq);
+    }
+    try expectWriterWaiting(&journal);
+    journal.finish();
+    try std.testing.expectEqual(null, journal.failure());
+    try std.testing.expect(journal.done and journal.worker == null);
+    try std.testing.expectEqual(@as(usize, 0), journal.outstanding);
+    try std.testing.expectEqual(@as(usize, 0), journal.bytes);
+}
+
+fn canceledWriterWait(_: ?*anyopaque, _: *const u32, _: u32, _: std.Io.Timeout) std.Io.Cancelable!void {
     return error.Canceled;
 }
 
@@ -561,7 +652,7 @@ test "journal idle writer failure is visible and never accepts stranded records"
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     var table = root.io.vtable.*;
-    table.sleep = canceledWriterSleep;
+    table.futexWait = canceledWriterWait;
     root.io.vtable = &table;
     var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
     defer journal.deinit();

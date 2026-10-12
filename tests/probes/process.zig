@@ -40,7 +40,6 @@ fn spawnOwned(io: Io, script: []const u8, env: *const std.process.Environ.Map) !
     const pid = child.id.?;
     // Never signal a negative PID before establishing ownership of this group.
     try t.expect(pid > 1 and getpgid(pid) == pid);
-    std.debug.print("\nPROBE_GROUP {d}\n", .{pid});
     return child;
 }
 
@@ -52,7 +51,6 @@ fn cleanup(io: Io, child: *std.process.Child, group: c.pid_t, owned: *bool) void
         child.stdout = null;
         child.stderr = null;
         child.id = null;
-        std.debug.print("\nPROBE_GROUP_DONE {d}\n", .{group});
     }
     if (!owned.*) return;
     // WNOWAIT confirms retained ownership, never kill(pid, 0). In particular,
@@ -201,7 +199,7 @@ test "probe: TERM reaches an owned process group and the shell reaps its child" 
     defer env.deinit();
     const script =
         \\trap 'wait; exit 0' TERM
-        \\sleep 60 &
+        \\sleep 10 &
         \\printf '%s\n' "$!"
         \\wait
     ;
@@ -228,6 +226,8 @@ test "probe: TERM reaches an owned process group and the shell reaps its child" 
 }
 
 // 验证：取消 wait 不会取代显式的 TERM 再 KILL 清理流程；子进程忽略 TERM，需要手动 KILL 所属组。
+// A finite workload avoids an immortal CPU loop if the probe itself is killed.
+// This is workload expiry, not guaranteed tree cleanup after arbitrary SIGKILL.
 test "probe: canceled wait does not replace explicit TERM then KILL cleanup" {
     var threaded = h.backend();
     defer threaded.deinit();
@@ -237,7 +237,7 @@ test "probe: canceled wait does not replace explicit TERM then KILL cleanup" {
     const script =
         \\trap '' TERM
         \\printf '%s\n' "$$"
-        \\while :; do :; done
+        \\while (( SECONDS < 10 )); do :; done
     ;
     var child = try spawnOwned(io, script, &env);
     const group = child.id.?;

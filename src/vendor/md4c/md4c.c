@@ -415,6 +415,16 @@ md_text_with_null_replacement(MD_CTX* ctx, MD_TEXTTYPE type, const CHAR* str, SZ
     } while(0)
 
 
+/* Processing helpers return zero on success, or any callback's nonzero code.
+ * Keep MD_CHECK for recognizers whose positive values mean successful matches. */
+#define MD_CHECK_PROCESS(func)                                              \
+    do {                                                                    \
+        ret = (func);                                                       \
+        if(ret != 0)                                                        \
+            goto abort;                                                     \
+    } while(0)
+
+
 #define MD_TEMP_BUFFER(sz)                                                  \
     do {                                                                    \
         if(sz > ctx->alloc_buffer) {                                        \
@@ -2225,17 +2235,23 @@ md_is_link_reference_definition(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lin
     /* So, it _is_ a reference definition. Remember it. */
     if(ctx->n_ref_defs >= ctx->alloc_ref_defs) {
         MD_REF_DEF* new_defs;
-
-        ctx->alloc_ref_defs = (ctx->alloc_ref_defs > 0
+        int new_alloc = (ctx->alloc_ref_defs > 0
                 ? ctx->alloc_ref_defs + ctx->alloc_ref_defs / 2
                 : 16);
-        new_defs = (MD_REF_DEF*) realloc(ctx->ref_defs, ctx->alloc_ref_defs * sizeof(MD_REF_DEF));
+
+        new_defs = (MD_REF_DEF*) realloc(ctx->ref_defs, new_alloc * sizeof(MD_REF_DEF));
         if(new_defs == NULL) {
             MD_LOG("realloc() failed.");
+            /* Report a fatal error, not "not a reference definition": the caller
+             * would otherwise keep parsing with a stale capacity. */
+            ret = -1;
             goto abort;
         }
 
         ctx->ref_defs = new_defs;
+        /* Commit the capacity only after realloc succeeded, so a failed
+         * growth never leaves alloc_ref_defs ahead of the real buffer. */
+        ctx->alloc_ref_defs = new_alloc;
     }
     def = &ctx->ref_defs[ctx->n_ref_defs];
     memset(def, 0, sizeof(MD_REF_DEF));
@@ -4346,7 +4362,7 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                         else
                             target_sz = closer->beg - opener->end;
 
-                        MD_CHECK(md_enter_leave_span_wikilink(ctx, (mark->ch != ']'),
+                        MD_CHECK_PROCESS(md_enter_leave_span_wikilink(ctx, (mark->ch != ']'),
                                  has_label ? STR(opener->beg+2) : STR(opener->end),
                                  target_sz));
 
@@ -4358,7 +4374,7 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                     title_mark = opener+2;
                     MD_ASSERT(title_mark->ch == 'D');
 
-                    MD_CHECK(md_enter_leave_span_a(ctx, (mark->ch != ']'),
+                    MD_CHECK_PROCESS(md_enter_leave_span_a(ctx, (mark->ch != ']'),
                                 (opener->ch == '!' ? MD_SPAN_IMG : MD_SPAN_A),
                                 STR(dest_mark->beg), dest_mark->end - dest_mark->beg, FALSE,
                                 md_mark_get_ptr(ctx, (int)(title_mark - ctx->marks)),
@@ -4417,7 +4433,7 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                     }
 
                     if(closer->flags & MD_MARK_VALIDPERMISSIVEAUTOLINK)
-                        MD_CHECK(md_enter_leave_span_a(ctx, (mark->flags & MD_MARK_OPENER),
+                        MD_CHECK_PROCESS(md_enter_leave_span_a(ctx, (mark->flags & MD_MARK_OPENER),
                                     MD_SPAN_A, dest, dest_size, TRUE, NULL, 0));
                     break;
                 }
@@ -4552,7 +4568,7 @@ md_process_table_cell(MD_CTX* ctx, MD_BLOCKTYPE cell_type, MD_ALIGN align, OFF b
     line.end = end;
 
     MD_ENTER_BLOCK(cell_type, &det);
-    MD_CHECK(md_process_normal_block_contents(ctx, &line, 1));
+    MD_CHECK_PROCESS(md_process_normal_block_contents(ctx, &line, 1));
     MD_LEAVE_BLOCK(cell_type, &det);
 
 abort:
@@ -4597,12 +4613,12 @@ md_process_table_row(MD_CTX* ctx, MD_BLOCKTYPE cell_type, OFF beg, OFF end,
     k = 0;
     for(i = 0; i < j-1  &&  k < col_count; i++) {
         if(pipe_offs[i] < pipe_offs[i+1]-1)
-            MD_CHECK(md_process_table_cell(ctx, cell_type, align[k++], pipe_offs[i], pipe_offs[i+1]-1));
+            MD_CHECK_PROCESS(md_process_table_cell(ctx, cell_type, align[k++], pipe_offs[i], pipe_offs[i+1]-1));
     }
     /* Make sure we call enough table cells even if the current table contains
      * too few of them. */
     while(k < col_count)
-        MD_CHECK(md_process_table_cell(ctx, cell_type, align[k++], 0, 0));
+        MD_CHECK_PROCESS(md_process_table_cell(ctx, cell_type, align[k++], 0, 0));
     MD_LEAVE_BLOCK(MD_BLOCK_TR, NULL);
 
 abort:
@@ -4635,14 +4651,14 @@ md_process_table_block_contents(MD_CTX* ctx, int col_count, const MD_LINE* lines
     md_analyze_table_alignment(ctx, lines[1].beg, lines[1].end, align, col_count);
 
     MD_ENTER_BLOCK(MD_BLOCK_THEAD, NULL);
-    MD_CHECK(md_process_table_row(ctx, MD_BLOCK_TH,
+    MD_CHECK_PROCESS(md_process_table_row(ctx, MD_BLOCK_TH,
                         lines[0].beg, lines[0].end, align, col_count));
     MD_LEAVE_BLOCK(MD_BLOCK_THEAD, NULL);
 
     if(n_lines > 2) {
         MD_ENTER_BLOCK(MD_BLOCK_TBODY, NULL);
         for(line_index = 2; line_index < n_lines; line_index++) {
-            MD_CHECK(md_process_table_row(ctx, MD_BLOCK_TD,
+            MD_CHECK_PROCESS(md_process_table_row(ctx, MD_BLOCK_TD,
                      lines[line_index].beg, lines[line_index].end, align, col_count));
         }
         MD_LEAVE_BLOCK(MD_BLOCK_TBODY, NULL);
@@ -4701,7 +4717,7 @@ md_process_normal_block_contents(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_li
     int ret;
 
     MD_CHECK(md_analyze_inlines(ctx, lines, n_lines, FALSE));
-    MD_CHECK(md_process_inlines(ctx, lines, n_lines));
+    MD_CHECK_PROCESS(md_process_inlines(ctx, lines, n_lines));
 
 abort:
     /* Free any temporary memory blocks stored within some dummy marks. */
@@ -4864,22 +4880,22 @@ md_process_leaf_block(MD_CTX* ctx, const MD_BLOCK* block)
             break;
 
         case MD_BLOCK_CODE:
-            MD_CHECK(md_process_code_block_contents(ctx, (block->data != 0),
+            MD_CHECK_PROCESS(md_process_code_block_contents(ctx, (block->data != 0),
                             (const MD_VERBATIMLINE*)(block + 1), block->n_lines));
             break;
 
         case MD_BLOCK_HTML:
-            MD_CHECK(md_process_verbatim_block_contents(ctx, MD_TEXT_HTML,
+            MD_CHECK_PROCESS(md_process_verbatim_block_contents(ctx, MD_TEXT_HTML,
                             (const MD_VERBATIMLINE*)(block + 1), block->n_lines));
             break;
 
         case MD_BLOCK_TABLE:
-            MD_CHECK(md_process_table_block_contents(ctx, block->data,
+            MD_CHECK_PROCESS(md_process_table_block_contents(ctx, block->data,
                             (const MD_LINE*)(block + 1), block->n_lines));
             break;
 
         default:
-            MD_CHECK(md_process_normal_block_contents(ctx,
+            MD_CHECK_PROCESS(md_process_normal_block_contents(ctx,
                             (const MD_LINE*)(block + 1), block->n_lines));
             break;
     }
@@ -4961,7 +4977,7 @@ md_process_all_blocks(MD_CTX* ctx)
                 }
             }
         } else {
-            MD_CHECK(md_process_leaf_block(ctx, block));
+            MD_CHECK_PROCESS(md_process_leaf_block(ctx, block));
 
             if(block->type == MD_BLOCK_CODE || block->type == MD_BLOCK_HTML)
                 byte_off += block->n_lines * sizeof(MD_VERBATIMLINE);
@@ -5676,7 +5692,7 @@ md_enter_child_containers(MD_CTX* ctx, int n_children)
             case _T('*'):
                 /* Remember offset in ctx->block_bytes so we can revisit the
                  * block if we detect it is a loose list. */
-                md_end_current_block(ctx);
+                MD_CHECK(md_end_current_block(ctx));
                 c->block_byte_off = ctx->n_block_bytes;
 
                 MD_CHECK(md_push_container_bytes(ctx,
@@ -6409,13 +6425,13 @@ md_process_doc(MD_CTX *ctx)
         MD_CHECK(md_process_line(ctx, &pivot_line, line));
     }
 
-    md_end_current_block(ctx);
+    MD_CHECK(md_end_current_block(ctx));
 
     MD_CHECK(md_build_ref_def_hashtable(ctx));
 
     /* Process all blocks. */
     MD_CHECK(md_leave_child_containers(ctx, 0));
-    MD_CHECK(md_process_all_blocks(ctx));
+    MD_CHECK_PROCESS(md_process_all_blocks(ctx));
 
     MD_LEAVE_BLOCK(MD_BLOCK_DOC, NULL);
 

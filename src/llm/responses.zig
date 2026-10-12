@@ -193,6 +193,90 @@ test "responses rejects incomplete truncation contradictions malformed args and 
     try std.testing.expectEqual(@as(?u64, null), out.usage.total());
 }
 
+// Refusal deltas are borrowed text drafts; completed native content remains authoritative.
+test "responses refusal drafts survive failure and commit native refusal exactly once" {
+    const Drafts = struct {
+        a: std.mem.Allocator,
+        text: std.ArrayList(u8) = .empty,
+        count: usize = 0,
+
+        fn emit(context: ?*anyopaque, event: p.ModelEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            switch (event) {
+                .text_delta => |delta| {
+                    try self.text.appendSlice(self.a, delta);
+                    self.count += 1;
+                },
+                else => return error.UnexpectedModelEvent,
+            }
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |fail| {
+        var drafts = Drafts{ .a = a };
+        var s = Stream.init(a, test_support.response_scope, .{ .context = &drafts, .emit_fn = Drafts.emit });
+        try s.feed("", "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\"}}");
+        try std.testing.expect(!s.observedContent());
+        try s.feed("", "{\"type\":\"response.refusal.delta\",\"output_index\":0,\"item_id\":\"m\",\"delta\":\"Cannot \"}");
+        try s.feed("", "{\"type\":\"response.refusal.delta\",\"output_index\":0,\"item_id\":\"m\",\"delta\":\"help.\"}");
+        try std.testing.expectEqualStrings("Cannot help.", drafts.text.items);
+        try std.testing.expectEqual(@as(usize, 2), drafts.count);
+        try std.testing.expect(s.observedContent());
+        if (fail) {
+            try s.feed("", "{\"type\":\"response.failed\"}");
+            try std.testing.expect((try s.finish()).failure.observed_content);
+        } else {
+            // Deliberately differs from the draft to catch concatenation/reuse.
+            try s.feed("", "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"Native refusal.\"}]}]}}");
+            const out = (try s.finish()).success;
+            try std.testing.expectEqual(@as(usize, 1), out.message.blocks.len);
+            try std.testing.expectEqualStrings("Native refusal.", out.message.blocks[0].text);
+            const native = try j.parse(a, out.message.replay.?.json);
+            const content = j.get(native.array.items[0], "content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), content.len);
+            try std.testing.expectEqualStrings("refusal", try c.text(content[0], "type"));
+            try std.testing.expectEqualStrings("Native refusal.", try c.text(content[0], "refusal"));
+        }
+        try std.testing.expectEqualStrings("Cannot help.", drafts.text.items);
+        try std.testing.expectEqual(@as(usize, 2), drafts.count);
+    }
+}
+
+test "responses refusal guards identity kind done and empty observation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const added = "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\"}}";
+    const delta = "{\"type\":\"response.refusal.delta\",\"output_index\":0,\"item_id\":\"m\",\"delta\":\"No\"}";
+    var empty = Stream.init(a, test_support.response_scope, .{});
+    try empty.feed("", added);
+    try empty.feed("", "{\"type\":\"response.refusal.delta\",\"output_index\":0,\"item_id\":\"m\",\"delta\":\"\"}");
+    try std.testing.expect(!empty.observedContent());
+    try empty.feed("", "{\"type\":\"response.failed\"}");
+    try std.testing.expect(!(try empty.finish()).failure.observed_content);
+
+    var wrong_id = Stream.init(a, test_support.response_scope, .{});
+    try wrong_id.feed("", added);
+    try std.testing.expectError(error.InconsistentItem, wrong_id.feed("", "{\"type\":\"response.refusal.delta\",\"output_index\":0,\"item_id\":\"wrong\",\"delta\":\"No\"}"));
+    try std.testing.expectError(error.InvalidStreamState, wrong_id.finish());
+
+    var wrong_index = Stream.init(a, test_support.response_scope, .{});
+    try wrong_index.feed("", added);
+    try std.testing.expectError(error.InconsistentItem, wrong_index.feed("", "{\"type\":\"response.refusal.delta\",\"output_index\":1,\"item_id\":\"m\",\"delta\":\"No\"}"));
+
+    var done = Stream.init(a, test_support.response_scope, .{});
+    try done.feed("", added);
+    try done.feed("", "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"No\"}]}}");
+    try std.testing.expectError(error.InvalidStreamState, done.feed("", delta));
+    try std.testing.expectError(error.InvalidStreamState, done.finish());
+
+    var wrong_kind = Stream.init(a, test_support.response_scope, .{});
+    try wrong_kind.feed("", "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"m\",\"type\":\"reasoning\"}}");
+    try std.testing.expectError(error.InconsistentItem, wrong_kind.feed("", delta));
+}
+
 /// 构造普通 message 输入项；assistant 决定使用 output_text 还是 input_text 类型。
 fn message(a: std.mem.Allocator, role: []const u8, text: []const u8, assistant: bool) !j.Value {
     var v = c.object(a);
@@ -510,11 +594,11 @@ pub const Stream = struct {
             return;
         }
 
-        // 文本与推理增量只发给上层作为草稿，不改变最终提交的内容。
-        if (c.eq(typ, "response.output_text.delta") or c.eq(typ, "response.reasoning_summary_text.delta") or c.eq(typ, "response.reasoning_text.delta")) {
+        // 文本、拒绝与推理增量只发给上层作为草稿，不改变最终提交的内容。
+        if (c.eq(typ, "response.output_text.delta") or c.eq(typ, "response.refusal.delta") or c.eq(typ, "response.reasoning_summary_text.delta") or c.eq(typ, "response.reasoning_text.delta")) {
             const item = try self.lookup(v);
             if (item.done) return error.InvalidStreamState;
-            const reasoning = !c.eq(typ, "response.output_text.delta");
+            const reasoning = c.eq(typ, "response.reasoning_summary_text.delta") or c.eq(typ, "response.reasoning_text.delta");
             if (!c.eq(item.kind, if (reasoning) "reasoning" else "message")) return error.InconsistentItem;
             const s = try c.text(v, "delta");
             if (s.len != 0) self.observed = true;

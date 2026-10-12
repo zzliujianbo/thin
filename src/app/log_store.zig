@@ -81,6 +81,21 @@ pub const Store = struct {
     /// marker 必须先于日志存在；不覆盖已有内容，失败遗留的半个 marker 也拒绝。
     fn ensureIgnore(self: *Store, dir_fd: c_int) !void {
         const linux = filesystem.linux;
+        // startTimestamp owns an independent open description for this directory.
+        // Cooperating starters must not inspect a marker still being initialized.
+        // Lock only this inode, bounded/cancellable; no lockfile or fsync promise.
+        var locked = false;
+        for (0..100) |_| {
+            if (linux.flock(dir_fd, 2 | 4) == 0) {
+                locked = true;
+                break;
+            }
+            const errno = std.c._errno().*;
+            if (errno != 11 and errno != 4) return filesystem.osError();
+            try std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake);
+        }
+        if (!locked) return error.LogStoreBusy;
+        defer _ = linux.flock(dir_fd, 8);
         const created = linux.openat(dir_fd, ".gitignore", 1 | linux.create | linux.exclusive | linux.nofollow | linux.cloexec | linux.nonblock, 0o600);
         if (created >= 0) {
             defer filesystem.closeFd(created);
@@ -450,6 +465,43 @@ test "log store ignore marker rejects unsafe modes content symlinks FIFO and dir
             try std.testing.expect(stat.permissions.toMode() & 0o077 != 0);
         }
     }
+}
+
+test "log store marker lock is bounded and independent stores start after release" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const thin = try Store.directory(root.dir.handle, ".thin");
+    defer filesystem.closeFd(thin);
+    const logs = try Store.directory(thin, "sessions");
+    defer filesystem.closeFd(logs);
+    var one = Store.init(std.testing.allocator, &root, .{});
+    defer one.deinit();
+    var two = Store.init(std.testing.allocator, &root, .{});
+    defer two.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), filesystem.linux.flock(logs, 2 | 4));
+    const before = try openFdCount();
+    const start = std.Io.Clock.awake.now(root.io);
+    try std.testing.expectError(error.LogStoreBusy, one.start());
+    const elapsed = start.untilNow(root.io, .awake).toMilliseconds();
+    try std.testing.expect(elapsed >= 200 and elapsed < 5000);
+    try std.testing.expectEqual(before, try openFdCount());
+    try std.testing.expect(one.file_fd == null and one.logs_fd == null);
+    try std.testing.expectEqual(@as(usize, 0), try jsonlCount(&root));
+    try std.testing.expectError(error.FileNotFound, root.dir.statFile(root.io, ".thin/sessions/.gitignore", .{}));
+    try std.testing.expectEqual(@as(c_int, 0), filesystem.linux.flock(logs, 8));
+    try one.append("{\"writer\":1}");
+    try two.append("{\"writer\":2}");
+    try std.testing.expect(!std.mem.eql(u8, one.path(), two.path()));
+    try expectContent(&root, one.path(), "{\"writer\":1}\n");
+    try expectContent(&root, two.path(), "{\"writer\":2}\n");
+    // Successful starts release the marker lock even while archive fds live.
+    try std.testing.expectEqual(@as(c_int, 0), filesystem.linux.flock(logs, 2 | 4));
+    try std.testing.expectEqual(@as(c_int, 0), filesystem.linux.flock(logs, 8));
+    one.deinit();
+    two.deinit();
+    try std.testing.expectEqual(before, try openFdCount());
 }
 
 test "log store marker partial creation fails closed without leaking or creating logs" {

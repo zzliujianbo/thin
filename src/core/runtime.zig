@@ -285,7 +285,8 @@ test "selection preserves canonical history and closes retained auto fallback" {
     try std.testing.expect(!runtime.selector.initial_attempted);
 }
 
-fn initialSelector(config: cfg.Config) llm.Selector {
+/// Shared by fresh runtimes and the explicit manual connectivity probe.
+pub fn initialSelector(config: cfg.Config) llm.Selector {
     var selector = llm.Selector.init(config.model.protocol);
     if (config.model.protocol == .auto and thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning).format == .deepseek) {
         // Declared Chat-only format is local metadata, not a failed POST or
@@ -294,6 +295,17 @@ fn initialSelector(config: cfg.Config) llm.Selector {
         selector.initial_attempted = true;
     }
     return selector;
+}
+
+/// Apply the same configured wire options to normal, summary and probe requests.
+pub fn withReasoning(config: cfg.Config, request_: p.Request) p.Request {
+    const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
+    const wire = capabilities.wire(config.model.reasoning_effort);
+    var result = request_;
+    result.reasoning_effort = wire.effort;
+    result.thinking = wire.thinking;
+    result.reasoning_format = capabilities.format;
+    return result;
 }
 
 /// Agent loop; owner serializes selection and worker execution.
@@ -557,16 +569,20 @@ pub const Runtime = struct {
         try checkCanceled(cancel);
         if (std.mem.trim(u8, text, " \t\r\n").len == 0 or !std.unicode.utf8ValidateSlice(text)) return error.InvalidInput;
         if (text.len > self.config.limits.max_response_bytes) return error.InputTooLarge;
-        // 记录本轮起点，之后压缩时保护本轮输入。
+        // Stage the current input without allocating its bytes in the history
+        // arena: rejected prompts must not accumulate unreachable copies.
+        // run is synchronous; text and this block remain alive through preflight,
+        // including summary calls. Host/observer callbacks only borrow strings.
         self.protected_index = self.history.items.len;
-        try self.history.append(self.arena.allocator(), try p.textMessage(self.arena.allocator(), .user, text));
-
-        // 摘要可能替换 arena 并重映射 protected_index；只撤回当前受保护输入，
-        // 不保存旧 slice，也不撤销已提交的摘要。正常请求一旦开始便不再回滚。
         var normal_started = false;
+        // Compaction may replace the arena and remap protected_index. Roll back
+        // only the current input, never an already committed summary. Install
+        // this guard before even the fallible message-header append.
         errdefer if (!normal_started) {
             self.history.items.len = self.protected_index;
         };
+        const input_blocks = [_]p.Block{.{ .text = text }};
+        try self.history.append(self.arena.allocator(), .{ .role = .user, .blocks = &input_blocks });
 
         while (true) {
             try checkCanceled(cancel);
@@ -587,6 +603,13 @@ pub const Runtime = struct {
             // 请求前的 raw token 数，事后用真实 usage 校准估算器。
             const raw = context.rawTokens(self.system, self.executor.schemas, self.history.items);
             var forward = Forward{ .runtime = self, .cancel = cancel };
+            // Before retaining a normal attempt, own the CURRENT protected
+            // message: preflight may have replaced history and its arena. Clone
+            // only once, not on every model/tool round. Any failure still rolls
+            // back the staged input before its stack block can escape runInner.
+            if (!normal_started) {
+                self.history.items[self.protected_index] = try p.cloneMessage(self.arena.allocator(), self.history.items[self.protected_index]);
+            }
             // 调用模型；协议选择与降级由 selector 处理。
             normal_started = true;
             const result = self.selector.call(self.model, result_arena.allocator(), self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
@@ -628,20 +651,15 @@ pub const Runtime = struct {
 
     /// 构造模型请求。摘要请求使用 summary_tokens 限制输出，其余使用 max_output_tokens。
     fn request(self: *Runtime, purpose: p.Purpose, messages_: []const p.Message, cancel: *const p.Cancellation) p.Request {
-        const capabilities = thinking.resolve(self.config.provider.base_url, self.config.model.name, self.config.model.reasoning);
-        const wire = capabilities.wire(self.config.model.reasoning_effort);
-        return .{
+        return withReasoning(self.config.*, .{
             .scope = .{ .connection = self.config.provider.base_url, .model = self.config.model.name, .protocol = self.selector.effective() },
             .system = self.system,
             .tools = self.executor.schemas,
             .messages = messages_,
             .max_output_tokens = if (purpose == .summary) self.config.limits.summary_tokens else self.config.limits.max_output_tokens,
-            .reasoning_effort = wire.effort,
-            .thinking = wire.thinking,
-            .reasoning_format = capabilities.format,
             .purpose = purpose,
             .cancellation = cancel,
-        };
+        });
     }
 
     /// 把模型流式事件转发为运行时事件；只转发文本、推理与工具预览，用量以最终结果为准。

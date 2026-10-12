@@ -10,6 +10,8 @@
 import http from 'node:http';
 import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
+import {EventEmitter} from 'node:events';
+import {PassThrough} from 'node:stream';
 import {mkdtemp, mkdir, writeFile, readFile, rm, access, stat, readdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {resolve, join} from 'node:path';
@@ -22,9 +24,10 @@ import {settingsRegressions} from './settings_mock.mjs';
 const [appArg, ptyArg] = process.argv.slice(2);
 
 // 参数缺失时 assert 直接抛出，进程以非零码退出。
-assert(appArg && ptyArg, 'usage: app_mock.mjs <thin executable> <PTY executable>');
+const watchdogOnly = appArg === '--watchdog-test';
+assert(watchdogOnly || (appArg && ptyArg), 'usage: app_mock.mjs <thin executable> <PTY executable>');
 // 转为绝对路径，避免子进程切换 cwd 后相对路径失效。
-const app = resolve(appArg), pty = resolve(ptyArg);
+const app = resolve(appArg), pty = resolve(ptyArg ?? appArg);
 const architectureTable = await readFile(new URL('../../src/tests/architecture_table.md', import.meta.url), 'utf8');
 
 // 假 API 密钥：通过 Authorization 头发送给伪造服务，并断言它不会出现在任何捕获的输出中。
@@ -102,20 +105,23 @@ function send(res, protocol, text, calls = [], truncated = false, nativeReasonin
  * 结束后断言输出不含假密钥与注入序列；对 thin 二进制还断言不含任何 ANSI 转义。
  * onChild 回调把子进程句柄及"仍归本函数管理"的判断交给调用方（取消测试需要）。
  */
-async function execute(bin, args, env, cwd, onChild, timeout = 30000) {
+async function execute(bin, args, env, cwd, onChild, timeout = 30000, spawnChild = spawn) {
   // detached 使子进程成为新进程组，便于整组发送信号。
-  const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore','pipe','pipe']});
+  const child = spawnChild(bin, args, {cwd, env, detached:true, stdio:['ignore','pipe','pipe']});
 
   // owned 表示子进程仍由本函数管理；退出后置为 false，防止向已回收的 PID 发信号。
-  let owned = true, size = 0, chunks = [], failure;
+  let owned = true, size = 0, chunks = [], failure, rejectWait;
+  // An exited leader cannot be signalled, but inherited pipes may stay open.
+  // Stop waiting/capturing independently of PID ownership on watchdog failure.
+  const abandonOutput = () => { child.stdout.destroy(); child.stderr.destroy(); rejectWait?.(failure); };
 
   // 向进程组发送 SIGTERM；忽略进程已退出导致的错误。
   const stop = () => { if (owned) { try { process.kill(-child.pid, 'SIGTERM'); } catch {} } };
 
   // 看门狗：超时记录失败并停止子进程。
-  const timer = setTimeout(() => { failure = new Error('application watchdog expired'); stop(); }, timeout);
-  // 升级定时器：超时后再过 3 秒，若仍归本函数管理则发送 SIGKILL。
-  const escalator = setTimeout(() => { if (owned) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} } }, timeout + 3000);
+  const timer = setTimeout(() => { failure = new Error('application watchdog expired'); stop(); if (!owned) abandonOutput(); }, timeout);
+  // Escalation also bounds the wait for capture EOF, not just the live process.
+  const escalator = setTimeout(() => { if (owned) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} } abandonOutput(); }, timeout + 3000);
 
   // 捕获输出；累计超过 2 MiB 则记录失败并终止子进程。
   const capture = b => { size += b.length; if (size <= 2*1024*1024) chunks.push(b); else { failure = new Error('output bound exceeded'); stop(); } };
@@ -124,14 +130,14 @@ async function execute(bin, args, env, cwd, onChild, timeout = 30000) {
   child.stdout.on('data', capture); child.stderr.on('data', capture);
 
   // 子进程退出后清除 owned 标记。
-  child.on('exit', () => { owned = false; });
+  child.on('exit', () => { owned = false; if (failure) abandonOutput(); });
 
   // 把句柄交给调用方（PTY 与取消场景需要向子进程发送信号）。
   onChild?.(child, () => owned);
 
   try {
     // 等待进程关闭（close 表示 stdio 全部关闭），取得退出码或信号；finally 中无论成功失败都清理定时器并终止残留进程组。
-    const result = await new Promise((res, rej) => { child.once('error', rej); child.once('close', (code, signal) => res({code, signal})); });
+    const result = await new Promise((res, rej) => { rejectWait = rej; child.once('error', rej); child.once('close', (code, signal) => res({code, signal})); });
 
     // 解码捕获的输出，并做安全断言：假密钥与注入序列不得出现。
     const output = Buffer.concat(chunks).toString('utf8');
@@ -608,7 +614,30 @@ async function scenario(name, protocol, kind, isPty = false) {
     await rm(root,{recursive:true,force:true});
   }
 }
+async function watchdogRegression() {
+  // Deterministic exit-without-close: no real PID is borrowed or signalled.
+  const child = new EventEmitter();
+  child.stdout = new PassThrough(); child.stderr = new PassThrough();
+  let pidReads = 0;
+  Object.defineProperty(child, 'pid', {get() { pidReads++; throw new Error('reaped PID accessed'); }});
+  let stillOwned;
+  const pending = execute('fixture', [], {}, '.', (_, owned) => { stillOwned = owned; }, 25, () => child);
+  child.emit('exit', 0);
+  assert.equal(stillOwned(), false);
+  let guard;
+  try {
+    await assert.rejects(Promise.race([pending, new Promise((_, reject) => {
+      guard = setTimeout(() => reject(new Error('capture did not stop')), 1000);
+    })]), /application watchdog expired/);
+    assert(child.stdout.destroyed && child.stderr.destroyed);
+    assert.equal(pidReads, 0);
+  } finally { clearTimeout(guard); child.emit('close', 0); await pending.catch(() => {}); }
+  console.log('PASS capture-watchdog: exited leader, open pipes, no stale PID signalling');
+}
+
 try {
+  await watchdogRegression();
+  if (!watchdogOnly) {
   // 运行全部场景：先测无配置的 help 与 print，再对 chat 与 responses 运行通用场景，最后运行 PTY 场景（仅 chat）。
   await scenario('PTY model/effort selection chat','chat','model-select',true);
   await scenario('PTY model/effort selection responses','responses','model-select',true);
@@ -628,6 +657,7 @@ try {
   await logRegressions(app,pty);
   await settingsRegressions({app,pty,execute,send});
   console.log('Application fixture suite passed; general PTY tests exercise chat, model selection also covers responses.');
+  }
 
 // 顶层捕获：任何场景失败都打印脱敏后的错误（替换密钥、去除控制字符），并以退出码 1 结束。
 } catch (error) {

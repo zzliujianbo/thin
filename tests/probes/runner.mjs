@@ -21,33 +21,28 @@ if (!executable || process.platform !== 'linux') {
 // 为本次运行创建独立临时目录（作为子进程 HOME 与证书目录），结束时递归删除。
 const directory = mkdtempSync(join(tmpdir(), 'thin-io-probes-'));
 
-// 运行期状态：活动 socket、受管进程组 PID、服务器列表、子进程句柄、看门狗与超时标记。
+// Runtime owns only its direct ChildProcess handle, never reported numeric PGIDs.
 const sockets = new Set();
-const processGroups = new Set();
 const servers = [];
 let child;
 let watchdog;
 let timedOut = false;
 let connectionId = 0;
+let rejectCompletion;
 
 // 临时自签名证书与私钥路径，由 openssl 在 try 块中生成。
 const key = join(directory, 'key.pem');
 const cert = join(directory, 'cert.pem');
 
-/**
- * 向进程组（负 PID）发送信号。拒绝非法或过小的 PID（<= 1），避免误杀系统进程；
- * 进程组已不存在（ESRCH）视为成功，其它错误原样抛出。
- */
-function signalGroup(pid, signal) {
-  if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error('Invalid owned process group');
-  try { process.kill(-pid, signal); }
-  catch (error) { if (error.code !== 'ESRCH') throw error; }
+function stopChild() {
+  if (child?.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
 }
 
-/** 强制结束被测子进程组以及 processGroups 中登记的所有进程组（SIGKILL）。 */
-function stopChild() {
-  if (child?.pid) signalGroup(child.pid, 'SIGKILL');
-  for (const pid of processGroups) signalGroup(pid, 'SIGKILL');
+function stopWaiting() {
+  timedOut = true;
+  stopChild();
+  child?.stdout.destroy(); child?.stderr.destroy();
+  rejectCompletion?.(new Error('Probe watchdog expired'));
 }
 
 /**
@@ -128,29 +123,10 @@ async function listen(server) {
   return server.address().port;
 }
 
-/**
- * 把子进程的输出流原样转发到 destination，并按行解析 PROBE_GROUP <pid> 与
- * PROBE_GROUP_DONE <pid> 标记，用于登记和注销需要清理的进程组。跨 chunk 的不完整行会被缓存。
- */
-function relay(stream, destination) {
-  let partial = '';
-  stream.on('data', chunk => {
-    destination.write(chunk);
-    partial += chunk.toString();
-
-    const lines = partial.split('\n');
-    partial = lines.pop();
-    for (const line of lines) {
-      const match = /^PROBE_GROUP (\d+)$/.exec(line);
-      if (match) processGroups.add(Number(match[1]));
-      const done = /^PROBE_GROUP_DONE (\d+)$/.exec(line);
-      if (done) processGroups.delete(Number(done[1]));
-    }
-  });
-}
-
-// 收到 SIGTERM/SIGINT 时标记超时并结束被测进程组，随后由 finally 完成清理。
-const interrupted = () => { timedOut = true; stopChild(); };
+// Group cleanup belongs to native code retaining an unreaped child. Printed
+// PGIDs cannot transfer that authority: markers may arrive after child reap.
+// Abnormal probe death can leave finite fixture workloads until their expiry.
+const interrupted = stopWaiting;
 process.on('SIGTERM', interrupted);
 process.on('SIGINT', interrupted);
 
@@ -185,19 +161,15 @@ try {
     },
   });
 
-  // 转发 stdout/stderr，并解析进程组登记标记。
-  relay(child.stdout, process.stdout);
-  relay(child.stderr, process.stderr);
+  child.stdout.pipe(process.stdout, {end: false});
+  child.stderr.pipe(process.stderr, {end: false});
 
-  // 60 秒看门狗：超时后标记 timedOut 并杀死所有受管进程组。
-  watchdog = setTimeout(() => {
-    timedOut = true;
-    console.error('PROBE WATCHDOG: exceeded 60 seconds; killing owned test processes.');
-    stopChild();
-  }, 60_000);
+  // Bound completion even if an exited leader's descendants retain its pipes.
+  watchdog = setTimeout(stopWaiting, 60_000);
 
   // 等待子进程关闭；被信号终止时视为失败（退出码 1）。
   const code = await new Promise((resolveExit, reject) => {
+    rejectCompletion = reject;
     child.once('error', reject);
     child.once('close', (exitCode, signal) => resolveExit(signal ? 1 : exitCode));
   });
@@ -208,8 +180,8 @@ try {
 // harness 自身失败（如 openssl 缺失、监听失败）时打印错误并返回 1。
 } catch (error) {
   console.error('Probe harness failed:', error.message);
-  process.exitCode = 1;
-// 无论成功还是失败都执行：取消看门狗、杀死残留进程组、销毁连接、关闭服务器并删除临时目录。
+  process.exitCode = timedOut ? 124 : 1;
+// Cancel the watchdog, stop only the unreaped direct child and close fixtures.
 } finally {
   clearTimeout(watchdog);
   stopChild();

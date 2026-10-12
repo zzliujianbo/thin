@@ -86,16 +86,18 @@ test "tools validate containment and Memory namespace before approval" {
     const temp = arena.allocator();
     const executor = tools.executor();
 
-    // 直接写 memory 目录（包括 ./ 与 // 的归一化变体）必须被引导到 memory 工具。
-    for ([_][]const u8{ ".thin", ".thin/mem/core.md", ".thin//./mem/a.md" }) |path| {
+    var cancel = p.Cancellation{};
+    const memory_path = try std.fs.path.join(temp, &.{ root.path, ".thin/mem/core.md" });
+    // Both entrypoints protect Memory aliases; direct calls cannot bypass CAS.
+    for ([_][]const u8{ ".thin", ".thin/mem/core.md", ".thin//./mem/a.md", memory_path }) |path| {
         const args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
         try std.testing.expectError(error.UseMemoryTool, executor.prepare_fn(executor.context, temp, .{ .id = "c", .name = "write_file", .arguments = args }));
+        try std.testing.expectError(error.UseMemoryTool, tools.execute(temp, .{ .write_file = .{ .path = path, .content = "x" } }, &cancel));
     }
 
     // 新旧会话目录的绝对/相对别名都受保护；直接执行也不能绕过。
     const session_path = try std.fs.path.join(temp, &.{ root.path, ".thin/sessions/session.jsonl" });
     const legacy_path = try std.fs.path.join(temp, &.{ root.path, ".thin/logs/session.jsonl" });
-    var cancel = p.Cancellation{};
     for ([_][]const u8{ ".thin/sessions/session.jsonl", "./.thin//./sessions/session.jsonl", session_path, ".thin/logs/session.jsonl", "./.thin//./logs/session.jsonl", legacy_path }) |path| {
         const args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\"}}", .{path});
         try std.testing.expectError(error.ProtectedSessionFile, executor.prepare_fn(executor.context, temp, .{ .id = "session", .name = "read_file", .arguments = args }));

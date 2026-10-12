@@ -1188,6 +1188,10 @@ const Ui = struct {
         for (self.records.items, 0..) |*record, index| {
             if (record.kind == .reasoning) continue;
             const drafting = self.draft == index;
+            if (record.output and !preview and !drafting) {
+                previous_kind = record.kind;
+                continue;
+            }
             try record.layout(self.allocator, @max(1, cols));
             const heading = if (record.interrupted) "Interrupted response — preview" else if (record.excerpt) "Display excerpt" else "";
             if (cols >= 8 and !record.output and !drafting) {
@@ -1243,7 +1247,10 @@ const Ui = struct {
             const state = self.connection.current();
             break :blk try std.fmt.allocPrint(a, "API key for model {s}\nBase URL: {s}\nEnter saves locally; no network request is made here", .{ state.model, state.base_url });
         } else "";
-        const secret_lines = try markdown.render(a, secret_destination, .{ .columns = @max(1, cols), .max_lines = 8, .markdown = false });
+        const empty_rendered: markdown.Rendered = .{ .lines = &.{}, .total_lines = 0, .truncated = false };
+        const secret_lines = if (self.secret_mode) try markdown.render(a, secret_destination, .{ .columns = @max(1, cols), .max_lines = 8, .markdown = false }) else empty_rendered;
+        // One frame-local plain render serves both sizing and the deny-only latch.
+        const approval_lines = if (self.permission) |permission| try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false }) else empty_rendered;
         const state = self.connection.current();
         // App-prepared immutable value, including local /auth activation.
         // Draw never dereferences Runtime, not even a fixture/idle pointer.
@@ -1256,8 +1263,8 @@ const Ui = struct {
         const picker_rows = if (self.model_picker) |*picker| try picker.rows(a, state.model, state.context_limit, state.models, cols, body_limit) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
         self.frame_model_epoch = null;
         self.frame_model_generation = null;
-        const wanted_body = if (self.permission) |permission|
-            @min(body_limit, 1 + @max(1, (try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false })).lines.len))
+        const wanted_body = if (self.permission != null)
+            @min(body_limit, 1 + @max(1, approval_lines.lines.len))
         else if (self.secret_mode) secret_lines.lines.len else if (self.model_picker != null) picker_rows.lines.len else if (thinking != null) @min(thinking_gap + @min(3, thinking_lines.len), body_limit) else @min(lines.items.len, body_limit);
         // Initial blank space keeps the first conversation at the top. Each
         // immutable row consumes it; expanding drafts scroll old content upward.
@@ -1285,7 +1292,7 @@ const Ui = struct {
                 self.frame_permission = null;
             } else if (self.permission) |permission| {
                 // Plain rendering: tool input must not hide behind Markdown formatting.
-                const all = try markdown.render(a, permission.description, .{ .columns = cols, .max_lines = 8192, .markdown = false });
+                const all = approval_lines;
                 const clipped = permission.clipped or all.truncated or all.total_lines > all.lines.len;
 
                 // 把截断状态写回审批，供 key 处理判断是否只允许拒绝。
@@ -1398,10 +1405,11 @@ const Ui = struct {
             }
         }
 
-        var candidate = try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset);
+        const snapshot_allowed = self.permission == null and self.model_picker == null and !self.secret_mode and !self.secret_quarantine;
+        var candidate = if (snapshot_allowed) try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset) else null;
         errdefer if (candidate) |*snapshot| snapshot.deinit();
         const sparse = transcript_rows == 0 and !self.abandon_tail and self.tail_height == rows and
-            self.permission == null and self.model_picker == null and !self.secret_mode and !self.secret_quarantine and
+            snapshot_allowed and
             self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows and
             self.tail_snapshot != null and candidate != null;
         writer = &out.writer;
@@ -1961,6 +1969,66 @@ test "file captions are contiguous but separated from final prose and percent co
     ui.finishFrame();
 }
 
+test "committed large Markdown caches stay untouched on resize until history preview opens" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var source: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    for ([_][]const u8{ "once-history-marker", "second-history-marker" }) |marker| {
+        source.clearRetainingCapacity();
+        try source.writer.print("{s}\n\n", .{marker});
+        for (0..64) |_| try source.writer.writeAll("**wide paragraph** with enough words to wrap at the smaller preview width.\n\n");
+        _ = try ui.add(.assistant, source.written());
+    }
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    const old_columns = ui.records.items[0].columns;
+    const caches = .{ ui.records.items[0].cache.?.state, ui.records.items[1].cache.?.state };
+    const line_ptrs = .{ ui.records.items[0].lines.ptr, ui.records.items[1].lines.ptr };
+    ui.resize(.{ .columns = 41, .rows = 24 });
+    try ui.draw();
+    inline for (0..2) |i| {
+        const record = &ui.records.items[i];
+        try std.testing.expect(record.output and !record.pending_output);
+        try std.testing.expectEqual(old_columns, record.columns);
+        try std.testing.expectEqualDeep(caches[i], record.cache.?.state);
+        try std.testing.expectEqual(line_ptrs[i], record.lines.ptr);
+    }
+    try std.testing.expect(std.mem.find(u8, ui.frame, "history-marker") == null);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    ui.scroll = 1;
+    try ui.draw();
+    for (ui.records.items) |*record| {
+        try std.testing.expectEqual(@as(usize, 40), record.columns);
+        try std.testing.expect(record.output and !record.pending_output);
+        for (record.lines) |line| {
+            var at: usize = 0;
+            var width: usize = 0;
+            while (at < line.len) {
+                const cluster = text.nextStyledCluster(line, at, width);
+                width += cluster.width;
+                at = cluster.end;
+            }
+            try std.testing.expect(width <= 40);
+        }
+    }
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    ui.scroll = 0;
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    // Screen is only a fixed-grid transcript counter, not a resize/reflow oracle.
+    try std.testing.expectEqual(@as(usize, 1), screen.count("once-history-marker"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("second-history-marker"));
+}
+
 test "stable large table body is not erased or reprinted for a footer animation tick" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -2011,12 +2079,14 @@ test "one-pass transcript separators erase acknowledged approval preview before 
     try screen.replay(ui.frame);
     ui.finishFrame();
     try std.testing.expect(screen.visible("Approval #1"));
+    try std.testing.expect(ui.tail_snapshot == null);
     // The actual loop can answer and receive results before its next draw slot.
     ui.clearPermission();
     _ = try ui.add(.tool, "completed-tool-result");
     _ = try ui.add(.user, "next-user-record");
     _ = try ui.add(.assistant, "short-canonical-record");
     try ui.draw();
+    try std.testing.expect(!ui.frame_sparse and ui.frame_tail_snapshot != null);
     try screen.replay(ui.frame);
     ui.finishFrame();
     try std.testing.expectEqual(@as(usize, 0), screen.count("Approval #1"));

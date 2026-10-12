@@ -61,6 +61,39 @@ test "known DeepSeek format selects Chat before an auto request even when effort
         try std.testing.expect(owner.selector.initial_attempted);
         try std.testing.expectEqual(p.Protocol.auto, owner.selector.configured);
         try std.testing.expect(config.model.reasoning_effort == null);
+        try std.testing.expectEqualDeep(owner.selector, r.initialSelector(config));
+    }
+}
+
+test "shared request options encode custom mapping and DeepSeek probe parity offline" {
+    const a = std.testing.allocator;
+    for ([_]thinking.Format{ .standard, .deepseek }) |format| {
+        var config: cfg.Config = .{
+            .provider = .{ .base_url = "https://proxy.invalid" },
+            .model = .{ .name = "custom", .context_tokens = 32768, .protocol = .auto, .reasoning = .{ .format = format, .map = .{ .off = "off", .high = "intensive" } } },
+        };
+        for ([_]?[]const u8{ null, "off", "high" }) |effort| {
+            config.model.reasoning_effort = effort;
+            const selector = r.initialSelector(config);
+            const req = r.withReasoning(config, support.request(selector.effective()));
+            try std.testing.expectEqual(format, req.reasoning_format);
+            const encoded = if (selector.effective() == .chat) try chat.encode(a, req) else try responses.encode(a, req);
+            defer a.free(encoded);
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+            defer parsed.deinit();
+            const object = parsed.value.object;
+            if (effort) |level| {
+                if (format == .deepseek) {
+                    const off = std.mem.eql(u8, level, "off");
+                    try std.testing.expectEqualStrings(if (off) "disabled" else "enabled", object.get("thinking").?.object.get("type").?.string);
+                    if (off) try std.testing.expect(!object.contains("reasoning_effort")) else try std.testing.expectEqualStrings("intensive", object.get("reasoning_effort").?.string);
+                } else {
+                    try std.testing.expectEqualStrings(if (std.mem.eql(u8, level, "off")) "off" else "intensive", object.get("reasoning").?.object.get("effort").?.string);
+                }
+            } else {
+                try std.testing.expect(!object.contains("thinking") and !object.contains("reasoning") and !object.contains("reasoning_effort"));
+            }
+        }
     }
 }
 

@@ -167,21 +167,6 @@ fn validatePath(path: []const u8) !void {
     while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return error.PathEscape;
 }
 
-/// 判断相对路径是否指向 .thin/mem 之下（忽略 "." 段）；write_file 据此拒绝，强制走 memory 工具。
-fn isMemoryPath(relative: []const u8) bool {
-    var parts = std.mem.tokenizeScalar(u8, relative, '/');
-    // first 记录第一个有效段；它必须是 .thin，紧随其后的有效段必须是 mem。
-    var first: ?[]const u8 = null;
-    while (parts.next()) |part| {
-        if (std.mem.eql(u8, part, ".")) continue;
-        if (first == null) {
-            if (!std.mem.eql(u8, part, ".thin")) return false;
-            first = part;
-        } else return std.mem.eql(u8, part, "mem");
-    }
-    return first != null;
-}
-
 /// 工具执行结果，直接来自 runtime 模块（text、is_error、canceled 等标记）。
 pub const Execution = runtime.Execution;
 
@@ -199,7 +184,13 @@ pub const Tools = struct {
     /// 即使启动目录是 HOME 或 HOME 本身是别名，也不能通过模型文件工具泄露凭证。
     auth_path: ?[]const u8 = null,
 
-    fn checkProtectedPath(self: *Tools, a: std.mem.Allocator, path: []const u8) !void {
+    /// Both preparation and direct execution use the same anchored path policy.
+    fn checkFileAction(self: *Tools, a: std.mem.Allocator, action: Action) !void {
+        const path = switch (action) {
+            .read_file => |read| read.path,
+            .write_file => |write| write.path,
+            else => return,
+        };
         const relative = try self.root.relative(path);
         // 会话记录不作为普通模型文件输入，也不允许工具篡改自己的留档。
         // 跳过点段和重复分隔符，保证绝对/相对路径别名使用同一规则。
@@ -211,6 +202,8 @@ pub const Tools = struct {
                 if (!std.mem.eql(u8, part, ".thin")) break;
                 in_thin = true;
             } else {
+                in_thin = false; // A second non-dot component exists.
+                if (action == .write_file and std.mem.eql(u8, part, "mem")) return error.UseMemoryTool;
                 // Exact project settings path only; ignore dot/slash aliases.
                 if (std.mem.eql(u8, part, settings.file_name)) {
                     var exact = true;
@@ -227,6 +220,8 @@ pub const Tools = struct {
                 break;
             }
         }
+        // Writing the .thin parent itself must not replace the Memory namespace.
+        if (in_thin and action == .write_file) return error.UseMemoryTool;
         const protected = self.auth_path orelse return;
         const absolute = try std.fs.path.resolve(a, &.{ self.root.path, path });
         defer a.free(absolute);
@@ -243,19 +238,7 @@ pub const Tools = struct {
         const self: *Tools = @ptrCast(@alignCast(context_));
         const action = try a.create(Action);
         action.* = try parse(a, call.name, call.arguments, self.config.limits);
-        switch (action.*) {
-            .read_file => |r| {
-                // relative 做包含检查，确保路径仍位于启动项目根目录内。
-                try self.checkProtectedPath(a, r.path);
-            },
-            .write_file => |w| {
-                try self.checkProtectedPath(a, w.path);
-                // 写文件工具不得直接改 .thin/mem，必须走 memory 工具以保证版本与锁语义。
-                const relative = try self.root.relative(w.path);
-                if (isMemoryPath(relative)) return error.UseMemoryTool;
-            },
-            else => {},
-        }
+        try self.checkFileAction(a, action.*);
         return .{ .payload = action, .description = try action.description(a), .requires_approval = action.requiresApproval() };
     }
 
@@ -274,11 +257,7 @@ pub const Tools = struct {
         if (cancel.isRequested()) return .{ .text = "Canceled before execution", .is_error = true, .canceled = true };
 
         // 直接执行入口也校验，避免绕过 prepare；已批准的任意 bash 仍不属于沙箱。
-        switch (action) {
-            .read_file => |read| try self.checkProtectedPath(a, read.path),
-            .write_file => |write| try self.checkProtectedPath(a, write.path),
-            else => {},
-        }
+        try self.checkFileAction(a, action);
 
         var value = j.object(a);
         switch (action) {
@@ -483,7 +462,7 @@ test "project settings exact aliases protected at prepare and direct execute" {
     const absolute = try std.fs.path.join(a, &.{ root.path, ".thin/./settings.json" });
     var cancel: p.Cancellation = .{};
     for ([_][]const u8{ settings.relative_path, "./.thin//./settings.json", ".thin/./settings.json/.", absolute }) |path| {
-        try std.testing.expectError(error.ProtectedSettingsFile, tools.checkProtectedPath(a, path));
+        try std.testing.expectError(error.ProtectedSettingsFile, tools.checkFileAction(a, .{ .read_file = .{ .path = path } }));
         try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .read_file = .{ .path = path } }, &cancel));
         try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .write_file = .{ .path = path, .content = "x" } }, &cancel));
         const read_args = try std.fmt.allocPrint(a, "{{\"path\":\"{s}\"}}", .{path});
@@ -492,8 +471,8 @@ test "project settings exact aliases protected at prepare and direct execute" {
         try std.testing.expectError(error.ProtectedSettingsFile, Tools.prepare(&tools, a, .{ .id = "w", .name = "write_file", .arguments = write_args }));
     }
     for ([_][]const u8{ ".thin/settings.jsonfoo", ".thin/sub/settings.json", "settings.json", ".thin/settings.json/child" }) |path| {
-        try tools.checkProtectedPath(a, path);
+        try tools.checkFileAction(a, .{ .read_file = .{ .path = path } });
     }
-    try std.testing.expectError(error.ProtectedSessionFile, tools.checkProtectedPath(a, ".thin/sessions/x"));
-    try std.testing.expectError(error.ProtectedSessionFile, tools.checkProtectedPath(a, ".thin/logs/x"));
+    try std.testing.expectError(error.ProtectedSessionFile, tools.checkFileAction(a, .{ .read_file = .{ .path = ".thin/sessions/x" } }));
+    try std.testing.expectError(error.ProtectedSessionFile, tools.checkFileAction(a, .{ .read_file = .{ .path = ".thin/logs/x" } }));
 }

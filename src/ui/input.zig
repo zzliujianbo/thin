@@ -103,6 +103,9 @@ pub const Parser = struct {
 
     /// 状态机核心，按顺序处理：ESC 序列 -> UTF-8 续字节 -> 粘贴模式 -> 普通按键。
     fn byte(self: *Parser, b: u8, sink: Sink) !void {
+        // CRLF folding requires adjacent bytes, including across feed calls.
+        // ESC/UTF-8 early returns must also break adjacency; a CR below sets it again.
+        if (b != '\n') self.pasted_cr = false;
         // 中文：状态一，正在收集 ESC 序列。
         if (self.escape_len != 0) {
             // 中文：序列中途的 Ctrl-C / Ctrl-D 仍视为取消 / 退出；粘贴中则忽略。
@@ -401,6 +404,30 @@ test "split UTF8 and bracketed paste cannot submit, cancel or authorize" {
     try std.testing.expectEqual(@as(usize, 1), record.enters);
     try std.testing.expectEqual(@as(usize, 1), record.cancels);
     try std.testing.expect(record.pasted > 0);
+}
+
+test "pasted CRLF requires immediate byte adjacency across feeds" {
+    const cases = .{
+        .{ "A\r你\nB", "A\n你\nB" },
+        .{ "A\r\nB", "A\nB" },
+        .{ "A\r\r\nB", "A\n\nB" },
+        .{ "A\r\x1b[A\nB", "A\n\nB" },
+        .{ "A\r\xe4\nB", "A\n\nB" },
+    };
+    inline for (cases) |case| {
+        for ([_]bool{ false, true }) |split| {
+            var record = Record{};
+            var parser = Parser{};
+            const sink = Sink{ .context = &record, .emit_fn = Record.event };
+            const sequence = "\x1b[200~" ++ case[0] ++ "\x1b[201~";
+            if (split) {
+                for (sequence) |b| try parser.feed(&.{b}, sink);
+            } else try parser.feed(sequence, sink);
+            try std.testing.expectEqualStrings(case[1], record.data[0..record.len]);
+            try std.testing.expectEqual(@as(usize, 0), record.enters);
+            try std.testing.expectEqual(@as(usize, 0), record.cancels);
+        }
+    }
 }
 
 test "split ShiftTab and Escape expiry never activate pasted or secret settings" {

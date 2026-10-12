@@ -513,6 +513,84 @@ test "Runtime local budget rejection recovers first and established turns for ev
     }
 }
 
+test "Runtime rejected prompts keep outstanding allocations bounded" {
+    const Counting = struct {
+        backing: std.mem.Allocator,
+        outstanding: usize = 0,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+            self.outstanding += len;
+            return bytes;
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.outstanding -= bytes.len;
+            self.backing.rawFree(bytes, alignment, ra);
+        }
+    };
+    var bounded = true;
+    for ([_]bool{ false, true }) |retained| {
+        var counting = Counting{ .backing = std.testing.allocator };
+        {
+            var fake = Fake{ .stop_after = 0 };
+            const config = smallConfiguration();
+            var runtime = try r.Runtime.init(counting.allocator(), std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
+            defer runtime.deinit();
+            fake.current_runtime = &runtime;
+            var cancel: p.Cancellation = .{};
+            if (retained) try std.testing.expectEqual(r.Status.success, (try runtime.run("Do the task", &cancel)).status);
+            const calls_before = fake.normal_calls;
+            const messages_before = runtime.messages().len;
+            const oversized: [16000]u8 = @splat('x');
+            try std.testing.expect(oversized.len < config.limits.max_response_bytes);
+            var first_outstanding: usize = 0;
+            for (0..16) |i| {
+                const terminal = try runtime.run(&oversized, &cancel);
+                try std.testing.expectEqual(r.Status.failed, terminal.status);
+                try std.testing.expectEqual(error.ContextTooLarge, terminal.detail.?);
+                try std.testing.expectEqual(messages_before, runtime.messages().len);
+                try std.testing.expectEqual(calls_before, fake.normal_calls);
+                try std.testing.expectEqual(@as(u32, 0), fake.summary_calls);
+                if (i == 0) first_outstanding = counting.outstanding;
+            }
+            std.debug.print("rejected-input retained={any}: outstanding first={d}, after16={d}\n", .{ retained, first_outstanding, counting.outstanding });
+            bounded = bounded and counting.outstanding <= first_outstanding + 4096;
+            if (retained) {
+                try std.testing.expectEqualStrings("Do the task", runtime.messages()[0].blocks[0].text);
+                try std.testing.expectEqualStrings("done", runtime.messages()[1].blocks[0].text);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), counting.outstanding);
+    }
+    try std.testing.expect(bounded);
+}
+
+test "Runtime successful input owns bytes after caller mutation" {
+    var fake = Fake{ .stop_after = 0 };
+    const config = configuration();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    var cancel: p.Cancellation = .{};
+    var prompt = "Do the task".*;
+    try std.testing.expectEqual(r.Status.success, (try runtime.run(&prompt, &cancel)).status);
+    @memset(&prompt, 'x');
+    try std.testing.expectEqualStrings("Do the task", runtime.messages()[0].blocks[0].text);
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("continue", &cancel)).status);
+    try std.testing.expectEqualStrings("Do the task", runtime.messages()[0].blocks[0].text);
+}
+
 test "Runtime rollback after committed compaction uses remapped history" {
     var fake = Fake{ .stop_after = 0 };
     var config = configuration();

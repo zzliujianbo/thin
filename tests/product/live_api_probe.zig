@@ -103,16 +103,15 @@ fn run(init: std.process.Init) !u8 {
     });
     if (!live) return 0;
 
-    var selector = thin.llm.Selector.init(config.model.protocol);
+    var selector = thin.runtime.initialSelector(config);
     var calls: usize = 0;
-    const request: p.Request = .{
-        .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = config.model.protocol },
+    const request = thin.runtime.withReasoning(config, .{
+        .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = selector.effective() },
         .system = system,
         .tools = schemas,
         .messages = &messages,
         .max_output_tokens = output_cap,
-        .reasoning_effort = config.model.reasoning_effort,
-    };
+    });
 
     for (0..3) |index| {
         if (calls >= max_calls) return error.ProbeCallLimit;
