@@ -17,10 +17,16 @@ extern "c" fn getpgrp() c_int;
 // O_NONBLOCK 的 Linux 数值（0x800），使读写不阻塞。
 const nonblock = 0x800;
 
+/// Supporting terminals present a complete frame together; others ignore this
+/// private mode. It supplements owned row diffs, never replaces their safety.
+pub const sync_begin = "\x1b[?2026h";
+pub const sync_end = "\x1b[?2026l";
+
 // 普通主缓冲：保留 shell 与滚屏内容；只管理自身追加的 live tail。
 const enter = "\x1b[?2004h\x1b[0m\x1b[?25l";
-// CAN 中止未完成的转义序列；不切屏、不清屏，最终输出留在滚屏中。
-const leave = "\x18\x1b[0m\x1b[?2004l\x1b[?25h\r\n";
+// CAN 中止未完成的转义，并释放可能被中断帧开启的同步显示。
+// 不切屏、不清屏，最终输出留在滚屏中。
+const leave = "\x18\x1b[0m\x1b[?2004l" ++ sync_end ++ "\x1b[?25h\r\n";
 /// 终端尺寸，单位为列数与行数。
 pub const Size = struct { columns: usize, rows: usize };
 
@@ -258,6 +264,40 @@ test "product terminal restores raw attributes and flags on PTY only" {
     try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &restored));
     try expectAttributes(original, restored);
     try std.testing.expectEqual(flags, c.fcntl(slave, 3));
+}
+
+test "restoration releases synchronized display after interrupted frame escapes on owned PTY" {
+    const end = "\x1b[?2026l";
+    for ([_][]const u8{ "\x1b[?2026h", "\x1b[?2026hpartial-frame\x1b[?2026", "\x1b[?202" }) |partial| {
+        var master: c_int = undefined;
+        var slave: c_int = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
+        defer _ = c.close(master);
+        defer _ = c.close(slave);
+        try std.testing.expect(c.fcntl(master, 4, c.fcntl(master, 3) | nonblock) >= 0);
+        var terminal = try Terminal.fromFd(slave, false);
+        defer terminal.deinit();
+        try std.testing.expect(terminal.writeBounded(partial, 10));
+        try std.testing.expect(terminal.restore());
+        var buffer: [2048]u8 = undefined;
+        var used: usize = 0;
+        for (0..20) |_| {
+            var pollfd = [_]c.pollfd{.{ .fd = master, .events = 1, .revents = 0 }};
+            if (c.poll(&pollfd, 1, 10) <= 0) continue;
+            const n = c.read(master, buffer[used..].ptr, buffer.len - used);
+            if (n > 0) used += @intCast(n);
+            if (std.mem.find(u8, buffer[0..used], "\x1b[?25h") != null or used == buffer.len) break;
+        }
+        const release = std.mem.find(u8, buffer[0..used], end) orelse return error.MissingSyncRelease;
+        const show = std.mem.find(u8, buffer[0..used], "\x1b[?25h") orelse return error.MissingCursorRestore;
+        try std.testing.expect(release + end.len <= show);
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        try screen.replay(buffer[0..used]); // CAN also cancels a partial begin/end.
+        var restored: abi.Termios = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &restored));
+        try expectAttributes(terminal.original, restored);
+        try std.testing.expectEqual(terminal.original_flags, c.fcntl(slave, 3));
+    }
 }
 
 test "post restoration stop on a backpressured retry still restores descriptor flags" {

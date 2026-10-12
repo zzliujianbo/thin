@@ -1095,12 +1095,12 @@ const Ui = struct {
             self.frame_offset = 0;
             self.frame_clear_end = 0;
             self.frame_sparse = false;
-            self.resize_rescue = "\x18\x1b[999B\r\n";
+            self.resize_rescue = "\x18" ++ terminal_module.sync_end ++ "\x1b[999B\r\n";
         } else if (self.frame.len != 0 and (self.frame_offset < self.frame_clear_end or self.resize_rescue.len != 0)) {
             // Never finish an old relative reclaim after reflow. Cancel a partial
-            // escape and continue transcript/tail at a fresh bottom line instead.
+            // escape, release a possibly interrupted sync, then recover at bottom.
             self.frame_offset = self.frame_clear_end;
-            self.resize_rescue = "\x18\x1b[999B\r\n";
+            self.resize_rescue = "\x18" ++ terminal_module.sync_end ++ "\x1b[999B\r\n";
         }
         self.abandon_tail = self.tail_height != 0 or self.frame.len != 0;
         self.dirty = true;
@@ -1178,7 +1178,10 @@ const Ui = struct {
         self.frame_permission = null;
 
         // Reclaim only our last complete live tail, never the user's earlier rows.
-        try writer.writeAll("\x1b[?25l\r");
+        // Batch visible presentation as well as writes: large canonical commits
+        // must scroll, and row-by-row correctness alone still exposes mid-frame
+        // footer/body states. Unsupported terminals retain the same safe diffs.
+        try writer.writeAll(terminal_module.sync_begin ++ "\x1b[?25l\r");
         if (self.abandon_tail or (self.tail_height != 0 and
             (self.tail_size.columns != self.size.columns or self.tail_size.rows != self.size.rows)))
         {
@@ -1296,7 +1299,7 @@ const Ui = struct {
         if (self.size.rows < 7 or cols < 8 or hides_approval_id) {
             for (0..rows) |row| try putLine(writer, a, row + 1, if (row == 0) "Resize terminal" else "", cols);
             cursor_offset = tail_out.written().len;
-            try writer.writeAll("\r\x1b[?25h");
+            try writer.writeAll("\r");
             self.frame_permission = null;
         } else {
             const body_rows = rows - footer_rows;
@@ -1363,7 +1366,7 @@ const Ui = struct {
                 const masked = try std.fmt.allocPrint(a, "API key> {s}", .{masks[0..count]});
                 try putLine(writer, a, rows, masked, cols);
                 cursor_offset = tail_out.written().len;
-                try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, count + 10) - 1});
+                try writer.print("\r\x1b[{d}C", .{@min(cols, count + 10) - 1});
             } else if (self.model_picker) |picker| {
                 const decorated = "Search> ";
                 const prefix = try editorDisplay(a, picker.query.bytes.items[0..picker.query.cursor]);
@@ -1379,7 +1382,7 @@ const Ui = struct {
                 const line = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ decorated, prefix[start..], suffix[0..end] });
                 try putLine(writer, a, rows, line, cols);
                 cursor_offset = tail_out.written().len;
-                try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, decorated.len + width + 1) - 1});
+                try writer.print("\r\x1b[{d}C", .{@min(cols, decorated.len + width + 1) - 1});
             } else {
 
                 // 光标所在逻辑行的起点（以换行为界）。
@@ -1415,10 +1418,13 @@ const Ui = struct {
                 // Decoration participates in clipping AND cursor positioning;
                 // editing/submitted raw bytes remain untouched.
                 cursor_offset = tail_out.written().len;
-                try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, width + decoration_width + 1) - 1});
+                try writer.print("\r\x1b[{d}C", .{@min(cols, width + decoration_width + 1) - 1});
             }
         }
 
+        // Include release in the trusted cursor suffix so full/sparse/recovery
+        // tails all close synchronization; cursor-show remains the final marker.
+        try writer.writeAll(terminal_module.sync_end ++ "\x1b[?25h");
         const snapshot_allowed = self.permission == null and self.model_picker == null and !self.secret_mode and !self.secret_quarantine;
         var candidate = if (snapshot_allowed) try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset) else null;
         errdefer if (candidate) |*snapshot| snapshot.deinit();
@@ -1602,7 +1608,7 @@ test "regular transcript starts at top and keeps composer at bottom without role
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     try std.testing.expectEqual(@as(usize, 1), screen.count("unique canonical reply"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") == null);
-    try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[20A"));
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\x1b[20A"));
     for ([_][]const u8{ "1049", "1047", "\x1b[H", "\x1b[2J", ";1H" }) |forbidden|
         try std.testing.expect(std.mem.find(u8, ui.frame, forbidden) == null);
 }
@@ -2091,6 +2097,62 @@ test "committed large Markdown caches stay untouched on resize until history pre
     try std.testing.expectEqual(@as(usize, 1), screen.count("second-history-marker"));
 }
 
+fn expectSynchronizedFrame(bytes: []const u8) !void {
+    const begin = "\x1b[?2026h";
+    const end = "\x1b[?2026l";
+    try std.testing.expect(std.mem.startsWith(u8, bytes, begin));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, begin));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, end));
+    // Cursor-show remains the final ACK marker, after the display is released.
+    try std.testing.expect(std.mem.endsWith(u8, bytes, end ++ "\x1b[?25h"));
+}
+
+test "growing and bulk committed frames synchronize before scrolling and release before cursor ACK" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var source: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    for (0..20) |_| try source.writer.writeAll("older-row\n");
+    try source.writer.writeAll("last-older-row");
+    _ = try ui.add(.assistant, source.written());
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 3), ui.tail_height);
+
+    try ui.appendDraft(.assistant, "growth-draft-marker\nsecond-draft-line");
+    try ui.draw();
+    try std.testing.expect(!ui.frame_sparse);
+    try expectSynchronizedFrame(ui.frame);
+    // This expansion scrolls three rows. Supporting terminals must not publish
+    // the intermediate state where draft rows have overwritten the old footer.
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 6), ui.tail_height);
+
+    source.clearRetainingCapacity();
+    for (0..64) |i| try source.writer.print("committed-{d}\n\n", .{i});
+    try ui.replaceCommitted(&.{.{ .text = source.written() }}, false, true);
+    try ui.draw();
+    try expectSynchronizedFrame(ui.frame);
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("committed-63"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("growth-draft-marker"));
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    ui.finishFrame();
+
+    try ui.draw();
+    try std.testing.expect(ui.frame_sparse);
+    try expectSynchronizedFrame(ui.frame);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "committed-") == null);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+}
+
 test "bulk frames repaint before erasing stale line suffixes" {
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -2242,23 +2304,33 @@ test "resize at every sparse frame byte drops stale relative edits and cannot re
         defer bridge.deinit();
         var ui = fixtureUi(&bridge, &cancel);
         defer ui.deinit();
-        ui.busy = true;
+        // Keep this byte-split fixture ASCII: Screen models CSI cancellation,
+        // not a terminal's replacement-character policy for truncated UTF-8.
         try ui.appendDraft(.assistant, "owned body");
         try ui.draw();
         ui.finishFrame();
-        ui.clock_ms = 80;
+        try ui.appendDraft(.assistant, " extended");
         try ui.draw();
         try std.testing.expect(ui.frame_sparse);
         length = ui.frame.len;
         const full = ui.frame_full_tail;
+        var captured: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer captured.deinit();
+        try captured.writer.writeAll(ui.frame[0..offset]);
         ui.frame_offset = offset;
         ui.resize(.{ .columns = 40, .rows = 12 });
         try std.testing.expect(!ui.frame_sparse and !ui.frame_fresh);
         try std.testing.expect(ui.tail_snapshot == null);
         try std.testing.expectEqual(@as(usize, 0), ui.frame_offset);
         try std.testing.expectEqualStrings(full, ui.frame);
-        try std.testing.expectEqualStrings("\x18\x1b[999B\r\n", ui.resize_rescue);
+        try std.testing.expectEqualStrings("\x18" ++ terminal_module.sync_end ++ "\x1b[999B\r\n", ui.resize_rescue);
         try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[23A") == null);
+        try captured.writer.writeAll(ui.resize_rescue);
+        try captured.writer.writeAll(ui.frame);
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        // Syntax/escape cancellation only, not a physical resize/reflow oracle.
+        try screen.replay(captured.written());
+        try std.testing.expect(std.mem.endsWith(u8, captured.written(), terminal_module.sync_end ++ "\x1b[?25h"));
         // Even returning to old dimensions does not revive the old ACK/cache.
         ui.resize(.{ .columns = 80, .rows = 24 });
         ui.finishFrame(); // Simulate completion of the full recovery, not sparse ACK.
@@ -2446,7 +2518,7 @@ test "model only default color prompt has no headers cache or status and preserv
     try std.testing.expect(std.mem.find(u8, ui.frame, "90.0%") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "(fixture)") == null);
     const decoration = "(fixture ?%) > ";
-    const position = try std.fmt.allocPrint(std.testing.allocator, "\r\x1b[{d}C\x1b[?25h", .{text.width(decoration) + text.width("hello    你")});
+    const position = try std.fmt.allocPrint(std.testing.allocator, "\r\x1b[{d}C" ++ terminal_module.sync_end ++ "\x1b[?25h", .{text.width(decoration) + text.width("hello    你")});
     defer std.testing.allocator.free(position);
     try std.testing.expect(std.mem.endsWith(u8, ui.frame, position));
     try std.testing.expectEqualStrings("hello\t你", ui.editor.bytes.items);
@@ -2509,7 +2581,7 @@ test "flow model prefix clips long editor suffix without wrap or changing raw cu
     try screen.replay(ui.frame);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "(fixture ?%) ~ x"));
-    try std.testing.expect(std.mem.endsWith(u8, ui.frame, "\r\x1b[16C\x1b[?25h"));
+    try std.testing.expect(std.mem.endsWith(u8, ui.frame, "\r\x1b[16C" ++ terminal_module.sync_end ++ "\x1b[?25h"));
     for (screen.grid[22]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
     try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
     ui.finishFrame();
@@ -2517,7 +2589,7 @@ test "flow model prefix clips long editor suffix without wrap or changing raw cu
     try ui.draw();
     try screen.replay(ui.frame);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
-    try std.testing.expect(std.mem.endsWith(u8, ui.frame, "\r\x1b[78C\x1b[?25h"));
+    try std.testing.expect(std.mem.endsWith(u8, ui.frame, "\r\x1b[78C" ++ terminal_module.sync_end ++ "\x1b[?25h"));
     try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
     ui.finishFrame();
 }
@@ -2537,12 +2609,12 @@ test "resize abandons unknown rows and old completed approval cannot authorize" 
     ui.frame_offset = 1; // Even a partially written reclaim escape is unsafe after reflow.
     ui.resize(.{ .columns = 70, .rows = 20 });
     try std.testing.expectEqual(ui.frame_clear_end, ui.frame_offset);
-    try std.testing.expectEqualStrings("\x18\x1b[999B\r\n", ui.resize_rescue);
+    try std.testing.expectEqualStrings("\x18" ++ terminal_module.sync_end ++ "\x1b[999B\r\n", ui.resize_rescue);
     ui.resize(.{ .columns = 80, .rows = 24 });
     ui.finishFrame();
     try std.testing.expect(ui.displayed_permission == null);
     try ui.draw();
-    try std.testing.expect(std.mem.startsWith(u8, ui.frame, "\x1b[?25l\r\x1b[999B\r\n"));
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\x1b[999B\r\n"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[6A") == null);
     try std.testing.expectEqual(@as(usize, 24), ui.frame_height);
     try std.testing.expect(ui.displayed_permission == null);
@@ -2859,7 +2931,7 @@ test "editor tabs expand before clipping and cursor placement but submit unchang
         ui.editor.cursor = case.cursor;
         try ui.draw();
         try std.testing.expect(std.mem.findScalar(u8, ui.frame, '\t') == null);
-        const expected = try std.fmt.allocPrint(std.testing.allocator, "\r\n\x1b[0m{s}\x1b[0m\x1b[K\r\x1b[{d}C\x1b[?25h", .{ case.line, case.column - 1 });
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "\r\n\x1b[0m{s}\x1b[0m\x1b[K\r\x1b[{d}C" ++ terminal_module.sync_end ++ "\x1b[?25h", .{ case.line, case.column - 1 });
         defer std.testing.allocator.free(expected);
         try std.testing.expect(std.mem.endsWith(u8, ui.frame, expected));
         try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);

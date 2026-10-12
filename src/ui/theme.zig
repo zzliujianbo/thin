@@ -17,7 +17,7 @@ pub const quote = md_dim ++ "\x1b[3m";
 pub const link = "\x1b[4m\x1b[38;5;12m";
 /// Foreground only, even for fenced/indented code; no row background or padding.
 pub const inline_code = "\x1b[38;5;141m";
-pub const code = "\x1b[38;5;83m";
+pub const code = "\x1b[38;5;77m";
 pub const table_header = "\x1b[1m";
 pub const bullet = inline_code;
 /// File-change counts are independent of Markdown brightness.
@@ -80,7 +80,7 @@ test "Markdown uses vivid yellow green and cool violet without changing font sty
     try testing.expectEqualStrings("\x1b[1m\x1b[38;5;220m", heading);
     try testing.expectEqualStrings("\x1b[4m\x1b[38;5;12m", link);
     try testing.expectEqualStrings("\x1b[38;5;141m", inline_code);
-    try testing.expectEqualStrings("\x1b[38;5;83m", code);
+    try testing.expectEqualStrings("\x1b[38;5;77m", code);
     try testing.expectEqualStrings(inline_code, bullet);
     try testing.expectEqualStrings("\x1b[1m", strong);
     for ([_][]const u8{ heading, link, inline_code, code, bullet }) |style| {

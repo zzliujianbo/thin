@@ -114,8 +114,10 @@ pub const Screen = struct {
                     const final = code.final;
                     if (final == 'm') continue; // SGR does not change cells/cursor.
                     if (final == 'h' or final == 'l') {
-                        if (!std.mem.eql(u8, args, "?25") and !std.mem.eql(u8, args, "?2004")) return error.UnsupportedMode;
-                        continue; // Cursor visibility and bracketed paste.
+                        if (!std.mem.eql(u8, args, "?25") and !std.mem.eql(u8, args, "?2004") and !std.mem.eql(u8, args, "?2026")) return error.UnsupportedMode;
+                        // Logical screen only: accept sync mode without claiming
+                        // physical presentation timing or terminal support.
+                        continue;
                     }
                     const n = if (args.len == 0) 0 else try std.fmt.parseInt(usize, args, 10);
                     const step = @max(1, n);

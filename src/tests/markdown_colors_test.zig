@@ -64,7 +64,7 @@ test "vivid Markdown semantic colors stay distinct and inline color never leaks 
         try expectColor(bytes.items, 'H', .{ .indexed = 220 });
         try expectColor(bytes.items, 'K', .{ .indexed = 12 });
         for ("IJTW") |glyph| try expectColor(bytes.items, glyph, .{ .indexed = 141 });
-        try expectColor(bytes.items, 'G', .{ .indexed = 83 });
+        try expectColor(bytes.items, 'G', .{ .indexed = 77 });
         // Strong is not a heading. Body, list prose and cells regain defaults.
         for ("OSABLCDEVU") |glyph| try expectColor(bytes.items, glyph, .normal);
         const following = try md.render(std.testing.allocator, "Z", .{ .columns = columns, .max_lines = 10 });
