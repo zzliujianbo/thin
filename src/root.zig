@@ -69,6 +69,7 @@ test {
     _ = @import("ui/terminal.zig");
     _ = @import("ui/input.zig");
     _ = @import("ui/markdown.zig");
+    _ = @import("ui/tail_frame.zig");
     _ = @import("tests/markdown_colors_test.zig");
     _ = @import("ui/bridge.zig");
     _ = @import("tests/ui_bridge_test_root.zig");

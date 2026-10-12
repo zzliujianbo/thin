@@ -759,10 +759,22 @@ pub fn main(init: std.process.Init) !void {
             if (clamped) try d.waitText(0, "Saved thinking level adjusted");
             if (std.mem.eql(u8, mode, "settings-unknown-low")) try d.waitText(0, "Saved thinking level not applied");
             if (blocked) {
+                const before = try d.screen();
                 const start = d.used;
                 try d.send("\x1b[Z");
-                try d.waitIdle(start);
-                try settingsColor(&d, start, level);
+                // Unknown/fixed capabilities keep the same idle composer. A
+                // completed sparse frame may only replace its notice row; do
+                // not require unchanged model/percentage pixels to be reprinted.
+                try d.waitFrame(start, "\x1b[?25l");
+                const after = try d.screen();
+                try check(std.mem.eql(u8, &before.grid[23], &after.grid[23]) and after.row == 23);
+                if (std.mem.indexOf(u8, d.output[start..d.used], "fixture-model") != null) {
+                    try settingsColor(&d, start, level);
+                } else {
+                    // No new styled footer payload: the previously verified
+                    // low color is retained, not silently replaced by another.
+                    try settingsColor(&d, 0, level);
+                }
             }
             const start = d.used;
             try d.send("settings-task\r");

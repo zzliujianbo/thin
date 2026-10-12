@@ -12,6 +12,7 @@ const input = @import("input.zig");
 const picker_module = @import("model_picker.zig");
 const text = @import("text.zig");
 const markdown = @import("markdown.zig");
+const tail_frame = @import("tail_frame.zig");
 const theme = @import("theme.zig");
 const activity = @import("activity.zig");
 const presentation = @import("presentation.zig");
@@ -329,6 +330,14 @@ const Ui = struct {
     prompt: ?[]const u8 = null,
     /// 待写出帧所在的 arena，帧全部写完后释放。
     frame_arena: ?std.heap.ArenaAllocator = null,
+    /// Independent bounded copies, never borrowed Record.lines. Only complete
+    /// writes publish the candidate as a reusable acknowledged tail snapshot.
+    frame_tail_snapshot: ?tail_frame.Snapshot = null,
+    tail_snapshot: ?tail_frame.Snapshot = null,
+    /// Sparse relative edits cannot survive reflow: keep a full one-pass tail
+    /// in the same frame arena for CAN/bottom recovery after any resize.
+    frame_full_tail: []const u8 = "",
+    frame_sparse: bool = false,
     /// 待输出的完整帧；可能分多次 write，由 frame_offset 记录进度。
     frame: []const u8 = "",
     frame_offset: usize = 0,
@@ -359,6 +368,8 @@ const Ui = struct {
         self.clearToolCaptions();
         self.tool_calls.deinit(self.allocator);
         if (self.frame_arena) |*arena| arena.deinit();
+        if (self.frame_tail_snapshot) |*snapshot| snapshot.deinit();
+        if (self.tail_snapshot) |*snapshot| snapshot.deinit();
         for (self.records.items) |*record| record.deinit(self.allocator);
         self.records.deinit(self.allocator);
         self.secret.deinit();
@@ -1062,8 +1073,18 @@ const Ui = struct {
         self.displayed_model_epoch = null;
         self.displayed_model_generation = null;
         self.frame_fresh = false;
-        if (self.frame.len != 0 and (self.frame_offset < self.frame_clear_end or self.resize_rescue.len != 0)) {
-            // Never finish an old CUU/EL reclaim after reflow. Cancel a partial
+        if (self.tail_snapshot) |*snapshot| snapshot.deinit();
+        self.tail_snapshot = null;
+        if (self.frame.len != 0 and self.frame_sparse) {
+            // Every sparse CUU/CUD after reflow is uncertain, even beyond the
+            // initial reclaim prefix. Skip them ALL and replace at a fresh bottom.
+            self.frame = self.frame_full_tail;
+            self.frame_offset = 0;
+            self.frame_clear_end = 0;
+            self.frame_sparse = false;
+            self.resize_rescue = "\x18\x1b[999B\r\n";
+        } else if (self.frame.len != 0 and (self.frame_offset < self.frame_clear_end or self.resize_rescue.len != 0)) {
+            // Never finish an old relative reclaim after reflow. Cancel a partial
             // escape and continue transcript/tail at a fresh bottom line instead.
             self.frame_offset = self.frame_clear_end;
             self.resize_rescue = "\x18\x1b[999B\r\n";
@@ -1093,8 +1114,16 @@ const Ui = struct {
             if (record.pending_output) record.output = true;
             record.pending_output = false;
         }
+        if (self.tail_snapshot) |*snapshot| snapshot.deinit();
+        self.tail_snapshot = null;
+        if (self.frame_fresh) {
+            self.tail_snapshot = self.frame_tail_snapshot;
+        } else if (self.frame_tail_snapshot) |*snapshot| snapshot.deinit();
+        self.frame_tail_snapshot = null;
         if (self.frame_arena) |*arena| arena.deinit();
         self.frame_arena = null;
+        self.frame_full_tail = "";
+        self.frame_sparse = false;
         self.frame = "";
         self.frame_offset = 0;
         self.resize_rescue = "";
@@ -1130,7 +1159,8 @@ const Ui = struct {
         const a = arena.allocator();
         const cols = self.size.columns -| 1; // Never trigger terminal autowrap.
         var out: std.Io.Writer.Allocating = .init(a);
-        const writer = &out.writer;
+        var tail_out: std.Io.Writer.Allocating = .init(a);
+        var writer: *Io.Writer = &out.writer;
         self.displayed_permission = null;
         self.frame_permission = null;
 
@@ -1142,12 +1172,8 @@ const Ui = struct {
             try writer.writeAll("\x1b[999B\r\n");
         } else if (self.tail_height != 0) {
             if (self.tail_height > 1) try writer.print("\x1b[{d}A", .{self.tail_height - 1});
-            for (0..self.tail_height) |line| {
-                if (line != 0) try writer.writeAll("\r\n");
-                try writer.writeAll("\x1b[0m\x1b[2K");
-            }
-            // No LF after the last erased row: that would scroll before CUU.
-            if (self.tail_height > 1) try writer.print("\x1b[{d}A", .{self.tail_height - 1});
+            // Replace each row once, without exposing a whole-tail blank pass.
+            // Transcript rows plus the nonshrinking live tail cover our footprint.
             try writer.writeAll("\r");
         }
 
@@ -1168,6 +1194,9 @@ const Ui = struct {
                 // Leading gaps work even when the prior command was committed
                 // in an earlier frame. Tool -> tool is always contiguous.
                 if (previous_kind) |prior| if (prior != .tool or record.kind != .tool) {
+                    // This separator is also an owned row replacement. Bare
+                    // CRLF would commit stale approval/preview text as history.
+                    try putStyled(writer, 1, "");
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
                 };
@@ -1237,11 +1266,16 @@ const Ui = struct {
         const available = if (self.tail_height == 0 or self.abandon_tail) self.size.rows else self.tail_height;
         const rows = @min(self.size.rows, @max(footer_rows + wanted_body, available -| transcript_rows));
 
+        // Build the complete candidate tail before choosing full or sparse output.
+        // Its bytes also provide recovery if resize interrupts a sparse frame.
+        writer = &tail_out.writer;
+        var cursor_offset: usize = 0;
         // 终端太小时只显示提示，避免布局越界。
         // 审批标题之外至少留一行正文；尺寸不足不属于永久的 clipped 状态。
         const hides_approval_id = if (self.permission) |permission| !self.approvalFits(permission.id) else false;
         if (self.size.rows < 7 or cols < 8 or hides_approval_id) {
             for (0..rows) |row| try putLine(writer, a, row + 1, if (row == 0) "Resize terminal" else "", cols);
+            cursor_offset = tail_out.written().len;
             try writer.writeAll("\r\x1b[?25h");
             self.frame_permission = null;
         } else {
@@ -1308,6 +1342,7 @@ const Ui = struct {
                 const count = @min(self.secret.len, @min(masks.len, cols - 3));
                 const masked = try std.fmt.allocPrint(a, "API key> {s}", .{masks[0..count]});
                 try putLine(writer, a, rows, masked, cols);
+                cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, count + 10) - 1});
             } else if (self.model_picker) |picker| {
                 const decorated = "Search> ";
@@ -1323,6 +1358,7 @@ const Ui = struct {
                 const end = fittingBytes(suffix, cols -| (decorated.len + width));
                 const line = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ decorated, prefix[start..], suffix[0..end] });
                 try putLine(writer, a, rows, line, cols);
+                cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, decorated.len + width + 1) - 1});
             } else {
 
@@ -1357,11 +1393,28 @@ const Ui = struct {
 
                 // Decoration participates in clipping AND cursor positioning;
                 // editing/submitted raw bytes remain untouched.
+                cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C\x1b[?25h", .{@min(cols, width + decoration_width + 1) - 1});
             }
         }
 
+        var candidate = try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset);
+        errdefer if (candidate) |*snapshot| snapshot.deinit();
+        const sparse = transcript_rows == 0 and !self.abandon_tail and self.tail_height == rows and
+            self.permission == null and self.model_picker == null and !self.secret_mode and !self.secret_quarantine and
+            self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows and
+            self.tail_snapshot != null and candidate != null;
+        writer = &out.writer;
+        if (sparse) {
+            try candidate.?.emitDiff(writer, &self.tail_snapshot.?);
+        } else {
+            try writer.writeAll(tail_out.written());
+        }
+
         // frame 指向 arena 内存，arena 所有权交给 frame_arena，直到这帧写完。
+        self.frame_full_tail = tail_out.written();
+        self.frame_sparse = sparse;
+        self.frame_tail_snapshot = candidate;
         self.frame = out.written();
         self.frame_offset = 0;
         self.frame_arena = arena;
@@ -1908,6 +1961,190 @@ test "file captions are contiguous but separated from final prose and percent co
     ui.finishFrame();
 }
 
+test "stable large table body is not erased or reprinted for a footer animation tick" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true; // No worker: simulate only the renderer-owned pulse.
+    _ = try ui.add(.user, "owned request");
+    var source: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    try source.writer.writeAll("| Key | Description |\n| --- | --- |\n");
+    for (0..64) |i| try source.writer.print("| row-{d} | bounded table cell |\n", .{i});
+    try ui.appendDraft(.assistant, source.written());
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    const before = screen.grid;
+    ui.clock_ms = 80;
+    try ui.draw();
+    // Only the animated composer changed. A completed body must not disappear
+    // in a separate blank pass or be rewritten solely for a footer pulse.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, "\x1b[2K"));
+    try std.testing.expect(std.mem.find(u8, ui.frame, "row-") == null);
+    try screen.replay(ui.frame);
+    for (0..23) |row| try std.testing.expectEqualSlices(u8, &before[row], &screen.grid[row]);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    ui.finishFrame();
+}
+
+test "one-pass transcript separators erase acknowledged approval preview before committing records" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.add(.user, "first request");
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .permission = .{ .id = 1, .tool_name = "bash", .description = "GHOST-preview-1\nGHOST-preview-2\nGHOST-preview-3\nGHOST-preview-4\nGHOST-preview-5\nGHOST-preview-6" } }, &cancel);
+    var item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(screen.visible("Approval #1"));
+    // The actual loop can answer and receive results before its next draw slot.
+    ui.clearPermission();
+    _ = try ui.add(.tool, "completed-tool-result");
+    _ = try ui.add(.user, "next-user-record");
+    _ = try ui.add(.assistant, "short-canonical-record");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), screen.count("Approval #1"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("GHOST-preview"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("completed-tool-result"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("next-user-record"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("short-canonical-record"));
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+}
+
+test "tail snapshots publish only on full ACK and own bytes after record invalidation" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.appendDraft(.assistant, "stable-body-A");
+    try ui.draw();
+    try std.testing.expect(ui.tail_snapshot == null and ui.frame_tail_snapshot != null);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(std.mem.find(u8, ui.tail_snapshot.?.rows[0], "stable-body-A") != null);
+    // appendDraft invalidates/frees Record.lines; the acknowledged copy stays valid.
+    try ui.appendDraft(.assistant, "-extended");
+    try std.testing.expect(std.mem.find(u8, ui.tail_snapshot.?.rows[0], "stable-body-A") != null);
+    try ui.draw();
+    try std.testing.expect(ui.frame_sparse);
+    try std.testing.expect(std.mem.find(u8, ui.tail_snapshot.?.rows[0], "extended") == null);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(std.mem.find(u8, ui.tail_snapshot.?.rows[0], "extended") != null);
+    try ui.draw();
+    try std.testing.expect(ui.frame_sparse);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ui.frame, "\x1b[2K"));
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("stable-body-A-extended"));
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    ui.finishFrame();
+}
+
+test "resize at every sparse frame byte drops stale relative edits and cannot republish ownership" {
+    var length: usize = 1;
+    var offset: usize = 0;
+    while (offset < length) : (offset += 1) {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.busy = true;
+        try ui.appendDraft(.assistant, "owned body");
+        try ui.draw();
+        ui.finishFrame();
+        ui.clock_ms = 80;
+        try ui.draw();
+        try std.testing.expect(ui.frame_sparse);
+        length = ui.frame.len;
+        const full = ui.frame_full_tail;
+        ui.frame_offset = offset;
+        ui.resize(.{ .columns = 40, .rows = 12 });
+        try std.testing.expect(!ui.frame_sparse and !ui.frame_fresh);
+        try std.testing.expect(ui.tail_snapshot == null);
+        try std.testing.expectEqual(@as(usize, 0), ui.frame_offset);
+        try std.testing.expectEqualStrings(full, ui.frame);
+        try std.testing.expectEqualStrings("\x18\x1b[999B\r\n", ui.resize_rescue);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[23A") == null);
+        // Even returning to old dimensions does not revive the old ACK/cache.
+        ui.resize(.{ .columns = 80, .rows = 24 });
+        ui.finishFrame(); // Simulate completion of the full recovery, not sparse ACK.
+        try std.testing.expect(ui.tail_snapshot == null);
+        try std.testing.expect(ui.displayed_permission == null and ui.displayed_model_epoch == null);
+        try std.testing.expect(ui.abandon_tail);
+    }
+}
+
+fn discardFixtureFrame(ui: *Ui) void {
+    // Test-only discard of an unsent preview, NOT an acknowledgement. Legacy
+    // tests freed only frame_arena; candidates now own a separate arena too.
+    if (ui.frame_arena) |*arena| arena.deinit();
+    if (ui.frame_tail_snapshot) |*snapshot| snapshot.deinit();
+    ui.frame_arena = null;
+    ui.frame_tail_snapshot = null;
+    ui.frame_full_tail = "";
+    ui.frame_sparse = false;
+    ui.frame_offset = 0;
+    ui.frame = "";
+}
+
+fn tailAllocationDraw(ui: *Ui) !void {
+    // draw writes only to std.Io.Writer.Allocating, never terminal I/O. Its
+    // drain translates allocator OOM to WriteFailed; the fault-test helper
+    // requires the original allocation error. Do not alter production errors.
+    ui.draw() catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+}
+
+fn tailAllocationScenario(a: std.mem.Allocator) !void {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    ui.allocator = a;
+    ui.editor.allocator = a;
+    defer ui.deinit();
+    try ui.appendDraft(.assistant, "| K | V |\n| --- | --- |\n| old | body |\n");
+    try tailAllocationDraw(&ui);
+    ui.finishFrame();
+    const old_ack = ui.tail_snapshot.?.full;
+    try ui.appendDraft(.assistant, "| new | cell |\n");
+    tailAllocationDraw(&ui) catch |err| {
+        // A failed candidate cannot replace/free the last acknowledged bytes.
+        try std.testing.expectEqualStrings(old_ack, ui.tail_snapshot.?.full);
+        try std.testing.expect(ui.frame.len == 0 and ui.frame_tail_snapshot == null);
+        return err;
+    };
+    ui.resize(.{ .columns = 40, .rows = 12 });
+    ui.finishFrame();
+    try tailAllocationDraw(&ui);
+    ui.finishFrame();
+}
+
+test "tail snapshot construction and resize release all allocations under OOM" {
+    try text.initLocale();
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), tailAllocationScenario, .{});
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+}
+
 test "composer displays startup zero and latest actual usage or unknown without billing accumulation" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -2365,9 +2602,7 @@ test "six-row approval cannot authorize and recovers after a complete visible fr
             try ui.parser.feed("yt", sink);
             try std.testing.expect(bridge.answer == null);
             try std.testing.expect(!ui.permission.?.clipped);
-            ui.frame_arena.?.deinit();
-            ui.frame_arena = null;
-            ui.frame = "";
+            discardFixtureFrame(&ui);
 
             ui.size.rows = restored_rows;
             try ui.draw();
@@ -2407,9 +2642,7 @@ test "approval identity must fit in full before narrow windows can authorize" {
         try ui.parser.feed("yt", sink);
         try std.testing.expect(bridge.answer == null);
         ui.displayed_permission = null;
-        ui.frame_arena.?.deinit();
-        ui.frame_arena = null;
-        ui.frame = "";
+        discardFixtureFrame(&ui);
 
         ui.size.columns += 1; // 末列保留给避免 autowrap；现在编号恰好完整显示。
         try ui.draw();
@@ -2455,9 +2688,7 @@ test "editor tabs expand before clipping and cursor placement but submit unchang
         defer std.testing.allocator.free(expected);
         try std.testing.expect(std.mem.endsWith(u8, ui.frame, expected));
         try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);
-        ui.frame_arena.?.deinit();
-        ui.frame_arena = null;
-        ui.frame = "";
+        discardFixtureFrame(&ui);
     }
 
     try ui.parser.feed("\r", sink);
