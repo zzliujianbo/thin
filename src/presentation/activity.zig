@@ -160,6 +160,42 @@ pub fn commandStep(now_ms: u64) usize {
     return @intCast((now_ms / 120) % 8);
 }
 
+/// Observed wall-clock execution time for one command row. Always a measurement
+/// of the same monotonic clock passed by the caller; never an estimate. Values
+/// below one second retain milliseconds; longer times use seconds/minutes.
+pub fn formatDuration(writer: *std.Io.Writer, ms: u64) !void {
+    if (ms < 1000) {
+        try writer.print("{d}ms", .{ms});
+    } else if (ms < 10_000) {
+        try writer.print("{d}.{d:0>2}s", .{ ms / 1000, (ms % 1000) / 10 });
+    } else if (ms < 60_000) {
+        try writer.print("{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 });
+    } else {
+        try writer.print("{d}m{d:0>2}s", .{ ms / 60_000, (ms % 60_000) / 1000 });
+    }
+}
+
+test "command duration keeps sub-second precision and rolls up past a minute" {
+    const cases = [_]struct { ms: u64, expected: []const u8 }{
+        .{ .ms = 0, .expected = "0ms" },
+        .{ .ms = 7, .expected = "7ms" },
+        .{ .ms = 420, .expected = "420ms" },
+        .{ .ms = 999, .expected = "999ms" },
+        .{ .ms = 1000, .expected = "1.00s" },
+        .{ .ms = 9999, .expected = "9.99s" },
+        .{ .ms = 12_300, .expected = "12.3s" },
+        .{ .ms = 59_999, .expected = "59.9s" },
+        .{ .ms = 60_000, .expected = "1m00s" },
+        .{ .ms = 125_400, .expected = "2m05s" },
+    };
+    for (cases) |case| {
+        var buffer: [16]u8 = undefined;
+        var stream = std.Io.Writer.fixed(&buffer);
+        try formatDuration(&stream, case.ms);
+        try std.testing.expectEqualStrings(case.expected, stream.buffered());
+    }
+}
+
 /// Continuous UI-owned phase, not absolute now/rate: speed changes must not
 /// jump the highlight backwards. Unknown TPS uses a quiet baseline, never a
 /// fabricated rate. A bounded catch-up prevents suspend/clock jumps flashing.

@@ -102,7 +102,11 @@ const Copy = struct {
             .reasoning => |s| .{ .reasoning = self.text(s) },
             .tool_preview => |v| .{ .tool_preview = .{ .index = v.index, .arguments = self.text(v.arguments) } },
             .permission => |v| .{ .permission = .{ .id = v.id, .tool_name = self.text(v.tool_name), .description = self.text(v.description) } },
-            .tool_started => |v| .{ .tool_started = .{ .id = v.id, .name = self.text(v.name) } },
+            .tool_started => |v| blk: {
+                var c = v;
+                c.name = self.text(v.name);
+                break :blk .{ .tool_started = c };
+            },
             .tool_result => |v| blk: {
                 var c = v;
                 c.name = self.text(v.name);

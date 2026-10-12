@@ -85,7 +85,18 @@ pub const Store = struct {
         return read(&dir);
     }
 
+    /// Existing preferences win, including a concurrent cooperating writer.
+    /// Invalid files are never repaired by initialization.
+    pub fn loadOrInitialize(self: *Store, default: activity.ReasoningEffort) !activity.ReasoningEffort {
+        if (try self.load()) |saved| return saved;
+        return self.write(default, false);
+    }
+
     pub fn save(self: *Store, effort: activity.ReasoningEffort) !void {
+        _ = try self.write(effort, true);
+    }
+
+    fn write(self: *Store, effort: activity.ReasoningEffort, overwrite: bool) !activity.ReasoningEffort {
         const name: []const u8 = switch (effort) {
             .off => "off",
             .minimal => "minimal",
@@ -111,9 +122,12 @@ pub const Store = struct {
             try std.Io.sleep(dir.io, .fromMilliseconds(2), .awake);
         }
         if (!locked) return error.SettingsStoreBusy;
-        _ = try read(&dir); // refuse to repair malformed/nonregular old settings
-        try dir.writeMode(file_name, bytes, true, 0o600);
+        if (try read(&dir)) |saved| {
+            if (!overwrite) return saved;
+        }
+        try dir.writeMode(file_name, bytes, overwrite, 0o600);
         // No fallible work after atomic commit.
+        return effort;
     }
 };
 
@@ -140,6 +154,26 @@ test "settings missing is lazy and roundtrips with private modes" {
     try std.testing.expectEqual(@as(u32, 0o600), st.permissions.toMode() & 0o777);
     try std.testing.expectError(error.InvalidReasoningEffort, store.save(.unspecified));
     try std.testing.expectError(error.InvalidReasoningEffort, store.save(.unknown));
+}
+
+test "settings initialize missing default and never replace existing preference" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testOpen(tmp.dir);
+    defer store.deinit();
+    try std.testing.expectEqual(activity.ReasoningEffort.medium, try store.loadOrInitialize(.medium));
+    const mode = try tmp.dir.statFile(std.testing.io, relative_path, .{});
+    try std.testing.expectEqual(@as(u32, 0o600), mode.permissions.toMode() & 0o777);
+    const existing = "{\"version\":1, \"reasoning_effort\":\"low\"}\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = relative_path, .data = existing });
+    try std.testing.expectEqual(activity.ReasoningEffort.low, try store.loadOrInitialize(.max));
+    // Simulate another writer winning after the initial absent-file check.
+    try std.testing.expectEqual(activity.ReasoningEffort.low, try store.write(.medium, false));
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, relative_path, std.testing.allocator, .limited(max_bytes));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings(existing, bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = relative_path, .data = "{}" });
+    try std.testing.expectError(error.InvalidSettings, store.loadOrInitialize(.medium));
 }
 
 test "settings strict schema legacy and malformed rollback" {
@@ -247,6 +281,26 @@ fn fdCount() !usize {
     var n: usize = 0;
     while (try it.next(std.testing.io)) |_| n += 1;
     return n;
+}
+
+test "settings failed default creation leaves no partial file or leaked descriptors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testOpen(tmp.dir);
+    defer store.deinit();
+    var vtable = store.root.io.vtable.*;
+    store.root.io.vtable = &vtable;
+    vtable.fileWritePositional = partialWriteFailure;
+    const before = try fdCount();
+    try std.testing.expectError(error.NoSpaceLeft, store.loadOrInitialize(.medium));
+    try std.testing.expectEqual(before, try fdCount());
+    try std.testing.expect((try store.load()) == null);
+    var thin = try tmp.dir.openDir(std.testing.io, ".thin", .{ .iterate = true });
+    defer thin.close(std.testing.io);
+    var it = thin.iterate();
+    try std.testing.expect((try it.next(std.testing.io)) == null);
+    vtable.fileWritePositional = std.testing.io.vtable.fileWritePositional;
+    try std.testing.expectEqual(activity.ReasoningEffort.medium, try store.loadOrInitialize(.medium));
 }
 
 test "settings partial write rollback cleans temps fds and releases lock" {

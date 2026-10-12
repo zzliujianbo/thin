@@ -155,10 +155,24 @@ pub fn commandColumns(columns: usize) usize {
     return if (columns == 0) 0 else @max(1, columns / 5 * 4 + columns % 5 * 4 / 5);
 }
 
-pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, active_time_ms: ?u64) ![]const u8 {
+/// `duration_ms` is the measured wall-clock execution time of this row. It is
+/// rendered last, in muted color, so it survives label clipping and never
+/// competes with the outcome color or diff marks. `active_time_ms` remains the
+/// animation clock only; the two are deliberately independent.
+pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, duration_ms: ?u64, active_time_ms: ?u64) ![]const u8 {
     // Detail stays <=512 bytes; allow its prefix and bounded observed counts
     // without sanitizing/truncating the same path a second time at512 bytes.
-    const safe = try boundedLine(a, body, commandColumns(columns), false, 640);
+    // Reserve the suffix inside the existing 80% limit, not after clipping.
+    // On tiny terminals omit optional time rather than wrapping the command.
+    var duration_buf: [32]u8 = undefined;
+    var duration_writer = std.Io.Writer.fixed(&duration_buf);
+    if (duration_ms) |ms| {
+        try duration_writer.writeAll("  ");
+        try shared.activity.formatDuration(&duration_writer, ms);
+    }
+    const limit = commandColumns(columns);
+    const suffix = if (duration_ms != null and limit >= duration_writer.buffered().len + 4) duration_writer.buffered() else "";
+    const safe = try boundedLine(a, body, limit - suffix.len, false, 640);
     defer a.free(safe);
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
@@ -196,6 +210,7 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         if (at == safe.len) break;
     }
     try out.writer.writeAll(safe[at..]);
+    if (suffix.len != 0) try out.writer.print("{s}{s}{s}", .{ theme.muted, suffix, theme.reset });
     return a.dupe(u8, out.written());
 }
 
@@ -215,13 +230,19 @@ pub const PromptActivity = struct {
     phase: usize = 0,
     rate_band: shared.activity.RateBand = .unknown,
     reasoning_effort: shared.ReasoningEffort = .unspecified,
+    /// Transient level confirmation: temporarily replaces the context percentage
+    /// in the prefix with the chosen level name; the owner expires it.
+    effort_flash: ?shared.ReasoningEffort = null,
 };
 
 /// Idle model and percentage use configured effort; busy text keeps the TPS
 /// palette/phase/ordinal. Parentheses, spaces and marker stay terminal-default,
 /// as does the editor after every style is reset. No prefix means no color.
 pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, motion: PromptActivity) !Prompt {
-    const percentage = try contextLabel(a, snapshot);
+    const percentage = if (motion.effort_flash) |level|
+        try a.dupe(u8, level.name() orelse "?")
+    else
+        try contextLabel(a, snapshot);
     defer a.free(percentage);
     const marker = if (motion.busy) activity.spinner(motion.now_ms) else ">";
     const reserve: usize = @min(@as(usize, 24), columns / 3);
@@ -348,13 +369,13 @@ test "write count colors use numeric metadata not patterns in a hostile path" {
     const body = try commandText(a, done, .success);
     defer a.free(body);
     const span: CommandSpan = .{ .start = 0, .end = body.len, .outcome = .success, .write_marks = done.write_marks.?.shifted(2) };
-    const line = try commandLine(a, body, &.{span}, 200, null);
+    const line = try commandLine(a, body, &.{span}, 200, null, null);
     defer a.free(line);
     try std.testing.expect(std.mem.startsWith(u8, line, theme.reset ++ "w" ++ theme.muted ++ " path +99 -88 中文  ~4 "));
     try std.testing.expect(std.mem.indexOf(u8, line, theme.diff_added ++ "+12" ++ theme.muted) != null);
     try std.testing.expect(std.mem.indexOf(u8, line, theme.diff_removed ++ "-34" ++ theme.muted) != null);
     for ([_]usize{ 1, 4, 20, 45, 55 }) |columns| {
-        const clipped = try commandLine(a, body, &.{span}, columns, null);
+        const clipped = try commandLine(a, body, &.{span}, columns, null, null);
         defer a.free(clipped);
         try std.testing.expect(@import("markdown_writer.zig").displayWidth(clipped) <= commandColumns(columns));
         try std.testing.expect(std.unicode.utf8ValidateSlice(clipped));
@@ -381,6 +402,26 @@ test "context prompt is retained occupancy not cache billing and remains bounded
     const zero = try prompt(a, "fixture", .{ .tokens = 9000, .limit = 0 }, 79, .{});
     defer zero.deinit(a);
     try std.testing.expect(std.mem.find(u8, zero.plain, "?%") != null);
+}
+
+test "effort confirmation replaces only the context slot and medium stays default color" {
+    const a = std.testing.allocator;
+    const context: shared.ContextSnapshot = .{ .tokens = 25, .limit = 100 };
+    const flash = try prompt(a, "fixture", context, 79, .{ .reasoning_effort = .medium, .effort_flash = .medium });
+    defer flash.deinit(a);
+    try std.testing.expectEqualStrings("(fixture medium) > ", flash.plain);
+    try std.testing.expectEqualStrings(flash.plain, flash.styled);
+    const restored = try prompt(a, "fixture", context, 79, .{ .reasoning_effort = .medium });
+    defer restored.deinit(a);
+    try std.testing.expectEqualStrings("(fixture 25.0%) > ", restored.plain);
+    const busy = try prompt(a, "fixture", context, 79, .{ .busy = true, .reasoning_effort = .high, .effort_flash = .high });
+    defer busy.deinit(a);
+    try std.testing.expect(std.mem.startsWith(u8, busy.plain, "(fixture high) "));
+    for (0..80) |columns| {
+        const narrow = try prompt(a, "very long model name", context, columns, .{ .reasoning_effort = .minimal, .effort_flash = .minimal });
+        defer narrow.deinit(a);
+        try std.testing.expect(text.width(narrow.plain) <= @max(columns, 2));
+    }
 }
 
 test "idle effort colors only prefix text and all busy TPS waves ignore effort" {
@@ -448,13 +489,13 @@ test "all four tool prefixes rotate80ms while preserving independent120ms warm p
         defer a.free(body);
         const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }};
         for ([_]u64{ 0, 80, 120 }) |time| {
-            const line = try commandLine(a, body, spans, 100, time);
+            const line = try commandLine(a, body, spans, 100, null, time);
             defer a.free(line);
             const prefix = try std.fmt.allocPrint(a, "{s}{s}{s} operation target{s}", .{ theme.command_pulse[shared.activity.commandStep(time)], activity.spinner(time), theme.muted, theme.reset });
             defer a.free(prefix);
             try std.testing.expectEqualStrings(prefix, line);
         }
-        const done = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .success }}, 100, 120);
+        const done = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .success }}, 100, null, 120);
         defer a.free(done);
         const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ theme.reset, activity.icon(kind), theme.muted, body[activity.icon(kind).len..], theme.reset });
         defer a.free(expected);
@@ -479,7 +520,7 @@ test "tool details survive old cutoffs and rows clip at80percent with complete c
         const body = try commandText(a, value, .pending);
         defer a.free(body);
         for ([_]usize{ 0, 1, 4, 10, 80, 200, 512 }) |columns| {
-            const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, columns, 80);
+            const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, columns, null, 80);
             defer a.free(line);
             try std.testing.expect(output.displayWidth(line) <= commandColumns(columns));
             try std.testing.expect(std.unicode.utf8ValidateSlice(line));
@@ -487,7 +528,7 @@ test "tool details survive old cutoffs and rows clip at80percent with complete c
         }
     }
     const body = "r 中文é repeated-path 中文é repeated-path 中文é repeated-path";
-    const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, 80, 120);
+    const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, 80, null, 120);
     defer a.free(line);
     try std.testing.expect(output.displayWidth(line) <= 64);
     try std.testing.expect(std.unicode.utf8ValidateSlice(line));
@@ -503,25 +544,52 @@ test "tool details survive old cutoffs and rows clip at80percent with complete c
     try std.testing.expectEqualStrings("(operation unavailable)", missing.label);
 }
 
+test "command duration stays last and inside the row width for every outcome" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    const output = @import("markdown_writer.zig");
+    const cases = [_]struct { ms: u64, suffix: []const u8 }{
+        .{ .ms = 7, .suffix = "7ms" },
+        .{ .ms = 1234, .suffix = "1.23s" },
+        .{ .ms = 62000, .suffix = "1m02s" },
+        .{ .ms = std.math.maxInt(u64), .suffix = "307445734561825m51s" },
+    };
+    for ([_]Outcome{ .pending, .success, .failed, .canceled }) |outcome| {
+        const body = try commandText(a, .{ .kind = .bash, .label = "echo 中文é very-long-command 中文é very-long-command 中文é tail" }, outcome);
+        defer a.free(body);
+        for (cases) |case| {
+            const ending = try std.fmt.allocPrint(a, "  {s}{s}", .{ case.suffix, theme.reset });
+            defer a.free(ending);
+            for ([_]usize{ 0, 1, 7, 12, 16, 40, 79, 200 }) |columns| {
+                const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }}, columns, case.ms, 120);
+                defer a.free(line);
+                try std.testing.expect(output.displayWidth(line) <= commandColumns(columns));
+                try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+                if (commandColumns(columns) >= case.suffix.len + 6) try std.testing.expect(std.mem.endsWith(u8, line, ending));
+            }
+        }
+    }
+}
+
 test "only pending command prefix pulses and completed spans remain static and clipped safely" {
     const a = std.testing.allocator;
     const body = "> sleep 1";
     const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }};
-    const first = try commandLine(a, body, spans, 79, 0);
+    const first = try commandLine(a, body, spans, 79, null, 0);
     defer a.free(first);
-    const second = try commandLine(a, body, spans, 79, 120);
+    const second = try commandLine(a, body, spans, 79, null, 120);
     defer a.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expect(std.mem.find(u8, first, theme.command_pulse[0] ++ "⠋" ++ theme.muted ++ " sleep 1") != null);
     for ([_]Outcome{ .success, .failed, .canceled }) |outcome| {
         const complete = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }};
-        const one = try commandLine(a, body, complete, 79, 0);
+        const one = try commandLine(a, body, complete, 79, null, 0);
         defer a.free(one);
-        const two = try commandLine(a, body, complete, 79, 1);
+        const two = try commandLine(a, body, complete, 79, null, 1);
         defer a.free(two);
         try std.testing.expectEqualStrings(one, two);
     }
-    const narrow = try commandLine(a, "r long-path", &.{CommandSpan{ .start = 0, .end = "r long-path".len, .outcome = .pending }}, 4, 1);
+    const narrow = try commandLine(a, "r long-path", &.{CommandSpan{ .start = 0, .end = "r long-path".len, .outcome = .pending }}, 4, null, 1);
     defer a.free(narrow);
     try std.testing.expect(std.unicode.utf8ValidateSlice(narrow));
     try std.testing.expectEqualStrings(theme.muted ++ "..." ++ theme.reset, narrow);
@@ -542,7 +610,7 @@ test "long byte capped paths use complete clusters and only ascii truncation dot
         try std.testing.expect(value.label.len <= 512);
         const body = try commandText(a, value, .success);
         defer a.free(body);
-        const row = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .success }}, 1000, null);
+        const row = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .success }}, 1000, null, null);
         defer a.free(row);
         try std.testing.expect(std.mem.indexOf(u8, row, "[truncated]") == null);
         try std.testing.expect(std.mem.indexOf(u8, row, "e...") == null);
@@ -557,10 +625,10 @@ test "long byte capped paths use complete clusters and only ascii truncation dot
 test "individual command rows retain default icons and their own outcome colors" {
     const a = std.testing.allocator;
     const body = "> date [error]";
-    const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 79, null);
+    const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 79, null, null);
     defer a.free(line);
     const success = "> pwd";
-    const success_line = try commandLine(a, success, &.{.{ .start = 0, .end = success.len, .outcome = .success }}, 79, null);
+    const success_line = try commandLine(a, success, &.{.{ .start = 0, .end = success.len, .outcome = .success }}, 79, null, null);
     defer a.free(success_line);
     try std.testing.expect(std.mem.find(u8, line, theme.reset ++ ">" ++ theme.failure ++ " date [error]") != null);
     try std.testing.expect(std.mem.find(u8, success_line, theme.reset ++ ">" ++ theme.muted ++ " pwd") != null);
@@ -568,7 +636,7 @@ test "individual command rows retain default icons and their own outcome colors"
     try std.testing.expect(std.mem.find(u8, success_line, "date") == null);
     try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);
     try std.testing.expect(std.mem.findScalar(u8, success_line, '\n') == null);
-    const clipped = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 10, null);
+    const clipped = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 10, null, null);
     defer a.free(clipped);
     try std.testing.expect(std.mem.endsWith(u8, clipped, "..." ++ theme.reset));
 }

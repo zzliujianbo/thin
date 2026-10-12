@@ -24,6 +24,9 @@ pub const Execution = struct {
     /// Optional measured file observations, copied by value across Host/Bridge.
     /// No content/authority; absent remains unknown, including synthetic errors.
     file_stats: ?@import("../util/line_stats.zig").File = null,
+    /// Monotonic dispatch-through-cleanup time, excluding permission/model waits
+    /// and result rendering. Null for calls that never started.
+    duration_ms: ?u64 = null,
 };
 
 /// prepare_fn 的产物：只解析与校验参数、不产生副作用，供授权与执行阶段使用。
@@ -123,7 +126,7 @@ pub const Event = union(enum) {
     /// 请求用户授权（随后会调用 Host.authorize_fn）。
     permission: Permission,
     /// 工具开始执行。
-    tool_started: struct { id: u64, name: []const u8 },
+    tool_started: struct { id: u64, name: []const u8, started_ms: ?u64 = null },
     /// 工具结束（包括被拒绝、失败、取消）。
     tool_result: struct { id: u64, name: []const u8, result: Execution },
     /// 单次模型调用的权威用量（流内快照不累加）。
@@ -896,7 +899,8 @@ pub const Runtime = struct {
                 if (task.tool_calls >= self.config.limits.max_tool_calls) return error.ToolCallLimit;
                 task.tool_calls += 1;
                 try self.emit(.{ .state = .executing_tool }, cancel);
-                try self.emit(.{ .tool_started = .{ .id = host_id, .name = call.name } }, cancel);
+                const began = Io.Clock.awake.now(self.io);
+                try self.emit(.{ .tool_started = .{ .id = host_id, .name = call.name, .started_ms = @intCast(@max(0, began.toMilliseconds())) } }, cancel);
 
                 // 执行错误转为 is_error 结果而不是 run 失败；Canceled 标记为 canceled。
                 started_call = call.id;
@@ -905,6 +909,7 @@ pub const Runtime = struct {
                     .is_error = true,
                     .canceled = err == error.Canceled,
                 };
+                result.duration_ms = @intCast(@max(0, began.untilNow(self.io, .awake).toMilliseconds()));
             }
 
             // 清理失败可能残留子进程，之后必须拒绝运行。

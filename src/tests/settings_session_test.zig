@@ -55,31 +55,35 @@ test "project effort persists without logs and auth saves the untouched global b
     defer first.deinit();
     first.setLogging(false);
     const initial = first.connection().current();
-    try std.testing.expectEqual(effort.unspecified, initial.reasoning_effort);
+    // First entry with no project preference persists a capability-clamped
+    // default (deepseek-flash clamps the built-in medium upward to high).
+    try std.testing.expectEqual(effort.high, initial.reasoning_effort);
     try std.testing.expect(initial.effort_levels.contains(.off));
     try std.testing.expect(initial.effort_levels.contains(.max));
     try std.testing.expect(!initial.effort_levels.contains(.medium));
-    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.openDir(std.testing.io, "project/.thin", .{}));
-    try first.connection().setEffort(.high);
-    try std.testing.expectEqual(effort.high, first.connection().current().reasoning_effort);
     try std.testing.expectEqual(effort.high, (try first.settings.load()).?);
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.openDir(std.testing.io, "project/.thin/sessions", .{}));
+    try first.connection().setEffort(.low);
+    try std.testing.expectEqual(effort.low, first.connection().current().reasoning_effort);
+    try std.testing.expectEqual(effort.low, (try first.settings.load()).?);
     try std.testing.expectError(error.UnsupportedReasoningEffort, first.connection().setEffort(.medium));
-    try std.testing.expectEqual(effort.high, first.connection().current().reasoning_effort);
-    try std.testing.expectEqual(effort.high, (try first.settings.load()).?);
+    try std.testing.expectEqual(effort.low, first.connection().current().reasoning_effort);
+    try std.testing.expectEqual(effort.low, (try first.settings.load()).?);
 
     var restarted = try fixture.session(fixture.project);
     defer restarted.deinit();
-    try std.testing.expectEqual(effort.high, restarted.connection().current().reasoning_effort);
+    try std.testing.expectEqual(effort.low, restarted.connection().current().reasoning_effort);
     try std.testing.expect(restarted.pending_base_model.?.reasoning_effort == null);
     var isolated = try fixture.session(fixture.other);
     defer isolated.deinit();
-    try std.testing.expectEqual(effort.unspecified, isolated.connection().current().reasoning_effort);
-    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.openDir(std.testing.io, "other/.thin", .{}));
+    // A different project is still a first entry and persists its own default.
+    try std.testing.expectEqual(effort.high, isolated.connection().current().reasoning_effort);
+    try std.testing.expectEqual(effort.high, (try isolated.settings.load()).?);
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.openDir(std.testing.io, "other/.thin/sessions", .{}));
 
     restarted.setLogging(false);
     try restarted.connection().configure("fake-settings-activation-key");
-    try std.testing.expectEqual(effort.high, restarted.connection().current().reasoning_effort);
+    try std.testing.expectEqual(effort.low, restarted.connection().current().reasoning_effort);
     try std.testing.expect(!restarted.connection().current().logging_enabled);
     var disk = try restarted.store.loadOrInitialize();
     defer cfg.release(&disk);
@@ -88,8 +92,32 @@ test "project effort persists without logs and auth saves the untouched global b
     // Headless entry also reads the project preference, but creates no archive.
     const app = try App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.project, .{}, false);
     defer app.deinit();
-    try std.testing.expectEqualStrings("high", app.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqualStrings("low", app.config.value.model.reasoning_effort.?);
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.openDir(std.testing.io, "project/.thin/sessions", .{}));
+}
+
+test "headless first entry creates settings and shares the mapped default with the UI" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const io = std.testing.io;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(fixture.tmp.dir.handle, "home/.thin", 0o700));
+    const config =
+        \\{"provider":{"base_url":"http://unused.invalid","api_key":"fake-default-key"},"model":{"name":"fixture","context_tokens":32768,"protocol":"chat","reasoning":{"map":{"medium":"balanced"}}}}
+    ;
+    try fixture.tmp.dir.writeFile(io, .{ .sub_path = "home/.thin/config.json", .data = config });
+    const app = try App.init(std.testing.allocator, io, &fixture.env, fixture.project, .{}, false);
+    defer app.deinit();
+    try std.testing.expectEqualStrings("medium", app.config.value.model.reasoning_effort.?);
+    const request = @import("../core/runtime.zig").withReasoning(app.config.value, @import("adapter_test_support.zig").request(.chat));
+    try std.testing.expectEqualStrings("balanced", request.reasoning_effort.?);
+    const bytes = try fixture.tmp.dir.readFileAlloc(io, "project/.thin/settings.json", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("{\"version\":1,\"reasoning_effort\":\"medium\"}\n", bytes);
+    var session = try fixture.session(fixture.project);
+    defer session.deinit();
+    try std.testing.expectEqual(effort.medium, session.connection().current().reasoning_effort);
+    try std.testing.expectEqual(effort.medium, session.preferred_effort.?);
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.openDir(io, "project/.thin/sessions", .{}));
 }
 
 test "unsupported saved effort clamps effectively without rewriting the preference" {

@@ -61,7 +61,7 @@ pub fn effortColor(effort: activity.ReasoningEffort) []const u8 {
         .off, .none => muted,
         .minimal => "\x1b[38;5;117m",
         .low => success,
-        .medium => caution,
+        .medium => reset,
         .high => "\x1b[38;5;75m",
         .xhigh => "\x1b[38;5;171m",
         .max => "\x1b[38;5;177m", // Distinct brighter violet for maximum effort.
@@ -89,6 +89,7 @@ test "Markdown restores old screenshot palette and original font styles" {
     for ([_][]const u8{ link, inline_code, code, bullet }) |style| try testing.expect(std.mem.indexOf(u8, style, "\x1b[1m") == null);
     try testing.expectEqualStrings("\x1b[38;5;2m", diff_added);
     try testing.expectEqualStrings("\x1b[38;5;1m", diff_removed);
+    try testing.expectEqualStrings(reset, effortColor(.medium));
     try testing.expectEqualStrings("\x1b[38;5;75m", effortColor(.high));
     try testing.expectEqualStrings("\x1b[38;5;171m", effortColor(.xhigh));
 }

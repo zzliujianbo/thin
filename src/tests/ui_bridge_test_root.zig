@@ -93,8 +93,8 @@ test "bridge owns every borrowed payload after source arena is freed" {
         try send(&bridge, .{ .reasoning = s });
         try send(&bridge, .{ .tool_preview = .{ .index = 3, .arguments = s } });
         try send(&bridge, .{ .permission = .{ .id = 1, .tool_name = s, .description = s } });
-        try send(&bridge, .{ .tool_started = .{ .id = 1, .name = s } });
-        try send(&bridge, .{ .tool_result = .{ .id = 1, .name = s, .result = .{ .text = s, .cleanup_failed = true } } });
+        try send(&bridge, .{ .tool_started = .{ .id = 1, .name = s, .started_ms = 1234 } });
+        try send(&bridge, .{ .tool_result = .{ .id = 1, .name = s, .result = .{ .text = s, .cleanup_failed = true, .duration_ms = 567 } } });
         @memset(s, 'x'); // deterministic proof of no borrowing, as well as free
     }
 
@@ -126,11 +126,13 @@ test "bridge owns every borrowed payload after source arena is freed" {
     item.deinit();
     item = bridge.pop().?;
     try t.expectEqualStrings("owned", item.event.tool_started.name);
+    try t.expectEqual(@as(?u64, 1234), item.event.tool_started.started_ms);
     item.deinit();
     item = bridge.pop().?;
     try t.expectEqualStrings("owned", item.event.tool_result.name);
     try t.expectEqualStrings("owned", item.event.tool_result.result.text);
     try t.expect(item.event.tool_result.result.cleanup_failed);
+    try t.expectEqual(@as(?u64, 567), item.event.tool_result.result.duration_ms);
     item.deinit();
 }
 

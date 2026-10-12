@@ -108,14 +108,14 @@ export async function settingsRegressions({app,pty,execute,send}) {
   for (const format of ['standard','deepseek']) await group(format,'chat',async t => {
     await t.configure({format});
     await t.run('settings-initial');
-    assert(!await exists(join(t.project,'.thin')));
+    await t.saved(t.project,'off');
     await t.run('settings-cycle',['low','high','max','off'],{format});
     await t.saved(t.project,'max');
     const before = await readFile(t.settingsPath(t.project),'utf8');
     await t.run('settings-probe-max',['max'],{format}); // Actual PTY restart, same project.
     await t.unchanged(t.project,before,0o600);
     await t.run('settings-probe-off',['off'],{p:t.other,format});
-    assert(!await exists(join(t.other,'.thin')));
+    await t.saved(t.other,'off');
     await t.run('', ['max'],{headless:true,format});
     assert.equal(await readFile(t.configPath,'utf8'),t.getConfig());
   });

@@ -75,10 +75,11 @@ pub const Call = struct {
 pub const Completion = struct {
     outcome: Outcome,
     file_stats: ?FileStats,
+    duration_ms: ?u64 = null,
 
     pub fn fromExecution(result: r.Execution) Completion {
         const outcome: Outcome = if (result.canceled) .canceled else if (result.is_error) .failed else .success;
-        return .{ .outcome = outcome, .file_stats = if (outcome == .success) result.file_stats else null };
+        return .{ .outcome = outcome, .file_stats = if (outcome == .success) result.file_stats else null, .duration_ms = result.duration_ms };
     }
 };
 

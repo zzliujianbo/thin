@@ -62,12 +62,12 @@ pub const Session = struct {
         // Capture GLOBAL defaults before any project overlay or capability
         // clamp. /auth must never persist a repository's transient choice.
         self.pending_base_model = self.pending.?.value.model;
-        self.preferred_effort = self.settings.load() catch |err| blk: {
+        const config = &self.pending.?.value;
+        const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
+        self.preferred_effort = self.settings.loadOrInitialize(capabilities.defaultEffort(config.model.reasoning_effort)) catch |err| blk: {
             self.settings_error = err;
             break :blk null;
         };
-        const config = &self.pending.?.value;
-        const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
         if (self.preferred_effort) |saved| {
             if (capabilities.known) {
                 config.model.reasoning_effort = capabilities.effective(saved.name());
@@ -347,7 +347,7 @@ test "transient pending selection owns names and auth saves original options" {
     try env.put("HOME", home);
     var session = try Session.init(a, io, &env, home, .{}, false);
     defer session.deinit();
-    var original = session.pending.?.value.model;
+    var original = session.pending_base_model.?;
     const original_name = try a.dupe(u8, original.name);
     defer a.free(original_name);
     original.name = original_name;
@@ -357,7 +357,9 @@ test "transient pending selection owns names and auth saves original options" {
     session.pending.?.value.models = &.{.{ .name = "configured", .context_tokens = 65536, .protocol = .chat, .reasoning_effort = "low", .reasoning = testReasoning() }};
     try Session.selectModel(&session, "configured");
     try std.testing.expectEqual(@as(u32, 65536), session.connection().current().context_limit);
-    try std.testing.expectEqual(presentation.ReasoningEffort.low, session.connection().current().reasoning_effort);
+    // First entry persisted a project default (deepseek-flash: medium -> high),
+    // which now overrides the same-named profile's declared "low".
+    try std.testing.expectEqual(presentation.ReasoningEffort.high, session.connection().current().reasoning_effort);
     try std.testing.expectEqual(@as(usize, 1), session.connection().current().models.len);
     try Session.setEffort(&session, .medium);
     try Session.selectModel(&session, "configured");

@@ -47,21 +47,19 @@ pub const App = struct {
         const path = try cfg.defaultPath(a, home);
         defer a.free(path);
         var parsed = try cfg.load(a, io, path);
-        // Missing preferences are read-only. Headless entry uses the same
-        // project choice, without changing the global configuration on disk.
+        // Headless entry creates the same missing project default as the TUI,
+        // without changing the global configuration on disk.
         var settings = Settings.open(a, io, project) catch |err| {
             cfg.release(&parsed);
             return err;
         };
         defer settings.deinit();
-        const saved = settings.load() catch |err| {
+        const capabilities = thinking.resolve(parsed.value.provider.base_url, parsed.value.model.name, parsed.value.model.reasoning);
+        const saved = settings.loadOrInitialize(capabilities.defaultEffort(parsed.value.model.reasoning_effort)) catch |err| {
             cfg.release(&parsed);
             return err;
         };
-        const capabilities = thinking.resolve(parsed.value.provider.base_url, parsed.value.model.name, parsed.value.model.reasoning);
-        if (saved) |effort| {
-            if (capabilities.known) parsed.value.model.reasoning_effort = capabilities.effective(effort.name());
-        }
+        if (capabilities.known) parsed.value.model.reasoning_effort = capabilities.effective(saved.name());
         return initConfiguredAnchored(a, io, environ, &settings.root, host, trusted, parsed);
     }
 

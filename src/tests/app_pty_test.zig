@@ -708,7 +708,7 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\"written_bytes\"") == null);
     } else if (std.mem.startsWith(u8, mode, "settings-")) {
         // All settings processes are real owned PTYs with --no-log. Check an
-        // acknowledged initial frame before typing; startup alone never saves.
+        // acknowledged initial frame before typing; a missing preference is initialized.
         try d.waitIdle(0);
         if (std.mem.eql(u8, mode, "settings-initial")) try settingsColor(&d, 0, "off");
         if (std.mem.eql(u8, mode, "settings-cycle") or std.mem.eql(u8, mode, "settings-map")) {
@@ -802,11 +802,14 @@ pub fn main(init: std.process.Init) !void {
         try d.send("\r");
         try d.waitIdle(start);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "fixture-next") != null);
+        // The initialized project preference (off) wins over the profile's low.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;245mfixture-next\x1b[0m \x1b[38;5;245m") != null);
         start = d.used;
-        try d.send("\x1b[Z"); // Configured low -> medium, not a visual-only label.
+        try d.send("\x1b[Z\x1b[Z\x1b[Z"); // off -> minimal -> low -> medium.
+        // Observe the acknowledged confirmation, then its automatic expiry.
+        // Intermediate levels may render if PTY input arrives in separate reads.
+        try d.waitFrame(start, "(fixture-next medium) > ");
         try d.waitIdle(start);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;214mfixture-next\x1b[0m \x1b[38;5;214m") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;214m>\x1b[0m") == null);
         start = d.used;
         try d.send("selection-second\r");
         try d.waitText(start, "selection-answer-two");

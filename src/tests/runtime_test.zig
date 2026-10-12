@@ -86,6 +86,10 @@ const Fake = struct {
     file_stats: ?@import("../util/line_stats.zig").File = null,
     last_file_stats: ?@import("../util/line_stats.zig").File = null,
     fitted_result: bool = false,
+    last_started_ms: ?u64 = null,
+    last_duration_ms: ?u64 = null,
+    execution_delay: bool = false,
+    execution_error: ?anyerror = null,
 
     /// 返回模型接口，调用分发到 call。
     fn model(self: *Fake) p.Model {
@@ -183,6 +187,8 @@ const Fake = struct {
         const self: *Fake = @ptrCast(@alignCast(ctx));
         if (cancel.isRequested()) return error.Canceled;
         self.executions += 1;
+        if (self.execution_delay) try std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake);
+        if (self.execution_error) |err| return err;
         if (self.fail_after_execution) |armed| armed.* = true;
         if (self.cancel_after_execution) |c| c.cancel();
         return .{ .text = self.output, .cleanup_failed = self.cleanup_failure, .is_error = self.cleanup_failure, .file_stats = self.file_stats };
@@ -218,7 +224,9 @@ const Fake = struct {
             .tool_result => |value| {
                 self.last_file_stats = value.result.file_stats;
                 self.fitted_result = value.result.truncated;
+                self.last_duration_ms = value.result.duration_ms;
             },
+            .tool_started => |value| self.last_started_ms = value.started_ms,
             .finished => self.terminals += 1,
             .compacted => {
                 self.compactions += 1;
@@ -272,6 +280,32 @@ fn smallConfiguration() cfg.Config {
     config.limits.summary_tokens = 100;
     config.limits.safety_tokens = 100;
     return config;
+}
+
+test "tool duration measures success failure and cancellation but not denial or prepare failure" {
+    const Mode = enum { success, failure, canceled, denied, invalid };
+    for ([_]Mode{ .success, .failure, .canceled, .denied, .invalid }) |mode| {
+        var fake: Fake = .{
+            .execution_delay = true,
+            .execution_error = switch (mode) {
+                .failure => error.FixtureExecutionFailure,
+                .canceled => error.Canceled,
+                else => null,
+            },
+            .decision = if (mode == .denied) .deny else .allow_once,
+            .fail_prepare = mode == .invalid,
+        };
+        var config = configuration();
+        var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "system", false);
+        defer runtime.deinit();
+        var cancel: p.Cancellation = .{};
+        const result = try runtime.run("task", &cancel);
+        try std.testing.expectEqual(if (mode == .canceled) r.Status.canceled else r.Status.success, result.status);
+        const executed = mode != .denied and mode != .invalid;
+        try std.testing.expectEqual(executed, fake.last_started_ms != null);
+        try std.testing.expectEqual(executed, fake.last_duration_ms != null);
+        if (executed) try std.testing.expect(fake.last_duration_ms.? >= 20);
+    }
 }
 
 test "owner publishes actual request snapshots across tools and compaction not cumulative usage" {

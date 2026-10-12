@@ -32,6 +32,8 @@ const Record = struct {
     kind: Kind,
     /// Every completed call owns one compact row, never a raw result block.
     command_row: bool = false,
+    /// Measured wall-clock execution time of this row; null when unobserved.
+    duration_ms: ?u64 = null,
     final_answer: bool = false,
     command_spans: std.ArrayList(presentation.CommandSpan) = .empty,
     /// Only a fully written frame commits transcript delivery. Pending survives index shifts.
@@ -66,7 +68,7 @@ const Record = struct {
         self.command_spans.deinit(a);
     }
 
-    fn setCommand(self: *Record, a: std.mem.Allocator, caption: presentation.Caption, outcome: presentation.Outcome) !void {
+    fn setCommand(self: *Record, a: std.mem.Allocator, caption: presentation.Caption, outcome: presentation.Outcome, duration_ms: ?u64) !void {
         std.debug.assert(self.body.items.len == 0 and self.command_spans.items.len == 0);
         const label = try presentation.commandText(a, caption, outcome);
         defer a.free(label);
@@ -74,6 +76,7 @@ const Record = struct {
         const start = self.body.items.len;
         try self.append(a, label);
         self.command_row = true;
+        self.duration_ms = duration_ms;
         self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome, .write_marks = if (caption.write_marks) |marks| marks.shifted(start + activity.icon(caption.kind).len + 1) else null });
     }
 
@@ -119,7 +122,7 @@ const Record = struct {
         const temp = arena.allocator();
 
         if (self.command_row) {
-            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns, null);
+            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns, self.duration_ms, null);
             self.lines = try temp.dupe([]const u8, &.{line});
             self.excerpt = false; // Commands indicate clipping with ... only.
             self.columns = columns;
@@ -311,13 +314,15 @@ const Ui = struct {
     mode: ?r.State = null,
     /// 仅必要的错误、设置和隔离提示使用临时hint。
     notice: []const u8 = "Ready",
+    /// 切换思考档位后的短暂确认：在输入框百分比位置显示新档位，2 秒后自动恢复。
+    effort_flash: ?struct { level: shared.ReasoningEffort, until_ms: u64 } = null,
     log_warning_seen: bool = false,
     /// UI receipt clock and bounded statistics; never read worker-owned timing.
     clock_ms: u64 = 0,
     animation_tick: u64 = 0,
     display: shared.State = .{},
     model_flow: activity.Flow = .{},
-    active_tool: ?struct { id: u64, caption: presentation.Caption } = null,
+    active_tool: ?struct { id: u64, caption: presentation.Caption, started_ms: u64 } = null,
     /// Shared canonical FIFO; renderer adds terminal widths/icons later.
     tool_calls: shared.tools.Queue = .{},
     /// 上一次终态用于失败详情和cleanup安全检查，不显示统计栏。
@@ -444,14 +449,15 @@ const Ui = struct {
         const observed = if (outcome == .success) try presentation.completed(self.allocator, caption, completion.file_stats) else presentation.Caption{ .kind = caption.kind, .label = try self.allocator.dupe(u8, caption.label) };
         defer observed.deinit(self.allocator);
         const index = try self.add(.tool, "");
-        try self.records.items[index].setCommand(self.allocator, observed, outcome);
+        try self.records.items[index].setCommand(self.allocator, observed, outcome, completion.duration_ms);
     }
 
     /// Only the currently running call is replaceable; every result owns a row.
     fn pendingCommand(self: *Ui, a: std.mem.Allocator, columns: usize) ![]const u8 {
         const label = try presentation.commandText(a, self.active_tool.?.caption, .pending);
         defer a.free(label);
-        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, self.clock_ms);
+        const start = self.active_tool.?.started_ms;
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, self.clock_ms -| start, self.clock_ms);
     }
 
     /// Only actionable notices/errors use a temporary hint row. Completed,
@@ -550,13 +556,15 @@ const Ui = struct {
             },
             .tool_started => |tool| {
                 self.clearActiveTool();
-                self.active_tool = .{ .id = tool.id, .caption = try self.nextToolCaption(tool.name) };
+                self.active_tool = .{ .id = tool.id, .caption = try self.nextToolCaption(tool.name), .started_ms = tool.started_ms orelse self.clock_ms };
             },
             .tool_result => |tool| {
                 // FIFO also covers prepare failures/denials without a start.
                 // Raw results stay in Runtime/archives, never UI JSON.
                 if (self.active_tool) |active| {
                     if (active.id == tool.id) {
+                        // Both events may arrive in one UI tick; use the worker's
+                        // measured result, never queue-drain time as execution time.
                         try self.toolCompleted(active.caption, tool.result);
                         self.clearActiveTool();
                     }
@@ -621,6 +629,7 @@ const Ui = struct {
         try self.connection.selectModel(name);
         const state = self.connection.current();
         self.display = .{ .context = state.initial_context, .reasoning_effort = state.reasoning_effort };
+        self.effort_flash = null;
         self.model_flow = .{};
         self.mode = null;
         self.last_terminal = null;
@@ -651,17 +660,18 @@ const Ui = struct {
             return;
         };
         self.display.setEffort(next);
-        self.notice = switch (next) {
-            .off, .none => "Thinking request: off (saved for this project)",
-            .minimal => "Thinking request: minimal (saved for this project)",
-            .low => "Thinking request: low (saved for this project)",
-            .medium => "Thinking request: medium (saved for this project)",
-            .high => "Thinking request: high (saved for this project)",
-            .xhigh => "Thinking request: xhigh (saved for this project)",
-            .max => "Thinking request: max (saved for this project)",
-            else => unreachable,
-        };
+        // 档位变更只在输入框百分比位置短暂确认，不再写常驻 hint 行。
+        self.effort_flash = .{ .level = next, .until_ms = self.clock_ms +| 2000 };
+        self.notice = "Ready";
         self.dirty = true;
+    }
+    fn expireEffortFlash(self: *Ui) void {
+        if (self.effort_flash) |pending| {
+            if (self.clock_ms >= pending.until_ms) {
+                self.effort_flash = null;
+                self.dirty = true;
+            }
+        }
     }
     fn modelKey(self: *Ui, event_: input.Event) !void {
         const picker = &self.model_picker.?;
@@ -1008,6 +1018,9 @@ const Ui = struct {
                 self.animation_tick = self.clock_ms / 80;
                 self.dirty = true;
             }
+            // 档位确认到期后自动恢复为上下文百分比，不必等下一次按键。
+            // 主循环每轮最多等待 16ms，因此到期后无需额外唤醒。
+            self.expireEffortFlash();
             // 每轮最多处理 64 个事件，避免大量输出阻塞输入与绘制。
             for (0..64) |_| {
                 var item = self.bridge.pop() orelse break;
@@ -1380,7 +1393,8 @@ const Ui = struct {
                 const working = self.busy or self.mode != null or self.active_tool != null;
                 const view = self.display.view(self.clock_ms);
                 self.model_flow.advance(self.clock_ms, working, view.live_tps_tenths);
-                const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .now_ms = self.clock_ms, .phase = self.model_flow.step(), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort });
+                const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
+                const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .now_ms = self.clock_ms, .phase = self.model_flow.step(), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash });
                 const decoration_width = text.width(decoration.plain);
                 const prefix = try editorDisplay(a, visible[begin..cursor]);
                 var start: usize = 0;
@@ -1461,10 +1475,12 @@ fn fittingBytes(bytes: []const u8, columns: usize) usize {
     return at;
 }
 
-/// 顺序输出一行；row 只区别首行是否换行，不是绝对坐标。清理自身行并复位样式。
+/// 顺序输出一行；row 只区别首行是否换行，不是绝对坐标。
+/// 先写正文再擦除行尾残留：整行清屏会让批量刷新时每行都先空一瞬，造成闪屏。
+/// 始终预留一列防止自动换行；空行仍从首列擦除，短行只擦除新内容之后的残留。
 fn putStyled(writer: *Io.Writer, row: usize, line: []const u8) !void {
     if (row > 1) try writer.writeAll("\r\n");
-    try writer.print("\x1b[0m\x1b[2K{s}\x1b[0m", .{line});
+    try writer.print("\x1b[0m{s}\x1b[0m\x1b[K", .{line});
 }
 
 /// 按终端列宽截断一行后输出：先清理控制字符，再按字素簇累计显示宽度，超出列宽即停止。
@@ -1500,6 +1516,52 @@ const FixtureConnection = struct {
 /// 测试用 Ui 构造器：使用 testing allocator，运行时与终端字段为 undefined（测试中不会访问）。
 fn fixtureUi(bridge: *bridge_module.Bridge, cancel: *p.Cancellation) Ui {
     return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = undefined, .editor = .{ .allocator = std.testing.allocator }, .job = undefined, .size = .{ .columns = 80, .rows = 24 } };
+}
+
+test "command elapsed time uses source timestamps freezes results and resets per call" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const host = bridge.host();
+    const drain = struct {
+        fn apply(target: *Ui) !void {
+            while (target.bridge.pop()) |value| {
+                var item = value;
+                defer item.deinit();
+                try target.event(item);
+            }
+        }
+    }.apply;
+    ui.clock_ms = 5000; // UI may consume both events long after execution.
+    try host.emit_fn(host.context, .{ .tool_started = .{ .id = 1, .name = "bash", .started_ms = 1000 } }, &cancel);
+    try drain(&ui);
+    const running = try ui.pendingCommand(std.testing.allocator, 79);
+    defer std.testing.allocator.free(running);
+    try std.testing.expect(std.mem.endsWith(u8, running, "4.00s" ++ theme.reset));
+    ui.clock_ms = 5500;
+    const later = try ui.pendingCommand(std.testing.allocator, 79);
+    defer std.testing.allocator.free(later);
+    try std.testing.expect(std.mem.endsWith(u8, later, "4.50s" ++ theme.reset));
+    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 1, .name = "bash", .result = .{ .text = "done", .duration_ms = 420 } } }, &cancel);
+    try drain(&ui);
+    try std.testing.expectEqual(@as(?u64, 420), ui.records.items[0].duration_ms);
+    try ui.records.items[0].layout(std.testing.allocator, 79);
+    try std.testing.expect(std.mem.endsWith(u8, ui.records.items[0].lines[0], "420ms" ++ theme.reset));
+    ui.clock_ms = 8000;
+    try ui.records.items[0].layout(std.testing.allocator, 60); // Resize cannot restart a completed timer.
+    try std.testing.expect(std.mem.endsWith(u8, ui.records.items[0].lines[0], "420ms" ++ theme.reset));
+    // Start/result drained in the same UI tick retain the measured duration.
+    try host.emit_fn(host.context, .{ .tool_started = .{ .id = 2, .name = "bash", .started_ms = 6100 } }, &cancel);
+    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 2, .name = "bash", .result = .{ .text = "failed", .is_error = true, .duration_ms = 230 } } }, &cancel);
+    try drain(&ui);
+    try std.testing.expectEqual(@as(?u64, 230), ui.records.items[1].duration_ms);
+    try std.testing.expectEqual(presentation.Outcome.failed, ui.records.items[1].command_spans.items[0].outcome);
+    // A denied/preparation-failed call did not execute: do not invent 0ms.
+    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 3, .name = "bash", .result = .{ .text = "not executed", .is_error = true } } }, &cancel);
+    try drain(&ui);
+    try std.testing.expect(ui.records.items[2].duration_ms == null);
 }
 
 test "regular transcript starts at top and keeps composer at bottom without role tags" {
@@ -1793,7 +1855,7 @@ test "first pending tool follows user gap then tools stay contiguous" {
         ui.finishFrame();
         const args = if (std.mem.eql(u8, name, "bash")) "{\"command\":\"target-one\"}" else if (std.mem.eql(u8, name, "memory")) "{\"action\":\"read\",\"topic\":\"target-one\"}" else "{\"path\":\"target-one\"}";
         try ui.captureToolCaptions(&.{.{ .tool_call = .{ .id = "gap-one", .name = name, .arguments = args } }});
-        ui.active_tool = .{ .id = 1, .caption = try ui.nextToolCaption(name) };
+        ui.active_tool = .{ .id = 1, .caption = try ui.nextToolCaption(name), .started_ms = 0 };
         try ui.draw();
         try screen.replay(ui.frame);
         try expectTranscriptGap(&screen, "tool-user-end", "target-one");
@@ -1805,7 +1867,7 @@ test "first pending tool follows user gap then tools stay contiguous" {
         try expectTranscriptGap(&screen, "tool-user-end", "target-one");
         ui.finishFrame();
         const second: presentation.Caption = .{ .kind = .read, .label = "target-two" };
-        ui.active_tool = .{ .id = 2, .caption = .{ .kind = .read, .label = try std.testing.allocator.dupe(u8, second.label) } };
+        ui.active_tool = .{ .id = 2, .caption = .{ .kind = .read, .label = try std.testing.allocator.dupe(u8, second.label) }, .started_ms = 0 };
         try ui.draw();
         try screen.replay(ui.frame);
         var first_row: ?usize = null;
@@ -2029,6 +2091,49 @@ test "committed large Markdown caches stay untouched on resize until history pre
     try std.testing.expectEqual(@as(usize, 1), screen.count("second-history-marker"));
 }
 
+test "bulk frames repaint before erasing stale line suffixes" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    // Cover shrinking/empty rows as well as an almost-full-width replacement.
+    const almost_full: [79]u8 = @splat('x');
+    for ([_][]const u8{ "new", "", &almost_full, "\x1b[1mbold\x1b[0m" }) |line| {
+        out.clearRetainingCapacity();
+        try putStyled(&out.writer, 1, line);
+        const bytes = out.written();
+        const erase = std.mem.find(u8, bytes, "\x1b[K") orelse return error.MissingSuffixErase;
+        try std.testing.expectEqual(@as(usize, 4 + line.len + 4), erase);
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        try screen.replay("previous long content\r");
+        try screen.replay(bytes[0..erase]); // 正文先于擦除出现，行尾旧内容不提前消失。
+        const replaced = screen.grid[0];
+        const column = screen.col;
+        try screen.replay(bytes[erase..]);
+        try std.testing.expectEqualSlices(u8, replaced[0..column], screen.grid[0][0..column]);
+        for (screen.grid[0][column..]) |cell| try std.testing.expectEqual(@as(u8, ' '), cell);
+    }
+
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true;
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    for (0..32) |i| {
+        var buffer: [128]u8 = undefined;
+        const chunk = try std.fmt.bufPrint(&buffer, "bulk-{d} **changing body** with several words to fill the viewport.\n\n", .{i});
+        try ui.appendDraft(.assistant, chunk);
+        ui.clock_ms = @intCast(i * 33);
+        try ui.draw();
+        // Inspect the candidate before finishFrame releases it, including growth.
+        try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2K") == null);
+        try screen.replay(ui.frame);
+        try std.testing.expectEqual(@as(usize, 23), screen.row);
+        ui.finishFrame();
+    }
+    try std.testing.expect(screen.visible("bulk-31"));
+}
+
 test "stable large table body is not erased or reprinted for a footer animation tick" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -2051,7 +2156,7 @@ test "stable large table body is not erased or reprinted for a footer animation 
     try ui.draw();
     // Only the animated composer changed. A completed body must not disappear
     // in a separate blank pass or be rewritten solely for a footer pulse.
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, "\x1b[2K"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, "\x1b[K"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "row-") == null);
     try screen.replay(ui.frame);
     for (0..23) |row| try std.testing.expectEqualSlices(u8, &before[row], &screen.grid[row]);
@@ -2121,7 +2226,7 @@ test "tail snapshots publish only on full ACK and own bytes after record invalid
     try std.testing.expect(std.mem.find(u8, ui.tail_snapshot.?.rows[0], "extended") != null);
     try ui.draw();
     try std.testing.expect(ui.frame_sparse);
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ui.frame, "\x1b[2K"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ui.frame, "\x1b[K"));
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("stable-body-A-extended"));
     try std.testing.expectEqual(@as(usize, 23), screen.row);
@@ -2754,7 +2859,7 @@ test "editor tabs expand before clipping and cursor placement but submit unchang
         ui.editor.cursor = case.cursor;
         try ui.draw();
         try std.testing.expect(std.mem.findScalar(u8, ui.frame, '\t') == null);
-        const expected = try std.fmt.allocPrint(std.testing.allocator, "\r\n\x1b[0m\x1b[2K{s}\x1b[0m\r\x1b[{d}C\x1b[?25h", .{ case.line, case.column - 1 });
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "\r\n\x1b[0m{s}\x1b[0m\x1b[K\r\x1b[{d}C\x1b[?25h", .{ case.line, case.column - 1 });
         defer std.testing.allocator.free(expected);
         try std.testing.expect(std.mem.endsWith(u8, ui.frame, expected));
         try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);
@@ -2810,6 +2915,70 @@ const SelectionFixture = struct {
     }
 };
 
+test "effort confirmation expires after two seconds and repeated switches restart it" {
+    var fixture: SelectionFixture = .{ .effort = .low, .levels = .{ .mask = 0x55 } };
+    defer fixture.deinit();
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(screen.visible("fixture-old 3.1%"));
+    try std.testing.expect(ui.effort_flash == null);
+
+    ui.clock_ms = 1000;
+    ui.cycleEffort(); // low -> high, expires at 3000.
+    const context = ui.display.context;
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(screen.visible("fixture-old high"));
+    try std.testing.expectEqualDeep(context, ui.display.context);
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    try std.testing.expectEqual(text.width("(fixture-old high) > "), screen.col);
+
+    ui.clock_ms = 2500;
+    ui.cycleEffort(); // high -> max, now expires at 4500 instead.
+    ui.dirty = false;
+    ui.clock_ms = 3000;
+    ui.expireEffortFlash();
+    try std.testing.expect(!ui.dirty);
+    fixture.fail = true;
+    ui.cycleEffort(); // Failed save neither changes the level nor extends time.
+    try std.testing.expectEqual(@as(u64, 4500), ui.effort_flash.?.until_ms);
+    try std.testing.expectEqual(shared.ReasoningEffort.max, ui.effort_flash.?.level);
+    ui.clock_ms = 4499;
+    ui.dirty = false;
+    ui.expireEffortFlash();
+    try std.testing.expect(!ui.dirty);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(screen.visible("fixture-old max"));
+
+    ui.display.context = .{ .tokens = 2000, .limit = fixture.limit };
+    ui.clock_ms = 4500;
+    ui.expireEffortFlash(); // Idle expiry schedules a redraw without a keypress.
+    try std.testing.expect(ui.dirty and ui.effort_flash == null);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(screen.visible("fixture-old 6.1%"));
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    ui.cycleEffort();
+    try std.testing.expect(ui.effort_flash == null);
+    fixture.fail = false;
+    ui.cycleEffort();
+    try ui.selectModel("fixture-next");
+    try std.testing.expect(ui.effort_flash == null);
+}
+
 test "effort shortcut follows declared levels and unknown or singleton sets never publish" {
     var fixture: SelectionFixture = .{ .effort = .off, .levels = .{} };
     defer fixture.deinit();
@@ -2832,8 +3001,8 @@ test "effort shortcut follows declared levels and unknown or singleton sets neve
         try std.testing.expectEqual(expected, fixture.effort);
     }
     try std.testing.expectEqual(@as(usize, 4), fixture.cycles);
-    // The preset deliberately leaves effort unspecified. Its FIRST shortcut
-    // must choose the first supported value, not claim capabilities unknown.
+    // An external connection may still supply an unspecified current value.
+    // Its first shortcut chooses a supported level, not capabilities unknown.
     fixture.effort = .unspecified;
     ui.cycleEffort();
     try std.testing.expectEqual(shared.ReasoningEffort.off, fixture.effort);
@@ -2902,6 +3071,13 @@ test "selection guards paste secret busy joined future poison and rollback" {
     try std.testing.expectEqualStrings("fixture-next", fixture.name);
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expectEqual(shared.ReasoningEffort.minimal, fixture.effort);
+    // 切换档位后，输入框百分比位置短暂显示新档位名。
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.minimal)) ++ "fixture-next" ++ theme.reset ++ " " ++ (comptime theme.effortColor(.minimal)) ++ "minimal" ++ theme.reset ++ ") > ") != null);
+    ui.finishFrame();
+    // 2 秒后自动恢复为上下文百分比。
+    ui.clock_ms = 2001;
+    ui.expireEffortFlash();
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.minimal)) ++ "fixture-next" ++ theme.reset ++ " " ++ (comptime theme.effortColor(.minimal)) ++ "1.5%" ++ theme.reset ++ ") > ") != null);
     ui.finishFrame();
