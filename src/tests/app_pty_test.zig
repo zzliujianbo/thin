@@ -556,18 +556,18 @@ pub fn main(init: std.process.Init) !void {
         // Real streamed Markdown uses independent semantic colors and a boxed
         // grid with a second body row, not just its old header-only rule.
         const markdown_output = d.output[start..d.used];
-        for ([_][]const u8{ "\x1b[1m\x1b[38;5;3m", "\x1b[38;5;5m", "\x1b[39m\x1b[2m", "\x1b[1m", "\x1b[38;5;2m", "┌", "├", "┼", "└", "second-row", "exit_code=124", "exit_code=0" }, 0..) |part, part_index| {
+        for ([_][]const u8{ "\x1b[1m\x1b[38;5;220m", "\x1b[38;5;141m", "\x1b[39m\x1b[2m", "\x1b[1m", "\x1b[38;5;83m", "┌", "├", "┼", "└", "second-row", "exit_code=124", "exit_code=0" }, 0..) |part, part_index| {
             const found = std.mem.indexOf(u8, markdown_output, part) != null;
             if (!found) std.debug.print("Markdown assertion index: {d}\n", .{part_index}); // Safe index, never captured bytes.
             try check(found);
         }
         // The independent model-name flow may legitimately contain orange.
         try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;215m\x1b[1mstream-stage-one") == null);
-        try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;5minline-marker\x1b[0m") != null);
-        for ([_][]const u8{ "38;5;11m", "38;5;12m", "38;5;13m", "38;5;10m" }) |rejected| try check(std.mem.indexOf(u8, markdown_output, rejected) == null);
+        try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;141minline-marker\x1b[0m") != null);
+        try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;2;") == null);
         // Code remains foreground-only and unpadded; user background is separate.
         for ([_][]const u8{ "exit_code=124", "exit_code=0" }) |code| {
-            const expected = try std.fmt.allocPrint(a, "\x1b[38;5;2m{s}\x1b[0m", .{code});
+            const expected = try std.fmt.allocPrint(a, "\x1b[38;5;83m{s}\x1b[0m", .{code});
             defer a.free(expected);
             try check(std.mem.indexOf(u8, markdown_output, expected) != null);
         }

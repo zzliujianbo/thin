@@ -1,23 +1,23 @@
-//! Historical Markdown palette, restored to the user's old screenshots.
-//! Heading yellow, links blue, inline/bullets purple, block code green.
-//! Use terminal palette slots again, without RGB lightening or added bold.
-//! The terminal owns those colors; no palette probing or brightness guarantee.
+//! Keep yellow headings, blue links, purple inline/bullets and green code.
+//! Use the 256-color cube for vivid yellow/green and a cooler violet, avoiding
+//! the gray/red cast of theme-defined bright slots. Blue stays at slot 12.
+//! No truecolor escapes, added bold, backgrounds or palette probing.
 //! Only our renderer emits SGR;
 //! model/user bytes are sanitized separately, never interpreted as escapes.
 const activity = @import("../presentation/activity.zig");
 
 pub const reset = "\x1b[0m";
 pub const accent = "\x1b[38;5;208m";
-pub const heading = "\x1b[1m\x1b[38;5;3m";
+pub const heading = "\x1b[1m\x1b[38;5;220m";
 /// Bold terminal-default foreground, readable on light and dark themes.
 pub const strong = "\x1b[1m";
 pub const muted = "\x1b[38;5;245m";
 pub const md_dim = "\x1b[39m\x1b[2m";
 pub const quote = md_dim ++ "\x1b[3m";
-pub const link = "\x1b[4m\x1b[38;5;4m";
+pub const link = "\x1b[4m\x1b[38;5;12m";
 /// Foreground only, even for fenced/indented code; no row background or padding.
-pub const inline_code = "\x1b[38;5;5m";
-pub const code = "\x1b[38;5;2m";
+pub const inline_code = "\x1b[38;5;141m";
+pub const code = "\x1b[38;5;83m";
 pub const table_header = "\x1b[1m";
 pub const bullet = inline_code;
 /// File-change counts are independent of Markdown brightness.
@@ -74,17 +74,17 @@ pub const command_pulse = [_][]const u8{
     "\x1b[38;5;223m", "\x1b[38;5;220m", "\x1b[38;5;214m", "\x1b[38;5;208m",
 };
 
-test "Markdown restores old screenshot palette and original font styles" {
+test "Markdown uses vivid yellow green and cool violet without changing font styles" {
     const std = @import("std");
     const testing = std.testing;
-    try testing.expectEqualStrings("\x1b[1m\x1b[38;5;3m", heading);
-    try testing.expectEqualStrings("\x1b[4m\x1b[38;5;4m", link);
-    try testing.expectEqualStrings("\x1b[38;5;5m", inline_code);
-    try testing.expectEqualStrings("\x1b[38;5;2m", code);
+    try testing.expectEqualStrings("\x1b[1m\x1b[38;5;220m", heading);
+    try testing.expectEqualStrings("\x1b[4m\x1b[38;5;12m", link);
+    try testing.expectEqualStrings("\x1b[38;5;141m", inline_code);
+    try testing.expectEqualStrings("\x1b[38;5;83m", code);
     try testing.expectEqualStrings(inline_code, bullet);
     try testing.expectEqualStrings("\x1b[1m", strong);
     for ([_][]const u8{ heading, link, inline_code, code, bullet }) |style| {
-        for ([_][]const u8{ "38;2;", "48;", "38;5;11m", "38;5;12m", "38;5;13m", "38;5;10m" }) |rejected| try testing.expect(std.mem.indexOf(u8, style, rejected) == null);
+        for ([_][]const u8{ "38;2;", "48;" }) |rejected| try testing.expect(std.mem.indexOf(u8, style, rejected) == null);
     }
     for ([_][]const u8{ link, inline_code, code, bullet }) |style| try testing.expect(std.mem.indexOf(u8, style, "\x1b[1m") == null);
     try testing.expectEqualStrings("\x1b[38;5;2m", diff_added);

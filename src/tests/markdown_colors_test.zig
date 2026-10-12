@@ -49,7 +49,7 @@ fn expectColor(bytes: []const u8, glyph: u8, expected: Color) !void {
     }
 }
 
-test "old Markdown semantic colors stay distinct and inline color never leaks into body" {
+test "vivid Markdown semantic colors stay distinct and inline color never leaks into body" {
     try @import("../ui/text.zig").initLocale();
     const sample = "# H\n\nO **S** `I` A [K](https://example.org) B\n\n- L `J` C\n\n```\nG\n```\n\nD\n\n| `T` | U |\n|---|---|\n| V | `W` |\n\nE";
     for ([_]usize{ 8, 20, 80 }) |columns| {
@@ -61,10 +61,10 @@ test "old Markdown semantic colors stay distinct and inline color never leaks in
             try bytes.appendSlice(std.testing.allocator, line);
             try bytes.append(std.testing.allocator, '\n');
         }
-        try expectColor(bytes.items, 'H', .{ .indexed = 3 });
-        try expectColor(bytes.items, 'K', .{ .indexed = 4 });
-        for ("IJTW") |glyph| try expectColor(bytes.items, glyph, .{ .indexed = 5 });
-        try expectColor(bytes.items, 'G', .{ .indexed = 2 });
+        try expectColor(bytes.items, 'H', .{ .indexed = 220 });
+        try expectColor(bytes.items, 'K', .{ .indexed = 12 });
+        for ("IJTW") |glyph| try expectColor(bytes.items, glyph, .{ .indexed = 141 });
+        try expectColor(bytes.items, 'G', .{ .indexed = 83 });
         // Strong is not a heading. Body, list prose and cells regain defaults.
         for ("OSABLCDEVU") |glyph| try expectColor(bytes.items, glyph, .normal);
         const following = try md.render(std.testing.allocator, "Z", .{ .columns = columns, .max_lines = 10 });
