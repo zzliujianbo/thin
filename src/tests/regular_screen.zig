@@ -41,6 +41,7 @@ pub fn rejectFullscreen(bytes: []const u8) !void {
             while (parts.next()) |part| {
                 const mode = std.fmt.parseInt(u16, part, 10) catch continue;
                 if (mode == 47 or mode == 1047 or mode == 1049) return error.FullscreenSequence;
+                if (code.final == 'h' and (mode == 1000 or mode == 1002 or mode == 1003 or mode == 1006)) return error.MouseCaptureSequence;
             }
         }
     }
@@ -126,6 +127,15 @@ pub const Screen = struct {
                         'B' => self.row = @min(height - 1, self.row +| step),
                         'C' => self.col = @min(width - 1, self.col +| step),
                         'D' => self.col -|= step,
+                        'M' => {
+                            // DL shifts only cursor..bottom, adds no scrollback,
+                            // and does not move the cursor. No scroll region exists.
+                            const count_ = @min(step, height - self.row);
+                            for (self.row..height - count_) |row_index|
+                                self.grid[row_index] = self.grid[row_index + count_];
+                            for (height - count_..height) |row_index|
+                                self.grid[row_index] = @splat(' ');
+                        },
                         'K' => switch (n) {
                             0 => @memset(self.grid[self.row][self.col..], ' '),
                             1 => @memset(self.grid[self.row][0 .. self.col + 1], ' '),
@@ -192,6 +202,23 @@ test "CAN cancels partial reclaim without hiding later forbidden sequences" {
     try std.testing.expect(s.visible("answer"));
     try std.testing.expectError(error.FullscreenSequence, rejectFullscreen("\x1b[2\x18\x1b[?1049h"));
     try std.testing.expectError(error.FullscreenSequence, rejectFullscreen("\x1b[2\x1b[2J"));
+}
+
+test "delete lines preserves history and rows above the owned cursor" {
+    var screen: Screen = .{};
+    try screen.replay(prior ++ "\r\nabove\r\nfirst\r\nsecond\r\nthird\x1b[2A\r\x1b[1M");
+    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    try std.testing.expectEqual(@as(usize, 2), screen.row);
+    try std.testing.expectEqual(@as(usize, 0), screen.col);
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[2], "second"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[3], "third"));
+    try std.testing.expect(screen.visible(prior));
+    try std.testing.expect(screen.visible("above"));
+    try screen.replay("\x1b[999M");
+    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    try std.testing.expect(screen.visible(prior));
+    try std.testing.expect(screen.visible("above"));
+    try std.testing.expect(!screen.visible("second"));
 }
 
 test "cursor movement erase and delayed wrapping" {

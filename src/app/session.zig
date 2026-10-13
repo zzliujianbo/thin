@@ -13,6 +13,10 @@ const Settings = @import("settings_store.zig").Store;
 const thinking = @import("../core/thinking.zig");
 const catalog = @import("provider_catalog.zig");
 const ProviderId = cfg.providers.Id;
+const selections = @import("selection_store.zig");
+const resume_store = @import("resume_store.zig");
+const resume_codec = @import("resume_codec.zig");
+const checkpoint = @import("../core/checkpoint.zig");
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
@@ -46,15 +50,33 @@ pub const Session = struct {
     credential_revisions: [3]u64 = @splat(0),
     active_revision: u64 = 0,
 
+    resume_lease: ?resume_store.Lease = null,
+    resumed: bool = false,
+
+    pub const Options = struct { restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, logging: bool = true };
+
     /// 只做本地初始化；缺少凭证时保持 pending，不发起试探请求。
     pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, trusted: bool) !Session {
+        return initWithOptions(a, io, environ, project, host, trusted, .{});
+    }
+
+    pub fn initWithOptions(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, trusted: bool, options: Options) !Session {
         const home = environ.get("HOME") orelse return error.MissingHome;
-        const id = try ids.generate(io);
+        if (options.resume_session != null and options.restore_selection != null) return error.InvalidArguments;
+        const id = options.resume_session orelse try ids.generate(io);
         var settings = try Settings.open(a, io, project);
-        const auth_store = Store.open(a, io, home) catch |err| {
-            settings.deinit();
-            return err;
+        var settings_moved = false;
+        errdefer if (!settings_moved) settings.deinit();
+        var lease: ?resume_store.Lease = if (options.resume_session) |source_id| try resume_store.Lease.open(&settings.root, source_id, options.logging) else null;
+        errdefer if (lease) |*owned| owned.deinit();
+        const source_bytes: ?[]u8 = if (lease) |*owned| try owned.load(&settings.root) else null;
+        defer if (source_bytes) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            a.free(bytes);
         };
+        const envelope: ?resume_codec.Envelope = if (source_bytes) |bytes| try resume_codec.inspect(a, bytes, id) else null;
+        const restored: ?selections.Snapshot = if (envelope) |value| value.selection else if (options.restore_selection) |source_id| try selections.load(&settings.root, source_id) else null;
+        const auth_store = if (restored != null) try Store.openExisting(a, io, home) else try Store.open(a, io, home);
         var self: Session = .{
             .allocator = a,
             .io = io,
@@ -62,47 +84,138 @@ pub const Session = struct {
             .project = project,
             .host = host,
             .trusted = trusted,
+            .logging = options.logging,
             .session_id = id,
             .store = auth_store,
             .settings = settings,
+            .resume_lease = lease,
+            .resumed = options.resume_session != null,
         };
+        lease = null;
+        settings_moved = true;
         errdefer self.deinit();
-        self.pending = try self.store.loadOrInitialize();
+        self.pending = if (restored != null) try self.store.loadExisting() else try self.store.loadOrInitialize();
         self.global_config = try cfg.clone(a, self.pending.?.value);
         // Capture GLOBAL defaults before any project overlay or capability
         // clamp. /auth must never persist a repository's transient choice.
         self.pending_base_model = self.pending.?.value.model;
+        if (restored) |snapshot| {
+            try self.restoreSelection(snapshot);
+        } else {
+            const config = &self.pending.?.value;
+            const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
+            self.preferred_effort = self.settings.loadOrInitialize(capabilities.defaultEffort(config.model.reasoning_effort)) catch |err| blk: {
+                self.settings_error = err;
+                break :blk null;
+            };
+            if (self.preferred_effort) |saved| {
+                if (capabilities.known) {
+                    config.model.reasoning_effort = capabilities.effective(saved.name());
+                    if (presentation.ReasoningEffort.fromName(config.model.reasoning_effort) != saved)
+                        self.settings_notice = "Saved thinking level adjusted for this model; preference unchanged";
+                } else self.settings_notice = "Saved thinking level not applied: model capabilities unknown";
+            } else config.model.reasoning_effort = capabilities.effective(config.model.reasoning_effort);
+        }
         const config = &self.pending.?.value;
-        const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
-        self.preferred_effort = self.settings.loadOrInitialize(capabilities.defaultEffort(config.model.reasoning_effort)) catch |err| blk: {
-            self.settings_error = err;
-            break :blk null;
-        };
-        if (self.preferred_effort) |saved| {
-            if (capabilities.known) {
-                config.model.reasoning_effort = capabilities.effective(saved.name());
-                if (presentation.ReasoningEffort.fromName(config.model.reasoning_effort) != saved)
-                    self.settings_notice = "Saved thinking level adjusted for this model; preference unchanged";
-            } else self.settings_notice = "Saved thinking level not applied: model capabilities unknown";
-        } else config.model.reasoning_effort = capabilities.effective(config.model.reasoning_effort);
-
         self.display_models = try self.buildModels(config.*, self.global_config.?.value);
         self.selected_alias = try self.aliasFor(config.*);
         const key = cfg.resolveApiKey(a, self.pending.?.value, environ) catch |err| {
-            if (err == error.ApiKeyNotFound) return self;
+            if (err == error.ApiKeyNotFound and restored == null) return self;
             return err;
         };
         defer {
             std.crypto.secureZero(u8, key);
             a.free(key);
         }
+        // Only small metadata was inspected to resolve the LOCAL credential.
+        // Verify the exact immutable bytes before parsing any large state JSON.
+        if (envelope) |*value| try resume_codec.authenticate(value, key);
+        const restored_state = if (envelope) |value| try checkpoint.decode(a, value.payload) else null;
+        defer if (restored_state) |value| value.deinit();
         const parsed = self.pending.?;
         self.pending = null;
         self.pending_base_model = null;
         self.app = try self.prepareApp(parsed);
+        self.app.?.setLogging(options.logging);
         try self.app.?.pinSessionID(self.session_id);
+        if (restored_state) |value| {
+            const app = self.app.?;
+            try app.runtime.restoreCheckpoint(value.value);
+            app.journal.seq = value.value.journal_seq;
+            app.journal.turn = value.value.journal_turn;
+            app.journal.resumed = true;
+            app.journal.began_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+            if (options.logging) app.journal.selection_writer.expected = try selections.existingDigest(&self.settings.root, id);
+            self.settings_notice = "Conversation restored; prior tools are NOT rerun";
+            // Last fallible initialization step: interrupted/poisoned resumed
+            // processes leave an active marker, never a misleading old command.
+            try self.resume_lease.?.activate(&self.settings.root);
+        }
         self.initial_context = self.app.?.runtime.contextSnapshot();
         return self;
+    }
+
+    fn restoreSelection(self: *Session, snapshot: selections.Snapshot) !void {
+        const global = self.global_config.?.value;
+        var candidate = global;
+        const original_endpoint = selections.endpoint(global.provider.base_url);
+        const same_endpoint = std.mem.eql(u8, &snapshot.endpoint, &original_endpoint);
+        var key: ?[]u8 = null;
+        defer if (key) |value| {
+            std.crypto.secureZero(u8, value);
+            self.allocator.free(value);
+        };
+        if (!same_endpoint) {
+            const service = snapshot.provider orelse return error.SelectionEndpointUnavailable;
+            candidate.provider = catalog.connection(service);
+            const fingerprint = selections.endpoint(candidate.provider.base_url);
+            if (!std.mem.eql(u8, &snapshot.endpoint, &fingerprint)) return error.SelectionEndpointUnavailable;
+            key = try self.keyFor(service);
+            candidate.provider.api_key = key;
+            candidate.models = &.{};
+        } else if ((candidate.provider.kind orelse ProviderId.fromUrl(candidate.provider.base_url)) != snapshot.provider)
+            return error.SelectionEndpointUnavailable;
+
+        // Explicit current profiles win. A transient custom ID without a saved
+        // profile cannot silently inherit unrelated options on another startup.
+        var model: ?cfg.Model = null;
+        if (same_endpoint) {
+            if (std.mem.eql(u8, global.model.name, snapshot.model())) model = global.model;
+            if (model == null) for (global.models) |profile| {
+                if (std.mem.eql(u8, profile.name, snapshot.model())) {
+                    model = profile;
+                    break;
+                }
+            };
+        }
+        if (model == null) for (catalog.entries) |entry| {
+            if (snapshot.provider == entry.provider and ProviderId.fromUrl(candidate.provider.base_url) == entry.provider and std.mem.eql(u8, entry.model.name, snapshot.model())) {
+                model = entry.model;
+                break;
+            }
+        };
+        candidate.model = model orelse return error.SelectionModelUnavailable;
+        candidate.model.protocol = snapshot.protocol;
+        const capabilities = thinking.resolve(candidate.provider.base_url, candidate.model.name, candidate.model.reasoning);
+        if (snapshot.effort) |level| {
+            if (capabilities.known) {
+                if (!capabilities.levels.contains(level)) return error.UnsupportedRestoredEffort;
+                candidate.model.reasoning_effort = level.name();
+            } else if (presentation.ReasoningEffort.fromName(candidate.model.reasoning_effort) != level)
+                return error.RestoredEffortUnavailable;
+        } else if (snapshot.effort_hash) |expected| {
+            const raw = candidate.model.reasoning_effort orelse return error.RestoredEffortUnavailable;
+            const actual = selections.endpoint(raw);
+            if (!std.mem.eql(u8, &expected, &actual)) return error.RestoredEffortUnavailable;
+        } else candidate.model.reasoning_effort = null;
+        var owned = try cfg.clone(self.allocator, candidate);
+        errdefer cfg.release(&owned);
+        if (self.pending) |*old| cfg.release(old);
+        self.pending = owned;
+        self.pending_base_model = global.model;
+        self.preferred_effort = snapshot.effort;
+        self.settings_notice = "Selection restored; NEW EMPTY CHAT (history not restored)";
+        // No settings load/initialization/save: restored choices win only here.
     }
 
     /// Consumes parsed on every path. Auth and project roots were opened at
@@ -123,6 +236,7 @@ pub const Session = struct {
         if (self.selected_alias) |alias| self.allocator.free(alias);
         if (self.global_config) |*global| cfg.release(global);
         if (self.app) |app| app.deinit();
+        if (self.resume_lease) |*lease| lease.deinit();
         if (self.selected_name) |name| self.allocator.free(name);
         if (self.pending) |*pending| cfg.release(pending);
         self.store.deinit();
@@ -137,7 +251,65 @@ pub const Session = struct {
     }
 
     pub fn connection(self: *Session) tui.Connection {
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .initial_history_fn = initialHistory };
+    }
+
+    /// Called once, before any producer exists; never exposed by per-frame state.
+    fn initialHistory(raw: *anyopaque) []const @import("../core/protocol.zig").Message {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        return if (self.resumed) self.app.?.runtime.messages() else &.{};
+    }
+
+    /// Joined, normal interactive exit only. Not an autosave/crash-recovery log.
+    /// A failure never changes task success; the caller must withhold the command.
+    pub fn saveOnExit(self: *Session) !bool {
+        if (!self.logging) return false;
+        const app = self.app orelse return false;
+        if (app.runtime.messages().len == 0) return false;
+        app.journal.finish();
+        var state = try app.runtime.checkpoint();
+        state.journal_seq = app.journal.seq;
+        state.journal_turn = app.journal.turn;
+        const payload = try checkpoint.encode(self.allocator, state);
+        defer {
+            std.crypto.secureZero(u8, payload);
+            self.allocator.free(payload);
+        }
+        const selection = try selections.capture(app.config.value);
+        const key = try self.restorableKey(selection);
+        defer {
+            std.crypto.secureZero(u8, key);
+            self.allocator.free(key);
+        }
+        var salt: [16]u8 = undefined;
+        try self.io.randomSecure(&salt);
+        const bytes = try resume_codec.encode(self.allocator, self.session_id, &selection, payload, key, salt);
+        defer {
+            std.crypto.secureZero(u8, bytes);
+            self.allocator.free(bytes);
+        }
+        try resume_store.saveFinal(&self.settings.root, self.session_id, if (self.resume_lease) |*lease| lease else null, bytes);
+        return true;
+    }
+
+    /// Re-resolve against CURRENT disk options before advertising a command.
+    /// A transient unknown model or a rotated-but-not-activated credential must
+    /// not produce an apparently usable checkpoint under the old connection.
+    fn restorableKey(self: *Session, selection: selections.Snapshot) ![]u8 {
+        var resolver = self.*;
+        resolver.global_config = try self.store.loadExisting();
+        defer cfg.release(&resolver.global_config.?);
+        resolver.pending = null;
+        defer if (resolver.pending) |*owned| cfg.release(owned);
+        try resolver.restoreSelection(selection);
+        const key = try cfg.resolveApiKey(self.allocator, resolver.pending.?.value, self.environ);
+        errdefer {
+            std.crypto.secureZero(u8, key);
+            self.allocator.free(key);
+        }
+        const actual = self.app.?.client.authorization;
+        if (!std.mem.startsWith(u8, actual, "Bearer ") or !std.mem.eql(u8, actual["Bearer ".len..], key)) return error.ResumeCredentialChanged;
+        return key;
     }
 
     fn current(raw: *anyopaque) tui.Connection.State {
@@ -318,7 +490,10 @@ pub const Session = struct {
         self.display_models = models;
         self.settings_notice = preference_notice;
         if (previous) |old| self.allocator.free(old);
-        if (self.app) |app| self.initial_context = app.runtime.contextSnapshot();
+        if (self.app) |app| {
+            self.initial_context = app.runtime.contextSnapshot();
+            app.recordSelection();
+        }
     }
 
     fn selectProviderModel(self: *Session, entry: catalog.Entry) !void {
@@ -470,6 +645,7 @@ pub const Session = struct {
         self.preferred_effort = canonical;
         self.settings_error = null;
         self.settings_notice = null;
+        if (self.app) |app| app.recordSelection();
     }
 
     fn configure(raw: *anyopaque, key: []const u8) !void {
@@ -518,6 +694,104 @@ pub const Session = struct {
         self.app = candidate;
     }
 };
+
+fn overwriteFixtureSelection(root: *@import("../platform/filesystem.zig").Root, id: ids.Id, snapshot: *const selections.Snapshot) !void {
+    var buffer: [selections.max_bytes]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try selections.encode(&writer, id, snapshot);
+    var path: [96]u8 = undefined;
+    const relative = try std.fmt.bufPrint(&path, ".thin/sessions/{s}.selection.json", .{id});
+    try root.writeMode(relative, writer.buffered(), true, 0o600);
+}
+
+test "restore selection creates empty history with session effort and unchanged defaults" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var source = try Session.init(a, std.testing.io, &env, home, .{}, true);
+    defer source.deinit();
+    const connection = source.connection();
+    try connection.configureProvider(.deepseek, "fixture-deepseek-key");
+    try connection.configureProvider(.opencode_zen, "fixture-zen-key");
+    try connection.configureProvider(.opencode_go, "fixture-go-key");
+    try connection.selectModel("opencode-go/gpt-5.6-luna");
+    const app = source.app.?;
+    app.journal.observer().notify(.{ .submitted = "old text must not become new history" });
+    try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "old text must not become new history" }} });
+    try connection.setEffort(.max);
+    app.journal.flush();
+    try std.testing.expect(app.journal.failure() == null);
+    try std.testing.expectError(error.UnsupportedProviderModel, connection.selectModel("opencode-go/not-a-preset"));
+    const snapshot = try selections.load(&source.settings.root, source.session_id);
+    try std.testing.expectEqual(presentation.ReasoningEffort.max, snapshot.effort.?);
+    try std.testing.expectEqual(ProviderId.opencode_go, snapshot.provider.?);
+    try source.settings.save(.low); // A different new-session default must lose.
+    const global_before = try tmp.dir.readFileAlloc(std.testing.io, ".thin/config.json", a, .limited(cfg.max_config_bytes));
+    defer a.free(global_before);
+    const settings_before = try tmp.dir.readFileAlloc(std.testing.io, ".thin/settings.json", a, .limited(1024));
+    defer a.free(settings_before);
+    {
+        var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = source.session_id, .logging = false });
+        defer restored.deinit();
+        try std.testing.expect(!std.mem.eql(u8, &source.session_id, &restored.session_id));
+        try std.testing.expectEqual(@as(usize, 0), restored.app.?.runtime.messages().len);
+        try std.testing.expectEqualStrings("gpt-5.6-luna", restored.app.?.config.value.model.name);
+        try std.testing.expectEqual(@import("../core/protocol.zig").Protocol.responses, restored.app.?.config.value.model.protocol);
+        try std.testing.expectEqualStrings("max", restored.app.?.config.value.model.reasoning_effort.?);
+        try std.testing.expectEqualStrings("Bearer fixture-go-key", restored.app.?.client.authorization);
+        try std.testing.expect(!restored.app.?.journal.started);
+        try std.testing.expect(std.mem.find(u8, restored.settings_notice.?, "history not restored") != null);
+        try restored.connection().selectModel("opencode-zen/gpt-5.6-luna");
+        try std.testing.expectEqualStrings("max", restored.app.?.config.value.model.reasoning_effort.?);
+        try std.testing.expectEqualStrings("Bearer fixture-zen-key", restored.app.?.client.authorization);
+        restored.app.?.journal.observer().notify(.{ .submitted = "not logged" });
+        try std.testing.expect(!restored.app.?.journal.started);
+    }
+    const global_after = try tmp.dir.readFileAlloc(std.testing.io, ".thin/config.json", a, .limited(cfg.max_config_bytes));
+    defer a.free(global_after);
+    const settings_after = try tmp.dir.readFileAlloc(std.testing.io, ".thin/settings.json", a, .limited(1024));
+    defer a.free(settings_after);
+    try std.testing.expectEqualStrings(global_before, global_after);
+    try std.testing.expectEqualStrings(settings_before, settings_after);
+    for (0..3) |case| {
+        var invalid = snapshot;
+        switch (case) {
+            0 => invalid.endpoint = @splat('0'),
+            1 => {
+                @memcpy(invalid.model_buffer[0..9], "not-local");
+                invalid.model_len = 9;
+            },
+            2 => invalid.effort = .minimal,
+            else => unreachable,
+        }
+        try overwriteFixtureSelection(&source.settings.root, source.session_id, &invalid);
+        const expected = switch (case) {
+            0 => error.SelectionEndpointUnavailable,
+            1 => error.SelectionModelUnavailable,
+            else => error.UnsupportedRestoredEffort,
+        };
+        try std.testing.expectError(expected, Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = source.session_id }));
+    }
+    try overwriteFixtureSelection(&source.settings.root, source.session_id, &snapshot);
+    try tmp.dir.deleteFile(std.testing.io, ".thin/settings.json");
+    {
+        var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = source.session_id });
+        defer restored.deinit();
+        try std.testing.expectEqual(presentation.ReasoningEffort.max, restored.preferred_effort.?);
+    }
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, ".thin/settings.json", .{}));
+    var disk = try cfg.clone(a, source.global_config.?.value);
+    defer cfg.release(&disk);
+    disk.value.credentials.opencode_go = null;
+    try source.store.save(disk.value);
+    try std.testing.expectError(error.ApiKeyNotFound, Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = source.session_id }));
+    try std.testing.expectError(error.SelectionNotFound, Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = "ffffffffffffffffffffffffffffffff".* }));
+}
 
 test "provider credentials stay separate and connection swaps preserve session ownership" {
     const a = std.testing.allocator;
@@ -663,6 +937,134 @@ test "provider save conflict and pure selection plans leave live state unchanged
     app.runtime.busy.store(true, .release);
     try std.testing.expectError(error.Busy, connection.configureProvider(.opencode_go, "fake-never-used"));
     app.runtime.busy.store(false, .release);
+}
+
+test "resume session preserves identity context counters and no-log without executing anything" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var id: ids.Id = undefined;
+    {
+        var source = try Session.init(a, io, &env, home, .{}, true);
+        defer source.deinit();
+        try source.connection().configure("fake-resume-source");
+        try std.testing.expect(!try source.saveOnExit());
+        id = source.session_id;
+        var state: checkpoint.State = .{
+            .system = "frozen original system",
+            .selector = source.app.?.runtime.selector,
+            .estimator = .{ .per_mille = 1200 },
+            .last_context_tokens = 77,
+            .permission_id = 19,
+            .messages = &.{
+                .{ .role = .user, .blocks = &.{.{ .text = "original question" }} },
+                .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "saved-call", .name = "write_file", .arguments = "{\"path\":\"must-not-run.txt\",\"content\":\"no\"}" } }} },
+                .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "saved-call", .text = "prior result", .canceled = true, .is_error = true } }} },
+                .{ .role = .assistant, .blocks = &.{.{ .text = "original answer" }} },
+            },
+        };
+        state.selector.initial_attempted = true;
+        try source.app.?.runtime.restoreCheckpoint(state);
+        source.app.?.journal.seq = 13;
+        source.app.?.journal.turn = 2;
+        try std.testing.expect(try source.saveOnExit());
+    }
+    {
+        var restored = try Session.initWithOptions(a, io, &env, home, .{}, false, .{ .resume_session = id, .logging = false });
+        defer restored.deinit();
+        try std.testing.expectEqual(id, restored.session_id);
+        try std.testing.expectEqualStrings("frozen original system", restored.app.?.runtime.system);
+        try std.testing.expectEqual(@as(usize, 4), restored.app.?.runtime.messages().len);
+        try std.testing.expectEqual(@as(u64, 13), restored.app.?.journal.seq);
+        try std.testing.expectEqual(@as(u64, 2), restored.app.?.journal.turn);
+        try std.testing.expectEqual(@as(u64, 77), restored.initial_context.?.tokens);
+        try std.testing.expect(!restored.app.?.runtime.trusted);
+        try std.testing.expect(!restored.app.?.journal.started);
+        try std.testing.expect(!restored.resume_lease.?.active);
+        try std.testing.expect(!try restored.saveOnExit());
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "must-not-run.txt", .{}));
+    }
+    // Wrong locally resolved credential must fail before activating the marker.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data = "{\"provider\":{\"base_url\":\"https://api.deepseek.com\",\"api_key\":\"wrong-fake-key\"},\"model\":{\"name\":\"deepseek-flash\",\"context_tokens\":1048576,\"protocol\":\"auto\"}}" });
+    try std.testing.expectError(error.ResumeAuthenticationFailed, Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id }));
+    {
+        var root = try @import("../platform/filesystem.zig").Root.open(a, io, home);
+        defer root.deinit();
+        var readable = try resume_store.Lease.open(&root, id, false);
+        defer readable.deinit();
+    }
+}
+
+test "resumed selection changes persist without a new submission and no-log stays read only" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |existing_sidecar| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [4096]u8 = undefined;
+        const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        var id: ids.Id = undefined;
+        {
+            var source = try Session.init(a, io, &env, home, .{}, true);
+            defer source.deinit();
+            try source.connection().configure("fake-resume-selection");
+            id = source.session_id;
+            try source.app.?.runtime.restoreCheckpoint(.{
+                .system = "saved system",
+                .selector = source.app.?.runtime.selector,
+                .estimator = .{},
+                .last_context_tokens = null,
+                .permission_id = 0,
+                .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "saved question" }} }},
+            });
+            if (existing_sidecar) source.app.?.journal.observer().notify(.{ .submitted = "saved question" });
+            try std.testing.expect(try source.saveOnExit());
+        }
+        // No-log selection changes must neither create nor overwrite a sidecar.
+        {
+            var readonly = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id, .logging = false });
+            defer readonly.deinit();
+            const before = try selections.existingDigest(&readonly.settings.root, id);
+            try readonly.connection().selectModel("deepseek/deepseek-v4-pro");
+            readonly.app.?.journal.flush();
+            try std.testing.expect(readonly.app.?.journal.worker == null);
+            try std.testing.expect(!try readonly.saveOnExit());
+            try std.testing.expectEqual(before, try selections.existingDigest(&readonly.settings.root, id));
+        }
+        {
+            var restored = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id });
+            defer restored.deinit();
+            try std.testing.expect(restored.app.?.journal.worker == null);
+            try restored.connection().selectModel("deepseek/deepseek-v4-pro");
+            restored.app.?.journal.flush();
+            try std.testing.expect(restored.app.?.journal.failure() == null);
+            try std.testing.expect(!restored.app.?.journal.started);
+            const snapshot = try selections.load(&restored.settings.root, id);
+            try std.testing.expectEqualStrings("deepseek-v4-pro", snapshot.model());
+            try std.testing.expect(try restored.saveOnExit());
+        }
+        {
+            var selection = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .restore_selection = id, .logging = false });
+            defer selection.deinit();
+            try std.testing.expectEqualStrings("deepseek-v4-pro", selection.app.?.config.value.model.name);
+            try std.testing.expectEqual(@as(usize, 0), selection.app.?.runtime.messages().len);
+        }
+        {
+            var conversation = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id, .logging = false });
+            defer conversation.deinit();
+            try std.testing.expectEqualStrings("deepseek-v4-pro", conversation.app.?.config.value.model.name);
+            try std.testing.expectEqual(@as(usize, 1), conversation.app.?.runtime.messages().len);
+        }
+    }
 }
 
 fn testReasoning() thinking.Declaration {

@@ -11,6 +11,8 @@ pub const Recorder = struct {
     usage: p.Usage = .{},
     /// 草稿事件（文本、推理、工具增量）的数量，用于断言未提交的内容未被当作结果。
     drafts: usize = 0,
+    preview_write: bool = false,
+    preview_bytes: usize = 0,
 
     /// 返回指向本 Recorder 的 ModelSink；Recorder 必须比 sink 活得更久。
     pub fn sink(self: *Recorder) p.ModelSink {
@@ -25,8 +27,11 @@ pub const Recorder = struct {
                 self.snapshots += 1;
                 self.usage = u;
             },
-            .text_delta, .reasoning_delta, .tool_delta => {
+            .text_delta, .reasoning_delta => self.drafts += 1,
+            .tool_delta => |delta| {
                 self.drafts += 1;
+                self.preview_write = delta.write_file;
+                self.preview_bytes = delta.argument_bytes orelse 0;
             },
         }
     }

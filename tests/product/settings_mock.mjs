@@ -74,7 +74,7 @@ export async function settingsRegressions({app,pty,execute,send}) {
         if (fixtureError) throw fixtureError;
         assert.equal(result.code,0);
         assert.equal(expected.length,0);
-        if (!headless) assert.equal([...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)].length,1);
+        if (!headless) assert.equal([...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)].length,0);
         stage = 'storage assertions';
         if (await exists(join(p,'.thin'))) assert.deepEqual(await readdir(join(p,'.thin')),['settings.json']);
         assert.deepEqual(await readdir(join(home,'.thin')),['config.json']);
@@ -149,7 +149,9 @@ export async function settingsRegressions({app,pty,execute,send}) {
     await t.run('settings-unknown-low',['low']);
     await t.unchanged(t.project,preference('high'),0o600);
     await t.run('settings-blocked-low',['low'],{p:t.other});
-    assert(!await exists(join(t.other,'.thin')));
+    // Unknown capabilities block cycling, not initialization of an explicit
+    // local preference. The configured wire value remains unchanged above.
+    await t.saved(t.other,'low');
     assert.equal(await readFile(t.configPath,'utf8'),t.getConfig());
   });
 

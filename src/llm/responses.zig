@@ -25,6 +25,20 @@ test "responses usage cumulative snapshots survive incomplete without content lo
 }
 
 // 测试：文本/推理增量只作为草稿发出，completed 时按原生 output 顺序提交；同时校验 item 身份、重复 id、事件类型与输入上限。
+test "responses write preview starts with the item name and counts only received arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var recorder = test_support.Recorder{};
+    var stream = Stream.init(arena.allocator(), test_support.response_scope, recorder.sink());
+    try stream.feed("", "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item-0\",\"type\":\"function_call\",\"call_id\":\"write-0\",\"name\":\"write_file\",\"arguments\":\"\"}}");
+    try std.testing.expect(recorder.preview_write);
+    try std.testing.expectEqual(@as(usize, 0), recorder.preview_bytes);
+    try stream.feed("", "{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item-0\",\"output_index\":0,\"delta\":\"{}\"}");
+    try std.testing.expect(recorder.preview_write);
+    try std.testing.expectEqual(@as(usize, 2), recorder.preview_bytes);
+    try std.testing.expectEqual(@as(usize, 2), recorder.drafts);
+}
+
 test "responses text drafts commit final native order and guard identities" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -544,6 +558,8 @@ pub const Stream = struct {
                     }
                 }
                 self.observed = true;
+                const initial_arguments = if (j.get(native, "arguments")) |value| j.string(value) orelse return error.InvalidEvent else "";
+                try self.sink.emit(.{ .tool_delta = .{ .index = index, .arguments = initial_arguments, .write_file = c.eq(name, "write_file"), .argument_bytes = item.args.len } });
             } else if (c.eq(kind, "reasoning")) self.observed = true;
 
             try self.items.append(self.a, item);
@@ -564,7 +580,7 @@ pub const Stream = struct {
                 try item.args.add(self.a, delta);
                 item.args_seen = true;
                 self.observed = true;
-                try self.sink.emit(.{ .tool_delta = .{ .index = item.index, .arguments = delta } });
+                try self.sink.emit(.{ .tool_delta = .{ .index = item.index, .arguments = delta, .write_file = c.eq(item.name.?, "write_file"), .argument_bytes = item.args.len } });
             } else {
                 if (item.args_done != null) return error.InvalidStreamState;
                 const args = try c.text(v, "arguments");

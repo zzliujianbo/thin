@@ -138,6 +138,15 @@ fn outcomeColor(outcome: Outcome) []const u8 {
     };
 }
 
+fn prefixColor(outcome: Outcome) []const u8 {
+    return switch (outcome) {
+        .pending => "", // Before execution: neutral; active animation is separate.
+        .success => theme.success,
+        .failed => theme.failure,
+        .canceled => theme.caution,
+    };
+}
+
 pub const CommandSpan = struct { start: usize, end: usize, outcome: Outcome, write_marks: ?WriteMarks = null };
 
 pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome) ![]const u8 {
@@ -188,7 +197,7 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
             const now_ms = active_time_ms.?;
             try out.writer.print("{s}{s}{s}{s}{s}", .{ theme.command_pulse[shared.activity.commandStep(now_ms)], activity.spinner(now_ms), theme.muted, safe[prefix_end..end], theme.reset });
         } else {
-            if (has_prefix) try out.writer.print("{s}{s}", .{ theme.reset, safe[begin..prefix_end] });
+            if (has_prefix) try out.writer.print("{s}{s}{s}", .{ theme.reset, prefixColor(span.outcome), safe[begin..prefix_end] });
             const summary_start = if (has_prefix) prefix_end else begin;
             const color = outcomeColor(span.outcome);
             try out.writer.writeAll(color);
@@ -371,7 +380,7 @@ test "write count colors use numeric metadata not patterns in a hostile path" {
     const span: CommandSpan = .{ .start = 0, .end = body.len, .outcome = .success, .write_marks = done.write_marks.?.shifted(2) };
     const line = try commandLine(a, body, &.{span}, 200, null, null);
     defer a.free(line);
-    try std.testing.expect(std.mem.startsWith(u8, line, theme.reset ++ "w" ++ theme.muted ++ " path +99 -88 中文  ~4 "));
+    try std.testing.expect(std.mem.startsWith(u8, line, theme.reset ++ theme.success ++ "w" ++ theme.muted ++ " path +99 -88 中文  ~4 "));
     try std.testing.expect(std.mem.indexOf(u8, line, theme.diff_added ++ "+12" ++ theme.muted) != null);
     try std.testing.expect(std.mem.indexOf(u8, line, theme.diff_removed ++ "-34" ++ theme.muted) != null);
     for ([_]usize{ 1, 4, 20, 45, 55 }) |columns| {
@@ -497,7 +506,7 @@ test "all four tool prefixes rotate80ms while preserving independent120ms warm p
         }
         const done = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .success }}, 100, null, 120);
         defer a.free(done);
-        const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ theme.reset, activity.icon(kind), theme.muted, body[activity.icon(kind).len..], theme.reset });
+        const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ theme.reset ++ theme.success, activity.icon(kind), theme.muted, body[activity.icon(kind).len..], theme.reset });
         defer a.free(expected);
         try std.testing.expectEqualStrings(expected, done);
     }
@@ -622,7 +631,37 @@ test "long byte capped paths use complete clusters and only ascii truncation dot
     try std.testing.expectEqualStrings("literal[truncated]file", literal.label);
 }
 
-test "individual command rows retain default icons and their own outcome colors" {
+test "all tool outcome prefixes are colored without recoloring summaries or durations" {
+    const a = std.testing.allocator;
+    for ([_]activity.Tool{ .bash, .read, .memory, .write }) |kind| {
+        for ([_]Outcome{ .success, .failed, .canceled }) |outcome| {
+            const value: Caption = .{ .kind = kind, .label = "operation target" };
+            const body = try commandText(a, value, outcome);
+            defer a.free(body);
+            const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }};
+            const line = try commandLine(a, body, spans, 100, 250, 0);
+            defer a.free(line);
+            const color = switch (outcome) {
+                .success => theme.success,
+                .failed => theme.failure,
+                .canceled => theme.caution,
+                .pending => unreachable,
+            };
+            const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}{s}{s}  250ms{s}", .{ theme.reset, color, activity.icon(kind), outcomeColor(outcome), body[activity.icon(kind).len..], theme.reset, theme.muted, theme.reset });
+            defer a.free(expected);
+            try std.testing.expectEqualStrings(expected, line);
+            try std.testing.expect(!std.mem.eql(u8, theme.thinking, color));
+            try std.testing.expect(!std.mem.eql(u8, theme.thinking, outcomeColor(outcome)));
+            const clipped = try commandLine(a, body, spans, 4, 250, 0);
+            defer a.free(clipped);
+            const clipped_expected = try std.fmt.allocPrint(a, "{s}...{s}", .{ outcomeColor(outcome), theme.reset });
+            defer a.free(clipped_expected);
+            try std.testing.expectEqualStrings(clipped_expected, clipped);
+        }
+    }
+}
+
+test "individual command rows retain their icons and own outcome prefix colors" {
     const a = std.testing.allocator;
     const body = "> date [error]";
     const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 79, null, null);
@@ -630,8 +669,8 @@ test "individual command rows retain default icons and their own outcome colors"
     const success = "> pwd";
     const success_line = try commandLine(a, success, &.{.{ .start = 0, .end = success.len, .outcome = .success }}, 79, null, null);
     defer a.free(success_line);
-    try std.testing.expect(std.mem.find(u8, line, theme.reset ++ ">" ++ theme.failure ++ " date [error]") != null);
-    try std.testing.expect(std.mem.find(u8, success_line, theme.reset ++ ">" ++ theme.muted ++ " pwd") != null);
+    try std.testing.expect(std.mem.find(u8, line, theme.reset ++ theme.failure ++ ">" ++ theme.failure ++ " date [error]") != null);
+    try std.testing.expect(std.mem.find(u8, success_line, theme.reset ++ theme.success ++ ">" ++ theme.muted ++ " pwd") != null);
     try std.testing.expect(std.mem.find(u8, line, "pwd") == null);
     try std.testing.expect(std.mem.find(u8, success_line, "date") == null);
     try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);

@@ -6,6 +6,24 @@ const j = @import("../util/json.zig");
 const c = @import("common.zig");
 const test_support = @import("../tests/adapter_test_support.zig");
 
+test "chat write preview recognizes split names before arguments and revokes changed names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var recorder = test_support.Recorder{};
+    var stream = Stream.init(arena.allocator(), test_support.chat_scope, recorder.sink());
+    try stream.feed("", "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"write-0\",\"function\":{\"name\":\"write_\"}}]}}]}");
+    try std.testing.expect(!recorder.preview_write);
+    try stream.feed("", "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"file\"}}]}}]}");
+    try std.testing.expect(recorder.preview_write);
+    try std.testing.expectEqual(@as(usize, 0), recorder.preview_bytes);
+    try stream.feed("", "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}");
+    try std.testing.expect(recorder.preview_write);
+    try std.testing.expectEqual(@as(usize, 2), recorder.preview_bytes);
+    try stream.feed("", "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"_other\"}}]}}]}");
+    try std.testing.expect(!recorder.preview_write);
+    try std.testing.expectEqual(@as(usize, 2), recorder.preview_bytes);
+}
+
 test "chat refusal chunks are visible text and retain native replay" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -363,7 +381,18 @@ pub fn encodeWithOptions(a: std.mem.Allocator, req: p.Request, use_max_tokens: b
 const Field = struct { key: []const u8, chunks: c.Chunks = .{} };
 
 /// 一个工具调用的流式状态：index 对应 tool_calls[].index，参数分块拼接。
-const Call = struct { index: usize, id: ?[]const u8 = null, name: c.Chunks = .{}, args: c.Chunks = .{}, native: j.Value, function: j.Value };
+const Call = struct { index: usize, id: ?[]const u8 = null, name: c.Chunks = .{}, args: c.Chunks = .{}, preview_write: bool = false, native: j.Value, function: j.Value };
+
+fn writeName(chunks: c.Chunks) bool {
+    const expected = "write_file";
+    if (chunks.len != expected.len) return false;
+    var offset: usize = 0;
+    for (chunks.parts.items) |part| {
+        if (!std.mem.eql(u8, part, expected[offset .. offset + part.len])) return false;
+        offset += part.len;
+    }
+    return true;
+}
 
 /// 按到达顺序记录的内容段（文本/思维/工具调用），用于还原 message.blocks 的顺序。
 const Segment = struct { kind: enum { text, reasoning, tool }, chunks: c.Chunks = .{}, call: usize = 0 };
@@ -579,12 +608,15 @@ pub const Stream = struct {
             // 函数名与参数分块累积；参数增量同时实时转发为 tool_delta。
             if (j.get(delta, "function")) |f| {
                 if (f != .object) return error.InvalidEvent;
-                if (j.get(f, "name")) |v| try call.name.add(self.a, j.string(v) orelse return error.InvalidEvent);
-                if (j.get(f, "arguments")) |v| {
-                    const s = j.string(v) orelse return error.InvalidEvent;
-                    try call.args.add(self.a, s);
-                    try self.sink.emit(.{ .tool_delta = .{ .index = @intCast(index), .arguments = s } });
+                if (j.get(f, "name")) |v| {
+                    const fragment = j.string(v) orelse return error.InvalidEvent;
+                    if (fragment.len != 0) try call.name.add(self.a, fragment);
+                    call.preview_write = writeName(call.name);
                 }
+                const arguments = if (j.get(f, "arguments")) |v| j.string(v) orelse return error.InvalidEvent else "";
+                if (j.get(f, "arguments") != null) try call.args.add(self.a, arguments);
+                if (j.get(f, "name") != null or j.get(f, "arguments") != null)
+                    try self.sink.emit(.{ .tool_delta = .{ .index = @intCast(index), .arguments = arguments, .write_file = call.preview_write, .argument_bytes = call.args.len } });
                 // 函数对象中的其他未知字段保存到 call.function，用于原样回放。
                 var it = f.object.iterator();
                 while (it.next()) |kv| {

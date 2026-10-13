@@ -11,6 +11,47 @@ pub const Limits = struct {
     file_bytes: usize = 16 * 1024 * 1024,
 };
 
+fn validateIgnore(io: std.Io, dir_fd: c_int) !void {
+    const linux = filesystem.linux;
+    const fd = linux.openat(dir_fd, ".gitignore", linux.nofollow | linux.cloexec | linux.nonblock, 0);
+    if (fd < 0) return filesystem.osError();
+    defer filesystem.closeFd(fd);
+    const file = filesystem.fileFromFd(fd);
+    const stat = try file.stat(io);
+    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0 or stat.size != 2)
+        return error.UnsafeLogIgnore;
+    var buffer: [3]u8 = undefined;
+    const n = try file.readPositionalAll(io, &buffer, 0);
+    if (n != 2 or !std.mem.eql(u8, buffer[0..n], "*\n")) return error.UnsafeLogIgnore;
+}
+
+/// Read-only access to the same protected namespace. Never create a directory,
+/// marker or archive just to restore selection metadata.
+pub fn openExistingDirectory(root: *filesystem.Root) !c_int {
+    const thin_fd = try filesystem.openDirectory(root.dir.handle, ".thin");
+    defer filesystem.closeFd(thin_fd);
+    const fd = try filesystem.openDirectory(thin_fd, "sessions");
+    errdefer filesystem.closeFd(fd);
+    const stat = try filesystem.fileFromFd(fd).stat(root.io);
+    if (stat.kind != .directory or stat.permissions.toMode() & 0o077 != 0) return error.UnsafeLogDirectory;
+    try validateIgnore(root.io, fd);
+    return fd;
+}
+
+/// Create only the private namespace/ignore marker, never a diagnostic archive.
+/// Shared by the exit-checkpoint writer; help, version and reads never call it.
+pub fn openCheckpointDirectory(root: *filesystem.Root) !c_int {
+    const thin_fd = try Store.directory(root.dir.handle, ".thin");
+    defer filesystem.closeFd(thin_fd);
+    const fd = try Store.directory(thin_fd, "sessions");
+    errdefer filesystem.closeFd(fd);
+    const stat = try filesystem.fileFromFd(fd).stat(root.io);
+    if (stat.kind != .directory or stat.permissions.toMode() & 0o077 != 0) return error.UnsafeLogDirectory;
+    var owner = Store.init(root.allocator, root, .{});
+    try owner.ensureIgnore(fd);
+    return fd;
+}
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     root: *filesystem.Root,
@@ -106,17 +147,7 @@ pub const Store = struct {
             return;
         }
         if (std.c._errno().* != 17) return filesystem.osError();
-        const fd = linux.openat(dir_fd, ".gitignore", linux.nofollow | linux.cloexec | linux.nonblock, 0);
-        if (fd < 0) return filesystem.osError();
-        defer filesystem.closeFd(fd);
-        const file = filesystem.fileFromFd(fd);
-        const stat = try file.stat(self.root.io);
-        if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0 or stat.size != 2)
-            return error.UnsafeLogIgnore;
-        // 最多读 3 字节，额外一字节检测 stat 后追加的内容。
-        var buffer: [3]u8 = undefined;
-        const n = try file.readPositionalAll(self.root.io, &buffer, 0);
-        if (n != 2 or !std.mem.eql(u8, buffer[0..n], "*\n")) return error.UnsafeLogIgnore;
+        try validateIgnore(self.root.io, dir_fd);
     }
 
     pub fn start(self: *Store) !void {

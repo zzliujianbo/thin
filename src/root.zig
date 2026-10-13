@@ -59,10 +59,16 @@ test {
     _ = @import("tests/headless_integration_test.zig");
 
     _ = @import("app/cli.zig");
+    _ = @import("main.zig");
     _ = @import("app/auth_store.zig");
     _ = @import("app/provider_catalog.zig");
     _ = @import("core/providers.zig");
     _ = @import("app/log_store.zig");
+    _ = @import("app/selection_store.zig");
+    _ = @import("app/resume_codec.zig");
+    _ = @import("app/resume_store.zig");
+    _ = @import("app/resume_command.zig");
+    _ = @import("core/checkpoint.zig");
     _ = @import("app/journal.zig");
     _ = @import("app/session.zig");
     _ = @import("tests/settings_session_test.zig");
@@ -70,8 +76,11 @@ test {
     _ = @import("tests/context_usage_test.zig");
     _ = @import("ui/terminal.zig");
     _ = @import("ui/input.zig");
+    _ = @import("ui/input_history.zig");
     _ = @import("ui/markdown.zig");
     _ = @import("ui/tail_frame.zig");
+    _ = @import("ui/stream_prefix.zig");
+    _ = @import("ui/startup.zig");
     _ = @import("tests/markdown_colors_test.zig");
     _ = @import("ui/bridge.zig");
     _ = @import("ui/command_menu.zig");

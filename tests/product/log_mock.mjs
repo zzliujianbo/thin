@@ -167,7 +167,7 @@ async function scenario(app, pty, kind) {
     const result = await execute(isPty?pty:app, isPty?[]:args, env, project);
     const ended = Date.now();
     const announced = isPty ? [...(result.stdout + '\n' + result.stderr).matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)] : [];
-    if (isPty) assert.equal(announced.length,1,'PTY exit identity missing');
+    if (isPty) assert.equal(announced.length,kind === 'date-pty' ? 1 : 0,'resume command must reflect a saved nonempty conversation');
     assert(!fixtureFailed, 'loopback fixture failed');
     if (kind === 'help') {
       assert(result.stdout.includes('.thin/sessions/*.jsonl') && !result.stdout.includes('.thin/logs'), 'session path missing from help');

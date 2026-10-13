@@ -38,6 +38,14 @@ pub const Store = struct {
     expected_version: ?Digest = null,
 
     pub fn open(a: std.mem.Allocator, io: std.Io, home: []const u8) !Store {
+        return openMode(a, io, home, true);
+    }
+
+    pub fn openExisting(a: std.mem.Allocator, io: std.Io, home: []const u8) !Store {
+        return openMode(a, io, home, false);
+    }
+
+    fn openMode(a: std.mem.Allocator, io: std.Io, home: []const u8, create: bool) !Store {
         // 复用配置层的绝对 HOME 校验；绝不探测真实 HOME 或环境变量。
         const auth_path = try cfg.defaultPath(a, home);
         defer a.free(auth_path);
@@ -45,7 +53,7 @@ pub const Store = struct {
         defer home_root.deinit();
 
         const fd = fs.openDirectory(home_root.dir.handle, ".thin") catch |err| blk: {
-            if (err != error.FileNotFound) return err;
+            if (!create or err != error.FileNotFound) return err;
             if (std.c.mkdirat(home_root.dir.handle, ".thin", 0o700) != 0 and std.c._errno().* != 17)
                 return fs.osError();
             break :blk try fs.openDirectory(home_root.dir.handle, ".thin");
@@ -117,6 +125,18 @@ pub const Store = struct {
         return bytes;
     }
 
+    /// Restore path: load an existing valid configuration, never initialize it.
+    pub fn loadExisting(self: *Store) !std.json.Parsed(cfg.Config) {
+        const fd = try self.lock();
+        defer fs.closeFd(fd);
+        self.expected_version = null;
+        var bytes = (try self.read()) orelse return error.ConfigNotFound;
+        defer bytes.deinit();
+        const parsed = try cfg.parse(self.root.allocator, bytes.data());
+        self.expected_version = digest(bytes.data());
+        return parsed;
+    }
+
     /// 只有缺失或 JSON 空白文件才初始化；任何非空内容都交给严格解析，失败不写回。
     /// 返回值必须使用 cfg.release 释放。
     pub fn loadOrInitialize(self: *Store) !std.json.Parsed(cfg.Config) {
@@ -169,6 +189,28 @@ fn testOpen(dir: std.Io.Dir) !Store {
     var path: [4096]u8 = undefined;
     const n = try dir.realPath(std.testing.io, &path);
     return Store.open(std.testing.allocator, std.testing.io, path[0..n]);
+}
+
+test "restore auth loading never creates or initializes configuration" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try std.testing.expectError(error.FileNotFound, Store.openExisting(std.testing.allocator, std.testing.io, home));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, ".thin", .{}));
+    var store = try Store.open(std.testing.allocator, std.testing.io, home);
+    defer store.deinit();
+    try std.testing.expectError(error.ConfigNotFound, store.loadExisting());
+    try store.root.dir.writeFile(std.testing.io, .{ .sub_path = cfg.file_name, .data = "  " });
+    if (store.loadExisting()) |value| {
+        var unexpected = value;
+        cfg.release(&unexpected);
+        return error.InitializedEmptyConfig;
+    } else |_| {}
+    const result = try store.root.read(std.testing.allocator, cfg.file_name, 0, 128);
+    defer std.testing.allocator.free(result.data);
+    try std.testing.expectEqualStrings("  ", result.data);
+    try std.testing.expect(store.expected_version == null);
 }
 
 test "auth store missing and empty initialize once with private modes" {

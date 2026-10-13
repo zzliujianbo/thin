@@ -1,7 +1,7 @@
 架构分层(src/)
 | 目录 | 职责 |
 |---|---|
-| app/ | 进程装配与前端:cli 参数解析、app 资源聚合、session 会话、journal/log_store 记录、auth_store 密钥存、provider_catalog 内置模型预设 |
+| app/ | 进程装配与前端:cli 参数解析、app 资源聚合、session 会话、journal/log_store 记录、selection_store 非敏感选择快照、auth_store 密钥存、provider_catalog 内置模型预设 |
 | core/ | agent loop 状态机 runtime(模型调用→权限询问→工具执行→上下文压缩→终态)、protocol 协议类型、context token 预算与压缩、config 配置校验、providers 内置服务与凭据槽 |
 | llm/ | HTTP 客户端、chat(Chat Completions)与 responses(Responses API)两套适配、sse 流解析、http_pool 连接复用 |
 | tools/ | 内置工具 schema 与执行:read_file / write_file / bash / memory(与我手上的工具一一对应) |

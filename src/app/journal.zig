@@ -5,10 +5,31 @@ const fs = @import("../platform/filesystem.zig");
 const r = @import("../core/runtime.zig");
 const p = @import("../core/protocol.zig");
 const logs = @import("log_store.zig");
+const selections = @import("selection_store.zig");
 
 const text_limit = 256 * 1024;
 const record_limit = 2 * 1024 * 1024;
 const omitted = "[omitted]";
+
+const SelectionEvent = struct {
+    snapshot: selections.Snapshot,
+    seq: u64,
+    turn: u64,
+    timestamp_ms: i64,
+    elapsed_ms: i64,
+};
+
+const Item = union(enum) {
+    record: []u8,
+    selection: SelectionEvent,
+
+    fn size(self: Item) usize {
+        return switch (self) {
+            .record => |bytes| bytes.len,
+            .selection => @sizeOf(SelectionEvent),
+        };
+    }
+};
 
 pub const Journal = struct {
     const queue_limit = 128;
@@ -23,9 +44,15 @@ pub const Journal = struct {
     known_key_count: usize = 0,
     store: logs.Store,
     protocol: p.Protocol = .auto,
+    /// Owned metadata; never borrows old configuration strings.
+    selection: ?selections.Snapshot = null,
+    selection_writer: selections.Writer = .{},
     enabled: bool = true,
     failure_code: std.atomic.Value(u16) = .init(0),
     started: bool = false,
+    /// An authenticated existing conversation may change selection before its
+    /// first submission in this process. Loading alone still starts no writer.
+    resumed: bool = false,
     seq: u64 = 0,
     turn: u64 = 0,
     message_index: u64 = 0,
@@ -34,7 +61,7 @@ pub const Journal = struct {
 
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     wake: std.Io.Event = .unset,
-    queue: [queue_limit][]u8 = undefined,
+    queue: [queue_limit]Item = undefined,
     head: usize = 0,
     count: usize = 0,
     outstanding: usize = 0,
@@ -67,17 +94,19 @@ pub const Journal = struct {
         return !self.stopping;
     }
 
-    fn release(self: *Journal, data: []u8) void {
-        const n = data.len;
-        std.crypto.secureZero(u8, data);
-        self.allocator.free(data);
+    fn release(self: *Journal, data: Item) void {
+        const n = data.size();
+        if (data == .record) {
+            std.crypto.secureZero(u8, data.record);
+            self.allocator.free(data.record);
+        }
         self.lock();
         self.bytes -= n;
         self.outstanding -= 1;
         self.unlock();
     }
 
-    fn pop(self: *Journal) ?[]u8 {
+    fn pop(self: *Journal) ?Item {
         self.lock();
         defer self.unlock();
         if (self.count == 0) {
@@ -93,8 +122,12 @@ pub const Journal = struct {
     }
 
     fn enqueue(self: *Journal, data: []u8) !void {
+        try self.enqueueItem(.{ .record = data });
+    }
+
+    fn enqueueItem(self: *Journal, data: Item) !void {
         self.lock();
-        if (self.stopping or self.outstanding == queue_limit or data.len > byte_limit - self.bytes) {
+        if (self.stopping or self.outstanding == queue_limit or data.size() > byte_limit - self.bytes) {
             const stopped = self.stopping;
             self.unlock();
             return if (stopped) error.LogStopped else error.LogQueueFull;
@@ -102,7 +135,7 @@ pub const Journal = struct {
         self.queue[(self.head + self.count) % queue_limit] = data;
         self.count += 1;
         self.outstanding += 1;
-        self.bytes += data.len;
+        self.bytes += data.size();
         self.unlock();
         self.wake.set(self.root.io);
     }
@@ -118,6 +151,20 @@ pub const Journal = struct {
         _ = try std.fmt.bufPrint(line[0..prefix_len], "{{\"session\":\"{s}\",", .{self.store.session_id});
         @memcpy(line[prefix_len..], data[1..]);
         try self.store.append(line);
+    }
+
+    fn writeItem(self: *Journal, item: Item) !void {
+        switch (item) {
+            .record => |data| try self.writeRecord(data),
+            .selection => |event| {
+                try self.store.start();
+                try self.selection_writer.save(self.root, self.store.logs_fd.?, self.store.session_id, &event.snapshot);
+                var buffer: [selections.max_bytes]u8 = undefined;
+                var writer = std.Io.Writer.fixed(&buffer);
+                try std.json.Stringify.value(.{ .schema = 1, .seq = event.seq, .turn = event.turn, .timestamp_ms = event.timestamp_ms, .elapsed_ms = event.elapsed_ms, .event = "selection", .data = event.snapshot.view() }, .{}, &writer);
+                try self.writeRecord(writer.buffered());
+            },
+        }
     }
 
     fn runWriter(self: *Journal) void {
@@ -140,7 +187,7 @@ pub const Journal = struct {
             }
             if (self.pop()) |data| {
                 defer self.release(data);
-                self.writeRecord(data) catch |err| {
+                self.writeItem(data) catch |err| {
                     self.fail(err);
                     return;
                 };
@@ -255,6 +302,39 @@ pub const Journal = struct {
         self.enabled = enabled;
     }
 
+    /// Owner-only, producer joined. No disk I/O or capacity wait after connection
+    /// publication. Lazy writer creation can fail but never rolls back a live selection.
+    pub fn setSelection(self: *Journal, candidate: anyerror!selections.Snapshot) void {
+        const snapshot = candidate catch |err| {
+            if (self.enabled) self.fail(err);
+            return;
+        };
+        if (self.nextSecret(snapshot.model()) != null) {
+            if (self.enabled) self.fail(error.SensitiveSelection);
+            return;
+        }
+        self.selection = snapshot;
+        if (!self.enabled or (!self.started and !self.resumed) or self.failure() != null) return;
+        self.enqueueSelection() catch |err| self.fail(err);
+    }
+
+    fn enqueueSelection(self: *Journal) !void {
+        const snapshot = self.selection orelse return;
+        const next = try std.math.add(u64, self.seq, 1);
+        if (self.worker == null) {
+            if (!self.accepting()) return error.LogStopped;
+            self.worker = try std.Io.concurrent(self.root.io, runWriter, .{self});
+        }
+        try self.enqueueItem(.{ .selection = .{
+            .snapshot = snapshot,
+            .seq = next,
+            .turn = self.turn,
+            .timestamp_ms = std.Io.Clock.real.now(self.root.io).toMilliseconds(),
+            .elapsed_ms = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() - self.began_ms),
+        } });
+        self.seq = next;
+    }
+
     /// 唯一允许 UI 线程并发读取的状态。
     pub fn failure(self: *const Journal) ?anyerror {
         const code = self.failure_code.load(.acquire);
@@ -314,7 +394,9 @@ pub const Journal = struct {
             self.first = false;
             if (!self.started) {
                 self.started = true;
-                try self.record(a, "session", .{ .protocol = self.protocol, .format = "jsonl", .text_bytes = text_limit, .record_bytes = record_limit, .plaintext = true, .redaction = "known_key_only" });
+                const selection_view: ?selections.Snapshot.View = if (self.selection) |*snapshot| snapshot.view() else null;
+                try self.record(a, "session", .{ .protocol = self.protocol, .selection = selection_view, .format = "jsonl", .text_bytes = text_limit, .record_bytes = record_limit, .plaintext = true, .redaction = "known_key_only" });
+                try self.enqueueSelection();
             }
             const t = try self.jsonText(a, observation.submitted);
             try self.record(a, "user", t);
@@ -523,6 +605,63 @@ fn testRoot(dir: std.Io.Dir) !fs.Root {
     var buffer: [4096]u8 = undefined;
     const n = try dir.realPath(std.testing.io, &buffer);
     return fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
+}
+
+test "selection snapshots are lazy ordered and save the last switch without another submission" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
+    defer journal.deinit();
+    const id = "0123456789abcdef0123456789abcdef".*;
+    try journal.pinSessionID(id);
+    var config: @import("../core/config.zig").Config = .{
+        .provider = .{ .base_url = "https://fixture.invalid/v1" },
+        .model = .{ .name = "first-fixture", .protocol = .chat, .context_tokens = 32768 },
+    };
+    journal.setSelection(selections.capture(config));
+    try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
+    journal.observer().notify(.{ .submitted = "fixture goal" });
+    config.model.name = "last-fixture";
+    config.model.protocol = .responses;
+    config.model.reasoning_effort = "high";
+    journal.setSelection(selections.capture(config));
+    journal.flush();
+    try std.testing.expect(journal.failure() == null);
+    const restored = try selections.load(&root, id);
+    try std.testing.expectEqualStrings("last-fixture", restored.model());
+    try std.testing.expectEqual(p.Protocol.responses, restored.protocol);
+    try std.testing.expectEqual(@import("../presentation/activity.zig").ReasoningEffort.high, restored.effort.?);
+    const data = try root.read(std.testing.allocator, journal.store.path(), 0, 8192);
+    defer std.testing.allocator.free(data.data);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, data.data, "\"event\":\"selection\""));
+    try std.testing.expect(std.mem.find(u8, data.data, "https://fixture.invalid") == null);
+    config.model.name = "prefix-fake-key-suffix";
+    journal.setSelection(selections.capture(config));
+    try std.testing.expectEqual(error.SensitiveSelection, journal.failure().?);
+    try std.testing.expectEqualStrings("last-fixture", (try selections.load(&root, id)).model());
+}
+
+test "no log selection updates create no snapshot or archive" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
+    defer journal.deinit();
+    journal.setEnabled(false);
+    const config: @import("../core/config.zig").Config = .{
+        .provider = .{ .base_url = "https://fixture.invalid/v1" },
+        .model = .{ .name = "fixture", .context_tokens = 32768 },
+    };
+    journal.setSelection(selections.capture(config));
+    journal.observer().notify(.{ .submitted = "not recorded" });
+    journal.setSelection(selections.capture(config));
+    journal.finish();
+    try std.testing.expect(journal.failure() == null);
+    try std.testing.expectEqual(@as(u64, 0), journal.seq);
+    try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
 }
 
 test "journal retains multiple keys and redacts overlapping and encoded credentials" {

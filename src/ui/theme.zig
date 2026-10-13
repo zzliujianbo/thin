@@ -12,6 +12,8 @@ pub const heading = "\x1b[1m\x1b[38;5;220m";
 /// Bold terminal-default foreground, readable on light and dark themes.
 pub const strong = "\x1b[1m";
 pub const muted = "\x1b[38;5;245m";
+/// Low-saturation gray-blue Thinking, plain and quieter than answer accents.
+pub const thinking = "\x1b[38;5;103m";
 pub const md_dim = "\x1b[39m\x1b[2m";
 pub const quote = md_dim ++ "\x1b[3m";
 pub const link = "\x1b[4m\x1b[38;5;12m";

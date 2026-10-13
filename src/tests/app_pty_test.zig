@@ -233,11 +233,13 @@ const Driver = struct {
         // 安全检查：应用不得输出 OSC 52 剪贴板序列，也不得泄露测试注入的密钥。
         try check(std.mem.indexOf(u8, self.output[0..self.used], "\x1b]52;") == null);
         try check(std.mem.indexOf(u8, self.output[0..self.used], "fixture-secret-never-log") == null);
-        const prefix = "Session ID: ";
+        const prefix = "thin --resume ";
         const bytes = self.output[0..self.used];
+        try check(std.mem.indexOf(u8, bytes, "Session ID: ") == null);
+        try check(std.mem.indexOf(u8, bytes, "Resume: ") == null);
         const at = std.mem.indexOf(u8, bytes, prefix);
-        if (expected == 0) {
-            try check(at != null and at.? + prefix.len + 32 <= bytes.len);
+        if (expected == 0 and at != null) {
+            try check(at.? + prefix.len + 32 <= bytes.len);
             const id = bytes[at.? + prefix.len ..][0..32];
             for (id) |byte| try check((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'));
             try check(std.mem.indexOf(u8, bytes[at.? + prefix.len + 32 ..], prefix) == null);
@@ -247,6 +249,8 @@ const Driver = struct {
             const exit_at = std.mem.lastIndexOf(u8, bytes[0..at.?], leave) orelse std.mem.lastIndexOf(u8, bytes[0..at.?], translated_leave);
             try check(exit_at != null);
             try check(std.mem.indexOfScalar(u8, bytes[at.?..], 0x1b) == null);
+            const tail = std.mem.trim(u8, bytes[exit_at.? + (if (std.mem.startsWith(u8, bytes[exit_at.?..], leave)) leave.len else translated_leave.len) ..], "\r\n");
+            try check(std.mem.eql(u8, tail, bytes[at.? .. at.? + prefix.len + 32]));
             // Only validated immutable metadata leaves this capture buffer.
             std.debug.print("PTY_SESSION_ID={s}\n", .{id});
         } else try check(at == null); // Signal/headless exits do not announce it.
@@ -322,14 +326,28 @@ pub fn main(init: std.process.Init) !void {
     const mode = try required(init, "THIN_APP_TEST_MODE");
     const home_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "HOME={s}", .{home}), 0);
 
-    // 子进程环境保持最小集合，并注入一个测试密钥，用于验证它不会出现在终端输出中。
-    const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", "THIN_FIXTURE_KEY=fixture-secret-never-log" };
+    const full_resume = std.mem.startsWith(u8, mode, "resume-") and !std.mem.eql(u8, mode, "resume-create");
+    const restore_error: ?[]const u8 = if (std.mem.eql(u8, mode, "restore-failure") or std.mem.eql(u8, mode, "resume-failure")) try required(init, "THIN_APP_TEST_RESTORE_ERROR") else null;
+    if (restore_error) |expected| {
+        try check(std.mem.eql(u8, expected, "SelectionNotFound") or std.mem.eql(u8, expected, "ApiKeyNotFound") or std.mem.eql(u8, expected, "SelectionEndpointUnavailable") or std.mem.eql(u8, expected, "ResumeNotFound") or std.mem.eql(u8, expected, "ResumeAuthenticationFailed") or std.mem.eql(u8, expected, "ResumeConflict") or std.mem.eql(u8, expected, "ResumeNotClosed") or std.mem.eql(u8, expected, "UnsupportedVersion") or std.mem.eql(u8, expected, "SessionInUse"));
+    }
+    const restore_mode = std.mem.eql(u8, mode, "restore-selection") or std.mem.eql(u8, mode, "restore-failure");
+    // All child environment bytes are prepared before fork; missing-key case
+    // terminates the env array before the fixture key, never inheriting HOME.
+    const timezone = init.environ_map.get("THIN_APP_TEST_TZ") orelse "UTC0";
+    try check(std.mem.eql(u8, timezone, "UTC0") or std.mem.eql(u8, timezone, "UTC-8"));
+    const timezone_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "TZ={s}", .{timezone}), 0);
+    const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", timezone_env, if (restore_error != null and std.mem.eql(u8, restore_error.?, "ApiKeyNotFound")) null else "THIN_FIXTURE_KEY=fixture-secret-never-log" };
 
     const interactive_argv = [_:null]?[*:0]const u8{bin};
     const print_argv = [_:null]?[*:0]const u8{ bin, "--print", "large-output" };
     const no_log_argv = [_:null]?[*:0]const u8{ bin, "--no-log" };
+    const restore_id = try a.dupeSentinel(u8, if (restore_mode or full_resume) try required(init, "THIN_APP_TEST_RESTORE_ID") else "", 0);
+    const restore_argv = [_:null]?[*:0]const u8{ bin, "--restore-selection", restore_id, "--no-log" };
+    const resume_argv = [_:null]?[*:0]const u8{ bin, "--resume", restore_id };
+    const resume_no_log_argv = [_:null]?[*:0]const u8{ bin, "--resume", restore_id, "--no-log" };
     // output 模式直接执行 --print 大输出；其余模式启动交互式界面。
-    const argv: [*:null]const ?[*:0]const u8 = if (std.mem.eql(u8, mode, "output")) &print_argv else if (std.mem.eql(u8, mode, "exit-no-log") or std.mem.startsWith(u8, mode, "settings-")) &no_log_argv else &interactive_argv;
+    const argv: [*:null]const ?[*:0]const u8 = if (full_resume) (if (std.mem.eql(u8, mode, "resume-readonly")) &resume_no_log_argv else &resume_argv) else if (restore_mode) &restore_argv else if (std.mem.eql(u8, mode, "output")) &print_argv else if (std.mem.eql(u8, mode, "exit-no-log") or std.mem.startsWith(u8, mode, "settings-")) &no_log_argv else &interactive_argv;
 
     var master: c_int = undefined;
     var slave: c_int = undefined;
@@ -417,11 +435,49 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Startup refusals precede raw mode and the first frame. Check their exit
+    // directly; waiting for a composer would mistake correct refusal for EOF.
+    if (restore_error) |expected| {
+        try d.finish(1);
+        const message = try std.fmt.allocPrint(a, "thin: {s}", .{expected});
+        try check(std.mem.indexOf(u8, d.output[0..d.used], message) != null);
+        try check(std.mem.indexOfScalar(u8, d.output[0..d.used], 0x1b) == null);
+        return;
+    }
     // A complete composer frame shows the cursor; no statistics/status footer.
     try d.waitText(0, "\x1b[?25h");
+    try check(std.mem.indexOf(u8, d.output[0..d.used], @import("../app/version.zig").text) != null);
+    const directory_line = try std.fmt.allocPrint(a, "Directory: {s}", .{project});
+    try check(std.mem.indexOf(u8, d.output[0..d.used], directory_line) != null);
+    try check(std.mem.indexOf(u8, d.output[0..d.used], "Time: ") != null and std.mem.indexOf(u8, d.output[0..d.used], if (std.mem.eql(u8, timezone, "UTC-8")) " +0800" else " +0000") != null);
+    try check(std.mem.indexOf(u8, d.output[0..d.used], "Zig ") == null);
     if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
         // 初始化只验证待配置界面；不输入密钥或发送消息，避免连接默认公共端点。
         try d.waitText(0, "/auth");
+    } else if (std.mem.eql(u8, mode, "resume-create")) {
+        const start = d.used;
+        try d.send("resume-first-turn remember-resume-marker\r");
+        try d.waitText(start, "resume-first-answer");
+        try d.waitIdle(start);
+    } else if (full_resume) {
+        try d.waitFrame(0, "prior tools are NOT rerun");
+        try check(std.mem.indexOf(u8, d.output[0..d.used], "resume-first-answer") != null);
+        try check(std.mem.indexOf(u8, d.output[0..d.used], "PRIVATE-RESUME-REASONING") == null);
+        try d.quiet(150); // No startup model request or historical execution.
+        if (!std.mem.eql(u8, mode, "resume-idle")) {
+            const start = d.used;
+            try d.send("resume-next-turn\r");
+            try d.waitText(start, "resume-next-answer");
+            try d.waitIdle(start);
+        }
+    } else if (std.mem.eql(u8, mode, "restore-selection")) {
+        try d.waitFrame(0, "history not restored");
+        try check(std.mem.indexOf(u8, d.output[0..d.used], "\x1b[38;5;75mfixture-restored") != null);
+        try check(std.mem.indexOf(u8, d.output[0..d.used], "OLD-HISTORY-MUST-NOT-APPEAR") == null);
+        const start = d.used;
+        try d.send("restore-new-turn\r");
+        try d.waitText(start, "restore-fresh-answer");
+        try d.waitIdle(start);
     } else if (std.mem.eql(u8, mode, "exit-no-submit") or std.mem.eql(u8, mode, "exit-unconfigured") or std.mem.eql(u8, mode, "exit-batched")) {
         try d.quiet(100);
     } else if (std.mem.eql(u8, mode, "exit-secret")) {
@@ -504,6 +560,36 @@ pub fn main(init: std.process.Init) !void {
             try check(current.count("regular-answer-one") == 1);
             if (turn == 1) try check(current.count("regular-answer-two") == 1);
         }
+    } else if (std.mem.eql(u8, mode, "stream-native-history")) {
+        try d.waitIdle(0);
+        const start = d.used;
+        try d.send("native-scroll-task\r");
+        try d.waitFrame(start, "native-row-039");
+        var stage = try d.screen();
+        if (stage.history_len < 8) return error.NativeHistoryMissing;
+        const top = stage.history_len - 8;
+        const old_history = stage.history_len;
+        var pinned: [24][80]u8 = undefined;
+        for (&pinned, 0..) |*line, index| {
+            const position = top + index;
+            @memcpy(line, if (position < stage.history_len) &stage.history[position] else &stage.grid[position - stage.history_len]);
+        }
+        // No mouse events are sent. Observe the same absolute native viewport
+        // while streaming continues beneath it, as a scrolled terminal would.
+        try d.waitFrame(start, "native-row-069");
+        stage = try d.screen();
+        if (stage.history_len <= old_history) return error.NativeHistoryDidNotGrow;
+        for (&pinned, 0..) |*line, index| {
+            const position = top + index;
+            const actual = if (position < stage.history_len) &stage.history[position] else &stage.grid[position - stage.history_len];
+            if (!std.mem.eql(u8, line, actual)) return error.NativeHistoryChanged;
+        }
+        try d.waitIdle(start);
+        stage = try d.screen();
+        try check(stage.count("native-row-") == 70);
+        try check(stage.count("native-row-000") == 1 and stage.count("native-row-069") == 1);
+        try check(stage.count("Response revised") == 0);
+        try check(stage.count("native-scroll-task") == 1);
     } else if (std.mem.eql(u8, mode, "stream-markdown")) {
         try d.waitIdle(0);
         const initial = try d.screen();
@@ -514,6 +600,11 @@ pub fn main(init: std.process.Init) !void {
         try d.quiet(100);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
         var stage = try d.screen();
+        // Check the actual streamed reasoning on the logical terminal, not
+        // only Record.layout: Markdown punctuation must remain literal.
+        if (!stage.visible("# **thinking-old-two**") or !stage.visible("- `thinking-old-three`")) return error.ThinkingMarkupNotLiteral;
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;103m# **thinking-old-two**") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;103m- `thinking-old-three`") != null);
         try check(stage.visible("reasoning-stage-one") and stage.row == 23);
         try Driver.checkGap(&stage, "stream-task", "thinking-old-two");
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Thinking") == null);
@@ -661,8 +752,8 @@ pub fn main(init: std.process.Init) !void {
         try check(command_rows[1].? == command_rows[0].? + 1 and command_rows[2].? == command_rows[1].? + 1);
         try check(final.count(markers[0]) == 1 and final.count(markers[1]) == 1 and final.count(markers[2]) == 1);
         try check(final.row == 23);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m>\x1b[38;5;245m sleep 0.6; printf ok") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m>\x1b[38;5;203m false; #") != null); // Default prefix; long third summary clips at80% in its true failure color.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m>\x1b[38;5;245m sleep 0.6; printf ok") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203m>\x1b[38;5;203m false; #") != null); // Failure prefix; summary still clips at80% in its existing failure color.
         try check(std.mem.indexOf(u8, d.output[start..d.used], "...\x1b[0m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "·") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "bash #") == null);
@@ -680,7 +771,7 @@ pub fn main(init: std.process.Init) !void {
         }
         try check(std.mem.indexOf(u8, d.output[start..d.used], "memory-summary-hidden-body") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "expected_version") == null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0mm\x1b[38;5;245m read caption-note") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mm\x1b[38;5;245m read caption-note") != null);
         try check(final.count("memory-summary-final-answer") == 1 and final.row == 23);
     } else if (std.mem.eql(u8, mode, "file-stats")) {
         const start = d.used;
@@ -701,6 +792,9 @@ pub fn main(init: std.process.Init) !void {
         }
         try check(final.count("Final answer") == 0 and final.count("file-stats-final-answer") == 1);
         try Driver.checkGap(&final, "file-stats-task", "w stats.txt");
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mw\x1b[38;5;245m stats.txt") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mr\x1b[38;5;245m stats.txt") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203mw\x1b[38;5;203m stats.txt [error]") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;2m+1\x1b[38;5;245m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;1m-1\x1b[38;5;245m") != null);
         for ([_][]const u8{ "read_file ", "write_file ", "memory read " }) |old_label| try check(std.mem.indexOf(u8, d.output[start..d.used], old_label) == null);
@@ -875,6 +969,53 @@ pub fn main(init: std.process.Init) !void {
             try d.waitIdle(start);
             try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
         }
+    } else if (std.mem.eql(u8, mode, "keyboard-history")) {
+        for ([_][]const u8{ "history-one", "history-two" }, 1..) |message, number| {
+            const start = d.used;
+            try d.send(message);
+            try d.send("\r");
+            const answer = try std.fmt.allocPrint(a, "history-answer-{d}", .{number});
+            try d.waitText(start, answer);
+            try d.waitIdle(start);
+        }
+        const EditorCheck = struct {
+            fn expect(driver: *Driver, keys: []const u8, expected: []const u8) !void {
+                try driver.send(keys);
+                try driver.quiet(120);
+                const state = try driver.screen();
+                const row = &state.grid[23];
+                const at = std.mem.indexOf(u8, row, "> ") orelse return error.EditorNotIdle;
+                try check(std.mem.eql(u8, std.mem.trim(u8, row[at + 2 ..], " "), expected));
+            }
+        };
+        try EditorCheck.expect(&d, "\x1b[A", "history-two");
+        try EditorCheck.expect(&d, "\x1b[A", "history-one");
+        try EditorCheck.expect(&d, "\x1b[B", "history-two");
+        try EditorCheck.expect(&d, "\x1b[B", "");
+        try EditorCheck.expect(&d, "manual-draft\x1b[A\x1b[B", "manual-draft");
+        try EditorCheck.expect(&d, "\x15\x1b[A-edited\x1b[A\x1b[B", "history-two-edited");
+        const start = d.used;
+        try d.send("\x15esc-task\r");
+        try d.waitBusy(start);
+        try d.send("\x1b");
+        try d.waitText(start, "Canceled; prior side effects remain");
+        try d.waitIdle(start);
+        try EditorCheck.expect(&d, "\x1b[A\x1b[A\x1b[A", "history-one");
+        const again = d.used;
+        try d.send("\r");
+        try d.waitText(again, "after-esc-answer");
+        try d.waitIdle(again);
+    } else if (std.mem.eql(u8, mode, "esc-cancel-tool")) {
+        const start = d.used;
+        try d.send("esc-tool-task\r");
+        try d.waitFrame(start, "sleep 30");
+        try d.send("\x1b");
+        try d.waitText(start, "Canceled; prior side effects remain");
+        try d.waitIdle(start);
+        const again = d.used;
+        try d.send("after-esc\r");
+        try d.waitText(again, "after-esc-answer");
+        try d.waitIdle(again);
     } else if (std.mem.eql(u8, mode, "cancel") or std.mem.eql(u8, mode, "term")) {
         // cancel / term：等待输入行模型流动色后的reset，证明任务已经启动。
         const start = d.used;
@@ -918,6 +1059,22 @@ pub fn main(init: std.process.Init) !void {
     // Remainder of the SAME read after Ctrl+D must not submit anything.
     try d.send(if (std.mem.eql(u8, mode, "exit-batched")) "\x04post-quit-must-not-submit\r" else "\x04");
     try d.finish(0);
+    if (std.mem.eql(u8, mode, "resume-readonly")) {
+        try check(std.mem.indexOf(u8, d.output[0..d.used], "thin --resume ") == null);
+    } else if (full_resume or std.mem.eql(u8, mode, "resume-create")) {
+        const prefix = "thin --resume ";
+        const at = (std.mem.indexOf(u8, d.output[0..d.used], prefix) orelse return error.MissingResumeCommand) + prefix.len;
+        const id = d.output[at..][0..32].*;
+        if (full_resume) try check(std.mem.eql(u8, &id, restore_id));
+    }
+    if (std.mem.eql(u8, mode, "exit-no-submit") or std.mem.eql(u8, mode, "exit-unconfigured") or std.mem.eql(u8, mode, "exit-batched")) {
+        const final = try d.screen();
+        try check(final.row <= 7); // No screenful of blank rows between startup and exit identity.
+        try check(final.count("Directory:") == 1 and final.count("Time:") == 1 and final.count("Session ID:") == 0);
+        try check(final.count("thin --resume") == 0);
+        const tail = std.mem.lastIndexOf(u8, d.output[0..d.used], "\x1b[?25h").? + "\x1b[?25h".len;
+        try check(std.mem.trim(u8, d.output[tail..d.used], "\r\n").len == 0);
+    }
     if (std.mem.eql(u8, mode, "date") or std.mem.eql(u8, mode, "log-idle") or std.mem.eql(u8, mode, "regular-two")) {
         const final = try d.screen();
         try check(final.count(regular.prior) == 1);

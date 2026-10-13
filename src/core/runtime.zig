@@ -61,7 +61,7 @@ pub const Decision = enum { allow_once, deny, trust_process };
 pub const State = enum { calling_model, awaiting_permission, executing_tool, compacting };
 
 /// 一次 run 的最终结局（取消与失败需区分，见 run）。
-pub const Status = enum { success, failed, canceled };
+pub const Status = enum { success, failed, canceled, paused };
 
 /// 一次 run 的用量累计，普通调用与摘要调用分别统计。
 /// 某字段任一次缺失或溢出后变为 null，之后不再累加（表示该总和不可信）。
@@ -122,7 +122,7 @@ pub const Event = union(enum) {
     /// intentionally absent, including on final-only Responses streams.
     assistant_committed: []const p.Block,
     /// 工具参数的流式预览，尚未校验，不能用于执行。
-    tool_preview: struct { index: usize, arguments: []const u8 },
+    tool_preview: struct { index: usize, arguments: []const u8, write_file: bool = false, argument_bytes: ?usize = null },
     /// 请求用户授权（随后会调用 Host.authorize_fn）。
     permission: Permission,
     /// 工具开始执行。
@@ -485,6 +485,52 @@ pub const Runtime = struct {
         return self.history.items;
     }
 
+    /// Borrowed owner-side checkpoint view: only before jobs start or after join.
+    /// Credentials/authorization are deliberately not part of persisted state.
+    pub fn checkpoint(self: *const Runtime) !@import("checkpoint.zig").State {
+        if (self.busy.load(.acquire)) return error.Busy;
+        if (self.poisoned) return error.UnsafeToContinue;
+        const state: @import("checkpoint.zig").State = .{
+            .system = self.system,
+            .messages = self.messages(),
+            .selector = self.selector,
+            .estimator = self.estimator,
+            .last_context_tokens = self.last_context_tokens,
+            .permission_id = self.permission_id,
+        };
+        try @import("checkpoint.zig").validate(self.allocator, state, self.config.*, self.executor.schemas);
+        return state;
+    }
+
+    /// Import an already authenticated checkpoint into an empty idle Runtime.
+    /// Validation and all copies finish before publication; never invokes a
+    /// model, a tool, a host callback or an old authorization decision.
+    pub fn restoreCheckpoint(self: *Runtime, state: @import("checkpoint.zig").State) !void {
+        if (self.busy.load(.acquire)) return error.Busy;
+        if (self.poisoned) return error.UnsafeToContinue;
+        if (self.history.items.len != 0) return error.RuntimeNotEmpty;
+        try @import("checkpoint.zig").validate(self.allocator, state, self.config.*, self.executor.schemas);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        var history: std.ArrayList(p.Message) = .empty;
+        try history.ensureTotalCapacity(arena.allocator(), state.messages.len);
+        for (state.messages) |message| history.appendAssumeCapacity(try p.cloneMessage(arena.allocator(), message));
+        const system = try self.allocator.dupe(u8, state.system);
+        const old_system = self.system;
+        var old_arena = self.arena;
+        self.system = system;
+        self.arena = arena;
+        self.history = history;
+        self.selector = state.selector;
+        self.estimator = state.estimator;
+        self.last_context_tokens = state.last_context_tokens;
+        self.permission_id = state.permission_id;
+        // runInner resets the protected boundary to the next explicit input.
+        self.protected_index = history.items.len;
+        old_arena.deinit();
+        self.allocator.free(old_system);
+    }
+
     /// 估算当前上下文 token 数（系统提示词 + 工具 schema + 历史），用于决定是否压缩。
     pub fn estimatedTokens(self: *const Runtime) usize {
         return self.estimator.tokens(context.rawTokens(self.system, self.executor.schemas, self.history.items));
@@ -555,9 +601,10 @@ pub const Runtime = struct {
             return terminal;
         };
 
-        // 仅当错误为 Canceled 且未 poisoned 时才算 canceled，其余错误都是 failed。
+        // A reached round budget is a bounded pause, not a model/HTTP failure.
+        // Only a new explicit user submission grants another per-run budget.
         self.runInner(text, cancel, &task) catch |err| {
-            task.terminal.status = if (err == error.Canceled and !self.poisoned) .canceled else .failed;
+            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit) .paused else .failed;
             task.terminal.detail = err;
         };
 
@@ -585,6 +632,12 @@ pub const Runtime = struct {
         if (cancel.isRequested()) return error.Canceled;
     }
 
+    fn retainCurrentInput(self: *Runtime, retained: *bool) !void {
+        if (retained.*) return;
+        self.history.items[self.protected_index] = try p.cloneMessage(self.arena.allocator(), self.history.items[self.protected_index]);
+        retained.* = true;
+    }
+
     /// 主循环：预检（必要时压缩）→ 调用模型 → stop 则提交返回，否则执行工具批次。
     /// 不变量：模型输出的每个 tool_call 在返回前都会有对应 tool_result（见 executeBatch 的 errdefer）。
     fn runInner(self: *Runtime, text: []const u8, cancel: *p.Cancellation, task: *Task) !void {
@@ -598,11 +651,11 @@ pub const Runtime = struct {
         // run is synchronous; text and this block remain alive through preflight,
         // including summary calls. Host/observer callbacks only borrow strings.
         self.protected_index = self.history.items.len;
-        var normal_started = false;
+        var input_retained = false;
         // Compaction may replace the arena and remap protected_index. Roll back
         // only the current input, never an already committed summary. Install
         // this guard before even the fallible message-header append.
-        errdefer if (!normal_started) {
+        errdefer if (!input_retained) {
             self.history.items.len = self.protected_index;
         };
         const input_blocks = [_]p.Block{.{ .text = text }};
@@ -611,11 +664,18 @@ pub const Runtime = struct {
         while (true) {
             try checkCanceled(cancel);
             // 预检：超过压缩阈值则先压缩。
-            try self.preflight(cancel, task);
+            self.preflight(cancel, task) catch |err| {
+                if (err == error.RoundLimit) try self.retainCurrentInput(&input_retained);
+                return err;
+            };
             try checkCanceled(cancel);
 
-            // 轮数上限防止模型无限调用工具；计数在发请求前递增。
-            if (task.rounds >= self.config.limits.max_rounds) return error.RoundLimit;
+            // Preserve the explicit goal even if summaries consumed the budget
+            // before the first normal request. Never retain a borrowed stack block.
+            if (task.rounds >= self.config.limits.max_rounds) {
+                try self.retainCurrentInput(&input_retained);
+                return error.RoundLimit;
+            }
             task.rounds += 1;
             try self.emitContext(cancel);
             try self.emit(.{ .state = .calling_model }, cancel);
@@ -631,11 +691,8 @@ pub const Runtime = struct {
             // message: preflight may have replaced history and its arena. Clone
             // only once, not on every model/tool round. Any failure still rolls
             // back the staged input before its stack block can escape runInner.
-            if (!normal_started) {
-                self.history.items[self.protected_index] = try p.cloneMessage(self.arena.allocator(), self.history.items[self.protected_index]);
-            }
+            try self.retainCurrentInput(&input_retained);
             // 调用模型；协议选择与降级由 selector 处理。
-            normal_started = true;
             const result = self.selector.call(self.model, result_arena.allocator(), self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
                 self.last_context_tokens = null;
                 return err;
@@ -696,7 +753,7 @@ pub const Runtime = struct {
             switch (event) {
                 .text_delta => |text| try self.runtime.emit(.{ .text = text }, self.cancel),
                 .reasoning_delta => |text| try self.runtime.emit(.{ .reasoning = text }, self.cancel),
-                .tool_delta => |delta| try self.runtime.emit(.{ .tool_preview = .{ .index = delta.index, .arguments = delta.arguments } }, self.cancel),
+                .tool_delta => |delta| try self.runtime.emit(.{ .tool_preview = .{ .index = delta.index, .arguments = delta.arguments, .write_file = delta.write_file, .argument_bytes = delta.argument_bytes } }, self.cancel),
                 .usage => {}, // Outcome is authoritative; snapshots are not sums.
             }
         }

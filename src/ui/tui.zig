@@ -15,6 +15,7 @@ const command_menu_module = @import("command_menu.zig");
 const text = @import("text.zig");
 const markdown = @import("markdown.zig");
 const tail_frame = @import("tail_frame.zig");
+const StreamPrefix = @import("stream_prefix.zig").Prefix;
 const theme = @import("theme.zig");
 const activity = @import("activity.zig");
 const presentation = @import("presentation.zig");
@@ -41,6 +42,11 @@ const Record = struct {
     /// Only a fully written frame commits transcript delivery. Pending survives index shifts.
     output: bool = false,
     pending_output: bool = false,
+    /// Display-only streamed rows released above the mutable tail. Never model
+    /// history or canonical output. Copies survive layout invalidation.
+    flow_prefix: ?StreamPrefix = null,
+    pending_flow_prefix: ?StreamPrefix = null,
+    pending_flow_change: bool = false,
     /// 原始文本（UTF-8），受 record_limit 约束。
     body: std.ArrayList(u8) = .empty,
     /// 文本超过上限被截断；渲染时会附加提示。
@@ -66,8 +72,25 @@ const Record = struct {
     /// 释放记录占用的全部内存（渲染缓存与原始文本）。
     fn deinit(self: *Record, a: std.mem.Allocator) void {
         self.invalidate();
+        if (self.flow_prefix) |*prefix| prefix.deinit();
+        self.discardPendingFlow();
         self.body.deinit(a);
         self.command_spans.deinit(a);
+    }
+
+    fn discardPendingFlow(self: *Record) void {
+        if (self.pending_flow_prefix) |*prefix| prefix.deinit();
+        self.pending_flow_prefix = null;
+        self.pending_flow_change = false;
+    }
+
+    fn stageFlow(self: *Record, a: std.mem.Allocator, count: usize) !bool {
+        var next: ?StreamPrefix = null;
+        if (count != 0) next = (try StreamPrefix.capture(a, self.lines[0..count], self.columns)) orelse return false;
+        self.discardPendingFlow();
+        self.pending_flow_prefix = next;
+        self.pending_flow_change = true;
+        return true;
     }
 
     fn setCommand(self: *Record, a: std.mem.Allocator, caption: presentation.Caption, outcome: presentation.Outcome, duration_ms: ?u64) !void {
@@ -133,7 +156,7 @@ const Record = struct {
         }
         // 截断时追加提示，但提示只用于显示，模型历史保持不变。
         const data = if (self.clipped and self.kind != .reasoning) try std.fmt.allocPrint(temp, "{s}\n[display clipped; model history is unchanged]", .{self.body.items}) else self.body.items;
-        const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = 4096, .markdown = self.kind == .assistant, .tone = if (self.kind == .user) .user else if (self.kind == .reasoning or self.kind == .notice) .muted else .normal });
+        const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = 4096, .markdown = self.kind == .assistant, .tone = if (self.kind == .user) .user else if (self.kind == .reasoning) .thinking else if (self.kind == .notice) .muted else .normal });
         self.lines = rendered.lines;
         self.excerpt = self.clipped or rendered.truncated or rendered.degraded or rendered.total_lines > rendered.lines.len;
         self.columns = columns;
@@ -157,6 +180,8 @@ pub const Connection = struct {
     select_model_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     configure_provider_fn: ?*const fn (*anyopaque, core_config.providers.Id, []const u8) anyerror!void = null,
     set_effort_fn: ?*const fn (*anyopaque, shared.ReasoningEffort) anyerror!void = null,
+    /// Startup-only borrowed context, consumed before any worker exists.
+    initial_history_fn: ?*const fn (*anyopaque) []const p.Message = null,
 
     pub const State = struct {
         runtime: ?*r.Runtime,
@@ -223,43 +248,29 @@ pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge
     var ui = Ui{ .allocator = a, .io = io, .connection = connection, .bridge = bridge, .cancel = cancel, .terminal = &terminal, .editor = .{ .allocator = a }, .job = undefined };
     defer ui.deinit();
 
+    var directory: [Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_len = try Io.Dir.cwd().realPath(io, &directory);
+    const banner = try @import("startup.zig").banner(a, directory[0..directory_len], Io.Clock.real.now(io).toSeconds());
+    defer a.free(banner);
+    _ = try ui.add(.notice, banner);
+    if (connection.initial_history_fn) |history| try ui.restoreHistory(history(connection.context));
+
     // 事件循环出错时直接返回，资源释放交给上面的 defer。
     const result = ui.loop() catch |err| {
         // ui.deinit joins its worker before terminal.deinit restores attributes.
         return err;
     };
 
-    return finishExit(&terminal, ui.ctrl_d_exit, result, session_id, interrupt.signal);
+    if (result == 0 and interrupt.signal() == 0) ui.tidyIdleExit();
+    return finishExit(&terminal, result, interrupt.signal);
 }
 
-const ExitSignal = struct {
-    read: *const fn () u8,
-    fn stopped(ctx: ?*const anyopaque) bool {
-        const self: *const ExitSignal = @ptrCast(@alignCast(ctx.?));
-        return self.read() != 0;
-    }
-};
-
-// The private reader seam permits exact post-restore/pre-write boundary tests.
-// Production always reads the process-local signal handler's atomic value.
-fn finishExit(terminal: *terminal_module.Terminal, ctrl_d: bool, result: u8, id: ?[32]u8, read_signal: *const fn () u8) !u8 {
+// Terminal cleanup emits no session metadata. The application prints exactly
+// one resume command only after it has saved a nonempty conversation.
+fn finishExit(terminal: *terminal_module.Terminal, result: u8, read_signal: *const fn () u8) !u8 {
     if (!terminal.restore()) return error.TerminalRestoreFailed;
     const signal = read_signal();
     if (signal != 0) return 128 + signal;
-    if (ctrl_d and result == 0) {
-        if (id) |value| {
-            var line: [64]u8 = undefined;
-            const bytes = try std.fmt.bufPrint(&line, "Session ID: {s}\r\n", .{value});
-            const guard = ExitSignal{ .read = read_signal };
-            terminal.writeAfterRestoreStopped(bytes, .{ .context = &guard, .stopped_fn = ExitSignal.stopped }) catch |err| {
-                if (err == error.Canceled) {
-                    const caught = read_signal();
-                    if (caught != 0) return 128 + caught;
-                }
-                return err;
-            };
-        }
-    }
     const final_signal = read_signal();
     return if (final_signal != 0) 128 + final_signal else result;
 }
@@ -281,6 +292,7 @@ const Ui = struct {
     secret_quarantine: bool = false,
     /// 输入框编辑器（UTF-8 字节缓冲）。
     editor: input.Editor,
+    input_history: @import("input_history.zig").History = .{},
     /// 终端输入解析器，处理转义序列与粘贴边界。
     parser: input.Parser = .{},
     editor_pasted: bool = false,
@@ -330,6 +342,8 @@ const Ui = struct {
     /// 用户请求退出；若任务仍在运行，会等它结束后再退出。
     want_exit: bool = false,
     ctrl_d_exit: bool = false,
+    /// Idle-exit cleanup must never consume a tail from a submitted conversation.
+    has_submitted: bool = false,
     /// 清理未确认（CleanupFailed 等），禁止再次提交，只允许退出并检查。
     poisoned: bool = false,
     /// 是否需要重绘，由事件与按键置位。
@@ -347,6 +361,8 @@ const Ui = struct {
     display: shared.State = .{},
     model_flow: activity.Flow = .{},
     active_tool: ?struct { id: u64, caption: presentation.Caption, started_ms: u64 } = null,
+    /// One transient receipt row, never a committed file-write result.
+    write_preview: ?struct { index: usize, argument_bytes: usize } = null,
     /// Shared canonical FIFO; renderer adds terminal widths/icons later.
     tool_calls: shared.tools.Queue = .{},
     /// 上一次终态用于失败详情和cleanup安全检查，不显示统计栏。
@@ -406,6 +422,7 @@ const Ui = struct {
         self.parser.secretMode(false);
         self.wipeEditor();
         self.editor.deinit();
+        self.input_history.deinit(self.allocator);
     }
 
     /// 释放当前审批的描述并清空审批状态（包括已显示的审批 id）。
@@ -435,6 +452,51 @@ const Ui = struct {
         try self.records.items[index].append(self.allocator, data);
         self.dirty = true;
         return index;
+    }
+
+    /// Display-only projection of authenticated, closed canonical history.
+    /// No Bridge/observer events, execution, approvals or live reasoning replay.
+    fn restoreHistory(self: *Ui, messages: []const p.Message) !void {
+        if (messages.len == 0) return;
+        _ = try self.add(.notice, "Restored model context (display may be shortened); prior tools are NOT rerun");
+        for (messages, 0..) |message, index| switch (message.role) {
+            .user, .context => {
+                for (message.blocks) |block| switch (block) {
+                    .text => |value| {
+                        _ = try self.add(if (message.role == .user) .user else .notice, value);
+                    },
+                    else => {},
+                };
+                if (message.role == .user and message.blocks.len == 1 and message.blocks[0] == .text) {
+                    const value = message.blocks[0].text;
+                    if (value.len != 0 and value.len <= @import("input_history.zig").History.max_entry_bytes and value[0] != '/') {
+                        const owned = try self.input_history.prepare(self.allocator, value);
+                        self.input_history.commit(self.allocator, owned);
+                    }
+                }
+            },
+            .assistant => {
+                try self.captureToolCaptions(message.blocks);
+                try self.replaceCommitted(message.blocks, false, true);
+            },
+            .tool => for (message.blocks) |block| switch (block) {
+                .tool_result => |result| {
+                    const tool_name = find_name: {
+                        for (messages[0..index]) |prior| for (prior.blocks) |candidate| {
+                            if (candidate == .tool_call and std.mem.eql(u8, candidate.tool_call.id, result.call_id)) break :find_name candidate.tool_call.name;
+                        };
+                        return error.OrphanToolResult;
+                    };
+                    const caption = try self.nextToolCaption(tool_name);
+                    defer caption.deinit(self.allocator);
+                    try self.toolCompleted(caption, .{ .text = result.text, .is_error = result.is_error, .canceled = result.canceled, .truncated = result.truncated });
+                },
+                else => {},
+            },
+        };
+        self.clearToolCaptions();
+        // Restored records are content, not a never-used empty composer tail.
+        self.has_submitted = true;
     }
 
     fn removeRecord(self: *Ui, index: usize) void {
@@ -484,6 +546,15 @@ const Ui = struct {
         return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, self.clock_ms -| start, self.clock_ms);
     }
 
+    fn writePreviewLine(self: *Ui, a: std.mem.Allocator, columns: usize) ![]const u8 {
+        const detail = try std.fmt.allocPrint(a, "receiving arguments ({d} B)", .{self.write_preview.?.argument_bytes});
+        defer a.free(detail);
+        const label = try presentation.commandText(a, .{ .kind = .write, .label = detail }, .pending);
+        defer a.free(label);
+        // Receipt is not execution: no duration or fabricated +added/-deleted.
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, null, self.clock_ms);
+    }
+
     /// Only actionable notices/errors use a temporary hint row. Completed,
     /// mode, usage and performance have no rows; the composer owns activity.
     fn hint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
@@ -491,10 +562,10 @@ const Ui = struct {
         if (self.secret_mode) return "Enter save | Ctrl+U erase | Ctrl+C cancel | Ctrl+D exit";
         if (self.provider_open) return if (self.provider_picker.pasted) "Pasted selection: Ctrl+U clears; Esc cancels" else "Up/Down select; Enter API key; Esc/Ctrl+C cancel";
         if (self.model_picker) |picker| return if (picker.pasted) "Pasted selection: Ctrl+U clears; Esc cancels" else "Up/Down select; Enter confirm; Esc/Ctrl+C cancel";
-        if (self.commandMenuVisible()) return "Up/Down select; Enter run; Tab complete; Esc dismiss";
+        if (self.commandMenuVisible()) return "Type to filter; Tab complete; Enter run; Esc dismiss";
         var notice: []const u8 = "";
         if (self.last_terminal) |result| {
-            if (result.status != .success) notice = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ self.notice, if (result.detail != null) ": " else "", if (result.detail) |err| @errorName(err) else "", if (result.model_failure != null) " / " else "", if (result.model_failure) |failure| @tagName(failure) else "" });
+            if (result.status != .success and result.status != .paused) notice = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ self.notice, if (result.detail != null) ": " else "", if (result.detail) |err| @errorName(err) else "", if (result.model_failure != null) " / " else "", if (result.model_failure) |failure| @tagName(failure) else "" });
         }
         if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
         if (notice.len == 0 and state.runtime == null) notice = "Not configured: /auth";
@@ -523,6 +594,7 @@ const Ui = struct {
     /// retained in UI history; Runtime protocol history remains untouched.
     fn replaceCommitted(self: *Ui, blocks: []const p.Block, clipped: bool, blocks_complete: bool) !void {
         self.discardReasoning();
+        var withdrawn_preview = false;
         if (self.draft) |i| {
             self.records.items[i].body.clearRetainingCapacity();
             self.records.items[i].clipped = false;
@@ -540,12 +612,14 @@ const Ui = struct {
         }
         if (self.draft) |i| {
             if (self.records.items[i].body.items.len == 0) {
+                withdrawn_preview = self.records.items[i].flow_prefix != null or self.records.items[i].pending_flow_prefix != null;
                 self.removeRecord(i);
             } else {
                 self.records.items[i].final_answer = shared.answer.classify(blocks, blocks_complete) == .final;
             }
         }
         self.draft = null;
+        if (withdrawn_preview) _ = try self.add(.notice, "Stream preview withdrawn (final response has no text)");
     }
 
     /// 把一个 bridge 事件应用到 UI 状态：追加文本、更新状态、插入审批或工具记录等。
@@ -553,7 +627,10 @@ const Ui = struct {
         self.dirty = true;
         self.display.observe(item.event, self.clock_ms);
         switch (item.event) {
-            .state => |state| self.mode = state,
+            .state => |state| {
+                self.mode = state;
+                self.write_preview = null;
+            },
             .text => |v| {
                 try self.appendDraft(.assistant, v);
                 if (item.display_truncated and self.draft != null) {
@@ -569,6 +646,7 @@ const Ui = struct {
                 }
             },
             .assistant_committed => |blocks| {
+                self.write_preview = null;
                 try self.captureToolCaptions(blocks);
                 try self.replaceCommitted(blocks, item.display_truncated, item.canonical_complete);
             },
@@ -581,6 +659,7 @@ const Ui = struct {
                 self.permission_scroll = 0;
             },
             .tool_started => |tool| {
+                self.write_preview = null;
                 self.clearActiveTool();
                 self.active_tool = .{ .id = tool.id, .caption = try self.nextToolCaption(tool.name), .started_ms = tool.started_ms orelse self.clock_ms };
             },
@@ -616,7 +695,14 @@ const Ui = struct {
             },
             // 这些事件对 UI 没有需要展示的内容。
             .finished => {},
-            .tool_preview => {},
+            .tool_preview => |preview| {
+                if (preview.write_file) {
+                    const before = if (self.write_preview) |old| if (old.index == preview.index) old.argument_bytes else 0 else 0;
+                    self.write_preview = .{ .index = preview.index, .argument_bytes = preview.argument_bytes orelse (before +| preview.arguments.len) };
+                } else if (self.write_preview) |old| {
+                    if (old.index == preview.index) self.write_preview = null;
+                }
+            },
         }
     }
 
@@ -916,14 +1002,18 @@ const Ui = struct {
 
         // prompt 在任务启动前的错误路径中由 errdefer 释放；启动后由 self.prompt 接管。
         errdefer self.allocator.free(prompt);
+        const history_entry = try self.input_history.prepare(self.allocator, prompt);
+        errdefer @import("input_history.zig").History.discard(self.allocator, history_entry);
 
         _ = try self.add(.user, prompt);
         self.job = .{ .runtime = runtime, .cancel = self.cancel, .prompt = prompt };
 
         // 在独立线程中运行任务；&self.job 在 future 结束前必须保持有效（Ui 持有）。
         const future = try Io.concurrent(self.io, task.Job.run, .{&self.job});
+        self.input_history.commit(self.allocator, history_entry);
         self.future = future;
         self.prompt = prompt;
+        self.has_submitted = true;
         self.busy = true;
         self.mode = .calling_model;
         self.last_terminal = null;
@@ -935,7 +1025,27 @@ const Ui = struct {
         self.editor.clear();
     }
 
+    fn navigateInput(self: *Ui, forward: bool) !void {
+        // Nonempty user edits are never overwritten. Text inserted by history
+        // itself retains index so subsequent Up/Down can keep browsing.
+        if (self.editor.bytes.items.len != 0 and self.input_history.index == null) return;
+        const selected = self.input_history.target(forward) orelse return;
+        try self.editor.bytes.ensureTotalCapacity(self.editor.allocator, selected.text.len);
+        self.editor.clear();
+        self.editor.bytes.appendSliceAssumeCapacity(selected.text);
+        self.editor.cursor = selected.text.len;
+        self.input_history.index = selected.index;
+        self.editor_pasted = false;
+    }
+
+    fn requestCancel(self: *Ui) void {
+        self.cancel.cancel();
+        self.notice = "Cancellation requested; cleaning up, not rolling back effects";
+        self.clearPermission();
+    }
+
     fn wipeEditor(self: *Ui) void {
+        self.input_history.index = null;
         // clear 在 Debug 模式会 poison 原 items；最后再擦除，确保整个保留缓冲区为零。
         self.editor.clear();
         self.editor_pasted = false;
@@ -1003,6 +1113,10 @@ const Ui = struct {
         const self: *Ui = @ptrCast(@alignCast(ctx));
         if (self.want_exit) return;
         self.dirty = true;
+        if (event_ == .escape and self.busy) {
+            self.requestCancel();
+            return; // Cancel the task even while an approval is visible; never exit.
+        }
         if (self.secret_mode) {
             self.secretKey(event_);
             return;
@@ -1021,6 +1135,10 @@ const Ui = struct {
 
         if (self.provider_open and self.permission == null) return self.providerKey(event_);
         if (self.model_picker != null and self.permission == null) return self.modelKey(event_);
+        switch (event_) {
+            .text, .paste_start, .backspace, .delete, .clear, .kill_end, .tab => self.input_history.index = null,
+            else => {},
+        }
         self.refreshCommandMenu();
         // Edits/cursor changes revoke old authority even if candidates stay equal.
         switch (event_) {
@@ -1031,16 +1149,9 @@ const Ui = struct {
         // is visible and the session is idle. Every other key still edits text.
         if (self.commandMenuVisible() and self.permission == null) {
             switch (event_) {
-                .up => {
-                    self.command_menu.move(false, self.command_matches.len);
-                    self.dirty = true;
-                    return;
-                },
-                .down => {
-                    self.command_menu.move(true, self.command_matches.len);
-                    self.dirty = true;
-                    return;
-                },
+                // A typed slash token is still user input: arrows must not
+                // change it or the highlighted command. Type a prefix or use Tab.
+                .up, .down => return,
                 .escape => {
                     self.command_menu.dismiss();
                     self.dirty = true;
@@ -1102,11 +1213,10 @@ const Ui = struct {
             // 忙碀时取消任务（已产生的副作用不回滚）；空闲时只清空输入。
             .cancel => {
                 if (self.busy) {
-                    self.cancel.cancel();
-                    self.notice = "Cancellation requested; cleaning up, not rolling back effects";
-                    self.clearPermission();
+                    self.requestCancel();
                 } else {
                     self.editor.clear();
+                    self.input_history.index = null;
                     self.notice = "Ready";
                 }
             },
@@ -1115,15 +1225,18 @@ const Ui = struct {
             .toggle_reasoning => self.show_reasoning = !self.show_reasoning,
             .cycle_effort => self.cycleEffort(),
             .escape => {},
-            .page_up, .up => if (self.permission != null) {
-                self.permission_scroll -|= if (event_ == .up) 1 else @max(1, @min(7, self.size.rows -| 6));
+            .up, .down => if (self.permission != null) {
+                if (event_ == .up) self.permission_scroll -|= 1 else self.permission_scroll +|= 1;
+            } else try self.navigateInput(event_ == .down),
+            .page_up => if (self.permission != null) {
+                self.permission_scroll -|= @max(1, @min(7, self.size.rows -| 6));
             } else {
-                self.scroll +|= if (event_ == .up) 1 else 10;
+                self.scroll +|= 10;
             },
-            .page_down, .down => if (self.permission != null) {
-                self.permission_scroll +|= if (event_ == .down) 1 else @max(1, @min(7, self.size.rows -| 6));
+            .page_down => if (self.permission != null) {
+                self.permission_scroll +|= @max(1, @min(7, self.size.rows -| 6));
             } else {
-                self.scroll -|= if (event_ == .down) 1 else 10;
+                self.scroll -|= 10;
             },
             .backspace => self.editor.backspace(),
             .delete => self.editor.delete(),
@@ -1171,6 +1284,7 @@ const Ui = struct {
         self.notice = switch (result.status) {
             .success => "Ready",
             .canceled => "Canceled; prior side effects remain",
+            .paused => "Paused at round limit; send a message to continue",
             .failed => "Failed",
         };
 
@@ -1179,6 +1293,7 @@ const Ui = struct {
         self.discardReasoning();
         self.draft = null;
         self.clearActiveTool();
+        self.write_preview = null;
         self.clearToolCaptions();
         self.mode = null;
         self.dirty = true;
@@ -1307,6 +1422,12 @@ const Ui = struct {
         for (self.records.items) |*record| {
             if (record.pending_output) record.output = true;
             record.pending_output = false;
+            if (record.pending_flow_change and self.frame_fresh) {
+                if (record.flow_prefix) |*prefix| prefix.deinit();
+                record.flow_prefix = record.pending_flow_prefix;
+                record.pending_flow_prefix = null;
+            }
+            record.discardPendingFlow();
         }
         if (self.tail_snapshot) |*snapshot| snapshot.deinit();
         self.tail_snapshot = null;
@@ -1339,6 +1460,43 @@ const Ui = struct {
         }
     }
 
+    /// Only an acknowledged, unchanged-size owned tail can be reclaimed. Keep
+    /// the startup transcript and shell history above it; never ED/CUP/scrollback-clear.
+    fn idleExitBytes(self: *const Ui, writer: *Io.Writer) !bool {
+        if (!self.ctrl_d_exit or self.has_submitted or self.busy or self.future != null or
+            self.frame.len != 0 or self.resize_rescue.len != 0 or !self.frame_fresh or
+            self.abandon_tail or self.tail_snapshot == null or self.tail_height == 0 or
+            self.tail_height > self.size.rows or self.tail_size.rows != self.size.rows or
+            self.tail_size.columns != self.size.columns) return false;
+        try writer.writeAll(terminal_module.sync_begin ++ "\x1b[?25l\r");
+        if (self.tail_height > 1) try writer.print("\x1b[{d}A", .{self.tail_height - 1});
+        for (0..self.tail_height) |row| {
+            try writer.writeAll("\x1b[0K");
+            if (row + 1 < self.tail_height) try writer.writeAll("\x1b[1B\r");
+        }
+        if (self.tail_height > 1) try writer.print("\x1b[{d}A", .{self.tail_height - 1});
+        try writer.writeAll("\r" ++ terminal_module.sync_end);
+        return true;
+    }
+
+    fn tidyIdleExit(self: *Ui) void {
+        self.resize(self.terminal.size());
+        var bytes: [2048]u8 = undefined;
+        var writer = Io.Writer.fixed(&bytes);
+        if (!(self.idleExitBytes(&writer) catch false)) return;
+        const start = Io.Clock.awake.now(self.io);
+        var offset: usize = 0;
+        for (0..50) |_| {
+            const size = self.terminal.size();
+            // Do not continue relative cleanup after a resize or interruption.
+            // Terminal.restore always cancels partial CSI and releases sync.
+            if (size.rows != self.size.rows or size.columns != self.size.columns or interrupt.signal() != 0) return;
+            offset += self.terminal.write(writer.buffered()[offset..]) catch return;
+            if (offset == writer.buffered().len or start.untilNow(self.io, .awake).toMilliseconds() >= 100) return;
+            self.terminal.wait(true, 2) catch return;
+        }
+    }
+
     /// 除正文行外，还必须完整显示审批编号；不能用被截断的标题确认当前请求。
     fn approvalFits(self: *const Ui, id: u64) bool {
         var buffer: [40]u8 = undefined;
@@ -1354,6 +1512,10 @@ const Ui = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        errdefer for (self.records.items) |*record| {
+            record.discardPendingFlow();
+            record.pending_output = false;
+        };
         const cols = self.size.columns -| 1; // Never trigger terminal autowrap.
         var out: std.Io.Writer.Allocating = .init(a);
         var tail_out: std.Io.Writer.Allocating = .init(a);
@@ -1379,10 +1541,17 @@ const Ui = struct {
 
         self.frame_clear_end = out.written().len;
 
-        // Commit each finalized record once. Live Markdown/reasoning remains a
-        // replaceable preview until canonical commit; model ANSI is never emitted.
+        // Native scrollback is an appendable document, not a sliding window.
+        // Streamed body prefixes may leave the mutable tail as DISPLAY previews;
+        // canonical flags/history remain separate. Thinking is always transient.
         var lines: std.ArrayList([]const u8) = .empty;
         const preview = self.scroll != 0;
+        const flow_allowed = !preview and self.size.rows >= 7 and cols >= 8 and
+            self.permission == null and self.model_picker == null and !self.provider_open and
+            !self.commandMenuVisible() and !self.secret_mode and !self.secret_quarantine;
+        const mutable_rows = @max(1, self.size.rows -| 4);
+        var flow_continuation = false;
+        var canonical_output = false;
         var transcript_rows: usize = 0;
         var previous_kind: ?Kind = null;
         for (self.records.items, 0..) |*record, index| {
@@ -1394,41 +1563,71 @@ const Ui = struct {
             }
             try record.layout(self.allocator, @max(1, cols));
             const heading = if (record.interrupted) "Interrupted response — preview" else if (record.excerpt) "Display excerpt" else "";
-            if (cols >= 8 and !record.output and !drafting) {
-                // Leading gaps work even when the prior command was committed
-                // in an earlier frame. Tool -> tool is always contiguous.
-                if (previous_kind) |prior| if (prior != .tool or record.kind != .tool) {
-                    // This separator is also an owned row replacement. Bare
-                    // CRLF would commit stale approval/preview text as history.
-                    try putStyled(writer, 1, "");
+            var prefix: usize = 0;
+            if (record.flow_prefix) |*shown| {
+                if (shown.matches(record.lines, @max(1, cols))) {
+                    prefix = shown.rows.len;
+                } else if (!drafting or flow_allowed) {
+                    // Do not clear/replay native history as Pi's regular renderer
+                    // can do. A revised/reflowed preview is explicitly superseded.
+                    try putToneLine(writer, a, 1, "Response revised — earlier stream preview above", cols, theme.muted);
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
-                };
-                if (heading.len != 0) {
+                    _ = try record.stageFlow(self.allocator, 0);
+                }
+            }
+            const finalized = cols >= 8 and !record.output and !drafting;
+            var stop = prefix;
+            if (drafting and flow_allowed) {
+                const wanted = @max(prefix, record.lines.len -| mutable_rows);
+                if (wanted > prefix and try record.stageFlow(self.allocator, wanted)) stop = wanted;
+            }
+            if (finalized) stop = record.lines.len;
+            if (finalized or stop > prefix) {
+                if (prefix == 0) {
+                    if (previous_kind) |prior| if (prior != .tool or record.kind != .tool) {
+                        try putStyled(writer, 1, "");
+                        try writer.writeAll("\r\n");
+                        transcript_rows += 1;
+                    };
+                }
+                if (heading.len != 0 and (prefix == 0 or finalized)) {
                     try putToneLine(writer, a, 1, heading, cols, theme.muted);
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
                 }
-                for (record.lines) |line| {
+                for (record.lines[prefix..stop]) |line| {
                     try putStyled(writer, 1, line);
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
                 }
-                record.pending_output = true;
+                if (finalized) {
+                    record.pending_output = true;
+                    canonical_output = true;
+                    _ = try record.stageFlow(self.allocator, 0);
+                }
+                prefix = stop;
             }
             if (preview or drafting) {
-                if (previous_kind) |prior| if (prior != .tool or record.kind != .tool) try lines.append(a, "");
-                if (heading.len != 0) {
-                    const headings = try markdown.render(a, heading, .{ .columns = @max(1, cols), .max_lines = 32, .markdown = false, .tone = .muted });
-                    try lines.appendSlice(a, headings.lines);
+                const begin = if (preview) 0 else prefix;
+                if (begin == 0) {
+                    if (previous_kind) |prior| if (prior != .tool or record.kind != .tool) try lines.append(a, "");
+                    if (heading.len != 0) {
+                        const headings = try markdown.render(a, heading, .{ .columns = @max(1, cols), .max_lines = 32, .markdown = false, .tone = .muted });
+                        try lines.appendSlice(a, headings.lines);
+                    }
                 }
-                try lines.appendSlice(a, record.lines);
+                try lines.appendSlice(a, record.lines[begin..]);
+                if (drafting and begin != 0) flow_continuation = true;
             }
             previous_kind = record.kind;
         }
         if (!preview and self.active_tool != null) {
             if (previous_kind) |prior| if (prior != .tool) try lines.append(a, "");
             try lines.append(a, try self.pendingCommand(a, @max(1, cols)));
+        } else if (!preview and self.write_preview != null) {
+            if (previous_kind) |prior| if (prior != .tool) try lines.append(a, "");
+            try lines.append(a, try self.writePreviewLine(a, @max(1, cols)));
         }
         const thinking = if (self.show_reasoning and !preview and self.draft == null) self.reasoning else null;
         var thinking_lines: []const []const u8 = &.{};
@@ -1442,7 +1641,7 @@ const Ui = struct {
         const thinking_gap: usize = @intFromBool(thinking != null and thinking_lines.len != 0 and previous_kind != null);
         // A live draft already has one leading gap in lines. Keep it outside
         // the scrollable slice so a long draft cannot clip it next to the user.
-        const live_gap: usize = @intFromBool(!preview and lines.items.len != 0 and lines.items[0].len == 0);
+        const live_gap: usize = @intFromBool(!preview and !flow_continuation and lines.items.len != 0 and lines.items[0].len == 0);
         const secret_destination = if (self.secret_mode) blk: {
             if (self.secret_provider) |id| break :blk try std.fmt.allocPrint(a, "API key for {s}\nBase URL: {s}\nSaved locally only; /model activates the saved key", .{ id.label(), id.baseUrl() });
             const state = self.connection.current();
@@ -1640,22 +1839,39 @@ const Ui = struct {
         const snapshot_allowed = self.permission == null and self.model_picker == null and !self.provider_open and !menu_visible and !self.secret_mode and !self.secret_quarantine;
         var candidate = if (snapshot_allowed) try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset) else null;
         errdefer if (candidate) |*snapshot| snapshot.deinit();
-        const sparse = transcript_rows == 0 and !self.abandon_tail and self.tail_height == rows and
-            snapshot_allowed and
+        const can_diff = !self.abandon_tail and snapshot_allowed and
             self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows and
             self.tail_snapshot != null and candidate != null;
+        const growing = can_diff and !canonical_output and transcript_rows != 0 and
+            transcript_rows + rows >= self.tail_height;
+        const sparse = can_diff and transcript_rows == 0 and self.tail_height == rows;
+        var growth_out: std.Io.Writer.Allocating = .init(a);
         writer = &out.writer;
-        if (sparse) {
-            try candidate.?.emitDiff(writer, &self.tail_snapshot.?);
+        if (growing) {
+            // Compare at unchanged document indices; only CRLF past the old
+            // physical bottom creates new history. No sliding-window DL.
+            const released = try a.alloc([]const u8, transcript_rows);
+            var split = std.mem.splitSequence(u8, out.written()[self.frame_clear_end..], "\r\n");
+            for (released) |*line| line.* = split.next() orelse return error.InvalidTailFrame;
+            try growth_out.writer.writeAll(out.written()[0..self.frame_clear_end]);
+            try candidate.?.emitGrowingDiff(&growth_out.writer, &self.tail_snapshot.?, released);
+        } else if (sparse) {
+            // Tail sizing pins its last row to the physical bottom. Only the
+            // current live view may reuse lines; internal history browsing keeps
+            // the ordinary diff, and all modal/ACK/resize gates remain above.
+            if (self.scroll == 0 and self.draft == null)
+                try candidate.?.emitBottomDiff(writer, &self.tail_snapshot.?)
+            else
+                try candidate.?.emitDiff(writer, &self.tail_snapshot.?);
         } else {
             try writer.writeAll(tail_out.written());
         }
 
         // frame 指向 arena 内存，arena 所有权交给 frame_arena，直到这帧写完。
         self.frame_full_tail = tail_out.written();
-        self.frame_sparse = sparse;
+        self.frame_sparse = sparse or growing;
         self.frame_tail_snapshot = candidate;
-        self.frame = out.written();
+        self.frame = if (growing) growth_out.written() else out.written();
         self.frame_offset = 0;
         self.frame_arena = arena;
         self.frame_height = rows;
@@ -1879,7 +2095,7 @@ fn expectTranscriptGap(screen: *const @import("../tests/regular_screen.zig").Scr
     for (line) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
 }
 
-test "user thinking short long and canonical replies keep one gap without preview titles" {
+test "user thinking streaming prefixes and revised replies keep explicit gaps" {
     for ([_]usize{ 80, 20 }) |columns| {
         var cancel: p.Cancellation = .{};
         var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -1910,7 +2126,8 @@ test "user thinking short long and canonical replies keep one gap without previe
         try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Streaming") == null);
         try std.testing.expect(std.mem.indexOf(u8, ui.frame, "History preview") == null);
         ui.finishFrame();
-        // Clipping the start of a long live draft cannot consume its leading gap.
+        // Growing native history preserves the original start and its gap,
+        // instead of clipping the stream into a moving last-screen window.
         for (0..60) |i| {
             const delta = try std.fmt.allocPrint(std.testing.allocator, "\nlive-line-{d}", .{i});
             defer std.testing.allocator.free(delta);
@@ -1918,19 +2135,159 @@ test "user thinking short long and canonical replies keep one gap without previe
         }
         try ui.draw();
         try screen.replay(ui.frame);
-        try expectTranscriptGap(&screen, "user-row-end", "live-line-");
+        try expectTranscriptGap(&screen, "user-row-end", "live-start");
         try std.testing.expectEqual(@as(usize, 23), screen.row);
         ui.finishFrame();
         try ui.replaceCommitted(&.{.{ .text = "formal-final" }}, false, true);
         try ui.draw();
         try screen.replay(ui.frame);
-        try expectTranscriptGap(&screen, "user-row-end", "formal-final");
+        try expectTranscriptGap(&screen, "Response revised", "formal-final");
         try std.testing.expectEqual(@as(usize, 1), screen.count("formal-final"));
-        try std.testing.expectEqual(@as(usize, 0), screen.count("live-line-"));
+        try std.testing.expect(screen.count("live-line-") > 0);
         try std.testing.expectEqual(@as(usize, 1), screen.count("user-row-end"));
         try std.testing.expectEqual(@as(usize, 23), screen.row);
         ui.finishFrame();
     }
+}
+
+test "empty composer arrows browse user input but manual edits and slash tokens do not respond" {
+    const a = std.testing.allocator;
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    for ([_][]const u8{ "first\n中文", "second" }) |message|
+        ui.input_history.commit(a, try ui.input_history.prepare(a, message));
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b[B", sink);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try ui.parser.feed("\x1b[A", sink);
+    try std.testing.expectEqualStrings("second", ui.editor.bytes.items);
+    try ui.parser.feed("\x1b[A\x1b[A", sink);
+    try std.testing.expectEqualStrings("first\n中文", ui.editor.bytes.items);
+    try ui.parser.feed("\x1b[B\x1b[B", sink);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try ui.parser.feed("manual\x1b[A\x1b[B", sink);
+    try std.testing.expectEqualStrings("manual", ui.editor.bytes.items);
+    try ui.parser.feed("\x15\x1b[A-edited\x1b[A\x1b[B", sink);
+    try std.testing.expectEqualStrings("second-edited", ui.editor.bytes.items);
+    try std.testing.expect(ui.input_history.index == null);
+    try ui.parser.feed("\x15/\x1b[B", sink);
+    try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
+    try std.testing.expectEqual(command_menu_module.Command.model, ui.command_menu.choice(ui.command_matches).?);
+    try std.testing.expectEqual(@as(usize, 0), ui.scroll);
+    try std.testing.expect(!ui.busy and ui.future == null); // Browsing is never submission.
+    ui.wipeEditor();
+    ui.beginSecret(null);
+    try ui.parser.feed("fake-secret-never-history", sink);
+    ui.endSecret();
+    try std.testing.expectEqual(@as(usize, 2), ui.input_history.entries.items.len);
+    try std.testing.expectEqualStrings("second", ui.input_history.target(false).?.text);
+}
+
+test "standalone Escape cancels active task without exit but arrows and pasted escapes cannot" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true;
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("draft-next\x1b[200~\x1b[A\x1b[201~\x1b[", sink);
+    try ui.parser.expireEscape(sink);
+    try std.testing.expect(!cancel.isRequested());
+    try ui.parser.feed("A", sink);
+    try ui.parser.expireEscape(sink);
+    try std.testing.expect(!cancel.isRequested());
+    try ui.parser.feed("\x1b", sink);
+    try std.testing.expect(!cancel.isRequested());
+    try ui.parser.expireEscape(sink);
+    try std.testing.expect(cancel.isRequested() and !ui.want_exit and !ui.ctrl_d_exit);
+    try std.testing.expectEqualStrings("draft-next", ui.editor.bytes.items);
+    try std.testing.expect(std.mem.startsWith(u8, ui.notice, "Cancellation requested"));
+}
+
+test "idle exit reclaims only acknowledged blank tail and preserves startup and shell history" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.add(.notice, "thin fixture-version\nDirectory: /fixture\nTime: fixture UTC");
+    ui.ctrl_d_exit = true;
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay("shell-kept\r\n");
+    try ui.draw();
+    var buf: [2048]u8 = undefined;
+    var writer = Io.Writer.fixed(&buf);
+    try std.testing.expect(!try ui.idleExitBytes(&writer));
+    try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    try std.testing.expect(try ui.idleExitBytes(&writer));
+    try screen.replay(writer.buffered());
+    try screen.replay("\r\nshell-next");
+    try std.testing.expectEqual(@as(usize, 0), screen.count("Session ID:"));
+    try std.testing.expect(screen.row <= 6);
+    for ([_][]const u8{ "shell-kept", "thin fixture-version", "Directory: /fixture", "Time: fixture UTC", "shell-next" }) |marker|
+        try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
+
+    const Denied = struct {
+        fn check(state: *Ui) !void {
+            var bytes: [2048]u8 = undefined;
+            var out = Io.Writer.fixed(&bytes);
+            try std.testing.expect(!try state.idleExitBytes(&out));
+            try std.testing.expectEqual(@as(usize, 0), out.buffered().len);
+        }
+    };
+    ui.has_submitted = true;
+    try Denied.check(&ui);
+    ui.has_submitted = false;
+    ui.frame_fresh = false;
+    try Denied.check(&ui);
+    ui.frame_fresh = true;
+    ui.abandon_tail = true;
+    try Denied.check(&ui);
+    ui.abandon_tail = false;
+    const old_size = ui.size;
+    ui.resize(.{ .columns = 40, .rows = 12 });
+    ui.resize(old_size);
+    try Denied.check(&ui); // ABA cannot resurrect cleanup ownership.
+}
+
+test "resume startup projects saved text and tool outcomes without replaying reasoning or commands" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.restoreHistory(&.{
+        .{ .role = .context, .blocks = &.{.{ .text = "[Earlier context summary — lossy background data]" }} },
+        .{ .role = .user, .blocks = &.{.{ .text = "remember this" }} },
+        .{ .role = .assistant, .blocks = &.{ .{ .reasoning = "hidden old thought" }, .{ .tool_call = .{ .id = "old-call", .name = "read_file", .arguments = "{\"path\":\"old.txt\"}" } } } },
+        .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "old-call", .text = "raw output must not render", .is_error = true, .canceled = true } }} },
+        .{ .role = .assistant, .blocks = &.{.{ .text = "## Earlier answer" }} },
+        .{ .role = .user, .blocks = &.{.{ .text = "/auth" }} },
+    });
+    try std.testing.expect(ui.has_submitted and !ui.busy and ui.future == null and !ui.secret_mode);
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    try std.testing.expectEqualStrings("remember this", ui.input_history.entries.items[0]);
+    var tools: usize = 0;
+    for (ui.records.items) |record| {
+        try std.testing.expect(record.kind != .reasoning);
+        try std.testing.expect(std.mem.indexOf(u8, record.body.items, "hidden old thought") == null);
+        try std.testing.expect(std.mem.indexOf(u8, record.body.items, "raw output must not render") == null);
+        if (record.kind == .tool) {
+            tools += 1;
+            try std.testing.expect(record.command_row and record.duration_ms == null);
+            try std.testing.expectEqual(presentation.Outcome.canceled, record.command_spans.items[0].outcome);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), tools);
 }
 
 test "thinking keeps Markdown syntax literal while assistant answers still render it" {
@@ -1943,7 +2300,8 @@ test "thinking keeps Markdown syntax literal while assistant answers still rende
     try std.testing.expectEqual(@as(usize, 3), thinking_lines.len);
     for (thinking_lines, [_][]const u8{ "# **plan**", "- `step`", "| a | b |" }) |line, literal| {
         try std.testing.expect(std.mem.find(u8, line, literal) != null);
-        for ([_][]const u8{ theme.heading, theme.inline_code, theme.code, theme.link }) |style|
+        try std.testing.expect(std.mem.startsWith(u8, line, theme.reset ++ theme.thinking));
+        for ([_][]const u8{ theme.heading, theme.inline_code, theme.code, theme.link, theme.strong, theme.muted, theme.success, theme.failure, theme.caution }) |style|
             try std.testing.expect(std.mem.find(u8, line, style) == null);
     }
     var answer: Record = .{ .kind = .assistant };
@@ -2033,6 +2391,58 @@ test "rolling thinking keeps latest bounded UTF8 suffix and can be hidden" {
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "newest-thinking") == null);
     ui.finishFrame();
+}
+
+test "write arguments show an early transient row and only results carry committed counts" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.mode = .calling_model;
+    const host = bridge.host();
+    const previews = [_]r.Event{
+        .{ .tool_preview = .{ .index = 2, .arguments = "", .write_file = true, .argument_bytes = 0 } },
+        .{ .tool_preview = .{ .index = 2, .arguments = "RAW_WRITE_BYTES", .write_file = true, .argument_bytes = 4096 } },
+    };
+    for (previews, 0..) |event_, index| {
+        try host.emit_fn(host.context, event_, &cancel);
+        var item = bridge.pop().?;
+        defer item.deinit();
+        try ui.event(item);
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+        try std.testing.expect(ui.active_tool == null);
+        try ui.draw();
+        try std.testing.expect(std.mem.find(u8, ui.frame, "receiving arguments") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, if (index == 0) "0 B" else "4096 B") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "RAW_WRITE_BYTES") == null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "+3") == null);
+        ui.finishFrame();
+    }
+    const events = [_]r.Event{
+        .{ .assistant_committed = &.{.{ .tool_call = .{ .id = "write-2", .name = "write_file", .arguments = "{\"path\":\"preview.txt\"}" } }} },
+        .{ .tool_started = .{ .id = 7, .name = "write_file" } },
+        .{ .tool_result = .{ .id = 7, .name = "write_file", .result = .{ .text = "written", .file_stats = .{ .changes = .{ .added = 3, .removed = 2 } } } } },
+    };
+    for (events, 0..) |event_, index| {
+        try host.emit_fn(host.context, event_, &cancel);
+        var item = bridge.pop().?;
+        defer item.deinit();
+        try ui.event(item);
+        try std.testing.expect(ui.write_preview == null);
+        if (index < 2) try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "+3") != null);
+    try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "-2") != null);
+    ui.last_terminal = .{ .status = .paused, .detail = error.RoundLimit };
+    ui.notice = "Paused at round limit; send a message to continue";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const notice = try ui.hint(arena.allocator(), ui.connection.current());
+    try std.testing.expect(std.mem.find(u8, notice, "send a message to continue") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "RoundLimit") == null);
+    try std.testing.expect(std.mem.find(u8, notice, "Failed") == null);
 }
 
 test "tool animation is transient and raw tool JSON never enters displayed records" {
@@ -2175,7 +2585,7 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     try std.testing.expectEqual(@as(usize, 1), ui.records.items[0].lines.len);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items[1].lines.len);
     try std.testing.expect(std.mem.find(u8, ui.frame, " date [error]") == null); // The previous result is not rewritten.
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ ">" ++ theme.muted ++ " pwd") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ theme.success ++ ">" ++ theme.muted ++ " pwd") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-") == null);
     try screen.replay(ui.frame);
     failed_row = null;
@@ -2499,6 +2909,121 @@ test "one-pass transcript separators erase acknowledged approval preview before 
     try std.testing.expectEqual(@as(usize, 23), screen.row);
 }
 
+fn seedShiftDraft(ui: *Ui) !void {
+    try ui.appendDraft(.assistant, "```\n");
+    for (0..35) |row_index| {
+        var buffer: [96]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buffer, "stream-row-{d:0>3} abcdefghijklmnopqrstuvwxyz abcdefghijklmnop\n", .{row_index});
+        try ui.appendDraft(.assistant, line);
+    }
+}
+
+fn nativeLine(screen: *const @import("../tests/regular_screen.zig").Screen, index: usize) []const u8 {
+    return if (index < screen.history_len) &screen.history[index] else &screen.grid[index - screen.history_len];
+}
+
+test "stream prefix publishes only after ACK and matching canonical text is not duplicated" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try seedShiftDraft(&ui);
+    const index = ui.draft.?;
+    try ui.draw();
+    try std.testing.expect(ui.records.items[index].flow_prefix == null);
+    try std.testing.expect(ui.records.items[index].pending_flow_prefix != null);
+    try std.testing.expect(!ui.records.items[index].output and !ui.records.items[index].pending_output);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    // Invalidating the render cache cannot invalidate the in-flight checkpoint.
+    try ui.appendDraft(.assistant, "```");
+    ui.finishFrame();
+    try std.testing.expect(ui.records.items[index].flow_prefix != null);
+    const body = try std.testing.allocator.dupe(u8, ui.records.items[index].body.items);
+    defer std.testing.allocator.free(body);
+    try ui.replaceCommitted(&.{.{ .text = body }}, false, true);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(ui.records.items[index].output);
+    try std.testing.expect(ui.records.items[index].flow_prefix == null);
+    try std.testing.expectEqual(@as(usize, 35), screen.count("stream-row-"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("Response revised"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-row-000"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-row-034"));
+}
+
+test "withdrawn streamed text is explained without clearing native scrollback" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try seedShiftDraft(&ui);
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try ui.replaceCommitted(&.{}, false, true);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(screen.count("stream-row-") > 0);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("Stream preview withdrawn"));
+}
+
+test "native history viewport stays stable during streaming and revisions are explicit" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.add(.user, "stream-goal");
+    try seedShiftDraft(&ui);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    // A native viewport is an absolute slice of scrollback+screen, NOT Ui.scroll.
+    // Pin an observer eight rows above the current bottom; send no wheel input.
+    try std.testing.expect(screen.history_len >= 8);
+    const view_top = screen.history_len - 8;
+    var pinned: [24][80]u8 = undefined;
+    for (&pinned, 0..) |*line, index| @memcpy(line, nativeLine(&screen, view_top + index));
+    const history = screen.history_len;
+    for (35..43) |row_index| {
+        var buffer: [96]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buffer, "stream-row-{d:0>3} abcdefghijklmnopqrstuvwxyz abcdefghijklmnop\n", .{row_index});
+        try ui.appendDraft(.assistant, line);
+        try ui.draw();
+        try std.testing.expect(ui.frame_sparse);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1M") == null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "\n") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "stream-row-020") == null);
+        try screen.replay(ui.frame);
+        try std.testing.expect(screen.history_len > history);
+        for (&pinned, 0..) |*line_, index| try std.testing.expectEqualSlices(u8, line_, nativeLine(&screen, view_top + index));
+        try std.testing.expectEqual(@as(usize, 23), screen.row);
+        try std.testing.expect(screen.visible(line[0..14]));
+        ui.finishFrame();
+    }
+    try ui.replaceCommitted(&.{.{ .text = "final-canonical-only" }}, false, true);
+    try ui.draw();
+    try std.testing.expect(!ui.frame_sparse);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    // Already-visible previews remain identifiable, not silently erased or
+    // presented as the corrected canonical answer.
+    try std.testing.expect(screen.count("stream-row-") > 0);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("Response revised"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("final-canonical-only"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-goal"));
+}
+
 test "tail snapshots publish only on full ACK and own bytes after record invalidation" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -2531,47 +3056,60 @@ test "tail snapshots publish only on full ACK and own bytes after record invalid
 }
 
 test "resize at every sparse frame byte drops stale relative edits and cannot republish ownership" {
-    var length: usize = 1;
-    var offset: usize = 0;
-    while (offset < length) : (offset += 1) {
-        var cancel: p.Cancellation = .{};
-        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-        defer bridge.deinit();
-        var ui = fixtureUi(&bridge, &cancel);
-        defer ui.deinit();
-        // Keep this byte-split fixture ASCII: Screen models CSI cancellation,
-        // not a terminal's replacement-character policy for truncated UTF-8.
-        try ui.appendDraft(.assistant, "owned body");
-        try ui.draw();
-        ui.finishFrame();
-        try ui.appendDraft(.assistant, " extended");
-        try ui.draw();
-        try std.testing.expect(ui.frame_sparse);
-        length = ui.frame.len;
-        const full = ui.frame_full_tail;
-        var captured: Io.Writer.Allocating = .init(std.testing.allocator);
-        defer captured.deinit();
-        try captured.writer.writeAll(ui.frame[0..offset]);
-        ui.frame_offset = offset;
-        ui.resize(.{ .columns = 40, .rows = 12 });
-        try std.testing.expect(!ui.frame_sparse and !ui.frame_fresh);
-        try std.testing.expect(ui.tail_snapshot == null);
-        try std.testing.expectEqual(@as(usize, 0), ui.frame_offset);
-        try std.testing.expectEqualStrings(full, ui.frame);
-        try std.testing.expectEqualStrings("\x18" ++ terminal_module.sync_end ++ "\x1b[999B\r\n", ui.resize_rescue);
-        try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[23A") == null);
-        try captured.writer.writeAll(ui.resize_rescue);
-        try captured.writer.writeAll(ui.frame);
-        var screen: @import("../tests/regular_screen.zig").Screen = .{};
-        // Syntax/escape cancellation only, not a physical resize/reflow oracle.
-        try screen.replay(captured.written());
-        try std.testing.expect(std.mem.endsWith(u8, captured.written(), terminal_module.sync_end ++ "\x1b[?25h"));
-        // Even returning to old dimensions does not revive the old ACK/cache.
-        ui.resize(.{ .columns = 80, .rows = 24 });
-        ui.finishFrame(); // Simulate completion of the full recovery, not sparse ACK.
-        try std.testing.expect(ui.tail_snapshot == null);
-        try std.testing.expect(ui.displayed_permission == null and ui.displayed_model_epoch == null);
-        try std.testing.expect(ui.abandon_tail);
+    for ([_]bool{ false, true }) |shifted| {
+        var length: usize = 1;
+        var offset: usize = 0;
+        while (offset < length) : (offset += 1) {
+            var cancel: p.Cancellation = .{};
+            var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+            defer bridge.deinit();
+            var ui = fixtureUi(&bridge, &cancel);
+            defer ui.deinit();
+            // Keep this byte-split fixture ASCII: Screen models CSI cancellation,
+            // not a terminal's replacement-character policy for truncated UTF-8.
+            if (shifted) try seedShiftDraft(&ui) else try ui.appendDraft(.assistant, "owned body");
+            try ui.draw();
+            ui.finishFrame();
+            try ui.appendDraft(.assistant, if (shifted) "stream-row-035 abcdefghijklmnopqrstuvwxyz abcdefghijklmnop\n" else " extended");
+            try ui.draw();
+            try std.testing.expect(ui.frame_sparse);
+            const old_prefix = if (ui.draft) |index| if (ui.records.items[index].flow_prefix) |prefix| prefix.rows.len else 0 else 0;
+            if (shifted) {
+                try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1M") == null);
+                try std.testing.expect(std.mem.find(u8, ui.frame, "\n") != null);
+            }
+            for (ui.frame) |byte| try std.testing.expect(byte < 128);
+            length = ui.frame.len;
+            const full = ui.frame_full_tail;
+            var captured: Io.Writer.Allocating = .init(std.testing.allocator);
+            defer captured.deinit();
+            try captured.writer.writeAll(ui.frame[0..offset]);
+            ui.frame_offset = offset;
+            ui.resize(.{ .columns = 40, .rows = 12 });
+            try std.testing.expect(!ui.frame_sparse and !ui.frame_fresh);
+            try std.testing.expect(ui.tail_snapshot == null);
+            try std.testing.expectEqual(@as(usize, 0), ui.frame_offset);
+            try std.testing.expectEqualStrings(full, ui.frame);
+            try std.testing.expectEqualStrings("\x18" ++ terminal_module.sync_end ++ "\x1b[999B\r\n", ui.resize_rescue);
+            try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[23A") == null);
+            try captured.writer.writeAll(ui.resize_rescue);
+            try captured.writer.writeAll(ui.frame);
+            var screen: @import("../tests/regular_screen.zig").Screen = .{};
+            // Syntax/escape cancellation only, not a physical resize/reflow oracle.
+            try screen.replay(captured.written());
+            try std.testing.expect(std.mem.endsWith(u8, captured.written(), terminal_module.sync_end ++ "\x1b[?25h"));
+            // Even returning to old dimensions does not revive the old ACK/cache.
+            ui.resize(.{ .columns = 80, .rows = 24 });
+            ui.finishFrame(); // Simulate completion of the full recovery, not sparse ACK.
+            try std.testing.expect(ui.tail_snapshot == null);
+            try std.testing.expect(ui.displayed_permission == null and ui.displayed_model_epoch == null);
+            if (ui.draft) |index| {
+                const record = &ui.records.items[index];
+                try std.testing.expectEqual(old_prefix, if (record.flow_prefix) |prefix| prefix.rows.len else 0);
+                try std.testing.expect(record.pending_flow_prefix == null);
+            }
+            try std.testing.expect(ui.abandon_tail);
+        }
     }
 }
 
@@ -2586,6 +3124,7 @@ fn discardFixtureFrame(ui: *Ui) void {
     ui.frame_sparse = false;
     ui.frame_offset = 0;
     ui.frame = "";
+    for (ui.records.items) |*record| record.discardPendingFlow();
 }
 
 fn tailAllocationDraw(ui: *Ui) !void {
@@ -2595,7 +3134,7 @@ fn tailAllocationDraw(ui: *Ui) !void {
     ui.draw() catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
 }
 
-fn tailAllocationScenario(a: std.mem.Allocator) !void {
+fn tailAllocationScenario(a: std.mem.Allocator, native: bool) !void {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -2603,14 +3142,18 @@ fn tailAllocationScenario(a: std.mem.Allocator) !void {
     ui.allocator = a;
     ui.editor.allocator = a;
     defer ui.deinit();
-    try ui.appendDraft(.assistant, "| K | V |\n| --- | --- |\n| old | body |\n");
+    if (native) try seedShiftDraft(&ui) else try ui.appendDraft(.assistant, "| K | V |\n| --- | --- |\n| old | body |\n");
     try tailAllocationDraw(&ui);
     ui.finishFrame();
     const old_ack = ui.tail_snapshot.?.full;
-    try ui.appendDraft(.assistant, "| new | cell |\n");
+    const prefix_count = if (ui.records.items[ui.draft.?].flow_prefix) |prefix| prefix.rows.len else 0;
+    try ui.appendDraft(.assistant, if (native) "stream-row-035 more body\n" else "| new | cell |\n");
     tailAllocationDraw(&ui) catch |err| {
         // A failed candidate cannot replace/free the last acknowledged bytes.
         try std.testing.expectEqualStrings(old_ack, ui.tail_snapshot.?.full);
+        const record = &ui.records.items[ui.draft.?];
+        try std.testing.expectEqual(prefix_count, if (record.flow_prefix) |prefix| prefix.rows.len else 0);
+        try std.testing.expect(record.pending_flow_prefix == null and !record.pending_flow_change);
         try std.testing.expect(ui.frame.len == 0 and ui.frame_tail_snapshot == null);
         return err;
     };
@@ -2623,7 +3166,7 @@ fn tailAllocationScenario(a: std.mem.Allocator) !void {
 test "tail snapshot construction and resize release all allocations under OOM" {
     try text.initLocale();
     var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
-    try std.testing.checkAllAllocationFailures(backing.allocator(), tailAllocationScenario, .{});
+    for ([_]bool{ false, true }) |native| try std.testing.checkAllAllocationFailures(backing.allocator(), tailAllocationScenario, .{native});
     try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
 }
 
@@ -3462,7 +4005,8 @@ test "slash menu suggests only model and auth and runs the highlighted command" 
     try std.testing.expect(std.mem.find(u8, ui.frame, "Commands") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/model") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/auth") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Up/Down select; Enter run") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Type to filter; Tab complete") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Up/Down select; Enter run") == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
     ui.finishFrame();
 
@@ -3568,8 +4112,8 @@ test "slash menu rejects stale navigation generations and resize ABA" {
         try std.testing.expect(ui.model_picker == null and !ui.secret_mode);
         try ui.draw();
         ui.finishFrame();
-        try ui.parser.feed("\x1b[B\r", sink);
-        try std.testing.expect(!ui.secret_mode); // Changed selection is not yet shown.
+        try ui.parser.feed("a\r", sink);
+        try std.testing.expect(!ui.secret_mode); // Changed token/selection is not yet shown.
         try ui.draw();
         ui.finishFrame();
         try ui.parser.feed("\r", sink);
@@ -3763,7 +4307,7 @@ test "effort shortcut waits for queued and borrowed bridge items" {
     }
 }
 
-test "shutdown signals after restoration and before announcement suppress identity" {
+test "shutdown restores terminal and handles signals without announcing identity" {
     const c = std.c;
     const abi = @import("../platform/terminal_abi.zig");
     const Reader = struct {
@@ -3789,7 +4333,7 @@ test "shutdown signals after restoration and before announcement suppress identi
         Reader.terminal = &terminal;
         Reader.calls = 0;
         Reader.later = later;
-        try std.testing.expectEqual(@as(u8, if (later) 130 else 143), try finishExit(&terminal, true, 0, @as([32]u8, @splat('a')), Reader.read));
+        try std.testing.expectEqual(@as(u8, if (later) 130 else 143), try finishExit(&terminal, 0, Reader.read));
         try std.testing.expectEqual(flags, c.fcntl(slave, 3));
         var bytes: [4096]u8 = undefined;
         const n = c.read(master, &bytes, bytes.len);

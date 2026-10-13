@@ -19,6 +19,8 @@ import assert from 'node:assert/strict';
 import {reviewRegressions} from './review_mock.mjs';
 import {logRegressions} from './log_mock.mjs';
 import {settingsRegressions} from './settings_mock.mjs';
+import {selectionRestoreRegressions} from './selection_restore_mock.mjs';
+import {fullResumeRegressions} from './full_resume_mock.mjs';
 
 // 命令行参数：第一个是 thin 可执行文件的绝对路径，第二个是 thin-app-pty 驱动的绝对路径。
 const [appArg, ptyArg] = process.argv.slice(2);
@@ -225,6 +227,26 @@ async function scenario(name, protocol, kind, isPty = false) {
         return;
       }
 
+      if (kind === 'keyboard-history') {
+        assert(rounds <= 4, 'history navigation must not submit or retry');
+        const expected = ['history-one','history-two','esc-task','history-one'][rounds - 1];
+        assert.equal(body.messages.filter(m=>m.role==='user').at(-1).content, expected);
+        if (rounds === 3) {
+          stalled = true;
+          res.writeHead(200, {'content-type':'text/event-stream'}); res.flushHeaders();
+        } else send(res, protocol, rounds === 4 ? 'after-esc-answer' : `history-answer-${rounds}`);
+        return;
+      }
+      if (kind === 'esc-cancel-tool') {
+        assert(rounds <= 2, 'Escape must not replay the canceled tool');
+        if (rounds === 1) send(res, protocol, '', [tool('esc-owned-command','bash',{command:'sleep 30; printf late > esc-unwanted.txt'})]);
+        else {
+          assert.equal(body.messages.filter(m=>m.role==='user').at(-1).content, 'after-esc');
+          send(res, protocol, 'after-esc-answer');
+        }
+        return;
+      }
+
       if (kind === 'exit-busy-tool') {
         assert.equal(requests,1, 'Ctrl+D busy tool must not start another request');
         send(res,protocol,'',[tool('exit-busy-command','bash',{command:'sleep 30; printf must-not-complete'})]);
@@ -279,7 +301,7 @@ async function scenario(name, protocol, kind, isPty = false) {
         assert.equal(protocol, 'chat');
         res.writeHead(200, {'content-type':'text/event-stream', 'cache-control':'no-cache'});
         const chunk = delta => res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta,finish_reason:null}]})}\n\n`);
-        chunk({reasoning_content:'thinking-old-one\nthinking-old-two\nthinking-old-three\nreasoning-stage-one'});
+        chunk({reasoning_content:'thinking-old-one\n# **thinking-old-two**\n- `thinking-old-three`\nreasoning-stage-one'});
         await new Promise(resolve=>setTimeout(resolve,450));
         chunk({reasoning_content:'\nthinking-new-five\nthinking-new-six\nreasoning-stage-two'});
         await new Promise(resolve=>setTimeout(resolve,600));
@@ -289,6 +311,20 @@ async function scenario(name, protocol, kind, isPty = false) {
         await new Promise(resolve=>setTimeout(resolve,200));
         res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\ndata: ${JSON.stringify({id:'stream_fixture',choices:[],usage:{prompt_tokens:12,completion_tokens:90,total_tokens:102,prompt_tokens_details:{cached_tokens:9},completion_tokens_details:{reasoning_tokens:30}}})}\n\ndata: [DONE]\n\n`);
         res.end();
+        return;
+      }
+
+      if (kind === 'stream-native-history') {
+        assert.equal(protocol, 'chat');
+        res.writeHead(200, {'content-type':'text/event-stream', 'cache-control':'no-cache'});
+        const chunk = content => res.write(`data: ${JSON.stringify({id:'native_stream', choices:[{index:0, delta:{content}, finish_reason:null}]})}\n\n`);
+        const rows = (start, end) => Array.from({length:end-start}, (_, i) => `native-row-${String(start+i).padStart(3,'0')} stable streaming document line`).join('\n')+'\n';
+        chunk('```text\n'+rows(0,40));
+        await new Promise(resolve=>setTimeout(resolve,700));
+        chunk(rows(40,70));
+        await new Promise(resolve=>setTimeout(resolve,700));
+        chunk('```');
+        res.end(`data: ${JSON.stringify({id:'native_stream', choices:[{index:0, delta:{}, finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`);
         return;
       }
 
@@ -465,10 +501,13 @@ async function scenario(name, protocol, kind, isPty = false) {
 
     if (isPty && !['term','output'].includes(kind)) {
       const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
-      assert.equal(ids.length,1, 'Ctrl+D must announce exactly one restored session identity');
-      const announced = ids[0][1];
+      const silentExit = ['exit-no-submit','exit-unconfigured','exit-batched','exit-secret','exit-no-log','auth-missing','auth-empty'].includes(kind);
+      if (silentExit) assert.equal(ids.length,0, 'empty/no-log exit must not announce a session');
+      else if (kind === 'model-select') assert(ids.length <= 1); // Transient unsaved profiles can refuse checkpointing.
+      else assert.equal(ids.length,1, 'saved conversation must print exactly one resume command');
+      const announced = ids[0]?.[1];
       const logDir = join(project,'.thin/sessions');
-      if (await exists(logDir) && (await stat(logDir)).isDirectory()) {
+      if (announced && await exists(logDir) && (await stat(logDir)).isDirectory()) {
         for (const file of (await readdir(logDir)).filter(name=>name.endsWith('.jsonl'))) {
           assert(file.includes(`-${announced}-`), 'archive filename differs from announced identity');
           for (const line of (await readFile(join(logDir,file),'utf8')).trimEnd().split('\n').filter(Boolean)) assert.equal(JSON.parse(line).session,announced, 'record identity differs from immutable owner identity');
@@ -521,8 +560,13 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert.equal(auth.provider.api_key_env, '');
       if (kind !== 'auth-activate') {
         assert(!await exists(join(project,'.thin/sessions')), 'initialization created session records without submission');
-        assert(!await exists(join(project,'.thin')));
-        assert.deepEqual((await readdir(project)).sort(), ['seed.txt'], 'unexpected project files');
+        // Normal startup initializes the local preference, even before auth.
+        // No submission may create archives or any other project artifact.
+        assert.deepEqual((await readdir(project)).sort(), ['.thin','seed.txt'], 'unexpected project files');
+        assert.deepEqual(await readdir(join(project,'.thin')), ['settings.json']);
+        const settingsPath = join(project,'.thin/settings.json');
+        assert.equal((await stat(settingsPath)).mode & 0o777, 0o600);
+        assert.deepEqual(JSON.parse(await readFile(settingsPath,'utf8')), {version:1,reasoning_effort:'high'});
       }
       if (kind === 'auth-activate') {
         const logs = join(project,'.thin/sessions');
@@ -601,6 +645,8 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert.deepEqual(JSON.parse(await readFile(join(project,'.thin/settings.json'),'utf8')), {version:1,reasoning_effort:'high'});
     }
     if (kind === 'regular-two') assert.equal(requests,2, 'regular two-turn request count');
+    if (kind === 'keyboard-history') { assert.equal(requests,4); assert(stalled); }
+    if (kind === 'esc-cancel-tool') { assert.equal(requests,2); assert(!await exists(join(project,'esc-unwanted.txt'))); }
     if (kind === 'tool-icons') assert.equal(requests,2, 'tool icon request count');
     if (kind === 'file-stats') assert.equal(requests,2, 'file stats request count');
     if (kind === 'idle-peer') {
@@ -656,10 +702,12 @@ try {
   }
 
   // PTY 场景：通过 thin-app-pty 驱动交互式终端，仅使用 chat 协议。
-  for (const kind of ['unicode','regular-two','stream-markdown','architecture-table','tool-icons','file-stats','memory-summary','auto-tools','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
+  for (const kind of ['unicode','regular-two','keyboard-history','esc-cancel-tool','stream-markdown','stream-native-history','architecture-table','tool-icons','file-stats','memory-summary','auto-tools','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
   await reviewRegressions(app);
   await logRegressions(app,pty);
   await settingsRegressions({app,pty,execute,send});
+  await selectionRestoreRegressions({app,pty,execute});
+  await fullResumeRegressions({app,pty,execute});
   console.log('Application fixture suite passed; general PTY tests exercise chat, model selection also covers responses.');
   }
 
@@ -667,7 +715,7 @@ try {
 } catch (error) {
   // 中文：不要渲染捕获的终端或模型输出、响应头或请求体。
   // Do not render captured terminal/model output, headers, or request bodies.
-  const label = /^(?:log|selection|settings)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
+  const label = /^(?:log|selection|settings|resume)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
     ? `${error.fixtureCase}: ${error.fixtureCheck}` : 'offline fixture assertion failed (details withheld)';
   console.error(`FAIL application acceptance: ${label}`);
   process.exitCode = 1;

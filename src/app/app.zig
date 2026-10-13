@@ -124,6 +124,7 @@ pub const App = struct {
         defer a.free(snapshot);
         self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, snapshot, trusted);
         self.runtime.observer = self.journal.observer();
+        self.recordSelection();
         return self;
     }
 
@@ -180,7 +181,7 @@ pub const App = struct {
         self.runtime.config = &self.config.value;
         self.executor.config = &self.config.value;
         self.runtime.model = self.client.model();
-        self.journal.protocol = self.config.value.model.protocol;
+        self.recordSelection();
         self.allocator.destroy(replacement);
         cfg.release(&previous);
     }
@@ -197,6 +198,13 @@ pub const App = struct {
     pub fn setLogging(self: *App, enabled: bool) void {
         std.debug.assert(!self.runtime.busy.load(.acquire));
         self.journal.setEnabled(enabled);
+    }
+
+    /// Owner-only fixed-size publication; no allocation or disk wait after
+    /// successful selection publication, and no borrowed old config bytes.
+    pub fn recordSelection(self: *App) void {
+        self.journal.protocol = self.config.value.model.protocol;
+        self.journal.setSelection(@import("selection_store.zig").capture(self.config.value));
     }
 
     /// 按创建的逆序释放资源，最后销毁自身。

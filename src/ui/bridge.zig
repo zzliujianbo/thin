@@ -100,7 +100,7 @@ const Copy = struct {
         return switch (e) {
             .text => |s| .{ .text = self.text(s) },
             .reasoning => |s| .{ .reasoning = self.text(s) },
-            .tool_preview => |v| .{ .tool_preview = .{ .index = v.index, .arguments = self.text(v.arguments) } },
+            .tool_preview => |v| .{ .tool_preview = .{ .index = v.index, .arguments = self.text(v.arguments), .write_file = v.write_file, .argument_bytes = v.argument_bytes } },
             .permission => |v| .{ .permission = .{ .id = v.id, .tool_name = self.text(v.tool_name), .description = self.text(v.description) } },
             .tool_started => |v| blk: {
                 var c = v;

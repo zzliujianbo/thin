@@ -7,7 +7,7 @@ const theme = @import("theme.zig");
 const Allocator = std.mem.Allocator;
 pub const Error = Allocator.Error || error{ MarkdownRenderLimit, MarkdownCellOverflow };
 
-pub const Tone = enum { normal, heading, strong, code, inline_code, quote, link, link_url, rule, border, muted, table_header, user };
+pub const Tone = enum { normal, heading, strong, code, inline_code, quote, link, link_url, rule, border, muted, thinking, table_header, user };
 pub const Style = struct { tone: Tone = .normal, bold: bool = false, italic: bool = false, strike: bool = false, underline: bool = false };
 
 pub const Budget = struct {
@@ -112,6 +112,7 @@ pub const Writer = struct {
             .link_url, .rule => theme.md_dim,
             .border => "\x1b[39m",
             .muted => theme.muted,
+            .thinking => theme.thinking,
             .table_header => theme.table_header,
             .user => theme.user,
         });

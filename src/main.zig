@@ -89,7 +89,7 @@ fn run(init: std.process.Init) !u8 {
         return 0;
     }
     if (options.version) {
-        try output(init.io, .stdout(), "thin development build (Zig 0.17.0)\n");
+        try output(init.io, .stdout(), @import("app/version.zig").text ++ "\n");
         return 0;
     }
 
@@ -163,9 +163,8 @@ fn run(init: std.process.Init) !u8 {
     defer bridge.deinit();
 
     // 先建立可处于未配置状态的会话，再进入 TUI；/auth 保存后才发布可用 Runtime。
-    var session = try Session.init(init.gpa, init.io, init.environ_map, ".", bridge.host(), options.trusted);
+    var session = try Session.initWithOptions(init.gpa, init.io, init.environ_map, ".", bridge.host(), options.trusted, .{ .logging = options.logging, .restore_selection = options.restore_selection, .resume_session = options.resume_session });
     defer session.deinit();
-    session.setLogging(options.logging);
 
     var guard = try interrupt.Guard.install();
     defer guard.deinit();
@@ -177,5 +176,36 @@ fn run(init: std.process.Init) !u8 {
     };
     // 恢复终端属性后再提示一次，让退出后仍能看到留档失败信息。
     if (session.app) |app| reportLogFailure(init.io, app);
-    return code;
+    if (code == 0 and interrupt.signal() == 0) reportResume(init, &session);
+    return exitCodeAfterRecording(code, interrupt.signal());
+}
+
+fn exitCodeAfterRecording(code: u8, signal: u8) u8 {
+    // Persistence adds a post-TUI interval. Honor a signal during that interval
+    // without hiding an already failed (especially poisoned) exit.
+    return if (code == 0 and signal != 0) 128 + signal else code;
+}
+
+test "resume exit persistence honors late signals without masking prior failures" {
+    try std.testing.expectEqual(@as(u8, 0), exitCodeAfterRecording(0, 0));
+    try std.testing.expectEqual(@as(u8, 130), exitCodeAfterRecording(0, 2));
+    try std.testing.expectEqual(@as(u8, 143), exitCodeAfterRecording(0, 15));
+    try std.testing.expectEqual(@as(u8, 1), exitCodeAfterRecording(1, 15));
+}
+
+/// TUI has joined all producers and restored the terminal before this runs.
+fn reportResume(init: std.process.Init, session: *Session) void {
+    const saved = session.saveOnExit() catch |err| {
+        var buffer: [256]u8 = undefined;
+        const warning = std.fmt.bufPrint(&buffer, "thin: full conversation was NOT saved for resume: {s}. No resume command is available for this exit.\n", .{@errorName(err)}) catch return;
+        output(init.io, .stderr(), warning) catch {};
+        return;
+    };
+    if (!saved or interrupt.signal() != 0) return;
+    const command = @import("app/resume_command.zig").format(init.gpa, session.session_id) catch {
+        output(init.io, .stderr(), "thin: checkpoint saved, but a safe copyable resume command could not be produced.\n") catch {};
+        return;
+    };
+    defer init.gpa.free(command);
+    output(init.io, .stdout(), command) catch {};
 }

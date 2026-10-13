@@ -11,7 +11,8 @@ pub const Purpose = enum { normal, summary };
 pub const Role = enum { user, assistant, tool, context };
 
 /// Replay is valid only for this connection, model and selected protocol.
-/// It is never rendered or persisted. Strings are owned by the caller's arena.
+/// Never rendered or written to cropped diagnostic logs. Explicit authenticated
+/// full-session checkpoints preserve it exactly. Strings are caller-arena-owned.
 /// 回放续接数据的作用域：只有 connection、model、protocol 全部相同时才允许复用。
 pub const ReplayScope = struct {
     /// 提供方连接标识（如 base_url）。
@@ -200,7 +201,14 @@ pub const ModelEvent = union(enum) {
     text_delta: []const u8,
     reasoning_delta: []const u8,
     /// 第 index 个工具调用的参数增量。
-    tool_delta: struct { index: usize, arguments: []const u8 },
+    tool_delta: struct {
+        index: usize,
+        arguments: []const u8,
+        /// Presentation-only recognition of a complete streamed tool name.
+        /// This grants no execution or file-write authority.
+        write_file: bool = false,
+        argument_bytes: ?usize = null,
+    },
     usage: Usage,
 };
 

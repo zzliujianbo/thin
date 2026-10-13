@@ -282,6 +282,83 @@ fn smallConfiguration() cfg.Config {
     return config;
 }
 
+test "checkpoint runtime restores owned context without replaying tools or authorization" {
+    const a = std.testing.allocator;
+    var config = configuration();
+    var first: Fake = .{};
+    var original = try r.Runtime.init(a, std.testing.io, &config, first.model(), first.executor(), first.host(), "original system", true);
+    defer original.deinit();
+    var cancel: p.Cancellation = .{};
+    try std.testing.expectEqual(r.Status.success, (try original.run("first question", &cancel)).status);
+    try std.testing.expectEqual(@as(u32, 1), first.executions);
+    original.permission_id = 42;
+    const saved = try original.checkpoint();
+    const count = saved.messages.len;
+    const codec = @import("../core/checkpoint.zig");
+    const bytes = try codec.encode(a, saved);
+    defer a.free(bytes);
+    const parsed = try codec.decode(a, bytes);
+    defer parsed.deinit();
+    var second: Fake = .{ .stop_after = 0 };
+    var restored = try r.Runtime.init(a, std.testing.io, &config, second.model(), second.executor(), second.host(), "new unused system", false);
+    defer restored.deinit();
+    try restored.restoreCheckpoint(parsed.value);
+    try std.testing.expectEqualStrings(original.system, restored.system);
+    try std.testing.expect(restored.system.ptr != original.system.ptr);
+    try std.testing.expectEqualDeep(original.messages(), restored.messages());
+    try std.testing.expect(restored.messages().ptr != original.messages().ptr);
+    try std.testing.expect(!restored.trusted);
+    try std.testing.expectEqual(@as(u64, 42), restored.permission_id);
+    try std.testing.expectEqual(@as(u32, 0), second.normal_calls);
+    try std.testing.expectEqual(@as(u32, 0), second.executions);
+    try std.testing.expectEqual(@as(u32, 0), second.terminals);
+    try std.testing.expectEqual(r.Status.success, (try restored.run("explicit next question", &cancel)).status);
+    try std.testing.expectEqual(@as(u32, 1), second.normal_calls);
+    try std.testing.expectEqual(@as(u32, 0), second.executions);
+    try std.testing.expectEqual(count + 2, restored.messages().len);
+    try std.testing.expectError(error.RuntimeNotEmpty, restored.restoreCheckpoint(parsed.value));
+}
+
+fn checkpointImportAllocation(a: std.mem.Allocator) !void {
+    var fake: Fake = .{};
+    var config = configuration();
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "before", false);
+    defer runtime.deinit();
+    const initial = runtime.system;
+    const state: @import("../core/checkpoint.zig").State = .{
+        .system = "restored system",
+        .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "prior question" }} }},
+        .selector = .init(.chat),
+        .estimator = .{},
+        .last_context_tokens = 12,
+        .permission_id = 7,
+    };
+    runtime.restoreCheckpoint(state) catch |err| {
+        try std.testing.expect(runtime.system.ptr == initial.ptr);
+        try std.testing.expectEqual(@as(usize, 0), runtime.messages().len);
+        try std.testing.expectEqual(@as(u64, 0), runtime.permission_id);
+        return err;
+    };
+    try std.testing.expectEqualStrings("restored system", runtime.system);
+    try std.testing.expectEqualStrings("prior question", runtime.messages()[0].blocks[0].text);
+    try std.testing.expect(!runtime.trusted);
+}
+
+test "checkpoint runtime allocation failure is transactional and busy poison fail closed" {
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), checkpointImportAllocation, .{});
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+    var fake: Fake = .{};
+    var config = configuration();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "system", false);
+    defer runtime.deinit();
+    runtime.busy.store(true, .release);
+    try std.testing.expectError(error.Busy, runtime.checkpoint());
+    runtime.busy.store(false, .release);
+    runtime.poisoned = true;
+    try std.testing.expectError(error.UnsafeToContinue, runtime.checkpoint());
+}
+
 test "tool duration measures success failure and cancellation but not denial or prepare failure" {
     const Mode = enum { success, failure, canceled, denied, invalid };
     for ([_]Mode{ .success, .failure, .canceled, .denied, .invalid }) |mode| {
@@ -625,7 +702,7 @@ test "Runtime successful input owns bytes after caller mutation" {
     try std.testing.expectEqualStrings("Do the task", runtime.messages()[0].blocks[0].text);
 }
 
-test "Runtime rollback after committed compaction uses remapped history" {
+test "Runtime round pause after compaction retains the remapped explicit goal" {
     var fake = Fake{ .stop_after = 0 };
     var config = configuration();
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
@@ -639,12 +716,39 @@ test "Runtime rollback after committed compaction uses remapped history" {
     config.limits.max_rounds = 1;
     const terminal = try runtime.run("Do the task", &cancel);
     try std.testing.expectEqual(error.RoundLimit, terminal.detail.?);
+    try std.testing.expectEqual(r.Status.paused, terminal.status);
     try std.testing.expectEqual(@as(u32, 1), fake.compactions);
     try std.testing.expectEqual(@as(u32, 1), fake.normal_calls);
-    try std.testing.expectEqual(@as(usize, 2), runtime.messages().len);
+    try std.testing.expectEqual(@as(usize, 3), runtime.messages().len);
     try std.testing.expectEqual(p.Role.context, runtime.messages()[0].role);
     try std.testing.expectEqualStrings("done", runtime.messages()[1].blocks[0].text);
+    try std.testing.expectEqualStrings("Do the task", runtime.messages()[2].blocks[0].text);
     try std.testing.expectEqual(r.Status.success, (try runtime.run("short", &cancel)).status);
+}
+
+test "Runtime round budget pauses and explicit continuation never replays completed tools" {
+    var fake = Fake{ .stop_after = 1 };
+    var config = configuration();
+    config.limits.max_rounds = 1;
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", true);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    var cancel = p.Cancellation{};
+    var goal = "Do the task".*;
+    const paused = try runtime.run(&goal, &cancel);
+    try std.testing.expectEqual(r.Status.paused, paused.status);
+    try std.testing.expectEqual(error.RoundLimit, paused.detail.?);
+    try std.testing.expect(paused.model_failure == null);
+    try std.testing.expectEqual(@as(u32, 1), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 1), fake.executions);
+    try std.testing.expectEqual(@as(usize, 3), runtime.messages().len);
+    try std.testing.expectEqualStrings(runtime.messages()[1].blocks[0].tool_call.id, runtime.messages()[2].blocks[0].tool_result.call_id);
+    @memset(&goal, 'x');
+    try std.testing.expectEqualStrings("Do the task", runtime.messages()[0].blocks[0].text);
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("continue", &cancel)).status);
+    try std.testing.expectEqual(@as(u32, 2), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 1), fake.executions);
+    try std.testing.expectEqual(@as(u32, 2), fake.terminals);
 }
 
 test "Runtime rejects historical tool IDs before execution and history remains encodable" {
@@ -814,7 +918,8 @@ test "summary tool calls are never executed and failure preserves history" {
     fake.current_runtime = &runtime;
     var cancel = p.Cancellation{};
     const terminal = try runtime.run("Do the task", &cancel);
-    try std.testing.expectEqual(r.Status.failed, terminal.status);
+    try std.testing.expectEqual(r.Status.paused, terminal.status);
+    try std.testing.expectEqual(error.RoundLimit, terminal.detail.?);
     try std.testing.expect(fake.summary_calls > 0);
     try std.testing.expect(fake.failed_summary_preserved);
     try std.testing.expectEqual(@as(u32, 0), fake.compactions);
