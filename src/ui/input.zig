@@ -24,6 +24,8 @@ pub const Event = union(enum) {
     down,
     page_up,
     page_down,
+    /// Kept separate from text so completion cannot mistake a paste for Tab.
+    tab,
     toggle_reasoning,
     cycle_effort,
     escape,
@@ -238,7 +240,7 @@ pub const Parser = struct {
             21 => return sink.emit(.clear),
             11 => return sink.emit(.kill_end),
             18 => return sink.emit(.toggle_reasoning),
-            9 => return sink.emit(.{ .text = .{ .value = if (self.secret) "\t" else "    ", .pasted = false } }),
+            9 => return sink.emit(if (self.secret) .{ .text = .{ .value = "\t", .pasted = false } } else .tab),
             // 中文：未映射的其他控制字符直接忽略。
             else => if (b < 0x20) return self.invalid(sink),
         }

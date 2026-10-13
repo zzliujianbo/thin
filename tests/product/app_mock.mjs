@@ -477,7 +477,11 @@ async function scenario(name, protocol, kind, isPty = false) {
     }
     if (['exit-no-submit','exit-unconfigured','exit-secret','exit-batched'].includes(kind)) {
       assert.equal(requests,0, 'exit identity must not send a request');
-      assert(!await exists(join(project,'.thin')), 'identity/no-submission created project storage');
+      // The TUI seeds the project default thinking level on startup, so the
+      // only allowed project artifact is the private settings file. Identity
+      // submission still must not create archives, history, or other storage.
+      const projectThin = join(project,'.thin');
+      if (await exists(projectThin)) assert.deepEqual(await readdir(projectThin),['settings.json'], 'identity/no-submission created unexpected project storage');
       if (['exit-unconfigured','exit-secret'].includes(kind)) {
         const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
         assert.equal(disk.provider.api_key,null, 'Ctrl+D secret exit must not save input');

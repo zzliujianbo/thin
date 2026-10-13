@@ -17,6 +17,10 @@ pub const Journal = struct {
     allocator: std.mem.Allocator,
     root: *fs.Root,
     key: []u8,
+    /// Retain previous/other configured keys for this session's redaction.
+    /// At most 16 additional 16-KiB keys; owner changes these only while joined.
+    known_keys: [16][]u8 = undefined,
+    known_key_count: usize = 0,
     store: logs.Store,
     protocol: p.Protocol = .auto,
     enabled: bool = true,
@@ -195,6 +199,36 @@ pub const Journal = struct {
         return .{ .allocator = a, .root = root, .key = try a.dupe(u8, key), .store = logs.Store.init(a, root, .{}) };
     }
 
+    /// Owner-only, with no active observer producer. Preparation may extend
+    /// redaction before a save, but never forgets an earlier credential.
+    pub fn rememberKey(self: *Journal, key: []const u8) !void {
+        if (key.len == 0 or key.len > 16384) return error.InvalidApiKey;
+        for (key) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidApiKey;
+        if (self.isKey(key)) return;
+        if (self.known_key_count == self.known_keys.len) return error.TooManySessionCredentials;
+        const owned = try self.allocator.dupe(u8, key);
+        self.known_keys[self.known_key_count] = owned;
+        self.known_key_count += 1;
+    }
+
+    fn isKey(self: *const Journal, value: []const u8) bool {
+        if (self.key.len != 0 and std.mem.eql(u8, self.key, value)) return true;
+        for (self.known_keys[0..self.known_key_count]) |key| if (std.mem.eql(u8, key, value)) return true;
+        return false;
+    }
+    const SecretMatch = struct { at: usize, len: usize };
+    fn nextSecret(self: *const Journal, value: []const u8) ?SecretMatch {
+        var found: ?SecretMatch = null;
+        for (0..self.known_key_count + 1) |index| {
+            const key = if (index == 0) self.key else self.known_keys[index - 1];
+            if (key.len == 0) continue;
+            if (std.mem.find(u8, value, key)) |at| {
+                if (found == null or at < found.?.at or (at == found.?.at and key.len > found.?.len)) found = .{ .at = at, .len = key.len };
+            }
+        }
+        return found;
+    }
+
     pub fn deinit(self: *Journal) void {
         self.finish();
         if (!self.done) self.store.deinit(); // No writer ever owned the store.
@@ -203,6 +237,11 @@ pub const Journal = struct {
         std.crypto.secureZero(u8, self.key);
         self.allocator.free(self.key);
         self.key = &.{};
+        for (self.known_keys[0..self.known_key_count]) |key| {
+            std.crypto.secureZero(u8, key);
+            self.allocator.free(key);
+        }
+        self.known_key_count = 0;
     }
 
     /// Lifecycle owner only, before any producer/writer starts. No storage I/O.
@@ -345,16 +384,16 @@ pub const Journal = struct {
     /// 超大/非法 UTF-8 整体省略，避免截断横跨边界的 key 或多字节字符。
     fn safe(self: *Journal, a: std.mem.Allocator, input: []const u8) ![]const u8 {
         if (input.len > text_limit or !std.unicode.utf8ValidateSlice(input)) return omitted;
-        if (self.key.len == 0 or std.mem.indexOf(u8, input, self.key) == null) return input;
+        if (self.nextSecret(input) == null) return input;
         const replacement = "[redacted]";
         var out: std.Io.Writer.Allocating = .init(a);
         defer out.deinit();
         var rest = input;
-        while (std.mem.indexOf(u8, rest, self.key)) |at| {
-            if (out.written().len + at + replacement.len > text_limit) return omitted;
-            try out.writer.writeAll(rest[0..at]);
+        while (self.nextSecret(rest)) |match| {
+            if (out.written().len + match.at + replacement.len > text_limit) return omitted;
+            try out.writer.writeAll(rest[0..match.at]);
             try out.writer.writeAll(replacement);
-            rest = rest[at + self.key.len ..];
+            rest = rest[match.at + match.len ..];
         }
         if (out.written().len + rest.len > text_limit) return omitted;
         try out.writer.writeAll(rest);
@@ -404,7 +443,7 @@ pub const Journal = struct {
                 result = .{ .string = clean };
             },
             .number_string => |s| {
-                if (self.key.len != 0 and std.mem.indexOf(u8, s, self.key) != null) {
+                if (self.nextSecret(s) != null) {
                     result = .{ .string = "[redacted]" };
                     changed.* = true;
                 }
@@ -444,7 +483,7 @@ pub const Journal = struct {
     }
 
     fn jsonText(self: *Journal, a: std.mem.Allocator, input: []const u8) !Text {
-        if (input.len > text_limit or std.mem.eql(u8, input, self.key)) return self.text(a, input);
+        if (input.len > text_limit or self.isKey(input)) return self.text(a, input);
         const json = try self.jsonValue(a, input);
         if (!json.parsed) return .{ .text = json.value.string, .source_bytes = input.len, .truncated = json.dropped, .omitted = json.dropped };
         if (!json.changed) return .{ .text = input, .source_bytes = input.len, .truncated = json.dropped, .omitted = json.dropped };
@@ -484,6 +523,34 @@ fn testRoot(dir: std.Io.Dir) !fs.Root {
     var buffer: [4096]u8 = undefined;
     const n = try dir.realPath(std.testing.io, &buffer);
     return fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
+}
+
+test "journal retains multiple keys and redacts overlapping and encoded credentials" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(a, &root, "fake-key");
+    defer journal.deinit();
+    try journal.rememberKey("fake-key-longer");
+    try journal.rememberKey("other-key");
+    try journal.rememberKey("other-key");
+    try std.testing.expectEqual(@as(usize, 2), journal.known_key_count);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    try std.testing.expectEqualStrings("[redacted] [redacted] [redacted]", try journal.safe(temp, "fake-key-longer other-key fake-key"));
+    const encoded = try journal.jsonText(temp, "{\"key\":\"other\\u002dkey\"}");
+    try std.testing.expectEqualStrings("{\"key\":\"[redacted]\"}", encoded.text);
+    try std.testing.expectError(error.InvalidApiKey, journal.rememberKey("bad\nkey"));
+    for (2..journal.known_keys.len) |index| {
+        var buffer: [40]u8 = undefined;
+        try journal.rememberKey(try std.fmt.bufPrint(&buffer, "fake-rotation-{d}", .{index}));
+    }
+    try std.testing.expectError(error.TooManySessionCredentials, journal.rememberKey("fake-excess"));
+    try journal.rememberKey("other-key"); // Dedup remains allowed at the bound.
+    try std.testing.expectEqualStrings("[redacted]", try journal.safe(temp, "other-key"));
 }
 
 test "journal recursively redacts encoded JSON content without reformatting untouched text" {

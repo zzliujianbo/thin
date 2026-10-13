@@ -19,6 +19,7 @@ pub const Picker = struct {
     selected: usize = 0,
     generation: u64 = 1,
     pasted: bool = false,
+    allow_custom: bool = true,
 
     pub fn init(a: Allocator) Picker {
         return .{ .query = .{ .allocator = a } };
@@ -58,7 +59,7 @@ pub const Picker = struct {
             if (std.mem.eql(u8, profile.name, current) or !matches(profile.name, query)) continue;
             try result.append(a, .{ .name = profile.name, .context_tokens = profile.context_tokens });
         }
-        if (query.len != 0 and !exact and manualName(query)) try result.append(a, .{ .name = query, .context_tokens = limit, .inherited = true });
+        if (self.allow_custom and query.len != 0 and !exact and manualName(query)) try result.append(a, .{ .name = query, .context_tokens = limit, .inherited = true });
         return result.toOwnedSlice(a);
     }
     pub fn rows(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, columns: usize, max_rows: usize) !Rows {
@@ -71,7 +72,7 @@ pub const Picker = struct {
         }
         if (max_rows == 0) return .{ .lines = try lines.toOwnedSlice(a), .can_confirm = false };
         {
-            const header = try presentation.singleLine(a, "Select model (configured endpoint)", columns);
+            const header = try presentation.singleLine(a, if (self.allow_custom) "Select model (configured endpoint)" else "Select model (saved providers)", columns);
             errdefer a.free(header);
             try lines.append(a, header);
         }
@@ -130,6 +131,17 @@ test "local picker keeps current first searches metadata and labels inherited na
     try std.testing.expectEqual(@as(usize, 2), picker.selected);
     picker.move(true, 3);
     try std.testing.expectEqual(@as(usize, 0), picker.selected);
+}
+
+test "named provider picker does not guess protocols for unknown custom IDs" {
+    const a = std.testing.allocator;
+    var picker = Picker.init(a);
+    defer picker.deinit();
+    picker.allow_custom = false;
+    try std.testing.expect(try picker.insert("claude-unknown", false));
+    const found = try picker.choices(a, "opencode-go/minimax-m2.7", 204800, &.{});
+    defer a.free(found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
 test "picker bytes rows and paste confirmation are bounded" {

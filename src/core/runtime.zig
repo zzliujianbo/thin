@@ -389,18 +389,24 @@ pub const Runtime = struct {
         self.allocator.free(self.system);
     }
 
-    /// Owner must have joined the worker. Publication belongs to Session;
-    /// every possible error precedes replay/selector/calibration mutation.
-    pub fn prepareSelection(self: *Runtime, next: cfg.Model) !void {
+    pub const SelectionPlan = struct {
+        selector: llm.Selector,
+        discard_replay: bool,
+        invalidate_context: bool,
+    };
+
+    /// Pure owner-side preparation. Connection replacement must be explicit;
+    /// native identities never cross provider/account boundaries.
+    pub fn planSelection(self: *Runtime, candidate: cfg.Config, connection_changed: bool) !SelectionPlan {
         if (self.busy.load(.acquire)) return error.Busy;
         if (self.poisoned) return error.UnsafeToContinue;
-        var candidate = self.config.*;
-        candidate.model = next;
         try cfg.validate(candidate);
+        const next = candidate.model;
+        if (connection_changed and next.protocol == .auto and self.history.items.len != 0) return error.ExplicitProtocolRequired;
         const protocol_changed = next.protocol != self.config.model.protocol;
         const name_changed = !std.mem.eql(u8, next.name, self.config.model.name);
-        var selector = self.selector;
-        if (protocol_changed) {
+        var selector = if (connection_changed) initialSelector(candidate) else self.selector;
+        if (protocol_changed and !connection_changed) {
             selector = llm.Selector.init(next.protocol);
             if (next.protocol == .auto and self.history.items.len != 0) {
                 selector.selected = self.selector.effective();
@@ -415,13 +421,28 @@ pub const Runtime = struct {
             selector.selected = .chat;
             selector.initial_attempted = true;
         }
-        const scope_changed = name_changed or protocol_changed or selector.effective() != self.selector.effective();
-        if (name_changed or protocol_changed) {
+        return .{
+            .selector = selector,
+            .discard_replay = connection_changed or name_changed or protocol_changed,
+            .invalidate_context = connection_changed or name_changed or protocol_changed or selector.effective() != self.selector.effective(),
+        };
+    }
+
+    /// Infallible publication after all preparation/persistence has succeeded.
+    pub fn applySelection(self: *Runtime, plan: SelectionPlan) void {
+        std.debug.assert(!self.busy.load(.acquire));
+        if (plan.discard_replay) {
             self.discardNativeReplay();
             self.estimator = .{};
         }
-        if (scope_changed) self.last_context_tokens = if (self.history.items.len == 0) 0 else null;
-        self.selector = selector;
+        if (plan.invalidate_context) self.last_context_tokens = if (self.history.items.len == 0) 0 else null;
+        self.selector = plan.selector;
+    }
+
+    pub fn prepareSelection(self: *Runtime, next: cfg.Model) !void {
+        var candidate = self.config.*;
+        candidate.model = next;
+        self.applySelection(try self.planSelection(candidate, false));
     }
 
     /// Canonical blocks are owned by this arena (cloneMessage/appendResult).

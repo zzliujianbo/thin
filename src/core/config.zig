@@ -4,6 +4,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const thinking = @import("thinking.zig");
+pub const providers = @import("providers.zig");
 
 /// 单一配置文件名；路径构造、交互存储和文件工具保护共用，避免名称漂移。
 pub const file_name = "config.json";
@@ -18,6 +19,9 @@ pub const Provider = struct {
     api_key: ?[]const u8 = null,
     /// Chat 兼容选项：DeepSeek 等服务使用 max_tokens；默认仍用 max_completion_tokens。
     chat_max_tokens: bool = false,
+    /// Explicit service identity; custom endpoints may opt into its transport
+    /// conventions, but saved keys are only resolved for exact official URLs.
+    kind: ?providers.Id = null,
 };
 
 /// 模型配置。
@@ -87,6 +91,8 @@ pub const Config = struct {
     model: Model,
     /// Same-provider profiles; no discovery or credential overrides.
     models: []const Model = &.{},
+    /// Private, independently saved credentials. Never session metadata.
+    credentials: providers.Credentials = .{},
     /// 未配置时使用 Limits 中的默认值。
     limits: Limits = .{},
 };
@@ -97,7 +103,25 @@ pub const max_config_bytes = 64 * 1024;
 /// Every string is owned by the returned arena, never by `bytes`.
 /// 中文：解析后的字符串复制到 allocator 中，因此调用方可以擦除 bytes；结果需调用 release 释放。
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Config) {
-    if (bytes.len > max_config_bytes) return error.ConfigTooLarge;
+    return parseBounded(allocator, bytes, max_config_bytes);
+}
+
+/// Clone an already bounded, validated application configuration. Re-encoding
+/// default fields may exceed the input-file limit; it does not relax disk reads.
+pub fn clone(allocator: std.mem.Allocator, config: Config) !std.json.Parsed(Config) {
+    if (config.provider.base_url.len > max_config_bytes) return error.ConfigTooLarge;
+    try validate(config);
+    var wiping = WipingAllocator{ .backing = allocator };
+    const bytes = try std.json.Stringify.valueAlloc(wiping.allocator(), config, .{ .emit_null_optional_fields = false });
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    }
+    return parseBounded(allocator, bytes, 512 * 1024);
+}
+
+fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize) !std.json.Parsed(Config) {
+    if (bytes.len > limit) return error.ConfigTooLarge;
 
     // 包装底层分配器：即使 JSON 在读完 key 后才失败，也擦除所有中间分配。
     var wiping = WipingAllocator{ .backing = allocator };
@@ -223,6 +247,10 @@ fn validateUrl(url: []const u8) !void {
 pub fn validate(config: Config) !void {
     try validateUrl(config.provider.base_url);
     try validateKeySource(config.provider);
+    if (config.provider.kind) |declared| if (providers.Id.fromUrl(config.provider.base_url)) |actual| {
+        if (declared != actual) return error.ProviderEndpointMismatch;
+    };
+    try config.credentials.validate();
 
     const l = config.limits;
     // 编译期遍历 Limits 的所有字段，任何字段为 0 都视为非法。
@@ -338,11 +366,50 @@ pub fn defaultPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
 pub fn resolveApiKey(allocator: std.mem.Allocator, config: Config, environ: *const std.process.Environ.Map) ![]u8 {
     try validateKeySource(config.provider);
     if (config.provider.api_key) |key| return allocator.dupe(u8, key);
-    if (config.provider.api_key_env.len == 0) return error.ApiKeyNotFound;
+    if (config.provider.api_key_env.len == 0) {
+        // Do not infer key authority from a declared kind or a similar hostname.
+        // A proxy must supply an explicit key/env source, not borrow saved keys.
+        const id = providers.Id.fromUrl(config.provider.base_url) orelse return error.ApiKeyNotFound;
+        try config.credentials.validate();
+        const saved = config.credentials.get(id) orelse return error.ApiKeyNotFound;
+        return allocator.dupe(u8, saved);
+    }
     const key = environ.get(config.provider.api_key_env) orelse return error.ApiKeyNotFound;
     // 拒绝空白或含控制字符的 key，防止 header 注入。
     if (!validText(key, 16384)) return error.InvalidApiKey;
     return allocator.dupe(u8, key);
+}
+
+test "named credentials are owned separate and never inferred for another endpoint" {
+    const a = std.testing.allocator;
+    var parsed = try parse(a,
+        \\{"provider":{"base_url":"https://opencode.ai/zen/go/v1"},"model":{"name":"minimax-m2.7","context_tokens":204800,"protocol":"chat"},"credentials":{"deepseek":"fake-deepseek","opencode_zen":"fake-zen","opencode_go":"fake-go"}}
+    );
+    defer release(&parsed);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    for (providers.Id.all) |id| {
+        parsed.value.provider.base_url = id.baseUrl();
+        const key = try resolveApiKey(a, parsed.value, &env);
+        defer {
+            std.crypto.secureZero(u8, key);
+            a.free(key);
+        }
+        try std.testing.expectEqualStrings(parsed.value.credentials.get(id).?, key);
+        try std.testing.expect(key.ptr != parsed.value.credentials.get(id).?.ptr);
+    }
+    parsed.value.provider.base_url = "https://example.invalid/v1";
+    parsed.value.provider.kind = .opencode_go;
+    try std.testing.expectError(error.ApiKeyNotFound, resolveApiKey(a, parsed.value, &env));
+    parsed.value.provider.base_url = providers.Id.opencode_go.baseUrl();
+    parsed.value.provider.api_key_env = "EXPLICIT_MISSING_KEY";
+    try std.testing.expectError(error.ApiKeyNotFound, resolveApiKey(a, parsed.value, &env));
+    var invalid = parsed.value;
+    invalid.provider.kind = .opencode_zen;
+    try std.testing.expectError(error.ProviderEndpointMismatch, validate(invalid));
+    invalid.provider.kind = .opencode_go;
+    invalid.credentials.opencode_zen = "bad\rkey";
+    try std.testing.expectError(error.InvalidApiKey, validate(invalid));
 }
 
 /// 测试用的最小合法配置 JSON。

@@ -111,8 +111,9 @@ pub const App = struct {
         errdefer self.root.deinit();
         self.memory = mem.Store.init(&self.root, self.config.value.limits);
         self.journal = try Journal.init(a, &self.root, key);
-        self.journal.protocol = self.config.value.model.protocol;
         errdefer self.journal.deinit();
+        for (cfg.providers.Id.all) |id| if (self.config.value.credentials.get(id)) |saved| try self.journal.rememberKey(saved);
+        self.journal.protocol = self.config.value.model.protocol;
         self.environment = try tools.commandEnvironment(a, environ, self.config.value.provider.api_key_env);
         errdefer self.environment.deinit();
         self.executor = .{ .root = &self.root, .memory = &self.memory, .config = &self.config.value, .environment = &self.environment, .auth_path = self.auth_path };
@@ -126,11 +127,70 @@ pub const App = struct {
         return self;
     }
 
+    /// Heap-placed until publication: the unused client borrows this config.
+    /// No requests may use it before installConnection rebinds App's pointers.
+    pub const ConnectionReplacement = struct {
+        owner: *App,
+        config: std.json.Parsed(cfg.Config),
+        client: http.Client,
+        plan: r.Runtime.SelectionPlan,
+
+        pub fn deinit(self: *ConnectionReplacement) void {
+            const a = self.owner.allocator;
+            self.client.deinit();
+            cfg.release(&self.config);
+            a.destroy(self);
+        }
+    };
+
+    /// Consumes parsed on every path. The current App and canonical history are
+    /// unchanged on failure; extending known-key redaction is fail-closed.
+    pub fn prepareConnection(self: *App, parsed: std.json.Parsed(cfg.Config), environ: *const std.process.Environ.Map) !*ConnectionReplacement {
+        var owned = parsed;
+        errdefer cfg.release(&owned);
+        const plan = try self.runtime.planSelection(owned.value, true);
+        if (!std.meta.eql(owned.value.limits, self.config.value.limits)) return error.ConnectionLimitsChanged;
+        const key = try cfg.resolveApiKey(self.allocator, owned.value, environ);
+        defer {
+            std.crypto.secureZero(u8, key);
+            self.allocator.free(key);
+        }
+        try self.journal.rememberKey(key);
+        for (cfg.providers.Id.all) |id| if (owned.value.credentials.get(id)) |saved| try self.journal.rememberKey(saved);
+        const replacement = try self.allocator.create(ConnectionReplacement);
+        errdefer self.allocator.destroy(replacement);
+        replacement.owner = self;
+        replacement.config = owned;
+        replacement.plan = plan;
+        replacement.client = try http.Client.init(self.allocator, self.root.io, &replacement.config.value, key);
+        return replacement;
+    }
+
+    /// Owner has joined/drained the worker. There are no allocations, requests,
+    /// storage writes or fallible operations after this publication boundary.
+    pub fn installConnection(self: *App, replacement: *ConnectionReplacement) void {
+        std.debug.assert(replacement.owner == self);
+        self.runtime.applySelection(replacement.plan);
+        var previous = self.config;
+        // Never relocate a used pool: destroy it in its original App slot.
+        self.client.deinit();
+        self.config = replacement.config;
+        self.client = replacement.client;
+        self.client.config = &self.config.value;
+        self.runtime.config = &self.config.value;
+        self.executor.config = &self.config.value;
+        self.runtime.model = self.client.model();
+        self.journal.protocol = self.config.value.model.protocol;
+        self.allocator.destroy(replacement);
+        cfg.release(&previous);
+    }
+
     /// Interactive owner pins the immutable ID before the first submission.
     /// Headless callers retain lazy ID generation and need not call this.
     pub fn pinSessionID(self: *App, id: [32]u8) !void {
         if (self.runtime.busy.load(.acquire)) return error.Busy;
         try self.journal.pinSessionID(id);
+        self.client.session_id = id;
     }
 
     /// 只在首次提交前设置；关闭不会读取或删除已有日志。

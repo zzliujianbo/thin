@@ -182,6 +182,17 @@ const Driver = struct {
         return result;
     }
 
+    /// The selected provider (or local fixture endpoint) must be visible before
+    /// Enter opens masked input. Mode changes intentionally drop batched bytes.
+    fn openAuth(self: *Driver) !void {
+        var start = self.used;
+        try self.send("/auth\r");
+        try self.waitFrame(start, "Configure provider");
+        start = self.used;
+        try self.send("\r");
+        try self.waitFrame(start, "API key>");
+    }
+
     /// 向 master 写入 bytes，最长 2 秒；写缓冲满（写入返回 0）时先 drain，避免与应用互相阻塞。
     fn send(self: *Driver, bytes: []const u8) !void {
         var pos: usize = 0;
@@ -414,9 +425,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, mode, "exit-no-submit") or std.mem.eql(u8, mode, "exit-unconfigured") or std.mem.eql(u8, mode, "exit-batched")) {
         try d.quiet(100);
     } else if (std.mem.eql(u8, mode, "exit-secret")) {
-        const start = d.used;
-        try d.send("/auth\r");
-        try d.waitFrame(start, "API key");
+        try d.openAuth();
         try d.send("fixture-secret-never-log");
         try d.quiet(100);
     } else if (std.mem.eql(u8, mode, "exit-no-log")) {
@@ -433,8 +442,7 @@ pub fn main(init: std.process.Init) !void {
         // 待激活配置指向本地 fixture。/auth 使用独立的掩码输入，取消不能保存或污染聊天输入。
         try d.waitText(0, "/auth");
         var start = d.used;
-        try d.send("/auth\r");
-        try d.waitText(start, "API key");
+        try d.openAuth();
         try d.quiet(150);
         start = d.used;
         try d.send("\x1b[200~fixture-secret-never-log\x1b[201~");
@@ -451,8 +459,7 @@ pub fn main(init: std.process.Init) !void {
 
         // 再次打开，粘贴本身不能保存；只有显式 Enter 才能提交，并在同一进程激活配置。
         start = d.used;
-        try d.send("/auth\r");
-        try d.waitText(start, "API key");
+        try d.openAuth();
         try d.quiet(150);
         start = d.used;
         try d.send("\x1b[200~fixture-secret-never-log\x1b[201~");
@@ -740,8 +747,7 @@ pub fn main(init: std.process.Init) !void {
             // Pending configuration still acknowledges its complete frame.
             try d.waitFrame(start, "> ");
             start = d.used;
-            try d.send("/auth\r");
-            try d.waitFrame(start, "API key");
+            try d.openAuth();
             start = d.used;
             try d.send("fixture-secret-never-log\r");
             try d.waitText(start, "Saved locally; send a message to connect");
@@ -793,7 +799,17 @@ pub fn main(init: std.process.Init) !void {
         try d.waitText(start, "selection-answer-one");
         try d.waitIdle(start);
         start = d.used;
-        try d.send("/model\r");
+        try d.send("/");
+        try d.waitFrame(start, "Commands");
+        const commands = try d.screen();
+        try check(commands.visible("/model") and commands.visible("/auth"));
+        start = d.used;
+        try d.send("\t");
+        try d.waitFrame(start, "/model");
+        const completed = try d.screen();
+        try check(!completed.visible("Commands") and !completed.visible("Search> "));
+        start = d.used;
+        try d.send("\r");
         try d.waitFrame(start, "Search> ");
         start = d.used;
         try d.send("\x1b[B");

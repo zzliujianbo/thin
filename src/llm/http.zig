@@ -26,18 +26,28 @@ pub const Client = struct {
     /// Guards request ownership and the timestamp, not merely pool traversal.
     request_mutex: Io.Mutex = .init,
     last_request_finish: ?Io.Timestamp = null,
+    /// OpenCode routing identity, stable across requests. The application can
+    /// replace the local headless fallback with its immutable session ID.
+    session_id: ?[32]u8 = null,
 
     /// 创建客户端并校验密钥。密钥需非空、长度不超过 16KB，且不含控制字符（防止 HTTP 头注入）。
     pub fn init(allocator: std.mem.Allocator, io: Io, config: *const cfg.Config, key: []const u8) !Client {
         // 控制字符会破坏 HTTP 头格式，因此在这里拒绝。
         if (key.len == 0 or key.len > 16384) return error.InvalidApiKey;
         for (key) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidApiKey;
+        const kind = config.provider.kind orelse cfg.providers.Id.fromUrl(config.provider.base_url);
+        const session_id: ?[32]u8 = if (kind != null and kind.?.usesSessionHeader()) blk: {
+            var random: [16]u8 = undefined;
+            try io.randomSecure(&random);
+            break :blk std.fmt.bytesToHex(random, .lower);
+        } else null;
         return .{
             .allocator = allocator,
             .io = io,
             .config = config,
             .authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{key}),
             .http = .{ .allocator = allocator, .io = io },
+            .session_id = session_id,
         };
     }
 
@@ -47,6 +57,18 @@ pub const Client = struct {
         // 先清零再释放，减少密钥在堆内存中残留的时间。
         std.crypto.secureZero(u8, self.authorization);
         self.allocator.free(self.authorization);
+    }
+
+    fn requestHeaders(self: *Client, buffer: *[2]std.http.Header) ![]const std.http.Header {
+        buffer[0] = .{ .name = "accept", .value = "text/event-stream" };
+        const kind = self.config.provider.kind orelse cfg.providers.Id.fromUrl(self.config.provider.base_url);
+        if (kind != null and kind.?.usesSessionHeader()) {
+            const id = if (self.session_id) |*id| id else return error.MissingSessionIdentity;
+            for (id) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidSessionIdentity;
+            buffer[1] = .{ .name = "x-opencode-session", .value = id };
+            return buffer;
+        }
+        return buffer[0..1];
     }
 
     /// 返回通用的 p.Model 接口，上层通过 call_fn 调用而不依赖具体实现。
@@ -171,6 +193,8 @@ pub const Client = struct {
         try pool.prune(&self.http, self.last_request_finish, Io.Clock.boot.now(self.io));
 
         // 禁止自动跟随重定向（否则 Authorization 头可能被发送到其他主机）；要求不压缩，便于逐块解析 SSE。
+        var header_buffer: [2]std.http.Header = undefined;
+        const headers = try self.requestHeaders(&header_buffer);
         var request = try self.http.request(.POST, try std.Uri.parse(address), .{
             .redirect_behavior = .unhandled,
             .headers = .{
@@ -178,7 +202,7 @@ pub const Client = struct {
                 .content_type = .{ .override = "application/json" },
                 .accept_encoding = .{ .override = "identity" },
             },
-            .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+            .extra_headers = headers,
         });
         defer {
             request.deinit(); // Release/destroy socket before recording idle time.
@@ -303,6 +327,32 @@ const Stream = union(enum) {
 /// 构造失败结果。message 必须是静态字符串或不含上游敏感内容的文本，避免泄露 API 返回的原始信息。
 fn failure(kind: p.FailureKind, message: []const u8, status: ?u16, observed: bool) p.Outcome {
     return .{ .failure = .{ .kind = kind, .message = message, .http_status = status, .observed_content = observed } };
+}
+
+test "OpenCode routing headers are stable explicit and absent on other services" {
+    for (cfg.providers.Id.all) |id| {
+        const config: cfg.Config = .{ .provider = .{ .base_url = id.baseUrl(), .kind = id }, .model = .{ .name = "fixture", .context_tokens = 32768 } };
+        var client = try Client.init(std.testing.allocator, std.testing.io, &config, "fake-key");
+        defer client.deinit();
+        var headers: [2]std.http.Header = undefined;
+        const first = try client.requestHeaders(&headers);
+        try std.testing.expectEqual(@as(usize, if (id.usesSessionHeader()) 2 else 1), first.len);
+        if (id.usesSessionHeader()) {
+            const generated = client.session_id.?;
+            try std.testing.expectEqualStrings("x-opencode-session", first[1].name);
+            try std.testing.expectEqualStrings(&generated, first[1].value);
+            try std.testing.expectEqualStrings(&generated, (try client.requestHeaders(&headers))[1].value);
+        }
+        client.session_id = @splat('a');
+        const pinned = try client.requestHeaders(&headers);
+        if (id.usesSessionHeader()) {
+            try std.testing.expectEqualStrings(&@as([32]u8, @splat('a')), pinned[1].value);
+            client.session_id = @splat('\n');
+            try std.testing.expectError(error.InvalidSessionIdentity, client.requestHeaders(&headers));
+            client.session_id = null;
+            try std.testing.expectError(error.MissingSessionIdentity, client.requestHeaders(&headers));
+        } else try std.testing.expectEqual(@as(usize, 1), pinned.len);
+    }
 }
 
 /// 把非 200 的响应体转换为失败结果，同时尽量保留错误响应中携带的 usage 与原始 JSON。

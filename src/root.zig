@@ -60,6 +60,8 @@ test {
 
     _ = @import("app/cli.zig");
     _ = @import("app/auth_store.zig");
+    _ = @import("app/provider_catalog.zig");
+    _ = @import("core/providers.zig");
     _ = @import("app/log_store.zig");
     _ = @import("app/journal.zig");
     _ = @import("app/session.zig");
@@ -72,6 +74,8 @@ test {
     _ = @import("ui/tail_frame.zig");
     _ = @import("tests/markdown_colors_test.zig");
     _ = @import("ui/bridge.zig");
+    _ = @import("ui/command_menu.zig");
+    _ = @import("ui/provider_picker.zig");
     _ = @import("tests/ui_bridge_test_root.zig");
     _ = @import("tests/regular_screen.zig");
     _ = @import("ui/tui.zig");
