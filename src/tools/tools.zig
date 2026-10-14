@@ -1,5 +1,6 @@
 //! ThinAgent 内置工具层：定义工具 schema、解析并校验模型参数、执行已授权的动作。
 //! 参数解析发生在授权之前；文件、命令与 memory 的真实副作用只在 execute 中产生。
+//! bash 在 prepare 里做危险命令分类。命中的命令带 explicit_denial，Runtime 即使 trusted 也会询问。
 
 const std = @import("std");
 const p = @import("../core/protocol.zig");
@@ -10,6 +11,7 @@ const mem = @import("memory.zig");
 const process = @import("../platform/process.zig");
 const j = @import("../util/json.zig");
 const runtime = @import("../core/runtime.zig");
+const command_risk = @import("command_risk.zig");
 
 /// 暴露给模型的工具 schema 列表；顺序是对外契约（测试依赖 read_file 在 0、memory 在 3）。
 pub const schemas = [_]p.ToolSchema{
@@ -29,7 +31,7 @@ pub const schemas = [_]p.ToolSchema{
     },
     .{
         .name = "bash",
-        .description = "Run a bash command in the startup project after user approval. Default timeout is 5 minutes. Bounded stdout/stderr retain head and tail; commands do not persist a changed working directory.",
+        .description = "Run a bash command in the startup project. Ordinary commands follow the process trust policy. High-risk commands (recursive delete, mkfs or dd onto devices, curl|bash and wget|sh, chmod/chown of sensitive paths, fork bombs, writes to /etc or ~/.ssh) always require an explicit user allow and are not auto-run when the process is trusted. A denial returns an error and does not execute. Default timeout is 5 minutes. Bounded stdout/stderr retain head and tail; commands do not persist a changed working directory.",
         .parameters_json =
         \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}
         ,
@@ -239,7 +241,14 @@ pub const Tools = struct {
         const action = try a.create(Action);
         action.* = try parse(a, call.name, call.arguments, self.config.limits);
         try self.checkFileAction(a, action.*);
-        return .{ .payload = action, .description = try action.description(a), .requires_approval = action.requiresApproval() };
+        // 危险 bash 在授权前打标。Runtime 看到 explicit_denial 后，即使 trusted 也会询问。
+        var description = try action.description(a);
+        const denial: ?[]const u8 = if (action.* == .bash) blk: {
+            const finding = command_risk.classify(action.bash.command) orelse break :blk null;
+            description = try std.fmt.allocPrint(a, "DANGEROUS bash ({s}). Process trust does not auto-run this; y runs it once, and t still asks for the next dangerous command.\n{s}", .{ finding.label, description });
+            break :blk try std.fmt.allocPrint(a, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow and is not covered by process trust.", .{finding.label});
+        } else null;
+        return .{ .payload = action, .description = description, .requires_approval = action.requiresApproval(), .explicit_denial = denial };
     }
 
     /// 从 prepare 生成的 payload 取回 Action 并执行；payload 指向同一个 arena 中的 Action。
@@ -256,7 +265,8 @@ pub const Tools = struct {
         // 执行前已取消则直接返回，不触碰磁盘或子进程。
         if (cancel.isRequested()) return .{ .text = "Canceled before execution", .is_error = true, .canceled = true };
 
-        // 直接执行入口也校验，避免绕过 prepare；已批准的任意 bash 仍不属于沙箱。
+        // 直接执行入口也校验路径，避免绕过 prepare。危险 bash 的拦截在 Runtime 授权，
+        // 不在这里重复拒绝：能进入 execute 说明本次调用已经过明确批准。bash 仍不是沙箱。
         try self.checkFileAction(a, action);
 
         var value = j.object(a);
@@ -475,4 +485,35 @@ test "project settings exact aliases protected at prepare and direct execute" {
     }
     try std.testing.expectError(error.ProtectedSessionFile, tools.checkFileAction(a, .{ .read_file = .{ .path = ".thin/sessions/x" } }));
     try std.testing.expectError(error.ProtectedSessionFile, tools.checkFileAction(a, .{ .read_file = .{ .path = ".thin/logs/x" } }));
+}
+
+test "dangerous bash is marked for explicit approval and ordinary bash is not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, io, buffer[0..n]);
+    defer root.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = undefined };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dangerous = try Tools.prepare(&tools, a, .{ .id = "d", .name = "bash", .arguments = "{\"command\":\"rm -rf build\"}" });
+    try std.testing.expect(dangerous.requires_approval);
+    try std.testing.expect(dangerous.explicit_denial != null);
+    try std.testing.expect(std.mem.indexOf(u8, dangerous.explicit_denial.?, "recursive delete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dangerous.explicit_denial.?, "not covered by process trust") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dangerous.description, "DANGEROUS bash") != null);
+
+    const safe = try Tools.prepare(&tools, a, .{ .id = "s", .name = "bash", .arguments = "{\"command\":\"printf ok\"}" });
+    try std.testing.expect(safe.requires_approval);
+    try std.testing.expect(safe.explicit_denial == null);
+    try std.testing.expect(std.mem.indexOf(u8, safe.description, "DANGEROUS") == null);
+}
+
+test {
+    _ = @import("command_risk.zig");
 }

@@ -4,8 +4,9 @@ const std = @import("std");
 const ids = @import("session_id.zig");
 
 /// 解析后的选项。prompt 为 null 表示交互模式；非 null 表示 --print 一次性模式。
-/// 当前 CLI 默认信任本进程的工具调用，不逐次审批；--trust 仅保留兼容。
-/// 这不是命令风险分类或沙箱，Runtime 的授权接口仍保留给嵌入调用方。
+/// 当前 CLI 默认信任本进程的普通工具调用，不逐次审批；--trust 仅保留兼容。
+/// 危险 bash 在执行前按命令内容分类，即使 trusted 也必须本次明确批准。
+/// 这不是沙箱。--print 没有审批界面，因此直接拒绝危险命令。
 pub const Options = struct { prompt: ?[]const u8 = null, restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, trusted: bool = true, logging: bool = true, auto_refresh_models: bool = true, help: bool = false, version: bool = false };
 
 /// 解析 argv。args[0] 是程序名，因此从 1 开始遍历。
@@ -102,9 +103,14 @@ pub const help =
     \\A null/missing mapping is unsupported; DeepSeek format uses thinking.type (Chat only).
     \\Only explicitly mapped model protocols are offered; unknown API IDs are not guessed.
     \\No trial inference requests or automatic changes to global defaults.
-    \\Tool calls are trusted for THIS PROCESS and run without approval prompts.
+    \\Ordinary tool calls are trusted for THIS PROCESS and run without approval prompts.
     \\Commands run with your account permissions; bash is NOT a sandbox.
-    \\No automatic command-risk classifier is enabled. --trust is a compatibility flag.
+    \\High-risk bash is classified before it runs and always asks, even when this process is trusted.
+    \\Patterns: recursive rm, find -delete, git clean -f, mkfs and dd onto devices,
+    \\writes or chmod/chown of /etc, /usr, /bin, /root or ~/.ssh, curl|bash and wget|sh, and fork bombs.
+    \\y runs that command once. t runs it once and trusts later ordinary tools; the next
+    \\dangerous command still asks. n denies it. The model gets an error and nothing runs.
+    \\--print cannot approve dangerous bash, so those calls are denied. --trust does not disable this check.
     \\--print returns the final committed visible answer with the same tool policy.
     \\
     \\Project settings: <startup directory>/.thin/settings.json (last logical effort, 0600).
@@ -145,7 +151,7 @@ pub const help =
     \\
 ;
 
-// 交互与 --print 默认均不审批，--trust 保持兼容；错误参数仍拒绝。
+// 交互与 --print 默认不审批普通工具；危险 bash 仍要明确批准。--trust 不关闭该检查。
 test "CLI selection restore is explicit bounded and interactive only" {
     const id = "0123456789abcdef0123456789abcdef";
     const options = try parse(&.{ "thin", "--restore-selection", id, "--no-log" });
@@ -179,6 +185,10 @@ test "CLI tools are trusted by default and print requires a prompt" {
     try std.testing.expect((try parse(&.{ "thin", "--print", "hello" })).trusted);
     try std.testing.expect((try parse(&.{ "thin", "--no-log" })).trusted);
     try std.testing.expect(std.mem.indexOf(u8, help, "run without approval prompts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "No automatic command-risk classifier") == null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "High-risk bash is classified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "even when this process is trusted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--trust does not disable this check") != null);
     try std.testing.expect((try parse(&.{"thin"})).logging);
     try std.testing.expect((try parse(&.{"thin"})).auto_refresh_models);
     try std.testing.expect(!(try parse(&.{ "thin", "--no-model-auto-refresh" })).auto_refresh_models);

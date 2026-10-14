@@ -35,8 +35,12 @@ pub const Prepared = struct {
     payload: *anyopaque,
     /// 展示给用户的操作描述（权限询问时显示）。
     description: []const u8,
-    /// 是否需要用户授权（非 trusted 模式下才会询问）。
+    /// 是否需要用户授权。trusted 时普通调用会跳过询问。
     requires_approval: bool,
+    /// 非空：本次必须人工批准，--trust / trust_process 不能自动放行。
+    /// allow_once 与 trust_process 都只放行这一次；之后的非空调用仍会询问。
+    /// 用户拒绝（或 --print 无法询问）时，这段文案作为工具错误回给模型。
+    explicit_denial: ?[]const u8 = null,
 };
 
 /// 工具执行器接口（上下文指针 + 函数指针），由宿主注入；Runtime 不关心具体工具。
@@ -54,7 +58,8 @@ pub const Executor = struct {
 /// 权限询问。id 由 Runtime 递增分配，与 tool_started / tool_result 事件关联。
 pub const Permission = struct { id: u64, tool_name: []const u8, description: []const u8 };
 
-/// 用户对权限询问的答复。trust_process 会让本 Runtime 之后的调用不再询问。
+/// 用户对权限询问的答复。trust_process 会让本 Runtime 之后的普通调用不再询问。
+/// explicit_denial 非空的调用（危险 bash）仍会询问；该决定只放行当前这一次。
 pub const Decision = enum { allow_once, deny, trust_process };
 
 /// Runtime 当前阶段，供 UI 展示；每次切换前都会先发出 state 事件。
@@ -1023,8 +1028,8 @@ pub const Runtime = struct {
 
             var allowed = true;
 
-            // 仅在需要授权且未信任时询问用户。
-            if (prepared.requires_approval and !self.trusted) {
+            // 普通调用在 trusted 时跳过。危险 bash 带 explicit_denial，即使 trusted 也要问。
+            if (prepared.requires_approval and (prepared.explicit_denial != null or !self.trusted)) {
                 const permission = Permission{ .id = host_id, .tool_name = call.name, .description = prepared.description };
                 try self.emit(.{ .state = .awaiting_permission }, cancel);
                 try self.emit(.{ .permission = permission }, cancel);
@@ -1038,13 +1043,14 @@ pub const Runtime = struct {
                 switch (decision) {
                     .allow_once => {},
                     .deny => allowed = false,
-                    // 信任只影响本 Runtime 实例之后的调用。
+                    // 信任只影响本 Runtime 之后、未标记 explicit_denial 的调用。当前调用已经过明确选择。
                     .trust_process => self.trusted = true,
                 }
             }
 
             // 默认结果为拒绝，只有通过授权时才真正执行。
-            var result: Execution = .{ .text = "User denied this action; it was not executed", .is_error = true };
+            // 危险命令被拒绝时回传分类原因，而不是笼统的 denied。
+            var result: Execution = .{ .text = prepared.explicit_denial orelse "User denied this action; it was not executed", .is_error = true };
             if (allowed) {
                 // 工具调用次数限制在执行前检查。
                 if (task.tool_calls >= self.config.limits.max_tool_calls) return error.ToolCallLimit;

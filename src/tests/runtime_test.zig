@@ -35,6 +35,9 @@ const Fake = struct {
     calls_per_response: usize = 1,
     /// prepare 阶段是否要求审批。
     requires_approval: bool = true,
+    /// 非空时即使 Runtime 已 trusted 也必须询问；拒绝文案回传给模型。
+    explicit_denial: ?[]const u8 = null,
+    last_result: []const u8 = "",
     /// authorize 返回的审批决定。
     decision: r.Decision = .allow_once,
     /// 工具执行返回的文本。
@@ -183,7 +186,7 @@ const Fake = struct {
         const self: *Fake = @ptrCast(@alignCast(ctx));
         if (!std.mem.eql(u8, call_.name, "write_file")) return error.UnexpectedTool;
         if (self.fail_prepare) return error.InvalidFixtureArguments;
-        return .{ .payload = ctx, .description = "write fixture", .requires_approval = self.requires_approval };
+        return .{ .payload = ctx, .description = "write fixture", .requires_approval = self.requires_approval, .explicit_denial = self.explicit_denial };
     }
 
     /// 执行工具：执行前先检查取消（已取消则不产生副作用），成功后计数，并按配置返回成功或清理失败。
@@ -229,6 +232,7 @@ const Fake = struct {
                 self.last_file_stats = value.result.file_stats;
                 self.fitted_result = value.result.truncated;
                 self.last_duration_ms = value.result.duration_ms;
+                self.last_result = value.result.text;
             },
             .tool_started => |value| self.last_started_ms = value.started_ms,
             .finished => self.terminals += 1,
@@ -858,6 +862,34 @@ test "denied and canceled approval have no tool side effects" {
     defer arena.deinit();
     // 检查消息历史结构是否合法（边界校验）。
     _ = try context.boundaries(arena.allocator(), runtime.messages());
+}
+
+// 危险操作的 explicit_denial 不因 trusted 或 trust_process 被跳过。拒绝文案原样回给模型。
+test "explicit denial still prompts when the Runtime is trusted" {
+    const denial = "Dangerous bash command was not executed (recursive delete). High-risk bash needs an explicit user allow and is not covered by process trust.";
+    var fake = Fake{ .decision = .deny, .explicit_denial = denial };
+    const config = configuration();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", true);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    var cancel = p.Cancellation{};
+    const terminal = try runtime.run("Do the task", &cancel);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
+    try std.testing.expect(runtime.trusted);
+    try std.testing.expectEqual(@as(u32, 1), fake.permissions);
+    try std.testing.expectEqual(@as(u32, 0), fake.executions);
+    try std.testing.expect(fake.denied_seen);
+    try std.testing.expectEqualStrings(denial, fake.last_result);
+
+    var trusted = Fake{ .decision = .trust_process, .stop_after = 2, .explicit_denial = denial };
+    var again = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, trusted.model(), trusted.executor(), trusted.host(), "", true);
+    defer again.deinit();
+    trusted.current_runtime = &again;
+    _ = try again.run("Do the task", &cancel);
+    // 两次危险调用都询问。trust_process 放行当前这次，并信任之后的普通调用，但不取消下一次危险询问。
+    try std.testing.expectEqual(@as(u32, 2), trusted.permissions);
+    try std.testing.expectEqual(@as(u32, 2), trusted.executions);
+    try std.testing.expect(again.trusted);
 }
 
 // 信任（trust_process）只对当前 Runtime 生效，新建的 Runtime 不继承该信任。
