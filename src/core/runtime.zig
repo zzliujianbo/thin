@@ -151,6 +151,10 @@ pub const Host = struct {
     emit_fn: *const fn (?*anyopaque, Event, *const p.Cancellation) anyerror!void = discard,
     /// 授权回调；默认拒绝，保证未配置宿主时不会执行需授权的工具。
     authorize_fn: *const fn (?*anyopaque, Permission, *const p.Cancellation) anyerror!Decision = deny,
+    /// Called only when the next permission id would exceed u64. The host must
+    /// drop its high-water mark while no request is pending. Null refuses the
+    /// allocation instead of wrapping to 0 (which Bridge rejects as InvalidPermission).
+    rebase_permission_fn: ?*const fn (?*anyopaque) anyerror!void = null,
 
     /// 默认事件接收器：丢弃所有事件。
     fn discard(_: ?*anyopaque, _: Event, _: *const p.Cancellation) !void {}
@@ -533,6 +537,12 @@ pub const Runtime = struct {
     /// Credentials/authorization are deliberately not part of persisted state.
     pub fn checkpoint(self: *const Runtime) !@import("checkpoint.zig").State {
         if (self.busy.load(.acquire)) return error.Busy;
+        return self.exportCheckpoint();
+    }
+
+    /// Runtime thread only, from inside `run` (the sole mutator). Same bytes as
+    /// `checkpoint`, without the idle check that would reject this thread.
+    pub fn exportCheckpoint(self: *const Runtime) !@import("checkpoint.zig").State {
         if (self.poisoned) return error.UnsafeToContinue;
         const state: @import("checkpoint.zig").State = .{
             .system = self.system,
@@ -604,7 +614,7 @@ pub const Runtime = struct {
 
     /// 单次 run 的计数与终态；用于限制轮数与工具调用次数。
     const Task = struct {
-        /// 模型调用轮数（含压缩），受 max_rounds 限制。
+        /// Model calls this run. Compaction is not counted toward max_rounds.
         rounds: u32 = 0,
         /// 已执行的工具调用次数，受 max_tool_calls 限制。
         tool_calls: u32 = 0,
@@ -675,6 +685,20 @@ pub const Runtime = struct {
     /// 若已请求取消则返回 error.Canceled。取消是协作式的，各检查点调用此函数。
     fn checkCanceled(cancel: *const p.Cancellation) !void {
         if (cancel.isRequested()) return error.Canceled;
+    }
+
+    /// Next host permission id. Stays strictly increasing for the Bridge lifetime.
+    /// At u64 max, ask the host to drop its high-water mark and start a new epoch
+    /// at 1. Without that callback, refuse instead of wrapping to 0.
+    fn allocatePermissionId(self: *Runtime) !u64 {
+        if (self.permission_id == std.math.maxInt(u64)) {
+            if (self.host.rebase_permission_fn) |rebase| {
+                try rebase(self.host.context);
+            } else return error.PermissionIdExhausted;
+            self.permission_id = 0;
+        }
+        self.permission_id += 1;
+        return self.permission_id;
     }
 
     fn retainCurrentInput(self: *Runtime, retained: *bool) !void {
@@ -835,6 +859,9 @@ pub const Runtime = struct {
 
     /// 发起模型调用前检查上下文是否超过压缩阈值，超过则尝试压缩。
     fn preflight(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
+        // No model round remains. The caller reports RoundLimit and keeps the
+        // current goal; do not spend another summary on a turn that cannot continue.
+        if (task.rounds >= self.config.limits.max_rounds) return;
         const budget = context.inputBudget(self.config.*);
         const before = self.estimatedTokens();
         if (before < context.threshold(budget, self.config.limits.compaction_trigger_percent)) return;
@@ -873,9 +900,8 @@ pub const Runtime = struct {
         const summary_limit = self.config.model.context_tokens - self.config.limits.summary_tokens - self.config.limits.safety_tokens;
         if (self.estimator.tokens(raw) > summary_limit) return error.SummaryDoesNotFit;
 
-        // 摘要调用同样计入轮数限制。
-        if (task.rounds >= self.config.limits.max_rounds) return error.RoundLimit;
-        task.rounds += 1;
+        // Compaction is not a user-facing model round. Failed and successful
+        // summaries both leave `task.rounds` unchanged so they cannot exhaust RoundLimit.
         try self.emit(.{ .state = .compacting }, cancel);
 
         // 摘要请求只使用 scratch arena，不影响主历史。
@@ -977,9 +1003,9 @@ pub const Runtime = struct {
             // 模型给出的 call.id 只用于回填结果；事件使用 Runtime 分配的 host_id。
             const call = block.tool_call;
 
-            // 分配本次调用的宿主 ID（允许回绕）。
-            self.permission_id +%= 1;
-            const host_id = self.permission_id;
+            // Monotonic for this Bridge. Wrapping to 0 would be <= last_id and
+            // surface as InvalidPermission; overflow rebases or refuses first.
+            const host_id = try self.allocatePermissionId();
 
             var temporary = std.heap.ArenaAllocator.init(self.allocator);
             defer temporary.deinit();
@@ -1004,6 +1030,8 @@ pub const Runtime = struct {
                 try self.emit(.{ .permission = permission }, cancel);
 
                 // 授权回调返回后再检查取消，避免取消后仍执行工具。
+                // Canceled is not a deny: the tool is not run, and observers do not
+                // record a user denial. Disconnect or a replaced request still returns deny.
                 const decision = try self.host.authorize_fn(self.host.context, permission, cancel);
                 self.observer.notify(.{ .decision = .{ .id = permission.id, .value = decision } });
                 try checkCanceled(cancel);
