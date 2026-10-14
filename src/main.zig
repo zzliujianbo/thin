@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) u8 {
         // interrupt by writing another message to the same blocked terminal.
         if (err == error.Canceled and interrupt.signal() != 0) return 128 + interrupt.signal();
         var buffer: [512]u8 = undefined;
-        const message = std.fmt.bufPrint(&buffer, "thin: {s}\nCheck ~/.thin/config.json, the configured key source, or --help. For first-time setup, run thin interactively and use /auth.\n", .{@errorName(err)}) catch "thin: application error\n";
+        const message = std.fmt.bufPrint(&buffer, "thin: {s}\nCheck ~/.thin/config.json, the configured key source, or --help. For first-time setup, run thin interactively and use /login.\n", .{@errorName(err)}) catch "thin: application error\n";
         output(init.io, .stderr(), message) catch {};
         return 1;
     };
@@ -162,8 +162,8 @@ fn run(init: std.process.Init) !u8 {
     var bridge = Bridge.init(init.gpa, init.io, &cancellation);
     defer bridge.deinit();
 
-    // 先建立可处于未配置状态的会话，再进入 TUI；/auth 保存后才发布可用 Runtime。
-    var session = try Session.initWithOptions(init.gpa, init.io, init.environ_map, ".", bridge.host(), options.trusted, .{ .logging = options.logging, .restore_selection = options.restore_selection, .resume_session = options.resume_session });
+    // 先建立可处于未配置状态的会话，再进入 TUI；/login 保存后才发布可用 Runtime。
+    var session = try Session.initWithOptions(init.gpa, init.io, init.environ_map, ".", bridge.host(), options.trusted, .{ .logging = options.logging, .restore_selection = options.restore_selection, .resume_session = options.resume_session, .auto_refresh_models = options.auto_refresh_models });
     defer session.deinit();
 
     var guard = try interrupt.Guard.install();

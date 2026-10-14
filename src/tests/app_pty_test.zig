@@ -182,12 +182,31 @@ const Driver = struct {
         return result;
     }
 
+    /// Candidate rows stay below prior output and directly above the composer.
+    fn checkMenu(self: *const Driver, candidate: []const u8, composer: []const u8) !void {
+        const view = try self.screen();
+        try check(view.count(regular.prior) == 1);
+        try check(!view.visible("Commands") and !view.visible("Configure provider (API key)"));
+        var prior_row: ?usize = null;
+        var candidate_row: ?usize = null;
+        var composer_row: ?usize = null;
+        for (0..view.history_len + view.grid.len) |i| {
+            const line = if (i < view.history_len) &view.history[i] else &view.grid[i - view.history_len];
+            if (std.mem.indexOf(u8, line, regular.prior) != null) prior_row = i;
+            if (std.mem.indexOf(u8, line, candidate) != null) candidate_row = i;
+            if (std.mem.indexOf(u8, line, composer) != null) composer_row = i;
+        }
+        try check(prior_row != null and candidate_row != null and composer_row != null);
+        try check(prior_row.? < candidate_row.? and candidate_row.? < composer_row.?);
+        try check(composer_row.? - candidate_row.? <= 11); // Ten candidates plus the blank composer separator.
+    }
+
     /// The selected provider (or local fixture endpoint) must be visible before
     /// Enter opens masked input. Mode changes intentionally drop batched bytes.
     fn openAuth(self: *Driver) !void {
         var start = self.used;
-        try self.send("/auth\r");
-        try self.waitFrame(start, "Configure provider");
+        try self.send("/login\r");
+        try self.waitFrame(start, "Provider> ");
         start = self.used;
         try self.send("\r");
         try self.waitFrame(start, "API key>");
@@ -339,9 +358,9 @@ pub fn main(init: std.process.Init) !void {
     const timezone_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "TZ={s}", .{timezone}), 0);
     const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", timezone_env, if (restore_error != null and std.mem.eql(u8, restore_error.?, "ApiKeyNotFound")) null else "THIN_FIXTURE_KEY=fixture-secret-never-log" };
 
-    const interactive_argv = [_:null]?[*:0]const u8{bin};
+    const interactive_argv = [_:null]?[*:0]const u8{ bin, "--no-model-auto-refresh" };
     const print_argv = [_:null]?[*:0]const u8{ bin, "--print", "large-output" };
-    const no_log_argv = [_:null]?[*:0]const u8{ bin, "--no-log" };
+    const no_log_argv = [_:null]?[*:0]const u8{ bin, "--no-log", "--no-model-auto-refresh" };
     const restore_id = try a.dupeSentinel(u8, if (restore_mode or full_resume) try required(init, "THIN_APP_TEST_RESTORE_ID") else "", 0);
     const restore_argv = [_:null]?[*:0]const u8{ bin, "--restore-selection", restore_id, "--no-log" };
     const resume_argv = [_:null]?[*:0]const u8{ bin, "--resume", restore_id };
@@ -447,13 +466,89 @@ pub fn main(init: std.process.Init) !void {
     // A complete composer frame shows the cursor; no statistics/status footer.
     try d.waitText(0, "\x1b[?25h");
     try check(std.mem.indexOf(u8, d.output[0..d.used], @import("../app/version.zig").text) != null);
-    const directory_line = try std.fmt.allocPrint(a, "Directory: {s}", .{project});
-    try check(std.mem.indexOf(u8, d.output[0..d.used], directory_line) != null);
-    try check(std.mem.indexOf(u8, d.output[0..d.used], "Time: ") != null and std.mem.indexOf(u8, d.output[0..d.used], if (std.mem.eql(u8, timezone, "UTC-8")) " +0800" else " +0000") != null);
+    try check(std.mem.indexOf(u8, d.output[0..d.used], project) != null);
+    try check(std.mem.indexOf(u8, d.output[0..d.used], "Directory:") == null);
+    try check(std.mem.indexOf(u8, d.output[0..d.used], "Time:") == null);
+    try check(std.mem.indexOf(u8, d.output[0..d.used], if (std.mem.eql(u8, timezone, "UTC-8")) " +0800" else " +0000") != null);
     try check(std.mem.indexOf(u8, d.output[0..d.used], "Zig ") == null);
     if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
         // 初始化只验证待配置界面；不输入密钥或发送消息，避免连接默认公共端点。
-        try d.waitText(0, "/auth");
+        try d.waitText(0, "/login");
+    } else if (std.mem.eql(u8, mode, "menu-navigation")) {
+        // Offline only: no message or credential is submitted. Every navigation
+        // waits for a complete owned frame before a subsequent confirmation.
+        var start = d.used;
+        try d.send("/");
+        try d.waitFrame(start, "/login");
+        try d.checkMenu("/model", ") > /");
+        start = d.used;
+        try d.send("\x1b[A"); // Up wraps the first root row to /login.
+        try d.waitFrame(start, "");
+        start = d.used;
+        try d.send("\r");
+        try d.waitFrame(start, "Provider> ");
+        try d.checkMenu("DeepSeek", "Provider> ");
+        const providers = try d.screen();
+        try check(providers.row > 0);
+        try check(!providers.visible("Configure provider"));
+        start = d.used;
+        try d.send("\x1b[D"); // Provider -> root, not a cursor movement.
+        try d.waitFrame(start, "");
+        const root = try d.screen();
+        try check(root.visible("/model") and root.visible("/login") and !root.visible("Provider> "));
+        start = d.used;
+        try d.send("\x15");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("/");
+        try d.waitFrame(start, "/login");
+        start = d.used;
+        try d.send("\x1b[B");
+        try d.waitFrame(start, "");
+        start = d.used;
+        try d.send("\x1b[B"); // Down wraps /login back to /model.
+        try d.waitFrame(start, "");
+        start = d.used;
+        try d.send("\r");
+        try d.waitFrame(start, "Search> ");
+        try d.checkMenu("fixture-model  (", "Search> ");
+        const models = try d.screen();
+        try check(!models.visible("Commands") and !models.visible("Configure provider"));
+        start = d.used;
+        try d.send("\x1b[D"); // Model -> root.
+        try d.waitFrame(start, "");
+        const model_parent = try d.screen();
+        try check(model_parent.visible("/model") and model_parent.visible("/login") and !model_parent.visible("Search> "));
+        start = d.used;
+        try d.send("\x15");
+        try d.waitIdle(start);
+        try d.openAuth();
+        start = d.used;
+        try d.send("\x1b[200~fixture-secret-never-log\x1b[201~");
+        try d.waitFrame(start, "*");
+        start = d.used;
+        try d.send("\x1b"); // Wipe the secret AND release paste quarantine.
+        try d.waitIdle(start);
+        try d.openAuth(); // Would fail if quarantine still swallowed /login.
+        const empty_secret = try d.screen();
+        try check(empty_secret.visible("API key> ") and !empty_secret.visible("***"));
+        start = d.used;
+        try d.send("\x1b");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("ordinary-edit");
+        try d.waitFrame(start, "ordinary-edit");
+        start = d.used;
+        try d.send("\x15");
+        try d.waitIdle(start);
+        const cleared = try d.screen();
+        try check(!cleared.visible("ordinary-edit"));
+        start = d.used;
+        try d.send("/model --refresh\r");
+        try d.waitFrame(start, "No official provider configured");
+        // This fixture uses a custom loopback endpoint: refresh must not send
+        // its credential to any official service or submit a model request.
+        try check(std.mem.indexOf(u8, d.output[0..d.used], "Saved locally; send a message to connect") == null);
     } else if (std.mem.eql(u8, mode, "resume-create")) {
         const start = d.used;
         try d.send("resume-first-turn remember-resume-marker\r");
@@ -495,8 +590,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, mode, "exit-busy-tool")) try d.waitFrame(start, "sleep 30") else try d.waitBusy(start);
         // Ctrl+D at the shared tail below cancels and joins before restoration.
     } else if (std.mem.eql(u8, mode, "auth-activate")) {
-        // 待激活配置指向本地 fixture。/auth 使用独立的掩码输入，取消不能保存或污染聊天输入。
-        try d.waitText(0, "/auth");
+        // 待激活配置指向本地 fixture。/login 使用独立的掩码输入，取消不能保存或污染聊天输入。
+        try d.waitText(0, "/login");
         var start = d.used;
         try d.openAuth();
         try d.quiet(150);
@@ -835,7 +930,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         } else if (std.mem.eql(u8, mode, "settings-pending-auth")) {
-            try d.waitText(0, "/auth");
+            try d.waitText(0, "/login");
             var start = d.used;
             try d.send("\x1b[Z");
             // Pending configuration still acknowledges its complete frame.
@@ -894,14 +989,10 @@ pub fn main(init: std.process.Init) !void {
         try d.waitIdle(start);
         start = d.used;
         try d.send("/");
-        try d.waitFrame(start, "Commands");
+        try d.waitFrame(start, "/login");
         const commands = try d.screen();
-        try check(commands.visible("/model") and commands.visible("/auth"));
-        start = d.used;
-        try d.send("\t");
-        try d.waitFrame(start, "/model");
-        const completed = try d.screen();
-        try check(!completed.visible("Commands") and !completed.visible("Search> "));
+        try check(commands.visible("/model") and commands.visible("/login"));
+        try check(!commands.visible("Commands") and !commands.visible("Search> "));
         start = d.used;
         try d.send("\r");
         try d.waitFrame(start, "Search> ");
@@ -1070,7 +1161,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "exit-no-submit") or std.mem.eql(u8, mode, "exit-unconfigured") or std.mem.eql(u8, mode, "exit-batched")) {
         const final = try d.screen();
         try check(final.row <= 7); // No screenful of blank rows between startup and exit identity.
-        try check(final.count("Directory:") == 1 and final.count("Time:") == 1 and final.count("Session ID:") == 0);
+        try check(final.count("Directory:") == 0 and final.count("Time:") == 0 and final.count("Session ID:") == 0);
         try check(final.count("thin --resume") == 0);
         const tail = std.mem.lastIndexOf(u8, d.output[0..d.used], "\x1b[?25h").? + "\x1b[?25h".len;
         try check(std.mem.trim(u8, d.output[tail..d.used], "\r\n").len == 0);

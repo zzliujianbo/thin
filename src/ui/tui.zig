@@ -182,6 +182,9 @@ pub const Connection = struct {
     set_effort_fn: ?*const fn (*anyopaque, shared.ReasoningEffort) anyerror!void = null,
     /// Startup-only borrowed context, consumed before any worker exists.
     initial_history_fn: ?*const fn (*anyopaque) []const p.Message = null,
+    /// Explicit metadata refresh and bounded owner polling, separate from LLM jobs.
+    refresh_models_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    poll_models_fn: ?*const fn (*anyopaque, bool) bool = null,
 
     pub const State = struct {
         runtime: ?*r.Runtime,
@@ -192,6 +195,9 @@ pub const Connection = struct {
         session_id: ?[32]u8 = null,
         /// Metadata-only catalog for this endpoint; never a credential catalog.
         models: []const core_config.Model = &.{},
+        model_context_official: []const bool = &.{},
+        context_official: bool = false,
+        metadata_notice: ?[]const u8 = null,
         selection_name: ?[]const u8 = null,
         provider: ?core_config.providers.Id = null,
         /// Nonsecret configured-status bits; never credential bytes.
@@ -558,17 +564,17 @@ const Ui = struct {
     /// Only actionable notices/errors use a temporary hint row. Completed,
     /// mode, usage and performance have no rows; the composer owns activity.
     fn hint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
-        if (self.secret_quarantine) return std.fmt.allocPrint(a, "{s} | Ctrl+U resume; Ctrl+D exit", .{if (std.mem.eql(u8, self.notice, "Saved locally; send a message to connect")) self.notice else "Secret paste drained"});
-        if (self.secret_mode) return "Enter save | Ctrl+U erase | Ctrl+C cancel | Ctrl+D exit";
-        if (self.provider_open) return if (self.provider_picker.pasted) "Pasted selection: Ctrl+U clears; Esc cancels" else "Up/Down select; Enter API key; Esc/Ctrl+C cancel";
-        if (self.model_picker) |picker| return if (picker.pasted) "Pasted selection: Ctrl+U clears; Esc cancels" else "Up/Down select; Enter confirm; Esc/Ctrl+C cancel";
-        if (self.commandMenuVisible()) return "Type to filter; Tab complete; Enter run; Esc dismiss";
+        if (self.secret_quarantine) return std.fmt.allocPrint(a, "{s}; Esc closes", .{self.notice});
+        if (self.secret_mode) return if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
+        if (self.provider_open) return if (self.provider_picker.pasted) "Pasted selection; Esc cancels" else if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
+        if (self.model_picker) |picker| return if (picker.pasted) "Pasted selection; Esc cancels" else if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
+        if (self.commandMenuVisible()) return "";
         var notice: []const u8 = "";
         if (self.last_terminal) |result| {
             if (result.status != .success and result.status != .paused) notice = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ self.notice, if (result.detail != null) ": " else "", if (result.detail) |err| @errorName(err) else "", if (result.model_failure != null) " / " else "", if (result.model_failure) |failure| @tagName(failure) else "" });
         }
         if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
-        if (notice.len == 0 and state.runtime == null) notice = "Not configured: /auth";
+        if (notice.len == 0 and state.runtime == null) notice = "Not configured: /login";
         if (state.settings_error) |err| {
             notice = try std.fmt.allocPrint(a, "{s}{s}SETTINGS FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
         } else if (state.settings_notice) |warning| {
@@ -734,7 +740,7 @@ const Ui = struct {
             self.command_matches = .{};
             return;
         }
-        // Compare identities too: /m -> /a has the same number of candidates.
+        // Compare identities too: /m -> /lg has the same number of candidates.
         if (!std.mem.eql(command_menu_module.Command, self.command_matches.commands[0..self.command_matches.len], matches.commands[0..matches.len])) self.command_menu.changed();
         self.command_matches = matches;
     }
@@ -746,9 +752,9 @@ const Ui = struct {
         self.command_menu.changed();
         self.displayed_command_generation = null;
     }
-    /// Only a fully acknowledged, current menu may choose an action. Tab fills
-    /// without executing; Enter submits through the usual guarded command path.
-    fn acceptCommandMenu(self: *Ui, submit_command: bool) !void {
+    /// Only a fully acknowledged, current menu may choose an action. Enter
+    /// submits through the usual guarded command path.
+    fn acceptCommandMenu(self: *Ui) !void {
         if (!self.commandMenuVisible() or self.frame.len != 0 or self.displayed_command_generation != self.command_menu.generation) return;
         const command = self.command_menu.choice(self.command_matches) orelse return;
         const item = command_menu_module.info(command);
@@ -757,7 +763,23 @@ const Ui = struct {
         self.closeCommandMenu();
         self.command_matches = command_menu_module.suggestions(self.editor.bytes.items, self.editor.cursor, false);
         self.command_menu.dismiss();
-        if (submit_command) try self.submit();
+        try self.submit();
+    }
+    fn backToCommands(self: *Ui, selected: command_menu_module.Command) !void {
+        // Prepare before closing the child menu; no stale child-frame authority
+        // can confirm the newly opened parent, even if a write is in flight.
+        try self.editor.bytes.ensureTotalCapacity(self.editor.allocator, 1);
+        self.closeModelPicker();
+        self.closeProviderPicker();
+        self.wipeEditor();
+        self.editor.bytes.appendSliceAssumeCapacity("/");
+        self.editor.cursor = 1;
+        self.closeCommandMenu();
+        self.refreshCommandMenu();
+        for (self.command_matches.commands[0..self.command_matches.len], 0..) |command, index| {
+            if (command == selected) self.command_menu.selected = index;
+        }
+        self.notice = "Ready";
     }
     fn closeProviderPicker(self: *Ui) void {
         self.provider_open = false;
@@ -775,16 +797,16 @@ const Ui = struct {
             if (choice == .provider and state.provider == choice.provider) self.provider_picker.selected = index;
         }
         self.provider_open = true;
-        self.notice = "Configure an API key locally; no login verification";
+        self.notice = "Ready";
     }
     fn beginSecret(self: *Ui, provider: ?core_config.providers.Id) void {
         self.secret_provider = provider;
         self.secret.wipe();
         self.secret_mode = true;
         self.parser.secretMode(true);
-        self.notice = "Enter API key below; Enter saves locally; Ctrl+C cancels";
+        self.notice = "Ready";
     }
-    fn providerKey(self: *Ui, event_: input.Event) void {
+    fn providerKey(self: *Ui, event_: input.Event) !void {
         switch (event_) {
             .escape, .cancel => {
                 self.closeProviderPicker();
@@ -796,7 +818,8 @@ const Ui = struct {
                 self.provider_picker.markPaste();
             },
             .clear => self.provider_picker.clear(),
-            .up, .down, .page_up, .page_down => self.provider_picker.move(event_ == .down or event_ == .page_down, self.provider_choices.len),
+            .left => try self.backToCommands(.auth),
+            .up, .down => self.provider_picker.move(event_ == .down, self.provider_choices.len),
             .enter => {
                 if (!self.settingsIdle() or self.frame.len != 0 or self.provider_picker.pasted or self.provider_choices.len == 0 or
                     self.displayed_provider_generation != self.provider_picker.generation) return;
@@ -819,8 +842,10 @@ const Ui = struct {
         self.closeModelPicker();
         self.model_epoch +%= 1;
         self.model_picker = picker_module.Picker.init(self.allocator);
-        self.model_picker.?.allow_custom = self.connection.current().allow_custom_models;
-        self.notice = if (self.model_picker.?.allow_custom) "Select a configured model or type a custom ID" else "Select a local Chat/Responses preset; availability is not verified";
+        const state = self.connection.current();
+        self.model_picker.?.allow_custom = state.allow_custom_models;
+        self.model_picker.?.provider = state.provider;
+        self.notice = "Ready";
     }
     fn selectModel(self: *Ui, name: []const u8) !void {
         if (!self.settingsIdle()) return error.Busy;
@@ -896,9 +921,6 @@ const Ui = struct {
                 if (std.mem.indexOfScalar(u8, value.value, '\n') != null) return;
                 if (!try picker.insert(value.value, value.pasted)) self.notice = "Search limit: 1024 bytes";
             },
-            .tab => if (!try picker.insert("    ", false)) {
-                self.notice = "Search limit: 1024 bytes";
-            },
             .clear => picker.clear(),
             .backspace => {
                 picker.query.backspace();
@@ -908,7 +930,7 @@ const Ui = struct {
                 picker.query.delete();
                 picker.changed();
             },
-            .left => picker.query.left(),
+            .left => try self.backToCommands(.model),
             .right => picker.query.right(),
             .home => picker.query.cursor = 0,
             .end => picker.query.cursor = picker.query.bytes.items.len,
@@ -916,17 +938,17 @@ const Ui = struct {
                 picker.query.bytes.items.len = picker.query.cursor;
                 picker.changed();
             },
-            .up, .down, .page_up, .page_down, .enter => {
+            .up, .down, .enter => {
                 const state = self.connection.current();
                 const choices = try picker.choices(self.allocator, state.selection_name orelse state.model, state.context_limit, state.models);
                 defer self.allocator.free(choices);
                 if (event_ == .enter) {
-                    if (picker.pasted or choices.len == 0 or self.displayed_model_epoch != self.model_epoch or self.displayed_model_generation != picker.generation) return;
+                    if (self.frame.len != 0 or picker.pasted or choices.len == 0 or self.displayed_model_epoch != self.model_epoch or self.displayed_model_generation != picker.generation) return;
                     const choice = choices[@min(picker.selected, choices.len - 1)];
                     self.selectModel(choice.name) catch {
                         self.notice = "Could not switch; selection is unchanged";
                     };
-                } else picker.move(event_ == .down or event_ == .page_down, choices.len);
+                } else picker.move(event_ == .down, choices.len);
             },
             else => {},
         }
@@ -936,6 +958,24 @@ const Ui = struct {
     fn submit(self: *Ui) !void {
         if (self.want_exit) return;
         const command = std.mem.trim(u8, self.editor.bytes.items, " \t\r\n");
+        if (std.mem.eql(u8, command, "/model --refresh")) {
+            const allowed = self.settingsIdle() and !self.editor_pasted;
+            self.wipeEditor();
+            if (!allowed) {
+                self.notice = "Metadata refresh requires an idle, non-pasted session";
+                return;
+            }
+            const refresh = self.connection.refresh_models_fn orelse {
+                self.notice = "Metadata refresh unavailable";
+                return;
+            };
+            refresh(self.connection.context) catch |err| {
+                self.notice = if (err == error.NoOfficialProvider) "No official provider configured; use /login first" else if (err == error.MetadataRefreshBusy) "Official metadata refresh already running" else "Could not start metadata refresh; previous cache kept";
+                return;
+            };
+            self.notice = "Refreshing official model metadata...";
+            return;
+        }
         if (modelCommand(command)) {
             if (!self.settingsIdle() or self.editor_pasted) {
                 self.wipeEditor();
@@ -960,11 +1000,11 @@ const Ui = struct {
             return;
         }
         if (std.mem.startsWith(u8, command, "/")) {
-            const auth = std.mem.eql(u8, command, "/auth");
+            const auth = std.mem.eql(u8, command, "/login");
             const idle = self.settingsIdle() and !self.editor_pasted;
             self.wipeEditor();
             if (!auth) {
-                self.notice = "Usage: /auth (no key argument); unknown commands are not sent";
+                self.notice = "Usage: /login (no key argument); unknown commands are not sent";
             } else if (!idle) {
                 self.notice = "Setup requires an idle, non-pasted session";
             } else {
@@ -972,7 +1012,7 @@ const Ui = struct {
                     self.notice = "Setup requires a drained session bridge";
                     return;
                 };
-                if (self.connection.configure_provider_fn != null) self.openProviderPicker() else if (self.connection.current().runtime != null) self.notice = "Already configured; /auth does not replace this session" else self.beginSecret(null);
+                if (self.connection.configure_provider_fn != null) self.openProviderPicker() else if (self.connection.current().runtime != null) self.notice = "Already configured; /login does not replace this session" else self.beginSecret(null);
             }
             return;
         }
@@ -989,7 +1029,7 @@ const Ui = struct {
 
         const runtime = self.connection.current().runtime orelse {
             self.wipeEditor();
-            self.notice = "Not configured: use /auth first";
+            self.notice = "Not configured: use /login first";
             return;
         };
 
@@ -1060,17 +1100,34 @@ const Ui = struct {
         self.parser.secretMode(false);
     }
 
-    fn secretKey(self: *Ui, event_: input.Event) void {
+    fn secretKey(self: *Ui, event_: input.Event) !void {
         switch (event_) {
             .text => |v| {
                 self.secret.insert(v.value);
-                if (self.secret.failed) self.notice = "Invalid or oversized key; Ctrl+U clears, Ctrl+C cancels";
+                if (self.secret.failed) self.notice = "Invalid or oversized key; Esc cancels";
             },
             .paste_start => self.parser.secret_paste = true,
             .backspace, .delete => self.secret.erase(),
             .clear => {
                 self.secret.wipe();
-                self.notice = "Key cleared; Enter saves locally; Ctrl+C cancels";
+                self.notice = "Ready";
+            },
+            .escape, .left => {
+                // Navigation must not be smuggled behind a paste in the same
+                // read. Mode changes wipe scratch and discard remaining bytes.
+                if (self.parser.secret_batch_paste) return;
+                const previous = self.secret_provider;
+                self.endSecret();
+                self.secret_quarantine = false;
+                self.notice = "Ready";
+                if (event_ == .left) {
+                    if (self.connection.configure_provider_fn != null) {
+                        self.openProviderPicker();
+                        for (self.provider_choices.items[0..self.provider_choices.len], 0..) |choice, index| {
+                            if (choice == .provider and previous == choice.provider) self.provider_picker.selected = index;
+                        }
+                    } else try self.backToCommands(.auth);
+                }
             },
             .cancel => {
                 self.endSecret();
@@ -1082,14 +1139,14 @@ const Ui = struct {
             },
             .enter => {
                 const key_bytes = self.secret.value() orelse {
-                    self.notice = "Empty or invalid key; Ctrl+U clears, Ctrl+C cancels";
+                    self.notice = "Empty or invalid key; Esc cancels";
                     return;
                 };
                 const named = self.secret_provider != null;
                 const saved = if (self.secret_provider) |id| self.connection.configureProvider(id, key_bytes) else self.connection.configure(key_bytes);
                 saved catch {
                     self.endSecret();
-                    self.notice = "Could not save configuration; use /auth to retry";
+                    self.notice = "Could not save configuration; use /login to retry";
                     return;
                 };
                 self.endSecret();
@@ -1118,12 +1175,12 @@ const Ui = struct {
             return; // Cancel the task even while an approval is visible; never exit.
         }
         if (self.secret_mode) {
-            self.secretKey(event_);
+            try self.secretKey(event_);
             return;
         }
         if (self.secret_quarantine) {
             switch (event_) {
-                .clear => {
+                .escape, .clear => {
                     self.secret_quarantine = false;
                     self.parser.secretMode(false);
                 },
@@ -1149,9 +1206,10 @@ const Ui = struct {
         // is visible and the session is idle. Every other key still edits text.
         if (self.commandMenuVisible() and self.permission == null) {
             switch (event_) {
-                // A typed slash token is still user input: arrows must not
-                // change it or the highlighted command. Type a prefix or use Tab.
-                .up, .down => return,
+                .up, .down => {
+                    self.command_menu.move(event_ == .down, self.command_matches.len);
+                    return;
+                },
                 .escape => {
                     self.command_menu.dismiss();
                     self.dirty = true;
@@ -1163,14 +1221,11 @@ const Ui = struct {
                     // this is not acceptance of an unseen suggested completion.
                     if (std.mem.eql(u8, self.editor.bytes.items, command_menu_module.info(chosen).value)) {
                         try self.submit();
-                    } else try self.acceptCommandMenu(true);
+                    } else try self.acceptCommandMenu();
                     self.refreshCommandMenu();
                     return;
                 },
-                .tab => {
-                    try self.acceptCommandMenu(false);
-                    return;
-                },
+                .tab, .page_up, .page_down, .cycle_effort, .toggle_reasoning => return,
                 else => {},
             }
         }
@@ -1253,6 +1308,15 @@ const Ui = struct {
         // Any editor mutation re-evaluates the slash menu; a changed token clears
         // an earlier Esc dismissal so suggestions reappear while typing.
         self.refreshCommandMenu();
+    }
+
+    fn pollMetadata(self: *Ui) void {
+        const poll = self.connection.poll_models_fn orelse return;
+        if (!poll(self.connection.context, self.settingsIdle())) return;
+        if (self.model_picker) |*picker| picker.changed();
+        self.displayed_model_generation = null;
+        if (self.connection.current().metadata_notice) |notice| self.notice = notice;
+        self.dirty = true;
     }
 
     /// 收尾已结束的后台任务：等待 worker、排空剩余事件、记录终态并更新状态。
@@ -1341,6 +1405,7 @@ const Ui = struct {
                 return if (interrupt.signal() != 0) 128 + interrupt.signal() else 0;
             }
 
+            self.pollMetadata();
             const dimensions = self.terminal.size();
             self.resize(dimensions);
 
@@ -1652,7 +1717,7 @@ const Ui = struct {
         // One frame-local plain render serves both sizing and the deny-only latch.
         const approval_lines = if (self.permission) |permission| try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false }) else empty_rendered;
         const state = self.connection.current();
-        // App-prepared immutable value, including local /auth activation.
+        // App-prepared immutable value, including local /login activation.
         // Draw never dereferences Runtime, not even a fixture/idle pointer.
         self.display.seed(state.initial_context);
         self.display.setEffort(state.reasoning_effort);
@@ -1660,25 +1725,29 @@ const Ui = struct {
         // Always reserve one EMPTY row between conversation and composer.
         const footer_rows: usize = 2 + @as(usize, @intFromBool(hint_line.len != 0));
         const body_limit = self.size.rows -| footer_rows;
-        const picker_rows = if (self.model_picker) |*picker| try picker.rows(a, state.selection_name orelse state.model, state.context_limit, state.models, cols, body_limit) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
+        const picker_rows = if (self.model_picker) |*picker| try picker.rowsWithOrigins(a, state.selection_name orelse state.model, state.context_limit, state.models, cols, body_limit, .{ .current = state.context_official, .models = state.model_context_official }) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, body_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
         const menu_visible = self.commandMenuVisible();
         const menu_rows = if (menu_visible) try command_menu_module.rows(a, self.command_matches, self.command_menu.selected, cols, body_limit) else command_menu_module.Rows{ .lines = &.{} };
         if (menu_visible) self.command_menu.selected = @min(self.command_menu.selected, self.command_matches.len - 1);
-        // The menu is an overlay above the composer; content below stays visible.
-        const content_body_limit = body_limit -| menu_rows.lines.len;
+        // All candidate menus share one bottom-pinned popup slot. Secondary
+        // pickers must not replace the top of the transcript body.
+        const popup_lines = if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else menu_rows.lines;
+        const selected_line = if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else menu_rows.selected_line;
+        const checked_mask: u16 = if (self.provider_open) provider_rows.checked_mask else if (self.model_picker != null) picker_rows.checked_mask else 0;
+        const content_body_limit = body_limit -| popup_lines.len;
         self.frame_model_epoch = null;
         self.frame_model_generation = null;
         const wanted_body = if (self.permission != null)
             @min(body_limit, 1 + @max(1, approval_lines.lines.len))
-        else if (self.secret_mode) secret_lines.lines.len else if (self.provider_open) provider_rows.lines.len else if (self.model_picker != null) picker_rows.lines.len else if (thinking != null) @min(thinking_gap + @min(3, thinking_lines.len), content_body_limit) else @min(lines.items.len, content_body_limit);
+        else if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (thinking != null) @min(thinking_gap + @min(3, thinking_lines.len), content_body_limit) else @min(lines.items.len, content_body_limit);
         // Initial blank space keeps the first conversation at the top. Each
         // immutable row consumes it; expanding drafts scroll old content upward.
         // Never shrink a tail without replacing it by committed rows: the editor
         // therefore stays on the physical bottom row, without absolute positioning.
         const available = if (self.tail_height == 0 or self.abandon_tail) self.size.rows else self.tail_height;
-        const rows = @min(self.size.rows, @max(footer_rows + menu_rows.lines.len + wanted_body, available -| transcript_rows));
+        const rows = @min(self.size.rows, @max(footer_rows + popup_lines.len + wanted_body, available -| transcript_rows));
 
         // Build the complete candidate tail before choosing full or sparse output.
         // Its bytes also provide recovery if resize interrupts a sparse frame.
@@ -1696,10 +1765,11 @@ const Ui = struct {
             const body_rows = rows - footer_rows;
             // Menu rows are pinned to the bottom of the body, directly above the
             // composer, so the transcript above keeps its own scroll window.
-            const menu_span = @min(menu_rows.lines.len, body_rows);
-            const content_body_rows = body_rows -| menu_span;
+            const popup_span = @min(popup_lines.len, body_rows);
+            const content_body_rows = body_rows -| popup_span;
             if (self.secret_mode) {
-                for (0..body_rows) |line| try putStyled(writer, 1 + line, if (line < secret_lines.lines.len) secret_lines.lines[line] else "");
+                const start = body_rows -| secret_lines.lines.len;
+                for (0..body_rows) |line| try putStyled(writer, 1 + line, if (line >= start and line - start < secret_lines.lines.len) secret_lines.lines[line - start] else "");
                 self.frame_permission = null;
             } else if (self.permission) |permission| {
                 // Plain rendering: tool input must not hide behind Markdown formatting.
@@ -1721,17 +1791,6 @@ const Ui = struct {
                 const start = @min(self.permission_scroll, all.lines.len -| (body_rows - 1));
                 for (0..body_rows - 1) |line| try putStyled(writer, 2 + line, if (start + line < all.lines.len) all.lines[start + line] else "");
                 self.frame_permission = permission.id;
-            } else if (self.provider_open) {
-                for (0..body_rows) |line| try putToneLine(writer, a, 1 + line, if (line < provider_rows.lines.len) provider_rows.lines[line] else "", cols, if (provider_rows.selected_line == line) theme.accent else theme.muted);
-                self.frame_permission = null;
-                if (provider_rows.can_confirm and provider_rows.lines.len <= body_rows) self.frame_provider_generation = self.provider_picker.generation;
-            } else if (self.model_picker) |picker| {
-                for (0..body_rows) |line| try putLine(writer, a, 1 + line, if (line < picker_rows.lines.len) picker_rows.lines[line] else "", cols);
-                self.frame_permission = null;
-                if (picker_rows.can_confirm and picker_rows.lines.len <= body_rows) {
-                    self.frame_model_epoch = self.model_epoch;
-                    self.frame_model_generation = picker.generation;
-                }
             } else if (thinking != null) {
                 // Latest THREE content rows, without any title/prefix.
                 const visible_rows = @min(3, content_body_rows -| thinking_gap);
@@ -1755,13 +1814,21 @@ const Ui = struct {
                 self.frame_permission = null;
             }
 
-            // Bottom-pinned menu rows; each is already width-clipped.
-            for (0..menu_span) |line| {
-                const tone = if (menu_rows.selected_line == line) theme.accent else theme.muted;
-                try putToneLine(writer, a, 1 + content_body_rows + line, menu_rows.lines[line], cols, tone);
+            // Shared provider palette for root, provider and model candidates.
+            for (0..popup_span) |line| {
+                const tone = if (selected_line == line) theme.accent else theme.muted;
+                try putCandidateLine(writer, a, 1 + content_body_rows + line, popup_lines[line], cols, tone, checked_mask & (@as(u16, 1) << @intCast(line)) != 0);
             }
-            if (menu_rows.can_confirm and menu_span == menu_rows.lines.len)
-                self.frame_command_generation = self.command_menu.generation;
+            if (popup_span == popup_lines.len) {
+                if (self.provider_open and provider_rows.can_confirm) self.frame_provider_generation = self.provider_picker.generation;
+                if (self.model_picker) |picker| {
+                    if (picker_rows.can_confirm) {
+                        self.frame_model_epoch = self.model_epoch;
+                        self.frame_model_generation = picker.generation;
+                    }
+                }
+                if (menu_visible and menu_rows.can_confirm) self.frame_command_generation = self.command_menu.generation;
+            }
 
             if (hint_line.len != 0) try putToneLine(writer, a, rows - 2, hint_line, cols, theme.muted);
             try putLine(writer, a, rows - 1, "", cols);
@@ -1770,12 +1837,11 @@ const Ui = struct {
                 // Only a bounded mask is copied to the frame; never format secret bytes.
                 const masks: [64]u8 = @splat('*');
                 const count = @min(self.secret.len, @min(masks.len, cols - 3));
-                const masked = try std.fmt.allocPrint(a, "API key> {s}", .{masks[0..count]});
-                try putLine(writer, a, rows, masked, cols);
+                try putInputLine(writer, a, rows, "API key> ", masks[0..count], cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols, count + 10) - 1});
             } else if (self.provider_open) {
-                try putLine(writer, a, rows, "Provider> ", cols);
+                try putInputLine(writer, a, rows, "Provider> ", "", cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols - 1, 10)});
             } else if (self.model_picker) |picker| {
@@ -1790,8 +1856,8 @@ const Ui = struct {
                 }
                 const suffix = try editorDisplay(a, picker.query.bytes.items[picker.query.cursor..]);
                 const end = fittingBytes(suffix, cols -| (decorated.len + width));
-                const line = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ decorated, prefix[start..], suffix[0..end] });
-                try putLine(writer, a, rows, line, cols);
+                const value = try std.fmt.allocPrint(a, "{s}{s}", .{ prefix[start..], suffix[0..end] });
+                try putInputLine(writer, a, rows, decorated, value, cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols, decorated.len + width + 1) - 1});
             } else {
@@ -1801,7 +1867,7 @@ const Ui = struct {
                 const trimmed = std.mem.trimStart(u8, self.editor.bytes.items, " \t\r\n");
                 const safe_model = modelCommand(trimmed) and picker_module.manualName(std.mem.trim(u8, trimmed["/model".len..], " \t"));
                 const hide_arguments = !safe_model and std.mem.startsWith(u8, trimmed, "/") and (std.mem.findScalar(u8, trimmed, ' ') != null or std.mem.findScalar(u8, trimmed, '\t') != null or std.mem.findScalar(u8, trimmed, '\r') != null or std.mem.findScalar(u8, trimmed, '\n') != null);
-                const visible: []const u8 = if (hide_arguments) "/auth [arguments hidden; no key argument]" else self.editor.bytes.items;
+                const visible: []const u8 = if (hide_arguments) "/login [arguments hidden; no key argument]" else self.editor.bytes.items;
                 const cursor = if (hide_arguments) visible.len else self.editor.cursor;
                 const begin = if (std.mem.findScalarLast(u8, visible[0..cursor], '\n')) |index| index + 1 else 0;
                 const working = self.busy or self.mode != null or self.active_tool != null;
@@ -1918,6 +1984,34 @@ fn putStyled(writer: *Io.Writer, row: usize, line: []const u8) !void {
 }
 
 /// 按终端列宽截断一行后输出：先清理控制字符，再按字素簇累计显示宽度，超出列宽即停止。
+/// Menu input prefixes are highlighted; typed text and secret masks stay in
+/// the terminal default color. Clip/sanitize before adding trusted styles.
+fn putCandidateLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, value: []const u8, columns: usize, tone: []const u8, checked: bool) !void {
+    // Candidate modules already bound display cells and sanitize identifiers.
+    // Do not reapply the generic 512-byte caption cap after adding the prefix:
+    // that could hide a previously authorized multi-byte identifier suffix.
+    const buffer = try text.sanitize(a, value, 4096);
+    defer a.free(buffer);
+    const safe = buffer[0..fittingBytes(buffer, columns)];
+    const glyph = "✓";
+    const styled = if (checked and safe.len >= 2 + glyph.len and std.mem.eql(u8, safe[2..][0..glyph.len], glyph))
+        try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}{s}{s}", .{ tone, safe[0..2], theme.success, glyph, tone, safe[2 + glyph.len ..], theme.reset })
+    else
+        try std.fmt.allocPrint(a, "{s}{s}{s}", .{ tone, safe, theme.reset });
+    defer a.free(styled);
+    try putStyled(writer, row, styled);
+}
+
+fn putInputLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, prefix: []const u8, value: []const u8, columns: usize) !void {
+    const label = try presentation.singleLine(a, prefix, columns);
+    defer a.free(label);
+    const content = try presentation.singleLine(a, value, columns -| text.width(label));
+    defer a.free(content);
+    const styled = try std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ theme.accent, label, theme.reset, content });
+    defer a.free(styled);
+    try putStyled(writer, row, styled);
+}
+
 fn putLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, line: []const u8, columns: usize) !void {
     try putToneLine(writer, a, row, line, columns, "");
 }
@@ -2150,7 +2244,7 @@ test "user thinking streaming prefixes and revised replies keep explicit gaps" {
     }
 }
 
-test "empty composer arrows browse user input but manual edits and slash tokens do not respond" {
+test "empty composer arrows browse history while slash arrows only select commands" {
     const a = std.testing.allocator;
     try text.initLocale();
     var cancel: p.Cancellation = .{};
@@ -2176,7 +2270,7 @@ test "empty composer arrows browse user input but manual edits and slash tokens 
     try std.testing.expect(ui.input_history.index == null);
     try ui.parser.feed("\x15/\x1b[B", sink);
     try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
-    try std.testing.expectEqual(command_menu_module.Command.model, ui.command_menu.choice(ui.command_matches).?);
+    try std.testing.expectEqual(command_menu_module.Command.auth, ui.command_menu.choice(ui.command_matches).?);
     try std.testing.expectEqual(@as(usize, 0), ui.scroll);
     try std.testing.expect(!ui.busy and ui.future == null); // Browsing is never submission.
     ui.wipeEditor();
@@ -2215,7 +2309,7 @@ test "idle exit reclaims only acknowledged blank tail and preserves startup and 
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    _ = try ui.add(.notice, "thin fixture-version\nDirectory: /fixture\nTime: fixture UTC");
+    _ = try ui.add(.notice, "thin fixture-version\n/fixture\nfixture UTC");
     ui.ctrl_d_exit = true;
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay("shell-kept\r\n");
@@ -2232,7 +2326,7 @@ test "idle exit reclaims only acknowledged blank tail and preserves startup and 
     try screen.replay("\r\nshell-next");
     try std.testing.expectEqual(@as(usize, 0), screen.count("Session ID:"));
     try std.testing.expect(screen.row <= 6);
-    for ([_][]const u8{ "shell-kept", "thin fixture-version", "Directory: /fixture", "Time: fixture UTC", "shell-next" }) |marker|
+    for ([_][]const u8{ "shell-kept", "thin fixture-version", "/fixture", "fixture UTC", "shell-next" }) |marker|
         try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
 
     const Denied = struct {
@@ -2271,7 +2365,7 @@ test "resume startup projects saved text and tool outcomes without replaying rea
         .{ .role = .assistant, .blocks = &.{ .{ .reasoning = "hidden old thought" }, .{ .tool_call = .{ .id = "old-call", .name = "read_file", .arguments = "{\"path\":\"old.txt\"}" } } } },
         .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "old-call", .text = "raw output must not render", .is_error = true, .canceled = true } }} },
         .{ .role = .assistant, .blocks = &.{.{ .text = "## Earlier answer" }} },
-        .{ .role = .user, .blocks = &.{.{ .text = "/auth" }} },
+        .{ .role = .user, .blocks = &.{.{ .text = "/login" }} },
     });
     try std.testing.expect(ui.has_submitted and !ui.busy and ui.future == null and !ui.secret_mode);
     try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
@@ -3736,15 +3830,28 @@ const SelectionFixture = struct {
     saved_provider: ?core_config.providers.Id = null,
     provider_hint: ?core_config.providers.Id = null,
     configured_providers: u8 = 0,
+    profiles_override: ?[]const core_config.Model = null,
+    refreshes: usize = 0,
+    metadata_changed: bool = false,
     key_matched: bool = false,
     fail: bool = false,
     const profiles = [_]core_config.Model{.{ .name = "fixture-next", .context_tokens = 65536 }};
+    fn refreshMetadata(ctx: *anyopaque) !void {
+        const self: *SelectionFixture = @ptrCast(@alignCast(ctx));
+        self.refreshes += 1;
+    }
+    fn pollMetadata(ctx: *anyopaque, idle: bool) bool {
+        const self: *SelectionFixture = @ptrCast(@alignCast(ctx));
+        if (!idle or !self.metadata_changed) return false;
+        self.metadata_changed = false;
+        return true;
+    }
     fn connection(self: *@This()) Connection {
         return .{ .context = self, .current_fn = current, .configure_fn = configure, .select_model_fn = select, .set_effort_fn = setEffort };
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .models = &profiles, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels };
+        return .{ .runtime = null, .model = self.name, .models = self.profiles_override orelse &profiles, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;
@@ -3778,6 +3885,204 @@ const SelectionFixture = struct {
     }
 };
 
+test "metadata refresh command excludes paste and revokes picker confirmation after catalog changes" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture: SelectionFixture = .{};
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.connection.refresh_models_fn = SelectionFixture.refreshMetadata;
+    ui.connection.poll_models_fn = SelectionFixture.pollMetadata;
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("/model --refresh\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.refreshes);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+    try ui.parser.feed("\x1b[200~/model --refresh\x1b[201~\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.refreshes);
+    ui.openModelPicker();
+    try ui.draw();
+    ui.finishFrame();
+    fixture.metadata_changed = true;
+    ui.pollMetadata();
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.selections);
+}
+
+test "green checked candidates preserve full multibyte IDs and configured label spacing" {
+    const a = std.testing.allocator;
+    try text.initLocale();
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    const name = try a.alloc(u8, 510);
+    defer a.free(name);
+    for (0..170) |i| @memcpy(name[i * 3 ..][0..3], "模");
+    const value = try std.fmt.allocPrint(a, "> ✓ {s}", .{name});
+    defer a.free(value);
+    try putCandidateLine(&out.writer, a, 1, value, 400, theme.accent, true);
+    try std.testing.expect(std.mem.find(u8, out.written(), name) != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), theme.success ++ "✓" ++ theme.accent) != null);
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture: SelectionFixture = .{ .provider_hint = .deepseek, .configured_providers = 1 };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openProviderPicker();
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ "✓" ++ theme.accent ++ " DeepSeek configured locally") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "DeepSeek  configured locally") == null);
+}
+
+test "menus stay above composer share colors and Left returns to acknowledged parent" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture: SelectionFixture = .{};
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.connection.configure_provider_fn = SelectionFixture.configureProvider;
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    _ = try ui.add(.assistant, "menu-prior-answer");
+    try ui.parser.feed("/", sink);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[A\r", sink); // Wrap to login, but no fresh ACK yet.
+    try std.testing.expect(!ui.provider_open and !ui.secret_mode);
+    try std.testing.expectEqual(command_menu_module.Command.auth, ui.command_menu.choice(ui.command_matches).?);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "> /login") != null);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[20], "  /model"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], "> /login"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("menu-prior-answer"));
+    try ui.parser.feed("\r", sink);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ ">   Current endpoint") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.muted ++ "    DeepSeek") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "Provider> " ++ theme.reset) != null);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[18], ">   Current endpoint"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], "    OpenCode Go"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "Provider> "));
+    try ui.parser.feed("\x1b[D\r", sink);
+    try std.testing.expect(!ui.provider_open and !ui.secret_mode);
+    try std.testing.expectEqual(command_menu_module.Command.auth, ui.command_menu.choice(ui.command_matches).?);
+    try ui.parser.feed("\x1b[B", sink); // Wrap back to model.
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ "✓" ++ theme.accent ++ " fixture-old") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.muted ++ "    fixture-next") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "Search> " ++ theme.reset) != null);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[20], "> ~ fixture-old"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], "    fixture-next"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "Search> "));
+    try ui.parser.feed("\t\x1b[5~\x1b[6~", sink);
+    try std.testing.expectEqual(@as(usize, 0), ui.model_picker.?.selected);
+    try std.testing.expectEqualStrings("", ui.model_picker.?.query.bytes.items);
+    try ui.parser.feed("\x1b[D", sink);
+    try std.testing.expect(ui.model_picker == null and ui.commandMenuVisible());
+    try std.testing.expectEqual(command_menu_module.Command.model, ui.command_menu.choice(ui.command_matches).?);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+}
+
+test "model popup shows at most ten bottom rows and keeps the selected item visible" {
+    try text.initLocale();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var profiles: [12]core_config.Model = undefined;
+    for (&profiles, 0..) |*profile, index| profile.* = .{
+        .name = try std.fmt.allocPrint(arena.allocator(), "menu-{d:0>2}", .{index}),
+        .context_tokens = 32768,
+    };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture: SelectionFixture = .{ .profiles_override = &profiles };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openModelPicker();
+    try ui.modelKey(.up);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ ">   menu-11") != null);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    var count: usize = 0;
+    for (screen.grid) |line| if (std.mem.find(u8, &line, "menu-") != null) {
+        count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 10), count);
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[12], "    menu-02"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], ">   menu-11"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "Search> "));
+}
+
+test "secret Escape cancels and Left returns to provider without leaking paste tails" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture: SelectionFixture = .{ .provider_hint = .deepseek };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.connection.configure_provider_fn = SelectionFixture.configureProvider;
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("/login\r\x1b[B", sink);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try ui.parser.feed("fake-ui-key", sink);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "API key> " ++ theme.reset) != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "fake-ui-key") == null);
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[Ddiscard-tail", sink);
+    try std.testing.expect(ui.provider_open and !ui.secret_mode and ui.secret.len == 0);
+    try std.testing.expectEqual(core_config.providers.Id.opencode_zen, ui.provider_choices.items[ui.provider_picker.selected].provider);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    for (ui.secret.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(!ui.secret_mode); // Newly reopened parent needs ACK.
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try ui.parser.feed("\x1b[200~fake-ui-key\x1b[201~\x1b[Ddiscard", sink);
+    try std.testing.expect(ui.secret_mode and !ui.provider_open);
+    try ui.parser.feed("\x1b", sink);
+    try ui.parser.expireEscape(sink);
+    try std.testing.expect(!ui.secret_mode and !ui.secret_quarantine and ui.secret.len == 0);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), fixture.provider_saves);
+    for (ui.secret.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
 test "provider auth selects Go separately and only renders masked credential bytes" {
     try text.initLocale();
     var cancel = p.Cancellation{};
@@ -3790,12 +4095,12 @@ test "provider auth selects Go separately and only renders masked credential byt
     ui.connection = fixture.connection();
     ui.connection.configure_provider_fn = SelectionFixture.configureProvider;
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
-    try ui.parser.feed("/auth\r", sink);
+    try ui.parser.feed("/login\r", sink);
     try std.testing.expect(ui.provider_open and !ui.secret_mode);
     try ui.parser.feed("\x1b[B\x1b[B\x1b[B\r", sink);
     try std.testing.expect(!ui.secret_mode); // No unseen selection authority.
     try ui.draw();
-    for ([_][]const u8{ "DeepSeek", "OpenCode Zen", "> OpenCode Go", "API key" }) |label| try std.testing.expect(std.mem.find(u8, ui.frame, label) != null);
+    for ([_][]const u8{ "DeepSeek", "OpenCode Zen", ">   OpenCode Go", "Provider> " }) |label| try std.testing.expect(std.mem.find(u8, ui.frame, label) != null);
     ui.finishFrame();
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.secret_mode and !ui.provider_open);
@@ -3824,7 +4129,7 @@ test "provider auth denies partial stale resize reopen and pasted choices" {
     ui.connection = fixture.connection();
     ui.connection.configure_provider_fn = SelectionFixture.configureProvider;
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
-    try ui.parser.feed("/auth\r", sink);
+    try ui.parser.feed("/login\r", sink);
     try ui.draw();
     try ui.parser.feed("\r", sink);
     try std.testing.expect(!ui.secret_mode);
@@ -3843,7 +4148,7 @@ test "provider auth denies partial stale resize reopen and pasted choices" {
     try ui.parser.feed("\x1b", sink);
     try ui.parser.expireEscape(sink);
     try std.testing.expect(!ui.provider_open);
-    try ui.parser.feed("/auth\r\r", sink);
+    try ui.parser.feed("/login\r\r", sink);
     try std.testing.expect(ui.provider_open and !ui.secret_mode);
     try ui.draw();
     ui.finishFrame();
@@ -3872,7 +4177,7 @@ test "provider auth requires a visible full label and save failure wipes the key
     ui.connection = fixture.connection();
     ui.connection.configure_provider_fn = SelectionFixture.configureProvider;
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
-    try ui.parser.feed("/auth\r", sink);
+    try ui.parser.feed("/login\r", sink);
     try std.testing.expectEqual(@as(usize, 3), ui.provider_choices.len);
     ui.size = .{ .columns = 12, .rows = 9 };
     try ui.draw();
@@ -3986,7 +4291,7 @@ test "effort shortcut follows declared levels and unknown or singleton sets neve
     try std.testing.expectEqual(@as(usize, 5), fixture.cycles);
 }
 
-test "slash menu suggests only model and auth and runs the highlighted command" {
+test "slash menu suggests only model and login without title or shortcut hints" {
     try text.initLocale();
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -4002,18 +4307,18 @@ test "slash menu suggests only model and auth and runs the highlighted command" 
     // Typing `/` opens the menu without executing anything.
     try ui.parser.feed("/", sink);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Commands") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Commands") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/model") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "/auth") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Type to filter; Tab complete") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/login") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Type to filter; Tab complete") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Up/Down select; Enter run") == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
     ui.finishFrame();
 
     // Case-insensitive filtering keeps only the matching entry.
-    try ui.parser.feed("AU", sink);
+    try ui.parser.feed("LO", sink);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "/auth") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/login") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/model") == null);
     ui.finishFrame();
 
@@ -4025,14 +4330,14 @@ test "slash menu suggests only model and auth and runs the highlighted command" 
     try std.testing.expect(std.mem.find(u8, ui.frame, "Commands") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Configure provider") == null);
     // The independent setup hint remains; it is not a menu item.
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Not configured: /auth") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Not configured: /login") != null);
     ui.finishFrame();
-    try ui.parser.feed("T", sink);
+    try ui.parser.feed("G", sink);
     try std.testing.expect(ui.commandMenuVisible());
     try ui.draw();
     ui.finishFrame();
 
-    // Enter runs the highlighted `/auth`, which here means entering key entry.
+    // Enter runs the highlighted `/login`, which here means entering key entry.
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.secret_mode);
     try std.testing.expect(!ui.commandMenuVisible());
@@ -4062,7 +4367,7 @@ test "slash menu enter selects the highlighted model entry" {
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
 }
 
-test "slash menu Tab completes without executing and ordinary Tab still indents" {
+test "slash menu ignores Tab while ordinary Tab still indents" {
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -4071,16 +4376,16 @@ test "slash menu Tab completes without executing and ordinary Tab still indents"
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("/", sink);
     try ui.draw();
-    // Neither a drawn-but-unacknowledged frame nor its partial output authorizes Tab.
+    // Removed menu shortcuts do nothing, before or after acknowledgement.
     ui.frame_offset = ui.frame.len / 2;
     try ui.parser.feed("\t", sink);
     try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
     ui.finishFrame();
     try ui.parser.feed("\t", sink);
-    try std.testing.expectEqualStrings("/model", ui.editor.bytes.items);
-    try std.testing.expect(ui.model_picker == null and !ui.commandMenuVisible());
+    try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
+    try std.testing.expect(ui.model_picker == null and ui.commandMenuVisible());
     try ui.draw();
-    try std.testing.expect(!ui.commandMenuVisible());
+    try std.testing.expect(ui.commandMenuVisible());
     ui.finishFrame();
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.model_picker != null);
@@ -4112,7 +4417,7 @@ test "slash menu rejects stale navigation generations and resize ABA" {
         try std.testing.expect(ui.model_picker == null and !ui.secret_mode);
         try ui.draw();
         ui.finishFrame();
-        try ui.parser.feed("a\r", sink);
+        try ui.parser.feed("lg\r", sink);
         try std.testing.expect(!ui.secret_mode); // Changed token/selection is not yet shown.
         try ui.draw();
         ui.finishFrame();
@@ -4131,9 +4436,9 @@ test "slash menu grows a short tail and cannot authorize a clipped panel" {
     ui.tail_height = 2;
     try ui.parser.feed("/", sink);
     try ui.draw();
-    try std.testing.expect(ui.frame_height >= 6);
+    try std.testing.expect(ui.frame_height >= 4);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/model") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "/auth") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/login") != null);
     ui.finishFrame();
     ui.resize(.{ .columns = 7, .rows = 6 });
     try ui.draw();
@@ -4153,7 +4458,7 @@ test "slash menu never opens for pasted arguments unknown tokens or busy session
     defer ui.deinit();
     ui.connection = fixture.connection();
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
-    try ui.parser.feed("\x1b[200~/auth\x1b[201~", sink);
+    try ui.parser.feed("\x1b[200~/login\x1b[201~", sink);
     try std.testing.expect(!ui.commandMenuVisible());
     try ui.parser.feed("\x15/Z", sink);
     try std.testing.expect(!ui.commandMenuVisible());
@@ -4182,7 +4487,7 @@ test "model picker confirms acknowledged epoch and revision preserving transcrip
     try ui.parser.feed("/model\r\x1b[B\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Select model") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Search> ") != null);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
     ui.finishFrame();
@@ -4436,8 +4741,8 @@ test "unconfigured text and slash commands never create jobs records or expose a
     defer ui.deinit();
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("hello\r", sink);
-    try std.testing.expectEqualStrings("Not configured: use /auth first", ui.notice);
-    try ui.parser.feed("/auth sk-accidental-secret", sink);
+    try std.testing.expectEqualStrings("Not configured: use /login first", ui.notice);
+    try ui.parser.feed("/login sk-accidental-secret", sink);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "sk-accidental-secret") == null);
     ui.frame_arena.?.deinit();
@@ -4448,7 +4753,7 @@ test "unconfigured text and slash commands never create jobs records or expose a
     try ui.parser.feed("/unknown\r", sink);
     try std.testing.expect(ui.future == null and !ui.busy and ui.prompt == null);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
-    try ui.parser.feed("/auth\rdiscard-command-batch-tail", sink);
+    try ui.parser.feed("/login\rdiscard-command-batch-tail", sink);
     try std.testing.expect(ui.secret_mode and ui.secret.len == 0);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
 }
@@ -4463,7 +4768,7 @@ test "secret prompt masks keys shows destination and erases cancel error and pas
     ui.connection = fixture.connection();
     defer ui.deinit();
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
-    try ui.parser.feed("/auth\r", sink);
+    try ui.parser.feed("/login\r", sink);
     try ui.parser.feed("sk-fixture-secret", sink);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "sk-fixture-secret") == null);
@@ -4475,7 +4780,7 @@ test "secret prompt masks keys shows destination and erases cancel error and pas
     try std.testing.expect(!ui.secret_mode and !fixture.configured);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
     for (ui.secret.bytes) |b| try std.testing.expectEqual(@as(u8, 0), b);
-    try ui.parser.feed("/auth\r", sink);
+    try ui.parser.feed("/login\r", sink);
     try ui.parser.feed("erase\x7f\x1b[3~", sink);
     try std.testing.expectEqualStrings("era", ui.secret.value().?);
     try ui.parser.feed("\x15", sink);
@@ -4492,7 +4797,7 @@ test "secret prompt masks keys shows destination and erases cancel error and pas
     for (ui.secret.bytes) |b| try std.testing.expectEqual(@as(u8, 0), b);
     try ui.parser.feed("\x15", sink);
     try std.testing.expect(!ui.secret_quarantine);
-    try ui.parser.feed("/auth\r", sink);
+    try ui.parser.feed("/login\r", sink);
     try ui.parser.feed("key\x04exit-tail", sink);
     try std.testing.expect(ui.want_exit and !ui.secret_mode and ui.secret.len == 0);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
@@ -4515,13 +4820,13 @@ test "configure enables same-process submit without sending secrets or commands"
     try ui.parser.feed("not-yet\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expectEqual(@as(usize, 0), runtime.messages().len);
-    try ui.parser.feed("/auth\r", sink);
+    try ui.parser.feed("/login\r", sink);
     try ui.parser.feed("\x1b[200~sk-fixture-secret\x1b[201~", sink);
     try ui.parser.feed("\rsecret-tail", sink);
     try std.testing.expectEqualStrings("Saved locally; send a message to connect", ui.notice);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Saved locally; send a message to connect") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Ctrl+U resume") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Esc closes") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "sk-fixture-secret") == null);
     ui.finishFrame();
     try std.testing.expectEqual(@as(usize, 1), fixture.saves);
@@ -4529,7 +4834,7 @@ test "configure enables same-process submit without sending secrets or commands"
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     for (ui.secret.bytes) |b| try std.testing.expectEqual(@as(u8, 0), b);
     try ui.parser.feed("\x15", sink); // Explicitly release post-paste quarantine.
-    try ui.parser.feed("/auth\r", sink);
+    try ui.parser.feed("/login\r", sink);
     try std.testing.expect(!ui.secret_mode);
     try std.testing.expectEqual(@as(usize, 1), fixture.saves);
     try ui.parser.feed("hello\r", sink);

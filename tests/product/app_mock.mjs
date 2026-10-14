@@ -485,6 +485,7 @@ async function scenario(name, protocol, kind, isPty = false) {
     // 启动参数：help 使用 --help；其它使用 --print 任务，trust 场景追加 --trust；PTY 不传参数。
     const args = kind === 'help' ? ['--help'] : ['--print','fixture-task', ...(kind==='trust'?['--trust']:[])];
 
+    const navigationConfig = kind === 'menu-navigation' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
     // 运行 CLI 或 PTY 驱动（PTY 超时 90 秒，其它 30 秒）。
     const result = await execute(isPty?pty:app, isPty?[]:args, env, project, (child, owns) => {signalChild=child; ownsChild=owns;}, isPty?90000:30000);
 
@@ -501,7 +502,7 @@ async function scenario(name, protocol, kind, isPty = false) {
 
     if (isPty && !['term','output'].includes(kind)) {
       const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
-      const silentExit = ['exit-no-submit','exit-unconfigured','exit-batched','exit-secret','exit-no-log','auth-missing','auth-empty'].includes(kind);
+      const silentExit = ['exit-no-submit','exit-unconfigured','exit-batched','exit-secret','exit-no-log','auth-missing','auth-empty','menu-navigation'].includes(kind);
       if (silentExit) assert.equal(ids.length,0, 'empty/no-log exit must not announce a session');
       else if (kind === 'model-select') assert(ids.length <= 1); // Transient unsaved profiles can refuse checkpointing.
       else assert.equal(ids.length,1, 'saved conversation must print exactly one resume command');
@@ -514,7 +515,11 @@ async function scenario(name, protocol, kind, isPty = false) {
         }
       }
     }
-    if (['exit-no-submit','exit-unconfigured','exit-secret','exit-batched'].includes(kind)) {
+    if (kind === 'menu-navigation') {
+      assert.equal(await readFile(join(home,'.thin/config.json'),'utf8'), navigationConfig, 'menu navigation changed configuration');
+      assert.deepEqual(await readdir(join(home,'.thin')), ['config.json'], 'menu navigation saved credentials');
+    }
+    if (['exit-no-submit','exit-unconfigured','exit-secret','exit-batched','menu-navigation'].includes(kind)) {
       assert.equal(requests,0, 'exit identity must not send a request');
       // The TUI seeds the project default thinking level on startup, so the
       // only allowed project artifact is the private settings file. Identity
@@ -689,6 +694,7 @@ try {
   await watchdogRegression();
   if (!watchdogOnly) {
   // 运行全部场景：先测无配置的 help 与 print，再对 chat 与 responses 运行通用场景，最后运行 PTY 场景（仅 chat）。
+  await scenario('PTY compact menu navigation','chat','menu-navigation',true);
   await scenario('PTY model/effort selection chat','chat','model-select',true);
   await scenario('PTY model/effort selection responses','responses','model-select',true);
   for (const kind of ['exit-batched','exit-no-submit','exit-no-log','exit-unconfigured','exit-secret','exit-busy','exit-busy-tool']) await scenario(`PTY/${kind}`,'chat',kind,true);

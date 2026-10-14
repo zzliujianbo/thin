@@ -6,7 +6,7 @@ const ids = @import("session_id.zig");
 /// 解析后的选项。prompt 为 null 表示交互模式；非 null 表示 --print 一次性模式。
 /// 当前 CLI 默认信任本进程的工具调用，不逐次审批；--trust 仅保留兼容。
 /// 这不是命令风险分类或沙箱，Runtime 的授权接口仍保留给嵌入调用方。
-pub const Options = struct { prompt: ?[]const u8 = null, restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, trusted: bool = true, logging: bool = true, help: bool = false, version: bool = false };
+pub const Options = struct { prompt: ?[]const u8 = null, restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, trusted: bool = true, logging: bool = true, auto_refresh_models: bool = true, help: bool = false, version: bool = false };
 
 /// 解析 argv。args[0] 是程序名，因此从 1 开始遍历。
 /// 无效参数返回错误（InvalidArguments、UnknownOption），由调用方决定如何提示。
@@ -18,7 +18,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         // --print 要求后面紧跟一个 prompt，且不允许重复指定，避免静默覆盖。
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) result.help = true else if (std.mem.eql(u8, arg, "--version")) result.version = true else if (std.mem.eql(u8, arg, "--trust")) result.trusted = true else if (std.mem.eql(u8, arg, "--no-log")) result.logging = false else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) result.help = true else if (std.mem.eql(u8, arg, "--version")) result.version = true else if (std.mem.eql(u8, arg, "--trust")) result.trusted = true else if (std.mem.eql(u8, arg, "--no-log")) result.logging = false else if (std.mem.eql(u8, arg, "--no-model-auto-refresh")) result.auto_refresh_models = false else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
             if (result.prompt != null or i + 1 >= args.len) return error.InvalidArguments;
             i += 1;
             result.prompt = args[i];
@@ -48,7 +48,7 @@ pub const help =
     \\
     \\Configuration: ~/.thin/config.json
     \\Interactive startup initializes a missing/empty file for DeepSeek (deepseek-flash).
-    \\Use /auth in the TUI for hidden key entry; the key is saved locally with mode 0600.
+    \\Use /login in the TUI for hidden key entry; the key is saved locally with mode 0600.
     \\Never put a key in chat or command arguments. Saving does not send an API request.
     \\Existing nonempty configurations are preserved. Advanced configuration example:
     \\  {"provider":{"base_url":"https://your-provider.example/v1",
@@ -63,7 +63,7 @@ pub const help =
     \\Committed output remains after exit; only the live input/status area is redrawn.
     \\Context percentage shows the latest provider-reported request total, not cumulative use.
     \\A fresh session starts at 0.0%; unreported usage shows ?. Safety budgets still use estimates.
-    \\Startup shows the current directory, Thin version and local time with UTC offset.
+    \\Startup shows three lines: Thin version, directory, local time with UTC offset.
     \\Enter sends; Ctrl+J adds newline; Esc or Ctrl+C cancels the current task; Ctrl+D exits.
     \\Up/Down browse this session's submitted inputs only from an empty composer.
     \\Manual edits stop browsing; navigation never submits. Keyboard recall is session-local.
@@ -72,7 +72,18 @@ pub const help =
     \\Empty chats and --no-log exits print no session information or resume command.
     \\Run the resume command from the same project with the current Thin version on PATH.
     \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning; Shift+Tab cycles supported effort.
+    \\/ opens /model and /login choices; Up/Down wraps, Enter confirms (no Tab shortcut).
+    \\Pickers: Up/Down selects, Enter confirms, Left returns, Esc cancels; at most 10 rows.
+    \\Tab and PgUp/PgDn are not picker shortcuts. Esc also clears secret-paste quarantine.
     \\/model opens a searchable picker; /model exact-id selects directly while idle.
+    \\/model --refresh refreshes official context metadata for configured providers.
+    \\First eligible interactive startup tries each configured provider once; failures do not auto-retry.
+    \\--no-model-auto-refresh disables that automatic attempt (manual refresh remains available).
+    \\Cache: ~/.thin/model-metadata.json. Only official /models endpoints; no third-party data.
+    \\Missing official capacities retain defaults. Explicit local profiles take precedence.
+    \\K/M are decimal token units; official/default is the capacity source, not actual usage.
+    \\Green checks mean current model or credentials saved locally, not a verified online login.
+    \\Refresh does not change the active budget; cached capacities apply on model selection.
     \\Model selection is session-only. Effort is saved per startup project, not globally.
     \\Optional models:[{name,context_tokens,protocol,reasoning_effort,reasoning}] profiles
     \\share the endpoint (maximum 64); a custom ID inherits current context/options.
@@ -93,7 +104,7 @@ pub const help =
     \\Project Memory: <startup directory>/.thin/mem/*.md, changed through memory tools.
     \\Session records: <startup directory>/.thin/sessions/*.jsonl (local plaintext, 0600).
     \\Recording starts on the first submitted message; --no-log disables it for this run.
-    \\Records include messages, tools, stages, usage and errors, not /auth input,
+    \\Records include messages, tools, stages, usage and errors, not /login input,
     \\hidden reasoning or native replay. The configured key is redacted; other sensitive
     \\content may remain. Records are not restored or automatically sent to the provider.
     \\Large fields are explicitly truncated/omitted; files rotate without deleting old records.
@@ -156,6 +167,8 @@ test "CLI tools are trusted by default and print requires a prompt" {
     try std.testing.expect((try parse(&.{ "thin", "--no-log" })).trusted);
     try std.testing.expect(std.mem.indexOf(u8, help, "run without approval prompts") != null);
     try std.testing.expect((try parse(&.{"thin"})).logging);
+    try std.testing.expect((try parse(&.{"thin"})).auto_refresh_models);
+    try std.testing.expect(!(try parse(&.{ "thin", "--no-model-auto-refresh" })).auto_refresh_models);
     try std.testing.expect(!(try parse(&.{ "thin", "--no-log" })).logging);
     try std.testing.expect(!(try parse(&.{ "thin", "--print", "hello", "--no-log" })).logging);
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--print" }));

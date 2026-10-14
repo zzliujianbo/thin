@@ -5,8 +5,9 @@
 const std = @import("std");
 const line_stats = @import("../util/line_stats.zig");
 
-/// 文本读取结果：data 为截取后的内容（由 allocator 复制），total_bytes 为文件总字节数，truncated 表示之后仍有未返回的内容。
-pub const ReadResult = struct { data: []const u8, total_bytes: u64, truncated: bool };
+/// 文本读取结果：data 为独立复制的内容，offset 为字符对齐后的真实字节起点。
+/// total_bytes 为文件总字节数，truncated 表示之后仍有未返回的内容。
+pub const ReadResult = struct { data: []const u8, offset: u64, total_bytes: u64, truncated: bool };
 
 /// Linux x86_64 系统调用与 O_* 标志的本地声明（数值与 fcntl.h 一致）。
 pub const linux = struct {
@@ -178,7 +179,8 @@ pub const Root = struct {
         return .{ .fd = fd, .name = try self.allocator.dupeSentinel(u8, current, 0), .allocator = self.allocator };
     }
 
-    /// 从 offset 字节处读取最多 limit 字节的 UTF-8 文本，结果按完整字符截断，并校验文本合法性。
+    /// 从 offset 附近读取最多 limit 字节的 UTF-8 文本。字符内部的起点最多向前
+    /// 对齐 3 字节，返回真实 offset；末尾按完整字符截断，非法文本仍然拒绝。
     pub fn read(self: *Root, allocator: std.mem.Allocator, path: []const u8, offset: u64, limit: usize) !ReadResult {
         var p = try self.parent(path);
         defer p.deinit();
@@ -193,23 +195,39 @@ pub const Root = struct {
         if (stat.kind != .file) return error.NotRegularFile;
         if (offset > stat.size or offset > std.math.maxInt(i64)) return error.InvalidOffset;
 
-        // 多取 3 字节：UTF-8 一个字符最长 4 字节，因此可以完整解码 limit 处被切开的末尾字符。
-        const count: usize = @intCast(@min(stat.size - offset, @as(u64, std.math.add(usize, limit, 3) catch return error.InvalidLimit)));
+        // One bounded read includes up to 3 lookbehind bytes and 3 lookahead
+        // bytes. Alignment and validation use the same fd and byte buffer.
+        const before: usize = @intCast(@min(offset, 3));
+        const window_offset = offset - before;
+        const capacity = std.math.add(usize, limit, before + 3) catch return error.InvalidLimit;
+        const count: usize = @intCast(@min(stat.size - window_offset, @as(u64, capacity)));
         const buffer = try allocator.alloc(u8, count);
         defer allocator.free(buffer);
 
         // 读到的字节数与 stat 不符，说明文件在读取过程中被修改。
-        const n = try file.readPositionalAll(self.io, buffer, offset);
+        const n = try file.readPositionalAll(self.io, buffer, window_offset);
         if (n != count) return error.FileChanged;
-        // Even a zero-byte request must not accept an offset into a continuation byte.
-        if (n > 0) _ = std.unicode.utf8ByteSequenceLength(buffer[0]) catch return error.InvalidUtf8;
+        var start = before;
+        if (start < n) {
+            while (start > 0 and buffer[start] & 0xc0 == 0x80) start -= 1;
+            const width = std.unicode.utf8ByteSequenceLength(buffer[start]) catch return error.InvalidUtf8;
+            // A stray continuation byte must not attach to an earlier ASCII or
+            // already-complete character. Never skip malformed bytes forward.
+            if (width <= before - start) return error.InvalidUtf8;
+            if (start < before) {
+                if (width > n - start) return error.InvalidUtf8;
+                try validateText(buffer[start..][0..width]);
+            }
+        }
+        const text = buffer[start..n];
+        const actual_offset = window_offset + start;
 
         // 逐个 UTF-8 字符校验并累加；超过 limit 的字符不返回。若第一个字符本身就超限，说明 limit 太小。
         var end: usize = 0;
-        while (end < @min(limit, n)) {
-            const width = std.unicode.utf8ByteSequenceLength(buffer[end]) catch return error.InvalidUtf8;
-            if (width > n - end) return error.InvalidUtf8;
-            try validateText(buffer[end..][0..width]);
+        while (end < @min(limit, text.len)) {
+            const width = std.unicode.utf8ByteSequenceLength(text[end]) catch return error.InvalidUtf8;
+            if (width > text.len - end) return error.InvalidUtf8;
+            try validateText(text[end..][0..width]);
             if (width > limit - end) {
                 if (end == 0 and limit != 0) return error.ReadLimitTooSmall;
                 break;
@@ -218,7 +236,7 @@ pub const Root = struct {
         }
 
         // truncated 表示返回的结束位置仍未到文件末尾。
-        return .{ .data = try allocator.dupe(u8, buffer[0..end]), .total_bytes = stat.size, .truncated = offset + end < stat.size };
+        return .{ .data = try allocator.dupe(u8, text[0..end]), .offset = actual_offset, .total_bytes = stat.size, .truncated = actual_offset + end < stat.size };
     }
     /// 以默认权限原子写入文本文件；overwrite 为 false 时目标已存在则失败。
     pub fn write(self: *Root, path: []const u8, content: []const u8, overwrite: bool) !void {
@@ -336,8 +354,15 @@ test "root reads writes ranges text and failed overwrite" {
     try std.testing.expect(r.truncated);
     try std.testing.expectEqual(@as(u64, 8), r.total_bytes);
     try std.testing.expectError(error.ReadLimitTooSmall, root.read(a, "a", 1, 1));
-    try std.testing.expectError(error.InvalidUtf8, root.read(a, "a", 2, 4));
-    try std.testing.expectError(error.InvalidUtf8, root.read(a, "a", 2, 0));
+    const aligned = try root.read(a, "a", 2, 4);
+    defer a.free(aligned.data);
+    try std.testing.expectEqualStrings("中", aligned.data);
+    try std.testing.expectEqual(@as(u64, 1), aligned.offset);
+    const aligned_zero = try root.read(a, "a", 2, 0);
+    defer a.free(aligned_zero.data);
+    try std.testing.expectEqual(@as(usize, 0), aligned_zero.data.len);
+    try std.testing.expectEqual(@as(u64, 1), aligned_zero.offset);
+    try std.testing.expect(aligned_zero.truncated);
     const zero = try root.read(a, "a", 0, 0);
     defer a.free(zero.data);
     try std.testing.expectEqual(@as(usize, 0), zero.data.len);
@@ -366,6 +391,77 @@ test "root reads writes ranges text and failed overwrite" {
     try tmp.dir.writeFile(io, .{ .sub_path = "invalid", .data = "\xff" });
     try std.testing.expectError(error.BinaryFile, root.read(a, "binary", 0, 100));
     try std.testing.expectError(error.InvalidUtf8, root.read(a, "invalid", 0, 100));
+}
+
+test "root UTF8 ranges align every character byte and paginate without loss" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(a, io, tmp.dir);
+    defer root.deinit();
+    const text = "aé中😀z";
+    try root.write("text", text, false);
+    const boundaries = [_]usize{ 0, 1, 3, 6, 10, 11 };
+    for (boundaries[0 .. boundaries.len - 1], boundaries[1..]) |first, next| {
+        for (first..next) |offset| {
+            const result = try root.read(a, "text", offset, 64);
+            defer a.free(result.data);
+            try std.testing.expectEqual(first, result.offset);
+            try std.testing.expectEqualStrings(text[first..], result.data);
+            try std.testing.expect(!result.truncated);
+        }
+    }
+    var offset: u64 = 0;
+    var collected: std.ArrayList(u8) = .empty;
+    defer collected.deinit(a);
+    for (boundaries[2..]) |next| {
+        const page = try root.read(a, "text", offset, 4);
+        defer a.free(page.data);
+        try std.testing.expectEqual(offset, page.offset);
+        try std.testing.expect(page.data.len > 0 and page.data.len <= 4);
+        offset = page.offset + page.data.len;
+        try std.testing.expectEqual(next, offset);
+        try std.testing.expectEqual(offset < text.len, page.truncated);
+        try collected.appendSlice(a, page.data);
+    }
+    try std.testing.expectEqualStrings(text, collected.items);
+    const eof = try root.read(a, "text", text.len, 4);
+    defer a.free(eof.data);
+    try std.testing.expectEqual(@as(u64, text.len), eof.offset);
+    try std.testing.expectEqual(@as(usize, 0), eof.data.len);
+    try std.testing.expect(!eof.truncated);
+    try std.testing.expectError(error.InvalidOffset, root.read(a, "text", std.math.maxInt(u64), 4));
+    try std.testing.expectError(error.InvalidLimit, root.read(a, "text", 1, std.math.maxInt(usize)));
+    for (7..10) |inside| try std.testing.expectError(error.ReadLimitTooSmall, root.read(a, "text", inside, 3));
+
+    // Same byte parameters as the reported failure, without reading any session.
+    var source: [240]u8 = @splat('b');
+    @memset(source[0..37], 'a');
+    @memcpy(source[37..40], "中");
+    try root.write("source", &source, false);
+    const range = try root.read(a, "source", 39, 120);
+    defer a.free(range.data);
+    try std.testing.expectEqual(@as(u64, 37), range.offset);
+    try std.testing.expectEqualStrings(source[37..157], range.data);
+    try std.testing.expect(range.truncated);
+}
+
+test "root UTF8 alignment never repairs malformed text or admits binary bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(a, io, tmp.dir);
+    defer root.deinit();
+    for ([_][]const u8{ "a\x80z", "\x80\x80\x80\x80z", "\xc0\xafz", "\xed\xa0\x80z", "\xf4\x90\x80\x80z", "\xe4\xb8", "\xf0\x9f\x98" }) |invalid| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "invalid", .data = invalid });
+        for ([_]usize{ 0, 4, 64 }) |limit| {
+            try std.testing.expectError(error.InvalidUtf8, root.read(a, "invalid", 1, limit));
+        }
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary", .data = "中\x00" });
+    try std.testing.expectError(error.BinaryFile, root.read(a, "binary", 1, 64));
 }
 
 test "root duplicate retains replaced inode and independent ownership" {

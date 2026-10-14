@@ -85,11 +85,12 @@ pub const Parser = struct {
         if (self.secret) try sink.emit(.{ .text = .{ .value = "\x00", .pasted = self.pasted } });
     }
 
-    /// UI-owned ambiguity timeout for a standalone Escape. Never turns a
-    /// partial CSI, secret or pasted escape into a command/approval event.
+    /// UI-owned ambiguity timeout for a standalone Escape, including canceling
+    /// secret entry. Partial CSI and pasted/batch-tail escapes never navigate.
     pub fn expireEscape(self: *Parser, sink: Sink) !void {
-        if (self.escape_len != 1 or self.pasted or self.secret) return;
+        if (self.escape_len != 1 or self.pasted or (self.secret and self.secret_batch_paste)) return;
         self.escape_len = 0;
+        std.crypto.secureZero(u8, &self.escape);
         try sink.emit(.escape);
     }
 
@@ -432,7 +433,7 @@ test "pasted CRLF requires immediate byte adjacency across feeds" {
     }
 }
 
-test "split ShiftTab and Escape expiry never activate pasted or secret settings" {
+test "split ShiftTab cannot change secret settings and only fresh Escape cancels" {
     var record = Record{};
     var parser = Parser{};
     const sink = Sink{ .context = &record, .emit_fn = Record.event };
@@ -453,7 +454,18 @@ test "split ShiftTab and Escape expiry never activate pasted or secret settings"
     try parser.feed("\x1b", sink);
     try parser.expireEscape(sink);
     try std.testing.expectEqual(@as(usize, 4), record.cycles);
-    try std.testing.expectEqual(@as(usize, 1), record.escapes);
+    try std.testing.expectEqual(@as(usize, 2), record.escapes);
+    try parser.feed("\x1b[200~key\x1b[201~\x1b", sink);
+    try parser.expireEscape(sink);
+    try std.testing.expectEqual(@as(usize, 2), record.escapes);
+    parser.secretMode(true);
+    try parser.feed("\x1b[200~\x1b", sink);
+    try parser.expireEscape(sink);
+    try std.testing.expectEqual(@as(usize, 2), record.escapes);
+    parser.secretMode(true);
+    try parser.feed("\x1b[", sink);
+    try parser.expireEscape(sink);
+    try std.testing.expectEqual(@as(usize, 2), record.escapes);
 }
 
 // 验证 Editor 的字形簇边界与输入长度上限。

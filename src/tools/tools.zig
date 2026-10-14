@@ -15,7 +15,7 @@ const runtime = @import("../core/runtime.zig");
 pub const schemas = [_]p.ToolSchema{
     .{
         .name = "read_file",
-        .description = "Read a UTF-8 file inside the startup project. offset is a byte offset. Output is bounded; use another range when truncated.",
+        .description = "Read a UTF-8 file inside the startup project. offset is a zero-based BYTE offset and limit is a BYTE count, NOT line numbers. A start inside a character rounds back at most 3 bytes; offset in the result is the actual start. Output is bounded; continue with returned next_offset when truncated.",
         .parameters_json =
         \\{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}
         ,
@@ -265,13 +265,13 @@ pub const Tools = struct {
                 // truncated 时 next_offset 指向下一段起点，模型可据此继续分页读取。
                 const result = try self.root.read(a, r.path, r.offset, r.limit orelse self.config.limits.read_bytes);
                 try j.put(a, &value, "path", j.str(r.path));
-                try j.put(a, &value, "offset", try j.number(r.offset));
+                try j.put(a, &value, "offset", try j.number(result.offset));
                 try j.put(a, &value, "bytes_read", try j.number(result.data.len));
-                try j.put(a, &value, "next_offset", try j.number(r.offset + result.data.len));
+                try j.put(a, &value, "next_offset", try j.number(result.offset + result.data.len));
                 try j.put(a, &value, "file_bytes", try j.number(result.total_bytes));
                 try j.put(a, &value, "truncated", .{ .bool = result.truncated });
                 try j.put(a, &value, "content", j.str(result.data));
-                return .{ .text = try j.encode(a, value), .truncated = result.truncated, .file_stats = .{ .read = @import("../util/line_stats.zig").count(result.data), .partial = r.offset != 0 or result.truncated } };
+                return .{ .text = try j.encode(a, value), .truncated = result.truncated, .file_stats = .{ .read = @import("../util/line_stats.zig").count(result.data), .partial = result.offset != 0 or result.truncated } };
             },
 
             .write_file => |w| {

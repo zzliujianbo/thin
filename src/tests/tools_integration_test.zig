@@ -158,6 +158,32 @@ test "actual file and command tool results preserve UTF8 and exact continuation 
     try std.testing.expectEqual(@as(?u64, 3), j.uint(j.get(value, "bytes_read")));
     try std.testing.expectEqual(@as(?u64, 4), j.uint(j.get(value, "next_offset")));
 
+    // Every interior byte of a four-byte character gives the same true range.
+    try root.write("wide", "a😀中z", false);
+    for (2..5) |inside| {
+        const aligned = try tools.execute(temp, .{ .read_file = .{ .path = "wide", .offset = inside, .limit = 4 } }, &cancel);
+        const aligned_value = try j.parse(temp, aligned.text);
+        try std.testing.expectEqualStrings("😀", j.string(j.get(aligned_value, "content")).?);
+        try std.testing.expectEqual(@as(?u64, 1), j.uint(j.get(aligned_value, "offset")));
+        try std.testing.expectEqual(@as(?u64, 4), j.uint(j.get(aligned_value, "bytes_read")));
+        const next = j.uint(j.get(aligned_value, "next_offset")).?;
+        try std.testing.expectEqual(@as(u64, 5), next);
+        try std.testing.expect(aligned.truncated and aligned.file_stats.?.partial);
+        const tail = try tools.execute(temp, .{ .read_file = .{ .path = "wide", .offset = next, .limit = 4 } }, &cancel);
+        const tail_value = try j.parse(temp, tail.text);
+        try std.testing.expectEqualStrings("中z", j.string(j.get(tail_value, "content")).?);
+        try std.testing.expectEqual(@as(?u64, 9), j.uint(j.get(tail_value, "next_offset")));
+        try std.testing.expect(!tail.truncated);
+    }
+    // Reporting [partial] must also use the actual range, not the input offset.
+    try root.write("first", "中😀a", false);
+    const full = try tools.execute(temp, .{ .read_file = .{ .path = "first", .offset = 1, .limit = 64 } }, &cancel);
+    const full_value = try j.parse(temp, full.text);
+    try std.testing.expectEqualStrings("中😀a", j.string(j.get(full_value, "content")).?);
+    try std.testing.expectEqual(@as(?u64, 0), j.uint(j.get(full_value, "offset")));
+    try std.testing.expectEqual(@as(?u64, 8), j.uint(j.get(full_value, "next_offset")));
+    try std.testing.expect(!full.truncated and !full.file_stats.?.partial);
+
     // Test author explicitly approves this fixed, harmless local command.
     const command = try tools.execute(temp, .{ .bash = .{ .command = "printf '你好\\n'" } }, &cancel);
     try std.testing.expect(!command.is_error and !command.cleanup_failed);

@@ -215,6 +215,50 @@ test "thinking runtime normal and summary requests map current model" {
     try std.testing.expect(req.thinking == null);
 }
 
+test "runtime checkpoint exports capacity and restore rejects mismatch without config mutation" {
+    const Stub = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            return error.UnexpectedRequest;
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !Prepared {
+            return error.UnexpectedTool;
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: Prepared, _: *const p.Cancellation) !Execution {
+            return error.UnexpectedTool;
+        }
+    };
+    var dummy: u8 = 0;
+    var config: cfg.Config = .{ .provider = .{ .base_url = "http://unused.invalid" }, .model = .{ .name = "test", .context_tokens = 65536, .protocol = .chat } };
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "original", false);
+    defer runtime.deinit();
+    var state = try runtime.checkpoint();
+    try std.testing.expectEqual(@as(?u32, 65536), state.context_tokens);
+    try std.testing.expect(!state.context_official);
+    const original_system = try std.testing.allocator.dupe(u8, runtime.system);
+    defer std.testing.allocator.free(original_system);
+    state.system = "restored";
+    state.context_tokens = 32768;
+    state.context_official = true;
+    try std.testing.expectError(error.ContextBudgetMismatch, runtime.restoreCheckpoint(state));
+    try std.testing.expectEqual(@as(u32, 65536), config.model.context_tokens);
+    try std.testing.expectEqualStrings(original_system, runtime.system);
+    try std.testing.expectEqual(@as(usize, 0), runtime.messages().len);
+    state.context_tokens = 65536;
+    try runtime.restoreCheckpoint(state);
+    try std.testing.expectEqual(@as(u32, 65536), config.model.context_tokens);
+    try std.testing.expectEqualStrings("restored", runtime.system);
+    const restored = try runtime.checkpoint();
+    try std.testing.expectEqual(state.context_tokens, restored.context_tokens);
+    // Provenance belongs to Session rather than mutable Runtime state.
+    try std.testing.expect(!restored.context_official);
+    state.context_tokens = null;
+    state.context_official = false;
+    state.system = "legacy";
+    try runtime.restoreCheckpoint(state);
+    try std.testing.expectEqual(@as(u32, 65536), config.model.context_tokens);
+    try std.testing.expectEqualStrings("legacy", runtime.system);
+}
+
 test "selection preserves canonical history and closes retained auto fallback" {
     const Stub = struct {
         fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
@@ -496,6 +540,7 @@ pub const Runtime = struct {
             .selector = self.selector,
             .estimator = self.estimator,
             .last_context_tokens = self.last_context_tokens,
+            .context_tokens = self.config.model.context_tokens,
             .permission_id = self.permission_id,
         };
         try @import("checkpoint.zig").validate(self.allocator, state, self.config.*, self.executor.schemas);

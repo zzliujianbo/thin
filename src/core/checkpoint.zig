@@ -20,6 +20,11 @@ pub const State = struct {
     selector: llm.Selector,
     estimator: context.Estimator,
     last_context_tokens: ?u64,
+    /// Selected capacity; absent in legacy payloads. Apply after authentication
+    /// and before Runtime construction, never from diagnostic metadata.
+    context_tokens: ?u32 = null,
+    /// UI provenance only; the parent Session owns saving/restoring this flag.
+    context_official: bool = false,
     permission_id: u64,
     poisoned: bool = false,
     /// Observer continuity only; the Runtime never treats these as authority.
@@ -164,6 +169,9 @@ fn utf8(s: []const u8) !void {
 
 fn basic(state: State) !void {
     if (state.version != 1) return error.UnsupportedVersion;
+    if (state.context_tokens) |tokens| {
+        if (tokens == 0 or tokens > 16 * 1024 * 1024) return error.InvalidContextTokens;
+    } else if (state.context_official) return error.InvalidContextSource;
     try utf8(state.system);
     if (state.messages.len > 1024) return error.InputLimit;
     var blocks: usize = 0;
@@ -194,6 +202,9 @@ fn basic(state: State) !void {
 pub fn validate(a: Allocator, state: State, config: cfg.Config, schemas: []const p.ToolSchema) !void {
     _ = try encodedSize(state);
     if (state.poisoned) return error.PoisonedCheckpoint;
+    if (state.context_tokens) |tokens| {
+        if (tokens != config.model.context_tokens) return error.ContextBudgetMismatch;
+    }
     if (state.estimator.per_mille < 1000) return error.InvalidEstimator;
     const selector = state.selector;
     if (selector.configured != config.model.protocol or selector.selected == .auto or
@@ -384,6 +395,73 @@ test "checkpoint tagged union exact Chat and Responses roundtrip and opaque repl
         defer std.testing.allocator.free(again);
         try std.testing.expectEqualStrings(bytes, again);
         try validate(std.testing.allocator, parsed.value, fixture_config, &.{});
+    }
+}
+
+test "checkpoint legacy missing capacity and explicit defaults remain accepted" {
+    const a = std.testing.allocator;
+    const original = fixture(.chat);
+    const bytes = try encode(a, original);
+    defer a.free(bytes);
+    const legacy = try std.mem.replaceOwned(u8, a, bytes, "\"context_tokens\":null,\"context_official\":false,", "");
+    defer a.free(legacy);
+    try std.testing.expect(legacy.len < bytes.len);
+    for ([_][]const u8{ bytes, legacy }) |payload| {
+        const parsed = try decode(a, payload);
+        defer parsed.deinit();
+        try std.testing.expectEqualDeep(original, parsed.value);
+        try validate(a, parsed.value, fixture_config, &.{});
+    }
+}
+
+test "checkpoint capacity bounds and provenance require valid capacity" {
+    const a = std.testing.allocator;
+    var state = fixture(.chat);
+    for ([_]u32{ 0, 16 * 1024 * 1024 + 1, std.math.maxInt(u32) }) |tokens| {
+        state.context_tokens = tokens;
+        try std.testing.expectError(error.InvalidContextTokens, encode(a, state));
+        try std.testing.expectError(error.InvalidContextTokens, validate(a, state, fixture_config, &.{}));
+    }
+    state.context_tokens = null;
+    state.context_official = true;
+    try std.testing.expectError(error.InvalidContextSource, encode(a, state));
+    try std.testing.expectError(error.InvalidContextSource, validate(a, state, fixture_config, &.{}));
+    const bytes = try encode(a, fixture(.chat));
+    defer a.free(bytes);
+    for ([_][]const u8{ "\"context_tokens\":0", "\"context_tokens\":16777217", "\"context_tokens\":\"32768\"", "\"context_tokens\":1.0", "\"context_tokens\":-1" }) |replacement| {
+        const bad = try std.mem.replaceOwned(u8, a, bytes, "\"context_tokens\":null", replacement);
+        defer a.free(bad);
+        try badDecode(bad);
+    }
+    const bad_source = try std.mem.replaceOwned(u8, a, bytes, "\"context_official\":false", "\"context_official\":true");
+    defer a.free(bad_source);
+    try std.testing.expectError(error.InvalidContextSource, decode(a, bad_source));
+}
+
+test "checkpoint exact capacity provenance roundtrip and config match preserve validation" {
+    const a = std.testing.allocator;
+    inline for (.{ p.Protocol.chat, p.Protocol.responses }) |proto| {
+        for ([_]u32{ 1, 65536, 16 * 1024 * 1024 }) |tokens| {
+            for ([_]bool{ false, true }) |official| {
+                var state = fixture(proto);
+                state.context_tokens = tokens;
+                state.context_official = official;
+                const bytes = try encode(a, state);
+                defer a.free(bytes);
+                const parsed = try decode(a, bytes);
+                defer parsed.deinit();
+                try std.testing.expectEqualDeep(state, parsed.value);
+                try std.testing.expectError(error.ContextBudgetMismatch, validate(a, parsed.value, fixture_config, &.{}));
+                var config = fixture_config;
+                config.model.context_tokens = tokens;
+                try validate(a, parsed.value, config, &.{});
+                state.estimator.per_mille = 999;
+                try std.testing.expectError(error.InvalidEstimator, validate(a, state, config, &.{}));
+                state.estimator = parsed.value.estimator;
+                state.messages = state.messages[0..3];
+                try std.testing.expectError(error.IncompleteToolGroup, validate(a, state, config, &.{}));
+            }
+        }
     }
 }
 

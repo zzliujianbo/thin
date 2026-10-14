@@ -22,7 +22,7 @@ pub fn banner(a: std.mem.Allocator, directory: []const u8, seconds: i64) ![]cons
         if (length == 0) break :blk "unavailable";
         break :blk time[0..length];
     };
-    return std.fmt.allocPrint(a, "{s}\nDirectory: {s}\nTime: {s}", .{ version.text, safe, stamp });
+    return std.fmt.allocPrint(a, "{s}\n{s}\n{s}", .{ version.text, safe, stamp });
 }
 
 test "startup shows Thin version safe directory and local timezone offset" {
@@ -30,8 +30,9 @@ test "startup shows Thin version safe directory and local timezone offset" {
     try @import("text.zig").initLocale();
     const value = try banner(a, "/tmp/project\nspoof\t\x1b[31m", 0);
     defer a.free(value);
-    try std.testing.expect(std.mem.startsWith(u8, value, version.text ++ "\nDirectory: /tmp/project spoof "));
-    try std.testing.expect(std.mem.find(u8, value, "\nTime: ") != null);
+    try std.testing.expect(std.mem.startsWith(u8, value, version.text ++ "\n/tmp/project spoof "));
+    try std.testing.expect(std.mem.find(u8, value, "Directory: ") == null);
+    try std.testing.expect(std.mem.find(u8, value, "Time: ") == null);
     try std.testing.expect(value[value.len - 5] == '+' or value[value.len - 5] == '-');
     for (value[value.len - 4 ..]) |digit| try std.testing.expect(digit >= '0' and digit <= '9');
     try std.testing.expect(std.mem.findScalar(u8, value, 0x1b) == null);
@@ -47,5 +48,5 @@ test "startup shows Thin version safe directory and local timezone offset" {
     }
     const unavailable = try banner(a, "/project", -1);
     defer a.free(unavailable);
-    try std.testing.expect(std.mem.endsWith(u8, unavailable, "Time: unavailable"));
+    try std.testing.expect(std.mem.eql(u8, unavailable, version.text ++ "\n/project\nunavailable"));
 }
