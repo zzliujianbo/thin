@@ -187,7 +187,7 @@ pub const Bridge = struct {
 
     /// 返回运行时使用的 Host 接口，其上下文指向本 Bridge。
     pub fn host(self: *Bridge) r.Host {
-        return .{ .context = self, .emit_fn = emit, .authorize_fn = authorize };
+        return .{ .context = self, .emit_fn = emit, .authorize_fn = authorize, .rebase_permission_fn = rebasePermissionIds };
     }
 
     /// 从 Host 的上下文指针还原出 Bridge。
@@ -297,8 +297,9 @@ pub const Bridge = struct {
         self.outstanding += 1;
     }
 
-    /// 权限确认入口（工作线程调用）。登记 pending 请求后轮询，直到 UI 调用 decide 作出回答；
-    /// 若被取消、断开或请求已被替换，则返回 deny。
+    /// 权限确认入口（工作线程调用）。登记 pending 请求后轮询，直到 UI 调用 decide 作出回答。
+    /// 取消令牌已置位且用户尚未表态时返回 `error.Canceled`（工具不执行，也不记成 deny）。
+    /// 断开或请求已被替换时仍返回 deny：没有新的用户允许，工具不执行。
     fn authorize(ctx: ?*anyopaque, permission: r.Permission, cancel: *const p.Cancellation) anyerror!r.Decision {
         const self = from(ctx);
         self.lock();
@@ -314,30 +315,46 @@ pub const Bridge = struct {
 
         while (true) {
             self.lock();
-            if (self.stopped(cancel)) {
-                self.clearPermission();
-                self.unlock();
-                return .deny;
-            }
-            if (self.pending != permission.id) {
-                self.unlock();
-                return .deny;
-            }
-            if (self.answer) |answer| {
-                self.clearPermission();
-                self.unlock();
-                return answer;
+            // Only this request's decision counts. A leftover answer for another
+            // id must not be reused, and cancel is not a user deny.
+            if (self.pending == permission.id) {
+                if (self.answer) |answer| {
+                    self.clearPermission();
+                    self.unlock();
+                    return answer;
+                }
+                if (self.cancel.isRequested() or cancel.isRequested()) {
+                    self.clearPermission();
+                    self.unlock();
+                    return error.Canceled;
+                }
+                if (!self.disconnected) {
+                    self.unlock();
+                    try self.pause();
+                    continue;
+                }
             }
             self.unlock();
-            try self.pause();
+            return .deny;
         }
+    }
+
+    /// Drop the permission high-water mark so the runtime can start a new epoch
+    /// after u64 exhaustion. Refuses while a request is still pending, so a stale
+    /// decision cannot approve the first id of the new epoch.
+    fn rebasePermissionIds(ctx: ?*anyopaque) anyerror!void {
+        const self = from(ctx);
+        self.lock();
+        defer self.unlock();
+        if (self.pending != null) return error.PermissionPending;
+        self.last_id = null;
     }
 
     /// UI 对权限请求 id 作出决定。仅当 id 与 pending 匹配且尚未回答时返回 true。
     pub fn decide(self: *Bridge, id: u64, decision: r.Decision) bool {
         self.lock();
         defer self.unlock();
-        // 中文：已停止时清除请求，使 authorize 下一次轮询即返回 deny。
+        // 已停止时清除请求。取消令牌使 authorize 返回 Canceled；仅断开且未取消时才是 deny。
         if (self.stopped(self.cancel)) {
             self.clearPermission();
             return false;

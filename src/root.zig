@@ -67,7 +67,7 @@ test {
     _ = @import("app/provider_catalog.zig");
     _ = @import("core/providers.zig");
     _ = @import("app/log_store.zig");
-    _ = @import("app/selection_store.zig");
+    _ = @import("app/selection.zig");
     _ = @import("app/resume_codec.zig");
     _ = @import("app/resume_store.zig");
     _ = @import("app/resume_command.zig");

@@ -7,7 +7,7 @@
 //! key-rotation compatibility. Caller must supply random salt and retain the
 //! borrowed bytes unchanged through authentication AND subsequent DTO parsing.
 const std = @import("std");
-const selections = @import("selection_store.zig");
+const selections = @import("selection.zig");
 const ids = @import("session_id.zig");
 const Hash = std.crypto.hash.sha2.Sha256;
 const header_bytes = 68;

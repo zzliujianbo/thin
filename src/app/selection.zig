@@ -1,11 +1,10 @@
-//! Bounded nonsecret selection state, independent of diagnostic JSONL/history.
-//! Atomic visibility/CAS for cooperative writers, not fsync or a same-user sandbox.
+//! Bounded nonsecret selection metadata embedded in the `.session` checkpoint.
+//! Diagnostic JSONL may record the same view; there is no `.selection.json` sidecar.
 const std = @import("std");
 const cfg = @import("../core/config.zig");
 const p = @import("../core/protocol.zig");
 const fs = @import("../platform/filesystem.zig");
 const ids = @import("session_id.zig");
-const logs = @import("log_store.zig");
 const activity = @import("../presentation/activity.zig");
 
 pub const max_bytes = 4096;
@@ -132,105 +131,10 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, expected_id: ids.Id) !Snap
     return snapshot;
 }
 
-fn filename(buffer: []u8, id: ids.Id) ![:0]u8 {
-    if (!ids.valid(id)) return error.InvalidSessionID;
-    return std.fmt.bufPrintSentinel(buffer, "{s}.selection.json", .{id}, 0);
-}
-
-fn readBytes(io: std.Io, fd: c_int, name: [:0]const u8, buffer: *[max_bytes + 1]u8) !?[]const u8 {
-    const file_fd = fs.linux.openat(fd, name, fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0);
-    if (file_fd < 0) return if (std.c._errno().* == 2) null else fs.osError();
-    defer fs.closeFd(file_fd);
-    const file = fs.fileFromFd(file_fd);
-    const stat = try file.stat(io);
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) return error.UnsafeSelectionFile;
-    if (stat.size > max_bytes) return error.SelectionTooLarge;
-    const n = try file.readPositionalAll(io, buffer, 0);
-    if (n > max_bytes) return error.SelectionTooLarge;
-    if (n != stat.size) return error.FileChanged;
-    return buffer[0..n];
-}
-
-pub fn load(root: *fs.Root, id: ids.Id) !Snapshot {
-    var name_buffer: [64]u8 = undefined;
-    const name = try filename(&name_buffer, id);
-    const fd = logs.openExistingDirectory(root) catch |err| return if (err == error.FileNotFound) error.SelectionNotFound else err;
-    defer fs.closeFd(fd);
-    var buffer: [max_bytes + 1]u8 = undefined;
-    const bytes = (try readBytes(root.io, fd, name, &buffer)) orelse return error.SelectionNotFound;
-    return parse(root.allocator, bytes, id);
-}
-
-/// Adopt the existing sidecar CAS baseline when continuing the SAME session.
-/// Full resume authenticates its independent checkpoint, not this metadata.
-pub fn existingDigest(root: *fs.Root, id: ids.Id) !?[32]u8 {
-    var name_buffer: [64]u8 = undefined;
-    const name = try filename(&name_buffer, id);
-    const fd = try logs.openExistingDirectory(root);
-    defer fs.closeFd(fd);
-    var buffer: [max_bytes + 1]u8 = undefined;
-    const bytes = (try readBytes(root.io, fd, name, &buffer)) orelse return null;
-    var digest: [32]u8 = undefined;
-    Hash.hash(bytes, &digest, .{});
-    return digest;
-}
-
-pub const Writer = struct {
-    expected: ?[32]u8 = null,
-
-    /// Writer thread only, on the exact directory already owned by log_store.
-    pub fn save(self: *Writer, root: *fs.Root, directory_fd: c_int, id: ids.Id, snapshot: *const Snapshot) !void {
-        var encoded: [max_bytes]u8 = undefined;
-        var output = std.Io.Writer.fixed(&encoded);
-        try encode(&output, id, snapshot);
-        const bytes = output.buffered();
-        var next_digest: [32]u8 = undefined;
-        Hash.hash(bytes, &next_digest, .{});
-        var name_buffer: [64]u8 = undefined;
-        const name = try filename(&name_buffer, id);
-        var dir = fs.Root{
-            .dir = .{ .handle = try fs.openDirectory(directory_fd, ".") },
-            .path = "", // Only the fixed relative filename is accepted below.
-            .allocator = root.allocator,
-            .io = root.io,
-        };
-        // Borrowed lexical path; close only the independently opened fd.
-        defer fs.closeFd(dir.dir.handle);
-        var locked = false;
-        for (0..100) |_| {
-            if (fs.linux.flock(dir.dir.handle, 2 | 4) == 0) {
-                locked = true;
-                break;
-            }
-            const errno = std.c._errno().*;
-            if (errno != 11 and errno != 4) return fs.osError();
-            try std.Io.sleep(root.io, .fromMilliseconds(2), .awake);
-        }
-        if (!locked) return error.SelectionStoreBusy;
-        const stat = try fs.fileFromFd(dir.dir.handle).stat(root.io);
-        if (stat.kind != .directory or stat.permissions.toMode() & 0o077 != 0) return error.UnsafeLogDirectory;
-        var existing: [max_bytes + 1]u8 = undefined;
-        const old = try readBytes(root.io, dir.dir.handle, name, &existing);
-        if (self.expected) |expected| {
-            var digest: [32]u8 = undefined;
-            Hash.hash(old orelse return error.SelectionConflict, &digest, .{});
-            if (!std.mem.eql(u8, &expected, &digest)) return error.SelectionConflict;
-        } else if (old != null) return error.SelectionConflict;
-        dir.writeMode(name, bytes, self.expected != null, 0o600) catch |err| return if (err == error.PathAlreadyExists) error.SelectionConflict else err;
-        self.expected = next_digest;
-    }
-};
-
 const test_id: ids.Id = "0123456789abcdef0123456789abcdef".*;
 
 fn fixtureSnapshot() !Snapshot {
     return capture(.{ .provider = .{ .base_url = "https://opencode.ai/zen/go/v1" }, .model = .{ .name = "gpt-5.6-luna", .protocol = .responses, .context_tokens = 1050000, .reasoning_effort = "high" } });
-}
-
-fn testRoot(dir: std.Io.Dir) !fs.Root {
-    var buffer: [4096]u8 = undefined;
-    const n = try dir.realPath(std.testing.io, &buffer);
-    return fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
 }
 
 test "selection strict schema owns metadata and binds the exact session identity" {
@@ -256,42 +160,3 @@ test "selection strict schema owns metadata and binds the exact session identity
     @memset(&buffer, 'x');
     try std.testing.expectEqualStrings("gpt-5.6-luna", restored.model());
 }
-
-test "selection persistence is private atomic CAS and refuses unsafe files" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try testRoot(tmp.dir);
-    defer root.deinit();
-    try std.testing.expectError(error.SelectionNotFound, load(&root, test_id));
-    try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
-    var log = logs.Store.init(std.testing.allocator, &root, .{});
-    defer log.deinit();
-    try log.pinSessionID(test_id);
-    try log.start();
-    var writer: Writer = .{};
-    var snapshot = try fixtureSnapshot();
-    try writer.save(&root, log.logs_fd.?, test_id, &snapshot);
-    var loaded = try load(&root, test_id);
-    try std.testing.expectEqualStrings("gpt-5.6-luna", loaded.model());
-    snapshot.effort = .max;
-    try writer.save(&root, log.logs_fd.?, test_id, &snapshot);
-    loaded = try load(&root, test_id);
-    try std.testing.expectEqual(activity.ReasoningEffort.max, loaded.effort.?);
-    const path = ".thin/sessions/" ++ test_id ++ ".selection.json";
-    const stat = try tmp.dir.statFile(std.testing.io, path, .{});
-    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
-    var other: Writer = .{};
-    try std.testing.expectError(error.SelectionConflict, other.save(&root, log.logs_fd.?, test_id, &snapshot));
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "{}" });
-    try std.testing.expectError(error.SelectionConflict, writer.save(&root, log.logs_fd.?, test_id, &snapshot));
-    try tmp.dir.deleteFile(std.testing.io, path);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("../absent", log.logs_fd.?, test_id ++ ".selection.json"));
-    if (load(&root, test_id)) |_| return error.AcceptedSymlink else |_| {}
-    if (writer.save(&root, log.logs_fd.?, test_id, &snapshot)) |_| return error.AcceptedSymlink else |_| {}
-    try tmp.dir.deleteFile(std.testing.io, path);
-    const name = test_id ++ ".selection.json";
-    if (mkfifoat(log.logs_fd.?, name, 0o600) != 0) return error.FixtureFailed;
-    try std.testing.expectError(error.UnsafeSelectionFile, load(&root, test_id));
-}
-
-extern "c" fn mkfifoat(c_int, [*:0]const u8, c_uint) c_int;

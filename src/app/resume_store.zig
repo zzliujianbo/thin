@@ -1,12 +1,27 @@
-//! Private immutable exit checkpoints. A persistent per-ID lease detects an
-//! interrupted resumed process. No-log takes the same lock read-only and never
-//! changes either file. Cooperative CAS, not a sandbox or fsync guarantee.
+//! Private checkpoints for one session id. A persistent per-ID lease detects an
+//! interrupted owner. No-log takes the same lock read-only and never changes
+//! either file. Cooperative CAS, not a same-user sandbox.
+//!
+//! Clean publication is marker `C` plus the digest of `.session`. Marker `A`
+//! means work or a publish is in progress; resume refuses it. Checkpoint data,
+//! the directory entry, and the lock marker are fsynced so a power loss after
+//! a successful save does not leave a clean marker pointing at a partial file.
 const std = @import("std");
 const fs = @import("../platform/filesystem.zig");
 const logs = @import("log_store.zig");
 const ids = @import("session_id.zig");
 const codec = @import("resume_codec.zig");
 const Hash = std.crypto.hash.sha2.Sha256;
+
+extern "c" fn fsync(c_int) c_int;
+
+fn fsyncFd(fd: c_int) !void {
+    while (true) {
+        if (fsync(fd) == 0) return;
+        if (std.c._errno().* == 4) continue; // EINTR
+        return fs.osError();
+    }
+}
 
 fn name(buffer: []u8, id: ids.Id, suffix: []const u8) ![:0]u8 {
     if (!ids.valid(id)) return error.InvalidSessionID;
@@ -49,9 +64,12 @@ fn atomicWrite(root: *fs.Root, dir: c_int, path: [:0]const u8, bytes: []const u8
     defer _ = std.c.unlinkat(dir, temp, 0);
     try fs.fileFromFd(fd).writePositionalAll(root.io, bytes, 0);
     if (std.c.fchmod(fd, 0o600) != 0) return fs.osError();
+    // Data must be durable before the directory entry publishes the name.
+    try fsyncFd(fd);
     if (replace) {
         if (std.c.renameat(dir, temp, dir, path) != 0) return fs.osError();
     } else if (std.c.linkat(dir, temp, dir, path, 0) != 0) return fs.osError();
+    try fsyncFd(dir);
 }
 
 pub const Lease = struct {
@@ -105,6 +123,7 @@ pub const Lease = struct {
         var marker: [33]u8 = @splat(0);
         marker[0] = 'A';
         try fs.fileFromFd(fd).writePositionalAll(root.io, &marker, 0);
+        try fsyncFd(fd);
         return .{ .directory_fd = dir, .lock_fd = fd, .id = id, .expected = null, .writable = true, .active = true };
     }
 
@@ -119,9 +138,10 @@ pub const Lease = struct {
 
     pub fn activate(self: *Lease, root: *fs.Root) !void {
         if (!self.writable or self.active) return;
-        // Before any new work can start. A crash/poison/failed final write leaves
-        // A, so the older healthy checkpoint cannot masquerade as current state.
+        // Before side effects that are not in the last clean checkpoint. A crash
+        // leaves A, so that older checkpoint cannot masquerade as current state.
         try fs.fileFromFd(self.lock_fd).writePositionalAll(root.io, "A", 0);
+        try fsyncFd(self.lock_fd);
         self.active = true;
     }
 
@@ -141,18 +161,31 @@ pub const Lease = struct {
         try atomicWrite(root, self.directory_fd, path, bytes, self.expected != null);
         var digest: [32]u8 = undefined;
         Hash.hash(bytes, &digest, .{});
-        // Publish clean LAST. Partial/canceled writes cannot mark older bytes
-        // clean for a newer generation. No fsync durability is implied.
-        try fs.fileFromFd(self.lock_fd).writePositionalAll(root.io, &digest, 1);
-        try fs.fileFromFd(self.lock_fd).writePositionalAll(root.io, "C", 0);
+        // Remember this generation before the clean marker so a failed `C`
+        // write can retry the same bytes instead of reporting a conflict.
         self.expected = digest;
+        const lock = fs.fileFromFd(self.lock_fd);
+        // Digest first, while the marker is still A. A crash here stays dirty.
+        try lock.writePositionalAll(root.io, &digest, 1);
+        try fsyncFd(self.lock_fd);
+        try lock.writePositionalAll(root.io, "C", 0);
+        try fsyncFd(self.lock_fd);
         self.active = false;
     }
 };
 
-/// Exit-only asynchronous I/O: the serialized owned bytes and Root stay alive
-/// until cancel/join. No Runtime/config/key is borrowed by the worker. A failed
-/// save is separate from task success and never causes model/tool retries.
+/// Join outcome, not the poll clock. `done == false` is the only timeout:
+/// a failure observed after the worker returns is that failure.
+pub fn classifySave(done: bool, failure: ?anyerror) !void {
+    if (!done) return error.ResumeSaveTimeout;
+    if (failure) |err| return err;
+}
+
+/// Exit save on a worker so the caller can keep polling signals. The poll
+/// window is not the outcome: cancel/join runs first, and only a worker that
+/// is still unfinished after that join is `ResumeSaveTimeout`. A slow disk
+/// that finishes during the join is success. Bytes and Root stay alive until
+/// the join. A failed save never causes model or tool retries.
 pub fn saveFinal(root: *fs.Root, id: ids.Id, existing: ?*Lease, bytes: []const u8) !void {
     const Work = struct {
         root: *fs.Root,
@@ -176,14 +209,24 @@ pub fn saveFinal(root: *fs.Root, id: ids.Id, existing: ?*Lease, bytes: []const u
     };
     var work = Work{ .root = root, .id = id, .existing = existing, .bytes = bytes };
     var future = try std.Io.concurrent(root.io, Work.run, .{&work});
-    defer future.cancel(root.io);
     const start = std.Io.Clock.awake.now(root.io);
     while (!work.done.load(.acquire)) {
-        if (start.durationTo(std.Io.Clock.awake.now(root.io)).toMilliseconds() >= 1000) return error.ResumeSaveTimeout;
+        if (start.durationTo(std.Io.Clock.awake.now(root.io)).toMilliseconds() >= 1000) break;
         try std.Io.sleep(root.io, .fromMilliseconds(2), .awake);
     }
+    // Join before classifying. await does not request cancellation, so a slow
+    // write that outlasts the poll still publishes `C` and is success.
+    // ResumeSaveTimeout is only when the worker is still unfinished after that join.
     future.await(root.io);
-    if (work.failure) |err| return err;
+    return classifySave(work.done.load(.acquire), work.failure);
+}
+
+test "resume save classification waits for the worker result" {
+    try classifySave(true, null);
+    try std.testing.expectError(error.ResumeConflict, classifySave(true, error.ResumeConflict));
+    try std.testing.expectError(error.Canceled, classifySave(true, error.Canceled));
+    try std.testing.expectError(error.ResumeSaveTimeout, classifySave(false, null));
+    try std.testing.expectError(error.ResumeSaveTimeout, classifySave(false, error.ResumeConflict));
 }
 
 fn testRoot(dir: std.Io.Dir) !fs.Root {

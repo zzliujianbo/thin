@@ -93,6 +93,8 @@ const Fake = struct {
     last_duration_ms: ?u64 = null,
     execution_delay: bool = false,
     execution_error: ?anyerror = null,
+    /// When set, permission-id exhaustion asks the host to start a new epoch.
+    rebase_permissions: bool = false,
 
     /// 返回模型接口，调用分发到 call。
     fn model(self: *Fake) p.Model {
@@ -106,8 +108,10 @@ const Fake = struct {
 
     /// 返回宿主接口（事件与审批）。
     fn host(self: *Fake) r.Host {
-        return .{ .context = self, .emit_fn = event, .authorize_fn = authorize };
+        return .{ .context = self, .emit_fn = event, .authorize_fn = authorize, .rebase_permission_fn = if (self.rebase_permissions) rebase else null };
     }
+
+    fn rebase(_: ?*anyopaque) !void {}
 
     /// 模拟模型：摘要请求返回固定文本（或非法工具调用）；普通请求先返回工具调用，超过 stop_after 后返回 "done"。
     fn call(ctx: *anyopaque, a: std.mem.Allocator, req: p.Request, sink: p.ModelSink) !p.Outcome {
@@ -717,17 +721,52 @@ test "Runtime round pause after compaction retains the remapped explicit goal" {
     try std.testing.expectEqual(r.Status.success, (try runtime.run(&older, &cancel)).status);
     config = smallConfiguration();
     config.limits.compaction_trigger_percent = 50;
+    // Compaction is free. The one model round runs a tool, then the next loop pauses.
     config.limits.max_rounds = 1;
+    fake.stop_after = 100;
     const terminal = try runtime.run("Do the task", &cancel);
     try std.testing.expectEqual(error.RoundLimit, terminal.detail.?);
     try std.testing.expectEqual(r.Status.paused, terminal.status);
     try std.testing.expectEqual(@as(u32, 1), fake.compactions);
-    try std.testing.expectEqual(@as(u32, 1), fake.normal_calls);
-    try std.testing.expectEqual(@as(usize, 3), runtime.messages().len);
+    try std.testing.expectEqual(@as(u32, 2), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 1), fake.executions);
+    var kept_goal = false;
+    for (runtime.messages()) |message| {
+        if (message.role != .user) continue;
+        for (message.blocks) |block| {
+            if (block == .text and std.mem.eql(u8, block.text, "Do the task")) kept_goal = true;
+        }
+    }
+    try std.testing.expect(kept_goal);
     try std.testing.expectEqual(p.Role.context, runtime.messages()[0].role);
-    try std.testing.expectEqualStrings("done", runtime.messages()[1].blocks[0].text);
-    try std.testing.expectEqualStrings("Do the task", runtime.messages()[2].blocks[0].text);
+    fake.stop_after = 0;
     try std.testing.expectEqual(r.Status.success, (try runtime.run("short", &cancel)).status);
+}
+
+test "permission ids do not wrap into a non-monotonic host id" {
+    var fake = Fake{ .stop_after = 1, .requires_approval = false };
+    const config = configuration();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", true);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    runtime.permission_id = std.math.maxInt(u64);
+    var cancel = p.Cancellation{};
+    const refused = try runtime.run("Do the task", &cancel);
+    try std.testing.expectEqual(error.PermissionIdExhausted, refused.detail.?);
+    try std.testing.expectEqual(@as(u32, 0), fake.executions);
+    try std.testing.expectEqual(std.math.maxInt(u64), runtime.permission_id);
+
+    fake.rebase_permissions = true;
+    runtime.poisoned = false;
+    var rebased = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", true);
+    defer rebased.deinit();
+    fake.current_runtime = &rebased;
+    fake.normal_calls = 0;
+    fake.executions = 0;
+    rebased.permission_id = std.math.maxInt(u64);
+    try std.testing.expectEqual(r.Status.success, (try rebased.run("Do the task", &cancel)).status);
+    try std.testing.expectEqual(@as(u64, 1), rebased.permission_id);
+    try std.testing.expectEqual(@as(u32, 1), fake.executions);
 }
 
 test "Runtime round budget pauses and explicit continuation never replays completed tools" {
