@@ -10,6 +10,7 @@ const r = @import("../core/runtime.zig");
 const Journal = @import("journal.zig").Journal;
 const Settings = @import("settings_store.zig").Store;
 const thinking = @import("../core/thinking.zig");
+const session_context = @import("../core/session_context.zig");
 
 /// 应用聚合体：持有配置、项目根目录、记忆存储、工具执行器、HTTP 客户端与 Runtime，
 /// 生命周期与进程一致（--print 或 TUI 会话结束时统一释放）。
@@ -21,6 +22,13 @@ pub const App = struct {
 
     /// 项目根目录句柄（记忆与工具文件访问的基准）。
     root: fs.Root,
+    /// HOME directory used to find `<HOME>/.thin/AGENTS.md`. Empty skips that source.
+    home_path: []u8,
+    /// Shell reported in the session preface. Captured from SHELL at startup.
+    shell_name: []u8,
+    /// Working directory reported to the model. Starts as the startup project.
+    /// setWorkingDirectory changes the next turn's preface without editing earlier messages.
+    session_cwd: []u8,
     /// 用户认证文件的绝对路径，普通文件工具不得读取或覆盖它。
     auth_path: []const u8,
     /// 项目记忆存储，指向上面的 root。
@@ -109,6 +117,12 @@ pub const App = struct {
 
         self.root = if (anchored) |root| try root.duplicate() else try fs.Root.open(a, io, project);
         errdefer self.root.deinit();
+        self.home_path = if (environ.get("HOME")) |home| try a.dupe(u8, home) else try a.dupe(u8, "");
+        errdefer a.free(self.home_path);
+        self.shell_name = try a.dupe(u8, session_context.shellName(environ.get("SHELL")));
+        errdefer a.free(self.shell_name);
+        self.session_cwd = try a.dupe(u8, self.root.path);
+        errdefer a.free(self.session_cwd);
         self.memory = mem.Store.init(&self.root, self.config.value.limits);
         self.journal = try Journal.init(a, &self.root, key);
         errdefer self.journal.deinit();
@@ -123,6 +137,7 @@ pub const App = struct {
         const snapshot = try self.memory.snapshot(a);
         defer a.free(snapshot);
         self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, snapshot, trusted);
+        self.runtime.session_loader = .{ .context = self, .load_fn = loadSessionPolicy };
         self.runtime.observer = self.journal.observer();
         self.recordSelection();
         return self;
@@ -194,6 +209,24 @@ pub const App = struct {
         self.client.session_id = id;
     }
 
+    /// Point the session preface at a new working directory. The startup tool
+    /// root stays put. The next run appends a context message when the resolved
+    /// cwd, shell, project root, or AGENTS text differs. A change before the
+    /// first run rebuilds the fresh prefix instead of appending an update.
+    pub fn setWorkingDirectory(self: *App, cwd: []const u8) !void {
+        if (self.runtime.busy.load(.acquire)) return error.Busy;
+        var opened = try fs.Root.open(self.allocator, self.root.io, cwd);
+        defer opened.deinit();
+        const path = try self.allocator.dupe(u8, opened.path);
+        self.allocator.free(self.session_cwd);
+        self.session_cwd = path;
+    }
+
+    fn loadSessionPolicy(ctx: *anyopaque, a: std.mem.Allocator) !session_context.Snapshot {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return session_context.load(a, self.root.io, self.home_path, self.session_cwd, self.shell_name);
+    }
+
     /// 只在首次提交前设置；关闭不会读取或删除已有日志。
     pub fn setLogging(self: *App, enabled: bool) void {
         std.debug.assert(!self.runtime.busy.load(.acquire));
@@ -204,7 +237,7 @@ pub const App = struct {
     /// successful selection publication, and no borrowed old config bytes.
     pub fn recordSelection(self: *App) void {
         self.journal.protocol = self.config.value.model.protocol;
-        self.journal.setSelection(@import("selection_store.zig").capture(self.config.value));
+        self.journal.setSelection(@import("selection.zig").capture(self.config.value));
     }
 
     /// 按创建的逆序释放资源，最后销毁自身。
@@ -215,6 +248,9 @@ pub const App = struct {
         self.client.deinit();
         self.environment.deinit();
         self.root.deinit();
+        a.free(self.session_cwd);
+        a.free(self.shell_name);
+        a.free(self.home_path);
         a.free(self.auth_path);
         cfg.release(&self.config);
         a.destroy(self);

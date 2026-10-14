@@ -184,3 +184,110 @@ fn scenario(allowed: bool) !void {
         try t.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
     }
 }
+
+// trusted 会话里：危险 bash 仍要审批；拒绝不执行；批准才执行。普通命令不询问。
+test "trusted runtime asks before dangerous bash and still runs ordinary bash" {
+    try bashTrust("rm -rf marker", .deny, true, false);
+    try bashTrust("rm -rf marker", .allow_once, true, true);
+    try bashTrust("printf ok > safe.txt", .deny, false, true);
+}
+
+const BashProbe = struct {
+    command: []const u8,
+    decision: r.Decision,
+    calls: usize = 0,
+    permissions: usize = 0,
+    started: usize = 0,
+    is_error: bool = false,
+    result: [384]u8 = undefined,
+    result_len: usize = 0,
+
+    fn model(self: *BashProbe) p.Model {
+        return .{ .context = self, .call_fn = call };
+    }
+    fn host(self: *BashProbe) r.Host {
+        return .{ .context = self, .emit_fn = event, .authorize_fn = authorize };
+    }
+    fn call(ctx: *anyopaque, a: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+        const self: *BashProbe = @ptrCast(@alignCast(ctx));
+        const step = self.calls;
+        self.calls += 1;
+        if (step == 0) {
+            const encoded = try std.json.Stringify.valueAlloc(a, self.command, .{});
+            const arguments = try std.fmt.allocPrint(a, "{{\"command\":{s}}}", .{encoded});
+            const blocks = try a.alloc(p.Block, 1);
+            blocks[0] = .{ .tool_call = .{ .id = "b", .name = "bash", .arguments = arguments } };
+            return .{ .success = .{ .message = .{ .role = .assistant, .blocks = blocks }, .finish = .tool_calls, .usage = .{ .input_tokens = 10, .output_tokens = 1 } } };
+        }
+        return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} }, .finish = .stop, .usage = .{ .input_tokens = 10, .output_tokens = 1 } } };
+    }
+    fn authorize(ctx: ?*anyopaque, _: r.Permission, _: *const p.Cancellation) !r.Decision {
+        const self: *BashProbe = @ptrCast(@alignCast(ctx.?));
+        self.permissions += 1;
+        return self.decision;
+    }
+    fn event(ctx: ?*anyopaque, ev: r.Event, _: *const p.Cancellation) !void {
+        const self: *BashProbe = @ptrCast(@alignCast(ctx.?));
+        switch (ev) {
+            .tool_started => self.started += 1,
+            .tool_result => |value| {
+                self.is_error = value.result.is_error;
+                const n = @min(self.result.len, value.result.text.len);
+                @memcpy(self.result[0..n], value.result.text[0..n]);
+                self.result_len = n;
+            },
+            else => {},
+        }
+    }
+};
+
+fn bashTrust(command: []const u8, decision: r.Decision, ask: bool, run: bool) !void {
+    const a = t.allocator;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(a, io, buffer[0..n]);
+    defer root.deinit();
+    const config = cfg.Config{ .provider = .{ .base_url = "http://unused.invalid", .api_key_env = "FAKE_KEY" }, .model = .{ .name = "scripted", .context_tokens = 32768, .protocol = .chat } };
+    var memory = mem.Store.init(&root, config.limits);
+    var source = std.process.Environ.Map.init(a);
+    defer source.deinit();
+    try source.put("PATH", "/usr/bin:/bin");
+    try source.put("HOME", root.path);
+    var environment = try tools_module.commandEnvironment(a, &source, config.provider.api_key_env);
+    defer environment.deinit();
+    try root.write("marker", "keep", false);
+
+    var tools = tools_module.Tools{ .root = &root, .memory = &memory, .config = &config, .environment = &environment };
+    var probe = BashProbe{ .command = command, .decision = decision };
+    var runtime = try r.Runtime.init(a, io, &config, probe.model(), tools.executor(), probe.host(), "", true);
+    defer runtime.deinit();
+    var cancel = p.Cancellation{};
+    const terminal = try runtime.run("classify this command", &cancel);
+    try t.expectEqual(r.Status.success, terminal.status);
+    try t.expect(runtime.trusted);
+    try t.expectEqual(@as(usize, if (ask) 1 else 0), probe.permissions);
+    try t.expectEqual(@as(usize, if (run) 1 else 0), probe.started);
+    const removes_marker = std.mem.startsWith(u8, command, "rm ");
+    if (run and removes_marker) {
+        try t.expectError(error.FileNotFound, root.read(a, "marker", 0, 16));
+        try t.expect(!probe.is_error);
+    } else {
+        const kept = try root.read(a, "marker", 0, 16);
+        defer a.free(kept.data);
+        try t.expectEqualStrings("keep", kept.data);
+    }
+    if (!run) {
+        try t.expect(probe.is_error);
+        try t.expect(std.mem.indexOf(u8, probe.result[0..probe.result_len], "Dangerous bash command was not executed") != null);
+        try t.expect(std.mem.indexOf(u8, probe.result[0..probe.result_len], "recursive delete") != null);
+    }
+    if (std.mem.indexOf(u8, command, "safe.txt") != null) {
+        const written = try root.read(a, "safe.txt", 0, 16);
+        defer a.free(written.data);
+        try t.expectEqualStrings("ok", written.data);
+        try t.expect(!probe.is_error);
+    }
+}

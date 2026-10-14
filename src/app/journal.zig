@@ -5,7 +5,7 @@ const fs = @import("../platform/filesystem.zig");
 const r = @import("../core/runtime.zig");
 const p = @import("../core/protocol.zig");
 const logs = @import("log_store.zig");
-const selections = @import("selection_store.zig");
+const selections = @import("selection.zig");
 
 const text_limit = 256 * 1024;
 const record_limit = 2 * 1024 * 1024;
@@ -45,8 +45,8 @@ pub const Journal = struct {
     store: logs.Store,
     protocol: p.Protocol = .auto,
     /// Owned metadata; never borrows old configuration strings.
+    /// Recorded in the diagnostic JSONL only. The session checkpoint owns the durable copy.
     selection: ?selections.Snapshot = null,
-    selection_writer: selections.Writer = .{},
     enabled: bool = true,
     failure_code: std.atomic.Value(u16) = .init(0),
     started: bool = false,
@@ -157,8 +157,6 @@ pub const Journal = struct {
         switch (item) {
             .record => |data| try self.writeRecord(data),
             .selection => |event| {
-                try self.store.start();
-                try self.selection_writer.save(self.root, self.store.logs_fd.?, self.store.session_id, &event.snapshot);
                 var buffer: [selections.max_bytes]u8 = undefined;
                 var writer = std.Io.Writer.fixed(&buffer);
                 try std.json.Stringify.value(.{ .schema = 1, .seq = event.seq, .turn = event.turn, .timestamp_ms = event.timestamp_ms, .elapsed_ms = event.elapsed_ms, .event = "selection", .data = event.snapshot.view() }, .{}, &writer);
@@ -629,18 +627,18 @@ test "selection snapshots are lazy ordered and save the last switch without anot
     journal.setSelection(selections.capture(config));
     journal.flush();
     try std.testing.expect(journal.failure() == null);
-    const restored = try selections.load(&root, id);
-    try std.testing.expectEqualStrings("last-fixture", restored.model());
-    try std.testing.expectEqual(p.Protocol.responses, restored.protocol);
-    try std.testing.expectEqual(@import("../presentation/activity.zig").ReasoningEffort.high, restored.effort.?);
     const data = try root.read(std.testing.allocator, journal.store.path(), 0, 8192);
     defer std.testing.allocator.free(data.data);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, data.data, "\"event\":\"selection\""));
+    try std.testing.expect(std.mem.indexOf(u8, data.data, "\"model\":\"last-fixture\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data.data, "\"protocol\":\"responses\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data.data, "\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, data.data, "https://fixture.invalid") == null);
+    try std.testing.expect(std.mem.find(u8, data.data, ".selection.json") == null);
     config.model.name = "prefix-fake-key-suffix";
     journal.setSelection(selections.capture(config));
     try std.testing.expectEqual(error.SensitiveSelection, journal.failure().?);
-    try std.testing.expectEqualStrings("last-fixture", (try selections.load(&root, id)).model());
+    try std.testing.expect(std.mem.find(u8, data.data, "prefix-fake-key-suffix") == null);
 }
 
 test "no log selection updates create no snapshot or archive" {

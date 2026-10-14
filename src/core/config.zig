@@ -56,7 +56,8 @@ pub const Limits = struct {
     /// 预留的安全余量 token 数，从输入预算中扣除。
     safety_tokens: u32 = 2048,
     /// 单个任务允许的最大模型轮数。
-    max_rounds: u16 = 32,
+    /// Model turns per user submission. Compaction is not counted.
+    max_rounds: u16 = 50,
     /// 单个任务允许的最大工具调用次数。
     max_tool_calls: u16 = 128,
     /// 整个任务的超时（毫秒）。

@@ -26,7 +26,7 @@ fn validateIgnore(io: std.Io, dir_fd: c_int) !void {
 }
 
 /// Read-only access to the same protected namespace. Never create a directory,
-/// marker or archive just to restore selection metadata.
+/// marker or archive just to read an existing checkpoint.
 pub fn openExistingDirectory(root: *filesystem.Root) !c_int {
     const thin_fd = try filesystem.openDirectory(root.dir.handle, ".thin");
     defer filesystem.closeFd(thin_fd);
