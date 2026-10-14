@@ -123,7 +123,7 @@ test "thinking actual responses mapping and rejects deepseek including unspecifi
     defer arena.deinit();
     const a = arena.allocator();
     var req = test_support.request(.responses);
-    const standard = thinking.resolve("https://api.openai.com/v1", "gpt-6-sol", null);
+    const standard = thinking.resolve("https://api.openai.com/v1", "gpt-6-sol", .{ .map = .{ .off = "none", .max = "max" } });
     req.reasoning_effort = standard.wire("off").effort;
     var v = try j.parse(a, try encode(a, req));
     try std.testing.expectEqualStrings("none", try c.text(j.get(v, "reasoning").?, "effort"));

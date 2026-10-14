@@ -1,5 +1,5 @@
 //! Small local preset list, not live model discovery or an availability claim.
-//! IDs, endpoints, windows and explicit effort maps were checked against the
+//! IDs, endpoints and windows were checked against the
 //! public Pi 1.2.0 pi-ai providers/data/{deepseek,opencode,opencode-go}.json.
 //! Go IDs/protocols follow the official endpoint table at opencode.ai/docs/go.
 //! Newly added capacities are conservative LOCAL defaults, not official limits.
@@ -14,21 +14,8 @@ pub const Entry = struct {
     selector: []const u8,
     model: cfg.Model,
 };
-const standard_high: @import("../core/thinking.zig").Declaration = .{ .map = .{
-    .low = "low",
-    .medium = "medium",
-    .high = "high",
-    .xhigh = "xhigh",
-} };
-const standard_max: @import("../core/thinking.zig").Declaration = .{ .map = .{
-    .low = "low",
-    .medium = "medium",
-    .high = "high",
-    .xhigh = "xhigh",
-    .max = "max",
-} };
 const minimax: cfg.Model = .{ .name = "minimax-m2.7", .context_tokens = 204800, .protocol = .chat };
-const luna: cfg.Model = .{ .name = "gpt-5.6-luna", .context_tokens = 1050000, .protocol = .responses, .reasoning = standard_max };
+const luna: cfg.Model = .{ .name = "gpt-5.6-luna", .context_tokens = 1050000, .protocol = .responses };
 
 fn go(comptime name: []const u8, protocol: @import("../core/protocol.zig").Protocol) Entry {
     return .{ .provider = .opencode_go, .selector = "opencode-go/" ++ name, .model = .{ .name = name, .context_tokens = 32768, .protocol = protocol } };
@@ -38,7 +25,7 @@ pub const entries = [_]Entry{
     .{ .provider = .deepseek, .selector = "deepseek/deepseek-flash", .model = .{ .name = "deepseek-flash", .context_tokens = 1000000, .protocol = .chat } },
     .{ .provider = .deepseek, .selector = "deepseek/deepseek-v4-pro", .model = .{ .name = "deepseek-v4-pro", .context_tokens = 1000000, .protocol = .chat } },
     .{ .provider = .opencode_zen, .selector = "opencode-zen/minimax-m2.7", .model = minimax },
-    .{ .provider = .opencode_zen, .selector = "opencode-zen/gpt-5.2", .model = .{ .name = "gpt-5.2", .context_tokens = 400000, .protocol = .responses, .reasoning = standard_high } },
+    .{ .provider = .opencode_zen, .selector = "opencode-zen/gpt-5.2", .model = .{ .name = "gpt-5.2", .context_tokens = 400000, .protocol = .responses } },
     .{ .provider = .opencode_zen, .selector = "opencode-zen/gpt-5.6-luna", .model = luna },
     .{ .provider = .opencode_go, .selector = "opencode-go/minimax-m2.7", .model = .{ .name = "minimax-m2.7", .context_tokens = 204800, .protocol = .anthropic } },
     .{ .provider = .opencode_go, .selector = "opencode-go/gpt-5.6-luna", .model = luna },
@@ -92,6 +79,7 @@ test "provider presets select exact protocols and keep Zen and Go separate" {
         const config: cfg.Config = .{ .provider = connection(entry.provider), .model = entry.model };
         try cfg.validate(config);
         try std.testing.expect(entry.model.protocol != .auto);
+        try std.testing.expect(entry.model.reasoning == null); // IDs/protocols are presets, capabilities are not.
         try std.testing.expectEqual(entry.provider, Id.fromUrl(config.provider.base_url).?);
         try std.testing.expectEqual(entry.provider, find(entry.selector).?.provider);
         for (entries[0..index]) |previous| try std.testing.expect(!std.mem.eql(u8, entry.selector, previous.selector));

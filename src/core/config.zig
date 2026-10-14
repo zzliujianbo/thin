@@ -24,6 +24,8 @@ pub const Provider = struct {
     kind: ?providers.Id = null,
 };
 
+pub const ReasoningSource = enum { explicit, metadata };
+
 /// 模型配置。
 pub const Model = struct {
     /// 模型名称。
@@ -34,8 +36,21 @@ pub const Model = struct {
     protocol: protocol.Protocol = .auto,
     /// 推理强度（可选），仅在提供方支持时使用。
     reasoning_effort: ?[]const u8 = null,
-    /// Explicit capability/wire map for custom endpoints, owned by the parse arena.
+    /// Explicit or fetched capability/wire map, owned by the parse arena.
     reasoning: ?thinking.Declaration = null,
+    /// Missing in old configs means explicit: do not guess whether a user wrote it.
+    reasoning_source: ReasoningSource = .explicit,
+
+    /// Derived maps/effort live in metadata cache/project settings, not config
+    /// defaults. This prevents a fetched profile becoming an explicit override.
+    pub fn persisted(self: Model) Model {
+        var result = self;
+        if (self.reasoning_source == .metadata) {
+            result.reasoning = null;
+            result.reasoning_effort = null;
+        }
+        return result;
+    }
 };
 
 /// Implementation defaults are adjustable; only the agreed timeout, read/output
@@ -104,7 +119,32 @@ pub const max_config_bytes = 64 * 1024;
 /// Every string is owned by the returned arena, never by `bytes`.
 /// 中文：解析后的字符串复制到 allocator 中，因此调用方可以擦除 bytes；结果需调用 release 释放。
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Config) {
-    return parseBounded(allocator, bytes, max_config_bytes);
+    return parseBounded(allocator, bytes, max_config_bytes, true);
+}
+
+test "disk derived reasoning is dropped but trusted config clones retain active maps" {
+    const a = std.testing.allocator;
+    var parsed = try parse(a,
+        \\{"provider":{"base_url":"https://proxy.invalid"},"model":{"name":"model","protocol":"responses","context_tokens":32768,"reasoning_source":"metadata","reasoning_effort":"high","reasoning":{"map":{"high":"high"}}},"models":[{"name":"other","protocol":"responses","context_tokens":32768,"reasoning_source":"metadata","reasoning_effort":"high","reasoning":{"map":{"high":"high"}}}]}
+    );
+    defer release(&parsed);
+    try std.testing.expect(parsed.value.model.reasoning == null and parsed.value.model.reasoning_effort == null);
+    try std.testing.expect(parsed.value.models[0].reasoning == null and parsed.value.models[0].reasoning_effort == null);
+    var active = parsed.value;
+    active.model.reasoning = .{ .map = .{ .high = "high" } };
+    active.model.reasoning_effort = "high";
+    var copied = try clone(a, active);
+    defer release(&copied);
+    try std.testing.expectEqualStrings("high", copied.value.model.reasoning.?.map.high.?);
+    try std.testing.expectEqualStrings("high", copied.value.model.reasoning_effort.?);
+    var stale = try parse(a,
+        \\{"provider":{"base_url":"https://proxy.invalid"},"model":{"name":"model","protocol":"responses","context_tokens":32768,"reasoning_source":"metadata","reasoning":{"format":"anthropic","map":{"high":"high"}}}}
+    );
+    defer release(&stale);
+    try std.testing.expect(stale.value.model.reasoning == null);
+    try std.testing.expectError(error.IncompatibleReasoningProtocol, parse(a,
+        \\{"provider":{"base_url":"https://proxy.invalid"},"model":{"name":"model","protocol":"responses","context_tokens":32768,"reasoning":{"format":"anthropic","map":{"high":"high"}}}}
+    ));
 }
 
 /// Clone an already bounded, validated application configuration. Re-encoding
@@ -118,10 +158,10 @@ pub fn clone(allocator: std.mem.Allocator, config: Config) !std.json.Parsed(Conf
         std.crypto.secureZero(u8, bytes);
         allocator.free(bytes);
     }
-    return parseBounded(allocator, bytes, 512 * 1024);
+    return parseBounded(allocator, bytes, 512 * 1024, false);
 }
 
-fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize) !std.json.Parsed(Config) {
+fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, disk: bool) !std.json.Parsed(Config) {
     if (bytes.len > limit) return error.ConfigTooLarge;
 
     // 包装底层分配器：即使 JSON 在读完 key 后才失败，也擦除所有中间分配。
@@ -138,6 +178,13 @@ fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize) !
     // 语义校验失败时需要释放已解析的内存。
     parsed.arena.child_allocator = allocator;
     errdefer release(&parsed);
+    // Derived disk data is not authority, including a stale wire format after
+    // the user changes protocol. Validate actual options only after discarding
+    // it. Trusted clone() retains and validates active/frozen runtime mappings.
+    if (disk) {
+        parsed.value.model = parsed.value.model.persisted();
+        for (@constCast(parsed.value.models)) |*model| model.* = model.persisted();
+    }
     try validate(parsed.value);
     return parsed;
 }
@@ -333,8 +380,15 @@ test "Anthropic config is explicit and rejects foreign thinking controls" {
     try std.testing.expectError(error.IncompatibleReasoningProtocol, validate(config));
 }
 
+/// Verified service protocol or an explicit wire format, not a capability table.
+pub fn chatOnly(base_url: []const u8, model: Model) bool {
+    const native_chat = providers.Id.fromUrl(base_url) == .deepseek and
+        (std.mem.eql(u8, model.name, "deepseek-flash") or std.mem.eql(u8, model.name, "deepseek-v4-pro"));
+    return native_chat or (model.reasoning != null and model.reasoning.?.format == .deepseek);
+}
+
 fn validateReasoningProtocol(base_url: []const u8, model: Model) !void {
-    if ((model.protocol == .responses or model.protocol == .anthropic) and thinking.resolve(base_url, model.name, model.reasoning).format == .deepseek) return error.IncompatibleReasoningProtocol;
+    if ((model.protocol == .responses or model.protocol == .anthropic) and chatOnly(base_url, model)) return error.IncompatibleReasoningProtocol;
 }
 
 /// Shared profile validation uses the same limits as the selected model.

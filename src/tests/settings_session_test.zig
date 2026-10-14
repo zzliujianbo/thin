@@ -44,7 +44,21 @@ const Fixture = struct {
     }
 
     fn session(self: *Fixture, project: []const u8) !Session {
-        return Session.init(std.testing.allocator, std.testing.io, &self.env, project, .{}, false);
+        // These preference/auth/anchor tests need a known map, not a production
+        // name-based fallback. Preserve any test's own explicitly written config.
+        var store = try @import("../app/auth_store.zig").Store.open(std.testing.allocator, std.testing.io, self.env.get("HOME").?);
+        defer store.deinit();
+        if (store.loadExisting()) |value| {
+            var existing = value;
+            cfg.release(&existing);
+        } else |err| {
+            if (err != error.ConfigNotFound) return err;
+            var initial = try store.loadOrInitialize();
+            defer cfg.release(&initial);
+            initial.value.model.reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } };
+            try store.save(initial.value);
+        }
+        return Session.init(std.testing.allocator, std.testing.io, &self.env, project, .{}, true);
     }
 };
 
@@ -56,7 +70,7 @@ test "project effort persists without logs and auth saves the untouched global b
     first.setLogging(false);
     const initial = first.connection().current();
     // First entry with no project preference persists a capability-clamped
-    // default (deepseek-flash clamps the built-in medium upward to high).
+    // default (the explicit fixture map clamps medium upward to high).
     try std.testing.expectEqual(effort.high, initial.reasoning_effort);
     try std.testing.expect(initial.effort_levels.contains(.off));
     try std.testing.expect(initial.effort_levels.contains(.max));
@@ -117,6 +131,46 @@ test "headless first entry creates settings and shares the mapped default with t
     defer session.deinit();
     try std.testing.expectEqual(effort.medium, session.connection().current().reasoning_effort);
     try std.testing.expectEqual(effort.medium, session.preferred_effort.?);
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.openDir(io, "project/.thin/sessions", .{}));
+}
+
+test "headless uses cached derived maps and preserves unknown after successful cache invalidation" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const metadata = @import("../app/model_metadata.zig");
+    const catalog = @import("../app/provider_catalog.zig");
+    var store = try @import("../app/auth_store.zig").Store.open(a, io, fixture.home);
+    defer store.deinit();
+    var initial = try store.loadOrInitialize();
+    defer cfg.release(&initial);
+    initial.value.provider = catalog.connection(.opencode_go);
+    initial.value.model = catalog.find("opencode-go/gpt-6-luna").?.model;
+    initial.value.model.reasoning_source = .metadata;
+    initial.value.credentials.opencode_go = "fake-headless-derived-key";
+    try store.save(initial.value);
+    _ = try metadata.commit(&store.root, 0, try metadata.parseDev(a, @embedFile("../app/models_dev_fixture.json")));
+    var settings = try @import("../app/settings_store.zig").Store.open(a, io, fixture.project);
+    defer settings.deinit();
+    try settings.save(.max);
+    const first = try App.init(a, io, &fixture.env, fixture.project, .{}, false);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("max", first.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqual(cfg.ReasoningSource.metadata, first.config.value.model.reasoning_source);
+    _ = try metadata.commit(&store.root, 0, .{ .dev_done = true });
+    const second = try App.init(a, io, &fixture.env, fixture.project, .{}, false);
+    defer second.deinit();
+    try std.testing.expect(second.config.value.model.reasoning == null and second.config.value.model.reasoning_effort == null);
+    try std.testing.expectEqual(effort.max, (try settings.load()).?);
+    for ([_]p.Purpose{ .normal, .summary }) |purpose| {
+        var base = @import("adapter_test_support.zig").request(.responses);
+        base.purpose = purpose;
+        const frozen = @import("../core/runtime.zig").withReasoning(first.config.value, base);
+        try std.testing.expectEqualStrings("max", frozen.reasoning_effort.?);
+        const unknown = @import("../core/runtime.zig").withReasoning(second.config.value, base);
+        try std.testing.expect(unknown.reasoning_effort == null and unknown.thinking == null);
+    }
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.openDir(io, "project/.thin/sessions", .{}));
 }
 

@@ -1,0 +1,47 @@
+{
+  "opencode-go": {
+    "npm": "@ai-sdk/openai-compatible",
+    "models": {
+      "gpt-6-luna": {
+        "provider": { "npm": "@ai-sdk/openai" },
+        "reasoning_options": [{ "type": "effort", "values": ["none", "low", "high", "max"] }]
+      },
+      "claude-haiku-5-5": {
+        "provider": { "npm": "@ai-sdk/anthropic" },
+        "reasoning": true
+      }
+    }
+  },
+  "anthropic": {
+    "npm": "@ai-sdk/anthropic",
+    "models": {
+      "claude-haiku-5-5": {
+        "reasoning_options": [{ "type": "toggle" }, { "type": "effort", "values": ["low", "high", "max"] }]
+      }
+    }
+  },
+  "fixture-same-profile": {
+    "npm": "@ai-sdk/anthropic",
+    "models": {
+      "claude-haiku-5-5": {
+        "reasoning_options": [{ "type": "effort", "values": ["max", "high", "low"] }, { "type": "toggle" }]
+      }
+    }
+  },
+  "fixture-minority": {
+    "npm": "@ai-sdk/anthropic",
+    "models": {
+      "claude-haiku-5-5": {
+        "reasoning_options": [{ "type": "toggle" }, { "type": "effort", "values": ["medium", "high"] }]
+      }
+    }
+  },
+  "fixture-wrong-protocol": {
+    "npm": "@ai-sdk/openai",
+    "models": {
+      "claude-haiku-5-5": {
+        "reasoning_options": [{ "type": "effort", "values": ["medium"] }]
+      }
+    }
+  }
+}

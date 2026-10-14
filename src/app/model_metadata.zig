@@ -3,6 +3,7 @@
 const std = @import("std");
 const fs = @import("../platform/filesystem.zig");
 const providers = @import("../core/providers.zig");
+const cfg = @import("../core/config.zig");
 const catalog = @import("provider_catalog.zig");
 const thinking = @import("../core/thinking.zig");
 const activity = @import("../presentation/activity.zig");
@@ -37,6 +38,45 @@ pub const Cache = struct {
     /// Dynamic models.dev profile; never bundled, replaced wholesale on success.
     dev_reasoning: [catalog.entries.len]?thinking.Declaration = @splat(null),
 };
+/// Shared cache-only resolution for interactive and headless entry. No network,
+/// capacity mutation or preset capabilities; explicit user overrides stay local.
+pub fn reasoningIndex(config: cfg.Config) ?usize {
+    const id = config.provider.kind orelse providers.Id.fromUrl(config.provider.base_url) orelse return null;
+    for (catalog.entries, 0..) |entry, index| {
+        if (entry.provider != id) continue;
+        if (std.mem.eql(u8, entry.model.name, config.model.name) or std.mem.eql(u8, entry.selector, config.model.name)) return index;
+    }
+    return null;
+}
+
+pub fn reasoningDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinking.Declaration {
+    const entry = catalog.entries[index];
+    const protocol = if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) .chat else config.model.protocol;
+    if (protocol != entry.model.protocol) return null;
+    const format: thinking.Format = if (protocol == .anthropic) .anthropic else if (entry.provider == .deepseek) .deepseek else .standard;
+    for ([_]?thinking.Declaration{ cache.reasoning[index], cache.dev_reasoning[index] }) |source| {
+        const declaration = source orelse continue;
+        if (declaration.format != format) continue;
+        declaration.validate() catch continue;
+        return declaration;
+    }
+    return null;
+}
+
+pub fn applyReasoning(cache: *const Cache, config: *cfg.Config) void {
+    if (config.model.reasoning_source == .explicit and config.model.reasoning != null) return;
+    if (config.model.reasoning_source == .metadata) {
+        config.model.reasoning = null;
+        config.model.reasoning_effort = null;
+    }
+    if (reasoningIndex(config.*)) |index| {
+        if (reasoningDeclaration(cache, config.*, index)) |declaration| {
+            config.model.reasoning = declaration;
+            config.model.reasoning_source = .metadata;
+        }
+    }
+}
+
 pub const Claim = struct { cache: Cache, mask: u8 };
 
 pub const dev_bit: u8 = 0x80;
@@ -209,7 +249,9 @@ fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8,
         .headers = .{
             .authorization = if (authorization) |header| .{ .override = header } else .omit,
             .accept_encoding = .{ .override = "identity" },
+            .user_agent = .{ .override = "ThinAgent-metadata-check/1.0" },
         },
+        .extra_headers = &.{.{ .name = "Accept", .value = "application/json" }},
     });
     defer request.deinit();
     try request.sendBodiless();
@@ -439,6 +481,14 @@ test "metadata deep oversized and duplicate caches remain untouched" {
 
 // One owned loopback connection per fixture. No environment routing or real key.
 fn serveMetadata(io: std.Io, server: *std.Io.net.Server, response: []const u8, cleaned: *std.atomic.Value(bool)) !void {
+    return serveMetadataChecked(io, server, response, cleaned, false);
+}
+
+fn servePublicMetadata(io: std.Io, server: *std.Io.net.Server, response: []const u8, cleaned: *std.atomic.Value(bool)) !void {
+    return serveMetadataChecked(io, server, response, cleaned, true);
+}
+
+fn serveMetadataChecked(io: std.Io, server: *std.Io.net.Server, response: []const u8, cleaned: *std.atomic.Value(bool), check_public: bool) !void {
     defer cleaned.store(true, .release);
     var stream = try server.accept(io);
     defer stream.close(io);
@@ -447,10 +497,20 @@ fn serveMetadata(io: std.Io, server: *std.Io.net.Server, response: []const u8, c
     var reader = stream.reader(io, &buffer);
     var suffix: u32 = 0;
     var count: usize = 0;
+    var headers: [8192]u8 = undefined;
+    defer std.crypto.secureZero(u8, &headers);
     while (suffix != 0x0d0a0d0a) {
         if (count == buffer.len) return error.TestHeadersTooLarge;
-        suffix = (suffix << 8) | try reader.interface.takeByte();
+        const byte = try reader.interface.takeByte();
+        headers[count] = std.ascii.toLower(byte);
+        suffix = (suffix << 8) | byte;
         count += 1;
+    }
+    if (check_public) {
+        try std.testing.expect(std.mem.startsWith(u8, headers[0..count], "get /api.json http/1.1\r\n"));
+        try std.testing.expect(std.mem.find(u8, headers[0..count], "authorization:") == null);
+        try std.testing.expect(std.mem.find(u8, headers[0..count], "user-agent: thinagent-metadata-check/1.0") != null);
+        try std.testing.expect(std.mem.find(u8, headers[0..count], "accept: application/json") != null);
     }
     var output: [1024]u8 = undefined;
     var writer = stream.writer(io, &output);
@@ -777,9 +837,14 @@ test "models.dev loopback transport parses public catalog and enforces its own s
     const io = std.testing.io;
     const a = std.testing.allocator;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    const body =
+    const document =
         \\{"deepseek":{"id":"deepseek","models":{"deepseek-flash":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high","max"]}],"provider":{"npm":"@ai-sdk/openai-compatible"}}}}}
     ;
+    // A valid catalog body larger than the official provider's 512 KiB limit.
+    const body = try a.alloc(u8, max_body_bytes + document.len + 1);
+    defer a.free(body);
+    @memset(body, ' ');
+    @memcpy(body[body.len - document.len ..], document);
     const response = try std.fmt.allocPrint(a, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
     defer a.free(response);
     var server = try address.listen(io, .{});
@@ -787,7 +852,7 @@ test "models.dev loopback transport parses public catalog and enforces its own s
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/api.json", .{server.socket.address.getPort()});
     defer a.free(url);
     var cleaned = std.atomic.Value(bool).init(false);
-    var worker = try std.Io.concurrent(io, serveMetadata, .{ io, &server, response, &cleaned });
+    var worker = try std.Io.concurrent(io, servePublicMetadata, .{ io, &server, response, &cleaned });
     defer worker.cancel(io) catch {};
     const fetched = try fetchUrl(a, io, url, null, models_dev.max_body_bytes);
     defer a.free(fetched);
@@ -805,7 +870,8 @@ test "models.dev loopback transport parses public catalog and enforces its own s
     const second_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/api.json", .{second.socket.address.getPort()});
     defer a.free(second_url);
     var second_cleaned = std.atomic.Value(bool).init(false);
-    var second_worker = try std.Io.concurrent(io, serveMetadata, .{ io, &second, response, &second_cleaned });
+    const oversized_head = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
+    var second_worker = try std.Io.concurrent(io, servePublicMetadata, .{ io, &second, oversized_head, &second_cleaned });
     defer second_worker.cancel(io) catch {};
     try std.testing.expectError(error.MetadataTooLarge, fetchUrl(a, io, second_url, null, 8));
     try second_worker.await(io);

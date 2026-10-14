@@ -10,6 +10,7 @@ const r = @import("../core/runtime.zig");
 const Journal = @import("journal.zig").Journal;
 const Settings = @import("settings_store.zig").Store;
 const thinking = @import("../core/thinking.zig");
+const metadata = @import("model_metadata.zig");
 const session_context = @import("../core/session_context.zig");
 
 /// 应用聚合体：持有配置、项目根目录、记忆存储、工具执行器、HTTP 客户端与 Runtime，
@@ -55,6 +56,16 @@ pub const App = struct {
         const path = try cfg.defaultPath(a, home);
         defer a.free(path);
         var parsed = try cfg.load(a, io, path);
+        // Derived defaults are not embedded in config.json. Headless entry can
+        // reuse a compatible cached profile without creating/fetching metadata.
+        if ((parsed.value.model.reasoning_source != .explicit or parsed.value.model.reasoning == null) and metadata.reasoningIndex(parsed.value) != null) {
+            var store: ?@import("auth_store.zig").Store = @import("auth_store.zig").Store.openExisting(a, io, home) catch null;
+            if (store) |*value| {
+                defer value.deinit();
+                const cache = metadata.load(&value.root) catch metadata.Cache{};
+                metadata.applyReasoning(&cache, &parsed.value);
+            }
+        }
         // Headless entry creates the same missing project default as the TUI,
         // without changing the global configuration on disk.
         var settings = Settings.open(a, io, project) catch |err| {

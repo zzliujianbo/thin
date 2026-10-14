@@ -35,6 +35,7 @@ const Record = struct {
     model: []const u8,
     profile: Profile,
     npm: ?[]const u8 = null,
+    override_invalid: bool = false,
     api: protocol.Protocol = .auto,
     declaration: ?thinking.Declaration = null,
 };
@@ -152,11 +153,13 @@ fn parseLevels(scanner: *std.json.Scanner, allocator: std.mem.Allocator, profile
 fn parseOption(scanner: *std.json.Scanner, allocator: std.mem.Allocator, profile: *Profile) !void {
     try expect(scanner, allocator, .object_begin);
     var kind: ?[]const u8 = null;
+    var saw_kind = false;
     var values: ?Profile = null;
     while (!(try at(scanner, .object_end))) {
         const key = try nextString(scanner, allocator);
         if (equal(key, "type")) {
-            if (kind != null) return error.InvalidModelsDev;
+            if (saw_kind) return error.InvalidModelsDev;
+            saw_kind = true;
             kind = try optionalString(scanner, allocator);
         } else if (equal(key, "values")) {
             if (values != null) return error.InvalidModelsDev;
@@ -172,6 +175,7 @@ fn parseOption(scanner: *std.json.Scanner, allocator: std.mem.Allocator, profile
     };
     if (equal(option_type, "toggle")) {
         if (profile.has_toggle) profile.unsupported = true;
+        if (values) |parsed| profile.unsupported = profile.unsupported or parsed.unsupported;
         profile.has_toggle = true;
         return;
     }
@@ -202,15 +206,24 @@ fn parseOptions(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !Profi
         return profile;
     }
     try expect(scanner, allocator, .array_begin);
-    while (!(try at(scanner, .array_end))) try parseOption(scanner, allocator, &profile);
+    while (!(try at(scanner, .array_end))) {
+        if (try at(scanner, .object_begin)) {
+            try parseOption(scanner, allocator, &profile);
+        } else {
+            try scanner.skipValue();
+            profile.unsupported = true;
+        }
+    }
     try expect(scanner, allocator, .array_end);
     return profile;
 }
 
-fn overrideNpm(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?[]const u8 {
+const AdapterOverride = struct { npm: ?[]const u8 = null, invalid: bool = false };
+
+fn overrideNpm(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !AdapterOverride {
     if (!(try at(scanner, .object_begin))) {
         try scanner.skipValue();
-        return null;
+        return .{ .invalid = true };
     }
     try expect(scanner, allocator, .object_begin);
     var npm: ?[]const u8 = null;
@@ -224,10 +237,10 @@ fn overrideNpm(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?[]con
         } else try scanner.skipValue();
     }
     try expect(scanner, allocator, .object_end);
-    return npm;
+    return .{ .npm = npm, .invalid = seen and npm == null };
 }
 
-const ModelRow = struct { npm: ?[]const u8 = null, profile: Profile = .{} };
+const ModelRow = struct { npm: ?[]const u8 = null, profile: Profile = .{}, override_invalid: bool = false };
 
 fn parseModel(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !ModelRow {
     try expect(scanner, allocator, .object_begin);
@@ -243,7 +256,9 @@ fn parseModel(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !ModelRo
         } else if (equal(field, "provider")) {
             if (saw_provider) return error.InvalidModelsDev;
             saw_provider = true;
-            row.npm = try overrideNpm(scanner, allocator);
+            const override = try overrideNpm(scanner, allocator);
+            row.npm = override.npm;
+            row.override_invalid = override.invalid;
         } else try scanner.skipValue(); // id is the catalog key; other fields are not used.
     }
     try expect(scanner, allocator, .object_end);
@@ -262,7 +277,7 @@ fn parseModels(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provide
             if (equal(prior.provider, provider) and equal(prior.model, model)) return error.InvalidModelsDev;
         }
         const row = try parseModel(scanner, allocator);
-        try records.append(allocator, .{ .provider = provider, .model = model, .profile = row.profile, .npm = row.npm });
+        try records.append(allocator, .{ .provider = provider, .model = model, .profile = row.profile, .npm = row.npm, .override_invalid = row.override_invalid });
     }
     try expect(scanner, allocator, .object_end);
 }
@@ -304,14 +319,16 @@ fn parseProvider(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provi
     }
     try expect(scanner, allocator, .object_end);
     for (records.items[first..]) |*record| {
-        record.api = protocolFor(record.npm orelse provider_npm);
+        record.api = if (record.override_invalid) .auto else protocolFor(record.npm orelse provider_npm);
         record.declaration = declarationFor(record.profile, record.api, provider);
     }
 }
 
-fn matching(record: Record, model: []const u8, api: protocol.Protocol) ?thinking.Declaration {
+fn matching(record: Record, model: []const u8, api: protocol.Protocol, format: thinking.Format) ?thinking.Declaration {
     if (!equal(record.model, model) or record.api != api) return null;
-    return record.declaration;
+    const declaration = record.declaration orelse return null;
+    if (declaration.format != format) return null;
+    return declaration;
 }
 
 fn sameProfile(a: thinking.Declaration, b: thinking.Declaration) bool {
@@ -329,24 +346,27 @@ fn sameProfile(a: thinking.Declaration, b: thinking.Declaration) bool {
 /// Exact usable provider/model profile first. Otherwise the unique most-common
 /// complete profile for the exact model ID and protocol; ties remain unknown.
 fn resolveIn(records: []const Record, provider: []const u8, model: []const u8, api: protocol.Protocol) Resolution {
-    if (api == .auto) return .{};
+    const format = formatFor(provider, api) orelse return .{};
     for (records) |record| {
         if (!equal(record.provider, provider) or !equal(record.model, model)) continue;
         if (record.api != api) return .{};
-        if (record.declaration) |declaration| return .{ .declaration = declaration, .source = .exact };
+        if (record.declaration) |declaration| {
+            if (declaration.format != format) return .{};
+            return .{ .declaration = declaration, .source = .exact };
+        }
         break;
     }
     var best: ?thinking.Declaration = null;
     var best_count: usize = 0;
     var tied = false;
     outer: for (records, 0..) |candidate, index| {
-        const declaration = matching(candidate, model, api) orelse continue;
+        const declaration = matching(candidate, model, api, format) orelse continue;
         for (records[0..index]) |prior| {
-            if (matching(prior, model, api)) |earlier| if (sameProfile(earlier, declaration)) continue :outer;
+            if (matching(prior, model, api, format)) |earlier| if (sameProfile(earlier, declaration)) continue :outer;
         }
         var count: usize = 0;
         for (records) |other| {
-            if (matching(other, model, api)) |profile| if (sameProfile(profile, declaration)) {
+            if (matching(other, model, api, format)) |profile| if (sameProfile(profile, declaration)) {
                 count += 1;
             };
         }
@@ -439,4 +459,75 @@ test "models.dev parser keeps catalog IDs, derives SDK protocols, and isolates b
     try t.expectEqual(protocol.Protocol.chat, protocolFor("@ai-sdk/openai-compatible"));
     try t.expectEqual(protocol.Protocol.anthropic, protocolFor("@ai-sdk/anthropic"));
     try t.expectEqual(protocol.Protocol.auto, protocolFor("@ai-sdk/google"));
+}
+
+fn fixtureIndex(selector: []const u8) usize {
+    for (catalog.entries, 0..) |entry, i| if (equal(entry.selector, selector)) return i;
+    unreachable;
+}
+
+test "models.dev Haiku majority is a complete normalized profile, not a union" {
+    // Synthetic offline fixture only. Never included in production data.
+    const parsed = try parse(std.testing.allocator, @embedFile("models_dev_fixture.json"));
+    const haiku = parsed[fixtureIndex("opencode-go/claude-haiku-5-5")];
+    try std.testing.expectEqual(Source.majority, haiku.source.?);
+    const declaration = haiku.declaration.?;
+    try std.testing.expectEqual(thinking.Format.anthropic, declaration.format);
+    try std.testing.expectEqualStrings("disabled", declaration.map.off.?);
+    try std.testing.expectEqualStrings("low", declaration.map.low.?);
+    try std.testing.expectEqualStrings("high", declaration.map.high.?);
+    try std.testing.expectEqualStrings("max", declaration.map.max.?);
+    try std.testing.expect(declaration.map.medium == null); // Minority profile is not merged.
+    const luna = parsed[fixtureIndex("opencode-go/gpt-6-luna")];
+    try std.testing.expectEqual(Source.exact, luna.source.?);
+    try std.testing.expectEqualStrings("none", luna.declaration.?.map.off.?);
+}
+
+test "models.dev format mismatch cannot turn DeepSeek thinking toggle into standard effort" {
+    const standard: thinking.Declaration = .{ .map = .{ .off = "none", .high = "high" } };
+    const records = [_]Record{testRecord("fixture", "deepseek-flash", .chat, standard)};
+    try std.testing.expect(resolveIn(&records, "deepseek", "deepseek-flash", .chat).declaration == null);
+}
+
+test "models.dev malformed toggle values neither authorize exact profiles nor cast votes" {
+    const a = std.testing.allocator;
+    const index = fixtureIndex("opencode-go/claude-haiku-5-5");
+    for ([_][]const u8{ "42", "null", "[]", "[false]", "[\"high\",false]", "[\"high\",\"high\"]" }) |bad_values| {
+        const bad = try std.mem.concat(a, u8, &.{
+            \\{"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"reasoning_options":[{"type":"toggle","values":
+            ,
+            bad_values,
+            \\},{"type":"effort","values":["high"]}]}}}}
+            ,
+        });
+        defer a.free(bad);
+        try std.testing.expect((try parse(a, bad))[index].declaration == null);
+        const fallback = try std.mem.concat(a, u8, &.{
+            bad[0 .. bad.len - 1],
+            \\,"valid":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
+            ,
+        });
+        defer a.free(fallback);
+        const resolved = (try parse(a, fallback))[index];
+        try std.testing.expectEqual(Source.majority, resolved.source.?);
+        try std.testing.expectEqualStrings("high", resolved.declaration.?.map.high.?);
+        const tied = try std.mem.concat(a, u8, &.{
+            fallback[0 .. fallback.len - 1],
+            \\,"other":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low"]}]}}}}
+            ,
+        });
+        defer a.free(tied);
+        // The malformed high row must not break the valid high/low tie.
+        try std.testing.expect((try parse(a, tied))[index].declaration == null);
+    }
+}
+
+test "models.dev malformed options and explicit invalid adapters are model-local unknowns" {
+    const body =
+        \\{"opencode-go":{"npm":"@ai-sdk/openai","models":{"gpt-6-luna":{"provider":{"npm":42},"reasoning_options":[{"type":"effort","values":["low"]}]},"claude-haiku-5-5":{"provider":{"npm":"@ai-sdk/anthropic"},"reasoning_options":[false,null,12]},"mimo-v2.5":{"reasoning":true}}}}
+    ;
+    const parsed = try parse(std.testing.allocator, body);
+    try std.testing.expect(parsed[fixtureIndex("opencode-go/gpt-6-luna")].declaration == null);
+    try std.testing.expect(parsed[fixtureIndex("opencode-go/claude-haiku-5-5")].declaration == null);
+    try std.testing.expect(parsed[fixtureIndex("opencode-go/mimo-v2.5")].declaration == null);
 }

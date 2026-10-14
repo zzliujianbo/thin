@@ -139,7 +139,7 @@ test "thinking actual chat standard and deepseek mapping" {
         .{ .model = "deepseek-v4-pro", .effort = "max", .expected = "max", .enabled = true },
     };
     for (cases) |case| {
-        const cap = thinking.resolve("https://api.deepseek.com", case.model, null);
+        const cap = thinking.resolve("https://api.deepseek.com", case.model, .{ .format = .deepseek, .map = .{ .off = "off", .high = "high", .max = "max" } });
         const wire = cap.wire(case.effort);
         req.reasoning_effort = wire.effort;
         req.thinking = wire.thinking;
@@ -148,7 +148,7 @@ test "thinking actual chat standard and deepseek mapping" {
         if (case.expected) |expected| try std.testing.expectEqualStrings(expected, try c.text(v, "reasoning_effort")) else try std.testing.expect(j.get(v, "reasoning_effort") == null);
         if (case.enabled) |enabled| try std.testing.expectEqualStrings(if (enabled) "enabled" else "disabled", try c.text(j.get(v, "thinking").?, "type")) else try std.testing.expect(j.get(v, "thinking") == null);
     }
-    const cap = thinking.resolve("https://api.openai.com/v1", "gpt-5.2", null);
+    const cap = thinking.resolve("https://api.openai.com/v1", "gpt-5.2", .{ .map = .{ .off = "none", .high = "high" } });
     req.reasoning_effort = cap.wire("off").effort;
     req.thinking = null;
     req.reasoning_format = cap.format;

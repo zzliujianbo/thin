@@ -23,6 +23,13 @@ const fs = @import("../platform/filesystem.zig");
 const MetadataTokens = [catalog.entries.len]?u32;
 const MetadataFetch = *const fn (std.mem.Allocator, std.Io, ProviderId, ?[]const u8) anyerror!metadata.Listing;
 const DevFetch = *const fn (std.mem.Allocator, std.Io) anyerror!metadata.Listing;
+const official_metadata_timeout_ms = 8000;
+const models_dev_timeout_ms = 30000;
+
+/// A prepared actual model is not a fresh catalog choice. Credential swaps
+/// preserve its budget, mapping, effective effort and context provenance.
+const RetainedSelection = struct { context_official: bool, notice: ?[]const u8 };
+
 const MetadataJob = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -30,12 +37,20 @@ const MetadataJob = struct {
     dev_fetch: DevFetch,
     keys: [3]?[]u8 = @splat(null),
     requested: u8 = 0,
+    credential_revisions: [3]u64 = @splat(0),
     succeeded: u8 = 0,
     listing: metadata.Listing = .{},
     manual: bool,
     started_ms: i64,
     done: std.atomic.Value(bool) = .init(false),
     future: ?std.Io.Future(void) = null,
+    // Separate worker storage: neither worker reads/writes the other's results.
+    dev_future: ?std.Io.Future(void) = null,
+    dev_done: std.atomic.Value(bool) = .init(false),
+    dev_listing: metadata.Listing = .{},
+    dev_started_ms: i64 = 0,
+    official_published: bool = false,
+    dev_published: bool = false,
 
     fn run(self: *MetadataJob) void {
         defer self.done.store(true, .release);
@@ -55,14 +70,11 @@ const MetadataJob = struct {
                 self.listing.reasoning[i] = values.reasoning[i];
             };
         }
-        // Public models.dev data is independent of provider keys and never blocks
-        // the official results above; a failed or cancelled fetch keeps the cache.
-        if (self.requested & metadata.dev_bit != 0) {
-            if (self.dev_fetch(self.allocator, self.io)) |dev| {
-                self.listing.dev = dev.dev;
-                self.listing.dev_done = true;
-            } else |err| if (err == error.Canceled) return;
-        }
+    }
+    fn runDev(self: *MetadataJob) void {
+        defer self.dev_done.store(true, .release);
+        const dev = self.dev_fetch(self.allocator, self.io) catch return;
+        self.dev_listing = dev;
     }
     fn wipeKeys(self: *MetadataJob) void {
         for (&self.keys) |*key| if (key.*) |bytes| {
@@ -73,6 +85,7 @@ const MetadataJob = struct {
     }
     fn destroy(self: *MetadataJob) void {
         if (self.future) |*future| future.cancel(self.io);
+        if (self.dev_future) |*future| future.cancel(self.io);
         self.wipeKeys();
         self.allocator.destroy(self);
     }
@@ -557,27 +570,15 @@ pub const Session = struct {
     }
 
     fn metadataIndex(config: cfg.Config) ?usize {
-        const id = config.provider.kind orelse ProviderId.fromUrl(config.provider.base_url) orelse return null;
-        for (catalog.entries, 0..) |entry, index| {
-            if (entry.provider != id) continue;
-            if (std.mem.eql(u8, entry.model.name, config.model.name) or std.mem.eql(u8, entry.selector, config.model.name)) return index;
-        }
-        return null;
+        return metadata.reasoningIndex(config);
+    }
+
+    fn metadataDeclaration(self: *const Session, config: cfg.Config, index: usize) ?thinking.Declaration {
+        return metadata.reasoningDeclaration(&self.metadata_cache, config, index);
     }
 
     fn applyReasoningMetadata(self: *const Session, config: *cfg.Config) void {
-        if (metadataIndex(config.*)) |index| {
-            if (self.metadata_cache.reasoning[index]) |declaration| {
-                config.model.reasoning = declaration;
-            } else if (config.model.reasoning == null) {
-                const entry = catalog.entries[index];
-                // A models.dev profile is protocol-specific; a changed local protocol gets no guess.
-                config.model.reasoning = if (entry.model.protocol == config.model.protocol)
-                    self.metadata_cache.dev_reasoning[index] orelse entry.model.reasoning
-                else
-                    entry.model.reasoning;
-            }
-        }
+        metadata.applyReasoning(&self.metadata_cache, config);
     }
 
     fn capabilitiesFor(self: *const Session, config: cfg.Config) thinking.Capabilities {
@@ -587,11 +588,14 @@ pub const Session = struct {
     }
 
     fn declarationForEntry(self: *const Session, entry: catalog.Entry) ?thinking.Declaration {
+        // Credential reactivation also passes explicit custom models through
+        // this entry path. Their declarations must not be treated as presets.
+        if (entry.model.reasoning_source == .explicit and entry.model.reasoning != null) return entry.model.reasoning;
         for (catalog.entries, 0..) |known, index| {
             if (known.provider == entry.provider and std.mem.eql(u8, known.selector, entry.selector))
-                return self.metadata_cache.reasoning[index] orelse self.metadata_cache.dev_reasoning[index] orelse entry.model.reasoning;
+                return self.metadataDeclaration(.{ .provider = catalog.connection(entry.provider), .model = entry.model }, index);
         }
-        return entry.model.reasoning;
+        return null;
     }
 
     fn sameDeclaration(a: ?thinking.Declaration, b: ?thinking.Declaration) bool {
@@ -617,7 +621,7 @@ pub const Session = struct {
         if (self.metadata_job != null) return error.MetadataRefreshBusy;
         if (requested == 0) return error.NoOfficialProvider;
         const job = try self.allocator.create(MetadataJob);
-        job.* = .{ .allocator = self.allocator, .io = self.io, .fetch = self.metadata_fetch, .dev_fetch = self.metadata_dev_fetch, .manual = manual, .started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds()) };
+        job.* = .{ .allocator = self.allocator, .io = self.io, .fetch = self.metadata_fetch, .dev_fetch = self.metadata_dev_fetch, .manual = manual, .started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds()), .credential_revisions = self.credential_revisions };
         errdefer job.destroy();
         for (ProviderId.all) |id| {
             const index: usize = @intCast(@backingInt(id));
@@ -632,10 +636,61 @@ pub const Session = struct {
             job.destroy();
             return;
         }
-        job.future = try std.Io.concurrent(self.io, MetadataJob.run, .{job});
+        if (claim.mask & metadata.provider_mask != 0)
+            job.future = try std.Io.concurrent(self.io, MetadataJob.run, .{job});
+        if (claim.mask & metadata.dev_bit != 0) {
+            job.dev_started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds());
+            job.dev_future = try std.Io.concurrent(self.io, MetadataJob.runDev, .{job});
+        }
         self.metadata_job = job;
         self.metadata_login_pending &= ~claim.mask;
         self.metadata_notice = null;
+    }
+
+    /// Reuse a joined official slot after a login while the independent public
+    /// source is still running. No public task is cancelled or restarted here.
+    fn restartOfficialMetadata(self: *Session, job: *MetadataJob, requested: u8) !void {
+        std.debug.assert(job.future == null and job.official_published);
+        var keys: [3]?[]u8 = @splat(null);
+        var transferred = false;
+        defer if (!transferred) {
+            for (keys) |key| if (key) |bytes| {
+                std.crypto.secureZero(u8, bytes);
+                self.allocator.free(bytes);
+            };
+        };
+        for (ProviderId.all) |id| {
+            if (requested & metadata.bit(id) != 0) keys[@intCast(@backingInt(id))] = try self.keyFor(id);
+        }
+        const claim = try metadata.claim(&self.store.root, requested, true);
+        const previous_mask = job.requested;
+        const previous_listing = job.listing;
+        const previous_succeeded = job.succeeded;
+        const previous_started = job.started_ms;
+        const previous_revisions = job.credential_revisions;
+        job.wipeKeys();
+        job.keys = keys;
+        transferred = true;
+        errdefer {
+            job.wipeKeys();
+            job.requested = previous_mask;
+            job.listing = previous_listing;
+            job.succeeded = previous_succeeded;
+            job.started_ms = previous_started;
+            job.credential_revisions = previous_revisions;
+            job.official_published = true;
+        }
+        job.requested = claim.mask | (previous_mask & metadata.dev_bit);
+        job.listing = .{};
+        job.succeeded = 0;
+        job.done.store(false, .release);
+        job.credential_revisions = self.credential_revisions;
+        job.official_published = false;
+        job.started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds());
+        job.future = try std.Io.concurrent(self.io, MetadataJob.run, .{job});
+        job.manual = true;
+        self.metadata_cache.attempted = claim.cache.attempted;
+        self.metadata_login_pending &= ~claim.mask;
     }
 
     /// Owner polling never waits for network. Completion may change only the
@@ -643,23 +698,64 @@ pub const Session = struct {
     fn pollModels(raw: *anyopaque, idle: bool) bool {
         const self: *Session = @ptrCast(@alignCast(raw));
         if (self.metadata_job) |job| {
-            if (job.future) |*future| {
-                if (job.done.load(.acquire)) {
-                    future.await(self.io);
-                } else if (std.Io.Clock.awake.now(self.io).toMilliseconds() - job.started_ms >= 8000) {
-                    future.cancel(self.io);
-                } else return false;
-                job.future = null;
-                job.wipeKeys(); // Also handles cancellation before the worker starts.
+            official_pending: {
+                if (job.future) |*future| {
+                    if (job.done.load(.acquire)) {
+                        future.await(self.io);
+                    } else if (std.Io.Clock.awake.now(self.io).toMilliseconds() - job.started_ms >= official_metadata_timeout_ms) {
+                        future.cancel(self.io);
+                    } else break :official_pending;
+                    job.future = null;
+                    job.wipeKeys(); // Also handles cancellation before the worker starts.
+                }
+            }
+            dev_pending: {
+                if (job.dev_future) |*future| {
+                    if (job.dev_done.load(.acquire)) {
+                        future.await(self.io);
+                    } else if (std.Io.Clock.awake.now(self.io).toMilliseconds() - job.dev_started_ms >= models_dev_timeout_ms) {
+                        future.cancel(self.io);
+                    } else break :dev_pending;
+                    job.dev_future = null;
+                }
             }
             if (!idle) return false;
-            defer {
+            if (job.future == null and job.official_published and job.dev_future != null and self.metadata_login_pending != 0) {
+                const requested = self.metadata_login_pending;
+                self.restartOfficialMetadata(job, requested) catch {
+                    self.metadata_login_pending &= ~requested; // One attempt per login, never a tight retry loop.
+                    self.metadata_notice = "Login saved; official model refresh failed, previous list kept";
+                };
+                return true;
+            }
+            const finished = job.future == null and job.dev_future == null;
+            defer if (finished) {
                 self.metadata_job = null;
                 job.destroy();
+            };
+            const official_ready = job.future == null and !job.official_published;
+            const dev_ready = job.dev_future == null and !job.dev_published;
+            if (!official_ready and !dev_ready) return false;
+            var listing: metadata.Listing = .{};
+            var succeeded: u8 = 0;
+            if (official_ready) {
+                listing = job.listing;
+                // Filtering is independent of automatic login refresh. Even
+                // with auto refresh disabled, a manual job may use an old key.
+                succeeded = job.succeeded;
+                for (ProviderId.all) |id| {
+                    const index: usize = @intCast(@backingInt(id));
+                    if (job.credential_revisions[index] != self.credential_revisions[index]) succeeded &= ~metadata.bit(id);
+                }
+                job.succeeded = succeeded;
+                job.official_published = true;
             }
-            // A login during an older job queues a fresh read with the new key.
-            // Do not publish the obsolete provider result over that intention.
-            const cache = metadata.commit(&self.store.root, job.succeeded & ~self.metadata_login_pending, job.listing) catch {
+            if (dev_ready) {
+                listing.dev = job.dev_listing.dev;
+                listing.dev_done = job.dev_listing.dev_done;
+                job.dev_published = true;
+            }
+            const cache = metadata.commit(&self.store.root, succeeded, listing) catch {
                 self.metadata_notice = if (job.manual) "Metadata cache could not be saved; previous values kept" else null;
                 return true;
             };
@@ -673,13 +769,18 @@ pub const Session = struct {
             self.allocator.free(self.display_models);
             self.display_models = models;
             const official_requested = job.requested & metadata.provider_mask;
-            self.metadata_notice = if (!job.manual) null else if (official_requested == 0)
-                (if (job.listing.dev_done) "models.dev metadata refreshed" else "models.dev metadata refresh failed; cached/default values kept")
+            self.metadata_notice = if (!job.manual) null else if (!finished)
+                (if (job.dev_future != null)
+                    (if (succeeded != 0) "Official metadata updated; models.dev refresh still running" else "Official metadata failed or became stale; models.dev refresh still running")
+                else
+                    (if (listing.dev_done) "models.dev updated; official metadata refresh still running" else "models.dev refresh failed; official metadata refresh still running"))
+            else if (official_requested == 0)
+                (if (job.dev_listing.dev_done) "models.dev metadata refreshed" else "models.dev metadata refresh failed; cached/default values kept")
             else if (job.succeeded == 0)
                 "Official metadata refresh failed; cached/default values kept"
             else if (job.succeeded != official_requested)
                 "Official metadata partly refreshed; failed sources kept cached/default values"
-            else if (job.requested & metadata.dev_bit != 0 and !job.listing.dev_done)
+            else if (job.requested & metadata.dev_bit != 0 and !job.dev_listing.dev_done)
                 "Official model list refreshed; models.dev metadata refresh failed"
             else
                 "Official model list refreshed; /model shows official or default capacity";
@@ -732,11 +833,8 @@ pub const Session = struct {
             };
             if (duplicate) continue; // An explicit local profile wins a name collision.
             var model = entry.model;
-            if (self.metadata_cache.reasoning[index]) |declaration| {
-                model.reasoning = declaration;
-            } else if (self.metadata_cache.dev_reasoning[index]) |declaration| {
-                model.reasoning = declaration;
-            }
+            model.reasoning = self.metadataDeclaration(.{ .provider = catalog.connection(entry.provider), .model = model }, index);
+            model.reasoning_source = .metadata;
             if (self.officialCapacity(entry)) |tokens| model.context_tokens = tokens;
             model.name = entry.selector;
             try models.append(self.allocator, model);
@@ -796,7 +894,7 @@ pub const Session = struct {
         const global = self.global_config.?.value;
         var disk = global;
         disk.provider = candidate.provider;
-        disk.model = candidate.model;
+        disk.model = candidate.model.persisted();
         disk.models = candidate.models;
         // Retain a legacy inline official key in its own slot when changing
         // the primary service. Never materialize an environment value on disk.
@@ -832,7 +930,7 @@ pub const Session = struct {
         }
     }
 
-    fn activateSavedCredential(self: *Session, model: cfg.Model, selector: []const u8) !bool {
+    fn activateSavedCredential(self: *Session, model: cfg.Model, selector: []const u8, retained: RetainedSelection) !bool {
         const app = self.app orelse return false;
         const id = ProviderId.fromUrl(app.config.value.provider.base_url) orelse return false;
         if (self.active_revision == self.credential_revisions[@intCast(@backingInt(id))]) return false;
@@ -840,7 +938,7 @@ pub const Session = struct {
         // A retained conversation already established its wire protocol. Do not
         // probe a different protocol merely because its credential changed.
         if (next.protocol == .auto and app.runtime.history.items.len != 0) next.protocol = app.runtime.selector.effective();
-        try self.selectProviderModel(.{ .provider = id, .selector = selector, .model = next });
+        try self.installProviderModel(.{ .provider = id, .selector = selector, .model = next }, retained);
         return true;
     }
 
@@ -848,6 +946,19 @@ pub const Session = struct {
         const self: *Session = @ptrCast(@alignCast(raw));
         try self.guardSelection();
         const config = self.mutableConfig();
+        // A catalog-recognized current model may still have a user declaration.
+        // Reactivate its actual options before dispatching to a bare preset.
+        const current_explicit = config.model.reasoning_source == .explicit and
+            (config.model.reasoning != null or config.model.reasoning_effort != null);
+        const current_name = std.mem.eql(u8, name, config.model.name) or
+            (self.selected_alias != null and std.mem.eql(u8, name, self.selected_alias.?));
+        if (current_name) {
+            if (try self.activateSavedCredential(config.model, self.selected_alias orelse name, .{ .context_official = self.active_context_official, .notice = self.settings_notice })) return;
+            if (current_explicit) {
+                if (self.app) |app| self.initial_context = app.runtime.contextSnapshot();
+                return;
+            }
+        }
         var explicit_profile = false;
         for (config.models) |profile| if (std.mem.eql(u8, profile.name, name)) {
             explicit_profile = true;
@@ -868,7 +979,7 @@ pub const Session = struct {
         // The current picker row represents the ACTUAL transient options, not
         // a same-named startup profile. Re-selecting it must not undo Shift+Tab.
         if (std.mem.eql(u8, name, config.model.name)) {
-            if (try self.activateSavedCredential(config.model, name)) return;
+            if (try self.activateSavedCredential(config.model, name, .{ .context_official = self.active_context_official, .notice = self.settings_notice })) return;
             // Owner-only idle path: preserve the latest actual value even when
             // the picker republishes a same-name no-op connection snapshot.
             if (self.app) |app| self.initial_context = app.runtime.contextSnapshot();
@@ -895,7 +1006,7 @@ pub const Session = struct {
         }
         candidate.model.reasoning_effort = capabilities.effective(candidate.model.reasoning_effort);
         try cfg.validate(candidate);
-        if (try self.activateSavedCredential(candidate.model, name)) return;
+        if (try self.activateSavedCredential(candidate.model, name, .{ .context_official = false, .notice = preference_notice })) return;
         const owned_name = try self.allocator.dupe(u8, candidate.model.name);
         errdefer self.allocator.free(owned_name);
         const alias = try self.aliasFor(candidate);
@@ -930,16 +1041,22 @@ pub const Session = struct {
     }
 
     fn selectProviderModel(self: *Session, entry: catalog.Entry) !void {
+        return self.installProviderModel(entry, null);
+    }
+
+    fn installProviderModel(self: *Session, entry: catalog.Entry, retained: ?RetainedSelection) !void {
         const previous = self.mutableConfig();
         const revision = self.credential_revisions[@intCast(@backingInt(entry.provider))];
-        const official = self.officialCapacity(entry);
+        const official = if (retained == null) self.officialCapacity(entry) else null;
         const capacity = official orelse entry.model.context_tokens;
+        const context_official = if (retained) |actual| actual.context_official else official != null;
+        const declaration = if (retained != null) entry.model.reasoning else self.declarationForEntry(entry);
         if (self.app != null and previous.provider.kind == entry.provider and
             std.mem.eql(u8, previous.model.name, entry.model.name) and self.active_revision == revision and
-            previous.model.context_tokens == capacity and sameDeclaration(previous.model.reasoning, self.declarationForEntry(entry)))
+            previous.model.context_tokens == capacity and sameDeclaration(previous.model.reasoning, declaration))
         {
             self.initial_context = self.app.?.runtime.contextSnapshot();
-            self.active_context_official = official != null;
+            self.active_context_official = context_official;
             return;
         }
         const key = try self.keyFor(entry.provider);
@@ -955,10 +1072,10 @@ pub const Session = struct {
         next.provider.api_key = key;
         next.credentials = self.global_config.?.value.credentials;
         next.model = entry.model;
-        next.model.reasoning = self.declarationForEntry(entry);
+        if (retained == null and next.model.reasoning == null and next.model.reasoning_effort == null) next.model.reasoning_source = .metadata;
         next.model.context_tokens = capacity;
         next.models = if (same_endpoint) previous.models else &.{};
-        const notice = self.applyPreference(&next);
+        const notice = if (retained) |actual| actual.notice else self.applyPreference(&next);
         const alias = try self.allocator.dupe(u8, entry.selector);
         errdefer self.allocator.free(alias);
         const owned = try cfg.clone(self.allocator, next);
@@ -993,7 +1110,7 @@ pub const Session = struct {
         self.allocator.free(self.display_models);
         self.display_models = models;
         self.active_revision = revision;
-        self.active_context_official = official != null;
+        self.active_context_official = context_official;
         self.settings_notice = notice;
         self.initial_context = self.app.?.runtime.contextSnapshot();
         self.publishCheckpoint();
@@ -1078,10 +1195,10 @@ pub const Session = struct {
         const canonical = effort.canonical();
         const name = canonical.name() orelse return error.InvalidReasoningEffort;
         const config = self.mutableConfig();
-        self.applyReasoningMetadata(config);
-        const capabilities = self.capabilitiesFor(config.*);
-        if (!capabilities.levels.contains(canonical)) return error.UnsupportedReasoningEffort;
         var candidate = config.*;
+        self.applyReasoningMetadata(&candidate);
+        const capabilities = self.capabilitiesFor(candidate);
+        if (!capabilities.levels.contains(canonical)) return error.UnsupportedReasoningEffort;
         candidate.model.reasoning_effort = name;
         try cfg.validate(candidate);
         // No effective option, baseline, replay or estimator mutation until
@@ -1116,7 +1233,9 @@ pub const Session = struct {
         }
         var writer = std.Io.Writer.fixed(encoded);
         std.json.Stringify.value(next, .{}, &writer) catch return error.ConfigTooLarge;
-        const owned = try cfg.parse(self.allocator, encoded[0..writer.end]);
+        // The fixed encoding above enforces the original setup size limit.
+        // This is a trusted pending config, not a disk load: retain its map.
+        const owned = try cfg.clone(self.allocator, next);
         const candidate = try self.prepareApp(owned);
         errdefer candidate.deinit();
         try candidate.pinSessionID(self.session_id);
@@ -1125,6 +1244,7 @@ pub const Session = struct {
         // 先完成本地对象构建和落盘，再发布 ready。保存失败不激活半配置会话。
         var disk_config = candidate.config.value;
         if (self.pending_base_model) |baseline| disk_config.model = baseline;
+        disk_config.model = disk_config.model.persisted();
         var global = try cfg.clone(self.allocator, disk_config);
         errdefer cfg.release(&global);
         const models = try self.buildModels(candidate.config.value, global.value);
@@ -1196,6 +1316,13 @@ test "restore selection is read only until an explicit empty conversation model 
     try connection.configureProvider(.deepseek, "fixture-deepseek-key");
     try connection.configureProvider(.opencode_zen, "fixture-zen-key");
     try connection.configureProvider(.opencode_go, "fixture-go-key");
+    // Restore reads a persisted capability source, not removed built-in tables.
+    var listing: metadata.Listing = .{};
+    for (catalog.entries, 0..) |entry, index| {
+        if (std.mem.eql(u8, entry.model.name, "gpt-5.6-luna"))
+            listing.reasoning[index] = .{ .map = .{ .low = "low", .medium = "medium", .high = "high", .xhigh = "xhigh", .max = "max" } };
+    }
+    source.metadata_cache = try metadata.commit(&source.store.root, metadata.bit(.opencode_go) | metadata.bit(.opencode_zen), listing);
     try connection.selectModel("opencode-go/gpt-5.6-luna");
     const app = source.app.?;
     app.journal.observer().notify(.{ .submitted = "old text must not become new history" });
@@ -1307,10 +1434,20 @@ const MetadataFixture = struct {
     fn dev(_: std.mem.Allocator, _: std.Io) !metadata.Listing {
         return .{ .dev_done = true };
     }
+    fn waitDone(io: std.Io, done: *std.atomic.Value(bool)) !void {
+        // Bounded fixture synchronization; leave Future ownership to pollModels.
+        const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 5000;
+        while (!done.load(.acquire)) {
+            if (std.Io.Clock.awake.now(io).toMilliseconds() >= deadline) return error.FixtureCompletionTimeout;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+    }
     fn finish(session: *Session) void {
         const job = session.metadata_job.?;
-        job.future.?.await(session.io);
+        if (job.future) |*future| future.await(session.io);
         job.future = null;
+        if (job.dev_future) |*future| future.await(session.io);
+        job.dev_future = null;
     }
 };
 
@@ -1566,6 +1703,474 @@ test "login refresh opt out remains offline and explicit profiles survive availa
     try std.testing.expectEqual(@as(u32, 65536), models[0].context_tokens);
 }
 
+test "derived reasoning stays in cache and cannot revive after a tied refresh or restart" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer source.deinit();
+    try source.connection().configureProvider(.opencode_go, "fake-provenance-go");
+    source.metadata_cache = try metadata.commit(&source.store.root, 0, try metadata.parseDev(a, @embedFile("models_dev_fixture.json")));
+    try source.connection().selectModel("opencode-go/gpt-6-luna");
+    try source.connection().setEffort(.max);
+    try std.testing.expectEqual(cfg.ReasoningSource.metadata, source.app.?.config.value.model.reasoning_source);
+    try std.testing.expectEqualStrings("max", source.app.?.config.value.model.reasoning.?.map.max.?);
+    // A rejected preference write must not clear the active derived effort/map.
+    const preference = try tmp.dir.readFileAlloc(std.testing.io, ".thin/settings.json", a, .limited(1024));
+    defer a.free(preference);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/settings.json", .data = "{\"version\":2,\"reasoning_effort\":\"low\"}" });
+    if (source.connection().setEffort(.low)) |_| return error.ExpectedPreferenceFailure else |_| {}
+    try std.testing.expectEqualStrings("max", source.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqualStrings("max", source.app.?.config.value.model.reasoning.?.map.max.?);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/settings.json", .data = preference });
+    {
+        var disk = try source.store.loadExisting();
+        defer cfg.release(&disk);
+        try std.testing.expectEqual(cfg.ReasoningSource.metadata, disk.value.model.reasoning_source);
+        try std.testing.expect(disk.value.model.reasoning == null and disk.value.model.reasoning_effort == null);
+    }
+    const tied =
+        \\{"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"gpt-6-luna":{"reasoning":true,"provider":{"npm":"@ai-sdk/openai"}}}},"one":{"npm":"@ai-sdk/openai","models":{"gpt-6-luna":{"reasoning_options":[{"type":"effort","values":["high"]}]}}},"two":{"npm":"@ai-sdk/openai","models":{"gpt-6-luna":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
+    ;
+    source.metadata_cache = try metadata.commit(&source.store.root, 0, try metadata.parseDev(a, tied));
+    try std.testing.expect(!source.capabilitiesFor(source.app.?.config.value).known);
+    // Until an explicit selection, the active runtime retains its frozen map.
+    try std.testing.expect(source.app.?.config.value.model.reasoning != null);
+    try source.connection().selectModel("opencode-go/gpt-6-luna");
+    const model = source.app.?.config.value.model;
+    try std.testing.expect(model.reasoning == null and model.reasoning_effort == null);
+    try std.testing.expectEqual(presentation.ReasoningEffort.max, source.preferred_effort.?);
+    for ([_]@import("../core/protocol.zig").Purpose{ .normal, .summary }) |purpose| {
+        var base = @import("../tests/adapter_test_support.zig").request(.responses);
+        base.purpose = purpose;
+        const request = @import("../core/runtime.zig").withReasoning(source.app.?.config.value, base);
+        try std.testing.expect(request.reasoning_effort == null and request.thinking == null);
+    }
+    {
+        var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+        defer again.deinit();
+        try std.testing.expect(!again.capabilitiesFor(again.mutableConfig().*).known);
+        try std.testing.expect(again.mutableConfig().model.reasoning == null);
+        try std.testing.expect(again.mutableConfig().model.reasoning_effort == null);
+        try std.testing.expectEqual(presentation.ReasoningEffort.max, again.preferred_effort.?);
+    }
+    // Former preset maps (including Luna/Zen) also stay unknown with no source.
+    source.metadata_cache = .{};
+    for (catalog.entries) |entry| {
+        const config: cfg.Config = .{ .provider = catalog.connection(entry.provider), .model = entry.model };
+        try std.testing.expect(!source.capabilitiesFor(config).known);
+        try std.testing.expect(source.declarationForEntry(entry) == null);
+    }
+}
+
+test "pending auth retains trusted derived map while saving only cache backed defaults" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer source.deinit();
+    var listing: metadata.Listing = .{};
+    const index = Session.metadataIndex(source.mutableConfig().*).?;
+    listing.reasoning[index] = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } };
+    source.metadata_cache = try metadata.commit(&source.store.root, metadata.bit(.deepseek), listing);
+    try source.connection().setEffort(.max);
+    try source.connection().configure("fake-derived-pending-auth");
+    try std.testing.expectEqualStrings("max", source.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqual(cfg.ReasoningSource.metadata, source.app.?.config.value.model.reasoning_source);
+    const request = @import("../core/runtime.zig").withReasoning(source.app.?.config.value, @import("../tests/adapter_test_support.zig").request(.chat));
+    try std.testing.expectEqualStrings("max", request.reasoning_effort.?);
+    try std.testing.expect(request.thinking.?);
+    var disk = try source.store.loadExisting();
+    defer cfg.release(&disk);
+    try std.testing.expect(disk.value.model.reasoning == null and disk.value.model.reasoning_effort == null);
+    var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer again.deinit();
+    try std.testing.expectEqualStrings("max", again.mutableConfig().model.reasoning_effort.?);
+    try std.testing.expect(again.capabilitiesFor(again.mutableConfig().*).known);
+}
+
+test "explicit user reasoning overrides metadata and survives default persistence" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer source.deinit();
+    // Old configs omit reasoning_source; user maps must not be removed by value/name guesses.
+    var parsed = try cfg.parse(a,
+        \\{"provider":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go"},"model":{"name":"gpt-6-luna","protocol":"responses","context_tokens":32768,"reasoning_effort":"high","reasoning":{"map":{"high":"user-intensive"}}}}
+    );
+    defer cfg.release(&parsed);
+    var config = parsed.value;
+    const index = LayeredMetadataFixture.index("opencode-go/gpt-6-luna");
+    source.metadata_cache.reasoning[index] = .{ .map = .{ .low = "low" } };
+    source.metadata_cache.dev_reasoning[index] = .{ .map = .{ .max = "max" } };
+    source.applyReasoningMetadata(&config);
+    try std.testing.expectEqual(cfg.ReasoningSource.explicit, config.model.reasoning_source);
+    try std.testing.expectEqualStrings("user-intensive", source.capabilitiesFor(config).wire("high").effort.?);
+    const persisted = config.model.persisted();
+    try std.testing.expectEqualStrings("user-intensive", persisted.reasoning.?.map.high.?);
+    try std.testing.expectEqualStrings("high", persisted.reasoning_effort.?);
+    var clone = try cfg.clone(a, config);
+    defer cfg.release(&clone);
+    try std.testing.expectEqualStrings("user-intensive", clone.value.model.reasoning.?.map.high.?);
+}
+
+test "derived metadata protocol or format mismatch clears stale mapping and effort" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer source.deinit();
+    const entry = catalog.find("opencode-go/gpt-6-luna").?;
+    const index = LayeredMetadataFixture.index(entry.selector);
+    source.metadata_cache.dev_reasoning[index] = .{ .map = .{ .high = "high" } };
+    var config: cfg.Config = .{ .provider = catalog.connection(entry.provider), .model = entry.model };
+    config.model.reasoning = .{ .map = .{ .max = "max" } };
+    config.model.reasoning_effort = "max";
+    config.model.reasoning_source = .metadata;
+    config.model.protocol = .chat;
+    source.applyReasoningMetadata(&config);
+    try std.testing.expect(config.model.reasoning == null and config.model.reasoning_effort == null);
+    try std.testing.expect(!source.capabilitiesFor(config).known);
+    config.model.protocol = .responses;
+    source.metadata_cache.dev_reasoning[index] = .{ .format = .anthropic, .map = .{ .high = "high" } };
+    source.applyReasoningMetadata(&config);
+    try std.testing.expect(!source.capabilitiesFor(config).known);
+}
+
+const LayeredMetadataFixture = struct {
+    var official_effort: std.atomic.Value(bool) = .init(false);
+    var dev_calls: std.atomic.Value(usize) = .init(0);
+    fn official(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+        if (id != .opencode_go or key == null or !std.mem.startsWith(u8, key.?, "fake-")) return error.UnexpectedFixtureCredential;
+        const body = if (official_effort.load(.acquire))
+            "{\"data\":[{\"id\":\"gpt-6-luna\"},{\"id\":\"claude-haiku-5-5\",\"effort\":{\"supported_levels\":[\"high\"]}}]}"
+        else
+            "{\"data\":[{\"id\":\"gpt-6-luna\",\"context_window\":262144},{\"id\":\"claude-haiku-5-5\",\"context_window\":65536}]}";
+        return metadata.parseListing(a, body, id);
+    }
+    fn dev(a: std.mem.Allocator, _: std.Io) !metadata.Listing {
+        _ = dev_calls.fetchAdd(1, .monotonic);
+        return metadata.parseDev(a, @embedFile("models_dev_fixture.json"));
+    }
+    fn devStall(_: std.mem.Allocator, io: std.Io) !metadata.Listing {
+        try std.Io.sleep(io, .fromSeconds(60), .awake);
+        return error.UnexpectedFixtureTimeout;
+    }
+    fn devFail(_: std.mem.Allocator, _: std.Io) !metadata.Listing {
+        return error.FixtureOffline;
+    }
+    fn index(selector: []const u8) usize {
+        for (catalog.entries, 0..) |entry, i| if (std.mem.eql(u8, entry.selector, selector)) return i;
+        unreachable;
+    }
+};
+
+test "dynamic models.dev refresh reaches model picker, cached reload and selection preference without POST" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    LayeredMetadataFixture.official_effort.store(false, .release);
+    LayeredMetadataFixture.dev_calls.store(0, .monotonic);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .auto_refresh_models = true, .logging = false });
+    defer session.deinit();
+    session.metadata_fetch = LayeredMetadataFixture.official;
+    session.metadata_dev_fetch = LayeredMetadataFixture.dev;
+    try session.connection().configureProvider(.opencode_go, "fake-layered-go");
+    session.preferred_effort = .max;
+    const active_before = session.app.?.config.value.model;
+    try std.testing.expect(Session.pollModels(&session, true)); // First/login-triggered refresh.
+    MetadataFixture.finish(&session);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expect(session.metadata_job == null);
+    try std.testing.expectEqual(@as(usize, 1), LayeredMetadataFixture.dev_calls.load(.monotonic));
+    try std.testing.expectEqualStrings(active_before.name, session.app.?.config.value.model.name);
+    try std.testing.expectEqual(active_before.context_tokens, session.app.?.config.value.model.context_tokens);
+    const index = LayeredMetadataFixture.index("opencode-go/claude-haiku-5-5");
+    for (session.connection().current().models) |model| {
+        if (std.mem.eql(u8, model.name, "opencode-go/claude-haiku-5-5")) {
+            try std.testing.expectEqual(thinking.Format.anthropic, model.reasoning.?.format);
+            try std.testing.expectEqualStrings("max", model.reasoning.?.map.max.?);
+            try std.testing.expect(model.reasoning.?.map.medium == null);
+            break;
+        }
+    } else return error.MissingModelPickerRow;
+    const disk = try metadata.load(&session.store.root);
+    try std.testing.expectEqualStrings("disabled", disk.dev_reasoning[index].?.map.off.?);
+    {
+        var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .auto_refresh_models = true, .logging = false });
+        defer again.deinit();
+        again.metadata_fetch = MetadataFixture.fail;
+        again.metadata_dev_fetch = LayeredMetadataFixture.devFail;
+        try std.testing.expect(!Session.pollModels(&again, true));
+        try std.testing.expect(again.metadata_job == null); // Persisted attempt suppresses a restart fetch.
+        again.preferred_effort = .max;
+        // Check cached application without rewriting the shared config behind the
+        // still-live first Session (whose auth-store digest protects such writes).
+        var candidate = again.mutableConfig().*;
+        candidate.model = catalog.find("opencode-go/claude-haiku-5-5").?.model;
+        try std.testing.expect(again.applyPreference(&candidate) == null);
+        try std.testing.expectEqualStrings("max", candidate.model.reasoning_effort.?);
+        try std.testing.expectEqualStrings("disabled", candidate.model.reasoning.?.map.off.?);
+    }
+    try session.connection().selectModel("opencode-go/claude-haiku-5-5");
+    try std.testing.expectEqualStrings("max", session.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expect(session.app.?.runtime.messages().len == 0);
+    // Explicit manual refresh retries both sources. Official metadata overrides
+    // fallback in picker and applyPreference; refresh alone leaves active options frozen.
+    LayeredMetadataFixture.official_effort.store(true, .release);
+    try session.connection().refresh_models_fn.?(session.connection().context);
+    MetadataFixture.finish(&session);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expectEqual(@as(usize, 2), LayeredMetadataFixture.dev_calls.load(.monotonic));
+    try std.testing.expectEqualStrings("max", session.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expect(session.metadata_cache.reasoning[index].?.map.max == null);
+    // Credential activation keeps the actual frozen derived map. A subsequent
+    // catalog confirmation, with the new credential already active, uses the refresh.
+    const frozen_capacity = session.app.?.config.value.model.context_tokens;
+    try session.connection().configureProvider(.opencode_go, "fake-layered-rotated-go");
+    try session.connection().selectModel("opencode-go/claude-haiku-5-5");
+    try std.testing.expectEqualStrings("max", session.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqual(frozen_capacity, session.app.?.config.value.model.context_tokens);
+    try session.connection().selectModel("opencode-go/claude-haiku-5-5");
+    try std.testing.expectEqualStrings("high", session.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqual(presentation.ReasoningEffort.max, session.preferred_effort.?);
+    session.metadata_dev_fetch = LayeredMetadataFixture.devFail;
+    try Session.refreshModels(&session);
+    MetadataFixture.finish(&session);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expectEqualStrings("max", (try metadata.load(&session.store.root)).dev_reasoning[index].?.map.max.?);
+    try std.testing.expect(std.mem.find(u8, session.metadata_notice.?, "models.dev metadata refresh failed") != null);
+}
+
+test "official results publish while models.dev retains an independent longer deadline" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer session.deinit();
+    session.metadata_fetch = LayeredMetadataFixture.official;
+    session.metadata_dev_fetch = LayeredMetadataFixture.devStall;
+    LayeredMetadataFixture.official_effort.store(false, .release);
+    try session.connection().configureProvider(.opencode_go, "fake-deadline-go");
+    const index = LayeredMetadataFixture.index("opencode-go/claude-haiku-5-5");
+    const previous = try metadata.parseDev(a, @embedFile("models_dev_fixture.json"));
+    session.metadata_cache = try metadata.commit(&session.store.root, 0, previous);
+    try Session.refreshModels(&session);
+    const job = session.metadata_job.?;
+    try MetadataFixture.waitDone(session.io, &job.done);
+    try std.testing.expect(job.future != null); // pollModels owns the actual join.
+    job.started_ms -= official_metadata_timeout_ms + 1;
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expect(session.metadata_job == job and job.dev_future != null);
+    try std.testing.expectEqual(@as(?u32, 65536), session.metadata_cache.tokens[index]);
+    for (job.keys) |key| try std.testing.expect(key == null);
+    // Passing the old shared deadline does not cancel the public catalog.
+    job.dev_started_ms -= official_metadata_timeout_ms + 1;
+    try std.testing.expect(!Session.pollModels(&session, true));
+    try std.testing.expect(job.dev_future != null);
+    job.dev_started_ms -= models_dev_timeout_ms;
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expect(session.metadata_job == null);
+    const saved = try metadata.load(&session.store.root);
+    try std.testing.expectEqual(@as(?u32, 65536), saved.tokens[index]);
+    try std.testing.expectEqualStrings("max", saved.dev_reasoning[index].?.map.max.?);
+    try std.testing.expect(!Session.pollModels(&session, true)); // No tight automatic retry loop.
+    // A user retry can still complete after the cancelled catalog attempt.
+    session.metadata_dev_fetch = LayeredMetadataFixture.dev;
+    try Session.refreshModels(&session);
+    MetadataFixture.finish(&session);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expectEqualStrings("max", session.metadata_cache.dev_reasoning[index].?.map.max.?);
+}
+
+test "login with new credentials refreshes official metadata without waiting for stalled models.dev" {
+    const Fixture = struct {
+        fn official(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+            if (id != .opencode_go) return error.UnexpectedProvider;
+            const rotated = std.mem.eql(u8, key orelse return error.MissingFixtureKey, "fake-rotated-go");
+            return metadata.parseListing(a, if (rotated)
+                "{\"data\":[{\"id\":\"claude-haiku-5-5\",\"context_window\":131072}]}"
+            else
+                "{\"data\":[{\"id\":\"claude-haiku-5-5\",\"context_window\":65536}]}", id);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false, .auto_refresh_models = true });
+    defer session.deinit();
+    session.metadata_fetch = Fixture.official;
+    session.metadata_dev_fetch = LayeredMetadataFixture.devStall;
+    try session.connection().configureProvider(.opencode_go, "fake-initial-go");
+    try std.testing.expect(Session.pollModels(&session, true));
+    const job = session.metadata_job.?;
+    const public_started = job.dev_started_ms;
+    try MetadataFixture.waitDone(session.io, &job.done);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expect(job.future == null and job.dev_future != null);
+    const index = LayeredMetadataFixture.index("opencode-go/claude-haiku-5-5");
+    try std.testing.expectEqual(@as(?u32, 65536), session.metadata_cache.tokens[index]);
+    try session.connection().configureProvider(.opencode_go, "fake-rotated-go");
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expect(session.metadata_job == job and job.future != null);
+    try std.testing.expectEqual(public_started, job.dev_started_ms);
+    try std.testing.expect(job.dev_future != null); // Existing public download not restarted.
+    try MetadataFixture.waitDone(session.io, &job.done);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expectEqual(@as(?u32, 131072), session.metadata_cache.tokens[index]);
+    try std.testing.expectEqual(@as(?u32, 131072), (try metadata.load(&session.store.root)).tokens[index]);
+    try std.testing.expect(job.dev_future != null and session.metadata_login_pending == 0);
+    job.dev_started_ms -= models_dev_timeout_ms + 1;
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expect(session.metadata_job == null);
+}
+
+test "models.dev completion survives a stalled official source and owner teardown cancels both" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer session.deinit();
+    session.metadata_fetch = MetadataFixture.stall;
+    session.metadata_dev_fetch = LayeredMetadataFixture.dev;
+    try session.connection().configureProvider(.opencode_go, "fake-stalled-official");
+    try Session.refreshModels(&session);
+    const job = session.metadata_job.?;
+    try MetadataFixture.waitDone(session.io, &job.dev_done);
+    try std.testing.expect(job.dev_future != null); // pollModels owns the actual join.
+    try std.testing.expect(Session.pollModels(&session, true));
+    const index = LayeredMetadataFixture.index("opencode-go/claude-haiku-5-5");
+    try std.testing.expectEqualStrings("max", session.metadata_cache.dev_reasoning[index].?.map.max.?);
+    try std.testing.expect(job.future != null);
+    job.started_ms -= official_metadata_timeout_ms + 1;
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expect(session.metadata_job == null);
+    session.metadata_dev_fetch = LayeredMetadataFixture.devStall;
+    try Session.refreshModels(&session);
+    // deinit must cancel/join both futures and wipe the official key copies.
+}
+
+test "manual metadata refresh filters obsolete credentials even with automatic refresh disabled" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false, .auto_refresh_models = false });
+    defer session.deinit();
+    session.metadata_fetch = MetadataFixture.fetch;
+    session.metadata_dev_fetch = MetadataFixture.dev;
+    MetadataFixture.calls.store(0, .monotonic);
+    try session.connection().configureProvider(.deepseek, "fake-stale-first-key");
+    const index = LayeredMetadataFixture.index("deepseek/deepseek-flash");
+    var previous: metadata.Listing = .{};
+    previous.tokens[index] = 65536;
+    previous.reasoning[index] = .{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } };
+    session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.deepseek), previous);
+    try Session.refreshModels(&session);
+    MetadataFixture.finish(&session); // Completed with the old key, not yet published.
+    try session.connection().configureProvider(.deepseek, "fake-stale-new-key");
+    try std.testing.expect(session.metadata_login_pending == 0); // No automatic re-query permission.
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expect(session.metadata_job == null);
+    try std.testing.expectEqual(@as(?u32, 65536), session.metadata_cache.tokens[index]);
+    try std.testing.expectEqualStrings("high", session.metadata_cache.reasoning[index].?.map.high.?);
+    try std.testing.expectEqual(@as(?u32, 65536), (try metadata.load(&session.store.root)).tokens[index]);
+    try std.testing.expect(!Session.pollModels(&session, true));
+    try std.testing.expectEqual(@as(usize, 1), MetadataFixture.calls.load(.monotonic));
+    // A new explicit refresh uses the replacement credential and can publish.
+    try Session.refreshModels(&session);
+    MetadataFixture.finish(&session);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expectEqual(@as(?u32, 1048576), session.metadata_cache.tokens[index]);
+}
+
+test "credential reactivation keeps raw effort frozen budget and retained effective protocol" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_map| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path: [4096]u8 = undefined;
+        const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+        {
+            var store = try Store.open(a, std.testing.io, home);
+            defer store.deinit();
+            var parsed = try store.loadOrInitialize();
+            defer cfg.release(&parsed);
+            parsed.value.provider = catalog.connection(.opencode_go);
+            parsed.value.credentials.opencode_go = "fake-retained-first-key";
+            parsed.value.model = .{ .name = "gpt-5.6-luna", .context_tokens = 65536, .protocol = .auto, .reasoning_effort = if (with_map) "high" else "raw-user-effort", .reasoning = if (with_map) .{ .map = .{ .high = "user-high" } } else null };
+            try store.save(parsed.value);
+        }
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+        defer session.deinit();
+        const index = LayeredMetadataFixture.index("opencode-go/gpt-5.6-luna");
+        session.metadata_cache.tokens[index] = 131072; // Refreshed candidate must not replace actual budget.
+        session.active_context_official = with_map;
+        const p = @import("../core/protocol.zig");
+        try session.app.?.runtime.restoreCheckpoint(.{ .system = "saved", .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }}, .selector = .{ .configured = .auto, .selected = .chat, .initial_attempted = true }, .estimator = .{}, .last_context_tokens = 1024, .context_tokens = 65536, .permission_id = 0 });
+        for ([_][]const u8{ "gpt-5.6-luna", "opencode-go/gpt-5.6-luna" }) |name| {
+            try session.connection().configureProvider(.opencode_go, "fake-retained-next-key");
+            try session.connection().selectModel(name);
+            const model = session.app.?.config.value.model;
+            try std.testing.expectEqual(@as(u32, 65536), model.context_tokens);
+            try std.testing.expectEqual(with_map, session.active_context_official);
+            try std.testing.expectEqual(p.Protocol.chat, session.app.?.runtime.selector.effective());
+            try std.testing.expectEqualStrings(if (with_map) "high" else "raw-user-effort", model.reasoning_effort.?);
+            try std.testing.expectEqualStrings("Bearer fake-retained-next-key", session.app.?.client.authorization);
+            try std.testing.expectEqual(@as(usize, 1), session.app.?.runtime.messages().len);
+            if (with_map) try std.testing.expectEqualStrings("user-high", model.reasoning.?.map.high.?) else try std.testing.expect(model.reasoning == null);
+        }
+    }
+}
+
 test "official cached effort metadata overrides the models.dev fallback" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1673,6 +2278,48 @@ test "provider credentials stay separate and connection swaps preserve session o
     try std.testing.expectEqual(preference, session.preferred_effort);
     try std.testing.expect(!app.journal.started);
     try std.testing.expectError(error.UnsupportedProviderModel, connection.selectModel("opencode-go/unlisted-claude"));
+}
+
+test "current catalog model reactivation preserves explicit wire mapping for name and selector" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    {
+        var store = try Store.open(a, std.testing.io, home);
+        defer store.deinit();
+        var initial = try store.loadOrInitialize();
+        defer cfg.release(&initial);
+        initial.value.provider.kind = .deepseek;
+        initial.value.credentials.deepseek = "fake-explicit-initial-key";
+        initial.value.model.reasoning_effort = "high";
+        initial.value.model.reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .high = "user-high" } };
+        try store.save(initial.value);
+    }
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer session.deinit();
+    const connection = session.connection();
+    for ([_]bool{ false, true }) |use_selector| {
+        const key = if (use_selector) "fake-explicit-selector-key" else "fake-explicit-name-key";
+        try connection.configureProvider(.deepseek, key);
+        try connection.selectModel(if (use_selector) "deepseek/deepseek-flash" else "deepseek-flash");
+        try std.testing.expectEqualStrings("user-high", session.app.?.config.value.model.reasoning.?.map.high.?);
+        try std.testing.expectEqual(cfg.ReasoningSource.explicit, session.app.?.config.value.model.reasoning_source);
+        const authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{key});
+        defer a.free(authorization);
+        try std.testing.expectEqualStrings(authorization, session.app.?.client.authorization);
+        var disk = try session.store.loadExisting();
+        defer cfg.release(&disk);
+        try std.testing.expectEqualStrings("user-high", disk.value.model.reasoning.?.map.high.?);
+        try std.testing.expectEqualStrings("high", disk.value.model.reasoning_effort.?);
+    }
+    var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer again.deinit();
+    try std.testing.expectEqualStrings("user-high", again.mutableConfig().model.reasoning.?.map.high.?);
 }
 
 test "same provider authentication preserves newly saved empty conversation defaults" {
@@ -2190,9 +2837,9 @@ test "pending selection owns names and auth preserves the latest saved model opt
     session.pending.?.value.models = &.{.{ .name = "configured", .context_tokens = 65536, .protocol = .chat, .reasoning_effort = "low", .reasoning = testReasoning() }};
     try Session.selectModel(&session, "configured");
     try std.testing.expectEqual(@as(u32, 65536), session.connection().current().context_limit);
-    // First entry persisted a project default (deepseek-flash: medium -> high),
-    // which now overrides the same-named profile's declared "low".
-    try std.testing.expectEqual(presentation.ReasoningEffort.high, session.connection().current().reasoning_effort);
+    // The unknown initial model persists the logical default medium without
+    // inventing a supported level; the explicit profile can now apply it.
+    try std.testing.expectEqual(presentation.ReasoningEffort.medium, session.connection().current().reasoning_effort);
     try std.testing.expectEqual(@as(usize, 1), session.connection().current().models.len);
     try Session.setEffort(&session, .medium);
     try Session.selectModel(&session, "configured");

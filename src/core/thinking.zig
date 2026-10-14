@@ -47,8 +47,7 @@ pub const Declaration = struct {
         if (self.format == .deepseek and self.map.off == null) return error.InvalidReasoningMap;
     }
 };
-/// New-project default. Known models clamp to a supported level
-/// (deepseek-flash: medium -> high; gpt-4: medium -> off).
+/// New-project default. Only supplied declarations authorize capability clamps.
 pub const default_level: activity.ReasoningEffort = .medium;
 
 pub const Wire = struct { effort: ?[]const u8, thinking: ?bool = null };
@@ -89,56 +88,28 @@ pub const Capabilities = struct {
 fn declared(d: Declaration) Capabilities {
     return .{ .known = true, .levels = d.map.levels(), .format = d.format, .map = d.map };
 }
-fn eq(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
-}
-fn oneOf(name: []const u8, names: []const []const u8) bool {
-    for (names) |value| if (eq(name, value)) return true;
-    return false;
-}
-/// Bounded exact official endpoint/model table from bundled public Pi metadata.
-/// A proxy or future model requires an explicit declaration, never a name guess.
-pub fn resolve(base_url: []const u8, name: []const u8, declaration: ?Declaration) Capabilities {
-    if (declaration) |d| {
-        d.validate() catch return .{};
-        return declared(d);
-    }
-    if (oneOf(base_url, &.{ "https://api.deepseek.com", "https://api.deepseek.com/", "https://api.deepseek.com/v1", "https://api.deepseek.com/v1/" })) {
-        if (eq(name, "deepseek-flash")) return declared(.{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } });
-        if (eq(name, "deepseek-v4-pro")) return declared(.{ .format = .deepseek, .map = .{ .off = "off", .high = "high", .max = "max" } });
-    }
-    if (!oneOf(base_url, &.{ "https://api.openai.com/v1", "https://api.openai.com/v1/" })) return .{};
-    if (oneOf(name, &.{ "gpt-4", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini", "gpt-5-chat-latest" })) {
-        // Disabled reasoning is selectable off, but has no wire parameter.
-        return .{ .known = true, .levels = .{ .mask = 1 } };
-    }
-    if (oneOf(name, &.{ "o1", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini" })) return declared(.{ .map = .{ .low = "low", .medium = "medium", .high = "high" } });
-    if (oneOf(name, &.{ "gpt-5", "gpt-5-mini", "gpt-5-nano" })) return declared(.{ .map = .{ .minimal = "minimal", .low = "low", .medium = "medium", .high = "high" } });
-    if (eq(name, "gpt-5-pro")) return declared(.{ .map = .{ .high = "high" } });
-    if (eq(name, "gpt-5.1")) return declared(.{ .map = .{ .off = "none", .low = "low", .medium = "medium", .high = "high" } });
-    if (oneOf(name, &.{ "gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.5" })) return declared(.{ .map = .{ .off = "none", .low = "low", .medium = "medium", .high = "high", .xhigh = "xhigh" } });
-    if (oneOf(name, &.{ "gpt-5.2-pro", "gpt-5.4-pro", "gpt-5.5-pro" })) return declared(.{ .map = .{ .medium = "medium", .high = "high", .xhigh = "xhigh" } });
-    if (eq(name, "gpt-5.2-chat-latest")) return declared(.{ .map = .{ .medium = "medium", .xhigh = "xhigh" } });
-    if (eq(name, "gpt-5.3-codex-spark")) return declared(.{ .map = .{ .low = "low", .medium = "medium", .high = "high", .xhigh = "xhigh" } });
-    if (oneOf(name, &.{ "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-luna", "gpt-6-sol" })) return declared(.{ .map = .{ .off = "none", .low = "low", .medium = "medium", .high = "high", .xhigh = "xhigh", .max = "max" } });
-    if (oneOf(name, &.{ "gpt-6-astra", "gpt-6.1-sol" })) return declared(.{ .map = .{ .low = "low", .medium = "medium", .high = "high", .xhigh = "xhigh", .max = "max" } });
-    return .{};
+/// Capabilities require an explicit or dynamically supplied declaration.
+/// Endpoint and model identity alone never manufacture reasoning capabilities.
+pub fn resolve(_: []const u8, _: []const u8, declaration: ?Declaration) Capabilities {
+    const d = declaration orelse return .{};
+    d.validate() catch return .{};
+    return declared(d);
 }
 
 test "project default uses medium adjusted to known capabilities and explicit logical choice" {
     const t = std.testing;
-    const standard = resolve("https://api.openai.com/v1", "gpt-5.2", null);
+    const standard = resolve("https://api.openai.com/v1", "gpt-5.2", .{ .map = .{ .off = "none", .low = "low", .medium = "medium", .high = "high" } });
     try t.expectEqual(activity.ReasoningEffort.medium, standard.defaultEffort(null));
     try t.expectEqual(activity.ReasoningEffort.low, standard.defaultEffort("low"));
     try t.expectEqual(activity.ReasoningEffort.off, standard.defaultEffort("none"));
-    try t.expectEqual(activity.ReasoningEffort.high, resolve("https://api.deepseek.com", "deepseek-flash", null).defaultEffort(null));
-    try t.expectEqual(activity.ReasoningEffort.off, resolve("https://api.openai.com/v1", "gpt-4o", null).defaultEffort(null));
+    try t.expectEqual(activity.ReasoningEffort.high, resolve("https://api.deepseek.com", "deepseek-flash", .{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } }).defaultEffort(null));
+    try t.expectEqual(activity.ReasoningEffort.off, resolve("https://api.openai.com/v1", "gpt-4o", .{ .map = .{ .off = "none" } }).defaultEffort(null));
     const unknown = resolve("https://proxy.invalid", "custom", null);
     try t.expectEqual(activity.ReasoningEffort.medium, unknown.defaultEffort(null));
     try t.expect(unknown.wire(null).effort == null); // A saved default is not a capability declaration.
 }
 
-test "exact official capabilities unknown preserves raw no discovery" {
+test "no builtin capabilities exist for official endpoints or recognized model names" {
     const t = std.testing;
     for ([_][]const u8{ "http://api.openai.com/v1", "https://api.openai.com/v1//", "https://api.openai.com.evil/v1", "https://proxy/v1" }) |url| {
         const cap = resolve(url, "gpt-5.2", null);
@@ -146,21 +117,27 @@ test "exact official capabilities unknown preserves raw no discovery" {
         try t.expectEqualStrings("custom", cap.effective("custom").?);
     }
     try t.expect(!resolve("https://api.openai.com/v1", "gpt-5.2-new", null).known);
-    const cap = resolve("https://api.openai.com/v1/", "gpt-5.2", null);
+    for ([_][]const u8{ "https://api.openai.com/v1", "https://api.deepseek.com", "https://opencode.ai/zen/v1", "https://opencode.ai/zen/go/v1" }) |url| {
+        for ([_][]const u8{ "gpt-4o", "gpt-5.2", "gpt-5.6-luna", "gpt-6-luna", "deepseek-flash", "deepseek-v4-pro", "claude-haiku-5-5" }) |name| {
+            const missing = resolve(url, name, null);
+            try t.expect(!missing.known and missing.levels.mask == 0);
+        }
+    }
+    const cap = resolve("https://api.openai.com/v1/", "gpt-5.2", .{ .map = .{ .off = "none", .low = "low", .high = "high", .xhigh = "xhigh" } });
     try t.expectEqualStrings("high", cap.effective("high").?);
     try t.expectEqualStrings("low", cap.effective("minimal").?);
     try t.expectEqualStrings("xhigh", cap.effective("max").?);
     try t.expectEqualStrings("none", cap.wire("none").effort.?);
     try t.expect(cap.wire(null).effort == null and cap.wire(null).thinking == null);
-    const disabled = resolve("https://api.openai.com/v1", "gpt-4o", null);
-    try t.expectEqualStrings("off", disabled.effective("max").?);
-    try t.expect(disabled.wire("off").effort == null);
-    try t.expect(resolve("https://api.openai.com/v1", "gpt-6-sol", null).levels.contains(.max));
+    const unknown = resolve("https://api.openai.com/v1", "gpt-4o", null);
+    try t.expect(!unknown.known);
+    try t.expect(unknown.wire(null).effort == null);
+    try t.expect(!resolve("https://api.openai.com/v1", "gpt-6-sol", null).levels.contains(.max));
 }
 test "deepseek wire and custom maps preserve unspecified validate bounded strings" {
     const t = std.testing;
     for ([_][]const u8{ "https://api.deepseek.com", "https://api.deepseek.com/v1/" }) |url| {
-        const cap = resolve(url, "deepseek-flash", null);
+        const cap = resolve(url, "deepseek-flash", .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } });
         try t.expectEqual(@as(usize, 4), cap.levels.count());
         try t.expectEqualStrings("high", cap.effective("medium").?);
         try t.expect(cap.wire("off").thinking.? == false and cap.wire("off").effort == null);
@@ -172,7 +149,7 @@ test "deepseek wire and custom maps preserve unspecified validate bounded string
         try t.expect(!resolve(url, "deepseek-flash", null).known);
     }
     try t.expect(!resolve("https://api.deepseek.com", "prefix-deepseek-flash", null).known);
-    const pro = resolve("https://api.deepseek.com", "deepseek-v4-pro", null);
+    const pro = resolve("https://api.deepseek.com", "deepseek-v4-pro", .{ .format = .deepseek, .map = .{ .off = "off", .high = "high", .max = "max" } });
     try t.expectEqualStrings("high", pro.effective("low").?);
     try t.expectEqual(@as(usize, 3), pro.levels.count());
     try t.expect(!pro.levels.contains(.low));

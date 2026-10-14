@@ -205,7 +205,7 @@ test "thinking runtime normal and summary requests map current model" {
         }
     };
     var dummy: u8 = 0;
-    var config: cfg.Config = .{ .provider = .{ .base_url = "https://api.deepseek.com" }, .model = .{ .name = "deepseek-flash", .context_tokens = 32768, .protocol = .chat, .reasoning_effort = "medium" } };
+    var config: cfg.Config = .{ .provider = .{ .base_url = "https://api.deepseek.com" }, .model = .{ .name = "deepseek-flash", .context_tokens = 32768, .protocol = .chat, .reasoning_effort = "medium", .reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } } } };
     var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "", false);
     defer runtime.deinit();
     const cancel: p.Cancellation = .{};
@@ -345,9 +345,9 @@ test "selection preserves canonical history and closes retained auto fallback" {
 /// Shared by fresh runtimes and the explicit manual connectivity probe.
 pub fn initialSelector(config: cfg.Config) llm.Selector {
     var selector = llm.Selector.init(config.model.protocol);
-    if (config.model.protocol == .auto and thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning).format == .deepseek) {
-        // Declared Chat-only format is local metadata, not a failed POST or
-        // an opportunity to probe Responses. Even unspecified effort uses it.
+    if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) {
+        // Verified service protocol / declared Chat-only format is not a
+        // reasoning-capability guess or an opportunity to probe Responses.
         selector.selected = .chat;
         selector.initial_attempted = true;
     }
@@ -525,7 +525,7 @@ pub const Runtime = struct {
                 selector.initial_attempted = true;
             }
         }
-        if (next.protocol == .auto and thinking.resolve(candidate.provider.base_url, next.name, next.reasoning).format == .deepseek) {
+        if (next.protocol == .auto and cfg.chatOnly(candidate.provider.base_url, next)) {
             // Preserve the SAME canonical-history boundary as auto fallback.
             // Refuse before native replay/calibration changes; never retry a
             // retained Responses conversation to accommodate this declaration.

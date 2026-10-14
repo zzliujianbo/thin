@@ -592,13 +592,16 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert.equal(auth.provider.api_key_env, '');
       if (kind !== 'auth-activate') {
         assert(!await exists(join(project,'.thin/sessions')), 'initialization created session records without submission');
-        // Normal startup initializes the local preference, even before auth.
+        // With no metadata/declaration, persist the logical medium preference
+        // without manufacturing a supported high level before authentication.
         // No submission may create archives or any other project artifact.
         assert.deepEqual((await readdir(project)).sort(), ['.thin','seed.txt'], 'unexpected project files');
         assert.deepEqual(await readdir(join(project,'.thin')), ['settings.json']);
         const settingsPath = join(project,'.thin/settings.json');
         assert.equal((await stat(settingsPath)).mode & 0o777, 0o600);
-        assert.deepEqual(JSON.parse(await readFile(settingsPath,'utf8')), {version:1,reasoning_effort:'high'});
+        assert.deepEqual(JSON.parse(await readFile(settingsPath,'utf8')), {version:1,reasoning_effort:'medium'});
+        assert.equal(auth.model.reasoning ?? null,null);
+        assert.equal(auth.model.reasoning_effort ?? null,null);
       }
       if (kind === 'auth-activate') {
         const logs = join(project,'.thin/sessions');
