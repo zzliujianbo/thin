@@ -2,7 +2,7 @@
 //! substring model inference, or frontend/terminal dependencies.
 const std = @import("std");
 const activity = @import("../presentation/activity.zig");
-pub const Format = enum { standard, deepseek };
+pub const Format = enum { standard, deepseek, anthropic };
 pub const LevelMap = struct {
     off: ?[]const u8 = null,
     minimal: ?[]const u8 = null,
@@ -79,7 +79,7 @@ pub const Capabilities = struct {
         const value = self.effective(configured) orelse return .{ .effort = null };
         if (!self.known) return .{ .effort = value };
         const logical = activity.ReasoningEffort.fromName(value);
-        if (self.format == .deepseek) {
+        if (self.format == .deepseek or self.format == .anthropic) {
             if (logical == .off) return .{ .effort = null, .thinking = false };
             return .{ .effort = if (logical == .unknown) value else self.map.get(logical), .thinking = true };
         }

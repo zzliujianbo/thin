@@ -54,7 +54,15 @@ pub fn nativeBlocks(a: std.mem.Allocator, native: j.Value) ![]const p.Block {
 
 pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
     try c.validateRequest(req, .anthropic);
-    if (req.reasoning_format != .standard or req.thinking != null or req.reasoning_effort != null) return error.IncompatibleReasoningProtocol;
+    switch (req.reasoning_format) {
+        .standard => if (req.thinking != null or req.reasoning_effort != null) return error.IncompatibleReasoningProtocol,
+        .deepseek => return error.IncompatibleReasoningProtocol,
+        .anthropic => {
+            if (req.thinking == null and req.reasoning_effort == null) {} else if (req.thinking == null or
+                (req.thinking.? and req.reasoning_effort == null) or (!req.thinking.? and req.reasoning_effort != null))
+                return error.IncompatibleReasoningProtocol;
+        },
+    }
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const t = arena.allocator();
@@ -63,6 +71,15 @@ pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
     try j.put(t, &root, "system", j.str(req.system));
     try j.put(t, &root, "max_tokens", try j.number(req.max_output_tokens));
     try j.put(t, &root, "stream", .{ .bool = true });
+    if (req.reasoning_format == .anthropic and req.thinking != null) {
+        const thinking = try typed(t, if (req.thinking.?) "adaptive" else "disabled");
+        try j.put(t, &root, "thinking", thinking);
+        if (req.reasoning_effort) |effort| {
+            var output = j.object(t);
+            try j.put(t, &output, "effort", j.str(effort));
+            try j.put(t, &root, "output_config", output);
+        }
+    }
     var tools = j.array(t);
     for (req.tools) |tool| {
         var v = j.object(t);

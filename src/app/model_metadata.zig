@@ -1,63 +1,20 @@
-//! Official-only, best-effort context-window metadata. No credentials or response
-//! bodies are persisted. The caller owns cancellation and the overall deadline.
+//! Official provider metadata is best-effort and bounded. No credentials or
+//! response bodies are persisted. The caller owns cancellation and deadlines.
 const std = @import("std");
 const fs = @import("../platform/filesystem.zig");
 const providers = @import("../core/providers.zig");
 const catalog = @import("provider_catalog.zig");
+const thinking = @import("../core/thinking.zig");
+const activity = @import("../presentation/activity.zig");
+const json_bound = @import("json_bound.zig");
+const models_dev = @import("models_dev.zig");
 
 pub const file_name = "model-metadata.json";
 pub const max_body_bytes = 512 * 1024;
 pub const max_cache_bytes = 16 * 1024;
 
-/// Allocation-free lexical preflight. Count containers, scalar tokens and keys;
-/// JSON syntax (including escape validity and duplicate fields) is still checked
-/// by the parser. Quoted punctuation cannot consume the structural budget.
 fn boundJson(bytes: []const u8, limit: usize) !void {
-    if (bytes.len > limit) return error.MetadataTooLarge;
-    var stack: [32]u8 = undefined;
-    var depth: usize = 0;
-    var nodes: usize = 0;
-    var quoted = false;
-    var escaped = false;
-    var scalar = false;
-    for (bytes) |c| {
-        if (quoted) {
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                quoted = false;
-            }
-            continue;
-        }
-        switch (c) {
-            '{', '[' => {
-                if (depth == stack.len) return error.MetadataTooDeep;
-                stack[depth] = c;
-                depth += 1;
-                nodes += 1;
-                scalar = false;
-            },
-            '}', ']' => {
-                if (depth == 0 or stack[depth - 1] != (if (c == '}') @as(u8, '{') else '[')) return error.InvalidMetadata;
-                depth -= 1;
-                scalar = false;
-            },
-            '"' => {
-                quoted = true;
-                nodes += 1;
-                scalar = false;
-            },
-            ' ', '\t', '\r', '\n', ',', ':' => scalar = false,
-            else => {
-                if (!scalar) nodes += 1;
-                scalar = true;
-            },
-        }
-        if (nodes > 32768) return error.MetadataTooComplex;
-    }
-    if (quoted or depth != 0) return error.InvalidMetadata;
+    return json_bound.bound(bytes, limit, 32768);
 }
 const max_tokens = 16 * 1024 * 1024;
 const Tokens = [catalog.entries.len]?u32;
@@ -65,13 +22,25 @@ pub const Listing = struct {
     tokens: Tokens = @splat(null),
     /// null means never fetched (including legacy caches); false means absent.
     available: [catalog.entries.len]?bool = @splat(null),
+    reasoning: [catalog.entries.len]?thinking.Declaration = @splat(null),
+    /// models.dev profiles: a usable value or null (unknown). Only meaningful when dev_done.
+    dev: [catalog.entries.len]?thinking.Declaration = @splat(null),
+    dev_done: bool = false,
 };
 pub const Cache = struct {
+    /// Provider bits plus dev_bit: the first models.dev attempt is claimed once.
     attempted: u8 = 0,
     tokens: Tokens = @splat(null),
     available: [catalog.entries.len]?bool = @splat(null),
+    /// Official wire capability metadata supersedes models.dev profiles.
+    reasoning: [catalog.entries.len]?thinking.Declaration = @splat(null),
+    /// Dynamic models.dev profile; never bundled, replaced wholesale on success.
+    dev_reasoning: [catalog.entries.len]?thinking.Declaration = @splat(null),
 };
 pub const Claim = struct { cache: Cache, mask: u8 };
+
+pub const dev_bit: u8 = 0x80;
+pub const provider_mask: u8 = all_mask;
 
 pub fn bit(id: providers.Id) u8 {
     return @as(u8, 1) << @intCast(@backingInt(id));
@@ -88,6 +57,61 @@ fn capacity(value: std.json.Value) !?u32 {
         .integer => |n| if (n > 0 and n <= max_tokens) @intCast(n) else error.InvalidMetadata,
         else => error.InvalidMetadata,
     };
+}
+
+fn parseEffort(value: std.json.Value, provider: providers.Id, protocol: @import("../core/protocol.zig").Protocol) !?thinking.Declaration {
+    if (value != .object or protocol == .auto) return error.InvalidMetadata;
+    const supported = value.object.get("supported_levels") orelse return error.InvalidMetadata;
+    if (supported != .array or supported.array.items.len > 16) return error.InvalidMetadata;
+    if (supported.array.items.len == 0) return null;
+    const format: thinking.Format = if (protocol == .anthropic) .anthropic else if (provider == .deepseek) .deepseek else .standard;
+    var map: thinking.LevelMap = .{};
+    if (format == .deepseek) map.off = "off";
+    var mapped: usize = 0;
+    var seen: [16][]const u8 = undefined;
+    var seen_count: usize = 0;
+    for (supported.array.items) |item| {
+        if (item != .string or item.string.len == 0 or item.string.len > 32) return error.InvalidMetadata;
+        for (seen[0..seen_count]) |previous| if (std.mem.eql(u8, previous, item.string)) return error.InvalidMetadata;
+        seen[seen_count] = item.string;
+        seen_count += 1;
+        const level = activity.ReasoningEffort.fromName(item.string);
+        switch (level.canonical()) {
+            .off => {
+                map.off = if (format == .anthropic) "disabled" else if (format == .deepseek) "off" else if (std.mem.eql(u8, item.string, "off")) "off" else "none";
+                mapped += 1;
+            },
+            .minimal => {
+                map.minimal = "minimal";
+                mapped += 1;
+            },
+            .low => {
+                map.low = "low";
+                mapped += 1;
+            },
+            .medium => {
+                map.medium = "medium";
+                mapped += 1;
+            },
+            .high => {
+                map.high = "high";
+                mapped += 1;
+            },
+            .xhigh => {
+                map.xhigh = "xhigh";
+                mapped += 1;
+            },
+            .max => {
+                map.max = "max";
+                mapped += 1;
+            },
+            else => {}, // Unknown provider-specific levels are not exposed as effort choices.
+        }
+    }
+    if (mapped == 0) return null;
+    const declaration: thinking.Declaration = .{ .format = format, .map = map };
+    try declaration.validate();
+    return declaration;
 }
 
 /// Only context_window denotes the total context; no input/output heuristic.
@@ -124,6 +148,7 @@ pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !L
             if (model.provider == id and std.mem.eql(u8, model.model.name, name.string)) {
                 result.tokens[i] = n;
                 result.available[i] = true;
+                if (record.object.get("effort")) |effort| result.reasoning[i] = try parseEffort(effort, id, model.model.protocol);
             }
         }
     }
@@ -133,9 +158,24 @@ pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !L
 /// Isolated client, fixed official URL, no redirects or credential discovery.
 /// The borrowed caller key is not mutated; the owned header copy is wiped.
 pub fn fetch(a: std.mem.Allocator, io: std.Io, id: providers.Id, key: ?[]const u8) !Listing {
-    const body = try fetchUrl(a, io, listingUrl(id), listingKey(id, key));
+    const body = try fetchUrl(a, io, listingUrl(id), listingKey(id, key), max_body_bytes);
     defer a.free(body);
     return parseListing(a, body, id);
+}
+
+/// Public catalog: no credentials and no provider listing key. Parsing is the
+/// same bounded models.dev parser used by tests; unusable profiles stay unknown.
+pub fn fetchDev(a: std.mem.Allocator, io: std.Io) !Listing {
+    const body = try fetchUrl(a, io, models_dev.url, null, models_dev.max_body_bytes);
+    defer a.free(body);
+    return parseDev(a, body);
+}
+
+pub fn parseDev(a: std.mem.Allocator, body: []const u8) !Listing {
+    const resolved = try models_dev.parse(a, body);
+    var result: Listing = .{ .dev_done = true };
+    for (resolved, 0..) |value, index| result.dev[index] = value.declaration;
+    return result;
 }
 
 fn listingUrl(id: providers.Id) []const u8 {
@@ -153,7 +193,7 @@ fn listingKey(id: providers.Id, key: ?[]const u8) ?[]const u8 {
 
 /// Private transport seam for owned loopback tests. Production callers can only
 /// reach it through fetch's fixed official endpoint, never through user URLs.
-fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8) ![]u8 {
+fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8, limit: usize) ![]u8 {
     var credentials: providers.Credentials = .{};
     if (key) |k| credentials.set(.deepseek, k);
     try credentials.validate();
@@ -176,9 +216,9 @@ fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8)
     var head: [8192]u8 = undefined;
     var response = try request.receiveHead(&head);
     if (response.head.status != .ok) return error.MetadataHttpStatus;
-    if (response.head.content_length) |size| if (size > max_body_bytes) return error.MetadataTooLarge;
+    if (response.head.content_length) |size| if (size > limit) return error.MetadataTooLarge;
     var transfer: [8192]u8 = undefined;
-    const body = try response.reader(&transfer).allocRemaining(a, .limited(max_body_bytes));
+    const body = try response.reader(&transfer).allocRemaining(a, .limited(limit));
     errdefer a.free(body);
     switch (request.reader.state) {
         .body_remaining_content_length, .body_remaining_chunk_len => return error.IncompleteMetadata,
@@ -187,15 +227,40 @@ fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8)
     return body;
 }
 
-const Record = struct { selector: []const u8, context_window: ?u32, available: ?bool = null };
+const Record = struct {
+    selector: []const u8,
+    context_window: ?u32,
+    available: ?bool = null,
+    reasoning: ?thinking.Declaration = null,
+    dev_reasoning: ?thinking.Declaration = null,
+};
 const Document = struct { version: u32, attempted: u8, records: []const Record };
+
+fn canonicalCacheDeclaration(declaration: thinking.Declaration) !thinking.Declaration {
+    try declaration.validate();
+    var result = declaration;
+    if (declaration.map.off) |value| {
+        result.map.off = switch (declaration.format) {
+            .deepseek => if (std.mem.eql(u8, value, "off")) "off" else return error.InvalidMetadata,
+            .anthropic => if (std.mem.eql(u8, value, "disabled")) "disabled" else return error.InvalidMetadata,
+            .standard => if (std.mem.eql(u8, value, "none")) "none" else if (std.mem.eql(u8, value, "off")) "off" else return error.InvalidMetadata,
+        };
+    }
+    inline for (.{ "minimal", "low", "medium", "high", "xhigh", "max" }) |field| {
+        if (@field(declaration.map, field)) |value| {
+            if (!std.mem.eql(u8, value, field)) return error.InvalidMetadata;
+            @field(result.map, field) = field;
+        }
+    }
+    return result;
+}
 
 fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
     try boundJson(bytes, max_cache_bytes);
     var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
     defer parsed.deinit();
     const doc = parsed.value;
-    if ((doc.version != 1 and doc.version != 2) or doc.attempted & ~all_mask != 0 or doc.records.len > catalog.entries.len) return error.InvalidMetadata;
+    if ((doc.version < 1 or doc.version > 4) or doc.attempted & ~(all_mask | dev_bit) != 0 or doc.records.len > catalog.entries.len) return error.InvalidMetadata;
     var result: Cache = .{ .attempted = doc.attempted };
     var seen: [catalog.entries.len]bool = @splat(false);
     for (doc.records) |record| {
@@ -206,7 +271,17 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
         if (seen[index]) return error.InvalidMetadata;
         seen[index] = true;
         result.tokens[index] = record.context_window;
-        if (doc.version == 2) result.available[index] = record.available;
+        if (doc.version >= 2) result.available[index] = record.available;
+        if (doc.version >= 3) {
+            if (record.reasoning) |declaration| {
+                result.reasoning[index] = try canonicalCacheDeclaration(declaration);
+            }
+        }
+        if (doc.version >= 4) {
+            if (record.dev_reasoning) |declaration| {
+                result.dev_reasoning[index] = try canonicalCacheDeclaration(declaration);
+            }
+        }
     }
     return result;
 }
@@ -245,22 +320,28 @@ fn lock(root: *fs.Root) !c_int {
 
 fn save(root: *fs.Root, cache: Cache) !void {
     var records: [catalog.entries.len]Record = undefined;
-    for (catalog.entries, 0..) |entry, i| records[i] = .{ .selector = entry.selector, .context_window = cache.tokens[i], .available = cache.available[i] };
+    for (catalog.entries, 0..) |entry, i| records[i] = .{
+        .selector = entry.selector,
+        .context_window = cache.tokens[i],
+        .available = cache.available[i],
+        .reasoning = cache.reasoning[i],
+        .dev_reasoning = cache.dev_reasoning[i],
+    };
     const bytes = try root.allocator.alloc(u8, max_cache_bytes);
     defer root.allocator.free(bytes);
     var writer = std.Io.Writer.fixed(bytes);
-    try std.json.Stringify.value(Document{ .version = 2, .attempted = cache.attempted, .records = &records }, .{}, &writer);
+    try std.json.Stringify.value(Document{ .version = 4, .attempted = cache.attempted, .records = &records }, .{}, &writer);
     try writer.writeByte('\n');
     try root.writeMode(file_name, bytes[0..writer.end], true, 0o600);
 }
 
 /// Persist the attempt before network work, even if the worker later fails.
 pub fn claim(root: *fs.Root, requested: u8, manual: bool) !Claim {
-    if (requested & ~all_mask != 0) return error.InvalidMetadata;
+    if (requested & ~(all_mask | dev_bit) != 0) return error.InvalidMetadata;
     const fd = try lock(root);
     defer fs.closeFd(fd);
     var cache = try load(root);
-    const mask = requested & (if (manual) all_mask else ~cache.attempted);
+    const mask = requested & (if (manual) (all_mask | dev_bit) else ~cache.attempted);
     if (mask != 0) {
         cache.attempted |= mask;
         try save(root, cache);
@@ -279,8 +360,10 @@ pub fn commit(root: *fs.Root, succeeded: u8, listing: Listing) !Cache {
         if (listing.tokens[i]) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
         cache.tokens[i] = listing.tokens[i];
         cache.available[i] = listing.available[i];
+        cache.reasoning[i] = listing.reasoning[i];
     }
-    if (succeeded != 0) try save(root, cache);
+    if (listing.dev_done) cache.dev_reasoning = listing.dev;
+    if (succeeded != 0 or listing.dev_done) try save(root, cache);
     return cache;
 }
 
@@ -400,9 +483,9 @@ test "metadata loopback transport success redirects size short body and cleanup"
         var worker = try std.Io.concurrent(io, serveMetadata, .{ io, &server, case.response, &cleaned });
         defer worker.cancel(io) catch {};
         if (case.err) |err| {
-            try std.testing.expectError(err, fetchUrl(a, io, url, "synthetic-test-key"));
+            try std.testing.expectError(err, fetchUrl(a, io, url, "synthetic-test-key", max_body_bytes));
         } else {
-            const body = try fetchUrl(a, io, url, null);
+            const body = try fetchUrl(a, io, url, null, max_body_bytes);
             defer a.free(body);
             _ = try parseProvider(a, body, .deepseek);
         }
@@ -489,10 +572,15 @@ test "metadata private roundtrip claims once and merges only successful provider
     var tokens: Tokens = @splat(1000);
     _ = try commit(&first, all_mask, .{ .tokens = tokens });
     tokens = @splat(null);
-    tokens[testIndex("deepseek/deepseek-flash")] = 2000;
-    const cache = try commit(&second, bit(.deepseek), .{ .tokens = tokens });
+    const deepseek_index = testIndex("deepseek/deepseek-flash");
+    tokens[deepseek_index] = 2000;
+    var refreshed: Listing = .{ .tokens = tokens };
+    refreshed.reasoning[deepseek_index] = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } };
+    const cache = try commit(&second, bit(.deepseek), refreshed);
     try std.testing.expectEqual(all_mask, cache.attempted);
-    try std.testing.expectEqual(@as(?u32, 2000), cache.tokens[testIndex("deepseek/deepseek-flash")]);
+    try std.testing.expectEqual(@as(?u32, 2000), cache.tokens[deepseek_index]);
+    try std.testing.expectEqualStrings("max", cache.reasoning[deepseek_index].?.map.max.?);
+    try std.testing.expectEqualStrings("max", (try load(&first)).reasoning[deepseek_index].?.map.max.?);
     try std.testing.expect(cache.tokens[testIndex("deepseek/deepseek-v4-pro")] == null);
     try std.testing.expectEqual(@as(?u32, 1000), cache.tokens[testIndex("opencode-zen/minimax-m2.7")]);
     try std.testing.expectEqualDeep(cache, try load(&first));
@@ -508,8 +596,8 @@ test "metadata malformed cache is never overwritten and selectors are validated"
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const bad = [_][]const u8{
-        "{\"version\":3,\"attempted\":0,\"records\":[]}",
-        "{\"version\":1,\"attempted\":128,\"records\":[]}",
+        "{\"version\":5,\"attempted\":0,\"records\":[]}",
+        "{\"version\":1,\"attempted\":64,\"records\":[]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"unknown\",\"context_window\":1}]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":0}]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":1},{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":2}]}",
@@ -525,6 +613,35 @@ test "metadata malformed cache is never overwritten and selectors are validated"
     const reordered = try parseCache(std.testing.allocator, "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"opencode-go/minimax-m2.7\",\"context_window\":42},{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":99}]}");
     try std.testing.expectEqual(@as(?u32, 42), reordered.tokens[testIndex("opencode-go/minimax-m2.7")]);
     try std.testing.expectEqual(@as(?u32, 99), reordered.tokens[testIndex("deepseek/deepseek-flash")]);
+}
+
+test "official effort metadata maps exact model IDs and protocol formats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const deepseek = try parseListing(
+        a,
+        "{\"data\":[{\"id\":\"deepseek-flash\",\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"],\"default_level\":\"high\"}}]}",
+        .deepseek,
+    );
+    const flash = deepseek.reasoning[testIndex("deepseek/deepseek-flash")];
+    try std.testing.expect(flash != null);
+    try std.testing.expectEqual(thinking.Format.deepseek, flash.?.format);
+    try std.testing.expectEqual(@as(usize, 4), flash.?.map.levels().count()); // includes protocol off toggle
+    try std.testing.expectEqualStrings("max", flash.?.map.max.?);
+    const anthropic = try parseListing(
+        a,
+        "{\"data\":[{\"id\":\"claude-haiku-5-5\",\"effort\":{\"supported_levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}}]}",
+        .opencode_go,
+    );
+    const haiku = anthropic.reasoning[testIndex("opencode-go/claude-haiku-5-5")];
+    try std.testing.expect(haiku != null);
+    try std.testing.expectEqual(thinking.Format.anthropic, haiku.?.format);
+    try std.testing.expectEqualStrings("xhigh", haiku.?.map.xhigh.?);
+    var unknown = try std.json.parseFromSlice(std.json.Value, a, "{\"supported_levels\":[\"ultra\"]}", .{});
+    defer unknown.deinit();
+    try std.testing.expectEqual(@as(?thinking.Declaration, null), try parseEffort(unknown.value, .deepseek, .chat));
+    try std.testing.expectError(error.InvalidMetadata, parseEffort(.{ .string = "bad" }, .deepseek, .chat));
 }
 
 test "metadata listing tracks exact membership independently of capacity and provider" {
@@ -570,7 +687,7 @@ test "metadata availability removal and failed refresh preserve other providers"
     try std.testing.expectEqualDeep(before, try load(&root));
 }
 
-test "metadata legacy v1 upgrades to v2 with unknown availability" {
+test "metadata legacy cache upgrades to v3 with unknown availability and reasoning" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
@@ -587,7 +704,7 @@ test "metadata legacy v1 upgrades to v2 with unknown availability" {
     defer std.testing.allocator.free(bytes.data);
     var parsed = try std.json.parseFromSlice(Document, std.testing.allocator, bytes.data, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 2), parsed.value.version);
+    try std.testing.expectEqual(@as(u32, 4), parsed.value.version);
     try std.testing.expectEqualDeep(upgraded.cache, try load(&root));
     const nullable = try parseCache(std.testing.allocator, "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":null}]}");
     for (nullable.available) |v| try std.testing.expect(v == null);
@@ -628,4 +745,69 @@ test "metadata official listing routes only DeepSeek credentials" {
         try std.testing.expect(listingKey(id, "synthetic-test-key") == null);
         try std.testing.expect(listingKey(id, "invalid\r\nkey") == null);
     }
+}
+
+test "models.dev profiles persist in version 4 cache and are claimed once automatically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const body =
+        \\{"deepseek":{"id":"deepseek","models":{"deepseek-flash":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high","max"]}],"provider":{"npm":"@ai-sdk/openai-compatible"}}}}}
+    ;
+    const listing = try parseDev(std.testing.allocator, body);
+    const index = for (catalog.entries, 0..) |entry, i| {
+        if (std.mem.eql(u8, entry.selector, "deepseek/deepseek-flash")) break i;
+    } else unreachable;
+    try std.testing.expect(listing.dev_done);
+    try std.testing.expectEqualStrings("off", listing.dev[index].?.map.off.?);
+    try std.testing.expectEqual(dev_bit, (try claim(&root, dev_bit, false)).mask);
+    _ = try commit(&root, 0, listing);
+    const reloaded = try load(&root);
+    try std.testing.expectEqualStrings("off", reloaded.dev_reasoning[index].?.map.off.?);
+    try std.testing.expect(reloaded.reasoning[index] == null);
+    try std.testing.expectEqual(dev_bit, reloaded.attempted & dev_bit);
+    try std.testing.expectEqual(@as(u8, 0), (try claim(&root, dev_bit, false)).mask);
+    // A failed later models.dev fetch does not erase the last successful profile.
+    _ = try commit(&root, 0, .{});
+    try std.testing.expect((try load(&root)).dev_reasoning[index] != null);
+}
+
+test "models.dev loopback transport parses public catalog and enforces its own size limit" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const body =
+        \\{"deepseek":{"id":"deepseek","models":{"deepseek-flash":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high","max"]}],"provider":{"npm":"@ai-sdk/openai-compatible"}}}}}
+    ;
+    const response = try std.fmt.allocPrint(a, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
+    defer a.free(response);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/api.json", .{server.socket.address.getPort()});
+    defer a.free(url);
+    var cleaned = std.atomic.Value(bool).init(false);
+    var worker = try std.Io.concurrent(io, serveMetadata, .{ io, &server, response, &cleaned });
+    defer worker.cancel(io) catch {};
+    const fetched = try fetchUrl(a, io, url, null, models_dev.max_body_bytes);
+    defer a.free(fetched);
+    const listing = try parseDev(a, fetched);
+    try worker.await(io);
+    try std.testing.expect(cleaned.load(.acquire));
+    try std.testing.expect(listing.dev_done);
+    const index = testIndex("deepseek/deepseek-flash");
+    try std.testing.expectEqualStrings("off", listing.dev[index].?.map.off.?);
+    // The provider limit (512 KiB) is not used for the public catalog, and a
+    // smaller explicit limit fails before any parser sees a partial document.
+    var tiny = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var second = try tiny.listen(io, .{});
+    defer second.deinit(io);
+    const second_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/api.json", .{second.socket.address.getPort()});
+    defer a.free(second_url);
+    var second_cleaned = std.atomic.Value(bool).init(false);
+    var second_worker = try std.Io.concurrent(io, serveMetadata, .{ io, &second, response, &second_cleaned });
+    defer second_worker.cancel(io) catch {};
+    try std.testing.expectError(error.MetadataTooLarge, fetchUrl(a, io, second_url, null, 8));
+    try second_worker.await(io);
+    try std.testing.expect(second_cleaned.load(.acquire));
 }

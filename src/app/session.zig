@@ -21,10 +21,12 @@ const metadata = @import("model_metadata.zig");
 
 const MetadataTokens = [catalog.entries.len]?u32;
 const MetadataFetch = *const fn (std.mem.Allocator, std.Io, ProviderId, ?[]const u8) anyerror!metadata.Listing;
+const DevFetch = *const fn (std.mem.Allocator, std.Io) anyerror!metadata.Listing;
 const MetadataJob = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     fetch: MetadataFetch,
+    dev_fetch: DevFetch,
     keys: [3]?[]u8 = @splat(null),
     requested: u8 = 0,
     succeeded: u8 = 0,
@@ -49,7 +51,16 @@ const MetadataJob = struct {
             for (catalog.entries, 0..) |entry, i| if (entry.provider == id) {
                 self.listing.tokens[i] = values.tokens[i];
                 self.listing.available[i] = values.available[i];
+                self.listing.reasoning[i] = values.reasoning[i];
             };
+        }
+        // Public models.dev data is independent of provider keys and never blocks
+        // the official results above; a failed or cancelled fetch keeps the cache.
+        if (self.requested & metadata.dev_bit != 0) {
+            if (self.dev_fetch(self.allocator, self.io)) |dev| {
+                self.listing.dev = dev.dev;
+                self.listing.dev_done = true;
+            } else |err| if (err == error.Canceled) return;
         }
     }
     fn wipeKeys(self: *MetadataJob) void {
@@ -104,6 +115,7 @@ pub const Session = struct {
     metadata_blocked: bool = false,
     metadata_job: ?*MetadataJob = null,
     metadata_fetch: MetadataFetch = metadata.fetch,
+    metadata_dev_fetch: DevFetch = metadata.fetchDev,
     metadata_notice: ?[]const u8 = null,
     active_context_official: bool = false,
     display_origins: [64 + catalog.entries.len]bool = @splat(false),
@@ -167,7 +179,8 @@ pub const Session = struct {
             try self.restoreSelection(snapshot);
         } else {
             const config = &self.pending.?.value;
-            const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
+            self.applyReasoningMetadata(config);
+            const capabilities = self.capabilitiesFor(config.*);
             self.preferred_effort = self.settings.loadOrInitialize(capabilities.defaultEffort(config.model.reasoning_effort)) catch |err| blk: {
                 self.settings_error = err;
                 break :blk null;
@@ -267,7 +280,8 @@ pub const Session = struct {
         };
         candidate.model = model orelse return error.SelectionModelUnavailable;
         candidate.model.protocol = snapshot.protocol;
-        const capabilities = thinking.resolve(candidate.provider.base_url, candidate.model.name, candidate.model.reasoning);
+        self.applyReasoningMetadata(&candidate);
+        const capabilities = self.capabilitiesFor(candidate);
         if (snapshot.effort) |level| {
             if (capabilities.known) {
                 if (!capabilities.levels.contains(level)) return error.UnsupportedRestoredEffort;
@@ -411,7 +425,7 @@ pub const Session = struct {
             .allow_custom_models = config.provider.kind == null,
             .context_limit = config.model.context_tokens,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
-            .effort_levels = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning).levels,
+            .effort_levels = self.capabilitiesFor(config).levels,
             .settings_error = self.settings_error,
             .settings_notice = self.settings_notice,
             .base_url = config.provider.base_url,
@@ -433,6 +447,57 @@ pub const Session = struct {
         return null;
     }
 
+    fn metadataIndex(config: cfg.Config) ?usize {
+        const id = config.provider.kind orelse ProviderId.fromUrl(config.provider.base_url) orelse return null;
+        for (catalog.entries, 0..) |entry, index| {
+            if (entry.provider != id) continue;
+            if (std.mem.eql(u8, entry.model.name, config.model.name) or std.mem.eql(u8, entry.selector, config.model.name)) return index;
+        }
+        return null;
+    }
+
+    fn applyReasoningMetadata(self: *const Session, config: *cfg.Config) void {
+        if (metadataIndex(config.*)) |index| {
+            if (self.metadata_cache.reasoning[index]) |declaration| {
+                config.model.reasoning = declaration;
+            } else if (config.model.reasoning == null) {
+                const entry = catalog.entries[index];
+                // A models.dev profile is protocol-specific; a changed local protocol gets no guess.
+                config.model.reasoning = if (entry.model.protocol == config.model.protocol)
+                    self.metadata_cache.dev_reasoning[index] orelse entry.model.reasoning
+                else
+                    entry.model.reasoning;
+            }
+        }
+    }
+
+    fn capabilitiesFor(self: *const Session, config: cfg.Config) thinking.Capabilities {
+        var effective = config;
+        self.applyReasoningMetadata(&effective);
+        return thinking.resolve(effective.provider.base_url, effective.model.name, effective.model.reasoning);
+    }
+
+    fn declarationForEntry(self: *const Session, entry: catalog.Entry) ?thinking.Declaration {
+        for (catalog.entries, 0..) |known, index| {
+            if (known.provider == entry.provider and std.mem.eql(u8, known.selector, entry.selector))
+                return self.metadata_cache.reasoning[index] orelse self.metadata_cache.dev_reasoning[index] orelse entry.model.reasoning;
+        }
+        return entry.model.reasoning;
+    }
+
+    fn sameDeclaration(a: ?thinking.Declaration, b: ?thinking.Declaration) bool {
+        if (a == null or b == null) return a == null and b == null;
+        if (a.?.format != b.?.format) return false;
+        inline for (.{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |field| {
+            const left = @field(a.?.map, field);
+            const right = @field(b.?.map, field);
+            if (left == null or right == null) {
+                if (left != null or right != null) return false;
+            } else if (!std.mem.eql(u8, left.?, right.?)) return false;
+        }
+        return true;
+    }
+
     fn refreshModels(raw: *anyopaque) !void {
         const self: *Session = @ptrCast(@alignCast(raw));
         try self.startMetadata(self.configuredMask(self.global_config.?.value), true);
@@ -443,7 +508,7 @@ pub const Session = struct {
         if (self.metadata_job != null) return error.MetadataRefreshBusy;
         if (requested == 0) return error.NoOfficialProvider;
         const job = try self.allocator.create(MetadataJob);
-        job.* = .{ .allocator = self.allocator, .io = self.io, .fetch = self.metadata_fetch, .manual = manual, .started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds()) };
+        job.* = .{ .allocator = self.allocator, .io = self.io, .fetch = self.metadata_fetch, .dev_fetch = self.metadata_dev_fetch, .manual = manual, .started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds()) };
         errdefer job.destroy();
         for (ProviderId.all) |id| {
             const index: usize = @intCast(@backingInt(id));
@@ -451,7 +516,7 @@ pub const Session = struct {
         }
         // Claim before launching: first-run failures/timeouts must not create an
         // automatic retry on every start, and concurrent sessions share the claim.
-        const claim = try metadata.claim(&self.store.root, requested, manual);
+        const claim = try metadata.claim(&self.store.root, requested | metadata.dev_bit, manual);
         self.metadata_cache.attempted = claim.cache.attempted;
         job.requested = claim.mask;
         if (claim.mask == 0) {
@@ -498,10 +563,15 @@ pub const Session = struct {
             };
             self.allocator.free(self.display_models);
             self.display_models = models;
-            self.metadata_notice = if (!job.manual) null else if (job.succeeded == 0)
+            const official_requested = job.requested & metadata.provider_mask;
+            self.metadata_notice = if (!job.manual) null else if (official_requested == 0)
+                (if (job.listing.dev_done) "models.dev metadata refreshed" else "models.dev metadata refresh failed; cached/default values kept")
+            else if (job.succeeded == 0)
                 "Official metadata refresh failed; cached/default values kept"
-            else if (job.succeeded != job.requested)
+            else if (job.succeeded != official_requested)
                 "Official metadata partly refreshed; failed sources kept cached/default values"
+            else if (job.requested & metadata.dev_bit != 0 and !job.listing.dev_done)
+                "Official model list refreshed; models.dev metadata refresh failed"
             else
                 "Official model list refreshed; /model shows official or default capacity";
             return true;
@@ -514,10 +584,13 @@ pub const Session = struct {
             };
             return true;
         }
-        if (idle and self.metadata_auto and !self.metadata_blocked and
-            self.configuredMask(self.global_config.?.value) & ~self.metadata_cache.attempted != 0)
+        const configured = self.configuredMask(self.global_config.?.value);
+        // models.dev is fetched once after the first configured-provider attempt, even
+        // when older caches already recorded official attempts without it.
+        if (idle and self.metadata_auto and !self.metadata_blocked and configured != 0 and
+            (configured & ~self.metadata_cache.attempted != 0 or self.metadata_cache.attempted & metadata.dev_bit == 0))
         {
-            self.startMetadata(self.configuredMask(self.global_config.?.value), false) catch {
+            self.startMetadata(configured, false) catch {
                 self.metadata_blocked = true;
             };
         }
@@ -550,6 +623,11 @@ pub const Session = struct {
             };
             if (duplicate) continue; // An explicit local profile wins a name collision.
             var model = entry.model;
+            if (self.metadata_cache.reasoning[index]) |declaration| {
+                model.reasoning = declaration;
+            } else if (self.metadata_cache.dev_reasoning[index]) |declaration| {
+                model.reasoning = declaration;
+            }
             if (self.officialCapacity(entry)) |tokens| model.context_tokens = tokens;
             model.name = entry.selector;
             try models.append(self.allocator, model);
@@ -571,7 +649,8 @@ pub const Session = struct {
     }
 
     fn applyPreference(self: *Session, config: *cfg.Config) ?[]const u8 {
-        const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
+        self.applyReasoningMetadata(config);
+        const capabilities = self.capabilitiesFor(config.*);
         if (self.preferred_effort) |saved| {
             if (!capabilities.known) return "Saved thinking level not applied: model capabilities unknown";
             config.model.reasoning_effort = capabilities.effective(saved.name());
@@ -695,7 +774,8 @@ pub const Session = struct {
                 break;
             }
         }
-        const capabilities = thinking.resolve(candidate.provider.base_url, candidate.model.name, candidate.model.reasoning);
+        self.applyReasoningMetadata(&candidate);
+        const capabilities = self.capabilitiesFor(candidate);
         var preference_notice: ?[]const u8 = null;
         if (self.preferred_effort) |saved| {
             if (capabilities.known) {
@@ -744,7 +824,7 @@ pub const Session = struct {
         const capacity = official orelse entry.model.context_tokens;
         if (self.app != null and previous.provider.kind == entry.provider and
             std.mem.eql(u8, previous.model.name, entry.model.name) and self.active_revision == revision and
-            previous.model.context_tokens == capacity)
+            previous.model.context_tokens == capacity and sameDeclaration(previous.model.reasoning, self.declarationForEntry(entry)))
         {
             self.initial_context = self.app.?.runtime.contextSnapshot();
             self.active_context_official = official != null;
@@ -763,6 +843,7 @@ pub const Session = struct {
         next.provider.api_key = key;
         next.credentials = self.global_config.?.value.credentials;
         next.model = entry.model;
+        next.model.reasoning = self.declarationForEntry(entry);
         next.model.context_tokens = capacity;
         next.models = if (same_endpoint) previous.models else &.{};
         const notice = self.applyPreference(&next);
@@ -883,7 +964,8 @@ pub const Session = struct {
         const canonical = effort.canonical();
         const name = canonical.name() orelse return error.InvalidReasoningEffort;
         const config = self.mutableConfig();
-        const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
+        self.applyReasoningMetadata(config);
+        const capabilities = self.capabilitiesFor(config.*);
         if (!capabilities.levels.contains(canonical)) return error.UnsupportedReasoningEffort;
         var candidate = config.*;
         candidate.model.reasoning_effort = name;
@@ -1072,6 +1154,10 @@ const MetadataFixture = struct {
         try std.Io.sleep(io, .fromSeconds(30), .awake);
         return error.UnexpectedFixtureTimeout;
     }
+    /// Offline models.dev stand-in: a successful empty public catalog.
+    fn dev(_: std.mem.Allocator, _: std.Io) !metadata.Listing {
+        return .{ .dev_done = true };
+    }
     fn finish(session: *Session) void {
         const job = session.metadata_job.?;
         job.future.?.await(session.io);
@@ -1151,6 +1237,7 @@ test "official metadata first attempt caches once without changing active budget
         var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .auto_refresh_models = true });
         defer session.deinit();
         session.metadata_fetch = MetadataFixture.fetch;
+        session.metadata_dev_fetch = MetadataFixture.dev;
         try std.testing.expect(!Session.pollModels(&session, true));
         try std.testing.expect(session.metadata_job == null); // No key yet: no request/attempt.
         try session.connection().configureProvider(.deepseek, "fake-metadata-key");
@@ -1204,6 +1291,7 @@ test "official metadata first attempt caches once without changing active budget
         var resumed = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .resume_session = saved_id, .logging = false, .auto_refresh_models = true });
         defer resumed.deinit();
         resumed.metadata_fetch = MetadataFixture.fail;
+        resumed.metadata_dev_fetch = MetadataFixture.dev;
         try std.testing.expectEqual(@as(u32, 1048576), resumed.connection().current().context_limit);
         try std.testing.expect(resumed.active_context_official);
         try std.testing.expect(!Session.pollModels(&resumed, true));
@@ -1213,6 +1301,7 @@ test "official metadata first attempt caches once without changing active budget
         var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .auto_refresh_models = true });
         defer again.deinit();
         again.metadata_fetch = MetadataFixture.fail;
+        again.metadata_dev_fetch = MetadataFixture.dev;
         try std.testing.expect(!Session.pollModels(&again, true));
         try std.testing.expect(again.metadata_job == null);
         try Session.refreshModels(&again); // Explicit refresh can retry a failed source.
@@ -1221,6 +1310,7 @@ test "official metadata first attempt caches once without changing active budget
         try std.testing.expectEqual(@as(?u32, 524288), again.metadata_cache.tokens[0]);
         try std.testing.expect(std.mem.find(u8, again.metadata_notice.?, "failed") != null);
         again.metadata_fetch = MetadataFixture.stall;
+        again.metadata_dev_fetch = MetadataFixture.dev;
         try Session.refreshModels(&again);
         again.metadata_job.?.started_ms -= 8001; // Deterministic deadline; do not wait 30 seconds.
         try std.testing.expect(!Session.pollModels(&again, false));
@@ -1259,6 +1349,7 @@ test "login refreshes only saved provider despite prior attempt and queues behin
     var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .auto_refresh_models = true });
     defer session.deinit();
     session.metadata_fetch = Fixture.fetch;
+    session.metadata_dev_fetch = MetadataFixture.dev;
     Fixture.calls.store(0, .monotonic);
     _ = try metadata.claim(&session.store.root, metadata.bit(.opencode_go), false);
     try session.connection().configureProvider(.opencode_go, "fake-go-full");
@@ -1267,7 +1358,7 @@ test "login refreshes only saved provider despite prior attempt and queues behin
     try std.testing.expectEqual(@as(usize, 0), Fixture.calls.load(.monotonic));
     try std.testing.expect(!Session.pollModels(&session, false)); // Owner must be idle.
     try std.testing.expect(Session.pollModels(&session, true));
-    try std.testing.expectEqual(metadata.bit(.opencode_go), session.metadata_job.?.requested);
+    try std.testing.expectEqual(metadata.bit(.opencode_go) | metadata.dev_bit, session.metadata_job.?.requested);
     MetadataFixture.finish(&session);
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expectEqual(@as(usize, 3), session.connection().current().models.len);
@@ -1324,6 +1415,36 @@ test "login refresh opt out remains offline and explicit profiles survive availa
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqualStrings("opencode-go/kimi-k3", models[0].name);
     try std.testing.expectEqual(@as(u32, 65536), models[0].context_tokens);
+}
+
+test "official cached effort metadata overrides the models.dev fallback" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.init(a, std.testing.io, &env, home, .{}, true);
+    defer session.deinit();
+
+    const entry = catalog.find("opencode-go/gpt-6-luna").?;
+    const config: cfg.Config = .{ .provider = catalog.connection(.opencode_go), .model = entry.model };
+    const index = Session.metadataIndex(config).?;
+    session.metadata_cache.reasoning[index] = .{ .format = .standard, .map = .{ .low = "official-low", .high = "official-high" } };
+    const official = session.capabilitiesFor(config);
+    try std.testing.expectEqualStrings("official-low", official.map.low.?);
+    try std.testing.expect(official.map.max == null);
+    session.metadata_cache.reasoning[index] = null;
+    // Dynamic models.dev profiles are used only when official metadata is absent.
+    session.metadata_cache.dev_reasoning[index] = .{ .format = .standard, .map = .{ .low = "dev-low", .max = "max", .off = "none" } };
+    const fallback = session.capabilitiesFor(config);
+    try std.testing.expectEqualStrings("dev-low", fallback.map.low.?);
+    try std.testing.expectEqualStrings("max", fallback.map.max.?);
+    try std.testing.expectEqualStrings("none", fallback.map.off.?);
+    session.metadata_cache.dev_reasoning[index] = null;
+    try std.testing.expect(!session.capabilitiesFor(config).known); // Missing metadata stays unknown.
 }
 
 test "provider credentials stay separate and connection swaps preserve session ownership" {
@@ -1389,11 +1510,15 @@ test "provider credentials stay separate and connection swaps preserve session o
     try std.testing.expectEqualStrings("call-1", app.runtime.history.items[1].blocks[0].tool_result.call_id);
     try std.testing.expectEqual(preference, session.preferred_effort);
     try std.testing.expect(app.runtime.trusted and !app.journal.started);
+    const haiku_index = for (catalog.entries, 0..) |entry, i| {
+        if (std.mem.eql(u8, entry.selector, "opencode-go/claude-haiku-5-5")) break i;
+    } else unreachable;
+    session.metadata_cache.dev_reasoning[haiku_index] = .{ .format = .anthropic, .map = .{ .off = "disabled", .low = "low", .medium = "medium", .high = "high", .xhigh = "xhigh", .max = "max" } };
     try connection.selectModel("opencode-go/claude-haiku-5-5");
     try std.testing.expectEqualStrings("opencode-go/claude-haiku-5-5", connection.current().selection_name.?);
     try std.testing.expect(app.config.value.model.protocol == .anthropic);
     try std.testing.expect(app.runtime.selector.selected == .anthropic);
-    try std.testing.expect(app.config.value.model.reasoning_effort == null);
+    try std.testing.expectEqual(preference.?, presentation.ReasoningEffort.fromName(app.config.value.model.reasoning_effort));
     try std.testing.expectEqualStrings("Bearer fake-go-rotated", app.client.authorization);
     try std.testing.expectEqual(@as(usize, 2), app.runtime.messages().len);
     try std.testing.expectEqual(preference, session.preferred_effort);

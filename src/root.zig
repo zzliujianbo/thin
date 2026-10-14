@@ -65,6 +65,8 @@ test {
     _ = @import("main.zig");
     _ = @import("app/auth_store.zig");
     _ = @import("app/provider_catalog.zig");
+    _ = @import("app/json_bound.zig");
+    _ = @import("app/models_dev.zig");
     _ = @import("core/providers.zig");
     _ = @import("app/log_store.zig");
     _ = @import("app/selection_store.zig");

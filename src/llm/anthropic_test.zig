@@ -122,7 +122,20 @@ test "anthropic summary tool result adjacency canceled and history guards" {
     req.messages = &.{};
     req.reasoning_effort = "low";
     try std.testing.expectError(error.IncompatibleReasoningProtocol, adapter.encode(a, req));
+    req.reasoning_format = .anthropic;
+    req.thinking = true;
+    const adaptive = try j.parse(a, try adapter.encode(a, req));
+    try std.testing.expectEqualStrings("adaptive", try c.text(j.get(adaptive, "thinking").?, "type"));
+    try std.testing.expectEqualStrings("low", try c.text(j.get(adaptive, "output_config").?, "effort"));
     req.reasoning_effort = null;
+    req.thinking = false;
+    const disabled = try j.parse(a, try adapter.encode(a, req));
+    try std.testing.expectEqualStrings("disabled", try c.text(j.get(disabled, "thinking").?, "type"));
+    req.thinking = null;
+    req.reasoning_effort = null;
+    const plain = try j.parse(a, try adapter.encode(a, req));
+    try std.testing.expect(j.get(plain, "thinking") == null and j.get(plain, "output_config") == null);
+    req.reasoning_format = .standard;
     req.thinking = false;
     try std.testing.expectError(error.IncompatibleReasoningProtocol, adapter.encode(a, req));
 }

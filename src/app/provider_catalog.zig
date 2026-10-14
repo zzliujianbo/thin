@@ -110,4 +110,6 @@ test "provider presets select exact protocols and keep Zen and Go separate" {
     try std.testing.expect(find("opencode-go/qwen3.8-max").?.model.protocol == .anthropic);
     try std.testing.expect(find("opencode-go/muse-spark-1.3-contributor").?.model.protocol == .responses);
     try std.testing.expect(find("opencode-go/kimi-k3").?.model.protocol == .chat);
+    try std.testing.expect(find("opencode-go/gpt-6-luna").?.model.reasoning == null); // Dynamic models.dev metadata is loaded through /model.
+    try std.testing.expect(find("opencode-go/claude-haiku-5-5").?.model.reasoning == null);
 }
