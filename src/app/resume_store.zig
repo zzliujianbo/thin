@@ -178,12 +178,27 @@ pub fn saveFinal(root: *fs.Root, id: ids.Id, existing: ?*Lease, bytes: []const u
     var future = try std.Io.concurrent(root.io, Work.run, .{&work});
     defer future.cancel(root.io);
     const start = std.Io.Clock.awake.now(root.io);
+    var timed_out = false;
     while (!work.done.load(.acquire)) {
-        if (start.durationTo(std.Io.Clock.awake.now(root.io)).toMilliseconds() >= 1000) return error.ResumeSaveTimeout;
+        if (start.durationTo(std.Io.Clock.awake.now(root.io)).toMilliseconds() >= 1000) {
+            timed_out = true;
+            break;
+        }
         try std.Io.sleep(root.io, .fromMilliseconds(2), .awake);
     }
-    future.await(root.io);
-    if (work.failure) |err| return err;
+    // Join before deciding. A slow write is often not an Io cancellation point,
+    // so returning here used to report ResumeSaveTimeout and then wait in defer
+    // while the worker published a clean checkpoint. The caller would withhold
+    // the resume command for a save that had actually finished.
+    if (timed_out) future.cancel(root.io) else future.await(root.io);
+    return classifySave(work.done.load(.acquire), work.failure);
+}
+
+/// Timeout only if the worker is still unpublished after join. A finished save
+/// keeps its real error, or success when the clean marker was published.
+fn classifySave(done: bool, failure: ?anyerror) !void {
+    if (failure) |err| return err;
+    if (!done) return error.ResumeSaveTimeout;
 }
 
 fn testRoot(dir: std.Io.Dir) !fs.Root {
@@ -228,6 +243,13 @@ test "resume store clean exit lock private files no-log and interrupted owner" {
         // Simulate death, without a final save.
     }
     try std.testing.expectError(error.ResumeNotClosed, Lease.open(&root, test_id, true));
+}
+
+test "resume save join reports a finished checkpoint instead of a stale timeout" {
+    try classifySave(true, null);
+    try std.testing.expectError(error.NoSpaceLeft, classifySave(true, error.NoSpaceLeft));
+    try std.testing.expectError(error.Canceled, classifySave(true, error.Canceled));
+    try std.testing.expectError(error.ResumeSaveTimeout, classifySave(false, null));
 }
 
 test "resume store detects changed snapshot and refuses unsafe paths" {
