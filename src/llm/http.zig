@@ -7,6 +7,7 @@ const sse = @import("sse.zig");
 const j = @import("../util/json.zig");
 const chat = @import("chat.zig");
 const responses = @import("responses.zig");
+const anthropic = @import("anthropic.zig");
 const common = @import("common.zig");
 const pool = @import("http_pool.zig");
 const Io = std.Io;
@@ -59,16 +60,23 @@ pub const Client = struct {
         self.allocator.free(self.authorization);
     }
 
-    fn requestHeaders(self: *Client, buffer: *[2]std.http.Header) ![]const std.http.Header {
+    fn requestHeaders(self: *Client, protocol: p.Protocol, buffer: *[4]std.http.Header) ![]const std.http.Header {
         buffer[0] = .{ .name = "accept", .value = "text/event-stream" };
+        var count: usize = 1;
         const kind = self.config.provider.kind orelse cfg.providers.Id.fromUrl(self.config.provider.base_url);
         if (kind != null and kind.?.usesSessionHeader()) {
             const id = if (self.session_id) |*id| id else return error.MissingSessionIdentity;
             for (id) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidSessionIdentity;
             buffer[1] = .{ .name = "x-opencode-session", .value = id };
-            return buffer;
+            count += 1;
         }
-        return buffer[0..1];
+        if (protocol == .anthropic) {
+            // Reuse the owned, securely wiped key buffer without another copy.
+            buffer[count] = .{ .name = "x-api-key", .value = self.authorization["Bearer ".len..] };
+            buffer[count + 1] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+            count += 2;
+        }
+        return buffer[0..count];
     }
 
     /// 返回通用的 p.Model 接口，上层通过 call_fn 调用而不依赖具体实现。
@@ -179,26 +187,25 @@ pub const Client = struct {
         const payload = switch (protocol) {
             .chat => try chat.encodeWithOptions(a, job.request, self.config.provider.chat_max_tokens),
             .responses => try responses.encode(a, job.request),
+            .anthropic => try anthropic.encode(a, job.request),
             .auto => unreachable,
         };
 
         // 去掉 base_url 结尾的斜杠，再拼接各协议固定的端点路径。
-        const base = std.mem.trimEnd(u8, self.config.provider.base_url, "/");
-        const address = try std.fmt.allocPrint(a, "{s}{s}", .{
-            base, if (protocol == .chat) "/chat/completions" else "/responses",
-        });
+        const address = try requestAddress(a, self.config.provider.base_url, protocol);
 
         // Before acquiring a socket, drop expired/closed/unread idle connections.
         // This sends nothing and never retries a POST. boot includes suspend time.
         try pool.prune(&self.http, self.last_request_finish, Io.Clock.boot.now(self.io));
 
         // 禁止自动跟随重定向（否则 Authorization 头可能被发送到其他主机）；要求不压缩，便于逐块解析 SSE。
-        var header_buffer: [2]std.http.Header = undefined;
-        const headers = try self.requestHeaders(&header_buffer);
+        var header_buffer: [4]std.http.Header = undefined;
+        const headers = try self.requestHeaders(protocol, &header_buffer);
         var request = try self.http.request(.POST, try std.Uri.parse(address), .{
             .redirect_behavior = .unhandled,
             .headers = .{
-                .authorization = .{ .override = self.authorization },
+                .authorization = if (protocol == .anthropic) .omit else .{ .override = self.authorization },
+                .user_agent = .{ .override = "thin" },
                 .content_type = .{ .override = "application/json" },
                 .accept_encoding = .{ .override = "identity" },
             },
@@ -247,6 +254,7 @@ pub const Client = struct {
         var stream: Stream = switch (protocol) {
             .chat => .{ .chat = chat.Stream.init(job.allocator, job.request.scope, sink) },
             .responses => .{ .responses = responses.Stream.init(job.allocator, job.request.scope, sink) },
+            .anthropic => .{ .anthropic = anthropic.Stream.init(job.allocator, job.request.scope, sink) },
             .auto => unreachable,
         };
 
@@ -298,10 +306,34 @@ pub const Client = struct {
     }
 };
 
-/// 按协议分派的流解析器（Chat 或 Responses），对外提供统一的 feed / finish / observed 接口。
+/// Keep persisted connection identity stable. Go uses its documented inference
+/// routes; custom endpoints are never rewritten by provider hint or model ID.
+fn requestAddress(a: std.mem.Allocator, base_url: []const u8, protocol: p.Protocol) ![]u8 {
+    const normalized = std.mem.trimEnd(u8, base_url, "/");
+    const base = blk: {
+        if (cfg.providers.Id.fromUrl(normalized)) |id| switch (id) {
+            .opencode_go => break :blk "https://opencode.ai/inference/go/v1",
+            .opencode_zen => if (protocol == .anthropic) {
+                break :blk "https://opencode.ai/inference/v1";
+            },
+            .deepseek => {},
+        };
+        break :blk normalized;
+    };
+    const suffix = switch (protocol) {
+        .chat => "/chat/completions",
+        .responses => "/responses",
+        .anthropic => "/messages",
+        .auto => return error.UnselectedProtocol,
+    };
+    return std.fmt.allocPrint(a, "{s}{s}", .{ base, suffix });
+}
+
+/// 按协议分派的流解析器，对外提供统一的 feed / finish / observed 接口。
 const Stream = union(enum) {
     chat: chat.Stream,
     responses: responses.Stream,
+    anthropic: anthropic.Stream,
 
     /// SSE 解码器的回调入口，通过 inline else 分派到当前协议的实现。
     fn feed(context: *anyopaque, event: []const u8, data: []const u8) !void {
@@ -334,25 +366,55 @@ test "OpenCode routing headers are stable explicit and absent on other services"
         const config: cfg.Config = .{ .provider = .{ .base_url = id.baseUrl(), .kind = id }, .model = .{ .name = "fixture", .context_tokens = 32768 } };
         var client = try Client.init(std.testing.allocator, std.testing.io, &config, "fake-key");
         defer client.deinit();
-        var headers: [2]std.http.Header = undefined;
-        const first = try client.requestHeaders(&headers);
+        var headers: [4]std.http.Header = undefined;
+        const first = try client.requestHeaders(.chat, &headers);
         try std.testing.expectEqual(@as(usize, if (id.usesSessionHeader()) 2 else 1), first.len);
         if (id.usesSessionHeader()) {
             const generated = client.session_id.?;
             try std.testing.expectEqualStrings("x-opencode-session", first[1].name);
             try std.testing.expectEqualStrings(&generated, first[1].value);
-            try std.testing.expectEqualStrings(&generated, (try client.requestHeaders(&headers))[1].value);
+            try std.testing.expectEqualStrings(&generated, (try client.requestHeaders(.chat, &headers))[1].value);
         }
         client.session_id = @splat('a');
-        const pinned = try client.requestHeaders(&headers);
+        const pinned = try client.requestHeaders(.chat, &headers);
         if (id.usesSessionHeader()) {
             try std.testing.expectEqualStrings(&@as([32]u8, @splat('a')), pinned[1].value);
             client.session_id = @splat('\n');
-            try std.testing.expectError(error.InvalidSessionIdentity, client.requestHeaders(&headers));
+            try std.testing.expectError(error.InvalidSessionIdentity, client.requestHeaders(.chat, &headers));
             client.session_id = null;
-            try std.testing.expectError(error.MissingSessionIdentity, client.requestHeaders(&headers));
+            try std.testing.expectError(error.MissingSessionIdentity, client.requestHeaders(.chat, &headers));
         } else try std.testing.expectEqual(@as(usize, 1), pinned.len);
     }
+}
+
+test "Anthropic exact routing and separate native authentication headers" {
+    const cases = [_]struct { base: []const u8, expected: []const u8 }{
+        .{ .base = "https://opencode.ai/zen/go/v1", .expected = "https://opencode.ai/inference/go/v1/messages" },
+        .{ .base = "https://opencode.ai/inference/go/v1/", .expected = "https://opencode.ai/inference/go/v1/messages" },
+        .{ .base = "https://opencode.ai/zen/v1", .expected = "https://opencode.ai/inference/v1/messages" },
+        .{ .base = "https://api.anthropic.com/v1", .expected = "https://api.anthropic.com/v1/messages" },
+        .{ .base = "https://proxy.invalid/v1", .expected = "https://proxy.invalid/v1/messages" },
+        .{ .base = "https://opencode.ai.evil/zen/go/v1", .expected = "https://opencode.ai.evil/zen/go/v1/messages" },
+    };
+    for (cases) |case| {
+        const address = try requestAddress(std.testing.allocator, case.base, .anthropic);
+        defer std.testing.allocator.free(address);
+        try std.testing.expectEqualStrings(case.expected, address);
+        const config: cfg.Config = .{ .provider = .{ .base_url = case.base }, .model = .{ .name = "fixture", .context_tokens = 32768, .protocol = .anthropic } };
+        var client = try Client.init(std.testing.allocator, std.testing.io, &config, "fake-key");
+        defer client.deinit();
+        var buffer: [4]std.http.Header = undefined;
+        const headers = try client.requestHeaders(.anthropic, &buffer);
+        const has_session = cfg.providers.Id.fromUrl(case.base) != null;
+        try std.testing.expectEqual(@as(usize, if (has_session) 4 else 3), headers.len);
+        try std.testing.expectEqualStrings("x-api-key", headers[headers.len - 2].name);
+        try std.testing.expectEqualStrings("fake-key", headers[headers.len - 2].value);
+        try std.testing.expectEqualStrings("anthropic-version", headers[headers.len - 1].name);
+        try std.testing.expectEqualStrings("2023-06-01", headers[headers.len - 1].value);
+    }
+    const old = try requestAddress(std.testing.allocator, cfg.providers.Id.opencode_go.baseUrl(), .chat);
+    defer std.testing.allocator.free(old);
+    try std.testing.expectEqualStrings("https://opencode.ai/inference/go/v1/chat/completions", old);
 }
 
 /// 把非 200 的响应体转换为失败结果，同时尽量保留错误响应中携带的 usage 与原始 JSON。

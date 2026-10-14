@@ -49,14 +49,20 @@ pub const help =
     \\Configuration: ~/.thin/config.json
     \\Interactive startup initializes a missing/empty file for DeepSeek (deepseek-flash).
     \\Use /login in the TUI for hidden key entry; the key is saved locally with mode 0600.
-    \\Never put a key in chat or command arguments. Saving does not send an API request.
+    \\Never put a key in chat or command arguments. Saving never calls model inference.
+    \\Successful /login returns to the prompt and refreshes that provider's official model list.
     \\Existing nonempty configurations are preserved. Advanced configuration example:
     \\  {"provider":{"base_url":"https://your-provider.example/v1",
     \\    "api_key_env":"THIN_API_KEY"},
     \\   "model":{"name":"your-model","context_tokens":128000,"protocol":"auto"}}
     \\Use either provider.api_key_env (environment variable) or provider.api_key, not both.
     \\--print requires an already configured file; it does not open the setup UI.
-    \\Protocols: auto (Responses then one explicitly supported fallback), responses, chat.
+    \\Protocols: auto (Responses then one explicitly supported fallback), responses, chat, anthropic.
+    \\Anthropic Messages must be selected explicitly; auto never probes it.
+    \\For Go Claude: /login OpenCode Go, then /model opencode-go/claude-haiku-5-5.
+    \\Haiku starts with a conservative 32.768K local budget (default, not an official limit).
+    \\Anthropic uses x-api-key and signed native replay; custom base_url must end before /messages.
+    \\Anthropic effort overrides are not yet enabled; unverified thinking options are rejected.
     \\Known DeepSeek thinking format selects Chat locally; it never probes Responses.
     \\
     \\Interactive uses regular terminal scrollback, not an alternate full-screen buffer.
@@ -76,22 +82,26 @@ pub const help =
     \\Pickers: Up/Down selects, Enter confirms, Left returns, Esc cancels; at most 10 rows.
     \\Tab and PgUp/PgDn are not picker shortcuts. Esc also clears secret-paste quarantine.
     \\/model opens a searchable picker; /model exact-id selects directly while idle.
-    \\/model --refresh refreshes official context metadata for configured providers.
+    \\/model --refresh refreshes official model availability and context metadata.
     \\First eligible interactive startup tries each configured provider once; failures do not auto-retry.
-    \\--no-model-auto-refresh disables that automatic attempt (manual refresh remains available).
+    \\--no-model-auto-refresh disables startup/login refresh (manual refresh remains available).
     \\Cache: ~/.thin/model-metadata.json. Only official /models endpoints; no third-party data.
     \\Missing official capacities retain defaults. Explicit local profiles take precedence.
+    \\Successful listing refresh hides absent catalog entries; failed refresh keeps the last list.
     \\K/M are decimal token units; official/default is the capacity source, not actual usage.
     \\Green checks mean current model or credentials saved locally, not a verified online login.
     \\Refresh does not change the active budget; cached capacities apply on model selection.
-    \\Model selection is session-only. Effort is saved per startup project, not globally.
+    \\Model changes in an empty chat save defaults to ~/.thin/config.json.
+    \\With conversation history, model changes stay in that session only.
+    \\Effort shortcuts are saved per startup project, not globally.
     \\Optional models:[{name,context_tokens,protocol,reasoning_effort,reasoning}] profiles
     \\share the endpoint (maximum 64); a custom ID inherits current context/options.
     \\Logical levels: off/minimal/low/medium/high/xhigh/max; only supported levels cycle.
     \\Legacy none means off. Unknown model capabilities keep fixed configured options.
     \\Custom/proxy models can declare reasoning:{format:"standard",map:{off:"none",high:"high"}}.
     \\A null/missing mapping is unsupported; DeepSeek format uses thinking.type (Chat only).
-    \\No model discovery, trial requests or automatic changes to global defaults.
+    \\Only explicitly mapped model protocols are offered; unknown API IDs are not guessed.
+    \\No trial inference requests or automatic changes to global defaults.
     \\Tool calls are trusted for THIS PROCESS and run without approval prompts.
     \\Commands run with your account permissions; bash is NOT a sandbox.
     \\No automatic command-risk classifier is enabled. --trust is a compatibility flag.

@@ -9,6 +9,7 @@ const llm = @import("../llm/llm.zig");
 const common = @import("../llm/common.zig");
 const chat = @import("../llm/chat.zig");
 const responses = @import("../llm/responses.zig");
+const anthropic = @import("../llm/anthropic.zig");
 const j = @import("../util/json.zig");
 const Allocator = std.mem.Allocator;
 
@@ -230,7 +231,7 @@ pub fn validate(a: Allocator, state: State, config: cfg.Config, schemas: []const
             .reasoning => if (m.role != .assistant) return error.InvalidHistory,
             .tool_call => |call| {
                 if (m.role != .assistant or call.name.len == 0) return error.InvalidHistory;
-                if (proto == .chat and call.item_id != null) return error.InvalidHistory;
+                if (proto != .responses and call.item_id != null) return error.InvalidHistory;
                 try common.checkUnique(&ids, call.id);
                 const args = try strictJson(t, call.arguments);
                 if (args.value != .object) return error.InvalidToolArguments;
@@ -239,14 +240,28 @@ pub fn validate(a: Allocator, state: State, config: cfg.Config, schemas: []const
         };
         if (m.replay) |r| {
             const native = try strictJson(t, r.json);
-            if (proto == .chat) try validateChat(t, m, native.value) else try validateResponses(t, m);
+            switch (proto) {
+                .chat => try validateChat(t, m, native.value),
+                .responses => try validateResponses(t, m),
+                .anthropic => {
+                    const blocks = try anthropic.nativeBlocks(t, native.value);
+                    if (!r.retain_turn or blocks.len != m.blocks.len) return error.NativeMismatch;
+                    for (blocks, m.blocks) |x, y| if (!sameBlock(x, y)) return error.NativeMismatch;
+                },
+                .auto => unreachable,
+            }
         }
     }
     // boundaries allocates before some errors; the temporary arena owns failures.
     _ = try context.boundaries(t, state.messages);
     // Exercise actual outgoing history validation, including native item expansion
     // count limits and Responses' native-reasoning requirement. No network calls.
-    const wire = if (proto == .chat) try chat.encode(t, req) else try responses.encode(t, req);
+    const wire = switch (proto) {
+        .chat => try chat.encode(t, req),
+        .responses => try responses.encode(t, req),
+        .anthropic => try anthropic.encode(t, req),
+        .auto => unreachable,
+    };
     if (wire.len > max_bytes) return error.InputLimit;
 }
 
@@ -396,6 +411,39 @@ test "checkpoint tagged union exact Chat and Responses roundtrip and opaque repl
         try std.testing.expectEqualStrings(bytes, again);
         try validate(std.testing.allocator, parsed.value, fixture_config, &.{});
     }
+}
+
+test "Anthropic checkpoint exact native canonical pairing and signed opaque roundtrip" {
+    const a = std.testing.allocator;
+    var state = fixture(.chat);
+    var config = fixture_config;
+    config.model.protocol = .anthropic;
+    state.selector.configured = .anthropic;
+    state.selector.selected = .anthropic;
+    var messages = state.messages[0..4].*;
+    state.messages = &messages;
+    var blocks = messages[2].blocks[0..3].*;
+    messages[2].blocks = &blocks;
+    messages[2].replay.?.scope.protocol = .anthropic;
+    messages[2].replay.?.json = "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"plan\",\"signature\":\"signature\"},{\"type\":\"redacted_thinking\",\"data\":\"opaque\"},{\"type\":\"text\",\"text\":\"answer\"},{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"lookup\",\"input\":{}}]}";
+    try validate(a, state, config, &.{});
+    const bytes = try encode(a, state);
+    defer a.free(bytes);
+    const parsed = try decode(a, bytes);
+    defer parsed.deinit();
+    try validate(a, parsed.value, config, &.{});
+    try std.testing.expectEqualDeep(state, parsed.value);
+    blocks[1] = .{ .text = "changed" };
+    try std.testing.expectError(error.NativeMismatch, validate(a, state, config, &.{}));
+    blocks[1] = .{ .text = "answer" };
+    blocks[2].tool_call.item_id = "foreign-item";
+    try std.testing.expectError(error.InvalidHistory, validate(a, state, config, &.{}));
+    blocks[2].tool_call.item_id = null;
+    messages[2].replay.?.retain_turn = false;
+    try std.testing.expectError(error.NativeMismatch, validate(a, state, config, &.{}));
+    messages[2].replay.?.retain_turn = true;
+    messages[2].replay.?.scope.protocol = .chat;
+    try std.testing.expectError(error.ReplayScopeMismatch, validate(a, state, config, &.{}));
 }
 
 test "checkpoint legacy missing capacity and explicit defaults remain accepted" {

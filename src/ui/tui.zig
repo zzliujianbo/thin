@@ -570,15 +570,22 @@ const Ui = struct {
         if (self.model_picker) |picker| return if (picker.pasted) "Pasted selection; Esc cancels" else if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
         if (self.commandMenuVisible()) return "";
         var notice: []const u8 = "";
+        var model_failed = false;
         if (self.last_terminal) |result| {
-            if (result.status != .success and result.status != .paused) notice = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ self.notice, if (result.detail != null) ": " else "", if (result.detail) |err| @errorName(err) else "", if (result.model_failure != null) " / " else "", if (result.model_failure) |failure| @tagName(failure) else "" });
+            if (result.status != .success and result.status != .paused) {
+                var formatted: std.Io.Writer.Allocating = .init(a);
+                defer formatted.deinit();
+                try shared.failure.write(&formatted.writer, self.notice, result.detail, result.model_failure, result.http_status);
+                notice = try a.dupe(u8, formatted.written());
+                model_failed = result.status == .failed and result.model_failure != null;
+            }
         }
         if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
         if (notice.len == 0 and state.runtime == null) notice = "Not configured: /login";
         if (state.settings_error) |err| {
             notice = try std.fmt.allocPrint(a, "{s}{s}SETTINGS FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
-        } else if (state.settings_notice) |warning| {
-            notice = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ notice, if (notice.len != 0) " | " else "", warning });
+        } else if (!model_failed) {
+            if (state.settings_notice) |warning| notice = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ notice, if (notice.len != 0) " | " else "", warning });
         }
         if (state.log_error) |err| return std.fmt.allocPrint(a, "{s}{s}REC FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
         if (!state.logging_enabled) return std.fmt.allocPrint(a, "{s}{s}recording off", .{ notice, if (notice.len != 0) " | " else "" });
@@ -1150,6 +1157,10 @@ const Ui = struct {
                     return;
                 };
                 self.endSecret();
+                // A fresh Enter authorizes the completed paste, not its read tail.
+                // endSecret still wipes parser scratch and sets stop_feed.
+                self.secret_quarantine = false;
+                self.wipeEditor();
                 self.notice = if (named) "Key saved locally; use /model to select or activate it" else "Saved locally; send a message to connect";
             },
             else => {},
@@ -1865,9 +1876,18 @@ const Ui = struct {
                 // 光标所在逻辑行的起点（以换行为界）。
                 // Slash arguments can be accidental credentials: never render them, even before Enter.
                 const trimmed = std.mem.trimStart(u8, self.editor.bytes.items, " \t\r\n");
-                const safe_model = modelCommand(trimmed) and picker_module.manualName(std.mem.trim(u8, trimmed["/model".len..], " \t"));
+                const is_model = modelCommand(trimmed);
+                const model_args = if (is_model) std.mem.trim(u8, trimmed["/model".len..], " \t\r\n") else "";
+                const safe_model = is_model and (model_args.len == 0 or picker_module.manualName(model_args));
                 const hide_arguments = !safe_model and std.mem.startsWith(u8, trimmed, "/") and (std.mem.findScalar(u8, trimmed, ' ') != null or std.mem.findScalar(u8, trimmed, '\t') != null or std.mem.findScalar(u8, trimmed, '\r') != null or std.mem.findScalar(u8, trimmed, '\n') != null);
-                const visible: []const u8 = if (hide_arguments) "/login [arguments hidden; no key argument]" else self.editor.bytes.items;
+                const command_end = std.mem.findAny(u8, trimmed, " \t\r\n") orelse trimmed.len;
+                const hidden_hint: []const u8 = if (is_model)
+                    "/model [arguments hidden; use one model ID]"
+                else if (std.mem.eql(u8, trimmed[0..command_end], "/login"))
+                    "/login [arguments hidden; no key argument]"
+                else
+                    "/ [command arguments hidden]";
+                const visible: []const u8 = if (hide_arguments) hidden_hint else self.editor.bytes.items;
                 const cursor = if (hide_arguments) visible.len else self.editor.cursor;
                 const begin = if (std.mem.findScalarLast(u8, visible[0..cursor], '\n')) |index| index + 1 else 0;
                 const working = self.busy or self.mode != null or self.active_tool != null;
@@ -4083,7 +4103,34 @@ test "secret Escape cancels and Left returns to provider without leaking paste t
     for (ui.secret.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
-test "provider auth selects Go separately and only renders masked credential bytes" {
+test "authentication failure hint preserves HTTP status and separates thinking notice" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var state = ui.connection.current();
+    state.settings_notice = "Saved thinking level not applied: model capabilities unknown";
+    ui.notice = "Failed";
+    for ([_]u16{ 401, 403 }) |code| {
+        ui.last_terminal = .{ .status = .failed, .detail = error.ModelRequestFailed, .model_failure = .authentication, .http_status = code };
+        const hint = try ui.hint(arena.allocator(), state);
+        try std.testing.expect(std.mem.startsWith(u8, hint, if (code == 401) "Failed [HTTP 401]" else "Failed [HTTP 403]"));
+        try std.testing.expect(std.mem.find(u8, hint, "authentication") != null);
+        try std.testing.expect(std.mem.find(u8, hint, "thinking") == null);
+    }
+    // Keep real persistence failures; hide only unrelated informational warnings.
+    state.settings_error = error.TestSettingsFailure;
+    try std.testing.expect(std.mem.find(u8, try ui.hint(arena.allocator(), state), "SETTINGS FAILED") != null);
+    state.settings_error = null;
+    ui.last_terminal = null;
+    ui.notice = "Ready";
+    try std.testing.expect(std.mem.find(u8, try ui.hint(arena.allocator(), state), "Saved thinking level") != null);
+}
+
+test "provider auth Go fresh Enter after pasted key restores ordinary drawn composer" {
     try text.initLocale();
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -4105,14 +4152,39 @@ test "provider auth selects Go separately and only renders masked credential byt
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.secret_mode and !ui.provider_open);
     try std.testing.expectEqual(core_config.providers.Id.opencode_go, ui.secret_provider.?);
-    try ui.parser.feed("fake-ui-key", sink);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.parser.feed("\x1b[200~fake-ui-key\x1b[201~\r", sink);
+    try std.testing.expect(ui.secret_mode and ui.secret.failed and fixture.provider_saves == 0);
+    try ui.parser.feed("\x15", sink);
+    try ui.parser.feed("\x1b[200~fake-ui-key\x1b[201~", sink);
     try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "API key> ***********"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "API key for OpenCode Go") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "https://opencode.ai/zen/go/v1") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "fake-ui-key") == null);
     ui.finishFrame();
-    try ui.parser.feed("\r", sink);
-    try std.testing.expect(!ui.secret_mode and ui.secret_provider == null and ui.secret.len == 0);
+    try ui.parser.feed("\rsame-read-secret-tail", sink);
+    try std.testing.expect(!ui.secret_mode and !ui.secret_quarantine and !ui.parser.secret and ui.secret_provider == null and ui.secret.len == 0);
+    try std.testing.expect(ui.parser.stop_feed and !ui.parser.secret_paste and !ui.parser.secret_batch_paste);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    for (ui.secret.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (ui.parser.escape) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (ui.parser.utf8) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    try ui.draw();
+    for ([_][]const u8{ "API key", "***", "fake-ui-key", "same-read-secret-tail" }) |hidden| {
+        try std.testing.expect(std.mem.find(u8, ui.frame, hidden) == null);
+    }
+    try screen.replay(ui.frame);
+    for ([_][]const u8{ "API key", "***", "fake-ui-key", "same-read-secret-tail" }) |hidden| try std.testing.expectEqual(@as(usize, 0), screen.count(hidden));
+    ui.finishFrame();
+    try ui.parser.feed("nexttext", sink);
+    try std.testing.expectEqualStrings("nexttext", ui.editor.bytes.items);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[23], "nexttext") != null);
+    try std.testing.expectEqual(@as(usize, 0), screen.count("same-read-secret-tail"));
+    ui.finishFrame();
     try std.testing.expect(fixture.key_matched and fixture.provider_saves == 1);
     try std.testing.expectEqual(core_config.providers.Id.opencode_go, fixture.saved_provider.?);
     try std.testing.expect(std.mem.find(u8, ui.notice, "saved locally") != null);
@@ -4758,6 +4830,50 @@ test "unconfigured text and slash commands never create jobs records or expose a
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
 }
 
+test "slash composer frames keep model prefixes and hide credentials with command specific hints" {
+    try text.initLocale();
+    const cases = [_]struct { raw: []const u8, shown: []const u8, hidden: ?[]const u8 = null }{
+        .{ .raw = "/model", .shown = "/model" },
+        .{ .raw = "/model ", .shown = "/model " },
+        .{ .raw = "/model\t", .shown = "/model    " },
+        .{ .raw = "/model \t  ", .shown = "/model       " },
+        .{ .raw = "/model provider/model-pre", .shown = "/model provider/model-pre" },
+        .{ .raw = "/model malformed extra", .shown = "/model [arguments hidden; use one model ID]", .hidden = "malformed" },
+        .{ .raw = "/login fakecredential", .shown = "/login [arguments hidden; no key argument]", .hidden = "fakecredential" },
+        .{ .raw = "/unknown fakecredential", .shown = "/ [command arguments hidden]", .hidden = "fakecredential" },
+    };
+    for (cases) |case| {
+        var cancel = p.Cancellation{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var fixture = SelectionFixture{};
+        defer fixture.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.connection = fixture.connection();
+        ui.connection.configure_provider_fn = SelectionFixture.configureProvider;
+        // Insert literal bytes: a physical Tab is a completion key, not an argument.
+        _ = try ui.editor.insert(case.raw);
+        try ui.draw();
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        try screen.replay(ui.frame);
+        try std.testing.expect(std.mem.find(u8, &screen.grid[23], case.shown) != null);
+        if (case.hidden) |hidden| {
+            try std.testing.expect(std.mem.find(u8, ui.frame, hidden) == null);
+            try std.testing.expectEqual(@as(usize, 0), screen.count(hidden));
+        }
+        if (!std.mem.startsWith(u8, case.raw, "/login")) {
+            try std.testing.expect(std.mem.find(u8, &screen.grid[23], "/login") == null);
+        }
+        try std.testing.expectEqualStrings(case.raw, ui.editor.bytes.items);
+        ui.finishFrame();
+        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+        try ui.parser.feed("\r", sink);
+        try std.testing.expect(!ui.secret_mode and !ui.provider_open);
+        try std.testing.expectEqual(@as(usize, 0), fixture.provider_saves);
+    }
+}
+
 test "secret prompt masks keys shows destination and erases cancel error and paste tails" {
     try text.initLocale();
     var cancel = p.Cancellation{};
@@ -4826,14 +4942,14 @@ test "configure enables same-process submit without sending secrets or commands"
     try std.testing.expectEqualStrings("Saved locally; send a message to connect", ui.notice);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Saved locally; send a message to connect") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Esc closes") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Esc closes") == null);
+    try std.testing.expect(!ui.secret_mode and !ui.secret_quarantine);
     try std.testing.expect(std.mem.find(u8, ui.frame, "sk-fixture-secret") == null);
     ui.finishFrame();
     try std.testing.expectEqual(@as(usize, 1), fixture.saves);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     for (ui.secret.bytes) |b| try std.testing.expectEqual(@as(u8, 0), b);
-    try ui.parser.feed("\x15", sink); // Explicitly release post-paste quarantine.
     try ui.parser.feed("/login\r", sink);
     try std.testing.expect(!ui.secret_mode);
     try std.testing.expectEqual(@as(usize, 1), fixture.saves);

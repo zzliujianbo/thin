@@ -6,6 +6,7 @@ pub const tools = @import("presentation/tools.zig");
 pub const answer = @import("presentation/answer.zig");
 pub const activity = @import("presentation/activity.zig");
 pub const state = @import("presentation/state.zig");
+pub const failure = @import("presentation/failure.zig");
 pub const State = state.State;
 pub const View = state.View;
 pub const ContextSnapshot = state.ContextSnapshot;
@@ -17,4 +18,5 @@ test {
     _ = answer;
     _ = activity;
     _ = state;
+    _ = failure;
 }

@@ -316,8 +316,23 @@ test "thinking declarations strict owned config validation and protocol incompat
     try t.expectError(error.IncompatibleReasoningProtocol, validate(config));
 }
 
+test "Anthropic config is explicit and rejects foreign thinking controls" {
+    var parsed = try parse(std.testing.allocator,
+        \\{"provider":{"base_url":"https://opencode.ai/inference/go/v1"},"model":{"name":"claude-haiku-5-5","context_tokens":32768,"protocol":"anthropic"}}
+    );
+    defer release(&parsed);
+    try std.testing.expect(parsed.value.model.protocol == .anthropic);
+    try validate(parsed.value);
+    var config = parsed.value;
+    config.model.reasoning_effort = "high";
+    try std.testing.expectError(error.UnsupportedAnthropicReasoning, validate(config));
+    config.model.reasoning_effort = null;
+    config.model.reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } };
+    try std.testing.expectError(error.IncompatibleReasoningProtocol, validate(config));
+}
+
 fn validateReasoningProtocol(base_url: []const u8, model: Model) !void {
-    if (model.protocol == .responses and thinking.resolve(base_url, model.name, model.reasoning).format == .deepseek) return error.IncompatibleReasoningProtocol;
+    if ((model.protocol == .responses or model.protocol == .anthropic) and thinking.resolve(base_url, model.name, model.reasoning).format == .deepseek) return error.IncompatibleReasoningProtocol;
 }
 
 /// Shared profile validation uses the same limits as the selected model.
@@ -328,8 +343,11 @@ pub fn validateModel(model: Model, l: Limits) !void {
     }
     if (model.reasoning) |declaration| {
         try declaration.validate();
-        if (model.protocol == .responses and declaration.format == .deepseek) return error.IncompatibleReasoningProtocol;
+        if ((model.protocol == .responses or model.protocol == .anthropic) and declaration.format == .deepseek) return error.IncompatibleReasoningProtocol;
     }
+    // Do not interpret an OpenAI/DeepSeek effort declaration as Anthropic thinking.
+    // Enable native controls only once the exact model's schema is verified.
+    if (model.protocol == .anthropic and (model.reasoning_effort != null or model.reasoning != null)) return error.UnsupportedAnthropicReasoning;
     const mib = 1024 * 1024;
     if (model.context_tokens == 0 or model.context_tokens > 16 * mib or
         l.max_output_tokens > mib or l.safety_tokens > mib or l.summary_tokens > l.max_output_tokens or

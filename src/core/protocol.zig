@@ -3,8 +3,8 @@
 
 const std = @import("std");
 
-/// 线协议选择：auto 自动选择，chat 为 Chat Completions，responses 为 Responses API。
-pub const Protocol = enum { auto, chat, responses };
+/// auto probes only Responses/Chat. Anthropic Messages is selected explicitly.
+pub const Protocol = enum { auto, chat, responses, anthropic };
 /// 请求用途：normal 为普通对话，summary 为上下文压缩时生成滚动摘要。
 pub const Purpose = enum { normal, summary };
 /// 消息角色；context 为滚动摘要等注入的上下文，不是用户真实输入。
@@ -33,8 +33,8 @@ pub const ReplayScope = struct {
 pub const Replay = struct {
     /// 产生该续接数据时的作用域，不匹配时必须丢弃 json。
     scope: ReplayScope,
-    /// Chat: complete assistant object. Responses: ordered output item array.
-    /// 中文：Chat 为完整 assistant 对象；Responses 为有序 output item 数组。
+    /// Chat/Anthropic: complete assistant role/content object.
+    /// Responses: ordered output item array. Anthropic signed/opaque blocks stay native.
     json: []const u8,
     /// Conservative adapter constraint: reasoning/opaque continuation may require
     /// the entire user turn. Context may remove the closed turn as a whole, but
@@ -51,7 +51,7 @@ pub const ToolCall = struct {
     name: []const u8,
     /// 工具参数的原始 JSON 文本。
     arguments: []const u8,
-    /// Responses 协议中的 item id；Chat 协议中为 null。
+    /// Responses 协议中的 item id；Chat/Anthropic 协议中为 null。
     item_id: ?[]const u8 = null,
 };
 

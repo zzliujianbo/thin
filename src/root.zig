@@ -22,6 +22,8 @@ pub const http = @import("llm/http.zig");
 pub const chat = @import("llm/chat.zig");
 /// Responses 协议适配。
 pub const responses = @import("llm/responses.zig");
+/// Anthropic Messages 协议适配。
+pub const anthropic = @import("llm/anthropic.zig");
 
 /// 子进程管理平台层。
 pub const process = @import("platform/process.zig");
@@ -49,6 +51,7 @@ test {
     _ = http;
     _ = chat;
     _ = responses;
+    _ = anthropic;
     _ = process;
     _ = filesystem;
     _ = memory;
@@ -72,6 +75,7 @@ test {
     _ = @import("app/journal.zig");
     _ = @import("app/session.zig");
     _ = @import("tests/settings_session_test.zig");
+    _ = @import("tests/selection_defaults_test.zig");
     _ = @import("tests/thinking_contract_test.zig");
     _ = @import("tests/context_usage_test.zig");
     _ = @import("ui/terminal.zig");

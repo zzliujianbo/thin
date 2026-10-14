@@ -143,7 +143,11 @@ fn run(init: std.process.Init) !u8 {
 
         // 失败或取消时，把终止状态、错误名与模型失败类型拼成一行写入 stderr。
         var buffer: [512]u8 = undefined;
-        const message = try std.fmt.bufPrint(&buffer, "thin: {s}{s}{s}{s}{s}\n", .{ @tagName(terminal.status), if (terminal.detail != null) ": " else "", if (terminal.detail) |err| @errorName(err) else "", if (terminal.model_failure != null) " / " else "", if (terminal.model_failure) |kind| @tagName(kind) else "" });
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writer.writeAll("thin: ");
+        try @import("presentation.zig").failure.write(&writer, @tagName(terminal.status), terminal.detail, terminal.model_failure, terminal.http_status);
+        try writer.writeByte('\n');
+        const message = writer.buffered();
 
         // 退出码约定：收到信号时为 128+信号号；否则取消为 130，其他失败为 1。
         const code: u8 = if (terminal.status == .canceled) (if (interrupt.signal() != 0) 128 + interrupt.signal() else 130) else 1;
