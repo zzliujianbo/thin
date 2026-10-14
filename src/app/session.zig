@@ -13,11 +13,12 @@ const Settings = @import("settings_store.zig").Store;
 const thinking = @import("../core/thinking.zig");
 const catalog = @import("provider_catalog.zig");
 const ProviderId = cfg.providers.Id;
-const selections = @import("selection_store.zig");
+const selections = @import("selection.zig");
 const resume_store = @import("resume_store.zig");
 const resume_codec = @import("resume_codec.zig");
 const checkpoint = @import("../core/checkpoint.zig");
 const metadata = @import("model_metadata.zig");
+const fs = @import("../platform/filesystem.zig");
 
 const MetadataTokens = [catalog.entries.len]?u32;
 const MetadataFetch = *const fn (std.mem.Allocator, std.Io, ProviderId, ?[]const u8) anyerror!metadata.Listing;
@@ -110,6 +111,9 @@ pub const Session = struct {
 
     resume_lease: ?resume_store.Lease = null,
     resumed: bool = false,
+    /// Journal observer wrapped so checkpoint writes stay on the runtime thread.
+    inner_observer: r.Observer = .{},
+    checkpoint_error: ?anyerror = null,
 
     pub const Options = struct { restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, logging: bool = true, auto_refresh_models: bool = false };
 
@@ -128,12 +132,17 @@ pub const Session = struct {
         var lease: ?resume_store.Lease = if (options.resume_session) |source_id| try resume_store.Lease.open(&settings.root, source_id, options.logging) else null;
         errdefer if (lease) |*owned| owned.deinit();
         const source_bytes: ?[]u8 = if (lease) |*owned| try owned.load(&settings.root) else null;
+        const selection_bytes: ?[]u8 = if (options.restore_selection) |source_id| try loadSelectionBytes(&settings.root, source_id) else null;
         defer if (source_bytes) |bytes| {
             std.crypto.secureZero(u8, bytes);
             a.free(bytes);
         };
-        const envelope: ?resume_codec.Envelope = if (source_bytes) |bytes| try resume_codec.inspect(a, bytes, id) else null;
-        const restored: ?selections.Snapshot = if (envelope) |value| value.selection else if (options.restore_selection) |source_id| try selections.load(&settings.root, source_id) else null;
+        defer if (selection_bytes) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            a.free(bytes);
+        };
+        const envelope: ?resume_codec.Envelope = if (source_bytes) |bytes| try resume_codec.inspect(a, bytes, id) else if (selection_bytes) |bytes| try resume_codec.inspect(a, bytes, options.restore_selection.?) else null;
+        const restored: ?selections.Snapshot = if (envelope) |value| value.selection else null;
         const auth_store = if (restored != null) try Store.openExisting(a, io, home) else try Store.open(a, io, home);
         var self: Session = .{
             .allocator = a,
@@ -193,8 +202,9 @@ pub const Session = struct {
         }
         // Only small metadata was inspected to resolve the LOCAL credential.
         // Verify the exact immutable bytes before parsing any large state JSON.
+        // --restore-selection authenticates the same checkpoint but does not import history.
         if (envelope) |*value| try resume_codec.authenticate(value, key);
-        const restored_state = if (envelope) |value| try checkpoint.decode(a, value.payload) else null;
+        const restored_state = if (source_bytes != null) if (envelope) |value| try checkpoint.decode(a, value.payload) else null else null;
         defer if (restored_state) |value| value.deinit();
         if (restored_state) |value| {
             if (value.value.context_tokens) |tokens| {
@@ -216,7 +226,6 @@ pub const Session = struct {
             app.journal.turn = value.value.journal_turn;
             app.journal.resumed = true;
             app.journal.began_ms = std.Io.Clock.awake.now(io).toMilliseconds();
-            if (options.logging) app.journal.selection_writer.expected = try selections.existingDigest(&self.settings.root, id);
             self.settings_notice = "Conversation restored; prior tools are NOT rerun";
             // Last fallible initialization step: interrupted/poisoned resumed
             // processes leave an active marker, never a misleading old command.
@@ -323,6 +332,7 @@ pub const Session = struct {
     }
 
     pub fn connection(self: *Session) tui.Connection {
+        self.installObserver();
         return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
     }
 
@@ -332,14 +342,95 @@ pub const Session = struct {
         return if (self.resumed) self.app.?.runtime.messages() else &.{};
     }
 
-    /// Joined, normal interactive exit only. Not an autosave/crash-recovery log.
-    /// A failure never changes task success; the caller must withhold the command.
+    /// Joined, normal interactive exit. Checkpoints are also written during the
+    /// run; this publishes the final clean generation. A failure never changes
+    /// task success; the caller must withhold the command.
     pub fn saveOnExit(self: *Session) !bool {
         if (!self.logging) return false;
         const app = self.app orelse return false;
         if (app.runtime.messages().len == 0) return false;
         app.journal.finish();
-        var state = try app.runtime.checkpoint();
+        const bytes = try self.encodeCheckpoint(false);
+        defer {
+            std.crypto.secureZero(u8, bytes);
+            self.allocator.free(bytes);
+        }
+        try resume_store.saveFinal(&self.settings.root, self.session_id, if (self.resume_lease) |*lease| lease else null, bytes);
+        return true;
+    }
+
+    fn installObserver(self: *Session) void {
+        const app = self.app orelse return;
+        if (app.runtime.observer.context == @as(*anyopaque, self)) return;
+        if (app.runtime.busy.load(.acquire)) return;
+        self.inner_observer = app.journal.observer();
+        app.runtime.observer = .{ .context = self, .notify_fn = persistNotify };
+    }
+
+    fn persistNotify(ctx: ?*anyopaque, observation: r.Observation) void {
+        const self: *Session = @ptrCast(@alignCast(ctx.?));
+        self.inner_observer.notify(observation);
+        if (!self.logging) return;
+        switch (observation) {
+            .event => |event| switch (event) {
+                // Dirty only once a tool can have side effects. Model calls and
+                // compaction keep the previous clean checkpoint resumable.
+                .tool_started => self.markCheckpointDirty(),
+                .assistant_committed, .compacted, .finished => self.persistBestEffort(true),
+                else => {},
+            },
+            .tool_completed => self.persistBestEffort(true),
+            else => {},
+        }
+    }
+
+    fn markCheckpointDirty(self: *Session) void {
+        const lease = &(self.resume_lease orelse return);
+        if (!lease.writable) return;
+        lease.activate(&self.settings.root) catch |err| {
+            self.checkpoint_error = err;
+        };
+    }
+
+    fn persistBestEffort(self: *Session, during_run: bool) void {
+        self.persistCheckpoint(during_run) catch |err| switch (err) {
+            error.IncompleteToolGroup => {},
+            else => self.checkpoint_error = err,
+        };
+    }
+
+    /// Reinstall the runtime observer, then publish a clean checkpoint when this
+    /// chat already has history. Idle selection changes are not a model turn.
+    fn publishCheckpoint(self: *Session) void {
+        self.installObserver();
+        self.persistBestEffort(false);
+    }
+
+    fn persistCheckpoint(self: *Session, during_run: bool) !void {
+        if (!self.logging) return;
+        const app = self.app orelse return;
+        if (app.runtime.messages().len == 0) return;
+        if (app.runtime.poisoned) return error.UnsafeToContinue;
+        const bytes = try self.encodeCheckpoint(during_run);
+        defer {
+            std.crypto.secureZero(u8, bytes);
+            self.allocator.free(bytes);
+        }
+        try self.ensureWritableLease();
+        try self.resume_lease.?.save(&self.settings.root, bytes);
+    }
+
+    fn ensureWritableLease(self: *Session) !void {
+        if (self.resume_lease) |*lease| {
+            if (!lease.writable) return error.ResumeReadOnly;
+            return;
+        }
+        self.resume_lease = try resume_store.Lease.create(&self.settings.root, self.session_id);
+    }
+
+    fn encodeCheckpoint(self: *Session, during_run: bool) ![]u8 {
+        const app = self.app orelse return error.NotConfigured;
+        var state = if (during_run) try app.runtime.exportCheckpoint() else try app.runtime.checkpoint();
         state.journal_seq = app.journal.seq;
         state.journal_turn = app.journal.turn;
         state.context_official = self.active_context_official;
@@ -356,13 +447,7 @@ pub const Session = struct {
         }
         var salt: [16]u8 = undefined;
         try self.io.randomSecure(&salt);
-        const bytes = try resume_codec.encode(self.allocator, self.session_id, &selection, payload, key, salt);
-        defer {
-            std.crypto.secureZero(u8, bytes);
-            self.allocator.free(bytes);
-        }
-        try resume_store.saveFinal(&self.settings.root, self.session_id, if (self.resume_lease) |*lease| lease else null, bytes);
-        return true;
+        return resume_codec.encode(self.allocator, self.session_id, &selection, payload, key, salt);
     }
 
     /// Re-resolve against CURRENT disk options before advertising a command.
@@ -735,6 +820,9 @@ pub const Session = struct {
             self.initial_context = app.runtime.contextSnapshot();
             app.recordSelection();
         }
+        // Publication already happened. A checkpoint miss must not look like a
+        // rolled-back model change.
+        self.publishCheckpoint();
     }
 
     fn selectProviderModel(self: *Session, entry: catalog.Entry) !void {
@@ -803,6 +891,7 @@ pub const Session = struct {
         self.active_context_official = official != null;
         self.settings_notice = notice;
         self.initial_context = self.app.?.runtime.contextSnapshot();
+        self.publishCheckpoint();
     }
 
     fn configureProvider(raw: *anyopaque, id: ProviderId, key: []const u8) !void {
@@ -875,6 +964,7 @@ pub const Session = struct {
         // Saving is local and transactional. Refresh starts later on the owner
         // idle poll, even if this provider was already attempted before login.
         if (self.metadata_login_auto) self.metadata_login_pending |= metadata.bit(id);
+        self.publishCheckpoint();
     }
 
     fn setEffort(raw: *anyopaque, effort: presentation.ReasoningEffort) !void {
@@ -900,6 +990,7 @@ pub const Session = struct {
         self.settings_error = null;
         self.settings_notice = null;
         if (self.app) |app| app.recordSelection();
+        self.publishCheckpoint();
     }
 
     fn configure(raw: *anyopaque, key: []const u8) !void {
@@ -946,16 +1037,42 @@ pub const Session = struct {
         self.selected_name = null;
         self.initial_context = candidate.runtime.contextSnapshot();
         self.app = candidate;
+        self.publishCheckpoint();
     }
 };
 
-fn overwriteFixtureSelection(root: *@import("../platform/filesystem.zig").Root, id: ids.Id, snapshot: *const selections.Snapshot) !void {
-    var buffer: [selections.max_bytes]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buffer);
-    try selections.encode(&writer, id, snapshot);
-    var path: [96]u8 = undefined;
-    const relative = try std.fmt.bufPrint(&path, ".thin/sessions/{s}.selection.json", .{id});
-    try root.writeMode(relative, writer.buffered(), true, 0o600);
+/// Read selection out of a clean checkpoint. A missing lease is the old
+/// "no snapshot" error so restore callers keep a stable name.
+fn loadSelectionBytes(root: *fs.Root, id: ids.Id) ![]u8 {
+    var lease = resume_store.Lease.open(root, id, false) catch |err| switch (err) {
+        error.ResumeNotFound, error.FileNotFound => return error.SelectionNotFound,
+        else => return err,
+    };
+    defer lease.deinit();
+    return lease.load(root) catch |err| switch (err) {
+        error.ResumeNotFound => error.SelectionNotFound,
+        else => return err,
+    };
+}
+
+fn releaseLease(session: *Session) void {
+    if (session.resume_lease) |*lease| lease.deinit();
+    session.resume_lease = null;
+}
+
+/// Replace the authenticated selection inside an existing checkpoint and
+/// publish a new clean generation. Payload bytes stay as they were.
+fn overwriteFixtureSelection(root: *fs.Root, id: ids.Id, snapshot: *const selections.Snapshot, key: []const u8) !void {
+    var lease = try resume_store.Lease.open(root, id, true);
+    defer lease.deinit();
+    const bytes = try lease.load(root);
+    defer root.allocator.free(bytes);
+    const envelope = try resume_codec.inspect(root.allocator, bytes, id);
+    var salt: [16]u8 = undefined;
+    @memcpy(&salt, bytes[12..28]);
+    const rewritten = try resume_codec.encode(root.allocator, id, snapshot, envelope.payload, key, salt);
+    defer root.allocator.free(rewritten);
+    try lease.save(root, rewritten);
 }
 
 test "restore selection is read only until an explicit empty conversation model change" {
@@ -980,11 +1097,19 @@ test "restore selection is read only until an explicit empty conversation model 
     try connection.setEffort(.max);
     app.journal.flush();
     try std.testing.expect(app.journal.failure() == null);
+    try std.testing.expect(source.checkpoint_error == null);
     try std.testing.expectError(error.UnsupportedProviderModel, connection.selectModel("opencode-go/not-a-preset"));
-    const snapshot = try selections.load(&source.settings.root, source.session_id);
-    try std.testing.expectEqual(presentation.ReasoningEffort.max, snapshot.effort.?);
-    try std.testing.expectEqual(ProviderId.opencode_go, snapshot.provider.?);
+    const snapshot = blk: {
+        const checkpoint_bytes = try source.resume_lease.?.load(&source.settings.root);
+        defer a.free(checkpoint_bytes);
+        const saved = try resume_codec.inspect(a, checkpoint_bytes, source.session_id);
+        try std.testing.expectEqual(presentation.ReasoningEffort.max, saved.selection.effort.?);
+        try std.testing.expectEqual(ProviderId.opencode_go, saved.selection.provider.?);
+        break :blk saved.selection;
+    };
     try source.settings.save(.low); // A different new-session default must lose.
+    // The owner holds the checkpoint lock. Restore and rewrite run as another opener.
+    releaseLease(&source);
     const global_before = try tmp.dir.readFileAlloc(std.testing.io, ".thin/config.json", a, .limited(cfg.max_config_bytes));
     defer a.free(global_before);
     const settings_before = try tmp.dir.readFileAlloc(std.testing.io, ".thin/settings.json", a, .limited(1024));
@@ -1029,7 +1154,7 @@ test "restore selection is read only until an explicit empty conversation model 
             2 => invalid.effort = .minimal,
             else => unreachable,
         }
-        try overwriteFixtureSelection(&source.settings.root, source.session_id, &invalid);
+        try overwriteFixtureSelection(&source.settings.root, source.session_id, &invalid, "fixture-go-key");
         const expected = switch (case) {
             0 => error.SelectionEndpointUnavailable,
             1 => error.SelectionModelUnavailable,
@@ -1037,7 +1162,7 @@ test "restore selection is read only until an explicit empty conversation model 
         };
         try std.testing.expectError(expected, Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = source.session_id }));
     }
-    try overwriteFixtureSelection(&source.settings.root, source.session_id, &snapshot);
+    try overwriteFixtureSelection(&source.settings.root, source.session_id, &snapshot, "fixture-go-key");
     try tmp.dir.deleteFile(std.testing.io, ".thin/settings.json");
     {
         var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = source.session_id });
@@ -1617,7 +1742,7 @@ test "Anthropic authenticated session resume preserves signed replay and never e
 test "resumed selection changes persist without a new submission and no-log stays read only" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    for ([_]bool{ false, true }) |existing_sidecar| {
+    for ([_]bool{ false, true }) |prior_submission| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var buffer: [4096]u8 = undefined;
@@ -1639,19 +1764,21 @@ test "resumed selection changes persist without a new submission and no-log stay
                 .permission_id = 0,
                 .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "saved question" }} }},
             });
-            if (existing_sidecar) source.app.?.journal.observer().notify(.{ .submitted = "saved question" });
+            if (prior_submission) source.app.?.journal.observer().notify(.{ .submitted = "saved question" });
             try std.testing.expect(try source.saveOnExit());
         }
-        // No-log selection changes must neither create nor overwrite a sidecar.
+        // No-log selection changes must not replace the checkpoint generation.
         {
             var readonly = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id, .logging = false });
             defer readonly.deinit();
-            const before = try selections.existingDigest(&readonly.settings.root, id);
+            const before = readonly.resume_lease.?.expected;
             try readonly.connection().selectModel("deepseek/deepseek-v4-pro");
             readonly.app.?.journal.flush();
             try std.testing.expect(readonly.app.?.journal.worker == null);
             try std.testing.expect(!try readonly.saveOnExit());
-            try std.testing.expectEqual(before, try selections.existingDigest(&readonly.settings.root, id));
+            try std.testing.expectEqual(before, readonly.resume_lease.?.expected);
+            const unchanged = try readonly.resume_lease.?.load(&readonly.settings.root);
+            defer a.free(unchanged);
         }
         {
             var restored = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id });
@@ -1660,9 +1787,12 @@ test "resumed selection changes persist without a new submission and no-log stay
             try restored.connection().selectModel("deepseek/deepseek-v4-pro");
             restored.app.?.journal.flush();
             try std.testing.expect(restored.app.?.journal.failure() == null);
+            try std.testing.expect(restored.checkpoint_error == null);
             try std.testing.expect(!restored.app.?.journal.started);
-            const snapshot = try selections.load(&restored.settings.root, id);
-            try std.testing.expectEqualStrings("deepseek-v4-pro", snapshot.model());
+            const checkpoint_bytes = try restored.resume_lease.?.load(&restored.settings.root);
+            defer a.free(checkpoint_bytes);
+            const saved = try resume_codec.inspect(a, checkpoint_bytes, id);
+            try std.testing.expectEqualStrings("deepseek-v4-pro", saved.selection.model());
             try std.testing.expect(try restored.saveOnExit());
         }
         {
@@ -1678,6 +1808,89 @@ test "resumed selection changes persist without a new submission and no-log stay
             try std.testing.expectEqual(@as(usize, 1), conversation.app.?.runtime.messages().len);
         }
     }
+}
+
+test "closed turn checkpoint is resumable before exit" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var id: ids.Id = undefined;
+    {
+        var source = try Session.init(a, io, &env, home, .{}, true);
+        defer source.deinit();
+        try source.connection().configure("fake-incremental-checkpoint");
+        id = source.session_id;
+        try source.app.?.runtime.restoreCheckpoint(.{
+            .system = "saved system",
+            .selector = source.app.?.runtime.selector,
+            .estimator = .{},
+            .last_context_tokens = null,
+            .permission_id = 0,
+            .messages = &.{
+                .{ .role = .user, .blocks = &.{.{ .text = "incremental question" }} },
+                .{ .role = .assistant, .blocks = &.{.{ .text = "incremental answer" }} },
+            },
+        });
+        source.app.?.runtime.observer.notify(.{ .event = .{ .assistant_committed = &.{.{ .text = "incremental answer" }} } });
+        try std.testing.expect(source.checkpoint_error == null);
+        try std.testing.expect(source.resume_lease != null);
+        try std.testing.expect(!source.resume_lease.?.active);
+        var selection_path: [80]u8 = undefined;
+        const relative = try std.fmt.bufPrint(&selection_path, ".thin/sessions/{s}.selection.json", .{id});
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, relative, .{}));
+        releaseLease(&source);
+    }
+    {
+        var resumed = try Session.initWithOptions(a, io, &env, home, .{}, false, .{ .resume_session = id, .logging = false });
+        defer resumed.deinit();
+        try std.testing.expectEqual(@as(usize, 2), resumed.app.?.runtime.messages().len);
+        try std.testing.expectEqualStrings("incremental question", resumed.app.?.runtime.messages()[0].blocks[0].text);
+        try std.testing.expectEqualStrings("incremental answer", resumed.app.?.runtime.messages()[1].blocks[0].text);
+        try std.testing.expect(!resumed.resume_lease.?.active);
+    }
+}
+
+test "tool start leaves the checkpoint dirty until the result is published" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var id: ids.Id = undefined;
+    {
+        var source = try Session.init(a, io, &env, home, .{}, true);
+        defer source.deinit();
+        try source.connection().configure("fake-incremental-checkpoint");
+        id = source.session_id;
+        try source.app.?.runtime.restoreCheckpoint(.{
+            .system = "saved system",
+            .selector = source.app.?.runtime.selector,
+            .estimator = .{},
+            .last_context_tokens = null,
+            .permission_id = 0,
+            .messages = &.{
+                .{ .role = .user, .blocks = &.{.{ .text = "incremental question" }} },
+                .{ .role = .assistant, .blocks = &.{.{ .text = "incremental answer" }} },
+            },
+        });
+        source.app.?.runtime.observer.notify(.{ .event = .{ .assistant_committed = &.{.{ .text = "incremental answer" }} } });
+        try std.testing.expect(!source.resume_lease.?.active);
+        source.app.?.runtime.observer.notify(.{ .event = .{ .tool_started = .{ .id = 1, .name = "read_file" } } });
+        try std.testing.expect(source.resume_lease.?.active);
+        try std.testing.expect(source.checkpoint_error == null);
+        releaseLease(&source);
+    }
+    try std.testing.expectError(error.ResumeNotClosed, Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id }));
 }
 
 fn testReasoning() thinking.Declaration {

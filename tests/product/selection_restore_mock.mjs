@@ -1,11 +1,40 @@
 // Selection-only restoration on an owned PTY and loopback server. Never uses
 // real HOME/config, public providers or the user's terminal. Capture stays local.
 import http from 'node:http';
-import {createHash} from 'node:crypto';
-import {mkdtemp, mkdir, writeFile, readFile, readdir, rm} from 'node:fs/promises';
+import {createHash, createHmac} from 'node:crypto';
+import {mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import assert from 'node:assert/strict';
+
+function checkpointBytes(id, snapshot, key) {
+  const selection = Buffer.from(JSON.stringify(snapshot));
+  const payload = Buffer.from('x');
+  const bytes = Buffer.alloc(68 + selection.length + payload.length);
+  Buffer.from('THINRSM\0', 'utf8').copy(bytes, 0);
+  bytes[8] = 1;
+  bytes[9] = 1;
+  bytes.writeUInt32LE(selection.length, 28);
+  bytes.writeUInt32LE(payload.length, 32);
+  selection.copy(bytes, 68);
+  payload.copy(bytes, 68 + selection.length);
+  createHmac('sha256', key)
+    .update('thin.resume.checkpoint.hmac-sha256.v1\0')
+    .update(bytes.subarray(0, 36))
+    .update(bytes.subarray(68))
+    .digest()
+    .copy(bytes, 36);
+  const marker = Buffer.concat([Buffer.from('C'), createHash('sha256').update(bytes).digest()]);
+  return {bytes, marker};
+}
+
+async function writeCheckpoint(sessionPath, lockPath, id, snapshot, key) {
+  const file = checkpointBytes(id, snapshot, key);
+  await writeFile(sessionPath, file.bytes, {mode:0o600});
+  await writeFile(lockPath, file.marker, {mode:0o600});
+  await chmod(sessionPath, 0o600);
+  await chmod(lockPath, 0o600);
+}
 
 export async function selectionRestoreRegressions({app, pty, execute}) {
   const root = await mkdtemp(join(tmpdir(), 'thin-selection-restore-'));
@@ -59,13 +88,19 @@ export async function selectionRestoreRegressions({app, pty, execute}) {
     const config = JSON.stringify({provider:{kind:'opencode_zen', base_url:url, api_key_env:'THIN_FIXTURE_KEY'}, model:{name:'fixture-model', protocol:'chat', context_tokens:32768, reasoning}, models:[{name:'fixture-restored', protocol:'chat', context_tokens:32768, reasoning_effort:'low', reasoning}]});
     const settings = '{ "version": 1, "reasoning_effort": "low" }\n';
     const snapshot = {version:1, session:id, provider:'opencode_zen', endpoint:createHash('sha256').update(url).digest('hex'), model:'fixture-restored', protocol:'responses', effort:'high', effort_hash:null};
-    const snapshotPath = join(sessions, `${id}.selection.json`);
+    const sessionPath = join(sessions, `${id}.session`);
+    const lockPath = join(sessions, `${id}.resume-lock`);
     await writeFile(join(home, '.thin', 'config.json'), config, {mode:0o600});
     await writeFile(join(project, '.thin', 'settings.json'), settings, {mode:0o600});
+    await chmod(join(home, '.thin'), 0o700);
+    await chmod(join(project, '.thin'), 0o700);
+    await chmod(sessions, 0o700);
     await writeFile(join(sessions, '.gitignore'), '*\n', {mode:0o600});
+    await chmod(join(sessions, '.gitignore'), 0o600);
     // Deliberately invalid diagnostic JSONL must never be opened/replayed.
     await writeFile(join(sessions, 'not-replayable.jsonl'), 'OLD-HISTORY-MUST-NOT-APPEAR\n', {mode:0o600});
-    await writeFile(snapshotPath, JSON.stringify(snapshot), {mode:0o600});
+    await chmod(join(sessions, 'not-replayable.jsonl'), 0o600);
+    await writeCheckpoint(sessionPath, lockPath, id, snapshot, key);
     const before = (await readdir(sessions)).sort();
     const env = {PATH:'/usr/bin:/bin', HOME:home, LANG:'C.UTF-8', TERM:'xterm-256color', THIN_FIXTURE_KEY:key,
       THIN_APP_BIN:app, THIN_APP_TEST_PROJECT:project, THIN_APP_TEST_HOME:home,
@@ -107,7 +142,7 @@ export async function selectionRestoreRegressions({app, pty, execute}) {
     for (const expected of ['SelectionNotFound', 'ApiKeyNotFound', 'SelectionEndpointUnavailable']) {
       checkpoint = `PTY ${expected}`;
       if (expected === 'SelectionEndpointUnavailable') {
-        await writeFile(snapshotPath, JSON.stringify({...snapshot, endpoint:'0'.repeat(64)}));
+        await writeCheckpoint(sessionPath, lockPath, id, {...snapshot, endpoint:'0'.repeat(64)}, key);
       }
       const failed = await execute(pty, [], {...env, THIN_APP_TEST_MODE:'restore-failure',
         THIN_APP_TEST_RESTORE_ID:expected === 'SelectionNotFound' ? 'f'.repeat(32) : id,

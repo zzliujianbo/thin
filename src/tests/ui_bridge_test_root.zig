@@ -289,7 +289,7 @@ test "permission installed before enqueue; cancel while awaiting permission clea
     try waitActive(&bridge);
 
     cancel.cancel();
-    try t.expectEqual(r.Decision.deny, try worker.await(bridge.io));
+    try t.expectError(error.Canceled, worker.await(bridge.io));
     try t.expect(!bridge.decide(8, .trust_process));
     try t.expect(bridge.pending == null and bridge.answer == null);
 }
@@ -380,4 +380,25 @@ test "total budget includes popped items; freeing ownership releases producer" {
     try t.expect(bridge.bytes <= b.data_budget);
     drain(&bridge);
     try t.expectEqual(@as(usize, 0), bridge.bytes);
+}
+
+test "permission epoch restarts above the old high water and disconnect stays deny" {
+    var env = Env.init();
+    defer env.deinit();
+    var cancel = p.Cancellation{};
+    var bridge = b.Bridge.init(t.allocator, env.backend.io(), &cancel);
+    defer bridge.deinit();
+    bridge.last_id = std.math.maxInt(u64);
+    try t.expectError(error.InvalidPermission, send(&bridge, .{ .permission = .{ .id = 0, .tool_name = "x", .description = "y" } }));
+    const host = bridge.host();
+    try host.rebase_permission_fn.?(host.context);
+    try t.expect(bridge.last_id == null);
+    try send(&bridge, .{ .permission = .{ .id = 1, .tool_name = "x", .description = "y" } });
+    try t.expect(bridge.decide(1, .deny));
+    try t.expectEqual(r.Decision.deny, try auth(&bridge, 1));
+    drain(&bridge);
+
+    bridge.disconnected = true;
+    try t.expectError(error.Canceled, send(&bridge, .{ .permission = .{ .id = 2, .tool_name = "x", .description = "y" } }));
+    try t.expectEqual(r.Decision.deny, try auth(&bridge, 2));
 }
