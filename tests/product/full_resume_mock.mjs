@@ -28,7 +28,8 @@ export async function fullResumeRegressions({app, pty, execute}) {
         const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         assert.equal(body.model, 'fixture-model');
         const history = protocol === 'chat' ? body.messages : body.input;
-        const users = history.filter(m => m.role === 'user');
+        // Session preface (environment/AGENTS) is context-material, not a user turn.
+        const users = history.filter(m => m.role === 'user' && !JSON.stringify(m).includes('[Context material'));
         serverCheck = 'exact user history';
         assert(JSON.stringify(users[0]).includes('remember-resume-marker'));
         assert.equal(users.length, requests <= 2 ? 1 : requests - 1);
@@ -114,13 +115,16 @@ export async function fullResumeRegressions({app, pty, execute}) {
       assert.equal((await stat(sessions)).mode & 0o777, 0o700);
       const stateOf = bytes => JSON.parse(bytes.subarray(68 + bytes.readUInt32LE(28)).toString());
       const firstState = stateOf(first);
-      assert.equal(firstState.messages.length, 4);
+      // Session preface is persisted as context messages; turns are counted separately.
+      const turnsOf = state => state.messages.filter(m => m.role !== 'context');
+      assert(firstState.messages.some(m => m.role === 'context'));
+      assert.equal(turnsOf(firstState).length, 4);
       assert.equal(firstState.selector.selected, protocol);
       assert.equal(await run('resume-next', id), id);
       assert.equal(requests, 3);
       check = 'saved continuation and counter continuity';
       const second = await readFile(snapshotPath), secondState = stateOf(second);
-      assert.equal(secondState.messages.length, 6);
+      assert.equal(turnsOf(secondState).length, 6);
       assert(secondState.journal_seq > firstState.journal_seq);
       assert.equal(secondState.journal_turn, firstState.journal_turn + 1);
       const snapshotTree = async () => {

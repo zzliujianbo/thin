@@ -64,9 +64,19 @@ export async function selectionRestoreRegressions({app, pty, execute}) {
       assert.equal(body.model, 'fixture-restored');
       assert.equal(body.reasoning.effort, 'high');
       serverCheck = 'new history';
-      assert.equal(body.input.length, 1);
-      assert.equal(body.input[0].role, 'user');
-      assert(JSON.stringify(body.input).includes('restore-new-turn'));
+      // The session preface (environment, plus AGENTS when present) is injected as
+      // context-material user messages before the new turn. Only those may precede it.
+      assert(body.input.length >= 1);
+      const turn = body.input[body.input.length - 1];
+      assert.equal(turn.role, 'user');
+      assert(JSON.stringify(turn).includes('restore-new-turn'));
+      for (const item of body.input.slice(0, -1)) {
+        assert.equal(item.role, 'user');
+        assert(JSON.stringify(item).includes('[Context material'));
+        assert(!JSON.stringify(item).includes('restore-new-turn'));
+      }
+      assert(JSON.stringify(body.input).includes(`cwd: ${project}`));
+      assert.equal(JSON.stringify(body.input).split('restore-new-turn').length - 1, 1);
       assert(!JSON.stringify(body).includes('OLD-HISTORY-MUST-NOT-APPEAR'));
       serverCheck = 'response';
       res.writeHead(200, {'content-type': 'text/event-stream'});
