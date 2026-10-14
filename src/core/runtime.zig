@@ -453,7 +453,13 @@ pub const Runtime = struct {
     /// Last preface actually written into history. Compared so an unchanged
     /// policy does not append another message. Not part of the checkpoint;
     /// a restored history is matched by parsing the preface messages.
+    /// A byte-for-byte snapshot match is not enough after compaction: the live
+    /// messages must still contain that preface.
     applied_policy: ?AppliedPolicy = null,
+    /// Set by the session observer when a clean checkpoint cannot be marked
+    /// dirty. The following tool must not run, or resume could replay a clean
+    /// generation over side effects that were never recorded.
+    tool_blocked: bool = false,
 
     /// 创建 Runtime：校验配置，并把启动时的 Memory 快照以 JSON 字符串嵌入系统提示词。
     pub fn init(a: std.mem.Allocator, io: Io, config: *const cfg.Config, model: p.Model, executor: Executor, host: Host, startup_memory: []const u8, trusted: bool) !Runtime {
@@ -665,7 +671,11 @@ pub const Runtime = struct {
     /// 向宿主发送事件。宿主报错时：若已取消返回 Canceled，否则视为宿主断开。
     fn emit(self: *Runtime, event: Event, cancel: *const p.Cancellation) !void {
         // 先观察，再交给可能背压/断开的显示宿主；诊断不依赖 UI 队列被消费。
+        // A failed dirty mark is recorded by the observer before any host-visible
+        // tool_started, and it must stop the tool from running.
+        if (event == .tool_started) self.tool_blocked = false;
         self.observer.notify(.{ .event = event });
+        if (event == .tool_started and self.tool_blocked) return error.CheckpointDirtyFailed;
         self.host.emit_fn(self.host.context, event, cancel) catch {
             if (cancel.isRequested()) return error.Canceled;
             return error.HostDisconnected;
@@ -764,7 +774,9 @@ pub const Runtime = struct {
     /// Install the session preface. A new (empty) history gets the full prefix.
     /// A later policy change appends context messages and leaves earlier ones
     /// untouched, so the provider prompt cache can reuse the stable prefix.
-    /// Restored history is parsed instead of rebuilt.
+    /// Restored history is parsed instead of rebuilt. An unchanged snapshot is
+    /// not enough: compaction (or a restore whose preface was summarized away)
+    /// must append the current policy again when those exact messages are gone.
     fn syncSessionContext(self: *Runtime) !void {
         const loader = self.session_loader orelse return;
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
@@ -772,7 +784,17 @@ pub const Runtime = struct {
         const snap = try loader.load_fn(loader.context, scratch.allocator());
         try session_context.validateSnapshot(snap);
         if (self.applied_policy) |applied| {
-            if (applied.same(snap)) return;
+            if (applied.same(snap)) {
+                if (self.history.items.len == 0) {
+                    try self.appendPolicy(snap, false, snap.agents.len != 0, true);
+                    return;
+                }
+                const agents = !agentsMatches(self.history.items, snap.agents);
+                const environment = !environmentMatches(self.history.items, snap.cwd, snap.shell, snap.project_root);
+                if (!agents and !environment) return;
+                try self.appendPolicy(snap, true, agents, environment);
+                return;
+            }
             try self.appendPolicy(snap, true, !std.mem.eql(u8, applied.agents, snap.agents), envDiffers(applied, snap));
             return;
         }
@@ -780,8 +802,8 @@ pub const Runtime = struct {
             try self.appendPolicy(snap, false, snap.agents.len != 0, true);
             return;
         }
-        const agents_changed = !self.historyAgentsMatch(snap);
-        const env_changed = !self.historyEnvMatch(snap);
+        const agents_changed = !agentsMatches(self.history.items, snap.agents);
+        const env_changed = !environmentMatches(self.history.items, snap.cwd, snap.shell, snap.project_root);
         if (!agents_changed and !env_changed) {
             try self.storeApplied(snap);
             return;
@@ -814,23 +836,30 @@ pub const Runtime = struct {
     }
 
     fn appendAgents(self: *Runtime, snap: session_context.Snapshot, update: bool) !void {
-        const body = if (snap.agents.len == 0) session_context.agents_cleared else snap.agents;
-        const text = try std.fmt.allocPrint(self.arena.allocator(), "{s}\n{s}", .{
-            if (update) "agents update" else "agents",
-            body,
-        });
-        try self.appendOwnedContext(text);
+        try appendContextAgents(self.arena.allocator(), &self.history, snap, update);
     }
 
     fn appendEnvironment(self: *Runtime, snap: session_context.Snapshot, update: bool) !void {
-        const text = try session_context.formatEnvironment(self.arena.allocator(), session_context.environmentOf(snap), update);
-        try self.appendOwnedContext(text);
+        try appendContextEnvironment(self.arena.allocator(), &self.history, snap, update);
     }
 
-    fn appendOwnedContext(self: *Runtime, text: []const u8) !void {
-        const blocks = try self.arena.allocator().alloc(p.Block, 1);
-        blocks[0] = .{ .text = text };
-        try self.history.append(self.arena.allocator(), .{ .role = .context, .blocks = blocks });
+    /// After a committed summary, put the current preface back onto the retained
+    /// tail when compaction removed it. Failure happens before the history swap.
+    fn reinstallPolicy(self: *const Runtime, a: std.mem.Allocator, history: *std.ArrayList(p.Message)) !void {
+        const applied = self.applied_policy orelse return;
+        const agents = !agentsMatches(history.items, applied.agents);
+        const environment = !environmentMatches(history.items, applied.cwd, applied.shell, applied.project_root);
+        if (!agents and !environment) return;
+        const snap = session_context.Snapshot{
+            .cwd = applied.cwd,
+            .shell = applied.shell,
+            .project_root = applied.project_root,
+            .agents = applied.agents,
+            .agents_text = "",
+            .truncated = false,
+        };
+        if (agents) try appendContextAgents(a, history, snap, true);
+        if (environment) try appendContextEnvironment(a, history, snap, true);
     }
 
     fn contextText(message: p.Message) ?[]const u8 {
@@ -841,25 +870,44 @@ pub const Runtime = struct {
         };
     }
 
-    fn historyEnvMatch(self: *Runtime, snap: session_context.Snapshot) bool {
-        const text = self.lastContext(&session_context.parseEnvironment) orelse return false;
+    fn appendContextAgents(a: std.mem.Allocator, history: *std.ArrayList(p.Message), snap: session_context.Snapshot, update: bool) !void {
+        const body = if (snap.agents.len == 0) session_context.agents_cleared else snap.agents;
+        const text = try std.fmt.allocPrint(a, "{s}\n{s}", .{
+            if (update) "agents update" else "agents",
+            body,
+        });
+        try appendContextMessage(a, history, text);
+    }
+
+    fn appendContextEnvironment(a: std.mem.Allocator, history: *std.ArrayList(p.Message), snap: session_context.Snapshot, update: bool) !void {
+        const text = try session_context.formatEnvironment(a, session_context.environmentOf(snap), update);
+        try appendContextMessage(a, history, text);
+    }
+
+    fn appendContextMessage(a: std.mem.Allocator, history: *std.ArrayList(p.Message), text: []const u8) !void {
+        const blocks = try a.alloc(p.Block, 1);
+        blocks[0] = .{ .text = text };
+        try history.append(a, .{ .role = .context, .blocks = blocks });
+    }
+
+    fn agentsMatches(items: []const p.Message, agents: []const u8) bool {
+        const text = lastContextText(items, &session_context.parseAgentsBody) orelse return agents.len == 0;
+        return session_context.agentsEquivalent(session_context.parseAgentsBody(text).?, agents);
+    }
+
+    fn environmentMatches(items: []const p.Message, cwd: []const u8, shell: []const u8, project_root: []const u8) bool {
+        const text = lastContextText(items, &session_context.parseEnvironment) orelse return false;
         const parsed = session_context.parseEnvironment(text).?;
-        return std.mem.eql(u8, parsed.cwd, snap.cwd) and
-            std.mem.eql(u8, parsed.shell, snap.shell) and
-            std.mem.eql(u8, parsed.project_root, snap.project_root);
+        return std.mem.eql(u8, parsed.cwd, cwd) and
+            std.mem.eql(u8, parsed.shell, shell) and
+            std.mem.eql(u8, parsed.project_root, project_root);
     }
 
-    fn historyAgentsMatch(self: *Runtime, snap: session_context.Snapshot) bool {
-        const text = self.lastContext(&session_context.parseAgentsBody) orelse return snap.agents.len == 0;
-        const body = session_context.parseAgentsBody(text).?;
-        return session_context.agentsEquivalent(body, snap.agents);
-    }
-
-    fn lastContext(self: *Runtime, parse: anytype) ?[]const u8 {
-        var index = self.history.items.len;
+    fn lastContextText(items: []const p.Message, parse: anytype) ?[]const u8 {
+        var index = items.len;
         while (index > 0) {
             index -= 1;
-            const text = contextText(self.history.items[index]) orelse continue;
+            const text = contextText(items[index]) orelse continue;
             if (parse(text) != null) return text;
         }
         return null;
@@ -1104,7 +1152,11 @@ pub const Runtime = struct {
         defer if (!installed) next_arena.deinit();
 
         // 在新 arena 中构造压缩后的历史，旧历史保持不变。
-        const next = try context.commit(next_arena.allocator(), self.history.items, selection, trimmed);
+        var next = try context.commit(next_arena.allocator(), self.history.items, selection, trimmed);
+        // The summary replaces the cut prefix, which may include the AGENTS and
+        // environment messages. Append them after the retained tail so that
+        // prefix stays cacheable and the same-turn request still sees the policy.
+        try self.reinstallPolicy(next_arena.allocator(), &next);
 
         const before = self.estimatedTokens();
         const after = self.estimator.tokens(context.rawTokens(self.system, self.executor.schemas, next.items));
@@ -1216,10 +1268,12 @@ pub const Runtime = struct {
             if (allowed) {
                 // 工具调用次数限制在执行前检查。
                 if (task.tool_calls >= self.config.limits.max_tool_calls) return error.ToolCallLimit;
-                task.tool_calls += 1;
                 try self.emit(.{ .state = .executing_tool }, cancel);
                 const began = Io.Clock.awake.now(self.io);
+                // Dirty-marker failure returns before started_call, so this call
+                // is recorded as not executed and later calls in the batch are too.
                 try self.emit(.{ .tool_started = .{ .id = host_id, .name = call.name, .started_ms = @intCast(@max(0, began.toMilliseconds())) } }, cancel);
+                task.tool_calls += 1;
 
                 // 执行错误转为 is_error 结果而不是 run 失败；Canceled 标记为 canceled。
                 started_call = call.id;

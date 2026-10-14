@@ -743,6 +743,29 @@ test "Runtime round pause after compaction retains the remapped explicit goal" {
     try std.testing.expectEqual(r.Status.success, (try runtime.run("short", &cancel)).status);
 }
 
+fn blockDirtyMark(ctx: ?*anyopaque, observation: r.Observation) void {
+    const runtime: *r.Runtime = @ptrCast(@alignCast(ctx.?));
+    if (observation == .event and observation.event == .tool_started) runtime.tool_blocked = true;
+}
+
+test "dirty checkpoint failure prevents tool execution" {
+    var fake = Fake{ .stop_after = 1, .requires_approval = false };
+    const config = configuration();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", true);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    runtime.observer = .{ .context = &runtime, .notify_fn = blockDirtyMark };
+    var cancel = p.Cancellation{};
+    const terminal = try runtime.run("Do the task", &cancel);
+    try std.testing.expectEqual(r.Status.failed, terminal.status);
+    try std.testing.expectEqual(error.CheckpointDirtyFailed, terminal.detail.?);
+    try std.testing.expectEqual(@as(u32, 0), fake.executions);
+    try std.testing.expectEqual(@as(?u64, null), fake.last_started_ms);
+    try std.testing.expect(!runtime.poisoned);
+    try std.testing.expectEqual(@as(usize, 3), runtime.messages().len);
+    try std.testing.expect(std.mem.indexOf(u8, runtime.messages()[2].blocks[0].tool_result.text, "Not executed") != null);
+}
+
 test "permission ids do not wrap into a non-monotonic host id" {
     var fake = Fake{ .stop_after = 1, .requires_approval = false };
     const config = configuration();

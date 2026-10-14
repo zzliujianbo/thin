@@ -2,7 +2,7 @@
 //! Global files live in the thin home (`<HOME>/.thin`). Project files live only at the
 //! git root of the session cwd, or at that cwd when it is not inside a git work tree.
 //! Intermediate parents and subdirectories are not searched. Override files win over
-//! the base name at the same directory. Missing files are skipped.
+//! the base name at the same directory. Missing or unreadable files are skipped.
 //! 中文：只注入两处 AGENTS（thin 主目录、仓库根），缺文件就跳过；总正文不超过 32KiB。
 
 const std = @import("std");
@@ -186,20 +186,22 @@ fn takeLayer(
         .data => |data| {
             defer if (data.bytes.len != 0) a.free(data.bytes);
             if (data.truncated) truncated.* = true;
-            if (data.bytes.len == 0) {
-                if (data.truncated) budget.* = 0;
-                return;
-            }
+            // A later source can be nonempty while the shared budget is already
+            // spent. Still name that source and mark the cut; an empty body with
+            // no marker looks like the project file was absent.
+            if (data.bytes.len == 0 and !data.truncated) return;
             const path = try std.fs.path.join(a, &.{ dir_path, data.name });
             defer a.free(path);
-            try raw.appendSlice(a, data.bytes);
             try formatted.appendSlice(a, "source: ");
             try formatted.appendSlice(a, @tagName(source));
             try formatted.appendSlice(a, "\npath: ");
             try formatted.appendSlice(a, path);
             try formatted.appendSlice(a, "\n");
-            try formatted.appendSlice(a, data.bytes);
-            if (data.bytes[data.bytes.len - 1] != '\n') try formatted.append(a, '\n');
+            if (data.bytes.len != 0) {
+                try raw.appendSlice(a, data.bytes);
+                try formatted.appendSlice(a, data.bytes);
+                if (data.bytes[data.bytes.len - 1] != '\n') try formatted.append(a, '\n');
+            }
             if (data.truncated) {
                 try formatted.appendSlice(a, "[truncated]\n");
                 budget.* = 0;
@@ -234,8 +236,11 @@ fn readFile(a: std.mem.Allocator, io: std.Io, dirfd: c_int, name: [*:0]const u8,
     const fd = fs.linux.openat(dirfd, name, fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0);
     if (fd < 0) {
         return switch (std.c._errno().*) {
-            2 => .missing,
-            40 => .invalid,
+            2 => .missing, // ENOENT
+            // EPERM and EACCES: an optional AGENTS layer must not abort the turn.
+            // A present override stays preferred, so this does not fall through to AGENTS.md.
+            1, 13 => .invalid,
+            40 => .invalid, // ELOOP
             else => fs.osError(),
         };
     }
