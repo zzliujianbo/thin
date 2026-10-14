@@ -325,7 +325,7 @@ try {
 
     // auto 场景：Responses 只请求 1 次（404），Chat 请求 2 次。
     expected.set('auto:responses', 1); expected.set('auto:chat/completions', 2);
-    for (const status of [404, 400, 401, 429, 503]) expected.set(`error${status}:responses`, 1);
+    for (const status of [404, 400, 401, 403, 429, 503]) expected.set(`error${status}:responses`, 1);
     for (const scenario of ['stall-header', 'stall-body', 'cancel-header', 'cancel-body']) expected.set(`${scenario}:chat/completions`, 2);
     assert.deepEqual(counts, expected, 'Every scenario and exact request count must run');
 

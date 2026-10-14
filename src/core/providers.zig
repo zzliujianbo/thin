@@ -34,6 +34,8 @@ pub const Id = enum {
         const normalized = std.mem.trimEnd(u8, url, "/");
         for (all) |id| if (std.mem.eql(u8, normalized, id.baseUrl())) return id;
         if (std.mem.eql(u8, normalized, "https://api.deepseek.com/v1")) return .deepseek;
+        if (std.mem.eql(u8, normalized, "https://opencode.ai/inference/go/v1")) return .opencode_go;
+        if (std.mem.eql(u8, normalized, "https://opencode.ai/inference/v1")) return .opencode_zen;
         return null;
     }
     pub fn fromSlug(value: []const u8) ?Id {
@@ -88,6 +90,9 @@ test "provider services have distinct exact endpoints and credential slots" {
     try t.expect(Id.fromUrl("https://opencode.ai/zen/go/v1?key=foo") == null);
     try t.expect(Id.fromUrl("https://opencode.ai/zen/go/v10") == null);
     try t.expectEqual(Id.deepseek, Id.fromUrl("https://api.deepseek.com/v1/").?);
+    try t.expectEqual(Id.opencode_go, Id.fromUrl("https://opencode.ai/inference/go/v1/").?);
+    try t.expectEqual(Id.opencode_zen, Id.fromUrl("https://opencode.ai/inference/v1").?);
+    try t.expect(Id.fromUrl("https://opencode.ai/inference/go/v10") == null);
     keys.set(.opencode_go, "bad\nheader");
     try t.expectError(error.InvalidApiKey, keys.validate());
 }

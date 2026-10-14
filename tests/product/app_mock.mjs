@@ -193,6 +193,12 @@ async function scenario(name, protocol, kind, isPty = false) {
       // 请求体上限 1 MiB，然后解析 JSON。
       for await (const chunk of req) { bytes += chunk.length; assert(bytes < 1024*1024); data += chunk; }
       const body = JSON.parse(data);
+      if (kind === 'auth-reject401' || kind === 'auth-reject403') {
+        const status = Number(kind.slice(-3));
+        res.writeHead(status, {'content-type':'application/json'});
+        res.end(JSON.stringify({error:{type:status === 401 ? 'invalid_api_key' : 'permission_error', message:'fixture-provider-secret-must-not-render'}}));
+        return;
+      }
       if (kind === 'stream-markdown' || kind === 'tool-icons') assert.equal(body.reasoning_effort, 'high');
       if (kind === 'auth-activate') {
         // DeepSeek 兼容选项必须真实影响线路参数，避免后端忽略输出上限。
@@ -478,7 +484,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       const filename = kind === 'legacy-config' ? 'auth.json' : 'config.json';
       // 空白文件走交互初始化；待激活配置始终使用回环服务，绝不向公共端点发送密钥或消息。
       const provider = ['auth-activate','exit-unconfigured','exit-secret'].includes(kind) ? {base_url:url, api_key_env:'', api_key:null, chat_max_tokens:true} : {base_url:url, api_key_env:'THIN_FIXTURE_KEY'};
-      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({provider, model:{name:'fixture-model',protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:kind==='model-select'?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:kind==='model-select'?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined}, models:kind==='model-select'?[{name:'fixture-next',protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}]:undefined, limits:{max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({provider, model:{name:'fixture-model',protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined}, models:['model-select','model-select-empty'].includes(kind)?[{name:'fixture-next',protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}]:undefined, limits:{max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
       await writeFile(join(home,'.thin',filename), content);
     }
 
@@ -492,17 +498,23 @@ async function scenario(name, protocol, kind, isPty = false) {
     // 先检查伪造服务的断言错误，避免被 CLI 的失败掩盖。
     if (fixtureError) throw fixtureError;
     // 失败类场景必须以非零码退出；其余场景必须返回 0。
-    const failureCase = ['no-config','legacy-config','malformed','truncated','stall'].includes(kind);
+    const failureCase = ['no-config','legacy-config','malformed','truncated','stall','auth-reject401','auth-reject403'].includes(kind);
     if (failureCase) assert.notEqual(result.code, 0, `${name} unexpectedly succeeded`);
     else {
       // 只提取 thin:/error: 后的标识符作为诊断信息，不输出原始内容。
       const codes = [...result.output.matchAll(/(?:thin:|error:)\s+[A-Za-z_][A-Za-z0-9_]*/g)].slice(-3).map(m=>m[0]).join(', ');
+      if (kind === 'auth-go' && result.code !== 0) {
+        const error = new Error('Go login PTY failed');
+        error.fixtureCase = 'login/go';
+        error.fixtureCheck = codes.replaceAll(', ', ' ') || 'no safe error code';
+        throw error;
+      }
       assert.equal(result.code, 0, `${name}: exit ${result.code}; ${codes || 'no safe error code'}; captured ${result.output.length} bytes (not rendered)`);
     }
 
     if (isPty && !['term','output'].includes(kind)) {
       const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
-      const silentExit = ['exit-no-submit','exit-unconfigured','exit-batched','exit-secret','exit-no-log','auth-missing','auth-empty','menu-navigation'].includes(kind);
+      const silentExit = ['exit-no-submit','exit-unconfigured','exit-batched','exit-secret','exit-no-log','auth-missing','auth-empty','menu-navigation','auth-go','model-select-empty'].includes(kind);
       if (silentExit) assert.equal(ids.length,0, 'empty/no-log exit must not announce a session');
       else if (kind === 'model-select') assert(ids.length <= 1); // Transient unsaved profiles can refuse checkpointing.
       else assert.equal(ids.length,1, 'saved conversation must print exactly one resume command');
@@ -519,7 +531,14 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert.equal(await readFile(join(home,'.thin/config.json'),'utf8'), navigationConfig, 'menu navigation changed configuration');
       assert.deepEqual(await readdir(join(home,'.thin')), ['config.json'], 'menu navigation saved credentials');
     }
-    if (['exit-no-submit','exit-unconfigured','exit-secret','exit-batched','menu-navigation'].includes(kind)) {
+    if (kind === 'auth-go') {
+      const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
+      assert.equal(disk.credentials.opencode_go, 'fixture-secret-never-log');
+      assert.equal(disk.provider.base_url, url, 'login must not silently switch active/global provider');
+      assert.equal((await stat(join(home,'.thin/config.json'))).mode & 0o777, 0o600);
+      assert(!result.output.includes('fixture-secret-never-log'), 'secret leaked');
+    }
+    if (['exit-no-submit','exit-unconfigured','exit-secret','exit-batched','menu-navigation','auth-go'].includes(kind)) {
       assert.equal(requests,0, 'exit identity must not send a request');
       // The TUI seeds the project default thinking level on startup, so the
       // only allowed project artifact is the private settings file. Identity
@@ -551,6 +570,14 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert(!await exists(join(project,'.thin')));
     } else if (!failureCase && !isPty) assert(result.output.includes('fixture-answer'));
 
+    if (kind === 'auth-reject401' || kind === 'auth-reject403') {
+      assert.equal(requests, 1, 'authentication failure must not retry');
+      assert(result.output.includes(`[HTTP ${kind.slice(-3)}]`), 'HTTP status lost');
+      assert(result.output.includes('/ authentication'), 'failure category lost');
+      assert(result.output.includes(kind === 'auth-reject401' ? 'credentials rejected' : 'workspace/model permissions'));
+      assert(!result.output.includes('fixture-provider-secret-must-not-render'));
+      assert(!result.output.includes(KEY));
+    }
     // 帮助与缺少新配置时的诊断均应指向 config.json，而不是旧文件名。
     if (['help','no-config','legacy-config'].includes(kind)) {
       assert(result.output.includes('~/.thin/config.json'));
@@ -639,6 +666,19 @@ async function scenario(name, protocol, kind, isPty = false) {
     if (kind === 'stall') assert.equal(result.code, 130, 'SIGINT must return canceled status');
     // cancel：取消后 CLI 应能继续发起第二轮请求。
     if (kind === 'cancel') assert.equal(rounds,2, 'did not resume after cancel');
+    if (kind === 'model-select-empty') {
+      assert.equal(requests,0, 'empty selection issued a request');
+      const path = join(home,'.thin/config.json');
+      const disk = JSON.parse(await readFile(path,'utf8'));
+      assert.equal(disk.model.name,'fixture-next');
+      assert.equal(disk.model.protocol,protocol);
+      assert.equal(disk.model.context_tokens,65536);
+      assert.equal(disk.models[0].name,'fixture-next');
+      assert.equal(disk.provider.api_key_env,'THIN_FIXTURE_KEY');
+      assert(!JSON.stringify(disk).includes(KEY), 'environment credential was persisted');
+      assert.equal((await stat(path)).mode & 0o777,0o600);
+      assert(!await exists(join(project,'.thin/sessions')), 'empty selection created session history');
+    }
     if (kind === 'model-select') {
       assert.equal(requests,4, 'selection issued discovery or extra requests');
       const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
@@ -695,12 +735,16 @@ try {
   if (!watchdogOnly) {
   // 运行全部场景：先测无配置的 help 与 print，再对 chat 与 responses 运行通用场景，最后运行 PTY 场景（仅 chat）。
   await scenario('PTY compact menu navigation','chat','menu-navigation',true);
+  await scenario('PTY Go login returns to prompt','chat','auth-go',true);
+  await scenario('PTY empty model selection chat','chat','model-select-empty',true);
+  await scenario('PTY empty model selection responses','responses','model-select-empty',true);
   await scenario('PTY model/effort selection chat','chat','model-select',true);
   await scenario('PTY model/effort selection responses','responses','model-select',true);
   for (const kind of ['exit-batched','exit-no-submit','exit-no-log','exit-unconfigured','exit-secret','exit-busy','exit-busy-tool']) await scenario(`PTY/${kind}`,'chat',kind,true);
   await scenario('help without configuration','chat','help');
   await scenario('print without configuration','chat','no-config');
   await scenario('legacy configuration is not loaded','chat','legacy-config');
+  for (const status of [401,403]) await scenario(`Responses authentication ${status}`,'responses',`auth-reject${status}`);
 
   // 对两种协议分别运行全部通用场景。
   for (const protocol of ['chat','responses']) {
@@ -721,7 +765,7 @@ try {
 } catch (error) {
   // 中文：不要渲染捕获的终端或模型输出、响应头或请求体。
   // Do not render captured terminal/model output, headers, or request bodies.
-  const label = /^(?:log|selection|settings|resume)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
+  const label = /^(?:log|selection|settings|resume|login)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
     ? `${error.fixtureCase}: ${error.fixtureCheck}` : 'offline fixture assertion failed (details withheld)';
   console.error(`FAIL application acceptance: ${label}`);
   process.exitCode = 1;

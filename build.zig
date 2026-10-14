@@ -80,6 +80,21 @@ pub fn build(b: *std.Build) void {
     run_http.setCwd(b.path("."));
     b.step("test-http", "Run local product HTTP/SSE integration tests (requires Node and OpenSSL)").dependOn(&run_http.step);
 
+    const anthropic_tests = b.addTest(.{
+        .use_llvm = false,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/anthropic_http_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_anthropic = b.addSystemCommand(&.{"node"});
+    run_anthropic.addFileArg(b.path("tests/product/anthropic_mock.mjs"));
+    run_anthropic.addArtifactArg(anthropic_tests);
+    run_anthropic.setCwd(b.path("."));
+    b.step("test-anthropic", "Run isolated Anthropic Messages HTTP/SSE fixtures").dependOn(&run_anthropic.step);
+
     // 终端 ABI 模块（libc termios 结构体布局）单独成模块，供 probes 测试导入。
     const terminal_abi = b.createModule(.{ .root_source_file = b.path("src/platform/terminal_abi.zig"), .target = target, .optimize = optimize, .link_libc = true });
 
@@ -126,6 +141,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_unit.step);
     test_all.dependOn(&run_presentation.step);
     test_all.dependOn(&run_http.step);
+    test_all.dependOn(&run_anthropic.step);
     test_all.dependOn(&run_app.step);
     test_all.dependOn(&run.step);
 }

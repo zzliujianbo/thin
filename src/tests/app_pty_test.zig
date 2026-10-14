@@ -549,6 +549,64 @@ pub fn main(init: std.process.Init) !void {
         // This fixture uses a custom loopback endpoint: refresh must not send
         // its credential to any official service or submit a model request.
         try check(std.mem.indexOf(u8, d.output[0..d.used], "Saved locally; send a message to connect") == null);
+    } else if (std.mem.eql(u8, mode, "auth-go")) {
+        var login_stage: usize = 1;
+        errdefer std.debug.print("error: GoLoginStage{d}\n", .{login_stage});
+        var start = d.used;
+        try d.send("/model ");
+        try d.waitFrame(start, "/model ");
+        const command = try d.screen();
+        try check(command.visible("/model ") and !command.visible("arguments hidden"));
+        login_stage = 2;
+        start = d.used;
+        try d.send("\x15");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("/login\r");
+        try d.waitFrame(start, "Provider> ");
+        start = d.used;
+        try d.send("\x1b[A"); // Wrap first row to Go; active sessions omit Current endpoint.
+        try d.waitFrame(start, ">   OpenCode Go");
+        login_stage = 3;
+        start = d.used;
+        try d.send("\r");
+        try d.waitFrame(start, "API key> ");
+        login_stage = 4;
+        start = d.used;
+        try d.send("\x1b[200~fixture-secret-never-log\x1b[201~");
+        try d.waitFrame(start, "***");
+        login_stage = 5;
+        start = d.used;
+        try d.send("\r");
+        try d.waitFrame(start, "Key saved locally");
+        const saved = try d.screen();
+        try check(!saved.visible("API key>") and !saved.visible("***") and !saved.visible("Provider> "));
+        // No Escape/Ctrl+U unlock step: fresh text must immediately be editable.
+        login_stage = 6;
+        start = d.used;
+        try d.send("ordinary-after-login");
+        try d.waitFrame(start, "ordinary-after-login");
+        login_stage = 7;
+        start = d.used;
+        try d.send("\x15");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("/model\r");
+        try d.waitFrame(start, "Search> ");
+        start = d.used;
+        try d.send("opencode-go/claude-haiku");
+        try d.waitFrame(start, "opencode-go/claude-haiku-5-5");
+        login_stage = 8;
+        start = d.used;
+        try d.send("\x15");
+        try d.waitFrame(start, "Search> ");
+        start = d.used;
+        try d.send("opencode-go/kimi-k3");
+        try d.waitFrame(start, "opencode-go/kimi-k3  (");
+        login_stage = 9;
+        start = d.used;
+        try d.send("\x1b");
+        try d.waitIdle(start);
     } else if (std.mem.eql(u8, mode, "resume-create")) {
         const start = d.used;
         try d.send("resume-first-turn remember-resume-marker\r");
@@ -978,6 +1036,13 @@ pub fn main(init: std.process.Init) !void {
         }
         const final = try d.screen();
         try check(final.row == 23 and final.count(regular.prior) == 1);
+    } else if (std.mem.eql(u8, mode, "model-select-empty")) {
+        const start = d.used;
+        try d.send("/model fixture-next\r");
+        try d.waitFrame(start, "fixture-next");
+        try d.waitIdle(start);
+        const selected = try d.screen();
+        try check(selected.visible("fixture-next") and !selected.visible("Model selection failed"));
     } else if (std.mem.eql(u8, mode, "model-select")) {
         var start = d.used;
         try d.send("selection-first\r");

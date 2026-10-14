@@ -194,7 +194,7 @@ test "integration: ordinary HTTP errors never fallback" {
     const a = arena.allocator();
 
     // (夹具场景名, 期望的错误类别) 对照表。
-    const cases = .{ .{ "error404", p.FailureKind.invalid_argument }, .{ "error400", p.FailureKind.invalid_argument }, .{ "error401", p.FailureKind.authentication }, .{ "error429", p.FailureKind.rate_limit }, .{ "error503", p.FailureKind.server } };
+    const cases = .{ .{ "error404", p.FailureKind.invalid_argument }, .{ "error400", p.FailureKind.invalid_argument }, .{ "error401", p.FailureKind.authentication }, .{ "error403", p.FailureKind.authentication }, .{ "error429", p.FailureKind.rate_limit }, .{ "error503", p.FailureKind.server } };
 
     inline for (cases) |case| {
         var c = try config(a, case[0], .auto);
@@ -204,6 +204,7 @@ test "integration: ordinary HTTP errors never fallback" {
         const result = try selector.call(client.model(), a, request(c, .auto), .{});
         try t.expect(result.outcome == .failure);
         try t.expectEqual(case[1], result.outcome.failure.kind);
+        try t.expectEqual(@as(?u16, try std.fmt.parseInt(u16, case[0][5..], 10)), result.outcome.failure.http_status);
         try t.expect(!result.fallback);
         try t.expectEqual(@as(u8, 1), result.calls);
     }

@@ -61,9 +61,15 @@ fn boundJson(bytes: []const u8, limit: usize) !void {
 }
 const max_tokens = 16 * 1024 * 1024;
 const Tokens = [catalog.entries.len]?u32;
+pub const Listing = struct {
+    tokens: Tokens = @splat(null),
+    /// null means never fetched (including legacy caches); false means absent.
+    available: [catalog.entries.len]?bool = @splat(null),
+};
 pub const Cache = struct {
     attempted: u8 = 0,
     tokens: Tokens = @splat(null),
+    available: [catalog.entries.len]?bool = @splat(null),
 };
 pub const Claim = struct { cache: Cache, mask: u8 };
 
@@ -87,6 +93,10 @@ fn capacity(value: std.json.Value) !?u32 {
 /// Only context_window denotes the total context; no input/output heuristic.
 /// Unknown model IDs are validated but never added to the local catalog.
 pub fn parseProvider(a: std.mem.Allocator, body: []const u8, id: providers.Id) !Tokens {
+    return (try parseListing(a, body, id)).tokens;
+}
+
+pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !Listing {
     try boundJson(body, max_body_bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_body_bytes });
     defer parsed.deinit();
@@ -98,7 +108,10 @@ pub fn parseProvider(a: std.mem.Allocator, body: []const u8, id: providers.Id) !
     if (data != .array or data.array.items.len > 512) return error.InvalidMetadata;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(a);
-    var result: Tokens = @splat(null);
+    var result: Listing = .{};
+    for (catalog.entries, 0..) |model, i| {
+        if (model.provider == id) result.available[i] = false;
+    }
     for (data.array.items) |record| {
         if (record != .object) return error.InvalidMetadata;
         const name = record.object.get("id") orelse return error.InvalidMetadata;
@@ -108,7 +121,10 @@ pub fn parseProvider(a: std.mem.Allocator, body: []const u8, id: providers.Id) !
         if (entry.found_existing) return error.InvalidMetadata;
         const n = if (record.object.get("context_window")) |v| try capacity(v) else null;
         for (catalog.entries, 0..) |model, i| {
-            if (model.provider == id and std.mem.eql(u8, model.model.name, name.string)) result[i] = n;
+            if (model.provider == id and std.mem.eql(u8, model.model.name, name.string)) {
+                result.tokens[i] = n;
+                result.available[i] = true;
+            }
         }
     }
     return result;
@@ -116,12 +132,23 @@ pub fn parseProvider(a: std.mem.Allocator, body: []const u8, id: providers.Id) !
 
 /// Isolated client, fixed official URL, no redirects or credential discovery.
 /// The borrowed caller key is not mutated; the owned header copy is wiped.
-pub fn fetch(a: std.mem.Allocator, io: std.Io, id: providers.Id, key: ?[]const u8) !Tokens {
-    const url = try std.fmt.allocPrint(a, "{s}/models", .{id.baseUrl()});
-    defer a.free(url);
-    const body = try fetchUrl(a, io, url, key);
+pub fn fetch(a: std.mem.Allocator, io: std.Io, id: providers.Id, key: ?[]const u8) !Listing {
+    const body = try fetchUrl(a, io, listingUrl(id), listingKey(id, key));
     defer a.free(body);
-    return parseProvider(a, body, id);
+    return parseListing(a, body, id);
+}
+
+fn listingUrl(id: providers.Id) []const u8 {
+    return switch (id) {
+        .deepseek => comptime providers.Id.deepseek.baseUrl() ++ "/models",
+        .opencode_go => "https://opencode.ai/inference/go/v1/models",
+        .opencode_zen => "https://opencode.ai/inference/v1/models",
+    };
+}
+
+fn listingKey(id: providers.Id, key: ?[]const u8) ?[]const u8 {
+    // OpenCode's official listing endpoints are public, not inference calls.
+    return if (id == .deepseek) key else null;
 }
 
 /// Private transport seam for owned loopback tests. Production callers can only
@@ -160,7 +187,7 @@ fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8)
     return body;
 }
 
-const Record = struct { selector: []const u8, context_window: ?u32 };
+const Record = struct { selector: []const u8, context_window: ?u32, available: ?bool = null };
 const Document = struct { version: u32, attempted: u8, records: []const Record };
 
 fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
@@ -168,7 +195,7 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
     var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
     defer parsed.deinit();
     const doc = parsed.value;
-    if (doc.version != 1 or doc.attempted & ~all_mask != 0 or doc.records.len > catalog.entries.len) return error.InvalidMetadata;
+    if ((doc.version != 1 and doc.version != 2) or doc.attempted & ~all_mask != 0 or doc.records.len > catalog.entries.len) return error.InvalidMetadata;
     var result: Cache = .{ .attempted = doc.attempted };
     var seen: [catalog.entries.len]bool = @splat(false);
     for (doc.records) |record| {
@@ -179,6 +206,7 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
         if (seen[index]) return error.InvalidMetadata;
         seen[index] = true;
         result.tokens[index] = record.context_window;
+        if (doc.version == 2) result.available[index] = record.available;
     }
     return result;
 }
@@ -217,11 +245,11 @@ fn lock(root: *fs.Root) !c_int {
 
 fn save(root: *fs.Root, cache: Cache) !void {
     var records: [catalog.entries.len]Record = undefined;
-    for (catalog.entries, 0..) |entry, i| records[i] = .{ .selector = entry.selector, .context_window = cache.tokens[i] };
+    for (catalog.entries, 0..) |entry, i| records[i] = .{ .selector = entry.selector, .context_window = cache.tokens[i], .available = cache.available[i] };
     const bytes = try root.allocator.alloc(u8, max_cache_bytes);
     defer root.allocator.free(bytes);
     var writer = std.Io.Writer.fixed(bytes);
-    try std.json.Stringify.value(Document{ .version = 1, .attempted = cache.attempted, .records = &records }, .{}, &writer);
+    try std.json.Stringify.value(Document{ .version = 2, .attempted = cache.attempted, .records = &records }, .{}, &writer);
     try writer.writeByte('\n');
     try root.writeMode(file_name, bytes[0..writer.end], true, 0o600);
 }
@@ -241,15 +269,16 @@ pub fn claim(root: *fs.Root, requested: u8, manual: bool) !Claim {
 }
 
 /// Reload under lock: unsuccessful providers and attempt flags remain intact.
-pub fn commit(root: *fs.Root, succeeded: u8, tokens: Tokens) !Cache {
+pub fn commit(root: *fs.Root, succeeded: u8, listing: Listing) !Cache {
     if (succeeded & ~all_mask != 0) return error.InvalidMetadata;
     const fd = try lock(root);
     defer fs.closeFd(fd);
     var cache = try load(root);
     for (catalog.entries, 0..) |entry, i| {
         if (succeeded & bit(entry.provider) == 0) continue;
-        if (tokens[i]) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
-        cache.tokens[i] = tokens[i];
+        if (listing.tokens[i]) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
+        cache.tokens[i] = listing.tokens[i];
+        cache.available[i] = listing.available[i];
     }
     if (succeeded != 0) try save(root, cache);
     return cache;
@@ -317,7 +346,7 @@ test "metadata deep oversized and duplicate caches remain untouched" {
         try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = case.body });
         const before = try root.dir.statFile(root.io, file_name, .{});
         try std.testing.expectError(case.err, claim(&root, all_mask, true));
-        try std.testing.expectError(case.err, commit(&root, all_mask, @splat(null)));
+        try std.testing.expectError(case.err, commit(&root, all_mask, .{}));
         try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
         const result = try root.read(std.testing.allocator, file_name, 0, max_body_bytes);
         defer std.testing.allocator.free(result.data);
@@ -382,6 +411,13 @@ test "metadata loopback transport success redirects size short body and cleanup"
     }
 }
 
+fn testIndex(selector: []const u8) usize {
+    for (catalog.entries, 0..) |entry, i| {
+        if (std.mem.eql(u8, selector, entry.selector)) return i;
+    }
+    @panic("missing test catalog selector");
+}
+
 fn testRoot(dir: std.Io.Dir) !fs.Root {
     var buffer: [4096]u8 = undefined;
     const len = try dir.realPath(std.testing.io, &buffer);
@@ -394,15 +430,15 @@ test "metadata uses only context_window and exact provider raw names" {
         \\{"object":"list","data":[{"id":"deepseek-flash","context_window":12345,"max_tokens":2},{"id":"deepseek-v4-pro","max_tokens":8192,"input_tokens":100000,"output_tokens":3}]}
     ;
     const values = try parseProvider(a, body, .deepseek);
-    try std.testing.expectEqual(@as(?u32, 12345), values[0]);
-    try std.testing.expectEqual(@as(?u32, null), values[1]);
+    try std.testing.expectEqual(@as(?u32, 12345), values[testIndex("deepseek/deepseek-flash")]);
+    try std.testing.expectEqual(@as(?u32, null), values[testIndex("deepseek/deepseek-v4-pro")]);
     for (try parseProvider(a, body, .opencode_go)) |v| try std.testing.expect(v == null);
     const absent = try parseProvider(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":null}]}", .deepseek);
     for (absent) |v| try std.testing.expect(v == null);
     const shared = "{\"data\":[{\"id\":\"minimax-m2.7\",\"context_window\":204800}]}";
     const zen = try parseProvider(a, shared, .opencode_zen);
-    try std.testing.expectEqual(@as(?u32, 204800), zen[2]);
-    try std.testing.expect(zen[5] == null);
+    try std.testing.expectEqual(@as(?u32, 204800), zen[testIndex("opencode-zen/minimax-m2.7")]);
+    try std.testing.expect(zen[testIndex("opencode-go/minimax-m2.7")] == null);
 }
 
 test "metadata rejects invalid IDs capacities duplicate IDs and shapes" {
@@ -451,18 +487,18 @@ test "metadata private roundtrip claims once and merges only successful provider
     try std.testing.expectEqual(@as(u8, 0), (try claim(&second, all_mask, false)).mask);
     try std.testing.expectEqual(bit(.deepseek), (try claim(&second, bit(.deepseek), true)).mask);
     var tokens: Tokens = @splat(1000);
-    _ = try commit(&first, all_mask, tokens);
+    _ = try commit(&first, all_mask, .{ .tokens = tokens });
     tokens = @splat(null);
-    tokens[0] = 2000;
-    const cache = try commit(&second, bit(.deepseek), tokens);
+    tokens[testIndex("deepseek/deepseek-flash")] = 2000;
+    const cache = try commit(&second, bit(.deepseek), .{ .tokens = tokens });
     try std.testing.expectEqual(all_mask, cache.attempted);
-    try std.testing.expectEqual(@as(?u32, 2000), cache.tokens[0]);
-    try std.testing.expect(cache.tokens[1] == null);
-    try std.testing.expectEqual(@as(?u32, 1000), cache.tokens[2]);
+    try std.testing.expectEqual(@as(?u32, 2000), cache.tokens[testIndex("deepseek/deepseek-flash")]);
+    try std.testing.expect(cache.tokens[testIndex("deepseek/deepseek-v4-pro")] == null);
+    try std.testing.expectEqual(@as(?u32, 1000), cache.tokens[testIndex("opencode-zen/minimax-m2.7")]);
     try std.testing.expectEqualDeep(cache, try load(&first));
     const stat = try tmp.dir.statFile(std.testing.io, file_name, .{});
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
-    _ = try commit(&first, 0, @splat(null));
+    _ = try commit(&first, 0, .{});
     try std.testing.expectEqual(stat.inode, (try tmp.dir.statFile(std.testing.io, file_name, .{})).inode);
 }
 
@@ -472,7 +508,7 @@ test "metadata malformed cache is never overwritten and selectors are validated"
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const bad = [_][]const u8{
-        "{\"version\":2,\"attempted\":0,\"records\":[]}",
+        "{\"version\":3,\"attempted\":0,\"records\":[]}",
         "{\"version\":1,\"attempted\":128,\"records\":[]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"unknown\",\"context_window\":1}]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":0}]}",
@@ -481,12 +517,115 @@ test "metadata malformed cache is never overwritten and selectors are validated"
     for (bad) |body| {
         try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = body });
         try std.testing.expectError(error.InvalidMetadata, claim(&root, all_mask, true));
-        try std.testing.expectError(error.InvalidMetadata, commit(&root, all_mask, @splat(null)));
+        try std.testing.expectError(error.InvalidMetadata, commit(&root, all_mask, .{}));
         const result = try root.read(std.testing.allocator, file_name, 0, max_body_bytes);
         defer std.testing.allocator.free(result.data);
         try std.testing.expectEqualStrings(body, result.data);
     }
     const reordered = try parseCache(std.testing.allocator, "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"opencode-go/minimax-m2.7\",\"context_window\":42},{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":99}]}");
-    try std.testing.expectEqual(@as(?u32, 42), reordered.tokens[5]);
-    try std.testing.expectEqual(@as(?u32, 99), reordered.tokens[0]);
+    try std.testing.expectEqual(@as(?u32, 42), reordered.tokens[testIndex("opencode-go/minimax-m2.7")]);
+    try std.testing.expectEqual(@as(?u32, 99), reordered.tokens[testIndex("deepseek/deepseek-flash")]);
+}
+
+test "metadata listing tracks exact membership independently of capacity and provider" {
+    const a = std.testing.allocator;
+    const listing = try parseListing(a, "{\"data\":[{\"id\":\"minimax-m2.7\"},{\"id\":\"deepseek-flash\",\"context_window\":42},{\"id\":\"unknown\",\"context_window\":100}]}", .opencode_go);
+    for (catalog.entries, 0..) |entry, i| {
+        const expected: ?bool = if (entry.provider == .opencode_go)
+            std.mem.eql(u8, entry.model.name, "minimax-m2.7") or std.mem.eql(u8, entry.model.name, "deepseek-flash")
+        else
+            null;
+        try std.testing.expectEqual(expected, listing.available[i]);
+        if (entry.provider != .opencode_go) try std.testing.expect(listing.tokens[i] == null);
+    }
+    const go = testIndex("opencode-go/minimax-m2.7");
+    try std.testing.expectEqual(@as(?bool, true), listing.available[go]);
+    try std.testing.expect(listing.tokens[go] == null);
+    const absent = try parseListing(a, "{\"data\":[{\"id\":\"opencode-go/minimax-m2.7\"},{\"id\":\"MINIMAX-M2.7\"}]}", .opencode_go);
+    try std.testing.expectEqual(@as(?bool, false), absent.available[go]);
+    const explicit_null = try parseListing(a, "{\"data\":[{\"id\":\"minimax-m2.7\",\"context_window\":null}]}", .opencode_go);
+    try std.testing.expectEqual(@as(?bool, true), explicit_null.available[go]);
+    try std.testing.expect(explicit_null.tokens[go] == null);
+}
+
+test "metadata availability removal and failed refresh preserve other providers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const original = try commit(&root, all_mask, .{ .tokens = @splat(4096), .available = @splat(true) });
+    const unchanged = try commit(&root, 0, .{ .tokens = @splat(0), .available = @splat(false) });
+    try std.testing.expectEqualDeep(original, unchanged);
+    const empty = try parseListing(std.testing.allocator, "{\"data\":[]}", .deepseek);
+    const removed = try commit(&root, bit(.deepseek), empty);
+    for (catalog.entries, 0..) |entry, i| {
+        try std.testing.expectEqual(@as(?bool, entry.provider != .deepseek), removed.available[i]);
+        try std.testing.expectEqual(if (entry.provider == .deepseek) @as(?u32, null) else @as(?u32, 4096), removed.tokens[i]);
+    }
+    try std.testing.expectEqualDeep(removed, try load(&root));
+    const claimed = try claim(&root, all_mask, true);
+    try std.testing.expectEqualDeep(removed.available, claimed.cache.available);
+    const before = try load(&root);
+    try std.testing.expectError(error.InvalidMetadata, commit(&root, bit(.deepseek), .{ .tokens = @splat(0), .available = @splat(true) }));
+    try std.testing.expectEqualDeep(before, try load(&root));
+}
+
+test "metadata legacy v1 upgrades to v2 with unknown availability" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const legacy = "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":99}]}";
+    try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = legacy });
+    const old = try load(&root);
+    for (old.available) |v| try std.testing.expect(v == null);
+    try std.testing.expectEqual(@as(?u32, 99), old.tokens[testIndex("deepseek/deepseek-flash")]);
+    const upgraded = try claim(&root, bit(.deepseek), false);
+    try std.testing.expectEqualDeep(old.tokens, upgraded.cache.tokens);
+    try std.testing.expectEqualDeep(old.available, upgraded.cache.available);
+    const bytes = try root.read(std.testing.allocator, file_name, 0, max_cache_bytes);
+    defer std.testing.allocator.free(bytes.data);
+    var parsed = try std.json.parseFromSlice(Document, std.testing.allocator, bytes.data, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 2), parsed.value.version);
+    try std.testing.expectEqualDeep(upgraded.cache, try load(&root));
+    const nullable = try parseCache(std.testing.allocator, "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":null}]}");
+    for (nullable.available) |v| try std.testing.expect(v == null);
+    const omitted = try parseCache(std.testing.allocator, "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":99}]}");
+    try std.testing.expectEqualDeep(old, omitted);
+}
+
+test "metadata rejects malformed availability and duplicate cache records without overwrite" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const cases = [_]struct { body: []const u8, err: anyerror }{
+        .{ .body = "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":1}]}", .err = error.UnexpectedToken },
+        .{ .body = "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":\"true\"}]}", .err = error.UnexpectedToken },
+        .{ .body = "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":true,\"available\":false}]}", .err = error.DuplicateField },
+        .{ .body = "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":true},{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":false}]}", .err = error.InvalidMetadata },
+    };
+    for (cases) |case| {
+        try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = case.body });
+        const before = try root.dir.statFile(root.io, file_name, .{});
+        try std.testing.expectError(case.err, claim(&root, all_mask, true));
+        try std.testing.expectError(case.err, commit(&root, all_mask, .{}));
+        try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
+        const bytes = try root.read(std.testing.allocator, file_name, 0, max_cache_bytes);
+        defer std.testing.allocator.free(bytes.data);
+        try std.testing.expectEqualStrings(case.body, bytes.data);
+    }
+}
+
+test "metadata official listing routes only DeepSeek credentials" {
+    try std.testing.expectEqualStrings("https://api.deepseek.com/models", listingUrl(.deepseek));
+    try std.testing.expectEqualStrings("https://opencode.ai/inference/go/v1/models", listingUrl(.opencode_go));
+    try std.testing.expectEqualStrings("https://opencode.ai/inference/v1/models", listingUrl(.opencode_zen));
+    try std.testing.expectEqualStrings("synthetic-test-key", listingKey(.deepseek, "synthetic-test-key").?);
+    try std.testing.expect(listingKey(.deepseek, null) == null);
+    for ([_]providers.Id{ .opencode_go, .opencode_zen }) |id| {
+        try std.testing.expect(listingKey(id, "synthetic-test-key") == null);
+        try std.testing.expect(listingKey(id, "invalid\r\nkey") == null);
+    }
 }
