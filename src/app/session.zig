@@ -113,7 +113,10 @@ pub const Session = struct {
     resumed: bool = false,
     /// Journal observer wrapped so checkpoint writes stay on the runtime thread.
     inner_observer: r.Observer = .{},
-    checkpoint_error: ?anyerror = null,
+    /// UI thread reads this while the runtime thread records incremental saves.
+    /// Zero means the last attempted save succeeded. A nonzero code stays until
+    /// a later save publishes a clean generation.
+    checkpoint_failure: std.atomic.Value(u16) = .init(0),
 
     pub const Options = struct { restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, logging: bool = true, auto_refresh_models: bool = false };
 
@@ -388,15 +391,33 @@ pub const Session = struct {
         const lease = &(self.resume_lease orelse return);
         if (!lease.writable) return;
         lease.activate(&self.settings.root) catch |err| {
-            self.checkpoint_error = err;
+            self.setCheckpointFailure(err);
+            // The runtime checks this before execute. Leaving the previous clean
+            // generation in place while the tool runs would let resume replay
+            // over side effects it never recorded.
+            if (self.app) |app| app.runtime.tool_blocked = true;
+            return;
         };
     }
 
     fn persistBestEffort(self: *Session, during_run: bool) void {
         self.persistCheckpoint(during_run) catch |err| switch (err) {
             error.IncompleteToolGroup => {},
-            else => self.checkpoint_error = err,
+            else => self.setCheckpointFailure(err),
         };
+    }
+
+    fn setCheckpointFailure(self: *Session, err: anyerror) void {
+        self.checkpoint_failure.store(@intFromError(err), .release);
+    }
+
+    fn clearCheckpointFailure(self: *Session) void {
+        self.checkpoint_failure.store(0, .release);
+    }
+
+    fn checkpointError(self: *const Session) ?anyerror {
+        const code = self.checkpoint_failure.load(.acquire);
+        return if (code == 0) null else @errorFromInt(code);
     }
 
     /// Reinstall the runtime observer, then publish a clean checkpoint when this
@@ -418,6 +439,7 @@ pub const Session = struct {
         }
         try self.ensureWritableLease();
         try self.resume_lease.?.save(&self.settings.root, bytes);
+        self.clearCheckpointFailure();
     }
 
     fn ensureWritableLease(self: *Session) !void {
@@ -502,7 +524,9 @@ pub const Session = struct {
             .base_url = config.provider.base_url,
             .tools_trusted = self.trusted,
             .logging_enabled = self.logging,
-            .log_error = if (self.app) |app| app.journal.failure() else null,
+            // Journal failures already render as REC FAILED. Checkpoint saves use
+            // that same channel when the journal itself is still healthy.
+            .log_error = (if (self.app) |app| app.journal.failure() else null) orelse self.checkpointError(),
         };
     }
 
@@ -1097,7 +1121,7 @@ test "restore selection is read only until an explicit empty conversation model 
     try connection.setEffort(.max);
     app.journal.flush();
     try std.testing.expect(app.journal.failure() == null);
-    try std.testing.expect(source.checkpoint_error == null);
+    try std.testing.expect(source.checkpointError() == null);
     try std.testing.expectError(error.UnsupportedProviderModel, connection.selectModel("opencode-go/not-a-preset"));
     const snapshot = blk: {
         const checkpoint_bytes = try source.resume_lease.?.load(&source.settings.root);
@@ -1787,7 +1811,7 @@ test "resumed selection changes persist without a new submission and no-log stay
             try restored.connection().selectModel("deepseek/deepseek-v4-pro");
             restored.app.?.journal.flush();
             try std.testing.expect(restored.app.?.journal.failure() == null);
-            try std.testing.expect(restored.checkpoint_error == null);
+            try std.testing.expect(restored.checkpointError() == null);
             try std.testing.expect(!restored.app.?.journal.started);
             const checkpoint_bytes = try restored.resume_lease.?.load(&restored.settings.root);
             defer a.free(checkpoint_bytes);
@@ -1838,7 +1862,7 @@ test "closed turn checkpoint is resumable before exit" {
             },
         });
         source.app.?.runtime.observer.notify(.{ .event = .{ .assistant_committed = &.{.{ .text = "incremental answer" }} } });
-        try std.testing.expect(source.checkpoint_error == null);
+        try std.testing.expect(source.checkpointError() == null);
         try std.testing.expect(source.resume_lease != null);
         try std.testing.expect(!source.resume_lease.?.active);
         var selection_path: [80]u8 = undefined;
@@ -1887,10 +1911,75 @@ test "tool start leaves the checkpoint dirty until the result is published" {
         try std.testing.expect(!source.resume_lease.?.active);
         source.app.?.runtime.observer.notify(.{ .event = .{ .tool_started = .{ .id = 1, .name = "read_file" } } });
         try std.testing.expect(source.resume_lease.?.active);
-        try std.testing.expect(source.checkpoint_error == null);
+        try std.testing.expect(source.checkpointError() == null);
         releaseLease(&source);
     }
     try std.testing.expectError(error.ResumeNotClosed, Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id }));
+}
+
+test "dirty marker failure blocks the tool and checkpoint write failure reaches the UI" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var source = try Session.init(a, io, &env, home, .{}, true);
+    defer source.deinit();
+    try source.connection().configure("fake-incremental-checkpoint");
+    try source.app.?.runtime.restoreCheckpoint(.{
+        .system = "saved system",
+        .selector = source.app.?.runtime.selector,
+        .estimator = .{},
+        .last_context_tokens = null,
+        .permission_id = 0,
+        .messages = &.{
+            .{ .role = .user, .blocks = &.{.{ .text = "incremental question" }} },
+            .{ .role = .assistant, .blocks = &.{.{ .text = "incremental answer" }} },
+        },
+    });
+    source.app.?.runtime.observer.notify(.{ .event = .{ .assistant_committed = &.{.{ .text = "incremental answer" }} } });
+    try std.testing.expect(source.checkpointError() == null);
+    try std.testing.expect(!source.resume_lease.?.active);
+
+    source.setCheckpointFailure(error.NoSpaceLeft);
+    try std.testing.expectEqual(error.NoSpaceLeft, source.connection().current().log_error.?);
+    source.app.?.runtime.observer.notify(.{ .event = .{ .assistant_committed = &.{.{ .text = "incremental answer" }} } });
+    source.app.?.journal.flush();
+    try std.testing.expect(source.app.?.journal.failure() == null);
+    try std.testing.expect(source.checkpointError() == null);
+    try std.testing.expect(source.connection().current().log_error == null);
+
+    var lock_name: [64]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintSentinel(&lock_name, "{s}.resume-lock", .{source.session_id}, 0);
+    const readonly = fs.linux.openat(source.resume_lease.?.directory_fd, lock_path, fs.linux.nofollow | fs.linux.cloexec, 0);
+    try std.testing.expect(readonly >= 0);
+    fs.closeFd(source.resume_lease.?.lock_fd);
+    source.resume_lease.?.lock_fd = readonly;
+    source.app.?.runtime.observer.notify(.{ .event = .{ .tool_started = .{ .id = 4, .name = "bash" } } });
+    try std.testing.expect(source.checkpointError() != null);
+    try std.testing.expect(source.app.?.runtime.tool_blocked);
+    try std.testing.expect(!source.resume_lease.?.active);
+    source.app.?.journal.flush();
+    try std.testing.expect(source.app.?.journal.failure() == null);
+    try std.testing.expectEqual(source.checkpointError(), source.connection().current().log_error);
+
+    // Restore a writable lock so the directory-permission failure is the one recorded.
+    const writable = fs.linux.openat(source.resume_lease.?.directory_fd, lock_path, 2 | fs.linux.nofollow | fs.linux.cloexec, 0);
+    try std.testing.expect(writable >= 0);
+    fs.closeFd(source.resume_lease.?.lock_fd);
+    source.resume_lease.?.lock_fd = writable;
+    source.app.?.runtime.tool_blocked = false;
+    defer _ = std.c.fchmodat(tmp.dir.handle, ".thin/sessions", 0o700, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(tmp.dir.handle, ".thin/sessions", 0o555, 0));
+    source.app.?.runtime.observer.notify(.{ .event = .{ .finished = .{ .status = .success } } });
+    source.app.?.journal.flush();
+    try std.testing.expect(source.app.?.journal.failure() == null);
+    try std.testing.expect(source.checkpointError() != null);
+    try std.testing.expectEqual(source.checkpointError(), source.connection().current().log_error);
 }
 
 fn testReasoning() thinking.Declaration {

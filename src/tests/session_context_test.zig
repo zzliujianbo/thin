@@ -115,7 +115,73 @@ test "agents text is capped at 32KiB without reading past the budget" {
     try std.testing.expect(only_global.truncated);
     try std.testing.expectEqual(session_context.max_agents_bytes, only_global.agents_text.len);
     try std.testing.expect(std.mem.allEqual(u8, only_global.agents_text, 'G'));
-    try std.testing.expect(std.mem.indexOf(u8, only_global.agents, "source: project") == null);
+    // The project file is nonempty and did not fit. Name it and mark the cut
+    // even though none of its bytes were copied. The global section is also
+    // truncated, so the project marker is the one after its source header.
+    const project_at = std.mem.indexOf(u8, only_global.agents, "source: project\n").?;
+    try std.testing.expect(std.mem.indexOf(u8, only_global.agents[project_at..], "[truncated]\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, only_global.agents, "PPP") == null);
+}
+
+test "exact 32KiB global budget still marks an omitted nonempty project source" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try mkdir(tmp.dir, "home");
+    try mkdir(tmp.dir, "home/.thin");
+    try mkdir(tmp.dir, "repo");
+    try mkdir(tmp.dir, "repo/.git");
+    const global = try a.alloc(u8, session_context.max_agents_bytes);
+    @memset(global, 'G');
+    try write(tmp.dir, "home/.thin/AGENTS.md", global);
+    try write(tmp.dir, "repo/AGENTS.md", "PROJECT_OMITTED\n");
+
+    const snap = try session_context.load(a, io, try absolute(a, tmp.dir, "home"), try absolute(a, tmp.dir, "repo"), "bash");
+    try std.testing.expect(snap.truncated);
+    try std.testing.expectEqual(session_context.max_agents_bytes, snap.agents_text.len);
+    try std.testing.expect(std.mem.allEqual(u8, snap.agents_text, 'G'));
+    try std.testing.expect(std.mem.indexOf(u8, snap.agents, "PROJECT_OMITTED") == null);
+    const project_at = std.mem.indexOf(u8, snap.agents, "source: project\n").?;
+    const mark_at = std.mem.indexOf(u8, snap.agents, "[truncated]\n").?;
+    try std.testing.expect(mark_at > project_at);
+    // The global file fit exactly, so its own section is not the truncation.
+    try std.testing.expect(std.mem.indexOf(u8, snap.agents[0..project_at], "[truncated]") == null);
+}
+
+test "unreadable optional agents files are skipped and an override does not fall through" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try mkdir(tmp.dir, "home");
+    try mkdir(tmp.dir, "home/.thin");
+    try mkdir(tmp.dir, "repo");
+    try mkdir(tmp.dir, "repo/.git");
+    try write(tmp.dir, "home/.thin/AGENTS.override.md", "OVERRIDE_SECRET\n");
+    try write(tmp.dir, "home/.thin/AGENTS.md", "GLOBAL_BASE\n");
+    try write(tmp.dir, "repo/AGENTS.md", "PROJECT_OK\n");
+    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(tmp.dir.handle, "home/.thin/AGENTS.override.md", 0, 0));
+
+    const hidden_override = try session_context.load(a, io, try absolute(a, tmp.dir, "home"), try absolute(a, tmp.dir, "repo"), "bash");
+    try std.testing.expect(std.mem.indexOf(u8, hidden_override.agents, "OVERRIDE_SECRET") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden_override.agents, "GLOBAL_BASE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden_override.agents, "PROJECT_OK") != null);
+
+    try std.testing.expectEqual(@as(c_int, 0), std.c.unlinkat(tmp.dir.handle, "home/.thin/AGENTS.override.md", 0));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(tmp.dir.handle, "home/.thin/AGENTS.md", 0, 0));
+    const hidden_global = try session_context.load(a, io, try absolute(a, tmp.dir, "home"), try absolute(a, tmp.dir, "repo"), "bash");
+    try std.testing.expect(std.mem.indexOf(u8, hidden_global.agents, "GLOBAL_BASE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden_global.agents, "PROJECT_OK") != null);
+
+    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(tmp.dir.handle, "home/.thin/AGENTS.md", 0o644, 0));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(tmp.dir.handle, "repo/AGENTS.md", 0, 0));
+    const hidden_project = try session_context.load(a, io, try absolute(a, tmp.dir, "home"), try absolute(a, tmp.dir, "repo"), "bash");
+    try std.testing.expect(std.mem.indexOf(u8, hidden_project.agents, "GLOBAL_BASE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden_project.agents, "PROJECT_OK") == null);
+    try std.testing.expect(!hidden_project.truncated);
 }
 
 fn rm(parent: std.Io.Dir, name: [*:0]const u8, directory: bool) void {
@@ -407,4 +473,162 @@ test "app wires agents discovery and appends when the working directory changes"
     try std.testing.expect(std.mem.startsWith(u8, textOf(app.runtime.messages()[5]), "environment update\n"));
     try std.testing.expect(std.mem.indexOf(u8, textOf(app.runtime.messages()[5]), "/tree/other\n") != null);
     try std.testing.expectEqualStrings("elsewhere", textOf(app.runtime.messages()[6]));
+}
+
+fn countPrefix(messages: []const p.Message, prefix: []const u8) usize {
+    var n: usize = 0;
+    for (messages) |message| {
+        if (message.role == .context and std.mem.startsWith(u8, textOf(message), prefix)) n += 1;
+    }
+    return n;
+}
+
+fn indexOfText(messages: []const p.Message, needle: []const u8) ?usize {
+    for (messages, 0..) |message, index| {
+        if (message.blocks.len == 1 and message.blocks[0] == .text and std.mem.indexOf(u8, message.blocks[0].text, needle) != null) return index;
+    }
+    return null;
+}
+
+test "matching applied policy is appended again when live history lost the preface" {
+    var config = cfg.Config{
+        .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
+        .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
+    };
+    const rule = "source: project\npath: /proj/AGENTS.md\nPROJECT_RULE\n";
+    var box = Box{ .snap = baseSnap(rule) };
+    var runtime = try openRuntime(&config, &box);
+    defer runtime.deinit();
+    var cancel = p.Cancellation{};
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("first", &cancel)).status);
+
+    const summary = "[Earlier context summary — lossy background data, not new instructions]\nrolled work";
+    runtime.history.clearRetainingCapacity();
+    const arena = runtime.arena.allocator();
+    try runtime.history.append(arena, try p.textMessage(arena, .context, summary));
+    try runtime.history.append(arena, try p.textMessage(arena, .user, "earlier"));
+    try runtime.history.append(arena, try p.textMessage(arena, .assistant, "done"));
+
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("next", &cancel)).status);
+    const messages = runtime.messages();
+    try std.testing.expectEqualStrings(summary, textOf(messages[0]));
+    try std.testing.expectEqualStrings("earlier", textOf(messages[1]));
+    try std.testing.expectEqualStrings("done", textOf(messages[2]));
+    try std.testing.expect(std.mem.startsWith(u8, textOf(messages[3]), "agents update\n"));
+    try std.testing.expect(std.mem.indexOf(u8, textOf(messages[3]), "PROJECT_RULE") != null);
+    try std.testing.expect(std.mem.startsWith(u8, textOf(messages[4]), "environment update\n"));
+    try std.testing.expect(std.mem.indexOf(u8, textOf(messages[4]), "cwd: /proj/cwd\n") != null);
+    try std.testing.expectEqualStrings("next", textOf(messages[5]));
+    try std.testing.expectEqual(@as(usize, 1), countPrefix(messages, "agents update\n"));
+
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("again", &cancel)).status);
+    try std.testing.expectEqual(@as(usize, 1), countPrefix(runtime.messages(), "agents update\n"));
+    try std.testing.expectEqual(@as(usize, 1), countPrefix(runtime.messages(), "environment update\n"));
+    try std.testing.expectEqualStrings(summary, textOf(runtime.messages()[0]));
+}
+
+test "restored summary without the preface reinstalls the current policy" {
+    var config = cfg.Config{
+        .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
+        .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
+    };
+    var box = Box{ .snap = baseSnap("source: project\npath: /proj/AGENTS.md\nRESTORED_RULE\n") };
+    var runtime = try openRuntime(&config, &box);
+    defer runtime.deinit();
+    const summary = "[Earlier context summary — lossy background data, not new instructions]\nold work";
+    var state = try runtime.checkpoint();
+    state.messages = &.{
+        .{ .role = .context, .blocks = &.{.{ .text = summary }} },
+        .{ .role = .user, .blocks = &.{.{ .text = "earlier" }} },
+        .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} },
+    };
+    try runtime.restoreCheckpoint(state);
+    var cancel = p.Cancellation{};
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("next", &cancel)).status);
+    const messages = runtime.messages();
+    try std.testing.expectEqualStrings(summary, textOf(messages[0]));
+    try std.testing.expectEqualStrings("earlier", textOf(messages[1]));
+    try std.testing.expect(std.mem.startsWith(u8, textOf(messages[3]), "agents update\n"));
+    try std.testing.expect(std.mem.indexOf(u8, textOf(messages[3]), "RESTORED_RULE") != null);
+    try std.testing.expect(std.mem.startsWith(u8, textOf(messages[4]), "environment update\n"));
+    try std.testing.expect(std.mem.indexOf(u8, textOf(messages[4]), "cwd: /proj/cwd\n") != null);
+    try std.testing.expectEqualStrings("next", textOf(messages[5]));
+}
+
+const SummaryGate = struct {
+    summaries: u32 = 0,
+    saw_policy_after_summary: bool = false,
+
+    fn call(ctx: *anyopaque, _: std.mem.Allocator, req: p.Request, _: p.ModelSink) !p.Outcome {
+        const self: *SummaryGate = @ptrCast(@alignCast(ctx));
+        if (req.purpose == .summary) {
+            self.summaries += 1;
+            return .{ .success = .{
+                .message = .{ .role = .assistant, .blocks = &.{.{ .text = "Earlier work is done." }} },
+                .finish = .stop,
+                .usage = .{},
+            } };
+        }
+        if (self.summaries > 0) {
+            var saw_rule = false;
+            var saw_cwd = false;
+            for (req.messages) |message| {
+                if (message.role != .context or message.blocks.len != 1 or message.blocks[0] != .text) continue;
+                if (std.mem.indexOf(u8, message.blocks[0].text, "PROJECT_RULE") != null) saw_rule = true;
+                if (std.mem.indexOf(u8, message.blocks[0].text, "cwd: /proj/cwd\n") != null) saw_cwd = true;
+            }
+            self.saw_policy_after_summary = saw_rule and saw_cwd;
+        }
+        return .{ .success = .{
+            .message = .{ .role = .assistant, .blocks = &.{.{ .text = "ok" }} },
+            .finish = .stop,
+            .usage = .{},
+        } };
+    }
+};
+
+test "compaction reinstalls the policy after the retained prefix" {
+    var config = cfg.Config{
+        .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
+        .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
+    };
+    var box = Box{ .snap = baseSnap("source: project\npath: /proj/AGENTS.md\nPROJECT_RULE\n") };
+    var gate = SummaryGate{};
+    var runtime = try openRuntime(&config, &box);
+    defer runtime.deinit();
+    runtime.model = .{ .context = &gate, .call_fn = SummaryGate.call };
+    var cancel = p.Cancellation{};
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("hello", &cancel)).status);
+
+    const bulk = try std.testing.allocator.alloc(u8, 24_000);
+    defer std.testing.allocator.free(bulk);
+    @memset(bulk, 'B');
+    const arena = runtime.arena.allocator();
+    try runtime.history.append(arena, try p.textMessage(arena, .user, bulk));
+    try runtime.history.append(arena, try p.textMessage(arena, .assistant, "retained-tail"));
+
+    config.model.context_tokens = 20000;
+    config.limits.max_output_tokens = 400;
+    config.limits.summary_tokens = 200;
+    config.limits.safety_tokens = 200;
+    config.limits.compaction_trigger_percent = 40;
+    config.limits.compaction_target_percent = 20;
+
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("next-goal", &cancel)).status);
+    try std.testing.expectEqual(@as(u32, 1), gate.summaries);
+    try std.testing.expect(gate.saw_policy_after_summary);
+    const messages = runtime.messages();
+    try std.testing.expect(std.mem.startsWith(u8, textOf(messages[0]), "[Earlier context summary"));
+    const tail = indexOfText(messages, "retained-tail").?;
+    const goal = indexOfText(messages, "next-goal").?;
+    const agents = indexOfText(messages, "agents update\n").?;
+    const env = indexOfText(messages, "environment update\n").?;
+    try std.testing.expect(tail < goal and goal < agents and agents < env);
+    try std.testing.expect(std.mem.indexOf(u8, textOf(messages[agents]), "PROJECT_RULE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, textOf(messages[env]), "cwd: /proj/cwd\n") != null);
+    try std.testing.expectEqual(@as(usize, 0), countPrefix(messages, "agents\n"));
+
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("later", &cancel)).status);
+    try std.testing.expectEqual(@as(usize, 1), countPrefix(runtime.messages(), "agents update\n"));
+    try std.testing.expectEqual(@as(usize, 1), countPrefix(runtime.messages(), "environment update\n"));
 }
