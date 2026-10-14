@@ -204,7 +204,7 @@ pub const App = struct {
     /// successful selection publication, and no borrowed old config bytes.
     pub fn recordSelection(self: *App) void {
         self.journal.protocol = self.config.value.model.protocol;
-        self.journal.setSelection(@import("selection_store.zig").capture(self.config.value));
+        self.journal.setSelection(@import("selection.zig").capture(self.config.value));
     }
 
     /// 按创建的逆序释放资源，最后销毁自身。

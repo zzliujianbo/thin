@@ -119,14 +119,17 @@ pub const help =
     \\content may remain. Records are not restored or automatically sent to the provider.
     \\Large fields are explicitly truncated/omitted; files rotate without deleting old records.
     \\View locally with ls -lt .thin/sessions and tail -f <chosen.jsonl>.
-    \\Separate <session-id>.selection.json snapshots retain the latest committed selection.
-    \\They start on first submission and update on successful model/effort changes.
-    \\--restore-selection restores provider/model/protocol/effort into a NEW EMPTY CHAT.
+    \\<session-id>.session is the authenticated checkpoint for that id. It stores the
+    \\full context and the committed provider/model/protocol/effort selection.
+    \\It is rewritten after each completed model turn, tool result, compaction,
+    \\cancellation, and again on normal exit. Each publish is an atomic rename plus fsync.
+    \\Resume accepts only a clean lock marker C. A crash during a tool leaves marker A
+    \\and refuses that generation. A crash during a model call keeps the previous C.
+    \\--restore-selection reads that selection into a NEW EMPTY CHAT.
     \\It does NOT restore conversation history, tools, native replay or the old session ID.
     \\Credentials are resolved locally; missing endpoints, keys or custom profiles are refused.
-    \\Old IDs without snapshots are not guessed. --print cannot restore a selection.
-    \\--no-log disables snapshot writes too, but permits explicit reading of an old snapshot.
-    \\Normal interactive exit saves a separate <session-id>.session full-context checkpoint.
+    \\Old IDs without a clean checkpoint are not guessed. --print cannot restore a selection.
+    \\--no-log disables checkpoint writes, but still allows reading an old checkpoint.
     \\--resume continues that SAME ID and model context, including native provider state.
     \\Loading never sends a request or reruns tools; only new input starts work.
     \\The exit command is printed only after a successful full save. Empty chats create none.
