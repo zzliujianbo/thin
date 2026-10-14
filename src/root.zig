@@ -13,6 +13,8 @@ pub const llm = @import("llm/llm.zig");
 pub const config = @import("core/config.zig");
 /// 上下文预算估算与压缩计划（token 估算、切分边界）。
 pub const context = @import("core/context.zig");
+/// 会话前言：两处 AGENTS.md 与 cwd/shell/项目根，按追加方式注入。
+pub const session_context = @import("core/session_context.zig");
 /// Agent 运行时：驱动模型调用、工具执行与事件分发。
 pub const runtime = @import("core/runtime.zig");
 
@@ -47,6 +49,7 @@ test {
     _ = llm;
     _ = config;
     _ = context;
+    _ = session_context;
     _ = runtime;
     _ = http;
     _ = chat;
@@ -94,5 +97,6 @@ test {
     _ = @import("ui/tui.zig");
 
     _ = @import("tests/runtime_test.zig");
+    _ = @import("tests/session_context_test.zig");
     _ = @import("tests/adapter_integration_test.zig");
 }
