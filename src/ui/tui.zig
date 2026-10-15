@@ -196,6 +196,7 @@ pub const Connection = struct {
         /// Metadata-only catalog for this endpoint; never a credential catalog.
         models: []const core_config.Model = &.{},
         model_context_official: []const bool = &.{},
+        model_disabled: []const bool = &.{},
         context_official: bool = false,
         metadata_notice: ?[]const u8 = null,
         selection_name: ?[]const u8 = null,
@@ -947,11 +948,15 @@ const Ui = struct {
             },
             .up, .down, .enter => {
                 const state = self.connection.current();
-                const choices = try picker.choices(self.allocator, state.selection_name orelse state.model, state.context_limit, state.models);
+                const choices = try picker.choicesWithDisabled(self.allocator, state.selection_name orelse state.model, state.context_limit, state.models, state.model_disabled);
                 defer self.allocator.free(choices);
                 if (event_ == .enter) {
                     if (self.frame.len != 0 or picker.pasted or choices.len == 0 or self.displayed_model_epoch != self.model_epoch or self.displayed_model_generation != picker.generation) return;
                     const choice = choices[@min(picker.selected, choices.len - 1)];
+                    if (choice.disabled) {
+                        self.notice = "Protocol unknown; model cannot be selected";
+                        return;
+                    }
                     self.selectModel(choice.name) catch {
                         self.notice = "Could not switch; selection is unchanged";
                     };
@@ -1736,7 +1741,7 @@ const Ui = struct {
         // Always reserve one EMPTY row between conversation and composer.
         const footer_rows: usize = 2 + @as(usize, @intFromBool(hint_line.len != 0));
         const body_limit = self.size.rows -| footer_rows;
-        const picker_rows = if (self.model_picker) |*picker| try picker.rowsWithOrigins(a, state.selection_name orelse state.model, state.context_limit, state.models, cols, body_limit, .{ .current = state.context_official, .models = state.model_context_official }) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
+        const picker_rows = if (self.model_picker) |*picker| try picker.rowsWithState(a, state.selection_name orelse state.model, state.context_limit, state.models, cols, body_limit, .{ .current = state.context_official, .models = state.model_context_official }, state.model_disabled) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, body_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
         const menu_visible = self.commandMenuVisible();
@@ -3851,6 +3856,7 @@ const SelectionFixture = struct {
     provider_hint: ?core_config.providers.Id = null,
     configured_providers: u8 = 0,
     profiles_override: ?[]const core_config.Model = null,
+    disabled_models: []const bool = &.{},
     refreshes: usize = 0,
     metadata_changed: bool = false,
     key_matched: bool = false,
@@ -3871,7 +3877,7 @@ const SelectionFixture = struct {
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .models = self.profiles_override orelse &profiles, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels };
+        return .{ .runtime = null, .model = self.name, .models = self.profiles_override orelse &profiles, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;
@@ -3904,6 +3910,34 @@ const SelectionFixture = struct {
         if (self.owned) |name| std.testing.allocator.free(name);
     }
 };
+
+test "model picker rejects disabled unknown protocol even after frame acknowledgement" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture: SelectionFixture = .{ .disabled_models = &.{true} };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.size = .{ .columns = 100, .rows = 24 };
+    ui.openModelPicker();
+    try ui.modelKey(.down);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Protocol unknown") != null);
+    ui.finishFrame();
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+    try std.testing.expect(ui.model_picker != null);
+    // Disabling a row after its acknowledged frame is also checked at Enter.
+    fixture.disabled_models = &.{};
+    try ui.draw();
+    ui.finishFrame();
+    fixture.disabled_models = &.{true};
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+}
 
 test "metadata refresh command excludes paste and revokes picker confirmation after catalog changes" {
     try text.initLocale();

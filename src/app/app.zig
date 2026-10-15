@@ -58,7 +58,7 @@ pub const App = struct {
         var parsed = try cfg.load(a, io, path);
         // Derived defaults are not embedded in config.json. Headless entry can
         // reuse a compatible cached profile without creating/fetching metadata.
-        if ((parsed.value.model.reasoning_source != .explicit or parsed.value.model.reasoning == null) and metadata.reasoningIndex(parsed.value) != null) {
+        if (parsed.value.model.reasoning_source != .explicit or parsed.value.model.reasoning == null) {
             var store: ?@import("auth_store.zig").Store = @import("auth_store.zig").Store.openExisting(a, io, home) catch null;
             if (store) |*value| {
                 defer value.deinit();

@@ -9,10 +9,12 @@ const thinking = @import("../core/thinking.zig");
 const activity = @import("../presentation/activity.zig");
 const json_bound = @import("json_bound.zig");
 const models_dev = @import("models_dev.zig");
+const directory = @import("model_directory.zig");
+const Protocol = @import("../core/protocol.zig").Protocol;
 
 pub const file_name = "model-metadata.json";
 pub const max_body_bytes = 512 * 1024;
-pub const max_cache_bytes = 16 * 1024;
+pub const max_cache_bytes = 512 * 1024;
 
 fn boundJson(bytes: []const u8, limit: usize) !void {
     return json_bound.bound(bytes, limit, 32768);
@@ -20,6 +22,9 @@ fn boundJson(bytes: []const u8, limit: usize) !void {
 const max_tokens = 16 * 1024 * 1024;
 const Tokens = [catalog.entries.len]?u32;
 pub const Listing = struct {
+    /// Owned byte offsets, not borrowed model IDs; safe across worker publication.
+    directory: directory.Directory = .{},
+    directory_mask: u8 = 0,
     tokens: Tokens = @splat(null),
     /// null means never fetched (including legacy caches); false means absent.
     available: [catalog.entries.len]?bool = @splat(null),
@@ -29,6 +34,9 @@ pub const Listing = struct {
     dev_done: bool = false,
 };
 pub const Cache = struct {
+    directory: directory.Directory = .{},
+    /// A successful official listing (even empty) supersedes offline presets.
+    directory_mask: u8 = 0,
     /// Provider bits plus dev_bit: the first models.dev attempt is claimed once.
     attempted: u8 = 0,
     tokens: Tokens = @splat(null),
@@ -50,6 +58,7 @@ pub fn reasoningIndex(config: cfg.Config) ?usize {
 }
 
 pub fn reasoningDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinking.Declaration {
+    if (dynamicIndex(cache, config)) |row| return rowDeclaration(cache, config, row);
     const entry = catalog.entries[index];
     const protocol = if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) .chat else config.model.protocol;
     if (protocol != entry.model.protocol) return null;
@@ -69,12 +78,185 @@ pub fn applyReasoning(cache: *const Cache, config: *cfg.Config) void {
         config.model.reasoning = null;
         config.model.reasoning_effort = null;
     }
-    if (reasoningIndex(config.*)) |index| {
-        if (reasoningDeclaration(cache, config.*, index)) |declaration| {
-            config.model.reasoning = declaration;
-            config.model.reasoning_source = .metadata;
+    const declaration = if (dynamicIndex(cache, config.*)) |row|
+        rowDeclaration(cache, config.*, row)
+    else if (reasoningIndex(config.*)) |index|
+        reasoningDeclaration(cache, config.*, index)
+    else
+        null;
+    if (declaration) |value| {
+        config.model.reasoning = value;
+        config.model.reasoning_source = .metadata;
+    }
+}
+
+fn preset(id: providers.Id, name: []const u8) ?catalog.Entry {
+    for (catalog.entries) |entry| if (entry.provider == id and std.mem.eql(u8, entry.model.name, name)) return entry;
+    return null;
+}
+
+pub fn hasDirectory(cache: *const Cache, id: providers.Id) bool {
+    return cache.directory_mask & bit(id) != 0;
+}
+
+fn resolvedProtocol(cache: *const Cache, index: usize) Protocol {
+    const row = cache.directory.rows[index];
+    if (row.protocol != .auto) return row.protocol;
+    if (row.dev_protocol != .auto) return row.dev_protocol;
+    if (preset(row.provider, cache.directory.name(index))) |entry| return entry.model.protocol;
+    // This exact service exposes Chat Completions, not a model-name heuristic.
+    if (row.provider == .deepseek) return .chat;
+    return .auto;
+}
+
+fn storedEntry(cache: *const Cache, index: usize) catalog.Entry {
+    const row = cache.directory.rows[index];
+    const known = preset(row.provider, cache.directory.name(index));
+    return .{
+        .provider = row.provider,
+        .selector = cache.directory.selector(index),
+        .model = .{
+            .name = cache.directory.name(index),
+            .context_tokens = row.tokens orelse (if (known) |entry| entry.model.context_tokens else 32768),
+            .protocol = resolvedProtocol(cache, index),
+        },
+    };
+}
+
+pub fn dynamicEntry(cache: *const Cache, id: providers.Id, name: []const u8) ?catalog.Entry {
+    if (!hasDirectory(cache, id)) return null;
+    const index = cache.directory.find(id, name) orelse return null;
+    if (cache.directory.rows[index].available != true) return null;
+    return storedEntry(cache, index);
+}
+
+pub fn findEntry(cache: *const Cache, selector: []const u8) ?catalog.Entry {
+    const slash = std.mem.findScalar(u8, selector, '/') orelse return null;
+    const id = providers.Id.fromSlug(selector[0..slash]) orelse return null;
+    if (hasDirectory(cache, id)) return dynamicEntry(cache, id, selector[slash + 1 ..]);
+    return catalog.find(selector);
+}
+
+/// Cached historical identity remains restorable after delisting. No new request
+/// or protocol guessing is performed by selection restoration.
+pub fn restoreEntry(cache: *const Cache, id: providers.Id, name: []const u8) ?catalog.Entry {
+    if (cache.directory.find(id, name)) |index| return storedEntry(cache, index);
+    return preset(id, name);
+}
+
+pub fn capacityFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
+    if (cache.directory.find(entry.provider, entry.model.name)) |index| {
+        const row = cache.directory.rows[index];
+        if (row.available == true) return row.tokens;
+        // A public-only row is not an official capacity result. Until an
+        // official directory succeeds, retain capacities from legacy caches.
+        if (row.available != null or hasDirectory(cache, entry.provider)) return null;
+    }
+    for (catalog.entries, 0..) |known, index| if (known.provider == entry.provider and std.mem.eql(u8, known.model.name, entry.model.name)) return cache.tokens[index];
+    return null;
+}
+
+fn dynamicIndex(cache: *const Cache, config: cfg.Config) ?usize {
+    const id = config.provider.kind orelse providers.Id.fromUrl(config.provider.base_url) orelse return null;
+    if (cache.directory.find(id, config.model.name)) |index| return index;
+    const prefix = id.slug();
+    if (std.mem.startsWith(u8, config.model.name, prefix) and config.model.name.len > prefix.len and config.model.name[prefix.len] == '/')
+        return cache.directory.find(id, config.model.name[prefix.len + 1 ..]);
+    return null;
+}
+
+fn rowDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinking.Declaration {
+    const row = cache.directory.rows[index];
+    const protocol = if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) .chat else config.model.protocol;
+    if (protocol == .auto) return null;
+    const format: thinking.Format = if (protocol == .anthropic) .anthropic else if (row.provider == .deepseek) .deepseek else .standard;
+    if (row.available == null and !hasDirectory(cache, row.provider)) {
+        // Public discovery may arrive before (or without) official discovery.
+        // Its row must not shadow a compatible, last-successful official map,
+        // even when the public SDK disagrees with the verified legacy route.
+        for (catalog.entries, 0..) |entry, legacy| {
+            if (entry.provider != row.provider or entry.model.protocol != protocol or !std.mem.eql(u8, entry.model.name, cache.directory.name(index))) continue;
+            if (cache.reasoning[legacy]) |declaration| {
+                if (declaration.format != format) continue;
+                declaration.validate() catch continue;
+                return declaration;
+            }
         }
     }
+    if (protocol != resolvedProtocol(cache, index)) return null;
+    if (row.reasoning) |profile| {
+        var declaration = profile.declaration();
+        // Official supported_levels describe logical levels; wire format can
+        // become known later from the independent exact models.dev adapter.
+        if (row.protocol == .auto and declaration.format != format) {
+            declaration.format = format;
+            if (declaration.map.off != null) declaration.map.off = switch (format) {
+                .standard => "none",
+                .deepseek => "off",
+                .anthropic => "disabled",
+            };
+        }
+        if (declaration.format == format) {
+            declaration.validate() catch return null;
+            return declaration;
+        }
+    }
+    if (row.dev_reasoning) |profile| {
+        const declaration = profile.declaration();
+        if (declaration.format == format) {
+            declaration.validate() catch return null;
+            return declaration;
+        }
+    }
+    // Legacy preset resolutions also carry complete-profile fallback when the
+    // exact provider row is absent from the public catalog.
+    for (catalog.entries, 0..) |entry, legacy| {
+        if (entry.provider != row.provider or entry.model.protocol != protocol or !std.mem.eql(u8, entry.model.name, cache.directory.name(index))) continue;
+        if (cache.dev_reasoning[legacy]) |declaration| {
+            if (declaration.format != format) continue;
+            declaration.validate() catch continue;
+            return declaration;
+        }
+    }
+    return null;
+}
+
+pub fn entryDeclaration(cache: *const Cache, entry: catalog.Entry) ?thinking.Declaration {
+    const config: cfg.Config = .{ .provider = catalog.connection(entry.provider), .model = entry.model };
+    if (dynamicIndex(cache, config)) |index| return rowDeclaration(cache, config, index);
+    if (reasoningIndex(config)) |index| return reasoningDeclaration(cache, config, index);
+    return null;
+}
+
+/// Merge only a joined provider's owned result. Credential filtering still
+/// happens at publication/commit, independently for each provider.
+pub fn mergeOfficial(target: *Listing, source: *const Listing, id: providers.Id) !void {
+    // A source that overflows the shared pool must not consume its capacity or
+    // partially overwrite records belonging to other successful provider jobs.
+    var merged = target.directory;
+    for (source.directory.rows[0..source.directory.count], 0..) |row, i| if (row.provider == id) try merged.copyRecord(&source.directory, i);
+    target.directory = merged;
+    for (catalog.entries, 0..) |entry, i| if (entry.provider == id) {
+        target.tokens[i] = source.tokens[i];
+        target.available[i] = source.available[i];
+        target.reasoning[i] = source.reasoning[i];
+    };
+    target.directory_mask |= source.directory_mask & bit(id);
+}
+
+pub fn mergeDev(target: *Listing, source: *const Listing) !void {
+    if (!source.dev_done) return;
+    var merged = target.directory;
+    for (source.directory.rows[0..source.directory.count], 0..) |source_row, index| {
+        if (!source_row.dev_present) continue;
+        const row = try merged.upsert(source_row.provider, source.directory.name(index));
+        row.dev_protocol = source_row.dev_protocol;
+        row.dev_reasoning = source_row.dev_reasoning;
+        row.dev_present = true;
+    }
+    target.directory = merged;
+    target.dev = source.dev;
+    target.dev_done = true;
 }
 
 pub const Claim = struct { cache: Cache, mask: u8 };
@@ -155,7 +337,7 @@ fn parseEffort(value: std.json.Value, provider: providers.Id, protocol: @import(
 }
 
 /// Only context_window denotes the total context; no input/output heuristic.
-/// Unknown model IDs are validated but never added to the local catalog.
+/// Legacy capacity-array view; parseListing also retains all discovered IDs.
 pub fn parseProvider(a: std.mem.Allocator, body: []const u8, id: providers.Id) !Tokens {
     return (try parseListing(a, body, id)).tokens;
 }
@@ -172,7 +354,7 @@ pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !L
     if (data != .array or data.array.items.len > 512) return error.InvalidMetadata;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(a);
-    var result: Listing = .{};
+    var result: Listing = .{ .directory_mask = bit(id) };
     for (catalog.entries, 0..) |model, i| {
         if (model.provider == id) result.available[i] = false;
     }
@@ -184,6 +366,17 @@ pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !L
         const entry = try seen.getOrPut(a, name.string);
         if (entry.found_existing) return error.InvalidMetadata;
         const n = if (record.object.get("context_window")) |v| try capacity(v) else null;
+        const row = try result.directory.upsert(id, name.string);
+        row.available = true;
+        row.tokens = n;
+        if (record.object.get("protocol")) |v| {
+            if (v == .string) row.protocol = std.meta.stringToEnum(Protocol, v.string) orelse .auto;
+        }
+        const known = preset(id, name.string);
+        const protocol: Protocol = if (row.protocol != .auto) row.protocol else if (known) |value| value.model.protocol else if (id == .deepseek) .chat else .auto;
+        if (record.object.get("effort")) |effort| {
+            if (try parseEffort(effort, id, if (protocol == .auto) .chat else protocol)) |declaration| row.reasoning = try directory.Profile.from(declaration);
+        }
         for (catalog.entries, 0..) |model, i| {
             if (model.provider == id and std.mem.eql(u8, model.model.name, name.string)) {
                 result.tokens[i] = n;
@@ -213,7 +406,7 @@ pub fn fetchDev(a: std.mem.Allocator, io: std.Io) !Listing {
 
 pub fn parseDev(a: std.mem.Allocator, body: []const u8) !Listing {
     const resolved = try models_dev.parse(a, body);
-    var result: Listing = .{ .dev_done = true };
+    var result: Listing = .{ .dev_done = true, .directory = try models_dev.parseDirectory(a, body) };
     for (resolved, 0..) |value, index| result.dev[index] = value.declaration;
     return result;
 }
@@ -276,7 +469,24 @@ const Record = struct {
     reasoning: ?thinking.Declaration = null,
     dev_reasoning: ?thinking.Declaration = null,
 };
-const Document = struct { version: u32, attempted: u8, records: []const Record };
+const DynamicRecord = struct {
+    provider: providers.Id,
+    id: []const u8,
+    context_window: ?u32 = null,
+    available: ?bool = null,
+    protocol: Protocol = .auto,
+    dev_protocol: Protocol = .auto,
+    reasoning: ?thinking.Declaration = null,
+    dev_reasoning: ?thinking.Declaration = null,
+    dev_present: bool = false,
+};
+const Document = struct {
+    version: u32,
+    attempted: u8,
+    records: []const Record,
+    directory_mask: u8 = 0,
+    models: []const DynamicRecord = &.{},
+};
 
 fn canonicalCacheDeclaration(declaration: thinking.Declaration) !thinking.Declaration {
     try declaration.validate();
@@ -298,12 +508,27 @@ fn canonicalCacheDeclaration(declaration: thinking.Declaration) !thinking.Declar
 }
 
 fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
-    try boundJson(bytes, max_cache_bytes);
+    try json_bound.bound(bytes, max_cache_bytes, 131072);
     var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
     defer parsed.deinit();
     const doc = parsed.value;
-    if ((doc.version < 1 or doc.version > 4) or doc.attempted & ~(all_mask | dev_bit) != 0 or doc.records.len > catalog.entries.len) return error.InvalidMetadata;
-    var result: Cache = .{ .attempted = doc.attempted };
+    if ((doc.version < 1 or doc.version > 5) or doc.attempted & ~(all_mask | dev_bit) != 0 or doc.records.len > catalog.entries.len or doc.models.len > directory.max_models or doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
+    if (doc.version < 5 and (doc.directory_mask != 0 or doc.models.len != 0)) return error.InvalidMetadata;
+    // Legacy caches never attempted dynamic discovery. Retain their successful
+    // metadata, but permit one automatic directory/protocol refresh after upgrade.
+    var result: Cache = .{ .attempted = if (doc.version < 5) 0 else doc.attempted, .directory_mask = doc.directory_mask };
+    for (doc.models) |record| {
+        if (record.context_window) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
+        if (result.directory.find(record.provider, record.id) != null) return error.InvalidMetadata;
+        const row = try result.directory.upsert(record.provider, record.id);
+        row.tokens = record.context_window;
+        row.available = record.available;
+        row.protocol = record.protocol;
+        row.dev_protocol = record.dev_protocol;
+        row.dev_present = record.dev_present;
+        if (record.reasoning) |declaration| row.reasoning = try directory.Profile.from(try canonicalCacheDeclaration(declaration));
+        if (record.dev_reasoning) |declaration| row.dev_reasoning = try directory.Profile.from(try canonicalCacheDeclaration(declaration));
+    }
     var seen: [catalog.entries.len]bool = @splat(false);
     for (doc.records) |record| {
         if (record.context_window) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
@@ -369,10 +594,23 @@ fn save(root: *fs.Root, cache: Cache) !void {
         .reasoning = cache.reasoning[i],
         .dev_reasoning = cache.dev_reasoning[i],
     };
+    const models = try root.allocator.alloc(DynamicRecord, cache.directory.count);
+    defer root.allocator.free(models);
+    for (cache.directory.rows[0..cache.directory.count], 0..) |row, index| models[index] = .{
+        .provider = row.provider,
+        .id = cache.directory.name(index),
+        .context_window = row.tokens,
+        .available = row.available,
+        .protocol = row.protocol,
+        .dev_protocol = row.dev_protocol,
+        .reasoning = if (row.reasoning) |profile| profile.declaration() else null,
+        .dev_reasoning = if (row.dev_reasoning) |profile| profile.declaration() else null,
+        .dev_present = row.dev_present,
+    };
     const bytes = try root.allocator.alloc(u8, max_cache_bytes);
     defer root.allocator.free(bytes);
     var writer = std.Io.Writer.fixed(bytes);
-    try std.json.Stringify.value(Document{ .version = 4, .attempted = cache.attempted, .records = &records }, .{}, &writer);
+    try std.json.Stringify.value(Document{ .version = 5, .attempted = cache.attempted, .records = &records, .directory_mask = cache.directory_mask, .models = models }, .{}, &writer);
     try writer.writeByte('\n');
     try root.writeMode(file_name, bytes[0..writer.end], true, 0o600);
 }
@@ -404,6 +642,37 @@ pub fn commit(root: *fs.Root, succeeded: u8, listing: Listing) !Cache {
         cache.available[i] = listing.available[i];
         cache.reasoning[i] = listing.reasoning[i];
     }
+    const refreshed = succeeded & listing.directory_mask;
+    for (cache.directory.rows[0..cache.directory.count]) |*row| {
+        if (refreshed & bit(row.provider) != 0) {
+            row.available = false;
+            row.tokens = null;
+            row.protocol = .auto;
+            row.reasoning = null;
+        }
+        if (listing.dev_done) {
+            row.dev_protocol = .auto;
+            row.dev_reasoning = null;
+            row.dev_present = false;
+        }
+    }
+    for (listing.directory.rows[0..listing.directory.count], 0..) |source, index| {
+        const official = refreshed & bit(source.provider) != 0 and source.available == true;
+        if (!official and !(listing.dev_done and source.dev_present)) continue;
+        const row = try cache.directory.upsert(source.provider, listing.directory.name(index));
+        if (official) {
+            row.available = source.available;
+            row.tokens = source.tokens;
+            row.protocol = source.protocol;
+            row.reasoning = source.reasoning;
+        }
+        if (listing.dev_done and source.dev_present) {
+            row.dev_protocol = source.dev_protocol;
+            row.dev_reasoning = source.dev_reasoning;
+            row.dev_present = true;
+        }
+    }
+    cache.directory_mask |= refreshed;
     if (listing.dev_done) cache.dev_reasoning = listing.dev;
     if (succeeded != 0 or listing.dev_done) try save(root, cache);
     return cache;
@@ -473,7 +742,7 @@ test "metadata deep oversized and duplicate caches remain untouched" {
         try std.testing.expectError(case.err, claim(&root, all_mask, true));
         try std.testing.expectError(case.err, commit(&root, all_mask, .{}));
         try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
-        const result = try root.read(std.testing.allocator, file_name, 0, max_body_bytes);
+        const result = try root.read(std.testing.allocator, file_name, 0, max_cache_bytes + 1);
         defer std.testing.allocator.free(result.data);
         try std.testing.expectEqualStrings(case.body, result.data);
     }
@@ -656,7 +925,7 @@ test "metadata malformed cache is never overwritten and selectors are validated"
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const bad = [_][]const u8{
-        "{\"version\":5,\"attempted\":0,\"records\":[]}",
+        "{\"version\":6,\"attempted\":0,\"records\":[]}",
         "{\"version\":1,\"attempted\":64,\"records\":[]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"unknown\",\"context_window\":1}]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":0}]}",
@@ -747,7 +1016,7 @@ test "metadata availability removal and failed refresh preserve other providers"
     try std.testing.expectEqualDeep(before, try load(&root));
 }
 
-test "metadata legacy cache upgrades to v3 with unknown availability and reasoning" {
+test "metadata legacy cache upgrades to v5 with unknown directory availability and reasoning" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
@@ -764,7 +1033,7 @@ test "metadata legacy cache upgrades to v3 with unknown availability and reasoni
     defer std.testing.allocator.free(bytes.data);
     var parsed = try std.json.parseFromSlice(Document, std.testing.allocator, bytes.data, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 4), parsed.value.version);
+    try std.testing.expectEqual(@as(u32, 5), parsed.value.version);
     try std.testing.expectEqualDeep(upgraded.cache, try load(&root));
     const nullable = try parseCache(std.testing.allocator, "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":null}]}");
     for (nullable.available) |v| try std.testing.expect(v == null);
@@ -807,7 +1076,7 @@ test "metadata official listing routes only DeepSeek credentials" {
     }
 }
 
-test "models.dev profiles persist in version 4 cache and are claimed once automatically" {
+test "models.dev profiles persist in version 5 cache and are claimed once automatically" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
@@ -876,4 +1145,8 @@ test "models.dev loopback transport parses public catalog and enforces its own s
     try std.testing.expectError(error.MetadataTooLarge, fetchUrl(a, io, second_url, null, 8));
     try second_worker.await(io);
     try std.testing.expect(second_cleaned.load(.acquire));
+}
+
+test {
+    _ = @import("model_metadata_directory_test.zig");
 }

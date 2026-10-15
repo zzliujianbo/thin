@@ -14,6 +14,7 @@ pub const Choice = struct {
     inherited: bool = false,
     profile_index: ?usize = null,
     uses_profile: bool = false,
+    disabled: bool = false,
 };
 pub const Origins = struct {
     current: bool = false,
@@ -64,6 +65,9 @@ pub const Picker = struct {
         self.generation +%= 1;
     }
     pub fn choices(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model) ![]Choice {
+        return self.choicesWithDisabled(a, current, limit, profiles, &.{});
+    }
+    pub fn choicesWithDisabled(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, disabled: []const bool) ![]Choice {
         var result: std.ArrayList(Choice) = .empty;
         errdefer result.deinit(a);
         const query = std.mem.trim(u8, self.query.bytes.items, " \t\r\n");
@@ -74,8 +78,13 @@ pub const Picker = struct {
             selected.profile_index = index;
             // Catalog rows describe the next selection, not the frozen Runtime
             // budget. Explicit raw same-name profiles retain the existing no-op.
+            // Qualified catalog rows describe an explicit fresh confirmation;
+            // raw same-name profiles retain the owner's actual current budget.
             selected.uses_profile = self.localName(profile.name).len != profile.name.len;
-            if (selected.uses_profile) selected.context_tokens = profile.context_tokens;
+            if (selected.uses_profile) {
+                selected.context_tokens = profile.context_tokens;
+                selected.disabled = index < disabled.len and disabled[index];
+            }
             break;
         }
         if (self.matchesName(current, query) or self.matchesName(selected.name, query)) try result.append(a, selected);
@@ -89,7 +98,7 @@ pub const Picker = struct {
                 break;
             };
             if (duplicate) continue;
-            try result.append(a, .{ .name = profile.name, .context_tokens = profile.context_tokens, .profile_index = index, .uses_profile = true });
+            try result.append(a, .{ .name = profile.name, .context_tokens = profile.context_tokens, .profile_index = index, .uses_profile = true, .disabled = index < disabled.len and disabled[index] });
         }
         if (self.allow_custom and query.len != 0 and !exact and manualName(query)) try result.append(a, .{ .name = query, .context_tokens = limit, .inherited = true });
         return result.toOwnedSlice(a);
@@ -117,7 +126,10 @@ pub const Picker = struct {
         return self.rowsWithOrigins(a, current, limit, profiles, columns, max_rows, .{});
     }
     pub fn rowsWithOrigins(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, columns: usize, max_rows: usize, origins: Origins) !Rows {
-        const choices_ = try self.choices(a, current, limit, profiles);
+        return self.rowsWithState(a, current, limit, profiles, columns, max_rows, origins, &.{});
+    }
+    pub fn rowsWithState(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, columns: usize, max_rows: usize, origins: Origins, disabled: []const bool) !Rows {
+        const choices_ = try self.choicesWithDisabled(a, current, limit, profiles, disabled);
         defer a.free(choices_);
         var lines: std.ArrayList([]const u8) = .empty;
         errdefer {
@@ -139,7 +151,7 @@ pub const Picker = struct {
             defer a.free(display_name);
             const name = try presentation.singleLine(a, display_name, columns -| 4);
             defer a.free(name);
-            if (index == selected) can_confirm = !self.pasted and columns >= 4 and
+            if (index == selected) can_confirm = !choice.disabled and !self.pasted and columns >= 4 and
                 name.len != 0 and std.mem.eql(u8, name, display_name) and text.width(name) <= columns - 4;
             if (choice.current) checked_mask |= @as(u16, 1) << @intCast(index - start);
             var official = choice.current and origins.current;
@@ -149,7 +161,7 @@ pub const Picker = struct {
             }
             var token_buffer: [24]u8 = undefined;
             const tokens = try compactTokens(&token_buffer, choice.context_tokens);
-            const raw = try std.fmt.allocPrint(a, "{s}{s}{s}  ({s} tokens; {s}{s})", .{ if (index == selected) "> " else "  ", if (choice.current) "✓ " else "  ", name, tokens, if (official) "official" else "default", if (choice.inherited) "; inherited budget" else "" });
+            const raw = try std.fmt.allocPrint(a, "{s}{s}{s}  ({s} tokens; {s}{s}{s})", .{ if (index == selected) "> " else "  ", if (choice.current) "✓ " else "  ", name, tokens, if (official) "official" else "default", if (choice.inherited) "; inherited budget" else "", if (choice.disabled) "; Protocol unknown" else "" });
             defer a.free(raw);
             const line = try clip(a, raw, columns);
             errdefer a.free(line);
@@ -201,6 +213,46 @@ fn matches(name: []const u8, query: []const u8) bool {
         if (at < query.len and std.ascii.toLower(byte) == std.ascii.toLower(query[at])) at += 1;
     }
     return at == query.len;
+}
+
+test "unknown protocol flags stay aligned through filtering and explicit auto stays enabled" {
+    const a = std.testing.allocator;
+    try text.initLocale();
+    var picker = Picker.init(a);
+    defer picker.deinit();
+    picker.allow_custom = false;
+    const profiles = [_]cfg.Model{
+        .{ .name = "explicit-auto", .context_tokens = 32768, .protocol = .auto },
+        .{ .name = "opencode-go/new-unknown", .context_tokens = 32768, .protocol = .auto },
+        .{ .name = "opencode-zen/known", .context_tokens = 32768, .protocol = .responses },
+    };
+    const flags = [_]bool{ false, true, false };
+    try std.testing.expect(try picker.insert("new-unknown", false));
+    const choices_ = try picker.choicesWithDisabled(a, "current", 32768, &profiles, &flags);
+    defer a.free(choices_);
+    try std.testing.expectEqual(@as(usize, 1), choices_.len);
+    try std.testing.expect(choices_[0].disabled);
+    try std.testing.expectEqual(@as(?usize, 1), choices_[0].profile_index);
+    const rendered = try picker.rowsWithState(a, "current", 32768, &profiles, 120, 10, .{}, &flags);
+    defer {
+        for (rendered.lines) |line| a.free(line);
+        a.free(rendered.lines);
+    }
+    try std.testing.expect(!rendered.can_confirm);
+    try std.testing.expect(std.mem.find(u8, rendered.lines[0], "Protocol unknown") != null);
+    picker.clear();
+    try std.testing.expect(try picker.insert("explicit-auto", false));
+    const explicit = try picker.choicesWithDisabled(a, "current", 32768, &profiles, &flags);
+    defer a.free(explicit);
+    try std.testing.expectEqual(@as(usize, 1), explicit.len);
+    try std.testing.expect(!explicit[0].disabled);
+    // A checked qualified row is a fresh candidate, including protocol safety.
+    picker.provider = .opencode_go;
+    picker.clear();
+    const retained = try picker.choicesWithDisabled(a, "opencode-go/new-unknown", 65536, &profiles, &flags);
+    defer a.free(retained);
+    try std.testing.expect(retained[0].current and retained[0].disabled);
+    try std.testing.expectEqual(profiles[1].context_tokens, retained[0].context_tokens);
 }
 
 test "official raw and qualified current IDs merge and show candidate capacity without changing selection key" {

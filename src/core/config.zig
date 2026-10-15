@@ -56,7 +56,7 @@ pub const Model = struct {
 /// Implementation defaults are adjustable; only the agreed timeout, read/output
 /// sizes and compaction percentages are product requirements.
 /// 中文：下面的默认值是实现层的可调参数；只有超时、读取/输出大小与压缩百分比是产品需求。
-/// 所有字段在校验时都不能为 0（见 validate）。
+/// 所有显式数值在校验时都不能为 0（见 validate）；max_rounds 可为 null。
 pub const Limits = struct {
     /// 单条命令的默认超时（毫秒）。
     command_timeout_ms: u32 = 300000,
@@ -70,9 +70,10 @@ pub const Limits = struct {
     max_output_tokens: u32 = 4096,
     /// 预留的安全余量 token 数，从输入预算中扣除。
     safety_tokens: u32 = 2048,
-    /// 单个任务允许的最大模型轮数。
-    /// Model turns per user submission. Compaction is not counted.
-    max_rounds: u16 = 50,
+    /// Model turns per user submission; missing/null means unlimited.
+    /// Explicit positive values retain their limit, including legacy 50.
+    /// Compaction is not counted. Independent safety limits still apply.
+    max_rounds: ?u16 = null,
     /// 单个任务允许的最大工具调用次数。
     max_tool_calls: u16 = 128,
     /// 整个任务的超时（毫秒）。
@@ -301,9 +302,13 @@ pub fn validate(config: Config) !void {
     try config.credentials.validate();
 
     const l = config.limits;
-    // 编译期遍历 Limits 的所有字段，任何字段为 0 都视为非法。
+    // Null is unlimited only for max_rounds; every explicit limit must be positive.
     inline for (@typeInfo(Limits).@"struct".field_names) |field| {
-        if (@field(l, field) == 0) return error.InvalidLimit;
+        if (comptime std.mem.eql(u8, field, "max_rounds")) {
+            if (l.max_rounds) |rounds| {
+                if (rounds == 0 or rounds > 4096) return error.InvalidLimit;
+            }
+        } else if (@field(l, field) == 0) return error.InvalidLimit;
     }
 
     // Hard ceilings are implementation safeguards, not provider capabilities.
@@ -319,7 +324,7 @@ pub fn validate(config: Config) !void {
     // 超时之间的大小关系与上限：清理宽限不能超过清理总超时，且总超时不超过 60 秒。
     if (l.command_timeout_ms > l.command_max_timeout_ms or l.command_max_timeout_ms > day_ms or
         l.request_timeout_ms > day_ms or l.task_timeout_ms > day_ms or l.cleanup_grace_ms > l.cleanup_timeout_ms or
-        l.cleanup_timeout_ms > 60000 or l.max_rounds > 4096 or l.max_tool_calls > 4096) return error.InvalidLimit;
+        l.cleanup_timeout_ms > 60000 or l.max_tool_calls > 4096) return error.InvalidLimit;
 
     // 预算检查：输出与安全余量之和必须小于上下文窗口，否则输入预算为负数；摘要预算也不能超过输出上限。
     try validateModel(config.model, l);
@@ -547,7 +552,43 @@ test "explicit protocol reasoning and limits overrides own their strings" {
 
     try std.testing.expectEqual(protocol.Protocol.responses, parsed.value.model.protocol);
     try std.testing.expectEqualStrings("high", parsed.value.model.reasoning_effort.?);
-    try std.testing.expectEqual(@as(u16, 10), parsed.value.limits.max_rounds);
+    try std.testing.expectEqual(@as(?u16, 10), parsed.value.limits.max_rounds);
+}
+
+// Defaults remain unlimited; serialization never guesses whether legacy 50 was explicit.
+test "round limits missing null and legacy numbers survive config serialization" {
+    const a = std.testing.allocator;
+    const prefix = "{\"provider\":{\"base_url\":\"http://localhost\"},\"model\":{\"name\":\"fake\",\"context_tokens\":32768},\"limits\":";
+    const cases = [_]struct { json: []const u8, expected: ?u16 }{
+        .{ .json = "{}", .expected = null },
+        .{ .json = "{\"max_rounds\":null}", .expected = null },
+        .{ .json = "{\"max_rounds\":1}", .expected = 1 },
+        .{ .json = "{\"max_rounds\":50}", .expected = 50 },
+        .{ .json = "{\"max_rounds\":4096}", .expected = 4096 },
+    };
+    try std.testing.expectEqual(@as(?u16, null), testConfig().limits.max_rounds);
+    for (cases) |case| {
+        const input = try std.mem.concat(a, u8, &.{ prefix, case.json, "}" });
+        defer a.free(input);
+        var parsed = try parse(a, input);
+        defer release(&parsed);
+        try std.testing.expectEqual(case.expected, parsed.value.limits.max_rounds);
+        var copied = try clone(a, parsed.value);
+        defer release(&copied);
+        try std.testing.expectEqual(case.expected, copied.value.limits.max_rounds);
+        for ([_]bool{ true, false }) |emit_null| {
+            const bytes = try std.json.Stringify.valueAlloc(a, parsed.value, .{ .emit_null_optional_fields = emit_null });
+            defer a.free(bytes);
+            var restored = try parse(a, bytes);
+            defer release(&restored);
+            try std.testing.expectEqual(case.expected, restored.value.limits.max_rounds);
+        }
+    }
+    for ([_][]const u8{ "{\"max_rounds\":0}", "{\"max_rounds\":4097}" }) |limits| {
+        const input = try std.mem.concat(a, u8, &.{ prefix, limits, "}" });
+        defer a.free(input);
+        try std.testing.expectError(error.InvalidLimit, parse(a, input));
+    }
 }
 
 // 验证：缺失字段、未知字段、重复字段以及 TOML 格式都会被拒绝。

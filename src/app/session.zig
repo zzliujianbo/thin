@@ -18,6 +18,7 @@ const resume_store = @import("resume_store.zig");
 const resume_codec = @import("resume_codec.zig");
 const checkpoint = @import("../core/checkpoint.zig");
 const metadata = @import("model_metadata.zig");
+const directory = @import("model_directory.zig");
 const fs = @import("../platform/filesystem.zig");
 
 const MetadataTokens = [catalog.entries.len]?u32;
@@ -63,12 +64,8 @@ const MetadataJob = struct {
                 if (err == error.Canceled) return;
                 continue;
             };
+            metadata.mergeOfficial(&self.listing, &values, id) catch continue;
             self.succeeded |= bit;
-            for (catalog.entries, 0..) |entry, i| if (entry.provider == id) {
-                self.listing.tokens[i] = values.tokens[i];
-                self.listing.available[i] = values.available[i];
-                self.listing.reasoning[i] = values.reasoning[i];
-            };
         }
     }
     fn runDev(self: *MetadataJob) void {
@@ -132,7 +129,8 @@ pub const Session = struct {
     metadata_dev_fetch: DevFetch = metadata.fetchDev,
     metadata_notice: ?[]const u8 = null,
     active_context_official: bool = false,
-    display_origins: [64 + catalog.entries.len]bool = @splat(false),
+    display_origins: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
+    display_disabled: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
 
     resume_lease: ?resume_store.Lease = null,
     resumed: bool = false,
@@ -297,10 +295,9 @@ pub const Session = struct {
                 }
             };
         }
-        if (model == null) for (catalog.entries) |entry| {
-            if (snapshot.provider == entry.provider and ProviderId.fromUrl(candidate.provider.base_url) == entry.provider and std.mem.eql(u8, entry.model.name, snapshot.model())) {
-                model = entry.model;
-                break;
+        if (model == null) if (snapshot.provider) |id| {
+            if (ProviderId.fromUrl(candidate.provider.base_url) == id) {
+                if (metadata.restoreEntry(&self.metadata_cache, id, snapshot.model())) |entry| model = entry.model;
             }
         };
         candidate.model = model orelse return error.SelectionModelUnavailable;
@@ -343,7 +340,7 @@ pub const Session = struct {
     /// 必须等 TUI 取消并 join worker 后再释放；Connection 不得比 Session 活得更久。
     pub fn deinit(self: *Session) void {
         if (self.metadata_job) |job| job.destroy();
-        self.allocator.free(self.display_models);
+        self.freeDisplayModels(self.display_models);
         if (self.selected_alias) |alias| self.allocator.free(alias);
         if (self.global_config) |*global| cfg.release(global);
         if (self.app) |app| app.deinit();
@@ -524,8 +521,10 @@ pub const Session = struct {
         const config = if (self.app) |app| app.config.value else self.pending.?.value;
         for (self.display_models, 0..) |model, index| {
             self.display_origins[index] = false;
-            if (index < config.models.len) continue; // Explicit local profiles always win.
-            if (catalog.find(model.name)) |entry| {
+            self.display_disabled[index] = false;
+            if (index < config.models.len) continue; // Explicit local profiles always win, including explicit auto.
+            self.display_disabled[index] = model.protocol == .auto;
+            if (metadata.findEntry(&self.metadata_cache, model.name)) |entry| {
                 if (self.officialCapacity(entry)) |tokens|
                     self.display_origins[index] = tokens == model.context_tokens;
             }
@@ -537,6 +536,7 @@ pub const Session = struct {
             .session_id = self.session_id,
             .models = self.display_models,
             .model_context_official = self.display_origins[0..self.display_models.len],
+            .model_disabled = self.display_disabled[0..self.display_models.len],
             .context_official = self.active_context_official,
             .metadata_notice = self.metadata_notice,
             .selection_name = self.selected_alias,
@@ -558,15 +558,7 @@ pub const Session = struct {
     }
 
     fn officialCapacity(self: *const Session, entry: catalog.Entry) ?u32 {
-        for (catalog.entries, 0..) |known, index| {
-            if (known.provider != entry.provider or !std.mem.eql(u8, known.selector, entry.selector) or
-                !std.mem.eql(u8, known.model.name, entry.model.name)) continue;
-            // A small official capacity is still authoritative. Show it; model
-            // selection must fail budget validation rather than invent a larger
-            // fallback when the configured output reserve would not fit.
-            return self.metadata_cache.tokens[index];
-        }
-        return null;
+        return metadata.capacityFor(&self.metadata_cache, entry);
     }
 
     fn metadataIndex(config: cfg.Config) ?usize {
@@ -591,11 +583,7 @@ pub const Session = struct {
         // Credential reactivation also passes explicit custom models through
         // this entry path. Their declarations must not be treated as presets.
         if (entry.model.reasoning_source == .explicit and entry.model.reasoning != null) return entry.model.reasoning;
-        for (catalog.entries, 0..) |known, index| {
-            if (known.provider == entry.provider and std.mem.eql(u8, known.selector, entry.selector))
-                return self.metadataDeclaration(.{ .provider = catalog.connection(entry.provider), .model = entry.model }, index);
-        }
-        return null;
+        return metadata.entryDeclaration(&self.metadata_cache, entry);
     }
 
     fn sameDeclaration(a: ?thinking.Declaration, b: ?thinking.Declaration) bool {
@@ -751,9 +739,11 @@ pub const Session = struct {
                 job.official_published = true;
             }
             if (dev_ready) {
-                listing.dev = job.dev_listing.dev;
-                listing.dev_done = job.dev_listing.dev_done;
                 job.dev_published = true;
+                metadata.mergeDev(&listing, &job.dev_listing) catch {
+                    self.metadata_notice = if (job.manual) "Metadata cache could not be saved; previous values kept" else null;
+                    return true;
+                };
             }
             const cache = metadata.commit(&self.store.root, succeeded, listing) catch {
                 self.metadata_notice = if (job.manual) "Metadata cache could not be saved; previous values kept" else null;
@@ -766,7 +756,7 @@ pub const Session = struct {
                 self.metadata_notice = if (job.manual) "Metadata display could not be updated; previous values kept" else null;
                 return true;
             };
-            self.allocator.free(self.display_models);
+            self.freeDisplayModels(self.display_models);
             self.display_models = models;
             const official_requested = job.requested & metadata.provider_mask;
             self.metadata_notice = if (!job.manual) null else if (!finished)
@@ -817,29 +807,81 @@ pub const Session = struct {
         return mask;
     }
 
+    fn freeDisplayModel(self: *const Session, model: cfg.Model) void {
+        self.allocator.free(model.name);
+        if (model.reasoning_effort) |effort| self.allocator.free(effort);
+        if (model.reasoning) |declaration| {
+            inline for (@typeInfo(thinking.LevelMap).@"struct".field_names) |field| {
+                if (@field(declaration.map, field)) |wire| self.allocator.free(wire);
+            }
+        }
+    }
+
+    fn freeDisplayModels(self: *const Session, models: []cfg.Model) void {
+        for (models) |model| self.freeDisplayModel(model);
+        self.allocator.free(models);
+    }
+
+    fn appendDisplayModel(self: *Session, models: *std.ArrayList(cfg.Model), model: cfg.Model) !void {
+        var owned = model;
+        owned.name = try self.allocator.dupe(u8, model.name);
+        owned.reasoning_effort = null;
+        owned.reasoning = null;
+        errdefer self.freeDisplayModel(owned);
+        if (model.reasoning_effort) |effort| owned.reasoning_effort = try self.allocator.dupe(u8, effort);
+        if (model.reasoning) |declaration| {
+            owned.reasoning = declaration;
+            owned.reasoning.?.map = .{};
+            inline for (@typeInfo(thinking.LevelMap).@"struct".field_names) |field| {
+                if (@field(declaration.map, field)) |wire| {
+                    @field(owned.reasoning.?.map, field) = try self.allocator.dupe(u8, wire);
+                }
+            }
+        }
+        try models.append(self.allocator, owned);
+    }
+
+    /// The returned rows own every string. Session moves, cache replacement and
+    /// config-arena release cannot invalidate a published candidate snapshot.
     fn buildModels(self: *Session, active: cfg.Config, global: cfg.Config) ![]cfg.Model {
         var models: std.ArrayList(cfg.Model) = .empty;
-        errdefer models.deinit(self.allocator);
-        // Explicit local profiles plus bounded, officially mapped candidates.
-        try models.appendSlice(self.allocator, active.models);
+        errdefer {
+            for (models.items) |model| self.freeDisplayModel(model);
+            models.deinit(self.allocator);
+        }
+        // Keep local profiles first and aligned with the owner's UI flags.
+        if (active.models.len > 64) return error.TooManyModels;
+        for (active.models) |model| try self.appendDisplayModel(&models, model);
         const configured = self.configuredMask(global);
+        const found = &self.metadata_cache.directory;
+        for (found.rows[0..found.count], 0..) |row, index| {
+            if (configured & metadata.bit(row.provider) == 0 or row.available != true) continue;
+            const entry = metadata.dynamicEntry(&self.metadata_cache, row.provider, found.name(index)) orelse continue;
+            try self.appendCandidate(&models, active, entry);
+        }
+        // A successful official directory is authoritative, including an empty
+        // directory. Never resurrect missing presets from an older cache.
         for (catalog.entries, 0..) |entry, index| {
-            if (configured & (@as(u8, 1) << @intCast(@backingInt(entry.provider))) == 0) continue;
+            if (configured & metadata.bit(entry.provider) == 0 or metadata.hasDirectory(&self.metadata_cache, entry.provider)) continue;
             if (self.metadata_cache.available[index] == false) continue;
-            var duplicate = false;
-            for (active.models) |profile| if (std.mem.eql(u8, profile.name, entry.selector)) {
-                duplicate = true;
-                break;
-            };
-            if (duplicate) continue; // An explicit local profile wins a name collision.
-            var model = entry.model;
-            model.reasoning = self.metadataDeclaration(.{ .provider = catalog.connection(entry.provider), .model = model }, index);
-            model.reasoning_source = .metadata;
-            if (self.officialCapacity(entry)) |tokens| model.context_tokens = tokens;
-            model.name = entry.selector;
-            try models.append(self.allocator, model);
+            try self.appendCandidate(&models, active, entry);
         }
         return models.toOwnedSlice(self.allocator);
+    }
+
+    fn appendCandidate(self: *Session, models: *std.ArrayList(cfg.Model), active: cfg.Config, entry: catalog.Entry) !void {
+        const active_provider = active.provider.kind orelse ProviderId.fromUrl(active.provider.base_url);
+        for (active.models) |profile| {
+            if (std.mem.eql(u8, profile.name, entry.selector) or
+                (active_provider == entry.provider and std.mem.eql(u8, profile.name, entry.model.name))) return;
+        }
+        for (models.items) |model| if (std.mem.eql(u8, model.name, entry.selector)) return;
+        var model = entry.model;
+        model.reasoning = self.declarationForEntry(entry);
+        model.reasoning_source = .metadata;
+        if (self.officialCapacity(entry)) |tokens| model.context_tokens = tokens;
+        model.name = entry.selector;
+        try self.appendDisplayModel(models, model);
     }
 
     fn aliasFor(self: *Session, config: cfg.Config) !?[]u8 {
@@ -847,10 +889,8 @@ pub const Session = struct {
         // Normalize those identities too, but never infer a provider from a
         // model name or a proxy/custom endpoint.
         const id = config.provider.kind orelse ProviderId.fromUrl(config.provider.base_url) orelse return null;
-        for (catalog.entries) |entry| {
-            if (entry.provider == id and std.mem.eql(u8, entry.model.name, config.model.name))
-                return try self.allocator.dupe(u8, entry.selector);
-        }
+        if (metadata.restoreEntry(&self.metadata_cache, id, config.model.name)) |entry|
+            return try self.allocator.dupe(u8, entry.selector);
         // Explicit configured models are not invented catalog selectors.
         return null;
     }
@@ -946,15 +986,18 @@ pub const Session = struct {
         const self: *Session = @ptrCast(@alignCast(raw));
         try self.guardSelection();
         const config = self.mutableConfig();
-        // A catalog-recognized current model may still have a user declaration.
-        // Reactivate its actual options before dispatching to a bare preset.
+        // Reactivate actual options before dispatching to a fresh candidate.
+        // Explicit current map/effort choices remain actual selections.
         const current_explicit = config.model.reasoning_source == .explicit and
             (config.model.reasoning != null or config.model.reasoning_effort != null);
         const current_name = std.mem.eql(u8, name, config.model.name) or
             (self.selected_alias != null and std.mem.eql(u8, name, self.selected_alias.?));
         if (current_name) {
             if (try self.activateSavedCredential(config.model, self.selected_alias orelse name, .{ .context_official = self.active_context_official, .notice = self.settings_notice })) return;
-            if (current_explicit) {
+            // A raw current row is the actual transient selection. A qualified
+            // catalog selector is a deliberate fresh confirmation and may adopt
+            // metadata, unless explicit current controls take precedence.
+            if (current_explicit or std.mem.eql(u8, name, config.model.name)) {
                 if (self.app) |app| self.initial_context = app.runtime.contextSnapshot();
                 return;
             }
@@ -965,15 +1008,23 @@ pub const Session = struct {
             break;
         };
         if (!explicit_profile) {
-            if (catalog.find(name)) |entry| return self.selectProviderModel(entry);
+            if (metadata.findEntry(&self.metadata_cache, name)) |entry| return self.selectProviderModel(entry);
             if (std.mem.findScalar(u8, name, '/')) |slash| {
                 if (ProviderId.fromSlug(name[0..slash]) != null) return error.UnsupportedProviderModel;
             }
-            if (config.provider.kind) |id| {
-                for (catalog.entries) |entry| {
-                    if (entry.provider == id and std.mem.eql(u8, entry.model.name, name)) return self.selectProviderModel(entry);
+            // A service hint on a custom endpoint opts into conventions, not
+            // permission to redirect a raw-ID selection to the official service.
+            if (ProviderId.fromUrl(config.provider.base_url)) |id| {
+                if (metadata.dynamicEntry(&self.metadata_cache, id, name)) |entry| return self.selectProviderModel(entry);
+                if (!metadata.hasDirectory(&self.metadata_cache, id)) {
+                    for (catalog.entries) |entry| {
+                        if (entry.provider == id and std.mem.eql(u8, entry.model.name, name) and
+                            metadata.findEntry(&self.metadata_cache, entry.selector) != null) return self.selectProviderModel(entry);
+                    }
                 }
-                if (!std.mem.eql(u8, name, config.model.name)) return error.UnsupportedProviderModel;
+                // Legacy unnamed endpoints retain custom-model entry until an
+                // official directory establishes authoritative availability.
+                if (config.provider.kind != null or metadata.hasDirectory(&self.metadata_cache, id)) return error.UnsupportedProviderModel;
             }
         }
         // The current picker row represents the ACTUAL transient options, not
@@ -1015,7 +1066,7 @@ pub const Session = struct {
         var defaults = try self.selectionDefaults(candidate);
         defer if (defaults) |*value| cfg.release(value);
         const models = try self.buildModels(candidate, if (defaults) |value| value.value else self.global_config.?.value);
-        errdefer self.allocator.free(models);
+        errdefer self.freeDisplayModels(models);
         const plan = if (self.app) |app| try app.runtime.planSelection(candidate, false) else null;
         try self.persistSelectionDefaults(&defaults);
         if (self.app) |app| app.runtime.applySelection(plan.?);
@@ -1026,7 +1077,7 @@ pub const Session = struct {
         self.selected_name = owned_name;
         if (self.selected_alias) |old| self.allocator.free(old);
         self.selected_alias = alias;
-        self.allocator.free(self.display_models);
+        self.freeDisplayModels(self.display_models);
         self.display_models = models;
         self.settings_notice = preference_notice;
         self.active_context_official = false;
@@ -1045,6 +1096,9 @@ pub const Session = struct {
     }
 
     fn installProviderModel(self: *Session, entry: catalog.Entry, retained: ?RetainedSelection) !void {
+        // Unknown discovered protocols must never enter paid auto negotiation.
+        // Retained explicit auto models are not directory candidates.
+        if (retained == null and entry.model.protocol == .auto) return error.UnknownModelProtocol;
         const previous = self.mutableConfig();
         const revision = self.credential_revisions[@intCast(@backingInt(entry.provider))];
         const official = if (retained == null) self.officialCapacity(entry) else null;
@@ -1053,7 +1107,7 @@ pub const Session = struct {
         const declaration = if (retained != null) entry.model.reasoning else self.declarationForEntry(entry);
         if (self.app != null and previous.provider.kind == entry.provider and
             std.mem.eql(u8, previous.model.name, entry.model.name) and self.active_revision == revision and
-            previous.model.context_tokens == capacity and sameDeclaration(previous.model.reasoning, declaration))
+            previous.model.protocol == entry.model.protocol and previous.model.context_tokens == capacity and sameDeclaration(previous.model.reasoning, declaration))
         {
             self.initial_context = self.app.?.runtime.contextSnapshot();
             self.active_context_official = context_official;
@@ -1094,7 +1148,7 @@ pub const Session = struct {
         var defaults = try self.selectionDefaults(prepared);
         defer if (defaults) |*value| cfg.release(value);
         const models = try self.buildModels(prepared, if (defaults) |value| value.value else self.global_config.?.value);
-        errdefer self.allocator.free(models);
+        errdefer self.freeDisplayModels(models);
         try self.persistSelectionDefaults(&defaults);
         // With history, only installConnection's session selection is updated.
         if (replacement) |value| self.app.?.installConnection(value) else {
@@ -1107,7 +1161,7 @@ pub const Session = struct {
         self.selected_name = null;
         if (self.selected_alias) |old| self.allocator.free(old);
         self.selected_alias = alias;
-        self.allocator.free(self.display_models);
+        self.freeDisplayModels(self.display_models);
         self.display_models = models;
         self.active_revision = revision;
         self.active_context_official = context_official;
@@ -1160,7 +1214,7 @@ pub const Session = struct {
         }
         const active = if (initial) |value| value.config.value else self.mutableConfig().*;
         const models = try self.buildModels(active, baseline.value);
-        errdefer self.allocator.free(models);
+        errdefer self.freeDisplayModels(models);
         if (self.app) |app| try app.journal.rememberKey(key);
         try self.store.save(baseline.value);
         // All remaining work is infallible; save failure preserves the running
@@ -1181,7 +1235,7 @@ pub const Session = struct {
             self.settings_notice = notice;
             self.initial_context = value.runtime.contextSnapshot();
         }
-        self.allocator.free(self.display_models);
+        self.freeDisplayModels(self.display_models);
         self.display_models = models;
         // Saving is local and transactional. Refresh starts later on the owner
         // idle poll, even if this provider was already attempted before login.
@@ -1248,11 +1302,11 @@ pub const Session = struct {
         var global = try cfg.clone(self.allocator, disk_config);
         errdefer cfg.release(&global);
         const models = try self.buildModels(candidate.config.value, global.value);
-        errdefer self.allocator.free(models);
+        errdefer self.freeDisplayModels(models);
         try self.store.save(disk_config);
         if (self.global_config) |*old| cfg.release(old);
         self.global_config = global;
-        self.allocator.free(self.display_models);
+        self.freeDisplayModels(self.display_models);
         self.display_models = models;
         // Candidate owns its strings independently; drop baseline borrows before
         // releasing pending, and release the separate override after publication.
@@ -1299,6 +1353,254 @@ fn overwriteFixtureSelection(root: *fs.Root, id: ids.Id, snapshot: *const select
     const rewritten = try resume_codec.encode(root.allocator, id, snapshot, envelope.payload, key, salt);
     defer root.allocator.free(rewritten);
     try lease.save(root, rewritten);
+}
+
+test "manual refresh asynchronously discovers new IDs and preserves public protocols through picker selection and reload" {
+    const Fixture = struct {
+        var requested: std.atomic.Value(u8) = .init(0);
+        var public_calls: std.atomic.Value(usize) = .init(0);
+        fn official(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+            if (key == null or !std.mem.eql(u8, key.?, "fake-async-directory-key")) return error.InvalidFixtureKey;
+            _ = requested.fetchOr(metadata.bit(id), .monotonic);
+            return metadata.parseListing(a,
+                \\{"data":[{"id":"future-official-id","context_window":131072},{"id":"future-unknown","context_window":65536}]}
+            , id);
+        }
+        fn public(a: std.mem.Allocator, _: std.Io) !metadata.Listing {
+            _ = public_calls.fetchAdd(1, .monotonic);
+            return metadata.parseDev(a,
+                \\{"deepseek":{"npm":"@ai-sdk/deepseek","models":{"future-official-id":{}}},"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"future-official-id":{"provider":{"npm":"@ai-sdk/openai"}}}},"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"future-official-id":{"provider":{"npm":"@ai-sdk/openai"}}}}}
+            );
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer session.deinit();
+    session.metadata_fetch = Fixture.official;
+    session.metadata_dev_fetch = Fixture.public;
+    for (ProviderId.all) |id| try session.connection().configureProvider(id, "fake-async-directory-key");
+    Fixture.requested.store(0, .monotonic);
+    Fixture.public_calls.store(0, .monotonic);
+    const before = session.mutableConfig().model;
+    try Session.refreshModels(&session);
+    const job = session.metadata_job.?;
+    try std.testing.expectEqual(metadata.provider_mask | metadata.dev_bit, job.requested);
+    try MetadataFixture.waitDone(session.io, &job.done);
+    try MetadataFixture.waitDone(session.io, &job.dev_done);
+    // Worker results remain private until owner join and revision filtering.
+    try std.testing.expectEqual(@as(usize, 0), session.metadata_cache.directory.count);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expect(session.metadata_job == null);
+    try std.testing.expectEqual(metadata.provider_mask, Fixture.requested.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), Fixture.public_calls.load(.monotonic));
+    const state = session.connection().current();
+    try std.testing.expectEqual(before.protocol, session.mutableConfig().model.protocol);
+    try std.testing.expectEqual(before.context_tokens, state.context_limit);
+    try std.testing.expectEqualStrings(before.name, state.model);
+    var picker = @import("../ui/model_picker.zig").Picker.init(a);
+    defer picker.deinit();
+    picker.allow_custom = false;
+    const reloaded = try metadata.load(&session.store.root);
+    for (ProviderId.all) |id| {
+        const selector = try std.fmt.allocPrint(a, "{s}/future-official-id", .{id.slug()});
+        defer a.free(selector);
+        picker.clear();
+        try std.testing.expect(try picker.insert(selector, false));
+        const latest = session.connection().current();
+        const choices = try picker.choicesWithDisabled(a, latest.selection_name orelse latest.model, latest.context_limit, latest.models, latest.model_disabled);
+        defer a.free(choices);
+        try std.testing.expectEqual(@as(usize, 1), choices.len);
+        try std.testing.expect(!choices[0].disabled);
+        const entry = metadata.findEntry(&reloaded, selector).?;
+        try std.testing.expectEqual(if (id == .deepseek) @import("../core/protocol.zig").Protocol.chat else .responses, entry.model.protocol);
+        // The picker yields exactly the owner's dynamic qualified selector.
+        try session.connection().selectModel(choices[0].name);
+        try std.testing.expectEqual(entry.model.protocol, session.mutableConfig().model.protocol);
+        try std.testing.expectEqual(@as(u32, 131072), session.mutableConfig().model.context_tokens);
+    }
+    try std.testing.expectError(error.UnknownModelProtocol, session.connection().selectModel("opencode-go/future-unknown"));
+}
+
+test "dynamic official IDs select for all providers and reject unknown protocols without probing" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer session.deinit();
+    for (ProviderId.all) |id| try session.connection().configureProvider(id, "fake-dynamic-key");
+    session.metadata_cache.directory_mask = metadata.provider_mask;
+    for (ProviderId.all) |id| {
+        const row = try session.metadata_cache.directory.upsert(id, "new/vendor-model");
+        row.available = true;
+        row.tokens = 131072;
+        row.protocol = if (id == .deepseek) .chat else .responses;
+        const unknown = try session.metadata_cache.directory.upsert(id, "new-unknown");
+        unknown.available = true;
+    }
+    const models = try session.buildModels(session.mutableConfig().*, session.global_config.?.value);
+    session.freeDisplayModels(session.display_models);
+    session.display_models = models;
+    var state = session.connection().current();
+    try std.testing.expectEqual(@as(usize, 6), state.models.len);
+    for (state.models, 0..) |model, index| {
+        try std.testing.expectEqual(model.protocol == .auto, state.model_disabled[index]);
+    }
+    for (ProviderId.all) |id| {
+        const selector = try std.fmt.allocPrint(a, "{s}/new/vendor-model", .{id.slug()});
+        defer a.free(selector);
+        try session.connection().selectModel(selector);
+        try std.testing.expectEqual(id, session.mutableConfig().provider.kind.?);
+        try std.testing.expectEqualStrings("new/vendor-model", session.mutableConfig().model.name);
+        try std.testing.expectEqual(@as(u32, 131072), session.mutableConfig().model.context_tokens);
+        try std.testing.expect(session.active_context_official);
+        try session.connection().selectModel("new/vendor-model");
+        // Missing presets may be restored from history, but are not new choices.
+        for (catalog.entries) |entry| if (entry.provider == id) {
+            try std.testing.expectError(error.UnsupportedProviderModel, session.connection().selectModel(entry.selector));
+            break;
+        };
+    }
+    const before = session.mutableConfig().model;
+    try std.testing.expectError(error.UnknownModelProtocol, session.connection().selectModel("opencode-go/new-unknown"));
+    // Raw lookup uses the current provider, not a global raw-ID guess.
+    const current_id = session.mutableConfig().provider.kind.?;
+    if (current_id != .deepseek) try std.testing.expectError(error.UnknownModelProtocol, session.connection().selectModel("new-unknown"));
+    try std.testing.expectEqualStrings(before.name, session.mutableConfig().model.name);
+    const current_row = &session.metadata_cache.directory.rows[session.metadata_cache.directory.find(current_id, before.name).?];
+    current_row.tokens = 65536;
+    current_row.protocol = .chat;
+    // Reading a refreshed catalog alone never mutates the active connection.
+    state = session.connection().current();
+    try std.testing.expectEqual(before.protocol, session.mutableConfig().model.protocol);
+    try std.testing.expectEqual(before.context_tokens, state.context_limit);
+    try session.connection().configureProvider(current_id, "fake-rotated-dynamic-key");
+    try session.connection().selectModel(session.selected_alias.?);
+    try std.testing.expectEqual(before.protocol, session.mutableConfig().model.protocol);
+    try std.testing.expectEqual(before.context_tokens, session.mutableConfig().model.context_tokens);
+    state = session.connection().current();
+    try std.testing.expectEqual(before.context_tokens, state.context_limit);
+}
+
+test "explicit raw and qualified profiles override dynamic rows including explicit auto" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer session.deinit();
+    try session.connection().configureProvider(.opencode_go, "fake-explicit-key");
+    session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
+    for ([_][]const u8{ "raw-override", "qualified-override", "visible-unknown" }) |name| {
+        const row = try session.metadata_cache.directory.upsert(.opencode_go, name);
+        row.available = true;
+    }
+    var active = session.mutableConfig().*;
+    active.models = &.{
+        .{ .name = "raw-override", .context_tokens = 32768, .protocol = .auto },
+        .{ .name = "opencode-go/qualified-override", .context_tokens = 32768, .protocol = .chat },
+    };
+    const models = try session.buildModels(active, session.global_config.?.value);
+    defer session.freeDisplayModels(models);
+    try std.testing.expectEqual(@as(usize, 3), models.len);
+    try std.testing.expectEqualStrings("raw-override", models[0].name);
+    try std.testing.expectEqualStrings("opencode-go/qualified-override", models[1].name);
+    try std.testing.expectEqualStrings("opencode-go/visible-unknown", models[2].name);
+    // Session's state flags align by profile position, not by protocol alone.
+    const old_models = session.display_models;
+    session.display_models = models;
+    session.mutableConfig().models = active.models;
+    const state = session.connection().current();
+    const flags_match = std.mem.eql(bool, &.{ false, false, true }, state.model_disabled);
+    session.display_models = old_models;
+    try std.testing.expect(flags_match);
+    try session.connection().selectModel("opencode-go/qualified-override");
+    try std.testing.expectEqual(@import("../core/protocol.zig").Protocol.chat, session.mutableConfig().model.protocol);
+}
+
+test "display candidates own names and explicit wires across cache and config replacement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer session.deinit();
+    try session.connection().configureProvider(.opencode_go, "fake-owned-display-key");
+    session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
+    const row = try session.metadata_cache.directory.upsert(.opencode_go, "owned-cache-name");
+    row.available = true;
+    row.protocol = .chat;
+    var profile_name = "owned-profile".*;
+    var effort = "high".*;
+    var wire = "custom-wire".*;
+    var active = session.mutableConfig().*;
+    active.models = &.{.{
+        .name = &profile_name,
+        .context_tokens = 32768,
+        .protocol = .chat,
+        .reasoning_effort = &effort,
+        .reasoning = .{ .map = .{ .high = &wire } },
+    }};
+    const models = try session.buildModels(active, session.global_config.?.value);
+    defer session.freeDisplayModels(models);
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    // A movable Session/cache and a released config arena are equivalent to
+    // replacing these backing bytes. Published rows must own separate storage.
+    @memset(&session.metadata_cache.directory.names, 'X');
+    profile_name[0] = 'X';
+    effort[0] = 'X';
+    wire[0] = 'X';
+    try std.testing.expectEqualStrings("opencode-go/owned-cache-name", models[1].name);
+    try std.testing.expectEqualStrings("owned-profile", models[0].name);
+    try std.testing.expectEqualStrings("high", models[0].reasoning_effort.?);
+    try std.testing.expectEqualStrings("custom-wire", models[0].reasoning.?.map.high.?);
+}
+
+test "raw explicit profile hides only the same provider dynamic identity" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer session.deinit();
+    try session.connection().configureProvider(.opencode_go, "fake-go-profile-key");
+    try session.connection().configureProvider(.opencode_zen, "fake-zen-profile-key");
+    session.metadata_cache.directory_mask = metadata.bit(.opencode_go) | metadata.bit(.opencode_zen);
+    for ([_]ProviderId{ .opencode_go, .opencode_zen }) |id| {
+        const row = try session.metadata_cache.directory.upsert(id, "shared-profile");
+        row.available = true;
+        row.protocol = .chat;
+    }
+    var active = session.mutableConfig().*;
+    active.models = &.{.{ .name = "shared-profile", .context_tokens = 32768, .protocol = .chat }};
+    const models = try session.buildModels(active, session.global_config.?.value);
+    defer session.freeDisplayModels(models);
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("shared-profile", models[0].name);
+    try std.testing.expectEqualStrings("opencode-zen/shared-profile", models[1].name);
 }
 
 test "restore selection is read only until an explicit empty conversation model change" {
@@ -1549,7 +1851,7 @@ test "official metadata first attempt caches once without changing active budget
         const saved_cache = session.metadata_cache;
         session.metadata_cache.tokens[0] = 1;
         const small_models = try session.buildModels(session.mutableConfig().*, session.global_config.?.value);
-        defer a.free(small_models);
+        defer session.freeDisplayModels(small_models);
         try std.testing.expectEqual(@as(u32, 1), small_models[0].context_tokens);
         try std.testing.expectError(error.InvalidBudget, session.connection().selectModel("deepseek/deepseek-flash"));
         try std.testing.expectEqual(@as(u32, 1048576), session.connection().current().context_limit);
@@ -1557,7 +1859,7 @@ test "official metadata first attempt caches once without changing active budget
         var local = session.mutableConfig().*;
         local.models = &.{.{ .name = "deepseek/deepseek-flash", .context_tokens = 262144, .protocol = .chat }};
         const models = try session.buildModels(local, session.global_config.?.value);
-        defer a.free(models);
+        defer session.freeDisplayModels(models);
         try std.testing.expectEqual(@as(u32, 262144), models[0].context_tokens);
         var disk = try session.store.loadExisting();
         defer cfg.release(&disk);
@@ -1697,7 +1999,7 @@ test "login refresh opt out remains offline and explicit profiles survive availa
     var active = session.mutableConfig().*;
     active.models = &.{.{ .name = "opencode-go/kimi-k3", .context_tokens = 65536, .protocol = .chat }};
     const models = try session.buildModels(active, session.global_config.?.value);
-    defer a.free(models);
+    defer session.freeDisplayModels(models);
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqualStrings("opencode-go/kimi-k3", models[0].name);
     try std.testing.expectEqual(@as(u32, 65536), models[0].context_tokens);

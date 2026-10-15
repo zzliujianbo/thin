@@ -46,6 +46,7 @@ const Fake = struct {
     fail_after_execution: ?*bool = null,
     /// 执行工具之后触发取消，用于测试"工具已执行但随后取消"的路径。
     cancel_after_execution: ?*p.Cancellation = null,
+    cancel_execution_number: u32 = 1,
     /// 审批回调中触发取消。
     cancel_permission: ?*p.Cancellation = null,
     /// 摘要请求中触发取消。
@@ -197,7 +198,9 @@ const Fake = struct {
         if (self.execution_delay) try std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake);
         if (self.execution_error) |err| return err;
         if (self.fail_after_execution) |armed| armed.* = true;
-        if (self.cancel_after_execution) |c| c.cancel();
+        if (self.cancel_after_execution) |c| {
+            if (self.executions >= self.cancel_execution_number) c.cancel();
+        }
         return .{ .text = self.output, .cleanup_failed = self.cleanup_failure, .is_error = self.cleanup_failure, .file_stats = self.file_stats };
     }
 
@@ -790,6 +793,95 @@ test "permission ids do not wrap into a non-monotonic host id" {
     try std.testing.expectEqual(r.Status.success, (try rebased.run("Do the task", &cancel)).status);
     try std.testing.expectEqual(@as(u64, 1), rebased.permission_id);
     try std.testing.expectEqual(@as(u32, 1), fake.executions);
+}
+
+test "Runtime unlimited default omitted and null exceed fifty rounds after checkpoint restore" {
+    const a = std.testing.allocator;
+    const inputs = [_][]const u8{
+        "{\"provider\":{\"base_url\":\"http://localhost\"},\"model\":{\"name\":\"fake\",\"context_tokens\":32768,\"protocol\":\"chat\"}}",
+        "{\"provider\":{\"base_url\":\"http://localhost\"},\"model\":{\"name\":\"fake\",\"context_tokens\":32768,\"protocol\":\"chat\"},\"limits\":{\"max_rounds\":null}}",
+    };
+    for (0..3) |variant| {
+        var parsed = try cfg.parse(a, inputs[if (variant == 2) 1 else 0]);
+        defer cfg.release(&parsed);
+        const config = if (variant == 0) configuration() else parsed.value;
+        try std.testing.expect(config.limits.max_rounds == null);
+        var fake: Fake = .{ .stop_after = 55, .requires_approval = false };
+        var original = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", true);
+        defer original.deinit();
+        const codec = @import("../core/checkpoint.zig");
+        const bytes = try codec.encode(a, try original.checkpoint());
+        defer a.free(bytes);
+        const saved = try codec.decode(a, bytes);
+        defer saved.deinit();
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", true);
+        defer runtime.deinit();
+        try runtime.restoreCheckpoint(saved.value);
+        fake.current_runtime = &runtime;
+        var cancel: p.Cancellation = .{};
+        const terminal = try runtime.run("Do the task", &cancel);
+        try std.testing.expectEqual(r.Status.success, terminal.status);
+        try std.testing.expect(terminal.detail == null);
+        try std.testing.expectEqual(@as(u32, 56), fake.normal_calls);
+        try std.testing.expectEqual(@as(u32, 55), fake.executions);
+    }
+}
+
+test "Runtime explicit fifty survives config and checkpoint roundtrip and pauses with free compaction" {
+    const a = std.testing.allocator;
+    var config = smallConfiguration();
+    // Leave room for the summary instruction during repeated compactions.
+    config.limits.compaction_trigger_percent = 70;
+    config.limits.max_rounds = 50;
+    var copied = try cfg.clone(a, config);
+    defer cfg.release(&copied);
+    var fake: Fake = .{ .stop_after = 55, .output = &long_output, .requires_approval = false };
+    var original = try r.Runtime.init(a, std.testing.io, &copied.value, fake.model(), fake.executor(), fake.host(), "", true);
+    defer original.deinit();
+    const codec = @import("../core/checkpoint.zig");
+    const bytes = try codec.encode(a, try original.checkpoint());
+    defer a.free(bytes);
+    const saved = try codec.decode(a, bytes);
+    defer saved.deinit();
+    var runtime = try r.Runtime.init(a, std.testing.io, &copied.value, fake.model(), fake.executor(), fake.host(), "", true);
+    defer runtime.deinit();
+    try runtime.restoreCheckpoint(saved.value);
+    fake.current_runtime = &runtime;
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run("Do the task", &cancel);
+    try std.testing.expectEqual(r.Status.paused, terminal.status);
+    try std.testing.expectEqual(error.RoundLimit, terminal.detail.?);
+    try std.testing.expectEqual(@as(u32, 50), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 50), fake.executions);
+    try std.testing.expect(fake.summary_calls > 0);
+    try std.testing.expectEqual(fake.summary_calls, fake.compactions);
+}
+
+test "Runtime unlimited still compacts beyond fifty and cancellation stops it" {
+    for ([_]bool{ false, true }) |cancel_run| {
+        var cancel: p.Cancellation = .{};
+        var fake: Fake = .{
+            .stop_after = if (cancel_run) std.math.maxInt(u32) else 55,
+            .output = &long_output,
+            .requires_approval = false,
+            .cancel_after_execution = if (cancel_run) &cancel else null,
+            .cancel_execution_number = 55,
+        };
+        var config = smallConfiguration();
+        // Fixture budget must fit both history and the summary instruction.
+        config.limits.compaction_trigger_percent = 70;
+        var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", true);
+        defer runtime.deinit();
+        fake.current_runtime = &runtime;
+        const terminal = try runtime.run("Do the task", &cancel);
+        try std.testing.expectEqual(if (cancel_run) r.Status.canceled else r.Status.success, terminal.status);
+        if (cancel_run) try std.testing.expectEqual(error.Canceled, terminal.detail.?);
+        try std.testing.expectEqual(@as(u32, if (cancel_run) 55 else 56), fake.normal_calls);
+        try std.testing.expectEqual(@as(u32, 55), fake.executions);
+        try std.testing.expect(fake.summary_calls > 0);
+        try std.testing.expectEqual(fake.summary_calls, fake.compactions);
+        try std.testing.expectEqual(@as(u32, 1), fake.terminals);
+    }
 }
 
 test "Runtime round budget pauses and explicit continuation never replays completed tools" {

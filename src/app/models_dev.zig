@@ -1,5 +1,5 @@
-//! Bounded parser for the public models.dev catalog (no credentials). Only
-//! Thin's catalog model IDs are retained. Protocol comes from the declared AI SDK
+//! Bounded parser for the public models.dev catalog (no credentials).
+//! Exact provider/model IDs are retained. Protocol comes from the declared AI SDK
 //! adapter (`npm`), never from model names; `reasoning: true` is not a profile.
 //! Structural JSON errors fail the whole document; an unusable or unknown option
 //! only makes that one model's profile unusable.
@@ -9,11 +9,16 @@ const activity = @import("../presentation/activity.zig");
 const protocol = @import("../core/protocol.zig");
 const catalog = @import("provider_catalog.zig");
 const json_bound = @import("json_bound.zig");
+const directory = @import("model_directory.zig");
+const providers = @import("../core/providers.zig");
 
 pub const url = "https://models.dev/api.json";
 pub const max_body_bytes = 16 * 1024 * 1024;
 pub const max_structural_nodes = 2_000_000;
 pub const max_value_bytes = 2048;
+/// Includes third-party rows used for complete-profile majority voting.
+/// Separate from the smaller by-value output directory limit.
+pub const max_records = 65536;
 
 pub const Source = enum { exact, majority };
 pub const Resolution = struct {
@@ -66,11 +71,6 @@ fn optionalString(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?[]
     if (try at(scanner, .string)) return try nextString(scanner, allocator);
     try scanner.skipValue();
     return null;
-}
-
-fn catalogName(model: []const u8) bool {
-    for (catalog.entries) |entry| if (equal(entry.model.name, model)) return true;
-    return false;
 }
 
 fn providerName(id: catalog.Id) []const u8 {
@@ -267,15 +267,16 @@ fn parseModel(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !ModelRo
 
 fn parseModels(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provider: []const u8, records: *std.ArrayList(Record)) !void {
     try expect(scanner, allocator, .object_begin);
+    const supported_provider = providerId(provider) != null;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
     while (!(try at(scanner, .object_end))) {
         const model = try nextString(scanner, allocator);
-        if (!catalogName(model)) {
-            try scanner.skipValue();
-            continue;
-        }
-        for (records.items) |prior| {
-            if (equal(prior.provider, provider) and equal(prior.model, model)) return error.InvalidModelsDev;
-        }
+        // Foreign rows only vote on exact supported IDs. Our output-key limits
+        // must not reject unrelated upstream keys; scanner bounds still apply.
+        if (supported_provider) try directory.validateId(model);
+        if ((try seen.getOrPut(allocator, model)).found_existing) return error.InvalidModelsDev;
+        if (records.items.len >= max_records) return error.MetadataTooLarge;
         const row = try parseModel(scanner, allocator);
         try records.append(allocator, .{ .provider = provider, .model = model, .profile = row.profile, .npm = row.npm, .override_invalid = row.override_invalid });
     }
@@ -382,11 +383,9 @@ fn resolveIn(records: []const Record, provider: []const u8, model: []const u8, a
     return .{ .declaration = best, .source = .majority };
 }
 
-pub fn parse(allocator: std.mem.Allocator, body: []const u8) !Listing {
+/// Returned records borrow the caller's arena, never the scanner's lifetime.
+fn scan(a: std.mem.Allocator, body: []const u8) ![]const Record {
     try json_bound.bound(body, max_body_bytes, max_structural_nodes);
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     var scanner = std.json.Scanner.initCompleteInput(a, body);
     defer scanner.deinit();
     var records: std.ArrayList(Record) = .empty;
@@ -399,9 +398,41 @@ pub fn parse(allocator: std.mem.Allocator, body: []const u8) !Listing {
     }
     try expect(&scanner, a, .object_end);
     try expect(&scanner, a, .end_of_document);
+    return records.items;
+}
+
+/// Compatibility output for existing catalog-indexed callers.
+pub fn parse(allocator: std.mem.Allocator, body: []const u8) !Listing {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const records = try scan(arena.allocator(), body);
     var result: Listing = @splat(.{});
     for (catalog.entries, 0..) |entry, index| {
-        result[index] = resolveIn(records.items, providerName(entry.provider), entry.model.name, entry.model.protocol);
+        result[index] = resolveIn(records, providerName(entry.provider), entry.model.name, entry.model.protocol);
+    }
+    return result;
+}
+
+fn providerId(name: []const u8) ?providers.Id {
+    for (providers.Id.all) |id| if (equal(name, providerName(id))) return id;
+    return null;
+}
+
+/// Exact rows for the three supported services. Adapter identity is independent
+/// of reasoning availability; only reasoning may use same-ID majority fallback.
+/// All keys and profiles are pointer-free and safe to copy by value.
+pub fn parseDirectory(allocator: std.mem.Allocator, body: []const u8) !directory.Directory {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const records = try scan(arena.allocator(), body);
+    var result: directory.Directory = .{};
+    for (records) |record| {
+        const id = providerId(record.provider) orelse continue;
+        const row = try result.upsert(id, record.model);
+        row.dev_present = true;
+        row.dev_protocol = record.api;
+        const resolved = resolveIn(records, record.provider, record.model, record.api);
+        if (resolved.declaration) |declaration| row.dev_reasoning = try directory.Profile.from(declaration);
     }
     return result;
 }
@@ -520,6 +551,169 @@ test "models.dev malformed toggle values neither authorize exact profiles nor ca
         // The malformed high row must not break the valid high/low tie.
         try std.testing.expect((try parse(a, tied))[index].declaration == null);
     }
+}
+
+test "models.dev directory retains new IDs and protocols independently of options" {
+    const t = std.testing;
+    const body =
+        \\{"opencode-go":{"models":{"new/plain":{},"new-response":{"provider":{"npm":"@ai-sdk/openai"}},"new-anthropic":{"provider":{"npm":"@ai-sdk/anthropic"},"reasoning":true},"bad-options":{"reasoning_options":[false]},"empty-options":{"reasoning_options":[]},"empty-provider":{"provider":{}},"invalid-provider":{"provider":false},"invalid-npm":{"provider":{"npm":42}},"null-npm":{"provider":{"npm":null}},"empty-npm":{"provider":{"npm":""}},"unknown-npm":{"provider":{"npm":"future-sdk"}}},"npm":"@ai-sdk/openai-compatible"},"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"new/plain":{}}},"opencode":{"npm":"@ai-sdk/anthropic","models":{"new/plain":{}}},"other":{"npm":"@ai-sdk/openai","models":{"third-party":{}}}}
+    ;
+    const parsed = try parseDirectory(t.allocator, body);
+    try t.expectEqual(@as(usize, 13), parsed.count);
+    for ([_][]const u8{ "new/plain", "bad-options", "empty-options", "empty-provider" }) |name| {
+        const row = parsed.rows[parsed.find(.opencode_go, name).?];
+        try t.expectEqual(protocol.Protocol.chat, row.dev_protocol);
+        try t.expect(row.dev_present and row.dev_reasoning == null);
+        try t.expectEqual(protocol.Protocol.auto, row.protocol);
+        try t.expect(row.available == null and row.tokens == null and row.reasoning == null);
+    }
+    try t.expectEqual(protocol.Protocol.responses, parsed.rows[parsed.find(.opencode_go, "new-response").?].dev_protocol);
+    const anthropic = parsed.rows[parsed.find(.opencode_go, "new-anthropic").?];
+    try t.expectEqual(protocol.Protocol.anthropic, anthropic.dev_protocol);
+    try t.expect(anthropic.dev_reasoning == null);
+    for ([_][]const u8{ "invalid-provider", "invalid-npm", "null-npm", "empty-npm", "unknown-npm" }) |name| {
+        const row = parsed.rows[parsed.find(.opencode_go, name).?];
+        try t.expect(row.dev_present and row.dev_protocol == .auto and row.dev_reasoning == null);
+    }
+    try t.expectEqual(protocol.Protocol.chat, parsed.rows[parsed.find(.deepseek, "new/plain").?].dev_protocol);
+    try t.expectEqual(protocol.Protocol.anthropic, parsed.rows[parsed.find(.opencode_zen, "new/plain").?].dev_protocol);
+    try t.expectEqualStrings("opencode-zen/new/plain", parsed.selector(parsed.find(.opencode_zen, "new/plain").?));
+    try t.expect(parsed.find(.opencode_go, "new") == null);
+    try t.expect(parsed.find(.opencode_go, "NEW/plain") == null);
+    try t.expect(parsed.find(.opencode_go, "third-party") == null);
+}
+
+test "models.dev new IDs retain exact profiles and safe complete majority fallback" {
+    const t = std.testing;
+    const body =
+        \\{"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"fresh":{},"exact":{"reasoning_options":[{"type":"effort","values":["low"]}]},"blocked":{"provider":{"npm":null}},"tie":{},"wrong-protocol":{}}},"one":{"npm":"@ai-sdk/anthropic","models":{"fresh":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low","high","max"]}]},"exact":{"reasoning_options":[{"type":"effort","values":["high"]}]},"blocked":{"reasoning_options":[{"type":"effort","values":["high"]}]},"tie":{"reasoning_options":[{"type":"effort","values":["low"]}]}}},"two":{"npm":"@ai-sdk/anthropic","models":{"fresh":{"reasoning_options":[{"type":"effort","values":["max","high","low"]},{"type":"toggle"}]},"exact":{"reasoning_options":[{"type":"effort","values":["high"]}]},"tie":{"reasoning_options":[{"type":"effort","values":["high"]}]}}},"minority":{"npm":"@ai-sdk/anthropic","models":{"fresh":{"reasoning_options":[{"type":"effort","values":["medium","high"]}]}}},"wrong":{"npm":"@ai-sdk/openai","models":{"wrong-protocol":{"reasoning_options":[{"type":"effort","values":["medium"]}]}}},"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"format-check":{}}},"standard":{"npm":"@ai-sdk/openai-compatible","models":{"format-check":{"reasoning_options":[{"type":"effort","values":["none","high"]}]}}}}
+    ;
+    const parsed = try parseDirectory(t.allocator, body);
+    const fresh = parsed.rows[parsed.find(.opencode_go, "fresh").?].dev_reasoning.?.declaration();
+    try t.expectEqual(thinking.Format.anthropic, fresh.format);
+    try t.expectEqualStrings("disabled", fresh.map.off.?);
+    try t.expectEqualStrings("max", fresh.map.max.?);
+    try t.expect(fresh.map.medium == null);
+    const exact = parsed.rows[parsed.find(.opencode_go, "exact").?].dev_reasoning.?.declaration();
+    try t.expectEqualStrings("low", exact.map.low.?);
+    try t.expect(exact.map.high == null);
+    for ([_][]const u8{ "blocked", "tie", "wrong-protocol" }) |name| {
+        try t.expect(parsed.rows[parsed.find(.opencode_go, name).?].dev_reasoning == null);
+    }
+    try t.expect(parsed.rows[parsed.find(.deepseek, "format-check").?].dev_reasoning == null);
+    const fixture = try parseDirectory(t.allocator, @embedFile("models_dev_fixture.json"));
+    const haiku = fixture.rows[fixture.find(.opencode_go, "claude-haiku-5-5").?];
+    try t.expectEqual(protocol.Protocol.anthropic, haiku.dev_protocol);
+    try t.expect(haiku.dev_reasoning.?.declaration().map.medium == null);
+}
+
+test "models.dev new model keys and recognized schema duplicates are rejected" {
+    const t = std.testing;
+    for ([_][]const u8{
+        \\{"opencode-go":{"models":{"fresh":{},"fresh":{}}}}
+        ,
+        \\{"other":{"models":{"fresh":{},"fresh":{}}}}
+        ,
+        \\{"opencode-go":{},"opencode-go":{}}
+        ,
+        \\{"opencode-go":{"npm":"a","npm":"b"}}
+        ,
+        \\{"opencode-go":{"models":{},"models":{}}}
+        ,
+        \\{"opencode-go":{"models":{"fresh":{"provider":{},"provider":{}}}}}
+        ,
+        \\{"opencode-go":{"models":{"fresh":{"provider":{"npm":"a","npm":"b"}}}}}
+        ,
+        \\{"opencode-go":{"models":{"fresh":{"reasoning_options":[],"reasoning_options":[]}}}}
+        ,
+    }) |body| {
+        try t.expectError(error.InvalidModelsDev, parseDirectory(t.allocator, body));
+        try t.expectError(error.InvalidModelsDev, parse(t.allocator, body));
+    }
+    for ([_][]const u8{
+        \\{"opencode-go":{"models":{"":{}}}}
+        ,
+        \\{"opencode-go":{"models":{"   ":{}}}}
+        ,
+        \\{"opencode-go":{"models":{"bad\n":{}}}}
+        ,
+    }) |body| try t.expectError(error.InvalidMetadata, parseDirectory(t.allocator, body));
+}
+
+test "unrelated provider IDs do not inherit the supported directory key limit" {
+    const t = std.testing;
+    const long_id: [257]u8 = @splat('x');
+    for ([_][]const u8{ &long_id, "", "bad\nname" }) |foreign_id| {
+        var bytes: [2048]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&bytes);
+        try writer.writeAll("{\"opencode\":{\"npm\":\"@ai-sdk/openai\",\"models\":{\"gpt-5.2\":{\"reasoning_options\":[{\"type\":\"effort\",\"values\":[\"high\"]}]}}},\"other\":{\"models\":{");
+        try std.json.Stringify.value(foreign_id, .{}, &writer);
+        try writer.writeAll(":{}}}}");
+        const body = bytes[0..writer.end];
+        const result = try parseDirectory(t.allocator, body);
+        try t.expectEqual(@as(usize, 1), result.count);
+        const row = result.rows[result.find(.opencode_zen, "gpt-5.2").?];
+        try t.expectEqual(protocol.Protocol.responses, row.dev_protocol);
+        try t.expectEqualStrings("high", row.dev_reasoning.?.declaration().map.high.?);
+        const legacy = try parse(t.allocator, body);
+        const index = for (catalog.entries, 0..) |entry, i| {
+            if (entry.provider == .opencode_zen and equal(entry.model.name, "gpt-5.2")) break i;
+        } else unreachable;
+        try t.expectEqualStrings("high", legacy[index].declaration.?.map.high.?);
+    }
+}
+
+test "models.dev directory capacity is explicit rather than truncated" {
+    const a = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, "{\"opencode-go\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{");
+    for (0..directory.max_models + 1) |i| {
+        if (i != 0) try body.append(a, ',');
+        var buf: [64]u8 = undefined;
+        try body.appendSlice(a, try std.fmt.bufPrint(&buf, "\"fresh-{d}\":{{}}", .{i}));
+    }
+    try body.appendSlice(a, "}}}");
+    try std.testing.expectError(error.MetadataTooLarge, parseDirectory(a, body.items));
+    // Compatibility output does not inherit the by-value directory row limit.
+    _ = try parse(a, body.items);
+}
+
+test "models.dev scan enforces the all-provider record limit" {
+    const a = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, "{\"other\":{\"models\":{");
+    for (0..max_records + 1) |i| {
+        if (i != 0) try body.append(a, ',');
+        var buf: [64]u8 = undefined;
+        try body.appendSlice(a, try std.fmt.bufPrint(&buf, "\"fresh-{d}\":{{}}", .{i}));
+    }
+    try body.appendSlice(a, "}}}");
+    try std.testing.expectError(error.MetadataTooLarge, parseDirectory(a, body.items));
+    try std.testing.expectError(error.MetadataTooLarge, parse(a, body.items));
+}
+
+test "models.dev absent and unknown provider adapters never borrow a protocol" {
+    const body =
+        \\{"opencode-go":{"models":{"fresh":{}}},"opencode":{"npm":"unknown-sdk","models":{"fresh":{}}},"other":{"npm":"@ai-sdk/anthropic","models":{"fresh":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
+    ;
+    const parsed = try parseDirectory(std.testing.allocator, body);
+    for ([_]providers.Id{ .opencode_go, .opencode_zen }) |id| {
+        const row = parsed.rows[parsed.find(id, "fresh").?];
+        try std.testing.expect(row.dev_present and row.dev_protocol == .auto and row.dev_reasoning == null);
+    }
+}
+
+fn directoryAllocationCheck(a: std.mem.Allocator) !void {
+    const result = try parseDirectory(a,
+        \\{"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"fresh":{}}},"other":{"npm":"@ai-sdk/anthropic","models":{"fresh":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
+    );
+    try std.testing.expect(result.rows[0].dev_reasoning != null);
+}
+
+test "models.dev directory allocation failures release parser scratch" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, directoryAllocationCheck, .{});
 }
 
 test "models.dev malformed options and explicit invalid adapters are model-local unknowns" {

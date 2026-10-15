@@ -72,6 +72,7 @@ pub const Status = enum { success, failed, canceled, paused };
 /// 一次 run 的用量累计，普通调用与摘要调用分别统计。
 /// 某字段任一次缺失或溢出后变为 null，之后不再累加（表示该总和不可信）。
 pub const UsageTotals = struct {
+    /// Saturating counts: an unlimited run must never wrap its telemetry.
     normal_calls: u32 = 0,
     summary_calls: u32 = 0,
     normal: p.Usage = zeroUsage(),
@@ -80,7 +81,7 @@ pub const UsageTotals = struct {
     /// 累加一次模型调用的用量。
     fn add(self: *UsageTotals, purpose: p.Purpose, usage: p.Usage) void {
         const target = if (purpose == .normal) &self.normal else &self.summary;
-        if (purpose == .normal) self.normal_calls += 1 else self.summary_calls += 1;
+        if (purpose == .normal) self.normal_calls +|= 1 else self.summary_calls +|= 1;
         // 逐字段累加；缺失或溢出即置为 null，避免得到错误的总和。
         inline for (@typeInfo(p.Usage).@"struct".field_names) |field| {
             @field(target, field) = if (@field(target, field)) |a| blk: {
@@ -223,6 +224,25 @@ test "thinking runtime normal and summary requests map current model" {
     const req = runtime.request(.normal, &.{}, &cancel);
     try std.testing.expectEqualStrings("own-wire", req.reasoning_effort.?);
     try std.testing.expect(req.thinking == null);
+}
+
+test "unlimited round counter saturates without imposing a hidden limit" {
+    var task: Runtime.Task = .{ .rounds = std.math.maxInt(u16) };
+    task.countRound();
+    try std.testing.expectEqual(@as(u32, 65536), task.rounds);
+    try std.testing.expect(!task.roundLimitReached(null));
+    try std.testing.expect(task.roundLimitReached(4096));
+    task.rounds = std.math.maxInt(u32) - 1;
+    task.countRound();
+    task.countRound();
+    try std.testing.expectEqual(std.math.maxInt(u32), task.rounds);
+    try std.testing.expect(!task.roundLimitReached(null));
+    try std.testing.expect(task.roundLimitReached(50));
+    var usage: UsageTotals = .{ .normal_calls = std.math.maxInt(u32), .summary_calls = std.math.maxInt(u32) };
+    usage.add(.normal, zeroUsage());
+    usage.add(.summary, zeroUsage());
+    try std.testing.expectEqual(std.math.maxInt(u32), usage.normal_calls);
+    try std.testing.expectEqual(std.math.maxInt(u32), usage.summary_calls);
 }
 
 test "runtime checkpoint exports capacity and restore rejects mismatch without config mutation" {
@@ -684,12 +704,22 @@ pub const Runtime = struct {
 
     /// 单次 run 的计数与终态；用于限制轮数与工具调用次数。
     const Task = struct {
-        /// Model calls this run. Compaction is not counted toward max_rounds.
+        /// Normal model calls this run, saturating so unlimited runs cannot
+        /// overflow. Compaction is not counted toward max_rounds.
         rounds: u32 = 0,
+
         /// 已执行的工具调用次数，受 max_tool_calls 限制。
         tool_calls: u32 = 0,
         /// 累计的用量与终态，run 结束时返回。
         terminal: Terminal = .{ .status = .success },
+
+        fn roundLimitReached(self: Task, limit: ?u16) bool {
+            return if (limit) |max| self.rounds >= max else false;
+        }
+
+        fn countRound(self: *Task) void {
+            self.rounds +|= 1;
+        }
     };
 
     /// 任务超时看门狗：睡眠 timeout_ms 后置位 expired 并取消 cancel。
@@ -954,13 +984,12 @@ pub const Runtime = struct {
             };
             try checkCanceled(cancel);
 
-            // Preserve the explicit goal even if summaries consumed the budget
-            // before the first normal request. Never retain a borrowed stack block.
-            if (task.rounds >= self.config.limits.max_rounds) {
+            // Only explicit limits pause a run. Never retain a borrowed stack block.
+            if (task.roundLimitReached(self.config.limits.max_rounds)) {
                 try self.retainCurrentInput(&input_retained);
                 return error.RoundLimit;
             }
-            task.rounds += 1;
+            task.countRound();
             try self.emitContext(cancel);
             try self.emit(.{ .state = .calling_model }, cancel);
 
@@ -1076,7 +1105,7 @@ pub const Runtime = struct {
     fn preflight(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
         // No model round remains. The caller reports RoundLimit and keeps the
         // current goal; do not spend another summary on a turn that cannot continue.
-        if (task.rounds >= self.config.limits.max_rounds) return;
+        if (task.roundLimitReached(self.config.limits.max_rounds)) return;
         const budget = context.inputBudget(self.config.*);
         const before = self.estimatedTokens();
         if (before < context.threshold(budget, self.config.limits.compaction_trigger_percent)) return;

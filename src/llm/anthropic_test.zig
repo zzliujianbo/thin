@@ -281,6 +281,82 @@ test "anthropic cumulative usage-only deltas require a stable final reason" {
     try std.testing.expectError(error.InvalidStreamState, block(&s, 0, "{\"type\":\"text\",\"text\":\"late\"}"));
 }
 
+test "anthropic message delta optional stop metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { fields: []const u8, reason: []const u8 }{
+        .{ .fields = "", .reason = "end_turn" },
+        .{ .fields = ",\"stop_details\":null,\"container\":null", .reason = "end_turn" },
+        .{ .fields = ",\"stop_details\":{\"type\":\"refusal\",\"category\":\"fixture\",\"explanation\":\"fixture\"},\"container\":{\"id\":\"container-fixture\",\"expires_at\":\"2030-01-01T00:00:00Z\",\"skills\":null}", .reason = "refusal" },
+    }) |example| {
+        var s = adapter.Stream.init(a, scope, .{});
+        try s.feed("", start);
+        try block(&s, 0, "{\"type\":\"text\",\"text\":\"\"}");
+        try delta(&s, 0, "{\"type\":\"text_delta\",\"text\":\"OK\"}");
+        try stop(&s, 0);
+        try s.feed("message_delta", try std.fmt.allocPrint(a, "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":null,\"stop_sequence\":null{s}}},\"usage\":{{\"output_tokens\":2}}}}", .{example.fields}));
+        try s.feed("message_delta", try std.fmt.allocPrint(a, "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\",\"stop_sequence\":null{s}}},\"usage\":{{\"input_tokens\":8,\"output_tokens\":4}}}}", .{ example.reason, example.fields }));
+        try s.feed("message_stop", "{\"type\":\"message_stop\"}");
+        const out = (try s.finish()).success;
+        try std.testing.expectEqual(.stop, out.finish);
+        try std.testing.expectEqualStrings("OK", out.message.blocks[0].text);
+        try std.testing.expectEqual(@as(?u64, 22), out.usage.total());
+        // These are response metadata, not assistant content or replay controls.
+        try std.testing.expect(std.mem.indexOf(u8, out.message.replay.?.json, "stop_details") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out.message.replay.?.json, "container-fixture") == null);
+    }
+}
+
+test "anthropic message delta optional metadata rejects malformed shapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "stop_details", "container" }) |field| {
+        for ([_][]const u8{ "true", "0", "\"invalid\"", "[]" }) |value| {
+            var s = adapter.Stream.init(a, scope, .{});
+            try s.feed("", start);
+            const payload = try std.fmt.allocPrint(a, "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"{s}\":{s}}}}}", .{ field, value });
+            try std.testing.expectError(error.InvalidEvent, s.feed("", payload));
+            try std.testing.expectError(error.InvalidStreamState, s.finish());
+        }
+    }
+    var s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try std.testing.expectError(error.InvalidEvent, s.feed("", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_details\":null,\"container\":null,\"tool_calls\":[]}}"));
+}
+
+test "anthropic message delta optional metadata preserves completion guards" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const metadata_only = "{\"type\":\"message_delta\",\"delta\":{\"stop_details\":null,\"container\":null}}";
+    const completed = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_details\":null,\"container\":null}}";
+    var s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try s.feed("", metadata_only);
+    try std.testing.expectError(error.TruncatedStream, s.feed("", "{\"type\":\"message_stop\"}"));
+    s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try s.feed("", completed);
+    try std.testing.expectError(error.TruncatedStream, s.finish());
+    s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try block(&s, 0, "{\"type\":\"text\",\"text\":\"draft\"}");
+    try std.testing.expectError(error.InvalidStreamState, s.feed("", completed));
+    s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try s.feed("", completed);
+    try std.testing.expectError(error.InvalidFinish, s.feed("", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_details\":null,\"container\":null}}"));
+    for ([_][]const u8{ "max_tokens", "pause_turn", "model_context_window_exceeded" }) |reason| {
+        s = adapter.Stream.init(a, scope, .{});
+        try s.feed("", start);
+        try s.feed("", try std.fmt.allocPrint(a, "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\",\"stop_details\":null,\"container\":null}}}}", .{reason}));
+        try s.feed("", "{\"type\":\"message_stop\"}");
+        try std.testing.expect((try s.finish()) == .failure);
+    }
+}
+
 test "anthropic arena allocation failures propagate" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{});
 }

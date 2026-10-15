@@ -250,7 +250,13 @@ pub const Stream = struct {
         if (c.eq(typ, "message_delta")) {
             if (self.open != null) return error.InvalidStreamState;
             const delta = j.get(v, "delta") orelse return error.InvalidEvent;
-            if (!c.onlyKeys(delta, &.{ "stop_reason", "stop_sequence" })) return error.InvalidEvent;
+            if (!c.onlyKeys(delta, &.{ "stop_reason", "stop_sequence", "stop_details", "container" })) return error.InvalidEvent;
+            // Current native deltas include nullable response metadata. It is
+            // not assistant content or a replay control; keep completion checks
+            // below authoritative and reject malformed metadata shapes.
+            for ([_][]const u8{ "stop_details", "container" }) |key| {
+                if (j.get(delta, key)) |value| if (value != .null and value != .object) return error.InvalidEvent;
+            }
             // Native usage updates are partial cumulative snapshots. A nullable
             // stop_reason is not a finish, and later usage may refine the total.
             if (j.get(delta, "stop_reason")) |value| if (value != .null) {

@@ -97,9 +97,9 @@ pub const Client = struct {
             return failure(.canceled, "Model request canceled before transport", null, false);
 
         // job 与 worker 共享，必须保证 worker 结束后才能让 job 失效。
-        var job = Job{ .client = self, .allocator = allocator, .request = request, .sink = sink };
-        // 网络 I/O 放入并发任务执行，避免阻塞取消与超时检查。
         const start = Io.Clock.awake.now(self.io);
+        var job = Job{ .client = self, .allocator = allocator, .request = request, .sink = sink, .start = start };
+        // 网络 I/O 放入并发任务执行，避免阻塞取消与超时检查。
         var future = try Io.concurrent(self.io, perform, .{&job});
         // 无论从哪个分支返回，都要取消并 join worker，保证 job 与 arena 不会被提前释放。
         defer _ = future.cancel(self.io) catch {};
@@ -135,6 +135,7 @@ pub const Client = struct {
         var outcome = future.await(self.io) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.Canceled => failure(.canceled, "Model request canceled", null, job.observed.load(.acquire)),
+            error.RequestTimeout => failure(.timeout, "Model request exceeded its time limit", null, job.observed.load(.acquire)),
             else => failure(.transport, "Model transport failed", null, job.observed.load(.acquire)),
         };
 
@@ -151,6 +152,8 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: p.Request,
         sink: p.ModelSink,
+        start: Io.Timestamp,
+
         /// worker 结束标志，由 perform 返回前设置，主协程据此停止轮询。
         done: std.atomic.Value(bool) = .init(false),
         /// 是否已向调用方发出过内容事件，用于失败结果判断是否产生过可见输出。
@@ -158,6 +161,14 @@ pub const Client = struct {
 
         // Written by the I/O worker; read only after joining/canceling it.
         last_usage: p.Usage = .{},
+
+        // One budget, including mutex wait, encoding, connection attempts and
+        // backoff. Check in the worker too: completion can race the 5ms poll.
+        fn checkBudget(self: *const Job) !void {
+            if (self.request.cancellation) |cancel| if (cancel.isRequested()) return error.Canceled;
+            if (self.start.untilNow(self.client.io, .awake).toMilliseconds() >= self.client.config.limits.request_timeout_ms)
+                return error.RequestTimeout;
+        }
 
         /// 由流解析器调用的事件回调：记录最新 usage 快照，并转发给调用方的 sink。
         fn emit(context: ?*anyopaque, event: p.ModelEvent) !void {
@@ -169,6 +180,26 @@ pub const Client = struct {
             try self.sink.emit(event);
         }
     };
+
+    /// Retry acquisition only. std 0.17 request() validates URI/CA and
+    /// acquires TCP/TLS (or a pooled connection), but sends no model headers
+    /// or body. Never extend this boundary to sendBodyComplete/receiveHead.
+    /// HostName.connect may try multiple resolved addresses within one call;
+    /// this caps acquisition rounds, not the resolver's address fan-out.
+    fn acquireRequest(job: *Job, uri: std.Uri, options: std.http.Client.RequestOptions) !std.http.Client.Request {
+        const delays_ms = [_]u32{ 200, 500 };
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            try job.checkBudget();
+            return job.client.http.request(.POST, uri, options) catch |err| {
+                if (attempt == delays_ms.len or !transientConnectError(err)) return err;
+                // Same cancellable worker Io and original invoke deadline.
+                // Cancellation joins this sleep before any request data dies.
+                try Io.sleep(job.client.io, .fromMilliseconds(delays_ms[attempt]), .awake);
+                continue;
+            };
+        }
+    }
 
     /// 在 I/O worker 中执行完整请求：编码、发送、读取 HTTP 响应，并解析 SSE 流。
     fn perform(job: *Job) !p.Outcome {
@@ -201,7 +232,8 @@ pub const Client = struct {
         // 禁止自动跟随重定向（否则 Authorization 头可能被发送到其他主机）；要求不压缩，便于逐块解析 SSE。
         var header_buffer: [4]std.http.Header = undefined;
         const headers = try self.requestHeaders(protocol, &header_buffer);
-        var request = try self.http.request(.POST, try std.Uri.parse(address), .{
+        const uri = try std.Uri.parse(address);
+        var request = try acquireRequest(job, uri, .{
             .redirect_behavior = .unhandled,
             .headers = .{
                 .authorization = if (protocol == .anthropic) .omit else .{ .override = self.authorization },
@@ -219,6 +251,7 @@ pub const Client = struct {
         // 请求体已完整编码，使用固定 Content-Length 而不是分块传输。
         request.transfer_encoding = .{ .content_length = payload.len };
         // The encoder allocated an independent mutable buffer; TLS may modify it.
+        try job.checkBudget();
         try request.sendBodyComplete(payload);
 
         // receiveHead 解析响应头所需的缓冲区（重定向已禁用，只用于读取响应头）。
@@ -305,6 +338,33 @@ pub const Client = struct {
         };
     }
 };
+
+/// Deliberate allowlist from Zig 0.17 HostName.ConnectError. DNS
+/// NameServerFailure is ambiguous (no temporary/permanent distinction), and
+/// TLS rejects collapse into TlsInitializationFailed: neither is safe to guess.
+fn transientConnectError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionRefused, error.ConnectionResetByPeer, error.NetworkUnreachable, error.HostUnreachable, error.NetworkDown => true,
+        else => false,
+    };
+}
+
+test "connection retry focused: transient allowlist rejects TLS DNS and configuration ambiguity" {
+    for ([_]anyerror{ error.ConnectionRefused, error.ConnectionResetByPeer, error.NetworkUnreachable, error.HostUnreachable, error.NetworkDown }) |err|
+        try std.testing.expect(transientConnectError(err));
+    for ([_]anyerror{
+        error.TlsInitializationFailed, error.CertificateBundleLoadFailure,
+        error.InvalidHostName,         error.UriMissingHost,
+        error.UnsupportedUriScheme,    error.NameServerFailure,
+        error.UnknownHostName,         error.AccessDenied,
+        error.OutOfMemory,             error.Canceled,
+        error.Unexpected,              error.Timeout,
+    }) |err| try std.testing.expect(!transientConnectError(err));
+}
+
+test {
+    _ = @import("../http_retry_test.zig");
+}
 
 /// Keep persisted connection identity stable. Go uses its documented inference
 /// routes; custom endpoints are never rewritten by provider hint or model ID.

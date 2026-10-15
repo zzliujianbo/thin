@@ -34,7 +34,8 @@ const start = () => frame({ type: 'message_start', message: {
 const blockStart = (index, content_block) => frame({ type: 'content_block_start', index, content_block });
 const delta = (index, delta) => frame({ type: 'content_block_delta', index, delta });
 const blockStop = index => frame({ type: 'content_block_stop', index });
-const finish = reason => frame({ type: 'message_delta', delta: { stop_reason: reason, stop_sequence: null }, usage: { output_tokens: 4 } }) + frame({ type: 'message_stop' });
+// Current native responses include these nullable metadata fields even without container tools.
+const finish = reason => frame({ type: 'message_delta', delta: { stop_reason: reason, stop_sequence: null, stop_details: null, container: null }, usage: { output_tokens: 4 } }) + frame({ type: 'message_stop' });
 const nativePrefix = [
   { type: 'thinking', thinking: 'local plan', signature: 'fixture-signature-A+B/==' },
   { type: 'redacted_thinking', data: 'opaque-native-A+B/==' },
