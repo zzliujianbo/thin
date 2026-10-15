@@ -68,9 +68,34 @@ pub fn rawTokens(system: []const u8, tools: []const p.ToolSchema, messages: []co
     return n;
 }
 
-/// 输入预算 = 上下文窗口 - 最大输出 - 安全余量。配置校验已保证结果为正数。
+/// Reserve one output token for hard input preflight. Neither a model maximum
+/// nor an explicit request ceiling is a permanent context reservation: both are
+/// clamped to the actual room when constructing each request.
 pub fn inputBudget(config: cfg.Config) usize {
-    return config.model.context_tokens - config.limits.max_output_tokens - config.limits.safety_tokens;
+    return @as(usize, config.model.context_tokens) -| config.limits.safety_tokens -| 1;
+}
+
+/// Independent summary policy: about 1/64 of the usable context, bounded to
+/// 2048..16384 before model, explicit request and actual headroom ceilings.
+/// This is a request policy, not an inferred model capability. Explicit summary
+/// values retain their meaning, including values below the automatic floor.
+pub fn summaryBudget(config: cfg.Config) u32 {
+    const desired: u32 = config.limits.summary_tokens orelse @intCast(@min(@as(usize, 16384), @max(@as(usize, 2048), inputBudget(config) / 64)));
+    return @min(desired, @min(config.model.output_tokens orelse desired, config.limits.max_output_tokens orelse desired));
+}
+
+/// Per-request budget, based on this purpose's complete serialized-message
+/// estimate (including summary instructions), never cumulative provider usage.
+/// Saturating arithmetic also handles a saturated calibrated input estimate.
+pub fn outputBudget(config: cfg.Config, purpose: p.Purpose, estimated_input: usize) !u32 {
+    const available = @as(usize, config.model.context_tokens) -| estimated_input -| config.limits.safety_tokens;
+    const desired = if (purpose == .summary)
+        summaryBudget(config)
+    else
+        config.limits.max_output_tokens orelse config.model.output_tokens orelse 4096;
+    const budget = @min(@as(usize, desired), available);
+    if (budget == 0) return error.ContextTooLarge;
+    return @intCast(budget);
 }
 
 /// 按百分比计算阈值（向下取整）。
@@ -161,6 +186,18 @@ pub const Plan = struct {
 /// prefix if necessary, allowing plain long tool turns to compact safely too.
 /// 中文：选择一个较早的、已闭合的前缀进行压缩。若当前用户请求位于前缀内，会在 commit 时单独复制保留。
 pub fn plan(a: std.mem.Allocator, config: cfg.Config, estimator: Estimator, system: []const u8, tools: []const p.ToolSchema, messages: []const p.Message, protected_index: usize) !Plan {
+    return planWithMode(a, config, estimator, system, tools, messages, protected_index, .automatic);
+}
+
+/// Explicit compaction selects the largest safe old prefix, even when the
+/// context is already below the automatic target. All retention rules match plan.
+pub fn planManual(a: std.mem.Allocator, config: cfg.Config, estimator: Estimator, system: []const u8, tools: []const p.ToolSchema, messages: []const p.Message, protected_index: usize) !Plan {
+    return planWithMode(a, config, estimator, system, tools, messages, protected_index, .manual);
+}
+
+const PlanningMode = enum { automatic, manual };
+
+fn planWithMode(a: std.mem.Allocator, config: cfg.Config, estimator: Estimator, system: []const u8, tools: []const p.ToolSchema, messages: []const p.Message, protected_index: usize, mode: PlanningMode) !Plan {
     // 受保护的消息必须存在且是用户消息。
     if (protected_index >= messages.len or messages[protected_index].role != .user) return error.InvalidProtectedMessage;
     const safe = try boundaries(a, messages);
@@ -200,7 +237,7 @@ pub fn plan(a: std.mem.Allocator, config: cfg.Config, estimator: Estimator, syst
         best = cut;
 
         // 一旦压缩后（加上摘要预算）已低于目标阈值就提前停止，尽量少压缩。
-        if (estimator.tokens(retained) +| config.limits.summary_tokens <= target) break;
+        if (mode == .automatic and estimator.tokens(retained) +| summaryBudget(config) <= target) break;
     }
     return .{ .cut = best orelse return error.NoCompactionCandidate, .protected_index = protected_index, .before_tokens = before };
 }

@@ -146,7 +146,7 @@ const Driver = struct {
             try self.drain(20);
             const bytes = self.output[start..self.used];
             var from: usize = 0;
-            const busy_prefix = "%\x1b[0m) "; // Animated percentage resets before closing parenthesis.
+            const busy_prefix = "%\x1b[0m) "; // Static occupancy color resets before closing parenthesis.
             while (std.mem.indexOfPos(u8, bytes, from, busy_prefix)) |prefix| {
                 from = prefix + busy_prefix.len;
                 const marker = from; // No effort color (or other SGR) before neutral braille.
@@ -267,9 +267,15 @@ const Driver = struct {
             const translated_leave = "\x18\x1b[0m\x1b[?2004l\x1b[?2026l\x1b[?25h\r\r\n";
             const exit_at = std.mem.lastIndexOf(u8, bytes[0..at.?], leave) orelse std.mem.lastIndexOf(u8, bytes[0..at.?], translated_leave);
             try check(exit_at != null);
-            try check(std.mem.indexOfScalar(u8, bytes[at.?..], 0x1b) == null);
-            const tail = std.mem.trim(u8, bytes[exit_at.? + (if (std.mem.startsWith(u8, bytes[exit_at.?..], leave)) leave.len else translated_leave.len) ..], "\r\n");
-            try check(std.mem.eql(u8, tail, bytes[at.? .. at.? + prefix.len + 32]));
+            const after_leave = exit_at.? + (if (std.mem.startsWith(u8, bytes[exit_at.?..], leave)) leave.len else translated_leave.len);
+            // Only the terminal leave, a blank separator, the green command and
+            // its reset may follow; no other escape or stray byte.
+            const theme = @import("../ui/theme.zig");
+            var expected_buffer: [128]u8 = undefined;
+            const expected_tail = std.fmt.bufPrint(&expected_buffer, "\n{s}thin --resume {s}{s}\n", .{ theme.success, id, theme.reset }) catch unreachable;
+            var translated_buffer: [128]u8 = undefined;
+            const translated_tail = std.fmt.bufPrint(&translated_buffer, "\r\n{s}thin --resume {s}{s}\r\n", .{ theme.success, id, theme.reset }) catch unreachable;
+            try check(std.mem.eql(u8, bytes[after_leave..], expected_tail) or std.mem.eql(u8, bytes[after_leave..], translated_tail));
             // Only validated immutable metadata leaves this capture buffer.
             std.debug.print("PTY_SESSION_ID={s}\n", .{id});
         } else try check(at == null); // Signal/headless exits do not announce it.
@@ -317,7 +323,20 @@ fn settingsColor(d: *const Driver, start: usize, level: []const u8) !void {
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, bytes, from, color)) |at| {
         from = at + color.len;
-        if (std.mem.startsWith(u8, bytes[from..], "fixture-model\x1b[0m ") and std.mem.startsWith(u8, bytes[from + "fixture-model\x1b[0m ".len ..], color)) return;
+        const model_end = "fixture-model\x1b[0m ";
+        if (!std.mem.startsWith(u8, bytes[from..], model_end)) continue;
+        const slot = bytes[from + model_end.len ..];
+        // A level confirmation keeps effort color; an actual percentage uses
+        // occupancy, independent of the model's configured effort.
+        if (std.mem.startsWith(u8, slot, color) and std.mem.startsWith(u8, slot[color.len..], level) and std.mem.startsWith(u8, slot[color.len + level.len ..], "\x1b[0m) > ")) return;
+        if (std.mem.startsWith(u8, slot, "\x1b[0m?%\x1b[0m) > ")) return;
+        const green = "\x1b[38;5;114m";
+        if (!std.mem.startsWith(u8, slot, green)) continue;
+        var end = green.len;
+        while (end < slot.len and (std.ascii.isDigit(slot[end]) or slot[end] == '.')) : (end += 1) {}
+        if (!std.mem.startsWith(u8, slot[end..], "%\x1b[0m) > ")) continue;
+        const percent = std.fmt.parseFloat(f64, slot[green.len..end]) catch continue;
+        if (percent >= 0 and percent < 25) return;
     }
     return error.SettingsColorMismatch;
 }
@@ -474,6 +493,31 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
         // 初始化只验证待配置界面；不输入密钥或发送消息，避免连接默认公共端点。
         try d.waitText(0, "/login");
+    } else if (std.mem.eql(u8, mode, "manual-compact")) {
+        var start = d.used;
+        try d.send("manual-first\r");
+        try d.waitText(start, "manual-first-answer");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("manual-second\r");
+        try d.waitText(start, "manual-second-answer");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("/co");
+        try d.waitFrame(start, "/compact  Compact conversation");
+        start = d.used;
+        try d.send("\r");
+        try d.waitText(start, "Context compacted:");
+        try d.waitIdle(start);
+        const compacted = try d.screen();
+        try check(compacted.visible("Context compacted:"));
+        try check(!compacted.visible("Unknown command"));
+    } else if (std.mem.eql(u8, mode, "read-error")) {
+        const start = d.used;
+        try d.send("read-missing\r");
+        try d.waitFrame(start, "[error] FileNotFound: file not found");
+        try d.waitText(start, "read-error-answer");
+        try d.waitIdle(start);
     } else if (std.mem.eql(u8, mode, "menu-navigation")) {
         // Offline only: no message or credential is submitted. Every navigation
         // waits for a complete owned frame before a subsequent confirmation.
@@ -482,7 +526,10 @@ pub fn main(init: std.process.Init) !void {
         try d.waitFrame(start, "/login");
         try d.checkMenu("/model", ") > /");
         start = d.used;
-        try d.send("\x1b[A"); // Up wraps the first root row to /login.
+        const commands = try d.screen();
+        try check(commands.visible("/model [exact-id|--refresh]  Select model"));
+        try check(commands.visible("/compact  Compact conversation"));
+        try d.send("\x1b[B"); // /model -> /login; /compact is the third root row.
         try d.waitFrame(start, "");
         start = d.used;
         try d.send("\r");
@@ -506,7 +553,7 @@ pub fn main(init: std.process.Init) !void {
         try d.send("\x1b[B");
         try d.waitFrame(start, "");
         start = d.used;
-        try d.send("\x1b[B"); // Down wraps /login back to /model.
+        try d.send("\x1b[A"); // Up from /login returns to /model.
         try d.waitFrame(start, "");
         start = d.used;
         try d.send("\r");
@@ -822,7 +869,7 @@ pub fn main(init: std.process.Init) !void {
             defer a.free(expected);
             try check(std.mem.indexOf(u8, markdown_output, expected) != null);
         }
-        try check(std.mem.indexOf(u8, markdown_output, "(\x1b[38;5;75mfixture-model\x1b[0m \x1b[38;5;75m") != null); // Configured high idle prefix, not stream duration.
+        try check(std.mem.indexOf(u8, markdown_output, "(\x1b[38;5;75mfixture-model\x1b[0m \x1b[38;5;114m0.3%\x1b[0m) > ") != null); // High model, static green occupancy.
         try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;75m>\x1b[0m") == null);
         for (stage.grid[22]) |byte| try check(byte == ' ');
         try check(stage.row == 23);
@@ -841,7 +888,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, mode, "tool-icons")) {
         const start = d.used;
         // Startup already shows configured high on idle text, not the marker.
-        try check(std.mem.indexOf(u8, d.output[0..start], "(\x1b[38;5;75mfixture-model\x1b[0m \x1b[38;5;75m") != null);
+        try check(std.mem.indexOf(u8, d.output[0..start], "(\x1b[38;5;75mfixture-model\x1b[0m \x1b[38;5;114m0.0%\x1b[0m) > ") != null);
         try check(std.mem.indexOf(u8, d.output[0..start], "%\x1b[0m) > ") != null);
         try check(std.mem.indexOf(u8, d.output[0..start], "\x1b[38;5;75m>\x1b[0m") == null);
         try d.send("tool-icon-task\r");
@@ -1069,7 +1116,7 @@ pub fn main(init: std.process.Init) !void {
         try d.waitIdle(start);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "fixture-next") != null);
         // The initialized project preference (off) wins over the profile's low.
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;245mfixture-next\x1b[0m \x1b[38;5;245m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;245mfixture-next\x1b[0m \x1b[0m?%\x1b[0m) > ") != null);
         start = d.used;
         try d.send("\x1b[Z\x1b[Z\x1b[Z"); // off -> minimal -> low -> medium.
         // Observe the acknowledged confirmation, then its automatic expiry.

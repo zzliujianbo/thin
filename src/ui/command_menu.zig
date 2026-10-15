@@ -2,11 +2,12 @@
 const std = @import("std");
 const text = @import("text.zig");
 
-pub const Command = enum { model, auth };
-pub const Item = struct { command: Command, value: []const u8, description: []const u8 };
+pub const Command = enum { model, auth, compact };
+pub const Item = struct { command: Command, value: []const u8, arguments: []const u8 = "", description: []const u8 };
 pub const items = [_]Item{
-    .{ .command = .model, .value = "/model", .description = "Select model" },
+    .{ .command = .model, .value = "/model", .arguments = "[exact-id|--refresh]", .description = "Select model" },
     .{ .command = .auth, .value = "/login", .description = "Configure provider" },
+    .{ .command = .compact, .value = "/compact", .description = "Compact conversation" },
 };
 
 pub const Matches = struct {
@@ -57,7 +58,7 @@ pub fn rows(a: std.mem.Allocator, matches: Matches, selected: usize, columns: us
     const start = @min(selected_ -| (count / 2), matches.len - count);
     for (matches.commands[start .. start + count], start..) |command, index| {
         const item = info(command);
-        const raw = try std.fmt.allocPrint(a, "{s}{s}  {s}", .{ if (index == selected_) "> " else "  ", item.value, item.description });
+        const raw = try std.fmt.allocPrint(a, "{s}{s}{s}{s}  {s}", .{ if (index == selected_) "> " else "  ", item.value, if (item.arguments.len != 0) " " else "", item.arguments, item.description });
         defer a.free(raw);
         const line = try singleLine(a, raw, columns);
         errdefer a.free(line);
@@ -110,11 +111,17 @@ pub const Menu = struct {
     }
 };
 
-test "slash suggestions contain only model and login and support local fuzzy search" {
+test "slash suggestions preserve model login compact order and support local fuzzy search" {
     const all = suggestions("/", 1, false);
-    try std.testing.expectEqual(@as(usize, 2), all.len);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
     try std.testing.expectEqual(Command.model, all.commands[0]);
     try std.testing.expectEqual(Command.auth, all.commands[1]);
+    try std.testing.expectEqual(Command.compact, all.commands[2]);
+    for ([_][]const u8{ "/co", "/CPT", "/compact" }) |query| {
+        const found = suggestions(query, query.len, false);
+        try std.testing.expectEqual(@as(usize, 1), found.len);
+        try std.testing.expectEqual(Command.compact, found.commands[0]);
+    }
     for ([_][]const u8{ "/mo", "/MD", "/model" }) |query| {
         const found = suggestions(query, query.len, false);
         try std.testing.expectEqual(@as(usize, 1), found.len);
@@ -126,7 +133,7 @@ test "slash suggestions contain only model and login and support local fuzzy sea
 }
 
 test "slash suggestions exclude arguments multiline prompts paste and mid-token cursor" {
-    for ([_][]const u8{ "", "hello /", " /model", "/login key", "/model\n", "/unknown", "/../" }) |value|
+    for ([_][]const u8{ "", "hello /", " /model", "/login key", "/model\n", "/unknown", "/../", "/compact now", "/压缩", "/compact1" }) |value|
         try std.testing.expectEqual(@as(usize, 0), suggestions(value, value.len, false).len);
     try std.testing.expectEqual(@as(usize, 0), suggestions("/login", 6, true).len);
     try std.testing.expectEqual(@as(usize, 0), suggestions("/model", 3, false).len);
@@ -140,7 +147,7 @@ test "command rows are bounded clipped and mark the selection" {
         for (rendered.lines) |line| a.free(line);
         a.free(rendered.lines);
     }
-    try std.testing.expectEqual(@as(usize, 2), rendered.lines.len);
+    try std.testing.expectEqual(@as(usize, 3), rendered.lines.len);
     try std.testing.expect(rendered.can_confirm);
     try std.testing.expectEqual(@as(usize, 1), rendered.selected_line.?);
     try std.testing.expect(std.mem.indexOf(u8, rendered.lines[1], "> ") != null);
@@ -148,6 +155,45 @@ test "command rows are bounded clipped and mark the selection" {
     const none = try rows(a, .{}, 0, 24, 8);
     defer a.free(none.lines);
     try std.testing.expectEqual(@as(usize, 0), none.lines.len);
+}
+
+test "command rows show optional arguments and descriptions" {
+    const a = std.testing.allocator;
+    const rendered = try rows(a, suggestions("/", 1, false), 0, 80, 8);
+    defer {
+        for (rendered.lines) |line| a.free(line);
+        a.free(rendered.lines);
+    }
+    try std.testing.expectEqualStrings("> /model [exact-id|--refresh]  Select model", rendered.lines[0]);
+    try std.testing.expectEqualStrings("  /login  Configure provider", rendered.lines[1]);
+    try std.testing.expectEqualStrings("  /compact  Compact conversation", rendered.lines[2]);
+    try std.testing.expectEqualStrings("", info(.auth).arguments);
+    try std.testing.expectEqualStrings("", info(.compact).arguments);
+}
+
+test "command confirmation needs only the complete command and keeps selection in a narrow window" {
+    const a = std.testing.allocator;
+    const all = suggestions("/", 1, false);
+    for (all.commands[0..all.len], 0..) |command, selected| {
+        const command_width = 2 + text.width(info(command).value);
+        for (0..command_width + 3) |width| {
+            const rendered = try rows(a, all, selected, width, 1);
+            defer {
+                for (rendered.lines) |line| a.free(line);
+                a.free(rendered.lines);
+            }
+            try std.testing.expectEqual(@as(usize, 1), rendered.lines.len);
+            try std.testing.expectEqual(@as(usize, 0), rendered.selected_line.?);
+            try std.testing.expect(text.width(rendered.lines[0]) <= width);
+            try std.testing.expectEqual(width >= command_width, rendered.can_confirm);
+            if (width == command_width) {
+                try std.testing.expectEqualStrings(info(command).value, rendered.lines[0][2..]);
+            }
+        }
+    }
+    const clipped = try singleLine(a, "中a文", 4);
+    defer a.free(clipped);
+    try std.testing.expectEqualStrings("中a", clipped);
 }
 
 test "command rows never authorize a hidden or clipped command" {
@@ -172,10 +218,13 @@ test "slash selection wraps and dismissal lasts until an edit" {
     var menu: Menu = .{};
     const all = suggestions("/", 1, false);
     menu.move(false, all.len);
+    try std.testing.expectEqual(Command.compact, menu.choice(all).?);
+    menu.move(true, all.len);
+    try std.testing.expectEqual(Command.model, menu.choice(all).?);
+    menu.move(true, all.len);
     try std.testing.expectEqual(Command.auth, menu.choice(all).?);
     menu.move(true, all.len);
-    menu.move(true, all.len);
-    try std.testing.expectEqual(Command.auth, menu.choice(all).?);
+    try std.testing.expectEqual(Command.compact, menu.choice(all).?);
     const generation = menu.generation;
     menu.dismiss();
     try std.testing.expect(menu.generation != generation and menu.choice(all) == null);

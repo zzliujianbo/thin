@@ -6,6 +6,49 @@ const j = @import("../util/json.zig");
 const c = @import("common.zig");
 const test_support = @import("../tests/adapter_test_support.zig");
 
+test "chat output limit explicit reasoning cap preserves usage and requires DONE" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |done| {
+        var s = Stream.init(a, test_support.chat_scope, .{});
+        try s.feed("", "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"plan\"},\"finish_reason\":\"length\"}],\"usage\":{\"completion_tokens\":4096,\"completion_tokens_details\":{\"reasoning_tokens\":4096}}}");
+        if (!done) {
+            try std.testing.expectError(error.TruncatedStream, s.finish());
+            continue;
+        }
+        try s.feed("", "[DONE]");
+        const f = (try s.finish()).failure;
+        try std.testing.expectEqual(p.FailureKind.output_limit, f.kind);
+        try std.testing.expect(f.observed_content);
+        try std.testing.expectEqual(@as(?u64, 4096), f.usage.output_tokens);
+        try std.testing.expectEqual(@as(?u64, 4096), f.usage.reasoning_tokens);
+        try std.testing.expect(f.raw_usage_json != null);
+        try std.testing.expectError(error.InvalidStreamState, s.finish());
+    }
+}
+
+test "chat output limit partial tools never commit and counters do not imply cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s = Stream.init(a, test_support.chat_scope, .{});
+    try s.feed("", "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"f\",\"arguments\":\"{\"}}]},\"finish_reason\":\"length\"}]}");
+    try s.feed("", "[DONE]");
+    try std.testing.expectEqual(p.FailureKind.output_limit, (try s.finish()).failure.kind);
+    for ([_][]const u8{ "stop", "content_filter" }) |reason| {
+        s = Stream.init(a, test_support.chat_scope, .{});
+        try s.feed("", try std.fmt.allocPrint(a, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"text\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"completion_tokens\":4096,\"completion_tokens_details\":{{\"reasoning_tokens\":4096}}}}}}", .{reason}));
+        try s.feed("", "[DONE]");
+        const out = try s.finish();
+        if (c.eq(reason, "stop")) try std.testing.expect(out == .success) else try std.testing.expectEqual(p.FailureKind.model, out.failure.kind);
+    }
+    s = Stream.init(a, test_support.chat_scope, .{});
+    try s.feed("", "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}");
+    try std.testing.expectError(error.InvalidStreamState, s.feed("", "{\"choices\":[{\"index\":0,\"delta\":{}}]}"));
+    try std.testing.expectError(error.InvalidStreamState, s.finish());
+}
+
 test "chat write preview recognizes split names before arguments and revokes changed names" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -416,6 +459,7 @@ pub const Stream = struct {
     ended: bool = false,
     // 上游报错或结束原因不被接受，最终转为失败结果。
     failed: bool = false,
+    output_limited: bool = false,
     // 任一 feed 出错后置位，流不可再用。
     poisoned: bool = false,
     // finish 已调用，禁止重复结束。
@@ -557,11 +601,11 @@ pub const Stream = struct {
                 } else try c.put(self.a, &self.native, try self.a.dupe(u8, key), try c.clone(self.a, val));
             }
 
-            // 只接受 stop 与 tool_calls；其他原因（length、content_filter 等）标记失败。
+            // length is an explicit cap, but still requires the final [DONE].
             if (j.get(choice, "finish_reason")) |reason| if (reason != .null) {
                 const s = j.string(reason) orelse return error.InvalidEvent;
                 self.ended = true;
-                if (c.eq(s, "stop")) self.finish_reason = .stop else if (c.eq(s, "tool_calls")) self.finish_reason = .tool_calls else self.failed = true;
+                if (c.eq(s, "stop")) self.finish_reason = .stop else if (c.eq(s, "tool_calls")) self.finish_reason = .tool_calls else if (c.eq(s, "length")) self.output_limited = true else self.failed = true;
             };
         }
     }
@@ -641,7 +685,10 @@ pub const Stream = struct {
         if (self.failed) return c.failure(self.observed, self.token_usage, self.raw_usage);
 
         // 缺少 [DONE] 或 finish_reason 说明流被截断，不能当作完整响应。
-        if (!self.done or !self.ended or self.finish_reason == null) return error.TruncatedStream;
+        if (!self.done or !self.ended) return error.TruncatedStream;
+        // Do not construct a Response/replay or validate partial tool arguments as a success.
+        if (self.output_limited) return c.outputLimit(self.observed, self.token_usage, self.raw_usage);
+        if (self.finish_reason == null) return error.TruncatedStream;
 
         // finish_reason 与是否存在工具调用必须一致。
         if ((self.finish_reason.? == .tool_calls) != (self.calls.items.len != 0)) return error.InvalidFinishReason;

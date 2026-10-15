@@ -253,6 +253,25 @@ try {
           return send(res, textStream(chat));
         }
 
+        if (scenario.startsWith('output-limit') || scenario.startsWith('limit-tools')) {
+          assert.equal(body.max_completion_tokens ?? body.max_tokens ?? body.max_output_tokens, 4096);
+          const partialTool = scenario.startsWith('limit-tools');
+          const silent = scenario.endsWith('-auto');
+          const usage = chat
+            ? {prompt_tokens:45871, completion_tokens:4096, completion_tokens_details:{reasoning_tokens:4096}}
+            : {input_tokens:45871, output_tokens:4096, output_tokens_details:{reasoning_tokens:4096}};
+          if (chat) {
+            const delta = partialTool
+              ? {tool_calls:[{index:0, id:'incomplete-call', type:'function', function:{name:'lookup', arguments:'{'}}]}
+              : {reasoning_content:'budget reasoning only'};
+            return send(res, frame(chatDelta(delta)) + frame(chatDelta({}, 'length')) + frame({choices:[], usage}) + frame('[DONE]'));
+          }
+          const draft = partialTool
+            ? frame({type:'response.output_item.added', output_index:0, item:{...tool(''), status:'in_progress'}}) + frame({type:'response.function_call_arguments.delta', output_index:0, item_id:'fc_actual', delta:'{'}) + frame({type:'response.function_call_arguments.done', output_index:0, item_id:'fc_actual', arguments:'{'}) + frame({type:'response.output_item.done', output_index:0, item:{...tool('{'), status:'incomplete'}})
+            : silent ? '' : frame({type:'response.output_item.added', output_index:0, item:{type:'reasoning', id:'rs_actual'}}) + frame({type:'response.reasoning_summary_text.delta', output_index:0, item_id:'rs_actual', delta:'budget reasoning only'});
+          return send(res, draft + frame({type:'response.incomplete', response:{status:'incomplete', incomplete_details:{reason:'max_output_tokens'}, usage}}));
+        }
+
         // missing 场景：流在完成前结束，缺少完成事件。
         if (scenario.startsWith('missing')) return send(res, chat ? frame(chatDelta({ content: 'draft' })) : frame({ type: 'response.created', response: { id: 'r' } }));
 
@@ -314,7 +333,7 @@ try {
       const endpoint = protocol === 'chat' ? 'chat/completions' : 'responses';
       expected.set(`split-${protocol}:${endpoint}`, 1);
       expected.set(`tools-${protocol}:${endpoint}`, 3);
-      for (const scenario of ['missing', 'truncated', 'invalid', 'incomplete', 'redirect']) expected.set(`${scenario}-${protocol}:${endpoint}`, 1);
+      for (const scenario of ['missing', 'truncated', 'invalid', 'incomplete', 'redirect', 'output-limit', 'limit-tools']) expected.set(`${scenario}-${protocol}:${endpoint}`, 1);
     }
 
     for (const transport of ['tcp', 'tls']) for (const protocol of ['chat', 'responses']) {
@@ -323,6 +342,7 @@ try {
     }
     for (const scenario of ['lock-cancel', 'lock-timeout']) expected.set(`${scenario}:chat/completions`, 1);
 
+    expected.set('output-limit-auto:responses', 1);
     // auto 场景：Responses 只请求 1 次（404），Chat 请求 2 次。
     expected.set('auto:responses', 1); expected.set('auto:chat/completions', 2);
     for (const status of [404, 400, 401, 403, 429, 503]) expected.set(`error${status}:responses`, 1);

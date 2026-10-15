@@ -48,6 +48,15 @@ pub const model_fast = [_][]const u8{
     "\x1b[38;5;120m", "\x1b[38;5;84m",  "\x1b[38;5;78m",  "\x1b[38;5;72m",
 };
 
+/// Static retained-context occupancy, using the same rounded tenths as the label.
+/// Unknown capacity stays neutral; neither TPS nor effort changes this color.
+pub fn contextColor(tenths: ?u128) []const u8 {
+    const value = tenths orelse return reset;
+    if (value < 250) return success;
+    if (value < 500) return "\x1b[38;5;220m";
+    return failure;
+}
+
 pub fn modelPalette(band: activity.RateBand) []const []const u8 {
     return switch (band) {
         .unknown, .standard => &model_flow,

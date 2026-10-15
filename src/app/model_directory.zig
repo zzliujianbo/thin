@@ -57,6 +57,10 @@ pub const Record = struct {
     offset: u32,
     len: u16,
     tokens: ?u32 = null,
+    output_tokens: ?u32 = null,
+    dev_output_tokens: ?u32 = null,
+    /// Exact models.dev limit.context; never an official window.
+    dev_context_tokens: ?u32 = null,
     available: ?bool = null,
     protocol: Protocol = .auto,
     dev_protocol: Protocol = .auto,
@@ -126,6 +130,7 @@ test "directory owns exact provider keys and metadata across value copies" {
     var input = [_]u8{ 'n', 'e', 'w', '/', 'i', 'd' };
     const row = try original.upsert(.opencode_go, &input);
     row.tokens = 123;
+    row.dev_context_tokens = 456;
     row.available = true;
     row.protocol = .chat;
     row.dev_protocol = .anthropic;
@@ -150,6 +155,7 @@ test "directory owns exact provider keys and metadata across value copies" {
     try t.expect(dest.rows[1].offset != copied.rows[0].offset);
     try t.expectEqualStrings("new/id", dest.name(1));
     try t.expectEqual(@as(?u32, 123), dest.rows[1].tokens);
+    try t.expectEqual(@as(?u32, 456), dest.rows[1].dev_context_tokens);
     try t.expectEqual(true, dest.rows[1].available.?);
     try t.expectEqual(Protocol.chat, dest.rows[1].protocol);
     try t.expectEqual(Protocol.anthropic, dest.rows[1].dev_protocol);

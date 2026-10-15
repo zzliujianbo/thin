@@ -83,6 +83,55 @@ pub const Completion = struct {
     }
 };
 
+/// Read failures are known local error identifiers, never arbitrary tool output
+/// or JSON. Exact matching keeps hostile/control/secret-bearing bodies out of
+/// captions; all returned strings are static and frontend-neutral.
+pub fn readFailure(result: r.Execution) ?[]const u8 {
+    if (!result.is_error or result.canceled) return null;
+    const reasons = .{
+        .{ "FileNotFound", "FileNotFound: file not found" },
+        .{ "AccessDenied", "AccessDenied: permission denied" },
+        .{ "OutsideRoot", "OutsideRoot: outside project root" },
+        .{ "PathEscape", "PathEscape: outside project root" },
+        .{ "InvalidPath", "InvalidPath: invalid file path" },
+        .{ "IsDir", "IsDir: path is a directory" },
+        .{ "NotDir", "NotDir: parent is not a directory" },
+        .{ "NotRegularFile", "NotRegularFile: not a regular file" },
+        .{ "SymlinkNotAllowed", "SymlinkNotAllowed: symlink refused" },
+        .{ "BinaryFile", "BinaryFile: binary file is not readable as text" },
+        .{ "InvalidUtf8", "InvalidUtf8: file is not valid UTF-8" },
+        .{ "InvalidOffset", "InvalidOffset: invalid byte offset" },
+        .{ "InvalidLimit", "InvalidLimit: invalid read limit" },
+        .{ "InvalidReadLimit", "InvalidReadLimit: invalid read limit" },
+        .{ "ReadLimitTooSmall", "ReadLimitTooSmall: limit cannot fit a character" },
+        .{ "NameTooLong", "NameTooLong: file path is too long" },
+        .{ "FileChanged", "FileChanged: file changed while reading" },
+        .{ "ProtectedAuthFile", "ProtectedAuthFile: protected credential file" },
+        .{ "ProtectedSettingsFile", "ProtectedSettingsFile: protected settings" },
+        .{ "ProtectedSessionFile", "ProtectedSessionFile: protected session data" },
+        .{ "UseMemoryTool", "UseMemoryTool: use memory tool for this path" },
+        .{ "UnknownField", "UnknownField: unsupported read argument" },
+        .{ "MissingField", "MissingField: required read argument missing" },
+        .{ "ArgumentsTooLarge", "ArgumentsTooLarge: read arguments too large" },
+        .{ "FileSystemError", "FileSystemError: filesystem read failed" },
+        .{ "OutOfMemory", "OutOfMemory: insufficient memory" },
+    };
+    inline for (reasons) |reason| {
+        if (std.mem.eql(u8, result.text, reason[0])) return reason[1];
+    }
+    return "Read failed: details unavailable";
+}
+
+test "read failure captions expose known reasons but never raw tool bodies" {
+    try std.testing.expectEqualStrings("FileNotFound: file not found", readFailure(.{ .text = "FileNotFound", .is_error = true }).?);
+    try std.testing.expectEqualStrings("AccessDenied: permission denied", readFailure(.{ .text = "AccessDenied", .is_error = true }).?);
+    for ([_][]const u8{ "{\"error\":\"private-body\"}", "FileNotFound\nprivate-body", "\x1b[2JFileNotFound", "unknown-private-error" }) |raw| {
+        try std.testing.expectEqualStrings("Read failed: details unavailable", readFailure(.{ .text = raw, .is_error = true }).?);
+    }
+    try std.testing.expect(readFailure(.{ .text = "FileNotFound" }) == null);
+    try std.testing.expect(readFailure(.{ .text = "FileNotFound", .is_error = true, .canceled = true }) == null);
+}
+
 /// 成员拥有各Call；take交出唯一所有权。调用方收到started/result后依次消费，
 /// 包括没有started的prepare失败或deny。只使用canonical块，不采信tool_preview。
 pub const Queue = struct {

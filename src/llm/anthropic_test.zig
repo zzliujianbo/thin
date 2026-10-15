@@ -23,6 +23,91 @@ fn delta(s: *adapter.Stream, index: usize, native: []const u8) !void {
     try s.feed("", try std.fmt.allocPrint(s.a, "{{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{s}}}", .{ index, native }));
 }
 
+test "anthropic output limit requires complete message stop and preserves reasoning usage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "max_tokens", "pause_turn", "model_context_window_exceeded", "end_turn", "stop_sequence", "refusal" }) |reason| {
+        var s = adapter.Stream.init(a, scope, .{});
+        try s.feed("", start);
+        try block(&s, 0, "{\"type\":\"thinking\",\"thinking\":\"plan\",\"signature\":\"signed\"}");
+        try stop(&s, 0);
+        try s.feed("", try std.fmt.allocPrint(a, "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":4096}}}}", .{reason}));
+        try s.feed("", "{\"type\":\"message_stop\"}");
+        const out = try s.finish();
+        if (c.eq(reason, "max_tokens") or c.eq(reason, "pause_turn") or c.eq(reason, "model_context_window_exceeded")) {
+            const f = out.failure;
+            const expected: p.FailureKind = if (c.eq(reason, "max_tokens")) .output_limit else if (c.eq(reason, "pause_turn")) .model else .context_limit;
+            try std.testing.expectEqual(expected, f.kind);
+            try std.testing.expect(f.observed_content and f.raw_usage_json != null);
+            try std.testing.expectEqual(@as(?u64, 4096), f.usage.output_tokens);
+        } else try std.testing.expect(out == .success);
+        try std.testing.expectError(error.InvalidStreamState, s.finish());
+    }
+    var s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try s.feed("", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":4096}}");
+    try std.testing.expectError(error.TruncatedStream, s.finish());
+}
+
+test "anthropic output limit never accepts partial tool arguments or later events" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try block(&s, 0, "{\"type\":\"tool_use\",\"id\":\"x\",\"name\":\"f\",\"input\":{}}");
+    try delta(&s, 0, "{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}");
+    try std.testing.expectError(error.InvalidStreamState, s.feed("", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}"));
+    try std.testing.expectError(error.InvalidStreamState, s.finish());
+    s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try end(&s, "max_tokens");
+    try std.testing.expectError(error.InvalidStreamState, s.feed("", "{\"type\":\"message_stop\"}"));
+    try std.testing.expectError(error.InvalidStreamState, s.finish());
+}
+
+test "anthropic output limit closed partial tool preserves final reason and usage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "{", "{\"path\":\"", "{\"path\":1," }) |fragment| {
+        for ([_]bool{ false, true }) |limited| {
+            var s = adapter.Stream.init(a, scope, .{});
+            try s.feed("", start);
+            try block(&s, 0, "{\"type\":\"tool_use\",\"id\":\"partial\",\"name\":\"write_file\",\"input\":{}}");
+            const text = try j.encode(a, j.str(fragment));
+            try delta(&s, 0, try std.fmt.allocPrint(a, "{{\"type\":\"input_json_delta\",\"partial_json\":{s}}}", .{text}));
+            // A provider may close a tool block whose JSON was cut by max_tokens.
+            // Keep consuming through the authoritative final reason and usage.
+            try stop(&s, 0);
+            try end(&s, if (limited) "max_tokens" else "tool_use");
+            if (limited) {
+                const failure = (try s.finish()).failure;
+                try std.testing.expectEqual(p.FailureKind.output_limit, failure.kind);
+                try std.testing.expectEqual(@as(?u64, 4), failure.usage.output_tokens);
+                try std.testing.expect(failure.raw_usage_json != null and failure.observed_content);
+            } else try std.testing.expectError(error.UnexpectedEndOfInput, s.finish());
+        }
+    }
+}
+
+test "anthropic cap truncated thinking signature never becomes replay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |limited| {
+        var s = adapter.Stream.init(arena.allocator(), scope, .{});
+        try s.feed("", start);
+        try block(&s, 0, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}");
+        try delta(&s, 0, "{\"type\":\"thinking_delta\",\"thinking\":\"unfinished reasoning\"}");
+        try stop(&s, 0);
+        try end(&s, if (limited) "max_tokens" else "end_turn");
+        if (limited) {
+            try std.testing.expectEqual(p.FailureKind.output_limit, (try s.finish()).failure.kind);
+        } else try std.testing.expectError(error.InvalidReplay, s.finish());
+    }
+}
+
 test "anthropic fragmented text tool JSON ordinal preview and usage" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -178,7 +263,7 @@ test "anthropic errors truncation invalid sequence duplicate IDs bounds and sink
         try s.feed("", start);
         try end(&s, reason);
         const failed = (try s.finish()).failure;
-        try std.testing.expectEqual(if (c.eq(reason, "model_context_window_exceeded")) p.FailureKind.context_limit else p.FailureKind.model, failed.kind);
+        try std.testing.expectEqual(if (c.eq(reason, "max_tokens")) p.FailureKind.output_limit else if (c.eq(reason, "model_context_window_exceeded")) p.FailureKind.context_limit else p.FailureKind.model, failed.kind);
     }
 }
 
@@ -241,7 +326,9 @@ test "anthropic block grammar unknown native types and unfinished tools fail clo
     try s.feed("", start);
     try block(&s, 0, "{\"type\":\"tool_use\",\"id\":\"x\",\"name\":\"f\",\"input\":{}}");
     try delta(&s, 0, "{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}");
-    if (stop(&s, 0)) |_| return error.ExpectedFailure else |_| {}
+    try stop(&s, 0);
+    try end(&s, "tool_use");
+    try std.testing.expectError(error.UnexpectedEndOfInput, s.finish());
     try std.testing.expectError(error.InvalidStreamState, s.finish());
     s = adapter.Stream.init(a, scope, .{});
     try s.feed("", start);

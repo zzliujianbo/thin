@@ -16,7 +16,17 @@ pub fn write(writer: *std.Io.Writer, label: []const u8, detail: ?anyerror, kind:
             403 => "; access denied; check workspace/model permissions",
             else => "; check credentials and access permissions",
         });
+        if (failure == .output_limit) try writer.writeAll("; output token limit reached; raise limits.max_output_tokens or lower reasoning effort");
     }
+}
+
+test "output limit pause explains shared output budget without implying network failure" {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try write(&writer, "Paused", error.OutputLimitReached, .output_limit, null);
+    try std.testing.expectEqualStrings("Paused: OutputLimitReached / output_limit; output token limit reached; raise limits.max_output_tokens or lower reasoning effort", writer.buffered());
+    try std.testing.expect(std.mem.find(u8, writer.buffered(), "HTTP") == null);
+    try std.testing.expect(std.mem.find(u8, writer.buffered(), "ModelRequestFailed") == null);
 }
 
 test "failure diagnostics expose HTTP status early without provider text" {

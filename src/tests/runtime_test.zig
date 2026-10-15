@@ -1215,6 +1215,452 @@ test "disconnect publishing a committed tool batch still closes every call" {
     _ = try context.boundaries(arena.allocator(), runtime.messages());
 }
 
+fn seedManualHistory(runtime: *r.Runtime) !void {
+    try runtime.restoreCheckpoint(.{
+        .system = "fixture",
+        .messages = &.{
+            .{ .role = .user, .blocks = &.{.{ .text = "old goal" }} },
+            .{ .role = .assistant, .blocks = &.{.{ .text = &long_output }} },
+            .{ .role = .user, .blocks = &.{.{ .text = "Do the task" }} },
+            .{ .role = .assistant, .blocks = &.{.{ .text = "latest answer" }} },
+        },
+        .selector = .init(.chat),
+        .estimator = .{},
+        .last_context_tokens = 500,
+        .permission_id = 0,
+    });
+    // Deliberately not the latest user: failures must restore this exact value.
+    runtime.protected_index = 0;
+}
+
+const OutputLimitFixture = struct {
+    normal: usize = 0,
+    summaries: usize = 0,
+    executions: usize = 0,
+    finished: usize = 0,
+    limited: bool = true,
+
+    fn call(raw: *anyopaque, _: std.mem.Allocator, request: p.Request, sink: p.ModelSink) !p.Outcome {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (request.purpose == .summary) self.summaries += 1 else self.normal += 1;
+        try std.testing.expectEqual(@as(u32, 4096), request.max_output_tokens);
+        try std.testing.expectEqualStrings("max", request.reasoning_effort.?);
+        if (!self.limited) return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .text = "continued" }} }, .finish = .stop } };
+        try sink.emit(.{ .reasoning_delta = "reasoning-only preview" });
+        return .{ .failure = .{ .kind = .output_limit, .message = "output token limit reached", .observed_content = true, .usage = .{ .input_tokens = 45871, .output_tokens = 4096, .reasoning_tokens = 4096 } } };
+    }
+    fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !r.Prepared {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.executions += 1;
+        return error.UnexpectedTool;
+    }
+    fn execute(raw: *anyopaque, _: std.mem.Allocator, _: r.Prepared, _: *const p.Cancellation) !r.Execution {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.executions += 1;
+        return error.UnexpectedTool;
+    }
+    fn event(raw: ?*anyopaque, value: r.Event, _: *const p.Cancellation) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (value == .finished) self.finished += 1;
+    }
+    fn config() cfg.Config {
+        var result = configuration();
+        result.model.context_tokens = 131072;
+        result.model.reasoning_effort = "max";
+        result.model.reasoning = .{ .format = .standard, .map = .{ .max = "max" } };
+        result.limits.max_output_tokens = 4096;
+        result.limits.summary_tokens = 4096;
+        return result;
+    }
+};
+
+test "output limit pauses reasoning-only run without replay budget mutation or tool execution" {
+    var fixture: OutputLimitFixture = .{};
+    var config = OutputLimitFixture.config();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fixture, .call_fn = OutputLimitFixture.call }, .{ .context = &fixture, .schemas = &.{}, .prepare_fn = OutputLimitFixture.prepare, .execute_fn = OutputLimitFixture.execute }, .{ .context = &fixture, .emit_fn = OutputLimitFixture.event }, "", false);
+    defer runtime.deinit();
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run("original goal", &cancel);
+    try std.testing.expectEqual(r.Status.paused, terminal.status);
+    try std.testing.expectEqual(error.OutputLimitReached, terminal.detail.?);
+    try std.testing.expectEqual(p.FailureKind.output_limit, terminal.model_failure.?);
+    try std.testing.expectEqual(@as(usize, 1), fixture.normal);
+    try std.testing.expectEqual(@as(usize, 0), fixture.summaries);
+    try std.testing.expectEqual(@as(usize, 0), fixture.executions);
+    try std.testing.expectEqual(@as(usize, 1), fixture.finished);
+    try std.testing.expectEqual(@as(u32, 1), terminal.usage.normal_calls);
+    try std.testing.expectEqual(@as(?u64, 4096), terminal.usage.normal.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 4096), terminal.usage.normal.reasoning_tokens);
+    try std.testing.expectEqual(@as(usize, 1), runtime.messages().len);
+    try std.testing.expectEqualStrings("original goal", runtime.messages()[0].blocks[0].text);
+    try std.testing.expectEqualDeep(config, runtime.config.*);
+    fixture.limited = false;
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("continue explicitly", &cancel)).status);
+    try std.testing.expectEqual(@as(usize, 2), fixture.normal);
+    try std.testing.expectEqual(@as(usize, 0), fixture.executions);
+}
+
+test "manual summary output limit pauses with history intact and no normal fallback" {
+    var fixture: OutputLimitFixture = .{};
+    var config = OutputLimitFixture.config();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fixture, .call_fn = OutputLimitFixture.call }, .{ .context = &fixture, .schemas = &.{}, .prepare_fn = OutputLimitFixture.prepare, .execute_fn = OutputLimitFixture.execute }, .{ .context = &fixture, .emit_fn = OutputLimitFixture.event }, "", false);
+    defer runtime.deinit();
+    try seedManualHistory(&runtime);
+    const before = runtime.messages();
+    const protected = runtime.protected_index;
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.compactContext(&cancel);
+    try std.testing.expectEqual(r.Status.paused, terminal.status);
+    try std.testing.expectEqual(error.OutputLimitReached, terminal.detail.?);
+    try std.testing.expectEqual(p.FailureKind.output_limit, terminal.model_failure.?);
+    try std.testing.expectEqual(@as(usize, 1), fixture.summaries);
+    try std.testing.expectEqual(@as(usize, 0), fixture.normal);
+    try std.testing.expectEqual(@as(usize, 0), fixture.executions);
+    try std.testing.expectEqual(@as(usize, 1), fixture.finished);
+    try std.testing.expectEqual(@as(u32, 1), terminal.usage.summary_calls);
+    try std.testing.expectEqual(before.ptr, runtime.messages().ptr);
+    try std.testing.expectEqual(before.len, runtime.messages().len);
+    try std.testing.expectEqual(protected, runtime.protected_index);
+}
+
+const ManualCapture = struct {
+    submitted: usize = 0,
+    finished: usize = 0,
+    command_seen: bool = false,
+
+    fn notify(raw: ?*anyopaque, observation: r.Observation) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        switch (observation) {
+            .submitted => |text| {
+                self.submitted += 1;
+                self.command_seen = std.mem.eql(u8, text, "/compact");
+            },
+            .event => |event| if (event == .finished) {
+                self.finished += 1;
+            },
+            else => {},
+        }
+    }
+};
+
+test "manual compaction summary-only Job has one terminal and unknown post-summary context" {
+    var fake: Fake = .{ .summary_usage = .{ .input_tokens = 100, .output_tokens = 10 } };
+    var config = smallConfiguration(); // well BELOW automatic threshold
+    config.limits.compaction_target_percent = 10;
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    try seedManualHistory(&runtime);
+    var capture = ManualCapture{};
+    runtime.observer = .{ .context = &capture, .notify_fn = ManualCapture.notify };
+    var cancel: p.Cancellation = .{};
+    var job: @import("../core/task.zig").Job = .{ .runtime = &runtime, .cancel = &cancel, .kind = .compact, .prompt = "" };
+    job.run();
+    const terminal = try job.result();
+    try std.testing.expectEqual(r.Status.success, terminal.status);
+    try std.testing.expectEqual(@as(u32, 1), fake.summary_calls);
+    try std.testing.expectEqual(@as(u32, 1), fake.compactions);
+    try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 0), fake.executions);
+    try std.testing.expectEqual(@as(u32, 1), fake.terminals);
+    try std.testing.expectEqual(@as(usize, 1), capture.submitted);
+    try std.testing.expectEqual(@as(usize, 1), capture.finished);
+    try std.testing.expect(capture.command_seen);
+    try std.testing.expectEqual(@as(u32, 1), terminal.usage.summary_calls);
+    try std.testing.expectEqual(@as(u32, 0), terminal.usage.normal_calls);
+    try std.testing.expectEqual(@as(?u64, 100), terminal.usage.summary.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 10), terminal.usage.summary.output_tokens);
+    try std.testing.expectEqual(@as(?u64, null), runtime.last_context_tokens);
+    try std.testing.expect(!terminal.context_snapshot.?.known);
+    try std.testing.expect(!fake.last_context.?.known);
+    try std.testing.expectEqualStrings("Do the task", runtime.messages()[runtime.protected_index].blocks[0].text);
+    for (runtime.messages()) |message| for (message.blocks) |block| {
+        if (block == .text) try std.testing.expect(!std.mem.eql(u8, block.text, "/compact"));
+    };
+    try std.testing.expectEqualDeep(config, runtime.config.*);
+}
+
+test "manual compaction below automatic target includes long old assistant and retains latest goal and tail" {
+    // Keep both ordinary short-user chat and long-old-user coverage. Neither
+    // fixture changes thresholds to force a useful automatic prefix selection.
+    for ([_]bool{ false, true }) |long_user| {
+        var fake: Fake = .{ .summary_usage = .{ .input_tokens = 100, .output_tokens = 10 } };
+        const config = configuration();
+        var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
+        defer runtime.deinit();
+        fake.current_runtime = &runtime;
+        try runtime.restoreCheckpoint(.{
+            .system = "fixture",
+            .messages = &.{
+                .{ .role = .user, .blocks = &.{.{ .text = if (long_user) &long_output else "old goal" }} },
+                .{ .role = .assistant, .blocks = &.{.{ .text = &long_output }} },
+                .{ .role = .user, .blocks = &.{.{ .text = "Do the task" }} },
+                .{ .role = .assistant, .blocks = &.{.{ .text = "latest answer" }} },
+            },
+            .selector = .init(.chat),
+            .estimator = .{},
+            .last_context_tokens = 500,
+            .permission_id = 0,
+        });
+        try std.testing.expect(runtime.estimatedTokens() < context.threshold(context.inputBudget(config), config.limits.compaction_trigger_percent));
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        const automatic = try context.plan(scratch.allocator(), config, runtime.estimator, runtime.system, &tool_schemas, runtime.messages(), 2);
+        const manual = try context.planManual(scratch.allocator(), config, runtime.estimator, runtime.system, &tool_schemas, runtime.messages(), 2);
+        try std.testing.expectEqual(@as(usize, 1), automatic.cut);
+        try std.testing.expectEqual(@as(usize, 3), manual.cut);
+        try std.testing.expectEqual(@as(usize, 2), manual.protected_index);
+
+        var cancel: p.Cancellation = .{};
+        const terminal = try runtime.compactContext(&cancel);
+        try std.testing.expectEqual(r.Status.success, terminal.status);
+        try std.testing.expectEqual(@as(u32, 1), fake.summary_calls);
+        try std.testing.expectEqual(@as(u32, 1), fake.compactions);
+        try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
+        try std.testing.expectEqual(@as(u32, 0), fake.executions);
+        try std.testing.expectEqual(@as(u32, 1), fake.terminals);
+        try std.testing.expectEqual(@as(usize, 3), runtime.messages().len);
+        try std.testing.expectEqualStrings("Do the task", runtime.messages()[runtime.protected_index].blocks[0].text);
+        try std.testing.expectEqualStrings("latest answer", runtime.messages()[2].blocks[0].text);
+        try std.testing.expectEqualDeep(config, runtime.config.*);
+    }
+}
+
+test "manual compaction canceled or failed summary preserves canonical history and protected index" {
+    for (0..4) |mode| {
+        var cancel: p.Cancellation = .{};
+        var fake: Fake = .{
+            .cancel_summary = if (mode == 0) &cancel else null,
+            .bad_summary = mode == 1,
+            .throw_summary = mode == 2,
+            .summary_usage = .{ .input_tokens = 100, .output_tokens = 10 },
+        };
+        var config = smallConfiguration();
+        config.limits.compaction_target_percent = 10;
+        var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
+        defer runtime.deinit();
+        fake.current_runtime = &runtime;
+        try seedManualHistory(&runtime);
+        const before = runtime.messages();
+        const tokens = runtime.estimatedTokens();
+        if (mode == 3) cancel.cancel();
+        const terminal = try runtime.compactContext(&cancel);
+        try std.testing.expectEqual(if (mode == 0 or mode == 3) r.Status.canceled else r.Status.failed, terminal.status);
+        try std.testing.expectEqual(@as(u32, if (mode == 3) 0 else 1), fake.summary_calls);
+        try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
+        try std.testing.expectEqual(@as(u32, 0), fake.executions);
+        try std.testing.expectEqual(@as(u32, 0), fake.compactions);
+        try std.testing.expectEqual(@as(u32, 1), fake.terminals);
+        try std.testing.expect(fake.compaction_error != null);
+        try std.testing.expect(before.ptr == runtime.messages().ptr);
+        try std.testing.expectEqualDeep(before, runtime.messages());
+        try std.testing.expectEqual(tokens, runtime.estimatedTokens());
+        try std.testing.expectEqual(@as(usize, 0), runtime.protected_index);
+        try std.testing.expectEqual(@as(u32, if (mode == 1 or mode == 0) 1 else 0), terminal.usage.summary_calls);
+    }
+}
+
+test "manual compaction empty or no candidate is zero-request and Busy is not accepted" {
+    for ([_]bool{ false, true }) |seed| {
+        var fake: Fake = .{};
+        const config = configuration();
+        var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
+        defer runtime.deinit();
+        fake.current_runtime = &runtime;
+        if (seed) try runtime.restoreCheckpoint(.{
+            .system = "fixture",
+            .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "Do the task" }} }},
+            .selector = .init(.chat),
+            .estimator = .{},
+            .last_context_tokens = null,
+            .permission_id = 0,
+        });
+        var capture = ManualCapture{};
+        runtime.observer = .{ .context = &capture, .notify_fn = ManualCapture.notify };
+        var cancel: p.Cancellation = .{};
+        runtime.busy.store(true, .release);
+        try std.testing.expectError(error.Busy, runtime.compactContext(&cancel));
+        try std.testing.expectEqual(@as(usize, 0), capture.submitted);
+        runtime.busy.store(false, .release);
+        const terminal = try runtime.compactContext(&cancel);
+        try std.testing.expectEqual(r.Status.failed, terminal.status);
+        try std.testing.expectEqual(error.NoCompactionCandidate, terminal.detail.?);
+        try std.testing.expectEqual(@as(usize, 1), capture.finished);
+        runtime.poisoned = true;
+        const poisoned = try runtime.compactContext(&cancel);
+        try std.testing.expectEqual(r.Status.failed, poisoned.status);
+        try std.testing.expectEqual(error.CleanupFailed, poisoned.detail.?);
+        try std.testing.expectEqual(@as(u32, 0), fake.summary_calls);
+        try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
+        try std.testing.expectEqual(@as(u32, 2), fake.terminals);
+        try std.testing.expectEqual(@as(usize, 2), capture.submitted);
+        try std.testing.expectEqual(@as(usize, 2), capture.finished);
+    }
+}
+
+test "output budget automatic config explicit caps and metadata provenance" {
+    const t = std.testing;
+    for ([_][]const u8{
+        \\{"provider":{"base_url":"http://localhost"},"model":{"name":"fake","context_tokens":131072}}
+        ,
+        \\{"provider":{"base_url":"http://localhost"},"model":{"name":"fake","context_tokens":131072},"limits":{"max_output_tokens":null}}
+        ,
+    }) |json| {
+        var parsed = try cfg.parse(t.allocator, json);
+        defer cfg.release(&parsed);
+        try t.expectEqual(@as(?u32, null), parsed.value.limits.max_output_tokens);
+        try t.expectEqual(@as(u32, 4096), parsed.value.limits.safety_tokens);
+    }
+    var config = configuration();
+    config.model.context_tokens = 131072;
+    config.model.output_tokens = 131072;
+    config.model.output_source = .metadata;
+    try cfg.validate(config);
+    try t.expectEqual(@as(usize, 126975), context.inputBudget(config));
+    try t.expectEqual(@as(u32, 125976), try context.outputBudget(config, .normal, 1000));
+    try t.expectEqual(@as(u32, 2048), try context.outputBudget(config, .summary, 1000));
+    try t.expectEqual(@as(u32, 976), try context.outputBudget(config, .summary, 126000));
+    config.model.output_tokens = 512;
+    try t.expectEqual(@as(u32, 512), try context.outputBudget(config, .summary, 1000));
+    config.model.output_tokens = 131072;
+    config.limits.max_output_tokens = 131072;
+    try cfg.validate(config);
+    try t.expectEqual(@as(usize, 126975), context.inputBudget(config));
+    try t.expectEqual(@as(u32, 125976), try context.outputBudget(config, .normal, 1000));
+    config.limits.max_output_tokens = 4096;
+    try t.expectEqual(@as(u32, 4096), try context.outputBudget(config, .normal, 1000));
+    try t.expectEqual(@as(u32, 976), try context.outputBudget(config, .normal, 126000));
+    try t.expectEqual(@as(?u32, null), config.model.persisted().output_tokens);
+    var clone = try cfg.clone(t.allocator, config);
+    defer cfg.release(&clone);
+    try t.expectEqual(@as(?u32, 131072), clone.value.model.output_tokens);
+    config.limits.max_output_tokens = 0;
+    try t.expectError(error.InvalidLimit, cfg.validate(config));
+    config.limits.max_output_tokens = null;
+    config.model.output_tokens = 0;
+    try t.expectError(error.InvalidBudget, cfg.validate(config));
+    config.model.output_tokens = 1048577;
+    try t.expectError(error.InvalidBudget, cfg.validate(config));
+    config.model.output_tokens = null;
+    try t.expectEqual(@as(u32, 4096), try context.outputBudget(config, .normal, 1000));
+    try t.expectError(error.ContextTooLarge, context.outputBudget(config, .normal, std.math.maxInt(usize)));
+    const estimator: context.Estimator = .{ .per_mille = std.math.maxInt(u64) };
+    try t.expectError(error.ContextTooLarge, context.outputBudget(config, .normal, estimator.tokens(std.math.maxInt(usize))));
+    config.model.context_tokens = 1;
+    try t.expectEqual(@as(usize, 0), context.inputBudget(config));
+    try t.expectError(error.ContextTooLarge, context.outputBudget(config, .summary, 0));
+}
+
+test "output budget requests shrink across rounds without changing effort" {
+    const Fixture = struct {
+        calls: usize = 0,
+        previous: u32 = std.math.maxInt(u32),
+        fn call(raw: *anyopaque, _: std.mem.Allocator, req: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("high", req.reasoning_effort.?);
+            try std.testing.expect(req.max_output_tokens > 0 and req.max_output_tokens < self.previous);
+            self.previous = req.max_output_tokens;
+            self.calls += 1;
+            if (self.calls == 1) return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "budget-call", .name = "write_file", .arguments = "{}" } }} }, .finish = .tool_calls } };
+            return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} }, .finish = .stop } };
+        }
+    };
+    const Case = struct { protocol: p.Protocol, cap: ?u32 = null };
+    for ([_]Case{ .{ .protocol = .chat }, .{ .protocol = .responses }, .{ .protocol = .anthropic }, .{ .protocol = .chat, .cap = 131072 }, .{ .protocol = .responses, .cap = 131072 }, .{ .protocol = .anthropic, .cap = 131072 } }) |case| {
+        const protocol = case.protocol;
+        var fixture: Fixture = .{};
+        var fake: Fake = .{ .requires_approval = false };
+        var config = configuration();
+        config.limits.max_output_tokens = case.cap;
+        config.model.protocol = protocol;
+        config.model.output_tokens = 32768;
+        config.model.reasoning_effort = "high";
+        config.model.reasoning = .{ .format = if (protocol == .anthropic) .anthropic else .standard, .map = .{ .high = "high" } };
+        var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fixture, .call_fn = Fixture.call }, fake.executor(), fake.host(), "", false);
+        defer runtime.deinit();
+        var cancel: p.Cancellation = .{};
+        const terminal = try runtime.run("budget task", &cancel);
+        try std.testing.expectEqual(r.Status.success, terminal.status);
+        try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+        const state = try runtime.checkpoint();
+        try std.testing.expect(state.output_budget_frozen);
+        try std.testing.expectEqual(config.model.output_tokens, state.output_tokens);
+    }
+}
+
+test "output budget clipped summary validates its actual sent cap atomically" {
+    var fake: Fake = .{};
+    var config = configuration();
+    config.model.output_tokens = 1;
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    try seedManualHistory(&runtime);
+    const before = runtime.messages();
+    const protected = runtime.protected_index;
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.compactContext(&cancel);
+    try std.testing.expectEqual(r.Status.failed, terminal.status);
+    try std.testing.expectEqual(error.InvalidSummary, terminal.detail.?);
+    try std.testing.expectEqual(@as(u32, 1), fake.summary_calls);
+    try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 0), fake.executions);
+    try std.testing.expectEqual(before.ptr, runtime.messages().ptr);
+    try std.testing.expectEqual(before.len, runtime.messages().len);
+    try std.testing.expectEqual(protected, runtime.protected_index);
+}
+
+test "output budget automatic context exhaustion sends no request" {
+    var fake: Fake = .{};
+    var config = configuration();
+    config.model.context_tokens = 5000;
+    config.model.output_tokens = 131072;
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "", false);
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    const oversized: [6000]u8 = @splat('x');
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run(&oversized, &cancel);
+    try std.testing.expectEqual(error.ContextTooLarge, terminal.detail.?);
+    try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 0), fake.summary_calls);
+    try std.testing.expectEqual(@as(usize, 0), runtime.messages().len);
+}
+
+test "output budget checkpoints legacy frozen known and unknown" {
+    const cp = @import("../core/checkpoint.zig");
+    const t = std.testing;
+    var state: cp.State = .{ .system = "", .messages = &.{}, .selector = .{ .configured = .chat, .selected = .chat }, .estimator = .{}, .last_context_tokens = null, .permission_id = 0 };
+    const legacy = try cp.decode(t.allocator,
+        \\{"version":1,"system":"","messages":[],"selector":{"configured":"chat","selected":"chat"},"estimator":{"per_mille":1000},"last_context_tokens":null,"permission_id":0}
+    );
+    defer legacy.deinit();
+    try t.expect(!legacy.value.output_budget_frozen);
+    for ([_]?u32{ null, 131072 }) |tokens| {
+        state.output_tokens = tokens;
+        state.output_source = .metadata;
+        state.output_budget_frozen = true;
+        const bytes = try cp.encode(t.allocator, state);
+        defer t.allocator.free(bytes);
+        const decoded = try cp.decode(t.allocator, bytes);
+        defer decoded.deinit();
+        try t.expect(decoded.value.output_budget_frozen);
+        try t.expectEqual(tokens, decoded.value.output_tokens);
+        try t.expectEqual(cfg.ReasoningSource.metadata, decoded.value.output_source);
+        var config = configuration();
+        config.model.output_tokens = tokens;
+        config.model.output_source = .metadata;
+        try cp.validate(t.allocator, decoded.value, config, &.{});
+        config.model.output_source = .explicit;
+        try t.expectError(error.OutputBudgetMismatch, cp.validate(t.allocator, decoded.value, config, &.{}));
+        config.model.output_source = .metadata;
+        config.model.output_tokens = if (tokens == null) 1 else null;
+        try t.expectError(error.OutputBudgetMismatch, cp.validate(t.allocator, decoded.value, config, &.{}));
+    }
+    state.output_tokens = 0;
+    try t.expectError(error.InvalidOutputTokens, cp.encode(t.allocator, state));
+}
+
 // Runtime 忙时拒绝新的提交；宿主断开时停止执行，并报告 HostDisconnected。
 test "busy rejects submit and a disconnected host stops the execution" {
     var fake = Fake{ .stop_after = 0, .disconnect_text = true };

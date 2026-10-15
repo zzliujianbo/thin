@@ -42,6 +42,8 @@ const Record = struct {
     npm: ?[]const u8 = null,
     override_invalid: bool = false,
     api: protocol.Protocol = .auto,
+    output_tokens: ?u32 = null,
+    context_tokens: ?u32 = null,
     declaration: ?thinking.Declaration = null,
 };
 
@@ -240,16 +242,58 @@ fn overrideNpm(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !Adapte
     return .{ .npm = npm, .invalid = seen and npm == null };
 }
 
-const ModelRow = struct { npm: ?[]const u8 = null, profile: Profile = .{}, override_invalid: bool = false };
+const Limits = struct { output: ?u32 = null, context: ?u32 = null };
+const ModelRow = struct { npm: ?[]const u8 = null, profile: Profile = .{}, override_invalid: bool = false, limits: Limits = .{} };
+
+// Independent public capabilities. Only integer limit.output / limit.context
+// count, never input/output sums, reasoning budgets or same-ID majority votes.
+fn parseLimits(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !Limits {
+    if (!(try at(scanner, .object_begin))) {
+        try scanner.skipValue();
+        return .{};
+    }
+    try expect(scanner, allocator, .object_begin);
+    var limits: Limits = .{};
+    var seen_output = false;
+    var seen_context = false;
+    while (!(try at(scanner, .object_end))) {
+        const key = try nextString(scanner, allocator);
+        const is_output = equal(key, "output");
+        if (is_output or equal(key, "context")) {
+            const seen = if (is_output) &seen_output else &seen_context;
+            if (seen.*) return error.InvalidModelsDev;
+            seen.* = true;
+            if (try at(scanner, .number)) {
+                const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, max_value_bytes);
+                const text = switch (token) {
+                    .number, .allocated_number => |value| value,
+                    else => unreachable,
+                };
+                const n = std.fmt.parseInt(u32, text, 10) catch 0;
+                const max: u32 = if (is_output) 1024 * 1024 else 16 * 1024 * 1024;
+                if (n > 0 and n <= max) {
+                    if (is_output) limits.output = n else limits.context = n;
+                }
+            } else try scanner.skipValue();
+        } else try scanner.skipValue();
+    }
+    try expect(scanner, allocator, .object_end);
+    return limits;
+}
 
 fn parseModel(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !ModelRow {
     try expect(scanner, allocator, .object_begin);
     var row: ModelRow = .{};
     var saw_options = false;
     var saw_provider = false;
+    var saw_limit = false;
     while (!(try at(scanner, .object_end))) {
         const field = try nextString(scanner, allocator);
-        if (equal(field, "reasoning_options")) {
+        if (equal(field, "limit")) {
+            if (saw_limit) return error.InvalidModelsDev;
+            saw_limit = true;
+            row.limits = try parseLimits(scanner, allocator);
+        } else if (equal(field, "reasoning_options")) {
             if (saw_options) return error.InvalidModelsDev;
             saw_options = true;
             row.profile = try parseOptions(scanner, allocator);
@@ -278,7 +322,7 @@ fn parseModels(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provide
         if ((try seen.getOrPut(allocator, model)).found_existing) return error.InvalidModelsDev;
         if (records.items.len >= max_records) return error.MetadataTooLarge;
         const row = try parseModel(scanner, allocator);
-        try records.append(allocator, .{ .provider = provider, .model = model, .profile = row.profile, .npm = row.npm, .override_invalid = row.override_invalid });
+        try records.append(allocator, .{ .provider = provider, .model = model, .profile = row.profile, .npm = row.npm, .override_invalid = row.override_invalid, .output_tokens = row.limits.output, .context_tokens = row.limits.context });
     }
     try expect(scanner, allocator, .object_end);
 }
@@ -431,6 +475,8 @@ pub fn parseDirectory(allocator: std.mem.Allocator, body: []const u8) !directory
         const row = try result.upsert(id, record.model);
         row.dev_present = true;
         row.dev_protocol = record.api;
+        row.dev_output_tokens = if (record.api != .auto) record.output_tokens else null;
+        row.dev_context_tokens = if (record.api != .auto) record.context_tokens else null;
         const resolved = resolveIn(records, record.provider, record.model, record.api);
         if (resolved.declaration) |declaration| row.dev_reasoning = try directory.Profile.from(declaration);
     }

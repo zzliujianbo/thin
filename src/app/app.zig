@@ -12,6 +12,17 @@ const Settings = @import("settings_store.zig").Store;
 const thinking = @import("../core/thinking.zig");
 const metadata = @import("model_metadata.zig");
 const session_context = @import("../core/session_context.zig");
+const model_resolver = @import("model_resolver.zig");
+
+fn rememberConfiguredKeys(journal: *Journal, config: cfg.Config, environ: *const std.process.Environ.Map) !void {
+    for (cfg.providers.Id.all) |id| if (config.credentials.get(id)) |saved| try journal.rememberKey(saved);
+    if (config.registry) |registry| for (registry.providers) |provider| {
+        if (provider.connection.api_key) |key| try journal.rememberKey(key);
+        if (provider.connection.api_key_env.len != 0) {
+            if (environ.get(provider.connection.api_key_env)) |key| try journal.rememberKey(key);
+        }
+    };
+}
 
 /// 应用聚合体：持有配置、项目根目录、记忆存储、工具执行器、HTTP 客户端与 Runtime，
 /// 生命周期与进程一致（--print 或 TUI 会话结束时统一释放）。
@@ -58,12 +69,23 @@ pub const App = struct {
         var parsed = try cfg.load(a, io, path);
         // Derived defaults are not embedded in config.json. Headless entry can
         // reuse a compatible cached profile without creating/fetching metadata.
-        if (parsed.value.model.reasoning_source != .explicit or parsed.value.model.reasoning == null) {
+        if (parsed.value.registry != null or parsed.value.model.reasoning_source != .explicit or parsed.value.model.reasoning == null or
+            parsed.value.model.output_source != .explicit or parsed.value.model.output_tokens == null)
+        {
+            var cache: metadata.Cache = .{};
             var store: ?@import("auth_store.zig").Store = @import("auth_store.zig").Store.openExisting(a, io, home) catch null;
             if (store) |*value| {
                 defer value.deinit();
-                const cache = metadata.load(&value.root) catch metadata.Cache{};
+                cache = metadata.load(&value.root) catch metadata.Cache{};
+            }
+            if (parsed.value.registry != null) {
+                model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &cache) catch |err| {
+                    cfg.release(&parsed);
+                    return err;
+                };
+            } else {
                 metadata.applyReasoning(&cache, &parsed.value);
+                metadata.applyOutput(&cache, &parsed.value);
             }
         }
         // Headless entry creates the same missing project default as the TUI,
@@ -102,6 +124,8 @@ pub const App = struct {
     fn initConfiguredRoot(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, anchored: ?*const fs.Root, protected_auth: ?[]const u8, host: r.Host, trusted: bool, parsed: std.json.Parsed(cfg.Config)) !*App {
         var owned = parsed;
         errdefer cfg.release(&owned);
+        if (owned.value.selection_pending) return error.DefaultModelUnavailable;
+        try cfg.validate(owned.value);
         const self = try a.create(App);
         errdefer a.destroy(self);
         self.allocator = a;
@@ -137,9 +161,16 @@ pub const App = struct {
         self.memory = mem.Store.init(&self.root, self.config.value.limits);
         self.journal = try Journal.init(a, &self.root, key);
         errdefer self.journal.deinit();
-        for (cfg.providers.Id.all) |id| if (self.config.value.credentials.get(id)) |saved| try self.journal.rememberKey(saved);
+        try rememberConfiguredKeys(&self.journal, self.config.value, environ);
         self.journal.protocol = self.config.value.model.protocol;
-        self.environment = try tools.commandEnvironment(a, environ, self.config.value.provider.api_key_env);
+        var secret_names: [17][]const u8 = undefined;
+        secret_names[0] = self.config.value.provider.api_key_env;
+        var secret_count: usize = 1;
+        if (self.config.value.registry) |registry| for (registry.providers) |provider| {
+            secret_names[secret_count] = provider.connection.api_key_env;
+            secret_count += 1;
+        };
+        self.environment = try tools.commandEnvironmentMany(a, environ, secret_names[0..secret_count]);
         errdefer self.environment.deinit();
         self.executor = .{ .root = &self.root, .memory = &self.memory, .config = &self.config.value, .environment = &self.environment, .auth_path = self.auth_path };
         self.client = try http.Client.init(a, io, &self.config.value, key);
@@ -183,7 +214,7 @@ pub const App = struct {
             self.allocator.free(key);
         }
         try self.journal.rememberKey(key);
-        for (cfg.providers.Id.all) |id| if (owned.value.credentials.get(id)) |saved| try self.journal.rememberKey(saved);
+        try rememberConfiguredKeys(&self.journal, owned.value, environ);
         const replacement = try self.allocator.create(ConnectionReplacement);
         errdefer self.allocator.destroy(replacement);
         replacement.owner = self;
@@ -269,6 +300,10 @@ pub const App = struct {
 };
 
 // 配置加载可经由符号链接，但文件工具必须保护最终实际文件，而非 HOME 的词法别名。
+test {
+    _ = @import("llm_app_test.zig");
+}
+
 test "App protects actual configuration behind HOME and file symlinks" {
     const a = std.testing.allocator;
     const io = std.testing.io;

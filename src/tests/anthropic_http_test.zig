@@ -129,7 +129,7 @@ test "anthropic HTTP: fixed selector errors incomplete tools and unsupported blo
         try t.expect(result.outcome == .failure);
         try t.expect(result.outcome.failure.kind == case[1]);
     }
-    for ([_][]const u8{ "max_tokens", "pause_turn", "context_limit", "missing-stop", "malformed-delta", "invalid-json", "unsupported-block", "server-tool", "redirect" }) |scenario| {
+    for ([_][]const u8{ "max_tokens", "max_tokens_partial", "pause_turn", "context_limit", "missing-stop", "malformed-delta", "invalid-json", "unsupported-block", "server-tool", "redirect" }) |scenario| {
         var c = try config(arena.allocator(), scenario);
         var client = try Client.init(t.allocator, backend.io(), &c, "fake-local-key");
         defer client.deinit();
@@ -138,6 +138,13 @@ test "anthropic HTTP: fixed selector errors incomplete tools and unsupported blo
         try t.expect(!result.fallback and result.calls == 1);
         // Streamed tool drafts cannot be a successful executable message.
         try t.expect(result.outcome == .failure);
+        if (std.mem.startsWith(u8, scenario, "max_tokens")) {
+            try t.expectEqual(p.FailureKind.output_limit, result.outcome.failure.kind);
+            try usage(result.outcome.failure.usage, 4);
+            try t.expect(result.outcome.failure.observed_content and result.outcome.failure.raw_usage_json != null);
+        }
+        if (std.mem.eql(u8, scenario, "pause_turn")) try t.expectEqual(p.FailureKind.model, result.outcome.failure.kind);
+        if (std.mem.eql(u8, scenario, "context_limit")) try t.expectEqual(p.FailureKind.context_limit, result.outcome.failure.kind);
     }
 }
 

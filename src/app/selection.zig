@@ -15,6 +15,9 @@ const Hash = std.crypto.hash.sha2.Sha256;
 pub const Snapshot = struct {
     model_buffer: [model_limit]u8 = @splat(0),
     model_len: u16 = 0,
+    provider_name_buffer: [model_limit]u8 = @splat(0),
+    provider_name_len: u16 = 0,
+
     endpoint: [64]u8,
     provider: ?cfg.providers.Id,
     protocol: p.Protocol,
@@ -23,12 +26,17 @@ pub const Snapshot = struct {
     /// local options; their raw strings are never stored here.
     effort_hash: ?[64]u8 = null,
 
+    pub fn providerName(self: *const Snapshot) ?[]const u8 {
+        return if (self.provider_name_len == 0) null else self.provider_name_buffer[0..self.provider_name_len];
+    }
+
     pub fn model(self: *const Snapshot) []const u8 {
         return self.model_buffer[0..self.model_len];
     }
 
     pub const View = struct {
         model: []const u8,
+        provider_name: ?[]const u8,
         endpoint: []const u8,
         provider: ?cfg.providers.Id,
         protocol: p.Protocol,
@@ -37,7 +45,7 @@ pub const Snapshot = struct {
     };
 
     pub fn view(self: *const Snapshot) View {
-        return .{ .model = self.model(), .endpoint = &self.endpoint, .provider = self.provider, .protocol = self.protocol, .effort = self.effort, .effort_hash = if (self.effort_hash) |*hash| hash else null };
+        return .{ .model = self.model(), .provider_name = self.providerName(), .endpoint = &self.endpoint, .provider = self.provider, .protocol = self.protocol, .effort = self.effort, .effort_hash = if (self.effort_hash) |*hash| hash else null };
     }
 };
 
@@ -53,6 +61,13 @@ fn setModel(snapshot: *Snapshot, name: []const u8) !void {
     for (name) |byte| if (byte < 32 or byte == 127) return error.InvalidSelectionModel;
     @memcpy(snapshot.model_buffer[0..name.len], name);
     snapshot.model_len = @intCast(name.len);
+}
+
+fn setProviderName(snapshot: *Snapshot, name: []const u8) !void {
+    if (name.len == 0 or name.len > 64) return error.InvalidSelection;
+    for (name) |byte| if (byte <= 0x20 or byte >= 0x7f or byte == '/' or byte == '\\') return error.InvalidSelection;
+    @memcpy(snapshot.provider_name_buffer[0..name.len], name);
+    snapshot.provider_name_len = @intCast(name.len);
 }
 
 fn knownEffort(effort: activity.ReasoningEffort) bool {
@@ -72,15 +87,31 @@ pub fn capture(config: cfg.Config) !Snapshot {
         .effort_hash = if (!knownEffort(effort) and config.model.reasoning_effort != null) endpoint(config.model.reasoning_effort.?) else null,
     };
     try setModel(&snapshot, config.model.name);
+    if (config.registry != null) if (config.selected_provider) |name| try setProviderName(&snapshot, name);
     return snapshot;
 }
 
 pub fn encode(writer: *std.Io.Writer, id: ids.Id, snapshot: *const Snapshot) !void {
     if (!ids.valid(id)) return error.InvalidSessionID;
+    if (snapshot.providerName() == null) {
+        // Keep legacy metadata byte shape; the additive field is registry-only.
+        try std.json.Stringify.value(.{
+            .version = 1,
+            .session = @as([]const u8, &id),
+            .provider = snapshot.provider,
+            .endpoint = @as([]const u8, &snapshot.endpoint),
+            .model = snapshot.model(),
+            .protocol = snapshot.protocol,
+            .effort = snapshot.effort,
+            .effort_hash = snapshot.view().effort_hash,
+        }, .{}, writer);
+        return;
+    }
     try std.json.Stringify.value(.{
         .version = 1,
         .session = @as([]const u8, &id),
         .provider = snapshot.provider,
+        .provider_name = snapshot.providerName(),
         .endpoint = @as([]const u8, &snapshot.endpoint),
         .model = snapshot.model(),
         .protocol = snapshot.protocol,
@@ -99,8 +130,9 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, expected_id: ids.Id) !Snap
     try fs.validateText(bytes);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
     defer parsed.deinit();
-    if (parsed.value != .object or parsed.value.object.count() != 8) return error.InvalidSelection;
+    if (parsed.value != .object) return error.InvalidSelection;
     const object = parsed.value.object;
+    if (object.count() != 8 + @as(usize, if (object.contains("provider_name")) 1 else 0)) return error.InvalidSelection;
     const version = object.get("version") orelse return error.InvalidSelection;
     if (version != .integer or version.integer != 1) return error.InvalidSelectionVersion;
     const id = try string(object.get("session") orelse return error.InvalidSelection);
@@ -126,6 +158,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, expected_id: ids.Id) !Snap
         for (hash) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidSelection;
         snapshot.effort_hash = hash[0..64].*;
     }
+    if (object.get("provider_name")) |name| if (name != .null) try setProviderName(&snapshot, try string(name));
     @memcpy(&snapshot.endpoint, fingerprint);
     try setModel(&snapshot, try string(object.get("model") orelse return error.InvalidSelection));
     return snapshot;

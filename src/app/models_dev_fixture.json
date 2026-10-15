@@ -4,11 +4,13 @@
     "models": {
       "gpt-6-luna": {
         "provider": { "npm": "@ai-sdk/openai" },
+        "limit": { "context": 262144, "output": 32768 },
         "reasoning_options": [{ "type": "effort", "values": ["none", "low", "high", "max"] }]
       },
       "claude-haiku-5-5": {
         "provider": { "npm": "@ai-sdk/anthropic" },
-        "reasoning": true
+        "reasoning": true,
+        "limit": { "output": 16384 }
       }
     }
   },

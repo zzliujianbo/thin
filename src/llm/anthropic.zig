@@ -185,6 +185,9 @@ pub const Stream = struct {
     reason: ?[]const u8 = null,
     open: ?Item = null,
     content: std.ArrayList(j.Value) = .empty,
+    // Closed blocks can still contain JSON cut by the output cap. Validate it
+    // only after the complete message's authoritative stop reason is known.
+    arguments: std.ArrayList(struct { index: usize, json: []const u8 }) = .empty,
     tool_count: usize = 0,
     uncached: ?u64 = null,
     token_usage: p.Usage = .{},
@@ -333,11 +336,10 @@ pub const Stream = struct {
         if (!c.eq(typ, "content_block_stop")) return error.InvalidEvent;
         if (c.eq(kind, "text") or c.eq(kind, "thinking")) {
             try j.put(self.a, &item.native, if (c.eq(kind, "text")) "text" else "thinking", j.str(try item.text.join(self.a)));
-            if (c.eq(kind, "thinking") and (try c.text(item.native, "signature")).len == 0) return error.InvalidReplay;
+            // nativeBlocks validates replay signatures only on a successful
+            // completed message; cap-truncated reasoning is never replayed.
         } else if (c.eq(kind, "tool_use") and item.args.len > 0) {
-            const input = try c.parse(self.a, try item.args.join(self.a));
-            if (input != .object) return error.InvalidToolArguments;
-            try j.put(self.a, &item.native, "input", input);
+            try self.arguments.append(self.a, .{ .index = self.content.items.len, .json = try item.args.join(self.a) });
         }
         try self.content.append(self.a, item.native);
         self.open = null;
@@ -353,13 +355,19 @@ pub const Stream = struct {
         }
         if (!self.stopped or self.open != null or self.reason == null) return error.TruncatedStream;
         const reason = self.reason.?;
-        if (c.eq(reason, "max_tokens") or c.eq(reason, "pause_turn") or c.eq(reason, "model_context_window_exceeded")) {
+        if (c.eq(reason, "max_tokens")) return c.outputLimit(self.observed, self.token_usage, raw);
+        if (c.eq(reason, "pause_turn") or c.eq(reason, "model_context_window_exceeded")) {
             var failure = c.failure(self.observed, self.token_usage, raw);
             if (c.eq(reason, "model_context_window_exceeded")) failure.failure.kind = .context_limit;
             return failure;
         }
         const calls = c.eq(reason, "tool_use");
         if (calls != (self.tool_count > 0)) return error.InvalidFinish;
+        for (self.arguments.items) |args| {
+            const input = try c.parse(self.a, args.json);
+            if (input != .object) return error.InvalidToolArguments;
+            try j.put(self.a, &self.content.items[args.index], "input", input);
+        }
         var content = j.array(self.a);
         for (self.content.items) |b| try j.append(&content, b);
         const native = try message(self.a, "assistant", content);

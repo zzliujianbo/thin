@@ -119,7 +119,7 @@ pub const Store = struct {
         };
         errdefer bytes.deinit();
         var writer = std.Io.Writer.fixed(bytes.buffer);
-        std.json.Stringify.value(config, .{ .whitespace = .indent_2 }, &writer) catch return error.ConfigTooLarge;
+        cfg.writeDisk(config, &writer) catch return error.ConfigTooLarge;
         writer.writeByte('\n') catch return error.ConfigTooLarge;
         bytes.len = writer.end;
         return bytes;

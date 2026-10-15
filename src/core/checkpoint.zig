@@ -26,6 +26,11 @@ pub const State = struct {
     context_tokens: ?u32 = null,
     /// UI provenance only; the parent Session owns saving/restoring this flag.
     context_official: bool = false,
+    /// Authenticated frozen output capability; frozen null deliberately means
+    /// unknown, not permission to refresh metadata during resume.
+    output_tokens: ?u32 = null,
+    output_source: cfg.ReasoningSource = .explicit,
+    output_budget_frozen: bool = false,
     permission_id: u64,
     poisoned: bool = false,
     /// Observer continuity only; the Runtime never treats these as authority.
@@ -173,6 +178,9 @@ fn basic(state: State) !void {
     if (state.context_tokens) |tokens| {
         if (tokens == 0 or tokens > 16 * 1024 * 1024) return error.InvalidContextTokens;
     } else if (state.context_official) return error.InvalidContextSource;
+    if (state.output_tokens) |tokens| {
+        if (tokens == 0 or tokens > 1024 * 1024) return error.InvalidOutputTokens;
+    }
     try utf8(state.system);
     if (state.messages.len > 1024) return error.InputLimit;
     var blocks: usize = 0;
@@ -206,6 +214,9 @@ pub fn validate(a: Allocator, state: State, config: cfg.Config, schemas: []const
     if (state.context_tokens) |tokens| {
         if (tokens != config.model.context_tokens) return error.ContextBudgetMismatch;
     }
+    if (state.output_budget_frozen and
+        (state.output_tokens != config.model.output_tokens or state.output_source != config.model.output_source))
+        return error.OutputBudgetMismatch;
     if (state.estimator.per_mille < 1000) return error.InvalidEstimator;
     const selector = state.selector;
     if (selector.configured != config.model.protocol or selector.selected == .auto or
@@ -217,7 +228,11 @@ pub fn validate(a: Allocator, state: State, config: cfg.Config, schemas: []const
         .system = state.system,
         .messages = state.messages,
         .tools = schemas,
-        .max_output_tokens = config.limits.max_output_tokens,
+        // This request is encoded only to validate canonical/native history,
+        // never sent. Even an overfull archive must remain saveable/resumable
+        // for later compaction; Runtime independently rejects zero room before
+        // any real request. Use a positive validation-only sentinel in that case.
+        .max_output_tokens = context.outputBudget(config, .normal, state.estimator.tokens(context.rawTokens(state.system, schemas, state.messages))) catch 1,
     };
     try common.validateRequest(req, proto);
     var arena = std.heap.ArenaAllocator.init(a);

@@ -37,8 +37,9 @@ pub const Cache = struct {
     directory: directory.Directory = .{},
     /// A successful official listing (even empty) supersedes offline presets.
     directory_mask: u8 = 0,
-    /// Provider bits plus dev_bit: the first models.dev attempt is claimed once.
+    /// Retained for legacy readers; eligibility is now driven by source timing.
     attempted: u8 = 0,
+    refresh: [4]Refresh = @splat(.{}),
     tokens: Tokens = @splat(null),
     available: [catalog.entries.len]?bool = @splat(null),
     /// Official wire capability metadata supersedes models.dev profiles.
@@ -49,7 +50,8 @@ pub const Cache = struct {
 /// Shared cache-only resolution for interactive and headless entry. No network,
 /// capacity mutation or preset capabilities; explicit user overrides stay local.
 pub fn reasoningIndex(config: cfg.Config) ?usize {
-    const id = config.provider.kind orelse providers.Id.fromUrl(config.provider.base_url) orelse return null;
+    const id = providers.Id.fromUrl(config.provider.base_url) orelse return null;
+    if (config.provider.kind) |hint| if (hint != id) return null;
     for (catalog.entries, 0..) |entry, index| {
         if (entry.provider != id) continue;
         if (std.mem.eql(u8, entry.model.name, config.model.name) or std.mem.eql(u8, entry.selector, config.model.name)) return index;
@@ -58,6 +60,9 @@ pub fn reasoningIndex(config: cfg.Config) ?usize {
 }
 
 pub fn reasoningDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinking.Declaration {
+    const actual = providers.Id.fromUrl(config.provider.base_url) orelse return null;
+    if (config.provider.kind) |hint| if (hint != actual) return null;
+    if (index >= catalog.entries.len or catalog.entries[index].provider != actual) return null;
     if (dynamicIndex(cache, config)) |row| return rowDeclaration(cache, config, row);
     const entry = catalog.entries[index];
     const protocol = if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) .chat else config.model.protocol;
@@ -112,15 +117,19 @@ fn resolvedProtocol(cache: *const Cache, index: usize) Protocol {
 fn storedEntry(cache: *const Cache, index: usize) catalog.Entry {
     const row = cache.directory.rows[index];
     const known = preset(row.provider, cache.directory.name(index));
-    return .{
+    var entry: catalog.Entry = .{
         .provider = row.provider,
         .selector = cache.directory.selector(index),
         .model = .{
             .name = cache.directory.name(index),
-            .context_tokens = row.tokens orelse (if (known) |entry| entry.model.context_tokens else 32768),
+            .context_tokens = if (known) |value| value.model.context_tokens else 32768,
             .protocol = resolvedProtocol(cache, index),
+            .output_tokens = rowOutput(row, resolvedProtocol(cache, index)),
+            .output_source = .metadata,
         },
     };
+    entry.model.context_tokens = contextFor(cache, entry) orelse entry.model.context_tokens;
+    return entry;
 }
 
 pub fn dynamicEntry(cache: *const Cache, id: providers.Id, name: []const u8) ?catalog.Entry {
@@ -156,8 +165,81 @@ pub fn capacityFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
     return null;
 }
 
+fn validContext(n: ?u32) ?u32 {
+    const value = n orelse return null;
+    return if (value > 0 and value <= max_tokens) value else null;
+}
+
+/// Exact provider/raw-ID/protocol resolution. Official windows retain priority;
+/// models.dev windows never populate the official capacityFor provenance slot.
+/// Callers applying this to configuration must verify the actual endpoint URL;
+/// provider kind or a same-name custom endpoint alone is not route identity.
+/// Selection-time only: callers own freezing active/resumed model windows.
+pub fn contextFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
+    const protocol = entry.model.protocol;
+    if (protocol == .auto) return null;
+    if (cache.directory.find(entry.provider, entry.model.name)) |index| {
+        const row = cache.directory.rows[index];
+        if (row.protocol != .auto and row.protocol != protocol) return null;
+        // Legacy official capacities remain usable before official discovery,
+        // but only for their original preset protocol, not a public reroute.
+        if (row.available == true) {
+            if (validContext(row.tokens)) |n| return n;
+        } else if (row.available == null and !hasDirectory(cache, entry.provider)) {
+            if (preset(entry.provider, entry.model.name)) |known| {
+                if (known.model.protocol == protocol) {
+                    if (validContext(capacityFor(cache, entry))) |n| return n;
+                }
+            }
+        }
+        if (row.dev_protocol == protocol) return validContext(row.dev_context_tokens);
+        return null;
+    }
+    if (preset(entry.provider, entry.model.name)) |known| {
+        if (known.model.protocol == protocol) return validContext(capacityFor(cache, entry));
+    }
+    return null;
+}
+
+fn validOutput(n: ?u32) ?u32 {
+    const value = n orelse return null;
+    return if (value > 0 and value <= 1024 * 1024) value else null;
+}
+
+fn rowOutput(row: directory.Record, protocol: Protocol) ?u32 {
+    if (protocol == .auto or (row.protocol != .auto and row.protocol != protocol)) return null;
+    if (row.protocol == protocol) {
+        if (validOutput(row.output_tokens)) |n| return n;
+    }
+    if (row.dev_protocol == protocol) return validOutput(row.dev_output_tokens);
+    return null;
+}
+
+/// Verified exact-route capability; never infers output from context or peers.
+pub fn outputFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
+    const index = cache.directory.find(entry.provider, entry.model.name) orelse return null;
+    return rowOutput(cache.directory.rows[index], entry.model.protocol);
+}
+
+/// Shared cache-only resolver. Session owns freezing an accepted task's budget.
+pub fn applyOutput(cache: *const Cache, config: *cfg.Config) void {
+    if (config.model.output_source == .explicit and config.model.output_tokens != null) return;
+    if (config.model.output_source == .metadata) config.model.output_tokens = null;
+    // Unlike a manually selected official catalog entry, a configured route
+    // must prove the actual URL identity; kind alone is only a hint.
+    const id = providers.Id.fromUrl(config.provider.base_url) orelse return;
+    if (config.provider.kind) |hint| if (hint != id) return;
+    const index = dynamicIndex(cache, config.*) orelse return;
+    const protocol = if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) .chat else config.model.protocol;
+    if (rowOutput(cache.directory.rows[index], protocol)) |n| {
+        config.model.output_tokens = n;
+        config.model.output_source = .metadata;
+    }
+}
+
 fn dynamicIndex(cache: *const Cache, config: cfg.Config) ?usize {
-    const id = config.provider.kind orelse providers.Id.fromUrl(config.provider.base_url) orelse return null;
+    const id = providers.Id.fromUrl(config.provider.base_url) orelse return null;
+    if (config.provider.kind) |hint| if (hint != id) return null;
     if (cache.directory.find(id, config.model.name)) |index| return index;
     const prefix = id.slug();
     if (std.mem.startsWith(u8, config.model.name, prefix) and config.model.name.len > prefix.len and config.model.name[prefix.len] == '/')
@@ -234,7 +316,19 @@ pub fn mergeOfficial(target: *Listing, source: *const Listing, id: providers.Id)
     // A source that overflows the shared pool must not consume its capacity or
     // partially overwrite records belonging to other successful provider jobs.
     var merged = target.directory;
-    for (source.directory.rows[0..source.directory.count], 0..) |row, i| if (row.provider == id) try merged.copyRecord(&source.directory, i);
+    for (source.directory.rows[0..source.directory.count], 0..) |row, i| {
+        if (row.provider != id) continue;
+        const old = if (merged.find(id, source.directory.name(i))) |index| merged.rows[index] else null;
+        try merged.copyRecord(&source.directory, i);
+        if (old) |previous| {
+            const dest = &merged.rows[merged.find(id, source.directory.name(i)).?];
+            dest.dev_protocol = previous.dev_protocol;
+            dest.dev_reasoning = previous.dev_reasoning;
+            dest.dev_output_tokens = previous.dev_output_tokens;
+            dest.dev_context_tokens = previous.dev_context_tokens;
+            dest.dev_present = previous.dev_present;
+        }
+    }
     target.directory = merged;
     for (catalog.entries, 0..) |entry, i| if (entry.provider == id) {
         target.tokens[i] = source.tokens[i];
@@ -247,11 +341,20 @@ pub fn mergeOfficial(target: *Listing, source: *const Listing, id: providers.Id)
 pub fn mergeDev(target: *Listing, source: *const Listing) !void {
     if (!source.dev_done) return;
     var merged = target.directory;
+    for (merged.rows[0..merged.count]) |*row| {
+        row.dev_protocol = .auto;
+        row.dev_reasoning = null;
+        row.dev_output_tokens = null;
+        row.dev_context_tokens = null;
+        row.dev_present = false;
+    }
     for (source.directory.rows[0..source.directory.count], 0..) |source_row, index| {
         if (!source_row.dev_present) continue;
         const row = try merged.upsert(source_row.provider, source.directory.name(index));
         row.dev_protocol = source_row.dev_protocol;
         row.dev_reasoning = source_row.dev_reasoning;
+        row.dev_output_tokens = source_row.dev_output_tokens;
+        row.dev_context_tokens = source_row.dev_context_tokens;
         row.dev_present = true;
     }
     target.directory = merged;
@@ -259,7 +362,10 @@ pub fn mergeDev(target: *Listing, source: *const Listing) !void {
     target.dev_done = true;
 }
 
-pub const Claim = struct { cache: Cache, mask: u8 };
+pub const Generations = [4]u64;
+pub const Claim = struct { cache: Cache, mask: u8, generations: Generations };
+pub const Commit = struct { cache: Cache, accepted: u8 };
+pub const max_generation: u64 = std.math.maxInt(i64);
 
 pub const dev_bit: u8 = 0x80;
 pub const provider_mask: u8 = all_mask;
@@ -473,6 +579,9 @@ const DynamicRecord = struct {
     provider: providers.Id,
     id: []const u8,
     context_window: ?u32 = null,
+    output_tokens: ?u32 = null,
+    dev_output_tokens: ?u32 = null,
+    dev_context_tokens: ?u32 = null,
     available: ?bool = null,
     protocol: Protocol = .auto,
     dev_protocol: Protocol = .auto,
@@ -480,12 +589,52 @@ const DynamicRecord = struct {
     dev_reasoning: ?thinking.Declaration = null,
     dev_present: bool = false,
 };
+pub const max_timestamp_ms: u64 = 253402300799999;
+pub const Policy = struct {
+    ttl_ms: u32 = 14400000,
+    cooldown_ms: u32 = 300000,
+};
+pub const Refresh = struct {
+    generation: u64 = 0,
+    last_attempt_ms: ?u64 = null,
+    last_success_ms: ?u64 = null,
+    successful: bool = false,
+};
+const source_bits = [_]u8{ 1, 2, 4, dev_bit };
+
+pub fn wallNow(io: std.Io) u64 {
+    return @intCast(@max(0, @min(max_timestamp_ms, std.Io.Clock.real.now(io).toMilliseconds())));
+}
+
+/// Future timestamps are due for one repair claim. That claim resets the future
+/// success and persists the current clock, preventing both storms and starvation.
+pub fn eligible(cache: *const Cache, requested: u8, now: u64, policy: Policy) u8 {
+    var mask: u8 = 0;
+    for (source_bits, cache.refresh) |source, timing| {
+        if (requested & source == 0) continue;
+        const attempt = timing.last_attempt_ms orelse {
+            mask |= source;
+            continue;
+        };
+        const success = timing.last_success_ms;
+        if (attempt > now or (success != null and success.? > now)) {
+            mask |= source;
+            continue;
+        }
+        const base = if (timing.successful and success != null) success.? else attempt;
+        const delay = if (timing.successful and success != null) policy.ttl_ms else policy.cooldown_ms;
+        if (now - base >= delay) mask |= source;
+    }
+    return mask;
+}
+
 const Document = struct {
     version: u32,
     attempted: u8,
     records: []const Record,
     directory_mask: u8 = 0,
     models: []const DynamicRecord = &.{},
+    refresh: [4]Refresh = @splat(.{}),
 };
 
 fn canonicalCacheDeclaration(declaration: thinking.Declaration) !thinking.Declaration {
@@ -512,16 +661,75 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
     var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
     defer parsed.deinit();
     const doc = parsed.value;
-    if ((doc.version < 1 or doc.version > 5) or doc.attempted & ~(all_mask | dev_bit) != 0 or doc.records.len > catalog.entries.len or doc.models.len > directory.max_models or doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
+    // Typed JSON integer parsing also accepts numeric strings. Cache capability
+    // fields deliberately require JSON integer tokens, not that coercion.
+    if (doc.version >= 6) {
+        var raw = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
+        defer raw.deinit();
+        if (raw.value == .object) {
+            if (raw.value.object.get("refresh")) |timings| {
+                if (timings != .array or timings.array.items.len != 4) return error.InvalidMetadata;
+                for (timings.array.items) |timing| {
+                    if (timing != .object) return error.InvalidMetadata;
+                    if (doc.version >= 9) if (timing.object.get("generation")) |value| switch (value) {
+                        .integer => |n| if (n < 0 or n > max_generation) return error.InvalidMetadata,
+                        else => return error.InvalidMetadata,
+                    };
+                    for ([_][]const u8{ "last_attempt_ms", "last_success_ms" }) |key| {
+                        if (timing.object.get(key)) |value| switch (value) {
+                            .null => {},
+                            .integer => |n| if (n < 0 or n > max_timestamp_ms) return error.InvalidMetadata,
+                            else => return error.InvalidMetadata,
+                        };
+                    }
+                }
+            }
+            if (raw.value.object.get("models")) |models| {
+                if (models == .array) for (models.array.items) |model| {
+                    if (model != .object) return error.InvalidMetadata;
+                    for ([_][]const u8{ "output_tokens", "dev_output_tokens" }) |key| {
+                        if (model.object.get(key)) |value| switch (value) {
+                            .null => {},
+                            .integer => |n| if (n <= 0 or n > 1024 * 1024) return error.InvalidMetadata,
+                            else => return error.InvalidMetadata,
+                        };
+                    }
+                    if (doc.version >= 7) {
+                        if (model.object.get("dev_context_tokens")) |value| switch (value) {
+                            .null => {},
+                            .integer => |n| if (n <= 0 or n > max_tokens) return error.InvalidMetadata,
+                            else => return error.InvalidMetadata,
+                        };
+                    }
+                };
+            }
+        }
+    }
+    if ((doc.version < 1 or doc.version > 9) or doc.attempted & ~(all_mask | dev_bit) != 0 or doc.records.len > catalog.entries.len or doc.models.len > directory.max_models or doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
     if (doc.version < 5 and (doc.directory_mask != 0 or doc.models.len != 0)) return error.InvalidMetadata;
     // Legacy caches never attempted dynamic discovery. Retain their successful
     // metadata, but permit one automatic directory/protocol refresh after upgrade.
     var result: Cache = .{ .attempted = if (doc.version < 5) 0 else doc.attempted, .directory_mask = doc.directory_mask };
+    if (doc.version >= 8) result.refresh = doc.refresh;
+    if (doc.version < 9) for (&result.refresh) |*timing| {
+        timing.generation = 0;
+    };
+    // v5 lacked output and v6 lacked public context. Grant one public refresh
+    // for either upgrade, preserving successful official and v6 output metadata.
+    // claim persists v9 timing/generations before fetching, so failures observe cooldown.
+    if (doc.version == 5 or doc.version == 6) result.attempted &= ~dev_bit;
     for (doc.models) |record| {
         if (record.context_window) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
         if (result.directory.find(record.provider, record.id) != null) return error.InvalidMetadata;
         const row = try result.directory.upsert(record.provider, record.id);
         row.tokens = record.context_window;
+        if (doc.version >= 7) row.dev_context_tokens = record.dev_context_tokens;
+        if (doc.version >= 6) {
+            if (record.output_tokens != null and validOutput(record.output_tokens) == null) return error.InvalidMetadata;
+            if (record.dev_output_tokens != null and validOutput(record.dev_output_tokens) == null) return error.InvalidMetadata;
+            row.output_tokens = record.output_tokens;
+            row.dev_output_tokens = record.dev_output_tokens;
+        }
         row.available = record.available;
         row.protocol = record.protocol;
         row.dev_protocol = record.dev_protocol;
@@ -586,6 +794,12 @@ fn lock(root: *fs.Root) !c_int {
 }
 
 fn save(root: *fs.Root, cache: Cache) !void {
+    for (cache.refresh) |timing| if (timing.generation > max_generation) return error.InvalidMetadata;
+    for (cache.directory.rows[0..cache.directory.count]) |row| {
+        if (row.dev_context_tokens != null and validContext(row.dev_context_tokens) == null) return error.InvalidMetadata;
+        if (row.output_tokens != null and validOutput(row.output_tokens) == null) return error.InvalidMetadata;
+        if (row.dev_output_tokens != null and validOutput(row.dev_output_tokens) == null) return error.InvalidMetadata;
+    }
     var records: [catalog.entries.len]Record = undefined;
     for (catalog.entries, 0..) |entry, i| records[i] = .{
         .selector = entry.selector,
@@ -600,6 +814,9 @@ fn save(root: *fs.Root, cache: Cache) !void {
         .provider = row.provider,
         .id = cache.directory.name(index),
         .context_window = row.tokens,
+        .output_tokens = row.output_tokens,
+        .dev_output_tokens = row.dev_output_tokens,
+        .dev_context_tokens = row.dev_context_tokens,
         .available = row.available,
         .protocol = row.protocol,
         .dev_protocol = row.dev_protocol,
@@ -610,31 +827,73 @@ fn save(root: *fs.Root, cache: Cache) !void {
     const bytes = try root.allocator.alloc(u8, max_cache_bytes);
     defer root.allocator.free(bytes);
     var writer = std.Io.Writer.fixed(bytes);
-    try std.json.Stringify.value(Document{ .version = 5, .attempted = cache.attempted, .records = &records, .directory_mask = cache.directory_mask, .models = models }, .{}, &writer);
+    try std.json.Stringify.value(Document{ .version = 9, .attempted = cache.attempted, .records = &records, .directory_mask = cache.directory_mask, .models = models, .refresh = cache.refresh }, .{}, &writer);
     try writer.writeByte('\n');
     try root.writeMode(file_name, bytes[0..writer.end], true, 0o600);
 }
 
 /// Persist the attempt before network work, even if the worker later fails.
 pub fn claim(root: *fs.Root, requested: u8, manual: bool) !Claim {
+    return claimAt(root, requested, manual, wallNow(root.io), .{});
+}
+
+pub fn claimAt(root: *fs.Root, requested: u8, manual: bool, now: u64, policy: Policy) !Claim {
+    if (now > max_timestamp_ms) return error.InvalidMetadata;
     if (requested & ~(all_mask | dev_bit) != 0) return error.InvalidMetadata;
     const fd = try lock(root);
     defer fs.closeFd(fd);
     var cache = try load(root);
-    const mask = requested & (if (manual) (all_mask | dev_bit) else ~cache.attempted);
+    const mask = if (manual) requested else eligible(&cache, requested, now, policy);
     if (mask != 0) {
         cache.attempted |= mask;
+        for (source_bits, &cache.refresh) |source, *timing| {
+            if (mask & source == 0) continue;
+            if (timing.last_success_ms) |success| if (success > now) {
+                timing.last_success_ms = null;
+            };
+            if (timing.generation == max_generation) return error.MetadataGenerationExhausted;
+            timing.generation += 1;
+            timing.last_attempt_ms = now;
+            timing.successful = false;
+        }
         try save(root, cache);
     }
-    return .{ .cache = cache, .mask = mask };
+    var generations: Generations = undefined;
+    for (cache.refresh, 0..) |timing, i| generations[i] = timing.generation;
+    return .{ .cache = cache, .mask = mask, .generations = generations };
 }
 
 /// Reload under lock: unsuccessful providers and attempt flags remain intact.
 pub fn commit(root: *fs.Root, succeeded: u8, listing: Listing) !Cache {
+    return commitAt(root, succeeded, listing, wallNow(root.io));
+}
+
+pub fn commitAt(root: *fs.Root, succeeded: u8, listing: Listing, now: u64) !Cache {
+    if (now > max_timestamp_ms) return error.InvalidMetadata;
     if (succeeded & ~all_mask != 0) return error.InvalidMetadata;
     const fd = try lock(root);
     defer fs.closeFd(fd);
-    var cache = try load(root);
+    return commitLocked(root, try load(root), succeeded, listing, now);
+}
+
+/// Production publication: reject obsolete source results before any mutation.
+/// Official and public claims are independent, including same-millisecond claims.
+pub fn commitClaimedAt(root: *fs.Root, succeeded: u8, listing: Listing, generations: Generations, now: u64) !Commit {
+    if (now > max_timestamp_ms or succeeded & ~all_mask != 0) return error.InvalidMetadata;
+    const fd = try lock(root);
+    defer fs.closeFd(fd);
+    const cache = try load(root);
+    var accepted = succeeded | (if (listing.dev_done) dev_bit else @as(u8, 0));
+    for (source_bits, cache.refresh, generations) |source, timing, expected| {
+        if (expected == 0 or timing.generation != expected) accepted &= ~source;
+    }
+    var filtered = listing;
+    filtered.dev_done = accepted & dev_bit != 0;
+    return .{ .cache = try commitLocked(root, cache, accepted & all_mask, filtered, now), .accepted = accepted };
+}
+
+fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing, now: u64) !Cache {
+    var cache = previous;
     for (catalog.entries, 0..) |entry, i| {
         if (succeeded & bit(entry.provider) == 0) continue;
         if (listing.tokens[i]) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
@@ -647,12 +906,15 @@ pub fn commit(root: *fs.Root, succeeded: u8, listing: Listing) !Cache {
         if (refreshed & bit(row.provider) != 0) {
             row.available = false;
             row.tokens = null;
+            row.output_tokens = null;
             row.protocol = .auto;
             row.reasoning = null;
         }
         if (listing.dev_done) {
             row.dev_protocol = .auto;
             row.dev_reasoning = null;
+            row.dev_output_tokens = null;
+            row.dev_context_tokens = null;
             row.dev_present = false;
         }
     }
@@ -663,17 +925,25 @@ pub fn commit(root: *fs.Root, succeeded: u8, listing: Listing) !Cache {
         if (official) {
             row.available = source.available;
             row.tokens = source.tokens;
+            row.output_tokens = source.output_tokens;
             row.protocol = source.protocol;
             row.reasoning = source.reasoning;
         }
         if (listing.dev_done and source.dev_present) {
             row.dev_protocol = source.dev_protocol;
             row.dev_reasoning = source.dev_reasoning;
+            row.dev_output_tokens = source.dev_output_tokens;
+            row.dev_context_tokens = source.dev_context_tokens;
             row.dev_present = true;
         }
     }
     cache.directory_mask |= refreshed;
     if (listing.dev_done) cache.dev_reasoning = listing.dev;
+    for (source_bits, &cache.refresh) |source, *timing| {
+        if ((succeeded | (if (listing.dev_done) dev_bit else @as(u8, 0))) & source == 0) continue;
+        timing.last_success_ms = now;
+        timing.successful = true;
+    }
     if (succeeded != 0 or listing.dev_done) try save(root, cache);
     return cache;
 }
@@ -925,7 +1195,7 @@ test "metadata malformed cache is never overwritten and selectors are validated"
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const bad = [_][]const u8{
-        "{\"version\":6,\"attempted\":0,\"records\":[]}",
+        "{\"version\":10,\"attempted\":0,\"records\":[]}",
         "{\"version\":1,\"attempted\":64,\"records\":[]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"unknown\",\"context_window\":1}]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":0}]}",
@@ -1016,7 +1286,7 @@ test "metadata availability removal and failed refresh preserve other providers"
     try std.testing.expectEqualDeep(before, try load(&root));
 }
 
-test "metadata legacy cache upgrades to v5 with unknown directory availability and reasoning" {
+test "metadata legacy cache upgrades to v9 with unknown directory availability and reasoning" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
@@ -1033,7 +1303,7 @@ test "metadata legacy cache upgrades to v5 with unknown directory availability a
     defer std.testing.allocator.free(bytes.data);
     var parsed = try std.json.parseFromSlice(Document, std.testing.allocator, bytes.data, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 5), parsed.value.version);
+    try std.testing.expectEqual(@as(u32, 9), parsed.value.version);
     try std.testing.expectEqualDeep(upgraded.cache, try load(&root));
     const nullable = try parseCache(std.testing.allocator, "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":null}]}");
     for (nullable.available) |v| try std.testing.expect(v == null);
@@ -1076,7 +1346,32 @@ test "metadata official listing routes only DeepSeek credentials" {
     }
 }
 
-test "models.dev profiles persist in version 5 cache and are claimed once automatically" {
+test "version 5 upgrades output discovery once while retaining official directory" {
+    const a = std.testing.allocator;
+    const old: Document = .{ .version = 5, .attempted = provider_mask | dev_bit, .records = &.{}, .directory_mask = bit(.deepseek), .models = &.{.{ .provider = .deepseek, .id = "deepseek-flash", .context_window = 131072, .available = true, .protocol = .chat }} };
+    const bytes = try std.json.Stringify.valueAlloc(a, old, .{});
+    defer a.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = bytes });
+    var path: [4096]u8 = undefined;
+    const name = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var root = try fs.Root.open(a, std.testing.io, name);
+    defer root.deinit();
+    const migrated = try load(&root);
+    try std.testing.expectEqual(provider_mask, migrated.attempted);
+    try std.testing.expect(hasDirectory(&migrated, .deepseek));
+    try std.testing.expectEqual(@as(?u32, 131072), migrated.directory.rows[0].tokens);
+    try std.testing.expect(migrated.directory.rows[0].dev_output_tokens == null);
+    const first = try claim(&root, dev_bit, false);
+    try std.testing.expectEqual(dev_bit, first.mask);
+    const reloaded = try load(&root);
+    try std.testing.expectEqual(@as(u8, provider_mask | dev_bit), reloaded.attempted);
+    try std.testing.expect(hasDirectory(&reloaded, .deepseek));
+    try std.testing.expectEqual(@as(u8, 0), (try claim(&root, dev_bit, false)).mask);
+}
+
+test "models.dev profiles persist in version 8 cache and automatic claims observe cooldown" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);

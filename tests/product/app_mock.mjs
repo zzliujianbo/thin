@@ -219,11 +219,33 @@ async function scenario(name, protocol, kind, isPty = false) {
       }
 
       // 摘要请求直接返回固定的摘要文本。
-      if (summary) { summaries++; send(res,protocol,'Earlier reads succeeded. Continue reading seed.txt until finished.'); return; }
+      if (summary) {
+        if (kind === 'manual-compact') {
+          assert.equal(rounds, 2, 'manual compaction must follow two completed turns');
+          assert(!body.messages.some(m => m.role === 'user' && m.content === '/compact'), 'slash command leaked into model history');
+        }
+        summaries++; send(res,protocol,'Earlier reads succeeded. Continue reading seed.txt until finished.'); return;
+      }
 
       // 摘要之后的普通请求，标记已完成压缩。
       if (summaries) afterSummary = true;
       rounds++;
+
+      if (kind === 'manual-compact') {
+        assert(rounds <= 2, 'manual compaction must not start a normal response');
+        assert.equal(body.messages.filter(m => m.role === 'user').at(-1).content, rounds === 1 ? 'manual-first' : 'manual-second');
+        send(res, protocol, rounds === 1 ? 'older-answer-context '.repeat(700) + '\nmanual-first-answer' : 'manual-second-answer');
+        return;
+      }
+      if (kind === 'read-error') {
+        assert(rounds <= 2, 'missing read must not be retried');
+        if (rounds === 1) send(res, protocol, '', [tool('missing-read', 'read_file', {path:'missing-readme.md'})]);
+        else {
+          assert.equal(outputs.get('missing-read'), 'FileNotFound');
+          send(res, protocol, 'read-error-answer');
+        }
+        return;
+      }
 
       // 挂起场景：返回 SSE 响应头后不再发送数据；非 PTY 时发送 SIGINT 以测试取消。
       if (kind === 'stall' || kind === 'exit-busy' || (isPty && (kind === 'cancel' || kind === 'term') && rounds === 1)) {
@@ -634,6 +656,13 @@ async function scenario(name, protocol, kind, isPty = false) {
       }
     }
 
+    if (kind === 'manual-compact') {
+      assert.equal(rounds, 2); assert.equal(summaries, 1); assert.equal(requests, 3);
+    }
+    if (kind === 'read-error') {
+      assert.equal(rounds, 2); assert.equal(summaries, 0);
+      assert.equal(observations.get('missing-read'), 'FileNotFound');
+    }
     if (kind === 'compact') {
       // 压缩场景应共 9 轮（8 次读取加 1 次最终回复），至少触发一次自动摘要，且摘要后仍能看到 8 个读取结果。
       assert.equal(rounds,9); assert(summaries>=1,'automatic compaction not reached: tune context using measured evidence'); assert(afterSummary);
@@ -738,6 +767,8 @@ try {
   if (!watchdogOnly) {
   // 运行全部场景：先测无配置的 help 与 print，再对 chat 与 responses 运行通用场景，最后运行 PTY 场景（仅 chat）。
   await scenario('PTY compact menu navigation','chat','menu-navigation',true);
+  await scenario('PTY manual context compaction','chat','manual-compact',true);
+  await scenario('PTY read failure reason','chat','read-error',true);
   await scenario('PTY Go login returns to prompt','chat','auth-go',true);
   await scenario('PTY empty model selection chat','chat','model-select-empty',true);
   await scenario('PTY empty model selection responses','responses','model-select-empty',true);

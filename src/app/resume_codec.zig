@@ -130,6 +130,7 @@ pub fn encode(a: std.mem.Allocator, id: ids.Id, selection: *const selections.Sna
     if (payload.len == 0 or payload.len > max_payload_bytes) return error.InvalidResumeLength;
     // Snapshot.model() assumes its length invariant, so check it before encode.
     if (selection.model_len == 0 or selection.model_len > selection.model_buffer.len) return error.InvalidResumeSelection;
+    if (selection.provider_name_len > selection.provider_name_buffer.len) return error.InvalidResumeSelection;
     var metadata: [selections.max_bytes]u8 = undefined;
     var writer = std.Io.Writer.fixed(&metadata);
     selections.encode(&writer, id, selection) catch return error.InvalidResumeSelection;

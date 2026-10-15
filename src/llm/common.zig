@@ -219,6 +219,11 @@ pub fn failure(observed: bool, token_usage: p.Usage, raw_usage: ?[]const u8) p.O
     return .{ .failure = .{ .kind = .model, .message = "Model did not complete successfully.", .observed_content = observed, .usage = token_usage, .raw_usage_json = raw_usage } };
 }
 
+/// Explicit provider output-cap termination; never inferred from usage counters.
+pub fn outputLimit(observed: bool, token_usage: p.Usage, raw_usage: ?[]const u8) p.Outcome {
+    return .{ .failure = .{ .kind = .output_limit, .message = "Model reached the output token limit.", .observed_content = observed, .usage = token_usage, .raw_usage_json = raw_usage } };
+}
+
 /// 复制回放作用域的 connection 与 model 字符串到分配器 a 中，使其独立于原始请求。
 pub fn scopeCopy(a: std.mem.Allocator, scope: p.ReplayScope) !p.ReplayScope {
     return .{ .connection = try a.dupe(u8, scope.connection), .model = try a.dupe(u8, scope.model), .protocol = scope.protocol };

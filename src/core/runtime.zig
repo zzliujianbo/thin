@@ -211,17 +211,17 @@ test "thinking runtime normal and summary requests map current model" {
     defer runtime.deinit();
     const cancel: p.Cancellation = .{};
     for ([_]p.Purpose{ .normal, .summary }) |purpose| {
-        const req = runtime.request(purpose, &.{}, &cancel);
+        const req = try runtime.request(purpose, &.{}, &cancel);
         try std.testing.expectEqualStrings("high", req.reasoning_effort.?);
         try std.testing.expect(req.thinking.?);
         try std.testing.expectEqual(thinking.Format.deepseek, req.reasoning_format);
     }
     config.model.reasoning_effort = null;
-    try std.testing.expect(runtime.request(.summary, &.{}, &cancel).thinking == null);
+    try std.testing.expect((try runtime.request(.summary, &.{}, &cancel)).thinking == null);
     config.provider.base_url = "https://proxy";
     config.model.reasoning = .{ .map = .{ .off = "none", .max = "own-wire" } };
     config.model.reasoning_effort = "high";
-    const req = runtime.request(.normal, &.{}, &cancel);
+    const req = try runtime.request(.normal, &.{}, &cancel);
     try std.testing.expectEqualStrings("own-wire", req.reasoning_effort.?);
     try std.testing.expect(req.thinking == null);
 }
@@ -483,6 +483,9 @@ pub const Runtime = struct {
 
     /// 创建 Runtime：校验配置，并把启动时的 Memory 快照以 JSON 字符串嵌入系统提示词。
     pub fn init(a: std.mem.Allocator, io: Io, config: *const cfg.Config, model: p.Model, executor: Executor, host: Host, startup_memory: []const u8, trusted: bool) !Runtime {
+        // A registry declaration is not executable until cache/manual fields
+        // have resolved it; never turn a directory unknown into paid auto probing.
+        if (config.selection_pending) return error.DefaultModelUnavailable;
         // 配置非法则直接失败，不进入运行。
         try cfg.validate(config.*);
 
@@ -532,6 +535,7 @@ pub const Runtime = struct {
     pub fn planSelection(self: *Runtime, candidate: cfg.Config, connection_changed: bool) !SelectionPlan {
         if (self.busy.load(.acquire)) return error.Busy;
         if (self.poisoned) return error.UnsafeToContinue;
+        if (candidate.selection_pending) return error.DefaultModelUnavailable;
         try cfg.validate(candidate);
         const next = candidate.model;
         if (connection_changed and next.protocol == .auto and self.history.items.len != 0) return error.ExplicitProtocolRequired;
@@ -635,6 +639,9 @@ pub const Runtime = struct {
             .estimator = self.estimator,
             .last_context_tokens = self.last_context_tokens,
             .context_tokens = self.config.model.context_tokens,
+            .output_tokens = self.config.model.output_tokens,
+            .output_source = self.config.model.output_source,
+            .output_budget_frozen = true,
             .permission_id = self.permission_id,
         };
         try @import("checkpoint.zig").validate(self.allocator, state, self.config.*, self.executor.schemas);
@@ -741,10 +748,24 @@ pub const Runtime = struct {
     /// 处理一条用户输入直到终态。同一实例并发调用返回 error.Busy。
     /// 返回的 Terminal 与 finished 事件一一对应。
     pub fn run(self: *Runtime, text: []const u8, cancel: *p.Cancellation) !Terminal {
+        return self.runTask(.{ .prompt = text }, cancel);
+    }
+
+    /// Explicit summary-only task; never submits an artificial model user turn.
+    pub fn compactContext(self: *Runtime, cancel: *p.Cancellation) !Terminal {
+        return self.runTask(.compact, cancel);
+    }
+
+    const Operation = union(enum) { prompt: []const u8, compact };
+
+    fn runTask(self: *Runtime, operation: Operation, cancel: *p.Cancellation) !Terminal {
         // 占用运行权；defer 保证任何退出路径都会释放，防止永久 Busy。
         if (self.busy.swap(true, .acq_rel)) return error.Busy;
         defer self.busy.store(false, .release);
-        self.observer.notify(.{ .submitted = text });
+        self.observer.notify(.{ .submitted = switch (operation) {
+            .prompt => |text| text,
+            .compact => "/compact",
+        } });
 
         var task = Task{};
         var watchdog = Watchdog{ .io = self.io, .timeout_ms = self.config.limits.task_timeout_ms, .cancel = cancel };
@@ -758,9 +779,14 @@ pub const Runtime = struct {
 
         // A reached round budget is a bounded pause, not a model/HTTP failure.
         // Only a new explicit user submission grants another per-run budget.
-        self.runInner(text, cancel, &task) catch |err| {
-            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit) .paused else .failed;
+        const result = switch (operation) {
+            .prompt => |text| self.runInner(text, cancel, &task),
+            .compact => self.compactInner(cancel, &task),
+        };
+        result catch |err| {
+            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached) .paused else .failed;
             task.terminal.detail = err;
+            if (err == error.OutputLimitReached) task.terminal.model_failure = .output_limit;
         };
 
         // 先停止看门狗，之后读取 expired 才能反映本次 run 是否超时。
@@ -780,6 +806,42 @@ pub const Runtime = struct {
         task.terminal.context_snapshot = self.contextSnapshot();
         self.emit(.{ .finished = task.terminal }, cancel) catch {};
         return task.terminal;
+    }
+
+    fn compactInner(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
+        self.compactManual(cancel, task) catch |err| {
+            self.emit(.{ .compaction_failed = err }, cancel) catch {};
+            return err;
+        };
+    }
+
+    fn compactManual(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
+        if (self.poisoned) return error.UnsafeToContinue;
+        try checkCanceled(cancel);
+
+        // Do not sync policy here: a rejected summary must not change canonical
+        // history. compact() reinstalls the already applied policy on commit.
+        var latest_user: ?usize = null;
+        for (self.history.items, 0..) |message, i| {
+            if (message.role == .user) latest_user = i;
+        }
+        const protected = latest_user orelse return error.NoCompactionCandidate;
+        const previous = self.protected_index;
+        const old_history = self.history.items.ptr;
+        self.protected_index = protected;
+        // compact's history/arena swap is atomic. A post-commit host error must
+        // not restore an index from the retired history.
+        defer {
+            if (self.history.items.ptr == old_history) {
+                self.protected_index = previous;
+            } else {
+                // Summary usage describes the OLD request, not the new context.
+                self.last_context_tokens = null;
+            }
+        }
+        try self.compact(cancel, task, .manual);
+        self.last_context_tokens = null;
+        try self.emitContext(cancel);
     }
 
     /// 若已请求取消则返回 error.Canceled。取消是协作式的，各检查点调用此函数。
@@ -979,7 +1041,9 @@ pub const Runtime = struct {
             try checkCanceled(cancel);
             // 预检：超过压缩阈值则先压缩。
             self.preflight(cancel, task) catch |err| {
-                if (err == error.RoundLimit) try self.retainCurrentInput(&input_retained);
+                // A bounded pause retains the accepted goal, including a paid
+                // summary that exhausted its output before normal inference.
+                if (err == error.RoundLimit or err == error.OutputLimitReached) try self.retainCurrentInput(&input_retained);
                 return err;
             };
             try checkCanceled(cancel);
@@ -1006,7 +1070,7 @@ pub const Runtime = struct {
             // back the staged input before its stack block can escape runInner.
             try self.retainCurrentInput(&input_retained);
             // 调用模型；协议选择与降级由 selector 处理。
-            const result = self.selector.call(self.model, result_arena.allocator(), self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
+            const result = self.selector.call(self.model, result_arena.allocator(), try self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
                 self.last_context_tokens = null;
                 return err;
             };
@@ -1021,7 +1085,11 @@ pub const Runtime = struct {
                 .failure => |failure| {
                     task.terminal.model_failure = failure.kind;
                     task.terminal.http_status = failure.http_status;
-                    return if (failure.kind == .canceled) error.Canceled else error.ModelRequestFailed;
+                    return switch (failure.kind) {
+                        .canceled => error.Canceled,
+                        .output_limit => error.OutputLimitReached,
+                        else => error.ModelRequestFailed,
+                    };
                 },
             };
 
@@ -1043,14 +1111,15 @@ pub const Runtime = struct {
         }
     }
 
-    /// 构造模型请求。摘要请求使用 summary_tokens 限制输出，其余使用 max_output_tokens。
-    fn request(self: *Runtime, purpose: p.Purpose, messages_: []const p.Message, cancel: *const p.Cancellation) p.Request {
+    /// Construct each purpose's independent budget from its complete input;
+    /// summary uses explicit/automatic summary policy, normal uses response policy.
+    fn request(self: *Runtime, purpose: p.Purpose, messages_: []const p.Message, cancel: *const p.Cancellation) !p.Request {
         return withReasoning(self.config.*, .{
             .scope = .{ .connection = self.config.provider.base_url, .model = self.config.model.name, .protocol = self.selector.effective() },
             .system = self.system,
             .tools = self.executor.schemas,
             .messages = messages_,
-            .max_output_tokens = if (purpose == .summary) self.config.limits.summary_tokens else self.config.limits.max_output_tokens,
+            .max_output_tokens = try context.outputBudget(self.config.*, purpose, self.estimator.tokens(context.rawTokens(self.system, self.executor.schemas, messages_))),
             .purpose = purpose,
             .cancellation = cancel,
         });
@@ -1108,10 +1177,14 @@ pub const Runtime = struct {
         if (task.roundLimitReached(self.config.limits.max_rounds)) return;
         const budget = context.inputBudget(self.config.*);
         const before = self.estimatedTokens();
+        if (!self.config.limits.compaction_enabled) {
+            if (before > budget) return error.ContextTooLarge;
+            return;
+        }
         if (before < context.threshold(budget, self.config.limits.compaction_trigger_percent)) return;
-        self.compact(cancel, task) catch |err| {
+        self.compact(cancel, task, .automatic) catch |err| {
             // 终止性错误直接上抛，不能当作普通压缩失败吞掉。
-            if (err == error.Canceled or err == error.RoundLimit or err == error.HostDisconnected) return err;
+            if (err == error.Canceled or err == error.RoundLimit or err == error.HostDisconnected or err == error.OutputLimitReached) return err;
             try self.emit(.{ .compaction_failed = err }, cancel);
             // Failed compaction never mutates the old history. It may continue
             // only if that old input still fits the hard input budget.
@@ -1121,7 +1194,9 @@ pub const Runtime = struct {
 
     /// 调用模型生成摘要，替换可压缩的历史。
     /// 原子性：只有摘要有效且确实减少了足够 token 才提交；任何失败都保留旧历史。
-    fn compact(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
+    const CompactionPlanning = enum { automatic, manual };
+
+    fn compact(self: *Runtime, cancel: *p.Cancellation, task: *Task, planning: CompactionPlanning) !void {
         try checkCanceled(cancel);
 
         // 尚未选定协议时不能发起摘要请求。
@@ -1133,23 +1208,26 @@ pub const Runtime = struct {
         const a = scratch.allocator();
 
         // 决定要摘要的历史范围，受保护区段保持原样。
-        const selection = try context.plan(a, self.config.*, self.estimator, self.system, self.executor.schemas, self.history.items, self.protected_index);
+        const selection = try switch (planning) {
+            .automatic => context.plan(a, self.config.*, self.estimator, self.system, self.executor.schemas, self.history.items, self.protected_index),
+            .manual => context.planManual(a, self.config.*, self.estimator, self.system, self.executor.schemas, self.history.items, self.protected_index),
+        };
         const instruction = try context.summaryInstruction(a, selection, self.history.items);
         const messages_ = try a.alloc(p.Message, self.history.items.len + 1);
         @memcpy(messages_[0..self.history.items.len], self.history.items);
         messages_[messages_.len - 1] = try p.textMessage(a, .user, instruction);
         const raw = context.rawTokens(self.system, self.executor.schemas, messages_);
 
-        // 摘要请求本身也必须装得下：输入不能超过上下文窗口减去输出与安全余量。
-        const summary_limit = self.config.model.context_tokens - self.config.limits.summary_tokens - self.config.limits.safety_tokens;
-        if (self.estimator.tokens(raw) > summary_limit) return error.SummaryDoesNotFit;
+        // Include the appended instruction. Shrink only the summary output,
+        // never send a zero-token request or change the reasoning effort.
+        const summary_request = self.request(.summary, messages_, cancel) catch return error.SummaryDoesNotFit;
 
         // Compaction is not a user-facing model round. Failed and successful
         // summaries both leave `task.rounds` unchanged so they cannot exhaust RoundLimit.
         try self.emit(.{ .state = .compacting }, cancel);
 
         // 摘要请求只使用 scratch arena，不影响主历史。
-        const result = self.selector.call(self.model, a, self.request(.summary, messages_, cancel), .{}) catch |err| {
+        const result = self.selector.call(self.model, a, summary_request, .{}) catch |err| {
             self.last_context_tokens = null;
             return err;
         };
@@ -1157,7 +1235,11 @@ pub const Runtime = struct {
         try checkCanceled(cancel);
         const response = switch (result.outcome) {
             .success => |r| r,
-            .failure => |f| return if (f.kind == .canceled) error.Canceled else error.SummaryFailed,
+            .failure => |f| return switch (f.kind) {
+                .canceled => error.Canceled,
+                .output_limit => error.OutputLimitReached,
+                else => error.SummaryFailed,
+            },
         };
 
         // 摘要阶段不允许模型调用工具，只接受纯文本的 stop 响应。
@@ -1171,9 +1253,9 @@ pub const Runtime = struct {
             .tool_call, .tool_result => return error.SummaryRequestedTool,
         };
 
-        // 摘要不能为空，且不能超过 summary_tokens 预算。
+        // Validate against the ACTUAL sent cap after policy and headroom clamps.
         const trimmed = std.mem.trim(u8, text.items, " \t\r\n");
-        if (trimmed.len == 0 or context.textTokens(trimmed) > self.config.limits.summary_tokens) return error.InvalidSummary;
+        if (trimmed.len == 0 or context.textTokens(trimmed) > summary_request.max_output_tokens) return error.InvalidSummary;
 
         // 压缩后的新历史使用新 arena；installed 为 false 时 defer 释放它。
         var next_arena = std.heap.ArenaAllocator.init(self.allocator);

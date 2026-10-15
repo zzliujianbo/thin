@@ -67,6 +67,9 @@ test {
     _ = @import("app/cli.zig");
     _ = @import("main.zig");
     _ = @import("app/auth_store.zig");
+    _ = @import("app/app.zig");
+    _ = @import("app/model_resolver.zig");
+    _ = @import("app/model_metadata.zig");
     _ = @import("app/provider_catalog.zig");
     _ = @import("app/json_bound.zig");
     _ = @import("app/models_dev.zig");
@@ -83,6 +86,8 @@ test {
     _ = @import("tests/selection_defaults_test.zig");
     _ = @import("tests/thinking_contract_test.zig");
     _ = @import("tests/context_usage_test.zig");
+    _ = @import("tests/output_budget_test.zig");
+    _ = @import("tests/compaction_policy_test.zig");
     _ = @import("ui/terminal.zig");
     _ = @import("ui/input.zig");
     _ = @import("ui/input_history.zig");

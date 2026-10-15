@@ -539,7 +539,11 @@ const Ui = struct {
     fn toolCompleted(self: *Ui, caption: presentation.Caption, result: r.Execution) !void {
         const completion = shared.tools.Completion.fromExecution(result);
         const outcome = completion.outcome;
-        const observed = if (outcome == .success) try presentation.completed(self.allocator, caption, completion.file_stats) else presentation.Caption{ .kind = caption.kind, .label = try self.allocator.dupe(u8, caption.label) };
+        const observed = if (outcome == .success) try presentation.completed(self.allocator, caption, completion.file_stats) else presentation.Caption{
+            .kind = caption.kind,
+            .label = try self.allocator.dupe(u8, caption.label),
+            .failure_reason = if (caption.kind == .read) shared.tools.readFailure(result) else null,
+        };
         defer observed.deinit(self.allocator);
         const index = try self.add(.tool, "");
         try self.records.items[index].setCommand(self.allocator, observed, outcome, completion.duration_ms);
@@ -573,7 +577,7 @@ const Ui = struct {
         var notice: []const u8 = "";
         var model_failed = false;
         if (self.last_terminal) |result| {
-            if (result.status != .success and result.status != .paused) {
+            if (result.status != .success and (result.status != .paused or result.model_failure == .output_limit)) {
                 var formatted: std.Io.Writer.Allocating = .init(a);
                 defer formatted.deinit();
                 try shared.failure.write(&formatted.writer, self.notice, result.detail, result.model_failure, result.http_status);
@@ -988,6 +992,25 @@ const Ui = struct {
             self.notice = "Refreshing official model metadata...";
             return;
         }
+        if (compactCommand(command)) {
+            const no_arguments = std.mem.trim(u8, command["/compact".len..], " \t").len == 0;
+            const allowed = self.settingsIdle() and !self.editor_pasted;
+            self.wipeEditor();
+            if (!allowed) {
+                self.notice = "Compaction requires an idle, non-pasted session";
+            } else if (!no_arguments) {
+                self.notice = "Usage: /compact (no arguments)";
+            } else if (self.connection.current().runtime) |runtime| {
+                if (runtime.messages().len == 0) {
+                    self.notice = "No conversation to compact yet";
+                    return;
+                }
+                try self.startCompaction(runtime);
+            } else {
+                self.notice = "Not configured: use /login first";
+            }
+            return;
+        }
         if (modelCommand(command)) {
             if (!self.settingsIdle() or self.editor_pasted) {
                 self.wipeEditor();
@@ -1016,7 +1039,7 @@ const Ui = struct {
             const idle = self.settingsIdle() and !self.editor_pasted;
             self.wipeEditor();
             if (!auth) {
-                self.notice = "Usage: /login (no key argument); unknown commands are not sent";
+                self.notice = "Unknown command; use /model, /login (no key argument) or /compact";
             } else if (!idle) {
                 self.notice = "Setup requires an idle, non-pasted session";
             } else {
@@ -1075,6 +1098,31 @@ const Ui = struct {
         self.clearToolCaptions();
         self.scroll = 0;
         self.editor.clear();
+    }
+
+    /// Summary-only worker, sharing the ordinary cancellation/join/terminal path.
+    /// No command text is added to model history or ordinary prompt history.
+    fn startCompaction(self: *Ui, runtime: *r.Runtime) !void {
+        self.bridge.reset() catch {
+            self.notice = "Compaction requires a drained session bridge";
+            return;
+        };
+        self.cancel.* = .{};
+        self.approval_paste_seen = false;
+        self.job = .{ .runtime = runtime, .cancel = self.cancel, .prompt = "", .kind = .compact };
+        const future = try Io.concurrent(self.io, task.Job.run, .{&self.job});
+        self.future = future;
+        self.prompt = null;
+        self.has_submitted = true;
+        self.busy = true;
+        self.mode = .compacting;
+        self.last_terminal = null;
+        self.notice = "Compacting context...";
+        self.display.reset(self.clock_ms);
+        self.clearActiveTool();
+        self.clearToolCaptions();
+        self.closeCommandMenu();
+        self.scroll = 0;
     }
 
     fn navigateInput(self: *Ui, forward: bool) !void {
@@ -1352,7 +1400,7 @@ const Ui = struct {
         // 取走 bridge 中记录的终止信息，避免残留到下一次运行。
         _ = self.bridge.takeTerminal();
         self.clearPermission();
-        self.allocator.free(self.prompt.?);
+        if (self.prompt) |prompt| self.allocator.free(prompt);
         self.prompt = null;
         self.last_terminal = try self.job.result();
         // Shared state applies owner-produced terminal context after join.
@@ -1364,7 +1412,7 @@ const Ui = struct {
         self.notice = switch (result.status) {
             .success => "Ready",
             .canceled => "Canceled; prior side effects remain",
-            .paused => "Paused at round limit; send a message to continue",
+            .paused => if (result.model_failure == .output_limit) "Paused" else "Paused at round limit; send a message to continue",
             .failed => "Failed",
         };
 
@@ -1890,6 +1938,8 @@ const Ui = struct {
                     "/model [arguments hidden; use one model ID]"
                 else if (std.mem.eql(u8, trimmed[0..command_end], "/login"))
                     "/login [arguments hidden; no key argument]"
+                else if (std.mem.eql(u8, trimmed[0..command_end], "/compact"))
+                    "/compact [arguments hidden; no arguments]"
                 else
                     "/ [command arguments hidden]";
                 const visible: []const u8 = if (hide_arguments) hidden_hint else self.editor.bytes.items;
@@ -1971,6 +2021,10 @@ const Ui = struct {
         self.abandon_tail = false;
     }
 };
+
+fn compactCommand(command: []const u8) bool {
+    return std.mem.eql(u8, command, "/compact") or std.mem.startsWith(u8, command, "/compact ") or std.mem.startsWith(u8, command, "/compact\t");
+}
 
 fn modelCommand(command: []const u8) bool {
     return std.mem.eql(u8, command, "/model") or std.mem.startsWith(u8, command, "/model ") or std.mem.startsWith(u8, command, "/model\t");
@@ -2787,7 +2841,7 @@ test "file captions are contiguous but separated from final prose and percent co
     try std.testing.expect(std.mem.find(u8, ui.frame, "w" ++ theme.muted ++ " src/main.zig  ~1 " ++ theme.diff_added ++ "+2" ++ theme.muted ++ " " ++ theme.diff_removed ++ "-3" ++ theme.muted ++ " lines") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "raw-json-must-stay-hidden") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "do-not-show-body") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture 50.0%) > ") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ theme.reset ++ "fixture" ++ theme.reset ++ " " ++ theme.failure ++ "50.0%" ++ theme.reset ++ ") > ") != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expect(!screen.visible("Final answer") and screen.visible("final-body-marker"));
@@ -3296,16 +3350,17 @@ test "composer displays startup zero and latest actual usage or unknown without 
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     ui.display.seed(.{ .tokens = 0, .limit = 1000000 });
+    const green_prompt = "(" ++ theme.reset ++ "fixture" ++ theme.reset ++ " " ++ theme.success;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture 0.0%) > ") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, green_prompt ++ "0.0%" ++ theme.reset ++ ") > ") != null);
     ui.finishFrame();
     const Case = struct { purpose: p.Purpose, usage: p.Usage, prefix: []const u8 };
     const host = bridge.host();
     for ([_]Case{
-        .{ .purpose = .normal, .usage = .{ .input_tokens = 12000, .output_tokens = 1000, .cached_input_tokens = 10000, .reasoning_tokens = 300 }, .prefix = "(fixture 1.3%) > " },
-        .{ .purpose = .summary, .usage = .{ .total_tokens = 1000 }, .prefix = "(fixture 0.1%) > " },
+        .{ .purpose = .normal, .usage = .{ .input_tokens = 12000, .output_tokens = 1000, .cached_input_tokens = 10000, .reasoning_tokens = 300 }, .prefix = green_prompt ++ "1.3%" ++ theme.reset ++ ") > " },
+        .{ .purpose = .summary, .usage = .{ .total_tokens = 1000 }, .prefix = green_prompt ++ "0.1%" ++ theme.reset ++ ") > " },
         .{ .purpose = .normal, .usage = .{ .input_tokens = 12 }, .prefix = "(fixture ?%) > " },
-        .{ .purpose = .normal, .usage = .{ .total_tokens = 0 }, .prefix = "(fixture 0.0%) > " },
+        .{ .purpose = .normal, .usage = .{ .total_tokens = 0 }, .prefix = green_prompt ++ "0.0%" ++ theme.reset ++ ") > " },
     }) |case| {
         try host.emit_fn(host.context, .{ .usage = .{ .purpose = case.purpose, .protocol = .chat, .value = case.usage } }, &cancel);
         var item = bridge.pop().?;
@@ -3315,6 +3370,44 @@ test "composer displays startup zero and latest actual usage or unknown without 
         try std.testing.expect(std.mem.find(u8, ui.frame, case.prefix) != null);
         ui.finishFrame();
     }
+}
+
+test "output limit paused hint retains cause and budget advice instead of round-limit notice" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.last_terminal = .{ .status = .paused, .detail = error.OutputLimitReached, .model_failure = .output_limit };
+    ui.notice = "Paused";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const line = try ui.hint(arena.allocator(), ui.connection.current());
+    try std.testing.expect(std.mem.find(u8, line, "OutputLimitReached / output_limit") != null);
+    try std.testing.expect(std.mem.find(u8, line, "limits.max_output_tokens") != null);
+    try std.testing.expect(std.mem.find(u8, line, "lower reasoning effort") != null);
+    try std.testing.expect(std.mem.find(u8, line, "round limit") == null);
+}
+
+test "read command errors include a safe reason after error and never display raw results" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const caption = try presentation.caption(std.testing.allocator, "read_file", "{\"path\":\"README.md\"}");
+    defer caption.deinit(std.testing.allocator);
+    try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .duration_ms = 3 });
+    try std.testing.expectEqualStrings("r README.md [error] FileNotFound: file not found", ui.records.items[0].body.items);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "[error] FileNotFound: file not found") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "3ms") != null);
+    ui.finishFrame();
+    try ui.toolCompleted(caption, .{ .text = "{\"private-result\":\"secret\"}\n\x1b[2J", .is_error = true });
+    try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "[error] Read failed: details unavailable") != null);
+    try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "secret") == null);
+    try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .canceled = true });
+    try std.testing.expectEqualStrings("r README.md [canceled]", ui.records.items[2].body.items);
 }
 
 test "sequential tool records from different frames have no gaps then final prose has one gap" {
@@ -3369,7 +3462,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     _ = try ui.editor.insert("input-default");
     // Idle startup, without any delta or mutable Runtime reads.
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.high)) ++ "fixture" ++ theme.reset ++ " " ++ (comptime theme.effortColor(.high)) ++ "?%" ++ theme.reset ++ ") > input-default") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.high)) ++ "fixture" ++ theme.reset ++ " " ++ theme.reset ++ "?%" ++ theme.reset ++ ") > input-default") != null);
     ui.finishFrame();
     ui.mode = .calling_model;
     ui.display.reset(0);
@@ -3389,12 +3482,33 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     ui.mode = null;
     owner.effort = .low;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.low)) ++ "fixture" ++ theme.reset ++ " " ++ (comptime theme.effortColor(.low)) ++ "?%" ++ theme.reset ++ ") > input-default") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.low)) ++ "fixture" ++ theme.reset ++ " " ++ theme.reset ++ "?%" ++ theme.reset ++ ") > input-default") != null);
     ui.finishFrame();
     owner.effort = .unspecified;
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture ?%) > input-default") != null);
     ui.finishFrame();
+}
+
+test "composer frame keeps context occupancy colors static while model and spinner animate" {
+    for ([_]bool{ false, true }) |busy| {
+        for ([_]u64{ 0, 25, 50 }) |tokens| {
+            var cancel: p.Cancellation = .{};
+            var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+            defer bridge.deinit();
+            var ui = fixtureUi(&bridge, &cancel);
+            defer ui.deinit();
+            ui.display.observe(.{ .context_snapshot = .{ .tokens = tokens, .limit = 100 } }, 0);
+            if (busy) ui.mode = .calling_model;
+            ui.clock_ms = 80;
+            _ = try ui.editor.insert("default-input");
+            try ui.draw();
+            const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}.0%{s}) {s} default-input", .{ if (tokens == 0) theme.success else if (tokens == 25) "\x1b[38;5;220m" else theme.failure, tokens, theme.reset, if (busy) activity.spinner(80) else ">" });
+            defer std.testing.allocator.free(expected);
+            try std.testing.expect(std.mem.find(u8, ui.frame, expected) != null);
+            ui.finishFrame();
+        }
+    }
 }
 
 test "model only default color prompt has no headers cache or status and preserves cursor" {
@@ -4016,15 +4130,16 @@ test "menus stay above composer share colors and Left returns to acknowledged pa
     try ui.draw();
     try screen.replay(ui.frame);
     ui.finishFrame();
-    try ui.parser.feed("\x1b[A\r", sink); // Wrap to login, but no fresh ACK yet.
+    try ui.parser.feed("\x1b[B\r", sink); // Move to login, but no fresh ACK yet.
     try std.testing.expect(!ui.provider_open and !ui.secret_mode);
     try std.testing.expectEqual(command_menu_module.Command.auth, ui.command_menu.choice(ui.command_matches).?);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "> /login") != null);
     try screen.replay(ui.frame);
     ui.finishFrame();
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[20], "  /model"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], "> /login"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[19], "  /model"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[20], "> /login"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], "  /compact"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("menu-prior-answer"));
     try ui.parser.feed("\r", sink);
     try ui.draw();
@@ -4039,7 +4154,7 @@ test "menus stay above composer share colors and Left returns to acknowledged pa
     try ui.parser.feed("\x1b[D\r", sink);
     try std.testing.expect(!ui.provider_open and !ui.secret_mode);
     try std.testing.expectEqual(command_menu_module.Command.auth, ui.command_menu.choice(ui.command_matches).?);
-    try ui.parser.feed("\x1b[B", sink); // Wrap back to model.
+    try ui.parser.feed("\x1b[A", sink); // Return from login to model.
     try ui.draw();
     try screen.replay(ui.frame);
     ui.finishFrame();
@@ -4397,7 +4512,7 @@ test "effort shortcut follows declared levels and unknown or singleton sets neve
     try std.testing.expectEqual(@as(usize, 5), fixture.cycles);
 }
 
-test "slash menu suggests only model and login without title or shortcut hints" {
+test "slash menu shows model login compact with arguments and descriptions but no shortcut hints" {
     try text.initLocale();
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -4415,7 +4530,9 @@ test "slash menu suggests only model and login without title or shortcut hints" 
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Commands") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/model") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "/login") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/login  Configure provider") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/model [exact-id|--refresh]  Select model") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/compact  Compact conversation") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Type to filter; Tab complete") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Up/Down select; Enter run") == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
@@ -4646,7 +4763,7 @@ test "selection guards paste secret busy joined future poison and rollback" {
     ui.clock_ms = 2001;
     ui.expireEffortFlash();
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.minimal)) ++ "fixture-next" ++ theme.reset ++ " " ++ (comptime theme.effortColor(.minimal)) ++ "1.5%" ++ theme.reset ++ ") > ") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.minimal)) ++ "fixture-next" ++ theme.reset ++ " " ++ theme.success ++ "1.5%" ++ theme.reset ++ ") > ") != null);
     ui.finishFrame();
     ui.busy = true;
     try ui.parser.feed("\x1b[Z/model busy-id\r", sink);
@@ -4805,6 +4922,8 @@ const AuthFixture = struct {
     fail: bool = false,
     saves: usize = 0,
     calls: usize = 0,
+    normal_calls: usize = 0,
+    summary_calls: usize = 0,
 
     fn connection(self: *AuthFixture) Connection {
         return .{ .context = self, .current_fn = current, .configure_fn = configure };
@@ -4823,9 +4942,10 @@ const AuthFixture = struct {
         self.configured = true;
     }
 
-    fn call(ctx: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+    fn call(ctx: *anyopaque, _: std.mem.Allocator, request: p.Request, _: p.ModelSink) !p.Outcome {
         const self: *AuthFixture = @ptrCast(@alignCast(ctx));
         self.calls += 1;
+        if (request.purpose == .summary) self.summary_calls += 1 else self.normal_calls += 1;
         return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .text = "fixture done" }} }, .finish = .stop } };
     }
 
@@ -4837,6 +4957,87 @@ const AuthFixture = struct {
         return error.UnexpectedTool;
     }
 };
+
+test "compact slash menu requires acknowledged choice then joins a summary-only job" {
+    const cfg = @import("../core/config.zig");
+    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat } };
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = AuthFixture{ .configured = true };
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fixture, .call_fn = AuthFixture.call }, .{ .context = &fixture, .schemas = &.{}, .prepare_fn = AuthFixture.prepare, .execute_fn = AuthFixture.execute }, bridge.host(), "", false);
+    defer runtime.deinit();
+    fixture.runtime = &runtime;
+    var ui = fixtureUi(&bridge, &cancel);
+    ui.connection = fixture.connection();
+    defer ui.deinit();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("/compact\r", sink);
+    try std.testing.expectEqualStrings("No conversation to compact yet", ui.notice);
+    try std.testing.expect(ui.future == null and !ui.busy);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    const old: [8192]u8 = @splat('a');
+    const a = runtime.arena.allocator();
+    try runtime.history.append(a, try p.textMessage(a, .user, &old));
+    try runtime.history.append(a, try p.textMessage(a, .assistant, "old answer"));
+    try runtime.history.append(a, try p.textMessage(a, .user, "latest goal"));
+    try runtime.history.append(a, try p.textMessage(a, .assistant, "latest answer"));
+    runtime.protected_index = 2;
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .context_snapshot = .{ .tokens = 1, .limit = 100 } }, &cancel);
+    try ui.parser.feed("/compact\r", sink);
+    try std.testing.expectEqualStrings("Compaction requires a drained session bridge", ui.notice);
+    try std.testing.expect(ui.future == null);
+    var pending = bridge.pop().?;
+    pending.deinit();
+    try ui.parser.feed("/compact unexpected\r", sink);
+    try std.testing.expectEqualStrings("Usage: /compact (no arguments)", ui.notice);
+    try std.testing.expect(ui.future == null);
+    try ui.parser.feed("/co", sink);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/compact  Compact conversation") != null);
+    try ui.parser.feed("\r", sink); // Built but not ACKed: no action.
+    try std.testing.expect(ui.future == null);
+    ui.frame_offset = 1;
+    try ui.parser.feed("\r", sink); // Partial output still has no authority.
+    try std.testing.expect(ui.future == null);
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(ui.busy and ui.future != null and ui.prompt == null);
+    try std.testing.expectEqual(.compact, ui.job.kind);
+    try ui.complete();
+    try std.testing.expect(!ui.busy and ui.future == null);
+    try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
+    try std.testing.expectEqual(@as(usize, 1), fixture.summary_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.normal_calls);
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+    for (runtime.messages()) |message| for (message.blocks) |block| {
+        if (block == .text) try std.testing.expect(!std.mem.eql(u8, block.text, "/compact"));
+    };
+    try std.testing.expectEqual(p.Role.context, runtime.messages()[0].role);
+    try std.testing.expect(!ui.last_terminal.?.context_snapshot.?.known);
+}
+
+test "compact command rejects busy pasted poisoned and unconfigured states without a job" {
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    for (0..3) |case| {
+        _ = try ui.editor.insert("/compact");
+        ui.busy = case == 0;
+        ui.editor_pasted = case == 1;
+        ui.poisoned = case == 2;
+        try ui.submit();
+        try std.testing.expect(ui.future == null);
+        try std.testing.expectEqualStrings("Compaction requires an idle, non-pasted session", ui.notice);
+        ui.busy = false;
+        ui.poisoned = false;
+    }
+    try ui.parser.feed("/compact\r", .{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expectEqualStrings("Not configured: use /login first", ui.notice);
+}
 
 test "unconfigured text and slash commands never create jobs records or expose arguments" {
     try text.initLocale();
@@ -4874,6 +5075,7 @@ test "slash composer frames keep model prefixes and hide credentials with comman
         .{ .raw = "/model provider/model-pre", .shown = "/model provider/model-pre" },
         .{ .raw = "/model malformed extra", .shown = "/model [arguments hidden; use one model ID]", .hidden = "malformed" },
         .{ .raw = "/login fakecredential", .shown = "/login [arguments hidden; no key argument]", .hidden = "fakecredential" },
+        .{ .raw = "/compact fakecredential", .shown = "/compact [arguments hidden; no arguments]", .hidden = "fakecredential" },
         .{ .raw = "/unknown fakecredential", .shown = "/ [command arguments hidden]", .hidden = "fakecredential" },
     };
     for (cases) |case| {

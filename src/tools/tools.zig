@@ -398,18 +398,29 @@ pub const Tools = struct {
 /// even if it collides with an otherwise allowed variable.
 /// 为 bash 构造最小环境：只保留白名单变量，并移除 secret_name 指定的凭据变量。
 pub fn commandEnvironment(a: std.mem.Allocator, source: *const std.process.Environ.Map, secret_name: []const u8) !std.process.Environ.Map {
+    return commandEnvironmentMany(a, source, &.{secret_name});
+}
+
+fn secretEnvironmentName(key: []const u8, names: []const []const u8) bool {
+    for (names) |name| if (std.mem.eql(u8, key, name)) return true;
+    return false;
+}
+
+/// Filter every configured provider's credential source BEFORE copying values.
+/// Inactive providers must not leak a key even when its name is whitelisted.
+pub fn commandEnvironmentMany(a: std.mem.Allocator, source: *const std.process.Environ.Map, secret_names: []const []const u8) !std.process.Environ.Map {
     var result = std.process.Environ.Map.init(a);
     errdefer result.deinit();
 
     // 白名单：只传递运行常见命令所需的变量，其余（如 API key）一律丢弃。
     const allowed = [_][]const u8{ "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "TZ" };
     for (allowed) |key| {
-        if (std.mem.eql(u8, key, secret_name)) continue;
+        if (secretEnvironmentName(key, secret_names)) continue;
         if (source.get(key)) |value| try result.put(key, value);
     }
 
     // PATH 缺失时补默认值；但若 PATH 本身就是凭据名，则不补，避免把它当成可用的 PATH。
-    if (result.get("PATH") == null and !std.mem.eql(u8, secret_name, "PATH")) try result.put("PATH", "/usr/bin:/bin");
+    if (result.get("PATH") == null and !secretEnvironmentName("PATH", secret_names)) try result.put("PATH", "/usr/bin:/bin");
     return result;
 }
 

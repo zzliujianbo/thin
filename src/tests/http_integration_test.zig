@@ -210,6 +210,43 @@ test "integration: ordinary HTTP errors never fallback" {
     }
 }
 
+test "integration: explicit output limits preserve reasoning usage and never replay or fallback" {
+    var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });
+    defer backend.deinit();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]p.Protocol{ .chat, .responses, .auto }) |protocol| {
+        for ([_][]const u8{ "output-limit", "limit-tools" }) |scenario| {
+            if (protocol == .auto and std.mem.eql(u8, scenario, "limit-tools")) continue;
+            const name = try std.fmt.allocPrint(a, "{s}-{s}", .{ scenario, @tagName(protocol) });
+            var c = try config(a, name, protocol);
+            c.model.context_tokens = 131072;
+            var client = try Client.init(t.allocator, backend.io(), &c, "fake-local-key");
+            defer client.deinit();
+            var selector = Selector.init(protocol);
+            var req = request(c, protocol);
+            req.max_output_tokens = 4096;
+            var recorder: Recorder = .{};
+            const result = try selector.call(client.model(), a, req, recorder.sink());
+            try t.expect(!result.fallback and result.calls == 1);
+            try t.expect(result.outcome == .failure);
+            const failure = result.outcome.failure;
+            try t.expectEqual(p.FailureKind.output_limit, failure.kind);
+            try t.expectEqual(@as(?u64, 45871), failure.usage.input_tokens);
+            try t.expectEqual(@as(?u64, 4096), failure.usage.output_tokens);
+            try t.expectEqual(@as(?u64, 4096), failure.usage.reasoning_tokens);
+            try t.expect(failure.raw_usage_json != null);
+            if (protocol == .auto) {
+                // Even with no visible content, this is not unsupported_protocol.
+                try t.expect(!failure.observed_content);
+            } else if (std.mem.eql(u8, scenario, "limit-tools")) {
+                try t.expect(recorder.tool > 0);
+            } else try t.expect(recorder.reasoning > 0 and recorder.len == 0);
+        }
+    }
+}
+
 // 验证：缺少终止事件、截断、非法 JSON、未完成以及重定向等异常都以失败结束（fail closed），不会伪装成成功。
 test "integration: missing terminal truncated HTTP invalid args and redirects fail closed" {
     var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });

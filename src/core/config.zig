@@ -8,6 +8,9 @@ pub const providers = @import("providers.zig");
 
 /// 单一配置文件名；路径构造、交互存储和文件工具保护共用，避免名称漂移。
 pub const file_name = "config.json";
+test {
+    _ = @import("llm_config_test.zig");
+}
 
 /// 提供方连接信息。两种密钥来源最多配置一种，也允许尚未配置密钥。
 pub const Provider = struct {
@@ -40,11 +43,15 @@ pub const Model = struct {
     reasoning: ?thinking.Declaration = null,
     /// Missing in old configs means explicit: do not guess whether a user wrote it.
     reasoning_source: ReasoningSource = .explicit,
+    /// Known output capability, not a user request cap. Null means unknown.
+    output_tokens: ?u32 = null,
+    output_source: ReasoningSource = .explicit,
 
-    /// Derived maps/effort live in metadata cache/project settings, not config
+    /// Derived maps/output limits and effort live in cache/project settings, not config
     /// defaults. This prevents a fetched profile becoming an explicit override.
     pub fn persisted(self: Model) Model {
         var result = self;
+        if (self.output_source == .metadata) result.output_tokens = null;
         if (self.reasoning_source == .metadata) {
             result.reasoning = null;
             result.reasoning_effort = null;
@@ -66,10 +73,10 @@ pub const Limits = struct {
     read_bytes: u32 = 65536,
     /// 单次工具输出的字节上限。
     output_bytes: u32 = 32768,
-    /// 单次模型响应允许的最大输出 token 数。
-    max_output_tokens: u32 = 4096,
+    /// Explicit response cap; missing/null uses model capability or conservative fallback.
+    max_output_tokens: ?u32 = null,
     /// 预留的安全余量 token 数，从输入预算中扣除。
-    safety_tokens: u32 = 2048,
+    safety_tokens: u32 = 4096,
     /// Model turns per user submission; missing/null means unlimited.
     /// Explicit positive values retain their limit, including legacy 50.
     /// Compaction is not counted. Independent safety limits still apply.
@@ -80,6 +87,10 @@ pub const Limits = struct {
     task_timeout_ms: u32 = 1800000,
     /// 单次模型请求的超时（毫秒）。
     request_timeout_ms: u32 = 300000,
+    /// Successful model metadata remains fresh for four hours; failures and
+    /// in-flight claims wait five minutes before another automatic attempt.
+    model_refresh_ttl_ms: u32 = 14400000,
+    model_refresh_cooldown_ms: u32 = 300000,
     /// 取消时先发送 TERM 后等待的宽限时间（毫秒）。
     cleanup_grace_ms: u32 = 1000,
     /// 清理子进程的总超时（毫秒），超过后强制结束。
@@ -90,12 +101,15 @@ pub const Limits = struct {
     index_bytes: u32 = 8192,
     /// 单个分片文件的大小上限。
     shard_bytes: u32 = 32768,
+    /// Disable only automatic compaction; manual /compact and hard preflight remain.
+    compaction_enabled: bool = true,
     /// 触发压缩的上下文占用百分比。
     compaction_trigger_percent: u8 = 80,
     /// 压缩后希望达到的上下文占用百分比（必须小于触发阈值）。
     compaction_target_percent: u8 = 50,
-    /// 摘要输出预留的 token 数（不能超过 max_output_tokens）。
-    summary_tokens: u32 = 2048,
+    /// Missing/null selects a bounded automatic summary budget. An explicit
+    /// value retains its ceiling and cannot exceed explicit max_output_tokens.
+    summary_tokens: ?u32 = null,
     /// 单次模型响应的最大字节数。
     max_response_bytes: u32 = 8388608,
     /// 单个流式事件的最大字节数（不能超过 max_response_bytes）。
@@ -103,7 +117,64 @@ pub const Limits = struct {
 };
 
 /// 完整配置的根结构，对应 config.json 的顶层对象。
+pub const ModelPatch = struct {
+    protocol: ?protocol.Protocol = null,
+    context_tokens: ?u32 = null,
+    output_tokens: ?u32 = null,
+    reasoning_effort: ?[]const u8 = null,
+    reasoning: ?thinking.Declaration = null,
+
+    pub fn apply(self: ModelPatch, base: Model) Model {
+        var result = base;
+        if (self.protocol) |v| result.protocol = v;
+        if (self.context_tokens) |v| result.context_tokens = v;
+        if (self.output_tokens) |v| {
+            result.output_tokens = v;
+            result.output_source = .explicit;
+        }
+        if (self.reasoning_effort) |v| result.reasoning_effort = v;
+        if (self.reasoning) |v| {
+            result.reasoning = v;
+            result.reasoning_source = .explicit;
+        }
+        return result;
+    }
+};
+pub const NamedModel = struct { name: []const u8, patch: ModelPatch };
+pub const NamedProvider = struct {
+    name: []const u8,
+    connection: Provider,
+    models: []const NamedModel = &.{},
+    pub fn patchFor(self: NamedProvider, rawid: []const u8) ?ModelPatch {
+        for (self.models) |m| if (std.mem.eql(u8, m.name, rawid)) return m.patch;
+        return null;
+    }
+};
+pub const Registry = struct {
+    default: []const u8,
+    providers: []const NamedProvider,
+    pub fn find(self: Registry, name: []const u8) ?NamedProvider {
+        for (self.providers) |p| if (std.mem.eql(u8, p.name, name)) return p;
+        return null;
+    }
+};
+pub const DefaultSelection = struct { provider: []const u8, model: []const u8 };
+pub fn splitDefault(value: []const u8) !DefaultSelection {
+    const slash = std.mem.findScalar(u8, value, '/') orelse return error.InvalidDefault;
+    const result: DefaultSelection = .{ .provider = value[0..slash], .model = value[slash + 1 ..] };
+    if (!validAlias(result.provider) or !validText(result.model, 1024)) return error.InvalidDefault;
+    return result;
+}
+fn validAlias(value: []const u8) bool {
+    if (value.len == 0 or value.len > 64) return false;
+    for (value) |c| if (c <= 0x20 or c >= 0x7f or c == '/' or c == '\\') return false;
+    return true;
+}
+
 pub const Config = struct {
+    registry: ?Registry = null,
+    selected_provider: ?[]const u8 = null,
+    selection_pending: bool = false,
     provider: Provider,
     model: Model,
     /// Same-provider profiles; no discovery or credential overrides.
@@ -165,6 +236,8 @@ pub fn clone(allocator: std.mem.Allocator, config: Config) !std.json.Parsed(Conf
 fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, disk: bool) !std.json.Parsed(Config) {
     if (bytes.len > limit) return error.ConfigTooLarge;
 
+    if (disk) return parseDisk(allocator, bytes);
+
     // 包装底层分配器：即使 JSON 在读完 key 后才失败，也擦除所有中间分配。
     var wiping = WipingAllocator{ .backing = allocator };
     var parsed = try std.json.parseFromSlice(Config, wiping.allocator(), bytes, .{
@@ -188,6 +261,179 @@ fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, d
     }
     try validate(parsed.value);
     return parsed;
+}
+
+const json_options: std.json.ParseOptions = .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" };
+
+fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
+    if (T == ModelPatch or T == Limits) {
+        const fields = try object(value);
+        var it = fields.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == .float or entry.value_ptr.* == .number_string) return error.InvalidNumber;
+        }
+    }
+    return std.json.parseFromValueLeaky(T, a, value, json_options);
+}
+fn object(value: std.json.Value) !std.json.ObjectMap {
+    if (value != .object) return error.UnexpectedToken;
+    return value.object;
+}
+fn string(value: std.json.Value) ![]const u8 {
+    if (value != .string) return error.UnexpectedToken;
+    return value.string;
+}
+
+fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Config) {
+    const trimmed = std.mem.trimStart(u8, bytes, " \t\r\n");
+    if (trimmed.len != 0 and trimmed[0] != '{') return error.UnexpectedToken;
+    var wiping = WipingAllocator{ .backing = allocator };
+    var tree = try std.json.parseFromSlice(std.json.Value, wiping.allocator(), bytes, json_options);
+    errdefer tree.deinit();
+    const a = tree.arena.allocator();
+    const root = try object(tree.value);
+    var result: Config = undefined;
+    if (root.get("llm")) |llm_value| {
+        var keys = root.iterator();
+        while (keys.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits")) return error.UnknownField;
+        }
+        const llm = try object(llm_value);
+        var lk = llm.iterator();
+        while (lk.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "default") and !std.mem.eql(u8, entry.key_ptr.*, "providers")) return error.UnknownField;
+        }
+        const default = try string(llm.get("default") orelse return error.MissingField);
+        const selection = try splitDefault(default);
+        const provider_map = try object(llm.get("providers") orelse return error.MissingField);
+        if (provider_map.count() > 16) return error.TooManyProviders;
+        const list = try a.alloc(NamedProvider, provider_map.count());
+        var entries = provider_map.iterator();
+        var index: usize = 0;
+        var total: usize = 0;
+        while (entries.next()) |entry| : (index += 1) {
+            if (!validAlias(entry.key_ptr.*)) return error.InvalidProviderName;
+            var fields = try object(entry.value_ptr.*);
+            const models_value = fields.get("models");
+            // Work on a copy: removing a key must not mutate the JSON object's storage.
+            var connection_fields: std.json.ObjectMap = .{};
+            var iter = fields.iterator();
+            while (iter.next()) |field| {
+                if (!std.mem.eql(u8, field.key_ptr.*, "models")) try connection_fields.put(a, field.key_ptr.*, field.value_ptr.*);
+            }
+            const connection = try decode(Provider, a, .{ .object = connection_fields });
+            var models: []const NamedModel = &.{};
+            if (models_value) |mv| {
+                const mm = try object(mv);
+                total += mm.count();
+                if (total > 64) return error.TooManyModels;
+                const mutable = try a.alloc(NamedModel, mm.count());
+                var mi = mm.iterator();
+                var n: usize = 0;
+                while (mi.next()) |m| : (n += 1) mutable[n] = .{ .name = m.key_ptr.*, .patch = try decode(ModelPatch, a, m.value_ptr.*) };
+                models = mutable;
+            }
+            list[index] = .{ .name = entry.key_ptr.*, .connection = connection, .models = models };
+        }
+        const registry: Registry = .{ .default = default, .providers = list };
+        const chosen = registry.find(selection.provider) orelse return error.UnknownProvider;
+        const limits = if (root.get("limits")) |v| try decode(Limits, a, v) else Limits{};
+        if (limits.safety_tokens > 1024 * 1024) return error.InvalidBudget;
+        const context: u32 = @max(32768, limits.safety_tokens + 2);
+        result = .{ .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
+    } else {
+        // Internal snapshots can only enter through trusted clone(), never disk.
+        if (root.contains("registry") or root.contains("selected_provider") or root.contains("selection_pending")) return error.UnknownField;
+        result = try decode(Config, a, tree.value);
+        result.model = result.model.persisted();
+        for (@constCast(result.models)) |*m| m.* = m.persisted();
+    }
+    try validate(result);
+    tree.arena.child_allocator = allocator;
+    return .{ .arena = tree.arena, .value = result };
+}
+
+/// Writes declarations only; active cache-resolved models are not disk authority.
+pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
+    var s: std.json.Stringify = .{ .writer = writer, .options = .{
+        .emit_null_optional_fields = config.registry == null,
+        .whitespace = .indent_2,
+    } };
+    if (config.registry) |registry| {
+        try s.beginObject();
+        try s.objectField("llm");
+        try s.beginObject();
+        try s.objectField("default");
+        try s.write(registry.default);
+        try s.objectField("providers");
+        try s.beginObject();
+        for (registry.providers) |p| {
+            try s.objectField(p.name);
+            try s.beginObject();
+            inline for (@typeInfo(Provider).@"struct".field_names) |field| {
+                try s.objectField(field);
+                try s.write(@field(p.connection, field));
+            }
+            try s.objectField("models");
+            try s.beginObject();
+            for (p.models) |m| {
+                try s.objectField(m.name);
+                try s.write(m.patch);
+            }
+            try s.endObject();
+            try s.endObject();
+        }
+        try s.endObject();
+        try s.endObject();
+        try s.objectField("limits");
+        try s.write(config.limits);
+        try s.endObject();
+    } else {
+        const models = config.models;
+        // persisted() is applied per model, without allocating or leaking scratch keys.
+        try s.beginObject();
+        try s.objectField("provider");
+        try s.write(config.provider);
+        try s.objectField("model");
+        try s.write(config.model.persisted());
+        try s.objectField("models");
+        try s.beginArray();
+        for (models) |m| try s.write(m.persisted());
+        try s.endArray();
+        try s.objectField("credentials");
+        try s.write(config.credentials);
+        try s.objectField("limits");
+        try s.write(config.limits);
+        try s.endObject();
+    }
+}
+
+/// Candidate-only edits. Allocate replacement slices; never mutate shared registry memory.
+pub fn setRegistryDefault(a: std.mem.Allocator, config: *Config, provider_name: []const u8, rawid: []const u8) !void {
+    const registry = config.registry orelse return error.MissingRegistry;
+    if (registry.find(provider_name) == null) return error.UnknownProvider;
+    if (!validAlias(provider_name) or !validText(rawid, 1024)) return error.InvalidDefault;
+    const value = try std.fmt.allocPrint(a, "{s}/{s}", .{ provider_name, rawid });
+    config.registry.?.default = value;
+}
+pub fn setRegistryCredential(a: std.mem.Allocator, config: *Config, provider_name: []const u8, key: []const u8) !void {
+    const registry = config.registry orelse return error.MissingRegistry;
+    const provider = registry.find(provider_name) orelse return error.UnknownProvider;
+    var connection = provider.connection;
+    connection.api_key_env = "";
+    connection.api_key = key;
+    try validateKeySource(connection);
+    const copy = try a.dupe(NamedProvider, registry.providers);
+    const owned_key = try a.dupe(u8, key);
+    for (copy) |*p| if (std.mem.eql(u8, p.name, provider_name)) {
+        p.connection.api_key_env = "";
+        p.connection.api_key = owned_key;
+    };
+    config.registry.?.providers = copy;
+    if (config.selected_provider) |selected| if (std.mem.eql(u8, selected, provider_name)) {
+        config.provider.api_key_env = "";
+        config.provider.api_key = owned_key;
+    };
 }
 
 /// 擦除所有释放的分配；禁止缩容与 remap，避免分配器内部释放未擦除的旧缓冲区。
@@ -300,14 +546,17 @@ pub fn validate(config: Config) !void {
         if (declared != actual) return error.ProviderEndpointMismatch;
     };
     try config.credentials.validate();
+    if (config.registry) |registry| try validateRegistry(registry, config.limits);
 
     const l = config.limits;
-    // Null is unlimited only for max_rounds; every explicit limit must be positive.
+    // Null means unlimited rounds / automatic output; explicit limits are positive.
     inline for (@typeInfo(Limits).@"struct".field_names) |field| {
         if (comptime std.mem.eql(u8, field, "max_rounds")) {
             if (l.max_rounds) |rounds| {
                 if (rounds == 0 or rounds > 4096) return error.InvalidLimit;
             }
+        } else if (comptime std.mem.eql(u8, field, "compaction_enabled")) {
+            // false is an intentional policy, not a zero numeric limit.
         } else if (@field(l, field) == 0) return error.InvalidLimit;
     }
 
@@ -320,13 +569,14 @@ pub fn validate(config: Config) !void {
         l.max_event_bytes > l.max_response_bytes) return error.InvalidLimit;
 
     const day_ms = 24 * 60 * 60 * 1000;
+    if (l.model_refresh_ttl_ms > 7 * day_ms or l.model_refresh_cooldown_ms > 7 * day_ms) return error.InvalidLimit;
 
     // 超时之间的大小关系与上限：清理宽限不能超过清理总超时，且总超时不超过 60 秒。
     if (l.command_timeout_ms > l.command_max_timeout_ms or l.command_max_timeout_ms > day_ms or
         l.request_timeout_ms > day_ms or l.task_timeout_ms > day_ms or l.cleanup_grace_ms > l.cleanup_timeout_ms or
         l.cleanup_timeout_ms > 60000 or l.max_tool_calls > 4096) return error.InvalidLimit;
 
-    // 预算检查：输出与安全余量之和必须小于上下文窗口，否则输入预算为负数；摘要预算也不能超过输出上限。
+    // 窗口须留出输入与至少一个输出 token；输出上限按每次请求剩余空间收缩，摘要仍遵守显式上限。
     try validateModel(config.model, l);
     try validateReasoningProtocol(config.provider.base_url, config.model);
     if (config.models.len > 64) return error.TooManyModels;
@@ -340,6 +590,39 @@ pub fn validate(config: Config) !void {
 
     // 压缩目标必须低于触发阈值，且触发阈值必须小于 100%，否则压缩永远无法生效或立即触发。
     if (!(l.compaction_target_percent < l.compaction_trigger_percent and l.compaction_trigger_percent < 100)) return error.InvalidCompactionRatio;
+}
+
+fn validateRegistry(registry: Registry, limits: Limits) !void {
+    const selection = try splitDefault(registry.default);
+    if (registry.find(selection.provider) == null) return error.UnknownProvider;
+    if (registry.providers.len > 16) return error.TooManyProviders;
+    var total: usize = 0;
+    for (registry.providers, 0..) |p, i| {
+        if (!validAlias(p.name)) return error.InvalidProviderName;
+        for (registry.providers[0..i]) |previous| if (std.mem.eql(u8, previous.name, p.name)) return error.DuplicateProvider;
+        try validateUrl(p.connection.base_url);
+        try validateKeySource(p.connection);
+        if (p.connection.kind) |declared| if (providers.Id.fromUrl(p.connection.base_url)) |actual| {
+            if (declared != actual) return error.ProviderEndpointMismatch;
+        };
+        total += p.models.len;
+        if (total > 64) return error.TooManyModels;
+        for (p.models, 0..) |m, j| {
+            for (p.models[0..j]) |previous| if (std.mem.eql(u8, previous.name, m.name)) return error.DuplicateModel;
+            const patch = m.patch;
+            var model = patch.apply(.{ .name = m.name, .context_tokens = @max(32768, @min(limits.safety_tokens, 1024 * 1024) + 2) });
+            // A missing protocol is not explicit auto authority. Validate the
+            // declaration now, defer its protocol union until cache resolution.
+            if (patch.protocol == null) {
+                if (model.reasoning) |r| try r.validate();
+                model.reasoning = null;
+                model.reasoning_effort = null;
+                if (patch.reasoning_effort) |effort| if (!validText(effort, 128)) return error.InvalidReasoningEffort;
+            }
+            try validateModel(model, limits);
+            if (patch.protocol != null) try validateReasoningProtocol(p.connection.base_url, model);
+        }
+    }
 }
 
 test "thinking declarations strict owned config validation and protocol incompatibility" {
@@ -411,9 +694,19 @@ pub fn validateModel(model: Model, l: Limits) !void {
     // An Anthropic effort requires an explicitly verified Anthropic wire map.
     if (model.protocol == .anthropic and model.reasoning_effort != null and model.reasoning == null) return error.UnsupportedAnthropicReasoning;
     const mib = 1024 * 1024;
+    if (model.output_tokens) |tokens| {
+        if (tokens == 0 or tokens > mib) return error.InvalidBudget;
+    }
     if (model.context_tokens == 0 or model.context_tokens > 16 * mib or
-        l.max_output_tokens > mib or l.safety_tokens > mib or l.summary_tokens > l.max_output_tokens or
-        @as(u64, l.max_output_tokens) + l.safety_tokens >= model.context_tokens) return error.InvalidBudget;
+        l.safety_tokens > mib or
+        @as(u64, l.safety_tokens) + 1 >= model.context_tokens) return error.InvalidBudget;
+    if (l.summary_tokens) |tokens| if (tokens == 0 or tokens > mib) return error.InvalidBudget;
+    if (l.max_output_tokens) |cap| {
+        // An explicit ceiling is preserved, but may shrink to available room
+        // per request. It must not invalidate an otherwise usable model window.
+        if (cap == 0 or cap > mib) return error.InvalidBudget;
+        if (l.summary_tokens) |tokens| if (tokens > cap) return error.InvalidBudget;
+    }
 }
 
 /// Reads only the explicit file; never consults environment variables.
@@ -511,6 +804,9 @@ test "profiles use shared budgets and exact unique names with a bounded catalog"
     config.models = &.{ profile, profile };
     try std.testing.expectError(error.DuplicateModel, validate(config));
     config.models = &.{.{ .name = "small", .context_tokens = 6144 }};
+    config.limits.max_output_tokens = 4096; // A ceiling may shrink on smaller profiles.
+    try validate(config);
+    config.models = &.{.{ .name = "unusable", .context_tokens = 4097 }};
     try std.testing.expectError(error.InvalidBudget, validate(config));
     var too_many: [65]Model = undefined;
     @memset(&too_many, profile);
@@ -576,13 +872,12 @@ test "round limits missing null and legacy numbers survive config serialization"
         var copied = try clone(a, parsed.value);
         defer release(&copied);
         try std.testing.expectEqual(case.expected, copied.value.limits.max_rounds);
-        for ([_]bool{ true, false }) |emit_null| {
-            const bytes = try std.json.Stringify.valueAlloc(a, parsed.value, .{ .emit_null_optional_fields = emit_null });
-            defer a.free(bytes);
-            var restored = try parse(a, bytes);
-            defer release(&restored);
-            try std.testing.expectEqual(case.expected, restored.value.limits.max_rounds);
-        }
+        var disk: std.Io.Writer.Allocating = .init(a);
+        defer disk.deinit();
+        try writeDisk(parsed.value, &disk.writer);
+        var restored = try parse(a, disk.written());
+        defer release(&restored);
+        try std.testing.expectEqual(case.expected, restored.value.limits.max_rounds);
     }
     for ([_][]const u8{ "{\"max_rounds\":0}", "{\"max_rounds\":4097}" }) |limits| {
         const input = try std.mem.concat(a, u8, &.{ prefix, limits, "}" });
@@ -626,12 +921,16 @@ test "reject invalid URL and header injection" {
 // 验证：预算、压缩比例与各项限额的边界都会被检查。
 test "budget ratios and bounded limits" {
     var c = testConfig();
-    // 窗口太小，无法容纳输出与安全余量。
+    // A ceiling is not a reservation; requests shrink to available context.
+    c.limits.max_output_tokens = 4096;
     c.model.context_tokens = 6144;
+    try validate(c);
+    c.model.context_tokens = c.limits.safety_tokens + 1;
     try std.testing.expectError(error.InvalidBudget, validate(c));
 
     c = testConfig();
-    // 摘要预算超过输出上限。
+    // 摘要预算超过显式输出上限（自动模式的摘要独立）。
+    c.limits.max_output_tokens = 4096;
     c.limits.summary_tokens = 4097;
     try std.testing.expectError(error.InvalidBudget, validate(c));
     c = testConfig();
@@ -643,11 +942,16 @@ test "budget ratios and bounded limits" {
     c.limits.compaction_trigger_percent = 100;
     try std.testing.expectError(error.InvalidCompactionRatio, validate(c));
 
-    // 任何字段设为 0 都必须报错。
+    // Numeric zero is invalid; false intentionally disables automatic compaction.
     inline for (@typeInfo(Limits).@"struct".field_names) |field| {
         c = testConfig();
-        @field(c.limits, field) = 0;
-        try std.testing.expectError(error.InvalidLimit, validate(c));
+        if (comptime std.mem.eql(u8, field, "compaction_enabled")) {
+            c.limits.compaction_enabled = false;
+            try validate(c);
+        } else {
+            @field(c.limits, field) = 0;
+            try std.testing.expectError(error.InvalidLimit, validate(c));
+        }
     }
 
     // 超过硬上限的大小字段必须报错。
@@ -797,6 +1101,13 @@ test "credential parser cleanup and release zero owned allocations" {
     ));
     try std.testing.expectError(error.InvalidApiKey, parse(observer.allocator(),
         \\{"provider":{"base_url":"https://example.invalid","api_key":"fake\ninline"},"model":{"name":"test","context_tokens":32768}}
+    ));
+    var registry_parsed = try parse(observer.allocator(),
+        \\{"llm":{"default":"a/m","providers":{"a":{"base_url":"https://example.invalid"},"backup":{"base_url":"https://backup.invalid","api_key":"fake-backup"}}}}
+    );
+    release(&registry_parsed);
+    try std.testing.expectError(error.InvalidApiKey, parse(observer.allocator(),
+        \\{"llm":{"default":"a/m","providers":{"a":{"base_url":"https://example.invalid"},"backup":{"base_url":"https://backup.invalid","api_key":"fake\nbackup"}}}}
     ));
     try std.testing.expect(observer.frees > 0);
     try std.testing.expect(!observer.dirty_free);

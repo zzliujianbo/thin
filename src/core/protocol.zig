@@ -141,6 +141,9 @@ pub const FailureKind = enum {
     protocol,
     timeout,
     canceled,
+    /// Explicit provider token-budget termination, never inferred from usage.
+    /// Partial text/tool arguments are NOT a successful response or replay state.
+    output_limit,
 };
 
 /// 一次失败调用的详情。

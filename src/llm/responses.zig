@@ -8,6 +8,85 @@ const c = @import("common.zig");
 const test_support = @import("../tests/adapter_test_support.zig");
 
 // 测试：usage 累计快照在 in_progress/incomplete 中仍被记录，但不会因此锁定内容（observedContent 为 false），失败结果也携带用量。
+test "responses output limit explicit cap with reasoning or partial tool never commits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |tool| {
+        var s = Stream.init(a, test_support.response_scope, .{});
+        if (tool) {
+            try s.feed("", "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"f\",\"arguments\":\"\"}}");
+            try s.feed("", "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc\",\"delta\":\"{\"}");
+        } else try s.feed("", "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"r\"}}");
+        try s.feed("response.incomplete", "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"output_tokens\":4096,\"output_tokens_details\":{\"reasoning_tokens\":4096}}}}");
+        const f = (try s.finish()).failure;
+        try std.testing.expectEqual(p.FailureKind.output_limit, f.kind);
+        try std.testing.expect(f.observed_content and f.raw_usage_json != null);
+        try std.testing.expectEqual(@as(?u64, 4096), f.usage.output_tokens);
+        try std.testing.expectEqual(@as(?u64, 4096), f.usage.reasoning_tokens);
+        try std.testing.expectError(error.InvalidStreamState, s.finish());
+    }
+}
+
+test "responses closed partial tool arguments wait for authoritative terminal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const native = "{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"f\",\"arguments\":\"{\"}";
+    for ([_]bool{ false, true }) |item_done| {
+        for (0..3) |terminal| {
+            var s = Stream.init(a, test_support.response_scope, .{});
+            try s.feed("", "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"f\",\"arguments\":\"\"}}");
+            try s.feed("", "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc\",\"delta\":\"{\"}");
+            try s.feed("", "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"item_id\":\"fc\",\"arguments\":\"{\"}");
+            if (item_done) try s.feed("", "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" ++ native ++ "}");
+            switch (terminal) {
+                0 => {
+                    try s.feed("", "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"output_tokens\":4096}}}");
+                    const failure = (try s.finish()).failure;
+                    try std.testing.expectEqual(p.FailureKind.output_limit, failure.kind);
+                    try std.testing.expectEqual(@as(?u64, 4096), failure.usage.output_tokens);
+                    try std.testing.expect(failure.observed_content and failure.raw_usage_json != null);
+                },
+                1 => {
+                    try std.testing.expectError(error.InvalidToolArguments, s.feed("", "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[" ++ native ++ "]}}"));
+                    try std.testing.expectError(error.InvalidStreamState, s.finish());
+                },
+                else => try std.testing.expectError(error.TruncatedStream, s.finish()),
+            }
+        }
+    }
+}
+
+test "responses output limit requires exact incomplete reason and valid types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "{}", "{\"reason\":null}", "{\"reason\":\"unknown\"}", "{\"reason\":\"content_filter\"}" }) |details| {
+        var s = Stream.init(a, test_support.response_scope, .{});
+        try s.feed("", try std.fmt.allocPrint(a, "{{\"type\":\"response.incomplete\",\"response\":{{\"incomplete_details\":{s},\"usage\":{{\"output_tokens\":4096,\"output_tokens_details\":{{\"reasoning_tokens\":4096}}}}}}}}", .{details}));
+        try std.testing.expectEqual(p.FailureKind.model, (try s.finish()).failure.kind);
+    }
+    for ([_][]const u8{ "response.failed", "error" }) |kind| {
+        var s = Stream.init(a, test_support.response_scope, .{});
+        try s.feed("", try std.fmt.allocPrint(a, "{{\"type\":\"{s}\",\"response\":{{\"incomplete_details\":{{\"reason\":\"max_output_tokens\"}}}}}}", .{kind}));
+        try std.testing.expectEqual(p.FailureKind.model, (try s.finish()).failure.kind);
+    }
+    for ([_][]const u8{ "[]", "{\"incomplete_details\":[]}", "{\"incomplete_details\":{\"reason\":7}}", "{\"status\":\"completed\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}", "{\"status\":7,\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}" }) |response| {
+        var s = Stream.init(a, test_support.response_scope, .{});
+        try std.testing.expectError(error.InvalidEvent, s.feed("", try std.fmt.allocPrint(a, "{{\"type\":\"response.incomplete\",\"response\":{s}}}", .{response})));
+        try std.testing.expectError(error.InvalidStreamState, s.finish());
+    }
+    var s = Stream.init(a, test_support.response_scope, .{});
+    const cap = "{\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}";
+    try std.testing.expectError(error.EventTypeMismatch, s.feed("response.completed", cap));
+    try std.testing.expectError(error.InvalidStreamState, s.finish());
+    s = Stream.init(a, test_support.response_scope, .{});
+    try s.feed("", cap);
+    try std.testing.expectError(error.InvalidStreamState, s.feed("", cap));
+    try std.testing.expectError(error.InvalidStreamState, s.finish());
+}
+
 test "responses usage cumulative snapshots survive incomplete without content lock" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -439,6 +518,7 @@ pub const Stream = struct {
     completed: bool = false,
     /// 是否收到 error、response.failed 或 response.incomplete。
     failed: bool = false,
+    output_limited: bool = false,
     /// 发生错误后置位；之后 feed 与 finish 都会被拒绝，避免使用不一致的状态。
     poisoned: bool = false,
     /// finish 已调用后置位，此后不再接受输入。
@@ -506,6 +586,21 @@ pub const Stream = struct {
 
         // 失败类事件只记录状态，不在此处返回错误；具体失败信息在 finish 中脱敏生成。
         if (c.eq(typ, "error") or c.eq(typ, "response.failed") or c.eq(typ, "response.incomplete")) {
+            if (c.eq(typ, "response.incomplete")) {
+                if (j.get(v, "response")) |response| {
+                    if (response != .object) return error.InvalidEvent;
+                    if (j.get(response, "status")) |status| {
+                        if (status != .string or !c.eq(status.string, "incomplete")) return error.InvalidEvent;
+                    }
+                    if (j.get(response, "incomplete_details")) |details| if (details != .null) {
+                        if (details != .object) return error.InvalidEvent;
+                        if (j.get(details, "reason")) |reason| if (reason != .null) {
+                            const name = j.string(reason) orelse return error.InvalidEvent;
+                            self.output_limited = c.eq(name, "max_output_tokens");
+                        };
+                    };
+                }
+            }
             self.failed = true;
             return;
         }
@@ -584,7 +679,8 @@ pub const Stream = struct {
             } else {
                 if (item.args_done != null) return error.InvalidStreamState;
                 const args = try c.text(v, "arguments");
-                try c.arguments(args);
+                // Done can precede response.incomplete with cap-truncated JSON.
+                // validateOutput gates all executable arguments at completed.
                 if (item.args_seen and !c.eq(try item.args.join(t), args)) return error.InconsistentToolArguments;
                 item.args_done = try self.a.dupe(u8, args);
             }
@@ -650,7 +746,6 @@ pub const Stream = struct {
     fn checkCall(_: *Stream, item: Item, final: j.Value, temp: std.mem.Allocator) !void {
         if (!c.eq(item.call_id.?, try c.text(final, "call_id")) or !c.eq(item.name.?, try c.text(final, "name"))) return error.InconsistentToolId;
         const args = try c.text(final, "arguments");
-        try c.arguments(args);
         if (item.args_seen and !c.eq(try item.args.join(temp), args)) return error.InconsistentToolArguments;
         if (item.args_done) |done| if (!c.eq(done, args)) return error.InconsistentToolArguments;
     }
@@ -661,7 +756,7 @@ pub const Stream = struct {
         if (self.poisoned or self.committed) return error.InvalidStreamState;
         self.committed = true;
         // 失败结果不包含 Message，只带上用量与内容观察状态。
-        if (self.failed) return c.failure(self.observed, self.token_usage, self.raw_usage);
+        if (self.failed) return if (self.output_limited) c.outputLimit(self.observed, self.token_usage, self.raw_usage) else c.failure(self.observed, self.token_usage, self.raw_usage);
         if (!self.completed) return error.TruncatedStream;
 
         var blocks: std.ArrayList(p.Block) = .empty;

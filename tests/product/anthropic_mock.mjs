@@ -17,7 +17,7 @@ const counts = new Map();
 const failures = new Set();
 const expected = new Map([
   ['replay', 3], ['multi', 3], ['error401', 1], ['error429', 1], ['error500', 1],
-  ['error404', 1], ['error-sse', 1], ['max_tokens', 1], ['pause_turn', 1],
+  ['error404', 1], ['error-sse', 1], ['max_tokens', 1], ['max_tokens_partial', 1], ['pause_turn', 1],
   ['context_limit', 1], ['missing-stop', 1], ['malformed-delta', 1], ['invalid-json', 1],
   ['unsupported-block', 1], ['server-tool', 1], ['redirect', 1], ['timeout', 1], ['cancel', 1],
 ]);
@@ -143,8 +143,8 @@ const server = http.createServer(async (req, res) => {
     if (scenario === 'malformed-delta') {
       send(res, start() + blockStart(0, { ...tool(), input: {} }) + delta(0, { type: 'input_json_delta', partial_json: 42 }) + blockStop(0) + finish('tool_use')); return;
     }
-    if (scenario === 'invalid-json') {
-      send(res, start() + blockStart(0, { ...tool(), input: {} }) + delta(0, { type: 'input_json_delta', partial_json: '{"q":' }) + blockStop(0) + finish('tool_use')); return;
+    if (scenario === 'invalid-json' || scenario === 'max_tokens_partial') {
+      send(res, start() + blockStart(0, { ...tool(), input: {} }) + delta(0, { type: 'input_json_delta', partial_json: '{"q":' }) + blockStop(0) + finish(scenario === 'max_tokens_partial' ? 'max_tokens' : 'tool_use')); return;
     }
     if (scenario === 'missing-stop') {
       send(res, start() + toolBlocks() + frame({ type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 4 } })); return;
