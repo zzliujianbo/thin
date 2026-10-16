@@ -52,6 +52,7 @@ test "known DeepSeek format selects Chat before an auto request even when effort
     var dummy: u8 = 0;
     for ([_]bool{ false, true }) |explicit| {
         var config: cfg.Config = .{
+            .limits = .{ .low_price_input = false },
             .provider = .{ .base_url = if (explicit) "https://proxy.invalid" else "https://api.deepseek.com" },
             .model = .{ .name = if (explicit) "custom" else "deepseek-flash", .context_tokens = 32768, .protocol = .auto, .reasoning = if (explicit) .{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } } else null },
         };
@@ -69,6 +70,7 @@ test "shared request options encode custom mapping and DeepSeek probe parity off
     const a = std.testing.allocator;
     for ([_]thinking.Format{ .standard, .deepseek }) |format| {
         var config: cfg.Config = .{
+            .limits = .{ .low_price_input = false },
             .provider = .{ .base_url = "https://proxy.invalid" },
             .model = .{ .name = "custom", .context_tokens = 32768, .protocol = .auto, .reasoning = .{ .format = format, .map = .{ .off = "off", .high = "intensive" } } },
         };
@@ -99,7 +101,7 @@ test "shared request options encode custom mapping and DeepSeek probe parity off
 
 test "incompatible retained auto selection rejects before replay calibration or config publication" {
     var dummy: u8 = 0;
-    var config: cfg.Config = .{ .provider = .{ .base_url = "https://proxy.invalid" }, .model = .{ .name = "old", .context_tokens = 32768, .protocol = .auto } };
+    var config: cfg.Config = .{ .limits = .{ .low_price_input = false }, .provider = .{ .base_url = "https://proxy.invalid" }, .model = .{ .name = "old", .context_tokens = 32768, .protocol = .auto } };
     var owner = try runtime(&config, &dummy);
     defer owner.deinit();
     owner.selector.selected = .responses;

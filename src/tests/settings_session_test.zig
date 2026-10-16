@@ -55,6 +55,7 @@ const Fixture = struct {
             if (err != error.ConfigNotFound) return err;
             var initial = try store.loadOrInitialize();
             defer cfg.release(&initial);
+            initial.value.limits.low_price_input = false;
             initial.value.model.reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } };
             try store.save(initial.value);
         }

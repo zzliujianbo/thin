@@ -17,7 +17,7 @@ fn config(a: std.mem.Allocator, scenario: []const u8) !cfg.Config {
         .raw, .percent_encoded => |s| s,
     };
     if (!std.mem.eql(u8, uri.scheme, "http") or !std.mem.eql(u8, host_text, "127.0.0.1") or uri.port == null or uri.port == 0 or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null or !uri.path.isEmpty()) return error.UnsafeFixtureUrl;
-    return .{ .provider = .{ .base_url = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, scenario }), .api_key_env = "THIN_FAKE_KEY" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .anthropic }, .limits = .{ .request_timeout_ms = 10000 } };
+    return .{ .provider = .{ .base_url = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, scenario }), .api_key_env = "THIN_FAKE_KEY" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .anthropic }, .limits = .{ .low_price_input = false, .request_timeout_ms = 10000 } };
 }
 fn request(c: cfg.Config) p.Request {
     return .{ .scope = .{ .connection = c.provider.base_url, .model = c.model.name, .protocol = .anthropic }, .system = "fixed fixture system", .tools = &tools, .messages = &initial, .max_output_tokens = 128 };

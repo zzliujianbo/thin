@@ -96,6 +96,7 @@ test "Responses retains optional tool fields instead of enabling strict schemas"
 // 验证：HTTP 模型在 scope 不匹配时拒绝调用，预取消的请求直接返回 canceled，全程不发起真实连接。
 test "HTTP model validates scope and pre-cancel without entering transport" {
     const configuration = cfg.Config{
+        .limits = .{ .low_price_input = false },
         // Intentionally not a URL: even a regression cannot contact a real host.
         .provider = .{ .base_url = "unused-test-connection", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "test-model", .context_tokens = 32768 },

@@ -116,6 +116,11 @@ pub const Terminal = struct {
 /// Only the owner calls contextSnapshot while running; consumers get values.
 pub const ContextSnapshot = struct { tokens: u64, limit: u64, known: bool = true };
 
+pub fn inputBudgetPause(detail: ?anyerror) bool {
+    const err = detail orelse return false;
+    return err == error.InputBudgetExceeded or err == error.UnknownInputPriceThreshold or err == error.InputBudgetSummaryFailed;
+}
+
 /// 发给宿主的运行时事件，按发生顺序同步送达 Host.emit_fn。
 pub const Event = union(enum) {
     /// 阶段切换。
@@ -206,7 +211,7 @@ test "thinking runtime normal and summary requests map current model" {
         }
     };
     var dummy: u8 = 0;
-    var config: cfg.Config = .{ .provider = .{ .base_url = "https://api.deepseek.com" }, .model = .{ .name = "deepseek-flash", .context_tokens = 32768, .protocol = .chat, .reasoning_effort = "medium", .reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } } } };
+    var config: cfg.Config = .{ .provider = .{ .base_url = "https://api.deepseek.com" }, .model = .{ .name = "deepseek-flash", .context_tokens = 32768, .protocol = .chat, .reasoning_effort = "medium", .reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } } }, .limits = .{ .low_price_input = false } };
     var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "", false);
     defer runtime.deinit();
     const cancel: p.Cancellation = .{};
@@ -360,6 +365,41 @@ test "selection preserves canonical history and closes retained auto fallback" {
     try runtime.prepareSelection(next);
     try std.testing.expect(runtime.selector.selected == null);
     try std.testing.expect(!runtime.selector.initial_attempted);
+}
+
+test "default low price policy refuses unknown pricing before inference and explicit optout runs" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn call(raw: *anyopaque, a: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .{ .success = .{ .finish = .stop, .message = try p.textMessage(a, .assistant, "fixture answer") } };
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !Prepared {
+            return error.UnexpectedTool;
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: Prepared, _: *const p.Cancellation) !Execution {
+            return error.UnexpectedTool;
+        }
+    };
+    for ([_]bool{ true, false }) |use_default| {
+        var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .protocol = .chat, .context_tokens = 32768 } };
+        if (!use_default) config.limits.low_price_input = false;
+        var fake: Fake = .{};
+        var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "", true);
+        defer runtime.deinit();
+        var cancel: p.Cancellation = .{};
+        const result = try runtime.run("fixture goal", &cancel);
+        if (use_default) {
+            try std.testing.expectEqual(Status.paused, result.status);
+            try std.testing.expectEqual(error.UnknownInputPriceThreshold, result.detail.?);
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+        } else {
+            try std.testing.expectEqual(Status.success, result.status);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        }
+        try std.testing.expectEqualStrings("fixture goal", runtime.messages()[0].blocks[0].text);
+    }
 }
 
 /// Shared by fresh runtimes and the explicit manual connectivity probe.
@@ -642,6 +682,11 @@ pub const Runtime = struct {
             .output_tokens = self.config.model.output_tokens,
             .output_source = self.config.model.output_source,
             .output_budget_frozen = true,
+            .input_budget_frozen = true,
+            .input_price_threshold = self.config.model.input_price_threshold,
+            .max_input_tokens = self.config.limits.max_input_tokens,
+            .low_price_input = self.config.limits.low_price_input,
+            .input_margin_tokens = self.config.limits.input_margin_tokens,
             .permission_id = self.permission_id,
         };
         try @import("checkpoint.zig").validate(self.allocator, state, self.config.*, self.executor.schemas);
@@ -717,6 +762,8 @@ pub const Runtime = struct {
 
         /// 已执行的工具调用次数，受 max_tool_calls 限制。
         tool_calls: u32 = 0,
+        /// Possible paid summary attempts, including transport throws before usage.
+        summary_attempts: u64 = 0,
         /// 累计的用量与终态，run 结束时返回。
         terminal: Terminal = .{ .status = .success },
 
@@ -784,7 +831,7 @@ pub const Runtime = struct {
             .compact => self.compactInner(cancel, &task),
         };
         result catch |err| {
-            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached) .paused else .failed;
+            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached or inputBudgetPause(err)) .paused else .failed;
             task.terminal.detail = err;
             if (err == error.OutputLimitReached) task.terminal.model_failure = .output_limit;
         };
@@ -1043,7 +1090,7 @@ pub const Runtime = struct {
             self.preflight(cancel, task) catch |err| {
                 // A bounded pause retains the accepted goal, including a paid
                 // summary that exhausted its output before normal inference.
-                if (err == error.RoundLimit or err == error.OutputLimitReached) try self.retainCurrentInput(&input_retained);
+                if (err == error.RoundLimit or err == error.OutputLimitReached or inputBudgetPause(err)) try self.retainCurrentInput(&input_retained);
                 return err;
             };
             try checkCanceled(cancel);
@@ -1175,20 +1222,28 @@ pub const Runtime = struct {
         // No model round remains. The caller reports RoundLimit and keeps the
         // current goal; do not spend another summary on a turn that cannot continue.
         if (task.roundLimitReached(self.config.limits.max_rounds)) return;
+        try context.validateInputPolicy(self.config.*);
         const budget = context.inputBudget(self.config.*);
         const before = self.estimatedTokens();
         if (!self.config.limits.compaction_enabled) {
-            if (before > budget) return error.ContextTooLarge;
+            if (before > budget) return context.inputBudgetError(self.config.*);
             return;
         }
         if (before < context.threshold(budget, self.config.limits.compaction_trigger_percent)) return;
+        const attempts = task.summary_attempts;
         self.compact(cancel, task, .automatic) catch |err| {
             // 终止性错误直接上抛，不能当作普通压缩失败吞掉。
             if (err == error.Canceled or err == error.RoundLimit or err == error.HostDisconnected or err == error.OutputLimitReached) return err;
+            if ((self.config.limits.low_price_input or self.config.limits.max_input_tokens != null) and task.summary_attempts != attempts) {
+                // A failed paid compaction under the opt-in cost policy must not
+                // fall through to normal inference or another automatic summary.
+                try self.emit(.{ .compaction_failed = err }, cancel);
+                return error.InputBudgetSummaryFailed;
+            }
             try self.emit(.{ .compaction_failed = err }, cancel);
             // Failed compaction never mutates the old history. It may continue
             // only if that old input still fits the hard input budget.
-            if (self.estimatedTokens() > budget) return error.ContextTooLarge;
+            if (self.estimatedTokens() > budget) return context.inputBudgetError(self.config.*);
         };
     }
 
@@ -1198,6 +1253,7 @@ pub const Runtime = struct {
 
     fn compact(self: *Runtime, cancel: *p.Cancellation, task: *Task, planning: CompactionPlanning) !void {
         try checkCanceled(cancel);
+        try context.validateInputPolicy(self.config.*);
 
         // 尚未选定协议时不能发起摘要请求。
         if (self.selector.selected == null) return error.ProtocolNotSelected;
@@ -1220,13 +1276,17 @@ pub const Runtime = struct {
 
         // Include the appended instruction. Shrink only the summary output,
         // never send a zero-token request or change the reasoning effort.
-        const summary_request = self.request(.summary, messages_, cancel) catch return error.SummaryDoesNotFit;
+        const summary_request = self.request(.summary, messages_, cancel) catch |err| {
+            if (inputBudgetPause(err)) return err;
+            return error.SummaryDoesNotFit;
+        };
 
         // Compaction is not a user-facing model round. Failed and successful
         // summaries both leave `task.rounds` unchanged so they cannot exhaust RoundLimit.
         try self.emit(.{ .state = .compacting }, cancel);
 
         // 摘要请求只使用 scratch arena，不影响主历史。
+        task.summary_attempts +|= 1;
         const result = self.selector.call(self.model, a, summary_request, .{}) catch |err| {
             self.last_context_tokens = null;
             return err;
@@ -1235,10 +1295,16 @@ pub const Runtime = struct {
         try checkCanceled(cancel);
         const response = switch (result.outcome) {
             .success => |r| r,
-            .failure => |f| return switch (f.kind) {
-                .canceled => error.Canceled,
-                .output_limit => error.OutputLimitReached,
-                else => error.SummaryFailed,
+            .failure => |f| {
+                if (self.config.limits.low_price_input or self.config.limits.max_input_tokens != null) {
+                    task.terminal.model_failure = f.kind;
+                    task.terminal.http_status = f.http_status;
+                }
+                return switch (f.kind) {
+                    .canceled => error.Canceled,
+                    .output_limit => error.OutputLimitReached,
+                    else => error.SummaryFailed,
+                };
             },
         };
 

@@ -14,7 +14,7 @@ fn configuration() cfg.Config {
         .output_tokens = 65536,
         .reasoning_effort = "high",
         .reasoning = .{ .format = .standard, .map = .{ .high = "high" } },
-    } };
+    }, .limits = .{ .low_price_input = false } };
 }
 
 test "compaction policy config automatic explicit and disabled survive both disk formats" {
@@ -22,7 +22,7 @@ test "compaction policy config automatic explicit and disabled survive both disk
         "{\"provider\":{\"base_url\":\"https://fixture.invalid/v1\"},\"model\":{\"name\":\"m\",\"context_tokens\":1000000},\"limits\":",
         "{\"llm\":{\"default\":\"local/m\",\"providers\":{\"local\":{\"base_url\":\"https://fixture.invalid/v1\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":1000000}}}}},\"limits\":",
     };
-    for (prefixes) |prefix| for ([_][]const u8{ "{}", "{\"summary_tokens\":null}", "{\"summary_tokens\":2048,\"compaction_enabled\":false}" }) |limits| {
+    for (prefixes) |prefix| for ([_][]const u8{ "{}", "{\"summary_tokens\":null}", "{\"max_output_tokens\":16384,\"summary_tokens\":null}", "{\"summary_tokens\":2048,\"compaction_enabled\":false}" }) |limits| {
         const raw = try std.mem.concat(a, u8, &.{ prefix, limits, "}" });
         defer a.free(raw);
         var parsed = try cfg.parse(a, raw);
@@ -56,20 +56,19 @@ test "compaction policy config automatic explicit and disabled survive both disk
     try std.testing.expectError(error.InvalidLimit, cfg.validate(config));
 }
 
-test "compaction policy automatic summary is independently bounded and exact room wins" {
+test "compaction policy automatic summary follows output ceiling and exact room wins" {
     var config = configuration();
-    for ([_]struct { window: u32, expected: u32 }{
-        .{ .window = 32768, .expected = 2048 },
-        .{ .window = 131072, .expected = 2048 },
-        .{ .window = 1000000, .expected = 15560 },
-        .{ .window = 16777216, .expected = 16384 },
-    }) |case| {
-        config.model.context_tokens = case.window;
-        try std.testing.expectEqual(case.expected, c.summaryBudget(config));
-        try std.testing.expectEqual(case.expected, try c.outputBudget(config, .summary, 100));
+    for ([_]u32{ 32768, 131072, 1000000, 16777216 }) |window| {
+        config.model.context_tokens = window;
+        try std.testing.expectEqual(@as(u32, 65536), c.summaryBudget(config));
+        try std.testing.expectEqual(try c.outputBudget(config, .normal, 100), try c.outputBudget(config, .summary, 100));
+        config.limits.max_output_tokens = 16384;
+        try std.testing.expectEqual(@as(u32, 16384), c.summaryBudget(config));
+        try std.testing.expectEqual(@as(u32, 16384), try c.outputBudget(config, .summary, 100));
+        config.limits.max_output_tokens = null;
     }
     config.model.output_tokens = null;
-    try std.testing.expectEqual(@as(u32, 16384), c.summaryBudget(config));
+    try std.testing.expectEqual(@as(u32, 4096), c.summaryBudget(config));
     try std.testing.expectEqual(@as(u32, 4096), try c.outputBudget(config, .normal, 100));
     try std.testing.expect(config.model.output_tokens == null);
     config.limits.max_output_tokens = 3000;
@@ -155,6 +154,7 @@ test "compaction policy disabled still allows manual auto-budget summary without
         config.model.protocol = protocol;
         config.model.reasoning.?.format = if (protocol == .anthropic) .anthropic else .standard;
         config.limits.compaction_enabled = false;
+        config.limits.max_output_tokens = 16384;
         var fake: Fake = .{};
         var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
         defer runtime.deinit();
@@ -162,7 +162,7 @@ test "compaction policy disabled still allows manual auto-budget summary without
         var cancel: p.Cancellation = .{};
         const result = try runtime.compactContext(&cancel);
         try std.testing.expectEqual(r.Status.success, result.status);
-        try std.testing.expectEqual(@as(u32, 15560), fake.cap);
+        try std.testing.expectEqual(@as(u32, 16384), fake.cap);
         try std.testing.expectEqual(@as(usize, 1), fake.summaries);
         try std.testing.expectEqual(@as(usize, 0), fake.normal);
         try std.testing.expectEqualStrings("recent task", runtime.messages()[1].blocks[0].text);

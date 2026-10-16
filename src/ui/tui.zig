@@ -205,6 +205,8 @@ pub const Connection = struct {
         configured_providers: u8 = 0,
         allow_custom_models: bool = true,
         context_limit: u32 = 0,
+        /// Immutable owner policy snapshot; never inferred from token usage.
+        low_price_input: bool = false,
         /// Immutable configured request option, not inferred from stream time.
         reasoning_effort: shared.ReasoningEffort = .unspecified,
         /// Capability metadata prepared by the owner; zero means unknown.
@@ -577,7 +579,7 @@ const Ui = struct {
         var notice: []const u8 = "";
         var model_failed = false;
         if (self.last_terminal) |result| {
-            if (result.status != .success and (result.status != .paused or result.model_failure == .output_limit)) {
+            if (result.status != .success and (result.status != .paused or result.model_failure == .output_limit or r.inputBudgetPause(result.detail))) {
                 var formatted: std.Io.Writer.Allocating = .init(a);
                 defer formatted.deinit();
                 try shared.failure.write(&formatted.writer, self.notice, result.detail, result.model_failure, result.http_status);
@@ -764,6 +766,22 @@ const Ui = struct {
         self.command_menu.changed();
         self.displayed_command_generation = null;
     }
+    /// Tab only edits the composer, never opens a picker or starts a job. Like
+    /// menu confirmation, completion may only use a fully shown current choice.
+    fn completeCommandMenu(self: *Ui) !void {
+        if (!self.commandMenuVisible() or self.frame.len != 0 or self.displayed_command_generation != self.command_menu.generation) return;
+        const command = self.command_menu.choice(self.command_matches) orelse return;
+        const value = command_menu_module.info(command).value;
+        if (std.mem.eql(u8, self.editor.bytes.items, value)) return;
+        // Prepare before clearing so allocation failure leaves the input intact.
+        try self.editor.bytes.ensureTotalCapacity(self.editor.allocator, value.len);
+        self.editor.clear();
+        self.editor.bytes.appendSliceAssumeCapacity(value);
+        self.editor.cursor = value.len;
+        self.closeCommandMenu();
+        self.refreshCommandMenu();
+    }
+
     /// Only a fully acknowledged, current menu may choose an action. Enter
     /// submits through the usual guarded command path.
     fn acceptCommandMenu(self: *Ui) !void {
@@ -1281,15 +1299,16 @@ const Ui = struct {
                 },
                 .enter => {
                     const chosen = self.command_menu.choice(self.command_matches).?;
-                    // A fully typed command keeps the existing fast input path;
-                    // this is not acceptance of an unseen suggested completion.
+                    // A literal command (typed or completed from an ACKed choice)
+                    // keeps the fast input path, not unseen candidate acceptance.
                     if (std.mem.eql(u8, self.editor.bytes.items, command_menu_module.info(chosen).value)) {
                         try self.submit();
                     } else try self.acceptCommandMenu();
                     self.refreshCommandMenu();
                     return;
                 },
-                .tab, .page_up, .page_down, .cycle_effort, .toggle_reasoning => return,
+                .tab => return self.completeCommandMenu(),
+                .page_up, .page_down, .cycle_effort, .toggle_reasoning => return,
                 else => {},
             }
         }
@@ -1412,7 +1431,7 @@ const Ui = struct {
         self.notice = switch (result.status) {
             .success => "Ready",
             .canceled => "Canceled; prior side effects remain",
-            .paused => if (result.model_failure == .output_limit) "Paused" else "Paused at round limit; send a message to continue",
+            .paused => if (result.model_failure == .output_limit or r.inputBudgetPause(result.detail)) "Paused" else "Paused at round limit; send a message to continue",
             .failed => "Failed",
         };
 
@@ -1949,7 +1968,7 @@ const Ui = struct {
                 const view = self.display.view(self.clock_ms);
                 self.model_flow.advance(self.clock_ms, working, view.live_tps_tenths);
                 const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
-                const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .now_ms = self.clock_ms, .phase = self.model_flow.step(), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash });
+                const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .now_ms = self.clock_ms, .phase = self.model_flow.step(), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input });
                 const decoration_width = text.width(decoration.plain);
                 const prefix = try editorDisplay(a, visible[begin..cursor]);
                 var start: usize = 0;
@@ -3389,6 +3408,24 @@ test "output limit paused hint retains cause and budget advice instead of round-
     try std.testing.expect(std.mem.find(u8, line, "round limit") == null);
 }
 
+test "input budget pauses explain input policy rather than round limit" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]anyerror{ error.InputBudgetExceeded, error.UnknownInputPriceThreshold, error.InputBudgetSummaryFailed }) |detail| {
+        ui.last_terminal = .{ .status = .paused, .detail = detail };
+        ui.notice = "Paused";
+        const line = try ui.hint(arena.allocator(), ui.connection.current());
+        try std.testing.expect(std.mem.find(u8, line, @errorName(detail)) != null);
+        try std.testing.expect(std.mem.find(u8, line, "round limit") == null);
+        try std.testing.expect(std.mem.find(u8, line, "HTTP") == null);
+    }
+}
+
 test "read command errors include a safe reason after error and never display raw results" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -3508,6 +3545,31 @@ test "composer frame keeps context occupancy colors static while model and spinn
             try std.testing.expect(std.mem.find(u8, ui.frame, expected) != null);
             ui.finishFrame();
         }
+    }
+}
+
+test "composer reflects owner low price policy without reading runtime configuration" {
+    try text.initLocale();
+    for ([_]bool{ false, true }) |enabled| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var fixture = SelectionFixture{ .low_price_input = enabled };
+        defer fixture.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.connection = fixture.connection();
+        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+        try ui.parser.feed("typed", sink);
+        try ui.draw();
+        const prefix = if (enabled) theme.success ++ "L 3.1%" ++ theme.reset else theme.success ++ "3.1%" ++ theme.reset;
+        try std.testing.expect(std.mem.find(u8, ui.frame, prefix) != null);
+        try std.testing.expectEqual(enabled, std.mem.find(u8, ui.frame, "L 3.1%") != null);
+        try std.testing.expectEqualStrings("typed", ui.editor.bytes.items);
+        try std.testing.expectEqual(@as(usize, 5), ui.editor.cursor);
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        try screen.replay(ui.frame);
+        try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], ") > typed") != null);
     }
 }
 
@@ -3917,7 +3979,7 @@ test "approval identity must fit in full before narrow windows can authorize" {
 test "editor tabs expand before clipping and cursor placement but submit unchanged" {
     try text.initLocale();
     const cfg = @import("../core/config.zig");
-    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat } };
+    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -3961,6 +4023,7 @@ const SelectionFixture = struct {
     name: []const u8 = "fixture-old",
     owned: ?[]u8 = null,
     limit: u32 = 32768,
+    low_price_input: bool = false,
     effort: shared.ReasoningEffort = .none,
     levels: shared.activity.EffortSet = .{ .mask = 0x3f },
     selections: usize = 0,
@@ -3991,7 +4054,7 @@ const SelectionFixture = struct {
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .models = self.profiles_override orelse &profiles, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels };
+        return .{ .runtime = null, .model = self.name, .models = self.profiles_override orelse &profiles, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;
@@ -4530,9 +4593,10 @@ test "slash menu shows model login compact with arguments and descriptions but n
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Commands") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/model") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "/login  Configure provider") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Configure provider") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/model [exact-id|--refresh]  Select model") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "/compact  Compact conversation") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/compact") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Compact conversation") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Type to filter; Tab complete") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Up/Down select; Enter run") == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
@@ -4590,7 +4654,7 @@ test "slash menu enter selects the highlighted model entry" {
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
 }
 
-test "slash menu ignores Tab while ordinary Tab still indents" {
+test "slash menu Tab completes only an ACKed choice without executing while ordinary Tab indents" {
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -4599,22 +4663,84 @@ test "slash menu ignores Tab while ordinary Tab still indents" {
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("/", sink);
     try ui.draw();
-    // Removed menu shortcuts do nothing, before or after acknowledgement.
+    // A partial frame cannot authorize even a text-only completion.
     ui.frame_offset = ui.frame.len / 2;
     try ui.parser.feed("\t", sink);
     try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
     ui.finishFrame();
     try ui.parser.feed("\t", sink);
-    try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
+    try std.testing.expectEqualStrings("/model", ui.editor.bytes.items);
+    try std.testing.expectEqual(ui.editor.bytes.items.len, ui.editor.cursor);
     try std.testing.expect(ui.model_picker == null and ui.commandMenuVisible());
+    try std.testing.expect(!ui.busy and !ui.secret_mode and !ui.provider_open);
+    try std.testing.expect(ui.displayed_command_generation == null);
     try ui.draw();
     try std.testing.expect(ui.commandMenuVisible());
     ui.finishFrame();
+    try ui.parser.feed("\t", sink); // Already complete: no spaces, cycling or action.
+    try std.testing.expectEqualStrings("/model", ui.editor.bytes.items);
+    try std.testing.expect(ui.model_picker == null and !ui.busy);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.model_picker != null);
     try ui.modelKey(.escape);
     try ui.parser.feed("\t", sink);
     try std.testing.expectEqualStrings("    ", ui.editor.bytes.items);
+}
+
+test "slash menu Tab canonicalizes filtered commands without opening surfaces or jobs" {
+    for ([_]struct { prefix: []const u8, full: []const u8 }{
+        .{ .prefix = "/mo", .full = "/model" },
+        .{ .prefix = "/LG", .full = "/login" },
+        .{ .prefix = "/cpt", .full = "/compact" },
+    }) |case| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+        try ui.parser.feed(case.prefix, sink);
+        try ui.parser.feed("\t", sink); // No visible ACK yet.
+        try std.testing.expectEqualStrings(case.prefix, ui.editor.bytes.items);
+        try ui.draw();
+        ui.finishFrame();
+        try ui.parser.feed("\t", sink);
+        try std.testing.expectEqualStrings(case.full, ui.editor.bytes.items);
+        try std.testing.expectEqual(case.full.len, ui.editor.cursor);
+        try std.testing.expect(!ui.busy and !ui.secret_mode and !ui.provider_open and ui.model_picker == null);
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    }
+}
+
+test "slash menu Tab honors highlighted selection only after a new ACK" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("/", sink);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[B\t", sink);
+    try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\t", sink);
+    try std.testing.expectEqualStrings("/login", ui.editor.bytes.items);
+    try std.testing.expect(!ui.secret_mode and !ui.provider_open and ui.model_picker == null and !ui.busy);
+}
+
+test "slash menu pasted Tab remains literal and never completes" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b[200~/mo\t\x1b[201~", sink);
+    try std.testing.expectEqualStrings("/mo\t", ui.editor.bytes.items);
+    try std.testing.expect(!ui.commandMenuVisible() and !ui.busy and ui.model_picker == null);
 }
 
 test "slash menu rejects stale navigation generations and resize ABA" {
@@ -4636,11 +4762,13 @@ test "slash menu rejects stale navigation generations and resize ABA" {
             try ui.parser.feed("\x15/", sink);
         }
         ui.finishFrame();
+        try ui.parser.feed("\t", sink);
+        try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
         try ui.parser.feed("\r", sink);
         try std.testing.expect(ui.model_picker == null and !ui.secret_mode);
         try ui.draw();
         ui.finishFrame();
-        try ui.parser.feed("lg\r", sink);
+        try ui.parser.feed("lg\t\r", sink);
         try std.testing.expect(!ui.secret_mode); // Changed token/selection is not yet shown.
         try ui.draw();
         ui.finishFrame();
@@ -4666,6 +4794,8 @@ test "slash menu grows a short tail and cannot authorize a clipped panel" {
     ui.resize(.{ .columns = 7, .rows = 6 });
     try ui.draw();
     ui.finishFrame();
+    try ui.parser.feed("\t", sink);
+    try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.model_picker == null and !ui.secret_mode);
 }
@@ -4960,7 +5090,7 @@ const AuthFixture = struct {
 
 test "compact slash menu requires acknowledged choice then joins a summary-only job" {
     const cfg = @import("../core/config.zig");
-    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat } };
+    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -5157,7 +5287,7 @@ test "secret prompt masks keys shows destination and erases cancel error and pas
 
 test "configure enables same-process submit without sending secrets or commands" {
     const cfg = @import("../core/config.zig");
-    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat } };
+    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();

@@ -58,7 +58,7 @@ export async function settingsRegressions({app,pty,execute,send}) {
         // Keep the strict /login baseline equality: supply schema defaults in
         // the fixture rather than misclassifying nullable-field serialization.
         const completeMap = Object.fromEntries(['off','minimal','low','medium','high','xhigh','max'].map(level => [level,map[level] ?? null]));
-        configBytes = JSON.stringify({provider:{base_url:url,api_key_env:pending?'':'THIN_FIXTURE_KEY',...(pending?{api_key:null}:{})},model:{name:'fixture-model',protocol,context_tokens:32768,reasoning_effort:effort,reasoning_source:'explicit',output_tokens:null,output_source:'explicit',...(unknown?{}:{reasoning:{format,map:completeMap}})},limits:{max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+        configBytes = JSON.stringify({provider:{base_url:url,api_key_env:pending?'':'THIN_FIXTURE_KEY',...(pending?{api_key:null}:{})},model:{name:'fixture-model',protocol,context_tokens:32768,reasoning_effort:effort,reasoning_source:'explicit',output_tokens:null,output_source:'explicit',...(unknown?{}:{reasoning:{format,map:completeMap}})},limits:{low_price_input:false,max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
         await writeFile(configPath,configBytes,{mode:0o600});
       }
       async function seed(p,raw) {

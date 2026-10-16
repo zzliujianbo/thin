@@ -286,6 +286,7 @@ fn encodeWire(a: std.mem.Allocator, runtime: *r.Runtime, protocol: p.Protocol) !
 
 test "environment preface is injected before the user turn for chat responses and anthropic" {
     var config = cfg.Config{
+        .limits = .{ .low_price_input = false },
         .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
     };
@@ -324,6 +325,7 @@ test "environment preface is injected before the user turn for chat responses an
 
 test "cwd change appends a new preface and does not mutate the original messages" {
     var config = cfg.Config{
+        .limits = .{ .low_price_input = false },
         .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
     };
@@ -363,6 +365,7 @@ test "cwd change appends a new preface and does not mutate the original messages
 
 test "a directory change before the first turn rebuilds the fresh prefix" {
     var config = cfg.Config{
+        .limits = .{ .low_price_input = false },
         .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
     };
@@ -380,6 +383,7 @@ test "a directory change before the first turn rebuilds the fresh prefix" {
 
 test "restored preface is kept until the session policy changes" {
     var config = cfg.Config{
+        .limits = .{ .low_price_input = false },
         .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
     };
@@ -424,7 +428,7 @@ test "app wires agents discovery and appends when the working directory changes"
     try mkdir(tmp.dir, "tree/other");
     try mkdir(tmp.dir, "tree/other/.git");
     const fake =
-        \\{"provider":{"base_url":"http://unused.invalid","api_key":"fake-review-key"},"model":{"name":"fake","context_tokens":32768,"protocol":"chat"}}
+        \\{"provider":{"base_url":"http://unused.invalid","api_key":"fake-review-key"},"model":{"name":"fake","context_tokens":32768,"protocol":"chat"},"limits":{"low_price_input":false}}
     ;
     try write(tmp.dir, "home/.thin/config.json", fake);
     try write(tmp.dir, "home/.thin/AGENTS.override.md", "APP_GLOBAL\n");
@@ -492,6 +496,7 @@ fn indexOfText(messages: []const p.Message, needle: []const u8) ?usize {
 
 test "matching applied policy is appended again when live history lost the preface" {
     var config = cfg.Config{
+        .limits = .{ .low_price_input = false },
         .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
     };
@@ -529,6 +534,7 @@ test "matching applied policy is appended again when live history lost the prefa
 
 test "restored summary without the preface reinstalls the current policy" {
     var config = cfg.Config{
+        .limits = .{ .low_price_input = false },
         .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
     };
@@ -589,6 +595,7 @@ const SummaryGate = struct {
 
 test "compaction reinstalls the policy after the retained prefix" {
     var config = cfg.Config{
+        .limits = .{ .low_price_input = false },
         .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
     };

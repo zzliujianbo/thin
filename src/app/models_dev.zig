@@ -44,6 +44,7 @@ const Record = struct {
     api: protocol.Protocol = .auto,
     output_tokens: ?u32 = null,
     context_tokens: ?u32 = null,
+    input_price_threshold: ?u32 = null,
     declaration: ?thinking.Declaration = null,
 };
 
@@ -243,7 +244,7 @@ fn overrideNpm(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !Adapte
 }
 
 const Limits = struct { output: ?u32 = null, context: ?u32 = null };
-const ModelRow = struct { npm: ?[]const u8 = null, profile: Profile = .{}, override_invalid: bool = false, limits: Limits = .{} };
+const ModelRow = struct { npm: ?[]const u8 = null, profile: Profile = .{}, override_invalid: bool = false, limits: Limits = .{}, input_price_threshold: ?u32 = null };
 
 // Independent public capabilities. Only integer limit.output / limit.context
 // count, never input/output sums, reasoning budgets or same-ID majority votes.
@@ -281,15 +282,168 @@ fn parseLimits(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !Limits
     return limits;
 }
 
+// Pricing is ancillary: malformed values invalidate only this capability. Keep
+// duplicate recognized keys strict and bound tier work/storage independently.
+const PriceTier = struct { input: ?f64 = null, output: ?f64 = null, size: ?u32 = null };
+const max_price_tiers = 128;
+
+fn priceNumber(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?f64 {
+    if (!(try at(scanner, .number))) {
+        try scanner.skipValue();
+        return null;
+    }
+    const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, max_value_bytes);
+    const text = switch (token) {
+        .number, .allocated_number => |v| v,
+        else => unreachable,
+    };
+    const n = std.fmt.parseFloat(f64, text) catch return null;
+    return if (std.math.isFinite(n) and n >= 0) n else null;
+}
+
+fn tierSize(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?u32 {
+    if (!(try at(scanner, .object_begin))) {
+        try scanner.skipValue();
+        return null;
+    }
+    try expect(scanner, allocator, .object_begin);
+    var seen_type = false;
+    var seen_size = false;
+    var context = false;
+    var size: ?u32 = null;
+    while (!(try at(scanner, .object_end))) {
+        const key = try nextString(scanner, allocator);
+        if (equal(key, "type")) {
+            if (seen_type) return error.InvalidModelsDev;
+            seen_type = true;
+            const kind = try optionalString(scanner, allocator);
+            context = if (kind) |v| equal(v, "context") else false;
+        } else if (equal(key, "size")) {
+            if (seen_size) return error.InvalidModelsDev;
+            seen_size = true;
+            if (try at(scanner, .number)) {
+                const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, max_value_bytes);
+                const text = switch (token) {
+                    .number, .allocated_number => |v| v,
+                    else => unreachable,
+                };
+                const n = std.fmt.parseInt(u32, text, 10) catch 0;
+                if (n > 0 and n <= 16777216) size = n;
+            } else try scanner.skipValue();
+        } else try scanner.skipValue();
+    }
+    try expect(scanner, allocator, .object_end);
+    return if (context) size else null;
+}
+
+fn parsePriceTier(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !PriceTier {
+    if (!(try at(scanner, .object_begin))) {
+        try scanner.skipValue();
+        return .{};
+    }
+    try expect(scanner, allocator, .object_begin);
+    var result: PriceTier = .{};
+    var seen: u8 = 0;
+    while (!(try at(scanner, .object_end))) {
+        const key = try nextString(scanner, allocator);
+        const bit: u8 = if (equal(key, "input")) 1 else if (equal(key, "output")) 2 else if (equal(key, "tier")) 4 else 0;
+        if (bit == 0) {
+            try scanner.skipValue();
+            continue;
+        }
+        if (seen & bit != 0) return error.InvalidModelsDev;
+        seen |= bit;
+        switch (bit) {
+            1 => result.input = try priceNumber(scanner, allocator),
+            2 => result.output = try priceNumber(scanner, allocator),
+            4 => result.size = try tierSize(scanner, allocator),
+            else => unreachable,
+        }
+    }
+    try expect(scanner, allocator, .object_end);
+    return result;
+}
+
+fn parseCost(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?u32 {
+    if (!(try at(scanner, .object_begin))) {
+        try scanner.skipValue();
+        return null;
+    }
+    try expect(scanner, allocator, .object_begin);
+    var baseline: PriceTier = .{};
+    var seen: u8 = 0;
+    var tiers: [max_price_tiers]PriceTier = undefined;
+    var count: usize = 0;
+    var invalid = false;
+    while (!(try at(scanner, .object_end))) {
+        const key = try nextString(scanner, allocator);
+        const bit: u8 = if (equal(key, "input")) 1 else if (equal(key, "output")) 2 else if (equal(key, "tiers")) 4 else 0;
+        if (bit == 0) {
+            try scanner.skipValue();
+            continue;
+        }
+        if (seen & bit != 0) return error.InvalidModelsDev;
+        seen |= bit;
+        switch (bit) {
+            1 => baseline.input = try priceNumber(scanner, allocator),
+            2 => baseline.output = try priceNumber(scanner, allocator),
+            4 => {
+                if (!(try at(scanner, .array_begin))) {
+                    try scanner.skipValue();
+                    invalid = true;
+                    continue;
+                }
+                try expect(scanner, allocator, .array_begin);
+                while (!(try at(scanner, .array_end))) {
+                    const tier = try parsePriceTier(scanner, allocator);
+                    if (count < tiers.len) {
+                        tiers[count] = tier;
+                        count += 1;
+                    } else invalid = true;
+                }
+                try expect(scanner, allocator, .array_end);
+            },
+            else => unreachable,
+        }
+    }
+    try expect(scanner, allocator, .object_end);
+    if (invalid) return null;
+    const input = baseline.input orelse return null;
+    const output = baseline.output orelse return null;
+    var threshold: ?u32 = null;
+    for (tiers[0..count], 0..) |tier, i| {
+        const ti = tier.input orelse return null;
+        const to = tier.output orelse return null;
+        const size = tier.size orelse return null;
+        if (ti < input or to < output) return null;
+        for (tiers[0..i]) |previous| {
+            if (previous.size == size and (previous.input != ti or previous.output != to)) return null;
+            // An unordered list must still describe a monotonic price schedule.
+            if (previous.size) |ps| {
+                const pi = previous.input orelse return null;
+                const po = previous.output orelse return null;
+                if ((ps < size and (pi > ti or po > to)) or (ps > size and (pi < ti or po < to))) return null;
+            }
+        }
+        if (ti > input or to > output) threshold = if (threshold) |n| @min(n, size) else size;
+    }
+    return threshold;
+}
+
 fn parseModel(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !ModelRow {
     try expect(scanner, allocator, .object_begin);
     var row: ModelRow = .{};
     var saw_options = false;
     var saw_provider = false;
     var saw_limit = false;
+    var saw_cost = false;
     while (!(try at(scanner, .object_end))) {
         const field = try nextString(scanner, allocator);
-        if (equal(field, "limit")) {
+        if (equal(field, "cost")) {
+            if (saw_cost) return error.InvalidModelsDev;
+            saw_cost = true;
+            row.input_price_threshold = try parseCost(scanner, allocator);
+        } else if (equal(field, "limit")) {
             if (saw_limit) return error.InvalidModelsDev;
             saw_limit = true;
             row.limits = try parseLimits(scanner, allocator);
@@ -322,7 +476,7 @@ fn parseModels(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provide
         if ((try seen.getOrPut(allocator, model)).found_existing) return error.InvalidModelsDev;
         if (records.items.len >= max_records) return error.MetadataTooLarge;
         const row = try parseModel(scanner, allocator);
-        try records.append(allocator, .{ .provider = provider, .model = model, .profile = row.profile, .npm = row.npm, .override_invalid = row.override_invalid, .output_tokens = row.limits.output, .context_tokens = row.limits.context });
+        try records.append(allocator, .{ .provider = provider, .model = model, .profile = row.profile, .npm = row.npm, .override_invalid = row.override_invalid, .output_tokens = row.limits.output, .context_tokens = row.limits.context, .input_price_threshold = row.input_price_threshold });
     }
     try expect(scanner, allocator, .object_end);
 }
@@ -477,6 +631,7 @@ pub fn parseDirectory(allocator: std.mem.Allocator, body: []const u8) !directory
         row.dev_protocol = record.api;
         row.dev_output_tokens = if (record.api != .auto) record.output_tokens else null;
         row.dev_context_tokens = if (record.api != .auto) record.context_tokens else null;
+        row.dev_input_price_threshold = if (record.api != .auto) record.input_price_threshold else null;
         const resolved = resolveIn(records, record.provider, record.model, record.api);
         if (resolved.declaration) |declaration| row.dev_reasoning = try directory.Profile.from(declaration);
     }

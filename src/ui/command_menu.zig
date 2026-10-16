@@ -53,21 +53,37 @@ pub fn rows(a: std.mem.Allocator, matches: Matches, selected: usize, columns: us
         lines.deinit(a);
     }
     if (max_rows == 0 or matches.len == 0) return .{ .lines = try lines.toOwnedSlice(a) };
+    var label_width: usize = 0;
+    for (matches.commands[0..matches.len]) |command| {
+        const item = info(command);
+        const width = text.width(item.value) + if (item.arguments.len != 0) 1 + text.width(item.arguments) else @as(usize, 0);
+        label_width = @max(label_width, width);
+    }
     const selected_ = @min(selected, matches.len - 1);
     const count = @min(matches.len, @min(max_rows, 10));
     const start = @min(selected_ -| (count / 2), matches.len - count);
     for (matches.commands[start .. start + count], start..) |command, index| {
         const item = info(command);
-        const raw = try std.fmt.allocPrint(a, "{s}{s}{s}{s}  {s}", .{ if (index == selected_) "> " else "  ", item.value, if (item.arguments.len != 0) " " else "", item.arguments, item.description });
-        defer a.free(raw);
-        const line = try singleLine(a, raw, columns);
+        var raw: std.Io.Writer.Allocating = .init(a);
+        defer raw.deinit();
+        // Allocating's only write failure is allocation failure.
+        raw.writer.writeAll(if (index == selected_) "> " else "  ") catch return error.OutOfMemory;
+        raw.writer.writeAll(item.value) catch return error.OutOfMemory;
+        if (item.arguments.len != 0) {
+            raw.writer.writeByte(' ') catch return error.OutOfMemory;
+            raw.writer.writeAll(item.arguments) catch return error.OutOfMemory;
+        }
+        const width = text.width(item.value) + if (item.arguments.len != 0) 1 + text.width(item.arguments) else @as(usize, 0);
+        raw.writer.splatByteAll(' ', label_width - width + 2) catch return error.OutOfMemory;
+        raw.writer.writeAll(item.description) catch return error.OutOfMemory;
+        const line = try singleLine(a, raw.written(), columns);
         errdefer a.free(line);
         try lines.append(a, line);
     }
     return .{
         .lines = try lines.toOwnedSlice(a),
         .selected_line = if (count != 0) selected_ - start else null,
-        .can_confirm = count != 0 and columns >= 2 + info(matches.commands[selected_]).value.len,
+        .can_confirm = count != 0 and columns >= 2 + text.width(info(matches.commands[selected_]).value),
     };
 }
 
@@ -165,10 +181,63 @@ test "command rows show optional arguments and descriptions" {
         a.free(rendered.lines);
     }
     try std.testing.expectEqualStrings("> /model [exact-id|--refresh]  Select model", rendered.lines[0]);
-    try std.testing.expectEqualStrings("  /login  Configure provider", rendered.lines[1]);
-    try std.testing.expectEqualStrings("  /compact  Compact conversation", rendered.lines[2]);
+    try std.testing.expectEqualStrings("  /login                       Configure provider", rendered.lines[1]);
+    try std.testing.expectEqualStrings("  /compact                     Compact conversation", rendered.lines[2]);
     try std.testing.expectEqualStrings("", info(.auth).arguments);
     try std.testing.expectEqualStrings("", info(.compact).arguments);
+}
+
+test "command rows clean up every allocation failure" {
+    const Check = struct {
+        fn render(a: std.mem.Allocator) !void {
+            const rendered = try rows(a, suggestions("/", 1, false), 1, 80, 8);
+            defer {
+                for (rendered.lines) |line| a.free(line);
+                a.free(rendered.lines);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.render, .{});
+}
+
+test "command descriptions align across selections windows filters and clipping" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "/", "/o", "/lgn", "/co" }) |query| {
+        const matches = suggestions(query, query.len, false);
+        var label_width: usize = 0;
+        for (matches.commands[0..matches.len]) |command| {
+            const item = info(command);
+            label_width = @max(label_width, text.width(item.value) + if (item.arguments.len != 0) 1 + text.width(item.arguments) else @as(usize, 0));
+        }
+        const description_column = 2 + label_width + 2;
+        for (matches.commands[0..matches.len], 0..) |_, selected| {
+            for ([_]usize{ 1, items.len }) |height| {
+                for ([_]usize{ 0, 8, description_column - 1, description_column, description_column + 3, 80 }) |columns| {
+                    const rendered = try rows(a, matches, selected, columns, height);
+                    defer {
+                        for (rendered.lines) |line| a.free(line);
+                        a.free(rendered.lines);
+                    }
+                    const count = @min(matches.len, height);
+                    const start = @min(selected -| (count / 2), matches.len - count);
+                    try std.testing.expectEqual(selected - start, rendered.selected_line.?);
+                    for (rendered.lines, start..) |line, index| {
+                        const item = info(matches.commands[index]);
+                        try std.testing.expectEqual(@min(columns, description_column + text.width(item.description)), text.width(line));
+                        try std.testing.expect(std.mem.indexOfScalar(u8, line, '\t') == null);
+                        if (columns > description_column) {
+                            const visible = @min(columns - description_column, item.description.len);
+                            try std.testing.expectEqualStrings(item.description[0..visible], line[description_column..]);
+                            if (columns == 80) {
+                                const offset = std.mem.indexOf(u8, line, item.description).?;
+                                try std.testing.expectEqual(description_column, text.width(line[0..offset]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 test "command confirmation needs only the complete command and keeps selection in a narrow window" {
@@ -191,6 +260,7 @@ test "command confirmation needs only the complete command and keeps selection i
             }
         }
     }
+    try text.initLocale();
     const clipped = try singleLine(a, "中a文", 4);
     defer a.free(clipped);
     try std.testing.expectEqualStrings("中a", clipped);

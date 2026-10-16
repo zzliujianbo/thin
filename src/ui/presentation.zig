@@ -245,16 +245,20 @@ pub const PromptActivity = struct {
     /// Transient level confirmation: temporarily replaces the context percentage
     /// in the prefix with the chosen level name; the owner expires it.
     effort_flash: ?shared.ReasoningEffort = null,
+    /// Owner snapshot of the input policy, independent of latest usage.
+    low_price_input: bool = false,
 };
 
 /// The model keeps idle effort/busy TPS styling; context occupancy has a static
 /// threshold color in both states. A transient effort confirmation retains its
 /// previous styling. Parentheses, spaces, marker and editor stay default.
 pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, motion: PromptActivity) !Prompt {
-    const percentage = if (motion.effort_flash) |level|
+    const value = if (motion.effort_flash) |level|
         try a.dupe(u8, level.name() orelse "?")
     else
         try contextLabel(a, snapshot);
+    defer a.free(value);
+    const percentage = try std.fmt.allocPrint(a, "{s}{s}", .{ if (motion.low_price_input) "L " else "", value });
     defer a.free(percentage);
     const marker = if (motion.busy) activity.spinner(motion.now_ms) else ">";
     const reserve: usize = @min(@as(usize, 24), columns / 3);
@@ -271,9 +275,10 @@ pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Context
     errdefer a.free(plain);
     const idle_color = theme.effortColor(motion.reasoning_effort);
     const slot_flow = motion.busy and motion.effort_flash != null;
-    const slot_color = if (motion.effort_flash != null) idle_color else theme.contextColor(if (snapshot) |value| shared.state.contextRatio(value) else null);
+    const context_color = theme.contextColor(if (snapshot) |current| shared.state.contextRatio(current) else null);
+    const slot_color = if (motion.effort_flash != null) idle_color else context_color;
     const styled_model = label.len != 0 and (motion.busy or !std.mem.eql(u8, idle_color, theme.reset));
-    const styled_slot = slot_flow or !std.mem.eql(u8, slot_color, theme.reset);
+    const styled_slot = slot_flow or !std.mem.eql(u8, slot_color, theme.reset) or (motion.low_price_input and !std.mem.eql(u8, context_color, theme.reset));
     if ((label.len == 0 and !percent_only) or (!styled_model and !styled_slot)) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
@@ -289,10 +294,18 @@ pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Context
             try out.writer.writeAll(" ");
             ordinal += 1;
         }
+        // A transient effort flash keeps its own styling, but must never turn
+        // the policy marker into a TPS animation or a reasoning-level color.
+        const separate_marker = motion.low_price_input and motion.effort_flash != null;
+        if (separate_marker) {
+            try out.writer.print("{s}L{s} ", .{ context_color, theme.reset });
+            ordinal += 2;
+        }
+        const slot = if (separate_marker) value else percentage;
         if (slot_flow) {
-            try flowText(&out.writer, percentage, palette, motion.phase, &ordinal);
+            try flowText(&out.writer, slot, palette, motion.phase, &ordinal);
             try out.writer.writeAll(theme.reset);
-        } else try out.writer.print("{s}{s}{s}", .{ slot_color, percentage, theme.reset });
+        } else try out.writer.print("{s}{s}{s}", .{ slot_color, slot, theme.reset });
         try out.writer.writeAll(") ");
     }
     try out.writer.print("{s} ", .{marker});
@@ -447,6 +460,47 @@ test "context percent thresholds follow displayed rounding without animation or 
                 try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
             }
         }
+    }
+}
+
+test "low price marker shares the full static context color and optout removes it" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { snapshot: ?shared.ContextSnapshot, label: []const u8, color: []const u8 }{
+        .{ .snapshot = null, .label = "?%", .color = theme.reset },
+        .{ .snapshot = .{ .tokens = 10, .limit = 100, .known = false }, .label = "?%", .color = theme.reset },
+        .{ .snapshot = .{ .tokens = 0, .limit = 100 }, .label = "0.0%", .color = theme.success },
+        .{ .snapshot = .{ .tokens = 24949, .limit = 100000 }, .label = "24.9%", .color = theme.success },
+        .{ .snapshot = .{ .tokens = 24950, .limit = 100000 }, .label = "25.0%", .color = "\x1b[38;5;220m" },
+        .{ .snapshot = .{ .tokens = 49949, .limit = 100000 }, .label = "49.9%", .color = "\x1b[38;5;220m" },
+        .{ .snapshot = .{ .tokens = 49950, .limit = 100000 }, .label = "50.0%", .color = theme.failure },
+        .{ .snapshot = .{ .tokens = std.math.maxInt(u64), .limit = 1 }, .label = ">100%", .color = theme.failure },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |enabled| for ([_]bool{ false, true }) |busy| for ([_]usize{ 0, 11 }) |phase| {
+        const value = try prompt(a, "fixture", case.snapshot, 79, .{ .busy = busy, .now_ms = 80, .phase = phase, .rate_band = .fast, .reasoning_effort = .high, .low_price_input = enabled });
+        defer value.deinit(a);
+        const suffix = try std.fmt.allocPrint(a, " {s}{s}{s}{s}) {s} ", .{ case.color, if (enabled) "L " else "", case.label, theme.reset, if (busy) activity.spinner(80) else ">" });
+        defer a.free(suffix);
+        try std.testing.expect(std.mem.endsWith(u8, value.styled, suffix));
+        try std.testing.expectEqual(enabled, std.mem.find(u8, value.plain, "L ") != null);
+        try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
+    };
+    for (0..80) |columns| {
+        const value = try prompt(a, "a very long model name", .{ .tokens = 10, .limit = 100 }, columns, .{ .low_price_input = true, .busy = true });
+        defer value.deinit(a);
+        try std.testing.expect(text.width(value.plain) <= @max(columns, 2));
+        try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
+        if (std.mem.find(u8, value.plain, "L ") != null) try std.testing.expect(std.mem.find(u8, value.plain, "L 10.0%") != null);
+    }
+}
+
+test "low price marker stays context colored during effort flashes" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |busy| {
+        const value = try prompt(a, "fixture", .{ .tokens = 50, .limit = 100 }, 79, .{ .busy = busy, .reasoning_effort = .medium, .effort_flash = .medium, .phase = 7, .low_price_input = true });
+        defer value.deinit(a);
+        try std.testing.expect(std.mem.find(u8, value.plain, "L medium") != null);
+        try std.testing.expect(std.mem.find(u8, value.styled, theme.failure ++ "L" ++ theme.reset ++ " ") != null);
+        try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
     }
 }
 

@@ -69,8 +69,7 @@ pub const App = struct {
         var parsed = try cfg.load(a, io, path);
         // Derived defaults are not embedded in config.json. Headless entry can
         // reuse a compatible cached profile without creating/fetching metadata.
-        if (parsed.value.registry != null or parsed.value.model.reasoning_source != .explicit or parsed.value.model.reasoning == null or
-            parsed.value.model.output_source != .explicit or parsed.value.model.output_tokens == null)
+        // Price thresholds are always derived, even with explicit reasoning/output.
         {
             var cache: metadata.Cache = .{};
             var store: ?@import("auth_store.zig").Store = @import("auth_store.zig").Store.openExisting(a, io, home) catch null;
@@ -86,6 +85,7 @@ pub const App = struct {
             } else {
                 metadata.applyReasoning(&cache, &parsed.value);
                 metadata.applyOutput(&cache, &parsed.value);
+                model_resolver.applyInputThreshold(&cache, &parsed.value);
             }
         }
         // Headless entry creates the same missing project default as the TUI,

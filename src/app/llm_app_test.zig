@@ -71,6 +71,7 @@ test "registry headless default resolves exact cached directory with no handwrit
     row.tokens = 1000000;
     row.dev_protocol = .responses;
     row.dev_output_tokens = 128000;
+    row.dev_input_price_threshold = 200000;
     row.dev_present = true;
     cache.directory_mask = metadata.bit(.opencode_go);
     _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), .{
@@ -84,8 +85,25 @@ test "registry headless default resolves exact cached directory with no handwrit
     try std.testing.expectEqual(@as(u32, 1000000), app.config.value.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 128000), app.config.value.model.output_tokens);
     try std.testing.expectEqual(.metadata, app.config.value.model.output_source);
+    try std.testing.expectEqual(@as(?u32, 200000), app.config.value.model.input_price_threshold);
     try std.testing.expectEqual(@as(usize, 0), app.config.value.registry.?.providers[0].models.len);
     try std.testing.expect(app.environment.get("FAKE_GO_KEY") == null);
+    const frozen = try app.runtime.exportCheckpoint();
+    try std.testing.expect(frozen.input_budget_frozen);
+    try std.testing.expectEqual(@as(?u32, 200000), frozen.input_price_threshold);
+    var changed = frozen;
+    changed.input_price_threshold = null;
+    try std.testing.expectError(error.InputBudgetMismatch, app.runtime.restoreCheckpoint(changed));
+    changed = frozen;
+    changed.max_input_tokens = 100000;
+    try std.testing.expectError(error.InputBudgetMismatch, app.runtime.restoreCheckpoint(changed));
+    changed = frozen;
+    changed.low_price_input = !frozen.low_price_input;
+    try std.testing.expectError(error.InputBudgetMismatch, app.runtime.restoreCheckpoint(changed));
+    changed = frozen;
+    changed.input_margin_tokens += 1;
+    try std.testing.expectError(error.InputBudgetMismatch, app.runtime.restoreCheckpoint(changed));
+    try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
 }
 
 test "registry headless unknown default fails locally without changing settings or selecting another model" {

@@ -31,6 +31,14 @@ pub const State = struct {
     output_tokens: ?u32 = null,
     output_source: cfg.ReasoningSource = .explicit,
     output_budget_frozen: bool = false,
+    /// Frozen derived price metadata plus the user-authorized input policy.
+    /// Limits must still match current declarations; restore cannot silently
+    /// relax a newer policy or use a refreshed price step for an old task.
+    input_budget_frozen: bool = false,
+    input_price_threshold: ?u32 = null,
+    max_input_tokens: ?u32 = null,
+    low_price_input: bool = false,
+    input_margin_tokens: u32 = 5000,
     permission_id: u64,
     poisoned: bool = false,
     /// Observer continuity only; the Runtime never treats these as authority.
@@ -181,6 +189,17 @@ fn basic(state: State) !void {
     if (state.output_tokens) |tokens| {
         if (tokens == 0 or tokens > 1024 * 1024) return error.InvalidOutputTokens;
     }
+    if (state.input_price_threshold) |tokens| {
+        if (tokens == 0 or tokens > 16 * 1024 * 1024) return error.InvalidInputBudget;
+    }
+    var policy: cfg.Limits = .{};
+    policy.max_input_tokens = state.max_input_tokens;
+    policy.low_price_input = state.low_price_input;
+    policy.input_margin_tokens = state.input_margin_tokens;
+    cfg.validateInputLimits(policy) catch return error.InvalidInputBudget;
+    if (!state.input_budget_frozen and
+        (state.input_price_threshold != null or state.max_input_tokens != null or state.low_price_input or state.input_margin_tokens != 5000))
+        return error.InvalidInputBudget;
     try utf8(state.system);
     if (state.messages.len > 1024) return error.InputLimit;
     var blocks: usize = 0;
@@ -217,6 +236,12 @@ pub fn validate(a: Allocator, state: State, config: cfg.Config, schemas: []const
     if (state.output_budget_frozen and
         (state.output_tokens != config.model.output_tokens or state.output_source != config.model.output_source))
         return error.OutputBudgetMismatch;
+    if (state.input_budget_frozen and
+        (state.input_price_threshold != config.model.input_price_threshold or
+            state.max_input_tokens != config.limits.max_input_tokens or
+            state.low_price_input != config.limits.low_price_input or
+            state.input_margin_tokens != config.limits.input_margin_tokens))
+        return error.InputBudgetMismatch;
     if (state.estimator.per_mille < 1000) return error.InvalidEstimator;
     const selector = state.selector;
     if (selector.configured != config.model.protocol or selector.selected == .auto or

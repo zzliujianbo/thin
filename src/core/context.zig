@@ -71,16 +71,45 @@ pub fn rawTokens(system: []const u8, tools: []const p.ToolSchema, messages: []co
 /// Reserve one output token for hard input preflight. Neither a model maximum
 /// nor an explicit request ceiling is a permanent context reservation: both are
 /// clamped to the actual room when constructing each request.
-pub fn inputBudget(config: cfg.Config) usize {
+fn windowInputBudget(config: cfg.Config) usize {
     return @as(usize, config.model.context_tokens) -| config.limits.safety_tokens -| 1;
 }
 
-/// Independent summary policy: about 1/64 of the usable context, bounded to
-/// 2048..16384 before model, explicit request and actual headroom ceilings.
-/// This is a request policy, not an inferred model capability. Explicit summary
-/// values retain their meaning, including values below the automatic floor.
+pub fn inputBudget(config: cfg.Config) usize {
+    const window = windowInputBudget(config);
+    var ceiling: ?u32 = config.limits.max_input_tokens;
+    if (config.limits.low_price_input) {
+        const step = config.model.input_price_threshold orelse return 0;
+        ceiling = if (ceiling) |manual| @min(manual, step) else step;
+    }
+    return if (ceiling) |limit| @min(window, @as(usize, limit) -| config.limits.input_margin_tokens) else window;
+}
+
+/// Enabled policy is conservative estimation, never an exact billing promise.
+/// Missing price metadata must not silently restore the full model window.
+pub fn validateInputPolicy(config: cfg.Config) !void {
+    if (config.limits.low_price_input and config.model.input_price_threshold == null) return error.UnknownInputPriceThreshold;
+    if (inputBudget(config) == 0) return inputBudgetError(config);
+}
+
+pub fn inputBudgetError(config: cfg.Config) anyerror {
+    return if (config.limits.low_price_input or config.limits.max_input_tokens != null) error.InputBudgetExceeded else error.ContextTooLarge;
+}
+
+pub fn checkInput(config: cfg.Config, estimated_input: usize) !void {
+    try validateInputPolicy(config);
+    if (estimated_input > inputBudget(config)) return inputBudgetError(config);
+}
+
+/// Summary defaults follow the normal output policy, not a window ratio.
+/// An explicit summary ceiling remains independent; model capability, global
+/// ceiling and per-request headroom can still reduce the actual sent allowance.
+fn desiredOutput(config: cfg.Config) u32 {
+    return config.limits.max_output_tokens orelse config.model.output_tokens orelse 4096;
+}
+
 pub fn summaryBudget(config: cfg.Config) u32 {
-    const desired: u32 = config.limits.summary_tokens orelse @intCast(@min(@as(usize, 16384), @max(@as(usize, 2048), inputBudget(config) / 64)));
+    const desired = config.limits.summary_tokens orelse desiredOutput(config);
     return @min(desired, @min(config.model.output_tokens orelse desired, config.limits.max_output_tokens orelse desired));
 }
 
@@ -88,11 +117,14 @@ pub fn summaryBudget(config: cfg.Config) u32 {
 /// estimate (including summary instructions), never cumulative provider usage.
 /// Saturating arithmetic also handles a saturated calibrated input estimate.
 pub fn outputBudget(config: cfg.Config, purpose: p.Purpose, estimated_input: usize) !u32 {
+    // Guard the COMPLETE request for both purposes, including summary instructions.
+    // Output room is still calculated from the real window, not a price step.
+    try checkInput(config, estimated_input);
     const available = @as(usize, config.model.context_tokens) -| estimated_input -| config.limits.safety_tokens;
     const desired = if (purpose == .summary)
         summaryBudget(config)
     else
-        config.limits.max_output_tokens orelse config.model.output_tokens orelse 4096;
+        desiredOutput(config);
     const budget = @min(@as(usize, desired), available);
     if (budget == 0) return error.ContextTooLarge;
     return @intCast(budget);

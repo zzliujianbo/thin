@@ -491,8 +491,11 @@ pub fn main(init: std.process.Init) !void {
     try check(std.mem.indexOf(u8, d.output[0..d.used], if (std.mem.eql(u8, timezone, "UTC-8")) " +0800" else " +0000") != null);
     try check(std.mem.indexOf(u8, d.output[0..d.used], "Zig ") == null);
     if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
-        // 初始化只验证待配置界面；不输入密钥或发送消息，避免连接默认公共端点。
+        // Default policy is visible even while configuration is pending. Do not
+        // enter a key or submit a prompt: no public endpoint may be contacted.
         try d.waitText(0, "/login");
+        const pending = try d.screen();
+        try check(std.mem.indexOf(u8, &pending.grid[pending.row], " L ") != null);
     } else if (std.mem.eql(u8, mode, "manual-compact")) {
         var start = d.used;
         try d.send("manual-first\r");
@@ -527,10 +530,34 @@ pub fn main(init: std.process.Init) !void {
         try d.checkMenu("/model", ") > /");
         start = d.used;
         const commands = try d.screen();
+        // The loopback fixture explicitly opts out; the default-on marker must
+        // not be inferred merely from the presence of a context percentage.
+        try check(std.mem.indexOf(u8, &commands.grid[commands.row], " L ") == null);
         try check(commands.visible("/model [exact-id|--refresh]  Select model"));
-        try check(commands.visible("/compact  Compact conversation"));
+        // Inspect logical terminal cells, not raw SGR/padding substrings.
+        var description_column: ?usize = null;
+        var descriptions: usize = 0;
+        for ([_][]const u8{ "Select model", "Configure provider", "Compact conversation" }) |description| {
+            var found = false;
+            for (commands.grid) |line| {
+                if (std.mem.indexOf(u8, &line, description)) |column| {
+                    if (description_column) |expected| try check(column == expected) else description_column = column;
+                    try check(!found);
+                    found = true;
+                }
+            }
+            try check(found);
+            descriptions += 1;
+        }
+        try check(descriptions == 3);
         try d.send("\x1b[B"); // /model -> /login; /compact is the third root row.
         try d.waitFrame(start, "");
+        start = d.used;
+        try d.send("\t");
+        try d.waitFrame(start, "");
+        const login_completed = try d.screen();
+        try check(std.mem.indexOf(u8, &login_completed.grid[login_completed.row], ") > /login") != null);
+        try check(!login_completed.visible("Provider> ") and !login_completed.visible("API key> "));
         start = d.used;
         try d.send("\r");
         try d.waitFrame(start, "Provider> ");
@@ -556,6 +583,12 @@ pub fn main(init: std.process.Init) !void {
         try d.send("\x1b[A"); // Up from /login returns to /model.
         try d.waitFrame(start, "");
         start = d.used;
+        try d.send("\t");
+        try d.waitFrame(start, "");
+        const model_completed = try d.screen();
+        try check(std.mem.indexOf(u8, &model_completed.grid[model_completed.row], ") > /model") != null);
+        try check(!model_completed.visible("Search> "));
+        start = d.used;
         try d.send("\r");
         try d.waitFrame(start, "Search> ");
         try d.checkMenu("fixture-model  (", "Search> ");
@@ -566,6 +599,18 @@ pub fn main(init: std.process.Init) !void {
         try d.waitFrame(start, "");
         const model_parent = try d.screen();
         try check(model_parent.visible("/model") and model_parent.visible("/login") and !model_parent.visible("Search> "));
+        start = d.used;
+        try d.send("\x15");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("/co");
+        try d.waitFrame(start, "Compact conversation");
+        start = d.used;
+        try d.send("\t");
+        try d.waitFrame(start, "");
+        const compact_completed = try d.screen();
+        try check(std.mem.indexOf(u8, &compact_completed.grid[compact_completed.row], ") > /compact") != null);
+        try check(!compact_completed.visible("Context compacted:"));
         start = d.used;
         try d.send("\x15");
         try d.waitIdle(start);

@@ -130,7 +130,7 @@ fn scenario(allowed: bool) !void {
     var root = try fs.Root.open(a, io, buffer[0..n]);
     defer root.deinit();
 
-    const config = cfg.Config{ .provider = .{ .base_url = "http://unused.invalid", .api_key_env = "FAKE_KEY" }, .model = .{ .name = "scripted", .context_tokens = 32768, .protocol = .chat } };
+    const config = cfg.Config{ .provider = .{ .base_url = "http://unused.invalid", .api_key_env = "FAKE_KEY" }, .model = .{ .name = "scripted", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
     var memory = mem.Store.init(&root, config.limits);
 
     // 启动时 memory 快照为空，且 .thin 目录尚未创建。
@@ -250,7 +250,7 @@ fn bashTrust(command: []const u8, decision: r.Decision, ask: bool, run: bool) !v
     const n = try tmp.dir.realPath(io, &buffer);
     var root = try fs.Root.open(a, io, buffer[0..n]);
     defer root.deinit();
-    const config = cfg.Config{ .provider = .{ .base_url = "http://unused.invalid", .api_key_env = "FAKE_KEY" }, .model = .{ .name = "scripted", .context_tokens = 32768, .protocol = .chat } };
+    const config = cfg.Config{ .provider = .{ .base_url = "http://unused.invalid", .api_key_env = "FAKE_KEY" }, .model = .{ .name = "scripted", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
     var memory = mem.Store.init(&root, config.limits);
     var source = std.process.Environ.Map.init(a);
     defer source.deinit();

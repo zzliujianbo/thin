@@ -46,11 +46,14 @@ pub const Model = struct {
     /// Known output capability, not a user request cap. Null means unknown.
     output_tokens: ?u32 = null,
     output_source: ReasoningSource = .explicit,
+    /// Exact compatible price-step metadata; never a user declaration or window.
+    input_price_threshold: ?u32 = null,
 
     /// Derived maps/output limits and effort live in cache/project settings, not config
     /// defaults. This prevents a fetched profile becoming an explicit override.
     pub fn persisted(self: Model) Model {
         var result = self;
+        result.input_price_threshold = null;
         if (self.output_source == .metadata) result.output_tokens = null;
         if (self.reasoning_source == .metadata) {
             result.reasoning = null;
@@ -75,6 +78,14 @@ pub const Limits = struct {
     output_bytes: u32 = 32768,
     /// Explicit response cap; missing/null uses model capability or conservative fallback.
     max_output_tokens: ?u32 = null,
+    /// Optional estimated-input ceiling, independent of the real model window.
+    max_input_tokens: ?u32 = null,
+    /// Enabled by default; explicit false opts out of the first known price step.
+    /// Unknown metadata fails closed before any inference, never guesses 100K.
+    low_price_input: bool = true,
+    /// Additional headroom below an enabled input ceiling. Estimates are NOT
+    /// an authoritative tokenizer or a guarantee about provider billing.
+    input_margin_tokens: u32 = 5000,
     /// 预留的安全余量 token 数，从输入预算中扣除。
     safety_tokens: u32 = 4096,
     /// Model turns per user submission; missing/null means unlimited.
@@ -107,8 +118,8 @@ pub const Limits = struct {
     compaction_trigger_percent: u8 = 80,
     /// 压缩后希望达到的上下文占用百分比（必须小于触发阈值）。
     compaction_target_percent: u8 = 50,
-    /// Missing/null selects a bounded automatic summary budget. An explicit
-    /// value retains its ceiling and cannot exceed explicit max_output_tokens.
+    /// Missing/null follows max_output_tokens (or the same model/fallback policy
+    /// when automatic). Explicit values cannot exceed explicit max_output_tokens.
     summary_tokens: ?u32 = null,
     /// 单次模型响应的最大字节数。
     max_response_bytes: u32 = 8388608,
@@ -271,7 +282,25 @@ fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
         var it = fields.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.* == .float or entry.value_ptr.* == .number_string) return error.InvalidNumber;
+            inline for (@typeInfo(T).@"struct".field_names) |field| {
+                if (std.mem.eql(u8, entry.key_ptr.*, field)) {
+                    const F = @FieldType(T, field);
+                    const optional = @typeInfo(F) == .optional;
+                    const Base = if (optional) @typeInfo(F).optional.child else F;
+                    if (comptime @typeInfo(Base) == .int) {
+                        if (entry.value_ptr.* != .integer and !(optional and entry.value_ptr.* == .null)) return error.InvalidNumber;
+                    } else if (comptime @typeInfo(Base) == .bool) {
+                        if (entry.value_ptr.* != .bool and !(optional and entry.value_ptr.* == .null)) return error.UnexpectedToken;
+                    }
+                }
+            }
         }
+    }
+    // Legacy Config decoding must enforce the same exact numeric types as the
+    // registry branch; std.json's typed decoder otherwise coerces "90000".
+    if (T == Config) {
+        const fields = try object(value);
+        if (fields.get("limits")) |limits| _ = try decode(Limits, a, limits);
     }
     return std.json.parseFromValueLeaky(T, a, value, json_options);
 }
@@ -395,10 +424,10 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
         try s.objectField("provider");
         try s.write(config.provider);
         try s.objectField("model");
-        try s.write(config.model.persisted());
+        try writeDeclaredModel(&s, config.model);
         try s.objectField("models");
         try s.beginArray();
-        for (models) |m| try s.write(m.persisted());
+        for (models) |m| try writeDeclaredModel(&s, m);
         try s.endArray();
         try s.objectField("credentials");
         try s.write(config.credentials);
@@ -406,6 +435,20 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
         try s.write(config.limits);
         try s.endObject();
     }
+}
+
+/// Preserve the legacy disk shape without emitting the new cache-only price
+/// capability, even as null. Trusted clone/checkpoint encoding is independent.
+fn writeDeclaredModel(s: *std.json.Stringify, model: Model) !void {
+    const declaration = model.persisted();
+    try s.beginObject();
+    inline for (@typeInfo(Model).@"struct".field_names) |field| {
+        if (comptime !std.mem.eql(u8, field, "input_price_threshold")) {
+            try s.objectField(field);
+            try s.write(@field(declaration, field));
+        }
+    }
+    try s.endObject();
 }
 
 /// Candidate-only edits. Allocate replacement slices; never mutate shared registry memory.
@@ -555,10 +598,12 @@ pub fn validate(config: Config) !void {
             if (l.max_rounds) |rounds| {
                 if (rounds == 0 or rounds > 4096) return error.InvalidLimit;
             }
-        } else if (comptime std.mem.eql(u8, field, "compaction_enabled")) {
+        } else if (@TypeOf(@field(l, field)) == bool) {
             // false is an intentional policy, not a zero numeric limit.
         } else if (@field(l, field) == 0) return error.InvalidLimit;
     }
+
+    try validateInputLimits(l);
 
     // Hard ceilings are implementation safeguards, not provider capabilities.
     // 中文：以下上限是实现层的安全保护，与提供方能力无关。
@@ -625,6 +670,32 @@ fn validateRegistry(registry: Registry, limits: Limits) !void {
     }
 }
 
+test "low price input defaults enabled and explicit optout survives both disk formats" {
+    const a = std.testing.allocator;
+    const prefixes = [_][]const u8{
+        "{\"provider\":{\"base_url\":\"https://fixture.invalid/v1\"},\"model\":{\"name\":\"m\",\"context_tokens\":32768},\"limits\":",
+        "{\"llm\":{\"default\":\"local/m\",\"providers\":{\"local\":{\"base_url\":\"https://fixture.invalid/v1\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":32768}}}}},\"limits\":",
+    };
+    for (prefixes) |prefix| for ([_][]const u8{ "{}", "{\"low_price_input\":true}", "{\"low_price_input\":false}" }) |limits| {
+        const raw = try std.mem.concat(a, u8, &.{ prefix, limits, "}" });
+        defer a.free(raw);
+        var parsed = try parse(a, raw);
+        defer release(&parsed);
+        const enabled = std.mem.find(u8, limits, "false") == null;
+        try std.testing.expectEqual(enabled, parsed.value.limits.low_price_input);
+        // Unknown price metadata does not prevent parsing or selection.
+        try std.testing.expect(parsed.value.model.input_price_threshold == null);
+        var cloned = try clone(a, parsed.value);
+        defer release(&cloned);
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try writeDisk(cloned.value, &out.writer);
+        var again = try parse(a, out.written());
+        defer release(&again);
+        try std.testing.expectEqual(enabled, again.value.limits.low_price_input);
+    };
+}
+
 test "thinking declarations strict owned config validation and protocol incompatibility" {
     const t = std.testing;
     var parsed = try parse(t.allocator,
@@ -679,6 +750,15 @@ fn validateReasoningProtocol(base_url: []const u8, model: Model) !void {
     if ((model.protocol == .responses or model.protocol == .anthropic) and chatOnly(base_url, model)) return error.IncompatibleReasoningProtocol;
 }
 
+/// Validate user input policy without requiring price metadata at parse time.
+pub fn validateInputLimits(l: Limits) !void {
+    const maximum = 16 * 1024 * 1024;
+    if (l.input_margin_tokens == 0 or l.input_margin_tokens > maximum) return error.InvalidBudget;
+    if (l.max_input_tokens) |tokens| {
+        if (tokens == 0 or tokens > maximum or tokens <= l.input_margin_tokens) return error.InvalidBudget;
+    }
+}
+
 /// Shared profile validation uses the same limits as the selected model.
 pub fn validateModel(model: Model, l: Limits) !void {
     if (!validText(model.name, 1024)) return error.InvalidModel;
@@ -700,6 +780,7 @@ pub fn validateModel(model: Model, l: Limits) !void {
     if (model.context_tokens == 0 or model.context_tokens > 16 * mib or
         l.safety_tokens > mib or
         @as(u64, l.safety_tokens) + 1 >= model.context_tokens) return error.InvalidBudget;
+    if (model.input_price_threshold) |tokens| if (tokens == 0 or tokens > 16 * mib) return error.InvalidBudget;
     if (l.summary_tokens) |tokens| if (tokens == 0 or tokens > mib) return error.InvalidBudget;
     if (l.max_output_tokens) |cap| {
         // An explicit ceiling is preserved, but may shrink to available room
@@ -945,8 +1026,8 @@ test "budget ratios and bounded limits" {
     // Numeric zero is invalid; false intentionally disables automatic compaction.
     inline for (@typeInfo(Limits).@"struct".field_names) |field| {
         c = testConfig();
-        if (comptime std.mem.eql(u8, field, "compaction_enabled")) {
-            c.limits.compaction_enabled = false;
+        if (@TypeOf(@field(c.limits, field)) == bool) {
+            @field(c.limits, field) = false;
             try validate(c);
         } else {
             @field(c.limits, field) = 0;

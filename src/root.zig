@@ -88,6 +88,7 @@ test {
     _ = @import("tests/context_usage_test.zig");
     _ = @import("tests/output_budget_test.zig");
     _ = @import("tests/compaction_policy_test.zig");
+    _ = @import("tests/input_budget_test.zig");
     _ = @import("ui/terminal.zig");
     _ = @import("ui/input.zig");
     _ = @import("ui/input_history.zig");

@@ -34,7 +34,7 @@ fn configBase(a: std.mem.Allocator, scenario: []const u8, protocol: p.Protocol, 
     if (!std.mem.eql(u8, uri.scheme, scheme) or !std.mem.eql(u8, host_text, "127.0.0.1") or
         uri.port == null or uri.port == 0 or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null or !uri.path.isEmpty()) return error.UnsafeFixtureUrl;
 
-    return .{ .provider = .{ .base_url = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, scenario }), .api_key_env = "THIN_FAKE_KEY" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = protocol }, .limits = .{ .request_timeout_ms = 10000 } };
+    return .{ .provider = .{ .base_url = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, scenario }), .api_key_env = "THIN_FAKE_KEY" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = protocol }, .limits = .{ .low_price_input = false, .request_timeout_ms = 10000 } };
 }
 
 /// 构造固定内容的请求，使每次调用的 scope 与 system 保持一致，便于对比。

@@ -95,7 +95,7 @@ export async function selectionRestoreRegressions({app, pty, execute}) {
     await mkdir(join(home, '.thin'), {recursive:true, mode:0o700});
     await mkdir(sessions, {recursive:true, mode:0o700});
     const reasoning = {format:'standard', map:{low:'low', medium:'medium', high:'high'}};
-    const config = JSON.stringify({provider:{kind:'opencode_zen', base_url:url, api_key_env:'THIN_FIXTURE_KEY'}, model:{name:'fixture-model', protocol:'chat', context_tokens:32768, reasoning}, models:[{name:'fixture-restored', protocol:'chat', context_tokens:32768, reasoning_effort:'low', reasoning}]});
+    const config = JSON.stringify({limits:{low_price_input:false},provider:{kind:'opencode_zen', base_url:url, api_key_env:'THIN_FIXTURE_KEY'}, model:{name:'fixture-model', protocol:'chat', context_tokens:32768, reasoning}, models:[{name:'fixture-restored', protocol:'chat', context_tokens:32768, reasoning_effort:'low', reasoning}]});
     const settings = '{ "version": 1, "reasoning_effort": "low" }\n';
     const snapshot = {version:1, session:id, provider:'opencode_zen', endpoint:createHash('sha256').update(url).digest('hex'), model:'fixture-restored', protocol:'responses', effort:'high', effort_hash:null};
     const sessionPath = join(sessions, `${id}.session`);

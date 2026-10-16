@@ -240,6 +240,7 @@ pub const Session = struct {
             if (config.registry == null) {
                 self.applyReasoningMetadata(config);
                 metadata.applyOutput(&self.metadata_cache, config);
+                model_resolver.applyInputThreshold(&self.metadata_cache, config);
             }
             const capabilities = self.capabilitiesFor(config.*);
             self.preferred_effort = self.settings.loadOrInitialize(capabilities.defaultEffort(config.model.reasoning_effort)) catch |err| blk: {
@@ -294,6 +295,9 @@ pub const Session = struct {
                 self.pending.?.value.model.output_tokens = value.value.output_tokens;
                 self.pending.?.value.model.output_source = value.value.output_source;
             }
+            if (value.value.input_budget_frozen)
+                self.pending.?.value.model.input_price_threshold = value.value.input_price_threshold;
+            // Limits remain current declarations; Runtime rejects policy drift.
             try cfg.validate(self.pending.?.value);
         }
         if (restored != null) {
@@ -365,6 +369,7 @@ pub const Session = struct {
         candidate.model.protocol = snapshot.protocol;
         self.applyReasoningMetadata(&candidate);
         metadata.applyOutput(&self.metadata_cache, &candidate);
+        model_resolver.applyInputThreshold(&self.metadata_cache, &candidate);
         const capabilities = self.capabilitiesFor(candidate);
         if (snapshot.effort) |level| {
             if (capabilities.known) {
@@ -625,6 +630,7 @@ pub const Session = struct {
             .configured_providers = self.configuredMask(self.global_config.?.value),
             .allow_custom_models = config.provider.kind == null,
             .context_limit = if (config.selection_pending) 0 else config.model.context_tokens,
+            .low_price_input = config.limits.low_price_input,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .effort_levels = self.capabilitiesFor(config).levels,
             .settings_error = self.settings_error,
@@ -997,7 +1003,12 @@ pub const Session = struct {
         }
         // Keep local profiles first and aligned with the owner's UI flags.
         if (active.models.len > 64) return error.TooManyModels;
-        for (active.models) |model| try self.appendDisplayModel(&models, model);
+        for (active.models) |model| {
+            var candidate = active;
+            candidate.model = model;
+            model_resolver.applyInputThreshold(&self.metadata_cache, &candidate);
+            try self.appendDisplayModel(&models, candidate.model);
+        }
         const configured = self.configuredMask(global);
         const found = &self.metadata_cache.directory;
         for (found.rows[0..found.count], 0..) |row, index| {
@@ -1046,6 +1057,7 @@ pub const Session = struct {
         model.reasoning_source = .metadata;
         model.output_tokens = metadata.outputFor(&self.metadata_cache, entry);
         model.output_source = .metadata;
+        model.input_price_threshold = metadata.inputPriceThresholdFor(&self.metadata_cache, entry);
         if (self.officialCapacity(entry)) |tokens| model.context_tokens = tokens;
         model.name = entry.selector;
         try self.appendDisplayModel(models, model);
@@ -1248,6 +1260,7 @@ pub const Session = struct {
         }
         self.applyReasoningMetadata(&candidate);
         metadata.applyOutput(&self.metadata_cache, &candidate);
+        model_resolver.applyInputThreshold(&self.metadata_cache, &candidate);
         const capabilities = self.capabilitiesFor(candidate);
         var preference_notice: ?[]const u8 = null;
         if (self.preferred_effort) |saved| {
@@ -1552,10 +1565,12 @@ pub const Session = struct {
         const explicit_output = entry.model.output_source == .explicit and entry.model.output_tokens != null;
         const output_tokens = if (retained != null or explicit_output) entry.model.output_tokens else metadata.outputFor(&self.metadata_cache, entry);
         const output_source: cfg.ReasoningSource = if (retained != null or explicit_output) entry.model.output_source else .metadata;
+        const input_price_threshold = if (retained != null) entry.model.input_price_threshold else metadata.inputPriceThresholdFor(&self.metadata_cache, entry);
         if (self.app != null and previous.provider.kind == entry.provider and
             std.mem.eql(u8, previous.model.name, entry.model.name) and self.active_revision == revision and
             previous.model.protocol == entry.model.protocol and previous.model.context_tokens == capacity and
             previous.model.output_tokens == output_tokens and previous.model.output_source == output_source and
+            previous.model.input_price_threshold == input_price_threshold and
             sameDeclaration(previous.model.reasoning, declaration))
         {
             self.initial_context = self.app.?.runtime.contextSnapshot();
@@ -1579,6 +1594,7 @@ pub const Session = struct {
         next.model.context_tokens = capacity;
         next.model.output_tokens = output_tokens;
         next.model.output_source = output_source;
+        next.model.input_price_threshold = input_price_threshold;
         next.models = if (same_endpoint) previous.models else &.{};
         const notice = if (retained) |actual| actual.notice else self.applyPreference(&next);
         const alias = try self.allocator.dupe(u8, entry.selector);
@@ -1658,7 +1674,10 @@ pub const Session = struct {
             var next = if (same_provider) self.pending.?.value else baseline.value;
             next.provider = baseline.value.provider;
             next.credentials = baseline.value.credentials;
-            if (!same_provider) metadata.applyOutput(&self.metadata_cache, &next);
+            if (!same_provider) {
+                metadata.applyOutput(&self.metadata_cache, &next);
+                model_resolver.applyInputThreshold(&self.metadata_cache, &next);
+            }
             notice = self.applyPreference(&next);
             initial = try self.prepareApp(try cfg.clone(self.allocator, next));
             try initial.?.pinSessionID(self.session_id);
@@ -3414,12 +3433,15 @@ test "Anthropic authenticated session resume preserves signed replay and never e
     const Wire = struct {
         fn encode(allocator: std.mem.Allocator, session: *Session) ![]u8 {
             const app = session.app.?;
+            // Wire-only replay fixture has no price directory and never sends.
+            var config = app.config.value;
+            config.limits.low_price_input = false;
             return adapter.encode(allocator, .{
                 .scope = .{ .connection = app.config.value.provider.base_url, .model = app.config.value.model.name, .protocol = .anthropic },
                 .system = app.runtime.system,
                 .messages = app.runtime.messages(),
                 .tools = &.{},
-                .max_output_tokens = try @import("../core/context.zig").outputBudget(app.config.value, .normal, app.runtime.estimator.tokens(@import("../core/context.zig").rawTokens(app.runtime.system, &.{}, app.runtime.messages()))),
+                .max_output_tokens = try @import("../core/context.zig").outputBudget(config, .normal, app.runtime.estimator.tokens(@import("../core/context.zig").rawTokens(app.runtime.system, &.{}, app.runtime.messages()))),
             });
         }
     };

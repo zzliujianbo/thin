@@ -10,6 +10,7 @@ const j = @import("../util/json.zig");
 
 /// 测试用配置：provider 地址为不可达的占位主机，防止误连真实服务。
 const configuration = cfg.Config{
+    .limits = .{ .low_price_input = false },
     .provider = .{ .base_url = "http://unused.invalid", .api_key_env = "FAKE_KEY" },
     .model = .{ .name = "fake", .context_tokens = 32768 },
 };

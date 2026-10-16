@@ -60,6 +60,18 @@ pub const Frozen = struct {
     effort: ?[]const u8 = null,
 };
 
+/// Derived capabilities belong to the exact endpoint, model and concrete wire
+/// route. Always clear the preceding selection, including a frozen unknown.
+pub fn applyInputThreshold(cache: *const metadata.Cache, config: *cfg.Config) void {
+    config.model.input_price_threshold = null;
+    const service = cfg.providers.Id.fromUrl(config.provider.base_url) orelse return;
+    if (config.provider.kind) |hint| if (hint != service) return;
+    if (config.model.protocol == .auto) return;
+    var entry = metadata.restoreEntry(cache, service, config.model.name) orelse return;
+    entry.model.protocol = config.model.protocol;
+    config.model.input_price_threshold = metadata.inputPriceThresholdFor(cache, entry);
+}
+
 const ResolvedModel = struct { model: cfg.Model, official: bool };
 fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.NamedProvider, raw_id: []const u8, historical: bool, frozen: ?Frozen, restored_route: ?@import("../core/protocol.zig").Protocol) !ResolvedModel {
     const patch = provider.patchFor(raw_id);
@@ -131,8 +143,13 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
     // Directory unknown must never become paid protocol probing.
     if (frozen == null and model.protocol == .auto and (patch == null or patch.?.protocol == null)) return error.UnknownModelProtocol;
     if (model.context_tokens == 0) return error.UnknownModelContext;
-    try cfg.validateModel(model, config.limits);
     var candidate = config;
+    candidate.provider = provider.connection;
+    candidate.model = model;
+    // Protocol patches and authenticated route selection must precede lookup.
+    applyInputThreshold(cache, &candidate);
+    model = candidate.model;
+    try cfg.validateModel(model, config.limits);
     candidate.provider = provider.connection;
     candidate.model = model;
     candidate.models = &.{};
@@ -216,6 +233,7 @@ test "registry resolution merges fields but never borrows identity from a custom
     row.tokens = 1000000;
     row.dev_protocol = .responses;
     row.dev_output_tokens = 128000;
+    row.dev_input_price_threshold = 200000;
     cache.directory_mask = metadata.bit(.opencode_go);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -223,6 +241,21 @@ test "registry resolution merges fields but never borrows identity from a custom
     try std.testing.expectEqual(@as(u32, 200000), selected.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 128000), selected.model.output_tokens);
     try std.testing.expectEqual(.responses, selected.model.protocol);
+    try std.testing.expectEqual(@as(?u32, 200000), selected.model.input_price_threshold);
+    var candidate = parsed.value;
+    candidate.provider = selected.connection;
+    candidate.model = selected.model;
+    candidate.model.protocol = .chat;
+    applyInputThreshold(&cache, &candidate);
+    try std.testing.expectEqual(@as(?u32, null), candidate.model.input_price_threshold);
+    candidate.model = selected.model;
+    candidate.model.name = "other";
+    applyInputThreshold(&cache, &candidate);
+    try std.testing.expectEqual(@as(?u32, null), candidate.model.input_price_threshold);
+    candidate.model = selected.model;
+    candidate.provider = parsed.value.registry.?.find("custom").?.connection;
+    applyInputThreshold(&cache, &candidate);
+    try std.testing.expectEqual(@as(?u32, null), candidate.model.input_price_threshold);
     try std.testing.expect(!selected.context_official);
     try std.testing.expectError(error.UnknownModelProtocol, resolve(arena.allocator(), parsed.value, &cache, "custom", "shared", false));
     // Mutating cache ownership cannot poison an exported candidate.

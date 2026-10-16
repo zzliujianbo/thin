@@ -17,6 +17,26 @@ fn save(home: []const u8, text: []const u8) !void {
     try store.root.writeMode(cfg.file_name, text, false, 0o600);
 }
 
+test "low price policy owner snapshot reflects default and explicit optout before configuration" {
+    for ([_][]const u8{ "{}", "{\"low_price_input\":true}", "{\"low_price_input\":false}" }) |limits| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [4096]u8 = undefined;
+        const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+        const raw = try std.mem.concat(a, u8, &.{ "{\"provider\":{\"base_url\":\"https://fixture.invalid/v1\",\"api_key_env\":\"MISSING_LOCAL_FIXTURE_KEY\"},\"model\":{\"name\":\"m\",\"protocol\":\"chat\",\"context_tokens\":32768},\"limits\":", limits, "}" });
+        defer a.free(raw);
+        try save(home, raw);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+        defer session.deinit();
+        const state = session.connection().current();
+        try std.testing.expectEqual(std.mem.find(u8, limits, "false") == null, state.low_price_input);
+        try std.testing.expect(state.runtime == null); // Still pending, no inference.
+    }
+}
+
 test "publication empty selection route constrains every capability before validation" {
     const resolver = @import("model_resolver.zig");
     var parsed = try cfg.parse(a,
@@ -32,6 +52,7 @@ test "publication empty selection route constrains every capability before valid
     row.dev_protocol = .responses;
     row.dev_context_tokens = 1000000;
     row.dev_output_tokens = 128000;
+    row.dev_input_price_threshold = 200000;
     cache.directory_mask = metadata.bit(.opencode_go);
     try std.testing.expectError(error.UnknownModelContext, resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "fresh", .chat));
     // Matching public evidence can restore the historical concrete route when
@@ -45,6 +66,10 @@ test "publication empty selection route constrains every capability before valid
     try std.testing.expectEqual(.chat, restored.model.protocol);
     try std.testing.expectEqual(@as(u32, 65536), restored.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 4096), restored.model.output_tokens);
+    try std.testing.expectEqual(@as(?u32, 200000), restored.model.input_price_threshold);
+    row.dev_protocol = .responses;
+    const isolated = try resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "manual", .chat);
+    try std.testing.expectEqual(@as(?u32, null), isolated.model.input_price_threshold);
     const preset = try resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "glm-5.3", .chat);
     try std.testing.expectEqual(@import("provider_catalog.zig").find("opencode-go/glm-5.3").?.model.context_tokens, preset.model.context_tokens);
     try std.testing.expect(preset.model.output_tokens == null);
@@ -545,6 +570,7 @@ test "llm Session dynamic frozen checkpoint survives lost window and delisting w
             row.dev_present = true;
             row.dev_protocol = .chat;
             row.dev_output_tokens = output;
+            row.dev_input_price_threshold = if (output != null) 200000 else null;
             listing.dev_done = true;
             _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
         }
@@ -556,6 +582,7 @@ test "llm Session dynamic frozen checkpoint survives lost window and delisting w
             const app = source.app.?;
             try std.testing.expectEqual(@as(u32, 1000000), app.config.value.model.context_tokens);
             try std.testing.expectEqual(output, app.config.value.model.output_tokens);
+            try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, app.config.value.model.input_price_threshold);
             try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "frozen dynamic canonical fixture" }} });
             // Publish an ordinary in-session checkpoint; saveOnExit is a
             // terminal one-shot and must not be invoked twice on this owner.
@@ -570,9 +597,12 @@ test "llm Session dynamic frozen checkpoint survives lost window and delisting w
             row.dev_present = true;
             row.dev_protocol = .chat;
             row.dev_output_tokens = 4096;
+            row.dev_input_price_threshold = 100000;
             listing.dev_done = true;
             _ = try metadata.commit(&source.store.root, metadata.bit(.opencode_go), listing);
             source.metadata_cache = try metadata.load(&source.store.root);
+            try source.connection().selectModel("cached.protochat");
+            try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, source.app.?.config.value.model.input_price_threshold);
             try std.testing.expect(try source.saveOnExit());
             try std.testing.expectEqualStrings("fake-frozen-go", source.global_config.?.value.registry.?.find("go").?.connection.api_key.?);
         }
@@ -582,6 +612,7 @@ test "llm Session dynamic frozen checkpoint survives lost window and delisting w
             defer restored.deinit();
             try std.testing.expectEqual(@as(u32, 1000000), restored.app.?.config.value.model.context_tokens);
             try std.testing.expectEqual(output, restored.app.?.config.value.model.output_tokens);
+            try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, restored.app.?.config.value.model.input_price_threshold);
             try std.testing.expectEqual(.chat, restored.app.?.config.value.model.protocol);
             try std.testing.expectEqual(@as(usize, 1), restored.app.?.runtime.messages().len);
             try std.testing.expect(try restored.saveOnExit());
@@ -596,6 +627,7 @@ test "llm Session dynamic frozen checkpoint survives lost window and delisting w
             defer restored.deinit();
             try std.testing.expectEqual(@as(u32, 1000000), restored.app.?.config.value.model.context_tokens);
             try std.testing.expectEqual(output, restored.app.?.config.value.model.output_tokens);
+            try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, restored.app.?.config.value.model.input_price_threshold);
             try std.testing.expect(try restored.saveOnExit());
         }
         // Valid lease/digest, but invalid HMAC and invalid payload JSON: auth

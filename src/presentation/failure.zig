@@ -8,7 +8,12 @@ pub fn write(writer: *std.Io.Writer, label: []const u8, detail: ?anyerror, kind:
     try writer.writeAll(label);
     // Put the status before verbose details so narrow terminal rows retain it.
     if (status) |code| try writer.print(" [HTTP {d}]", .{code});
-    if (detail) |err| try writer.print(": {s}", .{@errorName(err)});
+    if (detail) |err| {
+        try writer.print(": {s}", .{@errorName(err)});
+        if (err == error.InputBudgetExceeded) try writer.writeAll("; estimated input budget reached; compact context or adjust input policy");
+        if (err == error.InputBudgetSummaryFailed) try writer.writeAll("; summary failed; history kept, no further inference sent");
+        if (err == error.UnknownInputPriceThreshold) try writer.writeAll("; low-price threshold unavailable; refresh metadata or explicitly disable limits.low_price_input");
+    }
     if (kind) |failure| {
         try writer.print(" / {s}", .{@tagName(failure)});
         if (failure == .authentication) try writer.writeAll(switch (status orelse 0) {

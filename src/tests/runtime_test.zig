@@ -281,6 +281,7 @@ fn configuration() cfg.Config {
     return .{
         .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
+        .limits = .{ .low_price_input = false },
     };
 }
 /// 小上下文配置：窗口仅 3000 tokens，输出、摘要与安全余量都缩小，使长任务很快触发压缩。
@@ -798,8 +799,8 @@ test "permission ids do not wrap into a non-monotonic host id" {
 test "Runtime unlimited default omitted and null exceed fifty rounds after checkpoint restore" {
     const a = std.testing.allocator;
     const inputs = [_][]const u8{
-        "{\"provider\":{\"base_url\":\"http://localhost\"},\"model\":{\"name\":\"fake\",\"context_tokens\":32768,\"protocol\":\"chat\"}}",
-        "{\"provider\":{\"base_url\":\"http://localhost\"},\"model\":{\"name\":\"fake\",\"context_tokens\":32768,\"protocol\":\"chat\"},\"limits\":{\"max_rounds\":null}}",
+        "{\"provider\":{\"base_url\":\"http://localhost\"},\"model\":{\"name\":\"fake\",\"context_tokens\":32768,\"protocol\":\"chat\"},\"limits\":{\"low_price_input\":false}}",
+        "{\"provider\":{\"base_url\":\"http://localhost\"},\"model\":{\"name\":\"fake\",\"context_tokens\":32768,\"protocol\":\"chat\"},\"limits\":{\"low_price_input\":false,\"max_rounds\":null}}",
     };
     for (0..3) |variant| {
         var parsed = try cfg.parse(a, inputs[if (variant == 2) 1 else 0]);
@@ -1518,7 +1519,7 @@ test "output budget automatic config explicit caps and metadata provenance" {
     try cfg.validate(config);
     try t.expectEqual(@as(usize, 126975), context.inputBudget(config));
     try t.expectEqual(@as(u32, 125976), try context.outputBudget(config, .normal, 1000));
-    try t.expectEqual(@as(u32, 2048), try context.outputBudget(config, .summary, 1000));
+    try t.expectEqual(@as(u32, 125976), try context.outputBudget(config, .summary, 1000));
     try t.expectEqual(@as(u32, 976), try context.outputBudget(config, .summary, 126000));
     config.model.output_tokens = 512;
     try t.expectEqual(@as(u32, 512), try context.outputBudget(config, .summary, 1000));

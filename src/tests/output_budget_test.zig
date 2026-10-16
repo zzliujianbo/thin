@@ -22,6 +22,7 @@ test "output budget provider matrix uses one shared ceiling and the declared wir
                 const format: thinking.Format = if (protocol == .anthropic) .anthropic else if (provider == .deepseek) .deepseek else .standard;
                 var config: cfg.Config = .{
                     .provider = connection,
+                    .limits = .{ .low_price_input = false },
                     .model = .{ .name = "budget-fixture", .protocol = protocol, .context_tokens = window, .output_tokens = 65536, .reasoning_effort = "high", .reasoning = .{ .format = format, .map = .{ .off = if (format == .anthropic) "disabled" else if (format == .deepseek) "off" else "none", .high = "high" } } },
                 };
                 try cfg.validate(config);
@@ -33,7 +34,7 @@ test "output budget provider matrix uses one shared ceiling and the declared wir
                         defer arena.deinit();
                         const allocator = arena.allocator();
                         const budget = try context.outputBudget(config, purpose, estimated_input);
-                        try std.testing.expectEqual(if (purpose == .summary) @as(u32, if (window == 131072) 2048 else 15560) else if (window == 1000000 or estimated_input == 1000) @as(u32, 65536) else @as(u32, 6976), budget);
+                        try std.testing.expectEqual(if (window == 1000000 or estimated_input == 1000) @as(u32, 65536) else @as(u32, 6976), budget);
                         const request: p.Request = .{
                             .scope = .{ .connection = connection.base_url, .model = config.model.name, .protocol = protocol },
                             .system = "budget fixture",
