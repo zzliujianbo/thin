@@ -180,6 +180,9 @@ pub const Connection = struct {
     select_model_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     configure_provider_fn: ?*const fn (*anyopaque, core_config.providers.Id, []const u8) anyerror!void = null,
     set_effort_fn: ?*const fn (*anyopaque, shared.ReasoningEffort) anyerror!void = null,
+    /// Explicit owner-side action may adopt newly discovered missing capability
+    /// metadata. Redraw snapshots and existing accepted maps remain frozen.
+    cycle_effort_fn: ?*const fn (*anyopaque) anyerror!shared.ReasoningEffort = null,
     /// Startup-only borrowed context, consumed before any worker exists.
     initial_history_fn: ?*const fn (*anyopaque) []const p.Message = null,
     /// Explicit metadata refresh and bounded owner polling, separate from LLM jobs.
@@ -920,18 +923,30 @@ const Ui = struct {
             return;
         };
         const state = self.connection.current();
-        const next = state.effort_levels.next(state.reasoning_effort) orelse {
-            self.notice = "Thinking capabilities unknown: declare model reasoning levels in configuration";
-            return;
+        const next = if (self.connection.cycle_effort_fn) |cycle|
+            cycle(self.connection.context) catch |err| {
+                self.notice = switch (err) {
+                    error.ThinkingCapabilitiesLoading => "Thinking capabilities are loading; try Shift+Tab again shortly",
+                    error.ThinkingCapabilitiesUnknown => "Thinking capabilities unknown: refresh /model or declare reasoning levels in configuration",
+                    else => "Could not save thinking option; previous option kept",
+                };
+                return;
+            }
+        else blk: {
+            const selected = state.effort_levels.next(state.reasoning_effort) orelse {
+                self.notice = "Thinking capabilities unknown: declare model reasoning levels in configuration";
+                return;
+            };
+            if (selected != state.reasoning_effort.canonical()) self.connection.setEffort(selected) catch {
+                self.notice = "Could not save thinking option; previous option kept";
+                return;
+            };
+            break :blk selected;
         };
         if (next == state.reasoning_effort.canonical()) {
             self.notice = "This model has no other supported thinking level";
             return;
         }
-        self.connection.setEffort(next) catch {
-            self.notice = "Could not save thinking option; previous option kept";
-            return;
-        };
         self.display.setEffort(next);
         // 档位变更只在输入框百分比位置短暂确认，不再写常驻 hint 行。
         self.effort_flash = .{ .level = next, .until_ms = self.clock_ms +| 2000 };
@@ -4609,6 +4624,96 @@ test "provider auth requires a visible full label and save failure wipes the key
     try std.testing.expect(!ui.secret_mode and ui.secret.len == 0 and ui.secret_provider == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.provider_saves);
     try std.testing.expect(std.mem.find(u8, ui.notice, "Could not save") != null);
+}
+
+test "first DeepSeek login Shift Tab adopts discovered thinking without changing request budgets" {
+    const Session = @import("../app/session.zig").Session;
+    const metadata = @import("../app/model_metadata.zig");
+    const Fetch = struct {
+        fn official(a: std.mem.Allocator, _: Io, id: core_config.providers.Id, key: ?[]const u8) !metadata.Listing {
+            try std.testing.expectEqual(core_config.providers.Id.deepseek, id);
+            try std.testing.expectEqualStrings("fake-fresh-login", key.?);
+            return metadata.parseListing(a,
+                \\{"data":[{"id":"deepseek-flash","context_window":131072,"effort":{"supported_levels":["low","high","max"],"default_level":"high"}}]}
+            , id);
+        }
+        fn public(_: std.mem.Allocator, _: Io) !metadata.Listing {
+            return .{ .dev_done = true };
+        }
+    };
+    try text.initLocale();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false, .auto_refresh_models = true });
+    defer session.deinit();
+    session.metadata_fetch = Fetch.official;
+    session.metadata_dev_fetch = Fetch.public;
+    try std.testing.expect(session.app == null);
+    try session.connection().configure("fake-fresh-login");
+    const before = session.app.?.config.value.model;
+    try std.testing.expect(before.reasoning == null);
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(a, io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = session.connection();
+    try ui.draw();
+    ui.finishFrame();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b[Z", sink);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "are loading") != null);
+    try std.testing.expect(session.app.?.config.value.model.reasoning == null);
+    try std.testing.expect(session.metadata_job == null); // Shortcut itself never fetches.
+    try std.testing.expect(session.connection().poll_models_fn.?(session.connection().context, true));
+    const job = session.metadata_job.?;
+    if (job.future) |*future| future.await(io);
+    job.future = null;
+    if (job.dev_future) |*future| future.await(io);
+    job.dev_future = null;
+    try std.testing.expect(session.connection().poll_models_fn.?(session.connection().context, true));
+    // Refresh alone must not silently change an accepted request snapshot.
+    try std.testing.expectEqual(@as(u8, 0), session.connection().current().effort_levels.mask);
+    const saved_settings = try tmp.dir.readFileAlloc(io, ".thin/settings.json", a, .limited(1024));
+    defer a.free(saved_settings);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/settings.json", .data = "{}" });
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[Z", sink);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Could not save") != null);
+    try std.testing.expect(session.app.?.config.value.model.reasoning == null);
+    try std.testing.expect(session.app.?.config.value.model.reasoning_effort == null);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/settings.json", .data = saved_settings });
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[Z", sink);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    try std.testing.expectEqual(shared.ReasoningEffort.off, session.connection().current().reasoning_effort);
+    try std.testing.expectEqual(before.context_tokens, session.app.?.config.value.model.context_tokens);
+    try std.testing.expectEqual(before.output_tokens, session.app.?.config.value.model.output_tokens);
+    try std.testing.expectEqual(before.input_price_threshold, session.app.?.config.value.model.input_price_threshold);
+    try std.testing.expectEqual(before.protocol, session.app.?.config.value.model.protocol);
+    // The adopted map must be owned, not borrowed from movable cache storage.
+    session.metadata_cache = .{};
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[Z", sink);
+    try std.testing.expectEqual(shared.ReasoningEffort.low, session.connection().current().reasoning_effort);
+    try std.testing.expectEqual(shared.ReasoningEffort.low, (try session.settings.load()).?);
+    const wire = r.withReasoning(session.app.?.config.value, .{ .scope = .{ .connection = "https://api.deepseek.com", .model = "deepseek-flash", .protocol = .chat }, .system = "", .tools = &.{}, .messages = &.{}, .max_output_tokens = 128 });
+    try std.testing.expectEqualStrings("low", wire.reasoning_effort.?);
+    try std.testing.expect(wire.thinking.?);
+    var disk = try session.store.loadExisting();
+    defer core_config.release(&disk);
+    try std.testing.expect(disk.value.registry.?.find("deepseek").?.patchFor("deepseek-flash").?.reasoning == null);
+    try std.testing.expect(!session.app.?.journal.started);
 }
 
 test "effort confirmation expires after two seconds and repeated switches restart it" {

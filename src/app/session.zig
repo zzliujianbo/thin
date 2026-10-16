@@ -398,7 +398,7 @@ pub const Session = struct {
 
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -603,8 +603,8 @@ pub const Session = struct {
 
     fn applyReasoningMetadata(self: *const Session, config: *cfg.Config) void {
         // Registry selections already own the resolver's field-by-field merge.
-        // Accepted maps (including unknown) and manual effort are frozen until
-        // a deliberate fresh selection, not re-derived on redraw or Shift+Tab.
+        // Accepted maps (including unknown) and manual effort are frozen on
+        // redraw/refresh. An explicit effort action may resolve a missing map.
         if (config.registry != null) return;
         metadata.applyReasoning(&self.metadata_cache, config);
     }
@@ -1256,18 +1256,61 @@ pub const Session = struct {
         return self.configureRegistryProvider(id, key);
     }
 
+    /// Cache-only opt-in: discover a missing map on an explicit effort action,
+    /// never replace an already accepted map or re-resolve unrelated budgets.
+    fn effortCandidate(self: *const Session, config: cfg.Config) cfg.Config {
+        var candidate = config;
+        if (candidate.model.reasoning == null)
+            metadata.applyReasoning(&self.metadata_cache, &candidate)
+        else
+            self.applyReasoningMetadata(&candidate);
+        return candidate;
+    }
+
+    fn cycleEffort(raw: *anyopaque) !presentation.ReasoningEffort {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        try self.guardSelection();
+        const config = self.mutableConfig().*;
+        const current_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort);
+        const capabilities = self.capabilitiesFor(self.effortCandidate(config));
+        const next = capabilities.levels.next(current_effort) orelse {
+            if (ProviderId.fromUrl(config.provider.base_url) != null and
+                (self.metadata_job != null or self.metadata_login_pending != 0))
+                return error.ThinkingCapabilitiesLoading;
+            return error.ThinkingCapabilitiesUnknown;
+        };
+        if (next != current_effort.canonical()) try setEffort(raw, next);
+        return next;
+    }
+
     fn setEffort(raw: *anyopaque, effort: presentation.ReasoningEffort) !void {
         const self: *Session = @ptrCast(@alignCast(raw));
         try self.guardSelection();
         const canonical = effort.canonical();
         const name = canonical.name() orelse return error.InvalidReasoningEffort;
         const config = self.mutableConfig();
-        var candidate = config.*;
-        self.applyReasoningMetadata(&candidate);
+        var candidate = self.effortCandidate(config.*);
         const capabilities = self.capabilitiesFor(candidate);
         if (!capabilities.levels.contains(canonical)) return error.UnsupportedReasoningEffort;
         candidate.model.reasoning_effort = name;
         try cfg.validate(candidate);
+        // Cache storage is movable and later refreshes can replace it. Own any
+        // newly adopted map in the active configuration's existing arena before
+        // the save; failed saves leave the published model untouched.
+        const a = if (self.app) |app| app.config.arena.allocator() else self.pending.?.arena.allocator();
+        var owned_map: thinking.LevelMap = .{};
+        const fields = @typeInfo(thinking.LevelMap).@"struct".field_names;
+        errdefer inline for (0..fields.len) |i| {
+            if (@field(owned_map, fields[fields.len - 1 - i])) |value| a.free(value);
+        };
+        if (!sameDeclaration(config.model.reasoning, candidate.model.reasoning)) {
+            var declaration = candidate.model.reasoning.?;
+            inline for (fields) |field| {
+                if (@field(declaration.map, field)) |value| @field(owned_map, field) = try a.dupe(u8, value);
+            }
+            declaration.map = owned_map;
+            candidate.model.reasoning = declaration;
+        }
         // No effective option, baseline, replay or estimator mutation until
         // the bounded atomic save has succeeded. No fallible work follows it.
         self.settings.save(canonical) catch |err| {
@@ -1950,6 +1993,94 @@ const LayeredMetadataFixture = struct {
         unreachable;
     }
 };
+
+test "effort action adopts late public metadata after an official list without levels" {
+    const Fetch = struct {
+        var release: std.atomic.Value(bool) = .init(false);
+        fn official(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+            try std.testing.expectEqual(ProviderId.opencode_go, id);
+            try std.testing.expectEqualStrings("fake-public-effort", key.?);
+            return metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"context_window\":131072}]}", id);
+        }
+        fn public(a: std.mem.Allocator, io: std.Io) !metadata.Listing {
+            const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 5000;
+            while (!release.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).toMilliseconds() >= deadline) return error.FixtureCompletionTimeout;
+                try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+            }
+            return metadata.parseDev(a, @embedFile("models_dev_fixture.json"));
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false, .auto_refresh_models = true });
+    defer session.deinit();
+    Fetch.release.store(false, .release);
+    defer Fetch.release.store(true, .release);
+    session.metadata_fetch = Fetch.official;
+    session.metadata_dev_fetch = Fetch.public;
+    try session.connection().configureProvider(.opencode_go, "fake-public-effort");
+    try session.connection().selectModel("opencode-go/gpt-6-luna");
+    const before = session.app.?.config.value.model;
+    try std.testing.expect(before.reasoning == null);
+    try std.testing.expect(Session.pollModels(&session, true));
+    const job = session.metadata_job.?;
+    if (job.future) |*future| future.await(io);
+    job.future = null;
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expectError(error.ThinkingCapabilitiesLoading, Session.cycleEffort(&session));
+    try std.testing.expect(session.app.?.config.value.model.reasoning == null);
+    Fetch.release.store(true, .release);
+    MetadataFixture.finish(&session);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expect(session.metadata_job == null);
+    try std.testing.expect(session.app.?.config.value.model.reasoning == null);
+    const next = try Session.cycleEffort(&session);
+    const config = session.app.?.config.value;
+    try std.testing.expectEqual(cfg.ReasoningSource.metadata, config.model.reasoning_source);
+    try std.testing.expectEqualStrings(next.name().?, config.model.reasoning_effort.?);
+    try std.testing.expect(session.capabilitiesFor(config).levels.contains(next));
+    try std.testing.expectEqual(before.context_tokens, config.model.context_tokens);
+    try std.testing.expectEqual(before.output_tokens, config.model.output_tokens);
+    try std.testing.expectEqual(before.protocol, config.model.protocol);
+    // Subsequent refreshes must not replace the now-accepted map.
+    const accepted = config.model.reasoning;
+    session.metadata_cache = .{};
+    _ = try Session.cycleEffort(&session);
+    try std.testing.expect(Session.sameDeclaration(accepted, session.app.?.config.value.model.reasoning));
+    try std.testing.expect(!session.app.?.journal.started);
+}
+
+test "effort action cannot borrow official reasoning for a proxy kind hint" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeSessionTestConfig(tmp.dir,
+        \\{"llm":{"default":"proxy/deepseek-flash","providers":{"proxy":{"base_url":"https://proxy.invalid/v1","kind":"deepseek","api_key":"fake-proxy-effort","models":{"deepseek-flash":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false}}
+    );
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    defer session.deinit();
+    const listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", .deepseek);
+    session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.deepseek), listing);
+    try std.testing.expectError(error.ThinkingCapabilitiesUnknown, Session.cycleEffort(&session));
+    try std.testing.expect(session.app.?.config.value.model.reasoning == null);
+    try std.testing.expect(session.app.?.config.value.model.reasoning_effort == null);
+    try std.testing.expectEqual(@as(u8, 0), session.connection().current().effort_levels.mask);
+    try std.testing.expect(!session.app.?.journal.started);
+}
 
 test "timed automatic metadata refresh repeats while active capabilities stay frozen" {
     const Fixture = struct {
