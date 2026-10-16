@@ -1,11 +1,7 @@
-//! Private checkpoints for one session id. A persistent per-ID lease detects an
-//! interrupted owner. No-log takes the same lock read-only and never changes
-//! either file. Cooperative CAS, not a same-user sandbox.
-//!
-//! Clean publication is marker `C` plus the digest of `.session`. Marker `A`
-//! means work or a publish is in progress; resume refuses it. Checkpoint data,
-//! the directory entry, and the lock marker are fsynced so a power loss after
-//! a successful save does not leave a clean marker pointing at a partial file.
+//! Bounded checkpoints with atomic publication and cooperative writer leases.
+//! Reads ignore old markers/digests. Each complete read captures the next write's
+//! CAS baseline. Read-only leases do not acquire writer locks, so an active
+//! session remains viewable. Digests detect writes; they do not authenticate.
 const std = @import("std");
 const fs = @import("../platform/filesystem.zig");
 const logs = @import("log_store.zig");
@@ -36,7 +32,7 @@ fn readFile(root: *fs.Root, dir: c_int, id: ids.Id) !?[]u8 {
     defer fs.closeFd(fd);
     const file = fs.fileFromFd(fd);
     const stat = try file.stat(root.io);
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) return error.UnsafeResumeFile;
+    if (stat.kind != .file) return error.UnsafeResumeFile;
     if (stat.size == 0 or stat.size > codec.max_file_bytes) return error.InvalidResumeLength;
     const bytes = try root.allocator.alloc(u8, @intCast(stat.size + 1));
     defer root.allocator.free(bytes);
@@ -81,30 +77,27 @@ pub const Lease = struct {
     active: bool = false,
 
     pub fn deinit(self: *Lease) void {
-        fs.closeFd(self.lock_fd);
+        if (self.lock_fd >= 0) fs.closeFd(self.lock_fd);
         fs.closeFd(self.directory_fd);
         self.* = undefined;
     }
 
-    /// Existing-only open, bounded one-shot lock acquisition. Authentication and
-    /// runtime validation must succeed before activate() changes the marker.
+    /// Writable opens take an exclusive writer lock. On SessionInUse, use
+    /// open(..., false) to view history without a lock or permission to save.
     pub fn open(root: *fs.Root, id: ids.Id, writable: bool) !Lease {
         if (!ids.valid(id)) return error.InvalidSessionID;
         const dir = logs.openExistingDirectory(root) catch |err| return if (err == error.FileNotFound) error.ResumeNotFound else err;
         errdefer fs.closeFd(dir);
+        if (!writable) return .{ .directory_fd = dir, .lock_fd = -1, .id = id, .expected = null, .writable = false };
         var buffer: [64]u8 = undefined;
         const path = try name(&buffer, id, ".resume-lock");
-        const fd = fs.linux.openat(dir, path, (if (writable) @as(c_int, 2) else 0) | fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0);
-        if (fd < 0) return if (std.c._errno().* == 2) error.ResumeNotFound else fs.osError();
+        const fd = fs.linux.openat(dir, path, 2 | fs.linux.create | fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0o600);
+        if (fd < 0) return fs.osError();
         errdefer fs.closeFd(fd);
-        const file = fs.fileFromFd(fd);
-        const stat = try file.stat(root.io);
-        if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) return error.UnsafeResumeFile;
+        const stat = try fs.fileFromFd(fd).stat(root.io);
+        if (stat.kind != .file) return error.UnsafeResumeFile;
         if (fs.linux.flock(fd, 2 | 4) != 0) return if (std.c._errno().* == 11) error.SessionInUse else fs.osError();
-        var marker: [34]u8 = undefined;
-        const n = try file.readPositionalAll(root.io, &marker, 0);
-        if (n != 33 or marker[0] != 'C') return error.ResumeNotClosed;
-        return .{ .directory_fd = dir, .lock_fd = fd, .id = id, .expected = marker[1..33].*, .writable = writable };
+        return .{ .directory_fd = dir, .lock_fd = fd, .id = id, .expected = null, .writable = true };
     }
 
     /// Fresh IDs only. The lock is never unlinked or replaced; its inode remains
@@ -127,21 +120,18 @@ pub const Lease = struct {
         return .{ .directory_fd = dir, .lock_fd = fd, .id = id, .expected = null, .writable = true, .active = true };
     }
 
-    pub fn load(self: *const Lease, root: *fs.Root) ![]u8 {
+    pub fn load(self: *Lease, root: *fs.Root) ![]u8 {
         const bytes = (try readFile(root, self.directory_fd, self.id)) orelse return error.ResumeNotFound;
-        errdefer root.allocator.free(bytes);
         var digest: [32]u8 = undefined;
         Hash.hash(bytes, &digest, .{});
-        if (self.expected == null or !std.mem.eql(u8, &digest, &self.expected.?)) return error.ResumeConflict;
+        self.expected = digest;
         return bytes;
     }
 
     pub fn activate(self: *Lease, root: *fs.Root) !void {
         if (!self.writable or self.active) return;
-        // Before side effects that are not in the last clean checkpoint. A crash
-        // leaves A, so that older checkpoint cannot masquerade as current state.
-        try fs.fileFromFd(self.lock_fd).writePositionalAll(root.io, "A", 0);
-        try fsyncFd(self.lock_fd);
+        // Legacy marker bytes are neither authorization nor a loading gate.
+        _ = root;
         self.active = true;
     }
 
@@ -235,7 +225,7 @@ fn testRoot(dir: std.Io.Dir) !fs.Root {
     return fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
 }
 const test_id: ids.Id = "0123456789abcdef0123456789abcdef".*;
-test "resume store clean exit lock private files no-log and interrupted owner" {
+test "resume store atomic private writes concurrent read-only view and interrupted owner" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
@@ -246,7 +236,13 @@ test "resume store clean exit lock private files no-log and interrupted owner" {
         var lease = try Lease.create(&root, test_id);
         defer lease.deinit();
         try lease.save(&root, "fake authenticated bytes\x00\xff");
-        try std.testing.expectError(error.SessionInUse, Lease.open(&root, test_id, false));
+        try std.testing.expectError(error.SessionInUse, Lease.open(&root, test_id, true));
+        var view = try Lease.open(&root, test_id, false);
+        defer view.deinit();
+        const bytes = try view.load(&root);
+        defer root.allocator.free(bytes);
+        try std.testing.expectEqualStrings("fake authenticated bytes\x00\xff", bytes);
+        try std.testing.expectError(error.ResumeReadOnly, view.save(&root, "never"));
     }
     {
         var lease = try Lease.open(&root, test_id, false);
@@ -270,7 +266,11 @@ test "resume store clean exit lock private files no-log and interrupted owner" {
         try lease.activate(&root);
         // Simulate death, without a final save.
     }
-    try std.testing.expectError(error.ResumeNotClosed, Lease.open(&root, test_id, true));
+    var recovered = try Lease.open(&root, test_id, true);
+    defer recovered.deinit();
+    const recovered_bytes = try recovered.load(&root);
+    defer root.allocator.free(recovered_bytes);
+    try std.testing.expectEqualStrings("fake authenticated bytes\x00\xff", recovered_bytes);
 }
 
 test "resume store detects changed snapshot and refuses unsafe paths" {
@@ -283,8 +283,11 @@ test "resume store detects changed snapshot and refuses unsafe paths" {
     try lease.save(&root, "original");
     const path = ".thin/sessions/" ++ test_id ++ ".session";
     try tmp.dir.writeFile(root.io, .{ .sub_path = path, .data = "changed" });
-    try std.testing.expectError(error.ResumeConflict, lease.load(&root));
     try std.testing.expectError(error.ResumeConflict, lease.save(&root, "next"));
+    const changed = try lease.load(&root);
+    defer root.allocator.free(changed);
+    try std.testing.expectEqualStrings("changed", changed);
+    try lease.save(&root, "next");
     try tmp.dir.deleteFile(root.io, path);
     try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("missing", lease.directory_fd, test_id ++ ".session"));
     if (lease.load(&root)) |bytes| {
@@ -295,4 +298,30 @@ test "resume store detects changed snapshot and refuses unsafe paths" {
     if (mkfifoat(lease.directory_fd, test_id ++ ".session", 0o600) != 0) return error.FixtureFailed;
     try std.testing.expectError(error.UnsafeResumeFile, lease.load(&root));
 }
+test "resume store ignores stale A marker digest and legacy permission bits at load" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    {
+        var lease = try Lease.create(&root, test_id);
+        defer lease.deinit();
+        try lease.save(&root, "complete JSON-shaped history");
+        try fs.fileFromFd(lease.lock_fd).writePositionalAll(root.io, "Aobsolete digest", 0);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(lease.lock_fd, 0o644));
+        const fd = fs.linux.openat(lease.directory_fd, test_id ++ ".session", fs.linux.nofollow | fs.linux.cloexec, 0);
+        if (fd < 0) return fs.osError();
+        defer fs.closeFd(fd);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(fd, 0o644));
+    }
+    var resumed = try Lease.open(&root, test_id, true);
+    defer resumed.deinit();
+    const bytes = try resumed.load(&root);
+    defer root.allocator.free(bytes);
+    try std.testing.expectEqualStrings("complete JSON-shaped history", bytes);
+    try resumed.save(&root, "next complete history");
+    const stat = try tmp.dir.statFile(root.io, ".thin/sessions/" ++ test_id ++ ".session", .{});
+    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+}
+
 extern "c" fn mkfifoat(c_int, [*:0]const u8, c_uint) c_int;

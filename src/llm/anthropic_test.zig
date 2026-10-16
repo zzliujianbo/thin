@@ -23,6 +23,37 @@ fn delta(s: *adapter.Stream, index: usize, native: []const u8) !void {
     try s.feed("", try std.fmt.allocPrint(s.a, "{{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{s}}}", .{ index, native }));
 }
 
+test "anthropic prefix rewrite does not emit empty assistant after thinking only normalization" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const original: p.Message = .{
+        .role = .assistant,
+        .blocks = &.{.{ .reasoning = "private thinking fixture" }},
+        .replay = .{ .scope = scope, .json = "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"private thinking fixture\",\"signature\":\"stale-fixture\"}]}", .retain_turn = true },
+    };
+    const normalized = try @import("../core/context.zig").cloneAfterPrefixRewrite(a, original);
+    try std.testing.expect(normalized.replay == null and normalized.blocks.len == 0);
+    var req = request();
+    req.thinking = true;
+    req.reasoning_effort = "max";
+    req.reasoning_format = .anthropic;
+    req.messages = &.{
+        .{ .role = .user, .blocks = &.{.{ .text = "prior question" }} },
+        normalized,
+        .{ .role = .user, .blocks = &.{.{ .text = "next explicit question" }} },
+    };
+    const encoded = try adapter.encode(a, req);
+    const wire = try j.parse(a, encoded);
+    const messages = j.get(wire, "messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("user", j.string(j.get(messages[0], "role")).?);
+    try std.testing.expectEqual(@as(usize, 2), j.get(messages[0], "content").?.array.items.len);
+    try std.testing.expectEqualStrings("adaptive", j.string(j.get(j.get(wire, "thinking").?, "type")).?);
+    try std.testing.expectEqualStrings("max", j.string(j.get(j.get(wire, "output_config").?, "effort")).?);
+    try std.testing.expect(std.mem.find(u8, encoded, "stale-fixture") == null);
+}
+
 test "anthropic output limit requires complete message stop and preserves reasoning usage" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -155,8 +186,8 @@ test "anthropic signed redacted replay roundtrip nativeBlocks and scope" {
     try s.feed("", start);
     try block(&s, 0, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}");
     try delta(&s, 0, "{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}");
-    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"old\"}");
-    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"final\"}");
+    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"fi\"}");
+    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"nal\"}");
     try stop(&s, 0);
     try block(&s, 1, "{\"type\":\"redacted_thinking\",\"data\":\"opaque\",\"extension\":{\"x\":1}}");
     try stop(&s, 1);
@@ -297,6 +328,10 @@ fn allocationFixture(a: std.mem.Allocator) !void {
     try s.feed("", start);
     try block(&s, 0, "{\"type\":\"text\",\"text\":\"hello\"}");
     try stop(&s, 0);
+    try block(&s, 1, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"YW\"}");
+    try delta(&s, 1, "{\"type\":\"signature_delta\",\"signature\":\"Jj\"}");
+    try delta(&s, 1, "{\"type\":\"signature_delta\",\"signature\":\"ZA==\"}");
+    try stop(&s, 1);
     try end(&s, "end_turn");
     var req = request();
     req.messages = &.{(try s.finish()).success.message};
@@ -441,6 +476,127 @@ test "anthropic message delta optional metadata preserves completion guards" {
         try s.feed("", try std.fmt.allocPrint(a, "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\",\"stop_details\":null,\"container\":null}}}}", .{reason}));
         try s.feed("", "{\"type\":\"message_stop\"}");
         try std.testing.expect((try s.finish()) == .failure);
+    }
+}
+
+test "anthropic signature fragments preserve initial bytes order and independent empty thinking" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try block(&s, 0, "{\"type\":\"thinking\",\"thinking\":\"plan\",\"signature\":\"YW\",\"extension\":1}");
+    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"\"}");
+    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"Jj\"}");
+    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"ZA==\"}");
+    // Fragments must not overwrite the native start value before block stop.
+    try std.testing.expectEqualStrings("YW", try c.text(s.open.?.native, "signature"));
+    try stop(&s, 0);
+    try block(&s, 1, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}");
+    try delta(&s, 1, "{\"type\":\"thinking_delta\",\"thinking\":\"\"}");
+    try delta(&s, 1, "{\"type\":\"signature_delta\",\"signature\":\"eH\"}");
+    try delta(&s, 1, "{\"type\":\"signature_delta\",\"signature\":\"k=\"}");
+    try delta(&s, 1, "{\"type\":\"signature_delta\",\"signature\":\"\"}");
+    try stop(&s, 1);
+    try block(&s, 2, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"eg==\"}");
+    try stop(&s, 2);
+    try end(&s, "end_turn");
+    const out = (try s.finish()).success;
+    try std.testing.expectEqual(@as(usize, 1), out.message.blocks.len);
+    try std.testing.expectEqualStrings("plan", out.message.blocks[0].reasoning);
+    try std.testing.expect(out.message.replay.?.retain_turn);
+    const native = try j.parse(a, out.message.replay.?.json);
+    const content = j.get(native, "content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), content.len);
+    for (content, [_][]const u8{ "YWJjZA==", "eHk=", "eg==" }, 0..) |b, signature, index| {
+        try std.testing.expectEqualStrings(signature, try c.text(b, "signature"));
+        if (index != 0) try std.testing.expectEqualStrings("", try c.text(b, "thinking"));
+    }
+    try std.testing.expectEqual(@as(u64, 1), j.uint(j.get(content[0], "extension")).?);
+    var req = request();
+    req.messages = &.{out.message};
+    const wire = try j.parse(a, try adapter.encode(a, req));
+    const sent = j.get(wire, "messages").?.array.items[0];
+    try std.testing.expectEqualStrings(out.message.replay.?.json, try j.encode(a, sent));
+}
+
+test "anthropic signature bounds poison and empty fragments remain bounded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try block(&s, 0, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}");
+    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"\"}");
+    try std.testing.expect(!s.observedContent());
+    // White-box length seam isolates the collector cap from the stricter
+    // whole-SSE byte cap, without allocating a 16 MiB fixture.
+    s.open.?.signature.len = c.max_bytes - 1;
+    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"A\"}");
+    try std.testing.expectEqual(c.max_bytes, s.open.?.signature.len);
+    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"\"}");
+    try std.testing.expectError(error.InputLimit, delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"B\"}"));
+    try std.testing.expectError(error.InvalidStreamState, s.finish());
+    s = adapter.Stream.init(a, scope, .{});
+    try s.feed("", start);
+    try block(&s, 0, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}");
+    s.events = 65536;
+    try std.testing.expectError(error.InputLimit, delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"\"}"));
+    try std.testing.expectError(error.InvalidStreamState, s.finish());
+}
+
+test "anthropic fragmented signatures never authorize incomplete or capped replay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (0..4) |stage| {
+        var s = adapter.Stream.init(a, scope, .{});
+        try s.feed("", start);
+        try block(&s, 0, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"YW\"}");
+        try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"Jj\"}");
+        try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"ZA==\"}");
+        try std.testing.expect(s.observedContent());
+        if (stage > 0) try stop(&s, 0);
+        if (stage > 1) try s.feed("", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}");
+        if (stage > 2) try s.feed("", "{\"type\":\"message_stop\"}");
+        if (stage < 3) {
+            try std.testing.expectError(error.TruncatedStream, s.finish());
+        } else {
+            const out = try s.finish();
+            try std.testing.expect(out == .failure);
+            try std.testing.expectEqual(p.FailureKind.output_limit, out.failure.kind);
+            try std.testing.expect(out.failure.observed_content);
+        }
+    }
+}
+
+test "anthropic signature fragments reject wrong block index and late deltas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |closed| {
+        var s = adapter.Stream.init(a, scope, .{});
+        try s.feed("", start);
+        try block(&s, 0, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"YW\"}");
+        try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"JjZA==\"}");
+        if (closed) try stop(&s, 0);
+        try std.testing.expectError(error.InconsistentItem, delta(&s, if (closed) 0 else 1, "{\"type\":\"signature_delta\",\"signature\":\"late\"}"));
+        try std.testing.expectError(error.InvalidStreamState, s.finish());
+    }
+}
+
+test "anthropic empty signature fragments cannot create replay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "", "plan" }) |thinking| {
+        var s = adapter.Stream.init(a, scope, .{});
+        try s.feed("", start);
+        try block(&s, 0, try std.fmt.allocPrint(a, "{{\"type\":\"thinking\",\"thinking\":\"{s}\",\"signature\":\"\"}}", .{thinking}));
+        try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"\"}");
+        try stop(&s, 0);
+        try end(&s, "end_turn");
+        try std.testing.expectError(error.InvalidReplay, s.finish());
     }
 }
 

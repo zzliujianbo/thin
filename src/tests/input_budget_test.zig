@@ -17,9 +17,8 @@ fn configuration() cfg.Config {
     }, .limits = .{ .low_price_input = false, .max_output_tokens = 4096 } };
 }
 
-test "input budget declarations roundtrip both formats without persisting derived price metadata" {
+test "input budget registry declarations roundtrip without persisting derived price metadata" {
     const prefixes = [_][]const u8{
-        "{\"provider\":{\"base_url\":\"https://fixture.invalid/v1\"},\"model\":{\"name\":\"m\",\"context_tokens\":1000000},\"limits\":",
         "{\"llm\":{\"default\":\"local/m\",\"providers\":{\"local\":{\"base_url\":\"https://fixture.invalid/v1\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":1000000}}}}},\"limits\":",
     };
     for (prefixes) |prefix| {
@@ -29,6 +28,8 @@ test "input budget declarations roundtrip both formats without persisting derive
         defer cfg.release(&parsed);
         try std.testing.expect(parsed.value.limits.low_price_input);
         try std.testing.expectEqual(@as(?u32, 90000), parsed.value.limits.max_input_tokens);
+        const empty_cache: @import("../app/model_metadata.zig").Cache = .{};
+        try @import("../app/model_resolver.zig").applyDefault(parsed.arena.allocator(), &parsed.value, &empty_cache);
         parsed.value.model.input_price_threshold = 100000;
         var cloned = try cfg.clone(a, parsed.value);
         defer cfg.release(&cloned);
@@ -51,7 +52,7 @@ test "input budget declarations roundtrip both formats without persisting derive
     config.limits.input_margin_tokens = 16777217;
     try std.testing.expectError(error.InvalidBudget, cfg.validate(config));
     for ([_][]const u8{ "{\"low_price_input\":\"true\"}", "{\"max_input_tokens\":\"100000\"}", "{\"input_margin_tokens\":5000.0}", "{\"low_price_input\":true,\"low_price_input\":false}" }) |limits| {
-        const raw = try std.mem.concat(a, u8, &.{ prefixes[1], limits, "}" });
+        const raw = try std.mem.concat(a, u8, &.{ prefixes[0], limits, "}" });
         defer a.free(raw);
         if (cfg.parse(a, raw)) |value| {
             var parsed = value;
@@ -273,7 +274,7 @@ test "input budget failed paid summary stops no fallback or automatic repeated a
     }
 }
 
-test "input budget checkpoint freezes known null and policy and rejects changed declarations" {
+test "input budget checkpoint loads history across changed current policies" {
     for ([_]?u32{ null, 100000 }) |price| {
         var config = configuration();
         config.model.input_price_threshold = price;
@@ -297,7 +298,7 @@ test "input budget checkpoint freezes known null and policy and rejects changed 
                 2 => other.limits.input_margin_tokens = 1000,
                 else => other.model.input_price_threshold = if (price == null) 100000 else null,
             }
-            try std.testing.expectError(error.InputBudgetMismatch, checkpoint.validate(a, parsed.value, other, &.{}));
+            try checkpoint.validate(a, parsed.value, other, &.{});
         }
         var legacy = state;
         legacy.input_budget_frozen = false;

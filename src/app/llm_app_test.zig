@@ -88,21 +88,16 @@ test "registry headless default resolves exact cached directory with no handwrit
     try std.testing.expectEqual(@as(?u32, 200000), app.config.value.model.input_price_threshold);
     try std.testing.expectEqual(@as(usize, 0), app.config.value.registry.?.providers[0].models.len);
     try std.testing.expect(app.environment.get("FAKE_GO_KEY") == null);
-    const frozen = try app.runtime.exportCheckpoint();
-    try std.testing.expect(frozen.input_budget_frozen);
-    try std.testing.expectEqual(@as(?u32, 200000), frozen.input_price_threshold);
-    var changed = frozen;
-    changed.input_price_threshold = null;
-    try std.testing.expectError(error.InputBudgetMismatch, app.runtime.restoreCheckpoint(changed));
-    changed = frozen;
-    changed.max_input_tokens = 100000;
-    try std.testing.expectError(error.InputBudgetMismatch, app.runtime.restoreCheckpoint(changed));
-    changed = frozen;
-    changed.low_price_input = !frozen.low_price_input;
-    try std.testing.expectError(error.InputBudgetMismatch, app.runtime.restoreCheckpoint(changed));
-    changed = frozen;
-    changed.input_margin_tokens += 1;
-    try std.testing.expectError(error.InputBudgetMismatch, app.runtime.restoreCheckpoint(changed));
+    const saved = try app.runtime.exportCheckpoint();
+    // Loading history must not be rejected by a changed input policy; current
+    // capabilities still govern any subsequent send.
+    app.config.value.limits.low_price_input = false;
+    app.config.value.limits.max_input_tokens = 100000;
+    app.config.value.limits.input_margin_tokens += 1;
+    try app.runtime.restoreCheckpoint(saved);
+    try std.testing.expect(!app.runtime.config.limits.low_price_input);
+    try std.testing.expectEqual(@as(?u32, 100000), app.runtime.config.limits.max_input_tokens);
+    try std.testing.expectEqual(@as(?u32, 200000), app.config.value.model.input_price_threshold);
     try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
 }
 

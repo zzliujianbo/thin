@@ -11,9 +11,11 @@ pub const Purpose = enum { normal, summary };
 pub const Role = enum { user, assistant, tool, context };
 
 /// Replay is valid only for this connection, model and selected protocol.
-/// Never rendered or written to cropped diagnostic logs. Explicit authenticated
-/// full-session checkpoints preserve it exactly. Strings are caller-arena-owned.
-/// 回放续接数据的作用域：只有 connection、model、protocol 全部相同时才允许复用。
+/// Never rendered or written to cropped diagnostic logs. Full-session checkpoints
+/// preserve it as untrusted history, independently of credentials. Strings are
+/// caller-arena-owned. Matching scope is necessary but not sufficient: prefix-bound
+/// Anthropic thinking must also be discarded after client-side prefix rewrites.
+/// 回放续接数据须同 connection/model/protocol，且此前请求前缀仍满足供应商约束。
 pub const ReplayScope = struct {
     /// 提供方连接标识（如 base_url）。
     connection: []const u8,

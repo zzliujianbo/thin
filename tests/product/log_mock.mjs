@@ -155,7 +155,7 @@ async function scenario(app, pty, kind) {
     await mkdir(home); await mkdir(project); await mkdir(join(home,'.thin'));
     await new Promise((resolve,reject) => { server.once('error',reject); server.listen(0,'127.0.0.1',resolve); });
     const url = `http://127.0.0.1:${server.address().port}/v1`;
-    await writeFile(join(home,'.thin/config.json'), JSON.stringify({provider:{base_url:url, api_key_env:'THIN_FIXTURE_KEY'}, model:{name:'fixture-model',protocol:'chat',context_tokens:32768}, limits:{low_price_input:false,max_output_tokens:100,summary_tokens:80,request_timeout_ms:5000,task_timeout_ms:15000}}));
+    await writeFile(join(home,'.thin/config.json'), JSON.stringify({llm:{default:'local/fixture-model',providers:{local:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:32768}}}}}, limits:{low_price_input:false,max_output_tokens:100,summary_tokens:80,request_timeout_ms:5000,task_timeout_ms:15000}}));
     if (redact) await writeFile(join(project,`secret-${key}.json`), JSON.stringify({secret:key, [key]:key}));
     if (kind === 'failure' || kind === 'failure-pty') { await mkdir(join(project,'.thin')); await writeFile(join(project,'.thin/sessions'),'occupied'); }
     const env = {PATH:'/usr/bin:/bin', HOME:home, LANG:'C.UTF-8', TERM:'xterm-256color', THIN_FIXTURE_KEY:key,

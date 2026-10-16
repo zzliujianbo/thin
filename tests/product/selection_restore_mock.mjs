@@ -1,35 +1,28 @@
 // Selection-only restoration on an owned PTY and loopback server. Never uses
 // real HOME/config, public providers or the user's terminal. Capture stays local.
 import http from 'node:http';
-import {createHash, createHmac} from 'node:crypto';
+import {createHash} from 'node:crypto';
 import {mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import assert from 'node:assert/strict';
 
-function checkpointBytes(id, snapshot, key) {
+function checkpointBytes(id, snapshot) {
   const selection = Buffer.from(JSON.stringify(snapshot));
-  const payload = Buffer.from('x');
-  const bytes = Buffer.alloc(68 + selection.length + payload.length);
+  const payload = Buffer.from(JSON.stringify({version:1,system:'OLD-HISTORY-MUST-NOT-APPEAR',messages:[],selector:{configured:'responses',selected:null},estimator:{},last_context_tokens:null,permission_id:0}));
+  const bytes = Buffer.alloc(17 + selection.length + payload.length);
   Buffer.from('THINRSM\0', 'utf8').copy(bytes, 0);
-  bytes[8] = 1;
-  bytes[9] = 1;
-  bytes.writeUInt32LE(selection.length, 28);
-  bytes.writeUInt32LE(payload.length, 32);
-  selection.copy(bytes, 68);
-  payload.copy(bytes, 68 + selection.length);
-  createHmac('sha256', key)
-    .update('thin.resume.checkpoint.hmac-sha256.v1\0')
-    .update(bytes.subarray(0, 36))
-    .update(bytes.subarray(68))
-    .digest()
-    .copy(bytes, 36);
+  bytes[8] = 2;
+  bytes.writeUInt32LE(selection.length, 9);
+  bytes.writeUInt32LE(payload.length, 13);
+  selection.copy(bytes, 17);
+  payload.copy(bytes, 17 + selection.length);
   const marker = Buffer.concat([Buffer.from('C'), createHash('sha256').update(bytes).digest()]);
   return {bytes, marker};
 }
 
-async function writeCheckpoint(sessionPath, lockPath, id, snapshot, key) {
-  const file = checkpointBytes(id, snapshot, key);
+async function writeCheckpoint(sessionPath, lockPath, id, snapshot) {
+  const file = checkpointBytes(id, snapshot);
   await writeFile(sessionPath, file.bytes, {mode:0o600});
   await writeFile(lockPath, file.marker, {mode:0o600});
   await chmod(sessionPath, 0o600);
@@ -95,9 +88,9 @@ export async function selectionRestoreRegressions({app, pty, execute}) {
     await mkdir(join(home, '.thin'), {recursive:true, mode:0o700});
     await mkdir(sessions, {recursive:true, mode:0o700});
     const reasoning = {format:'standard', map:{low:'low', medium:'medium', high:'high'}};
-    const config = JSON.stringify({limits:{low_price_input:false},provider:{kind:'opencode_zen', base_url:url, api_key_env:'THIN_FIXTURE_KEY'}, model:{name:'fixture-model', protocol:'chat', context_tokens:32768, reasoning}, models:[{name:'fixture-restored', protocol:'chat', context_tokens:32768, reasoning_effort:'low', reasoning}]});
+    const config = JSON.stringify({limits:{low_price_input:false},llm:{default:'local/fixture-model',providers:{local:{kind:'opencode_zen',base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:32768,reasoning},'fixture-restored':{protocol:'responses',context_tokens:32768,reasoning_effort:'low',reasoning}}}}}});
     const settings = '{ "version": 1, "reasoning_effort": "low" }\n';
-    const snapshot = {version:1, session:id, provider:'opencode_zen', endpoint:createHash('sha256').update(url).digest('hex'), model:'fixture-restored', protocol:'responses', effort:'high', effort_hash:null};
+    const snapshot = {version:1, session:id, provider_name:'local', provider:'opencode_zen', endpoint:createHash('sha256').update(url).digest('hex'), model:'fixture-restored', protocol:'responses', effort:'high', effort_hash:null};
     const sessionPath = join(sessions, `${id}.session`);
     const lockPath = join(sessions, `${id}.resume-lock`);
     await writeFile(join(home, '.thin', 'config.json'), config, {mode:0o600});
@@ -149,21 +142,21 @@ export async function selectionRestoreRegressions({app, pty, execute}) {
     }
     assert.deepEqual(await readdir(emptyHome), []);
     assert.deepEqual(await readdir(emptyProject), []);
-    for (const expected of ['SelectionNotFound', 'ApiKeyNotFound', 'SelectionEndpointUnavailable']) {
+    for (const expected of ['SelectionNotFound', 'no-key-history', 'changed-endpoint']) {
       checkpoint = `PTY ${expected}`;
-      if (expected === 'SelectionEndpointUnavailable') {
+      if (expected === 'changed-endpoint') {
         await writeCheckpoint(sessionPath, lockPath, id, {...snapshot, endpoint:'0'.repeat(64)}, key);
       }
-      const failed = await execute(pty, [], {...env, THIN_APP_TEST_MODE:'restore-failure',
+      const failed = await execute(pty, [], {...env, THIN_APP_TEST_MODE:expected === 'SelectionNotFound' ? 'restore-failure' : expected === 'no-key-history' ? 'restore-no-key' : 'restore-idle',
         THIN_APP_TEST_RESTORE_ID:expected === 'SelectionNotFound' ? 'f'.repeat(32) : id,
         THIN_APP_TEST_RESTORE_ERROR:expected}, project);
-      assert.equal(failed.code, 0, 'PTY startup refusal assertion failed');
+      assert.equal(failed.code, 0, 'PTY load/refusal assertion failed');
     }
     assert.deepEqual((await readdir(sessions)).sort(), before);
     assert.equal(requests, 1, 'restore failure issued a request');
     assert.equal(await readFile(join(home, '.thin', 'config.json'), 'utf8'), config);
     assert.equal(await readFile(join(project, '.thin', 'settings.json'), 'utf8'), settings);
-    console.log('PASS selection/restore: owned PTY, new history/id, saved protocol/effort, unchanged defaults, no-log, 3 PTY refusal cases and 4 CLI refusal cases; requests=1');
+    console.log('PASS selection/restore: owned PTY, new history/id, saved protocol/effort, unchanged defaults, no-log, missing-source refusal, no-key/changed-endpoint loading and 4 CLI refusal cases; requests=1');
   } catch {
     const error = new Error('selection restoration fixture failed');
     error.fixtureCase = 'selection/restore';

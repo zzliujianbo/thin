@@ -1,7 +1,7 @@
 // Real two-process continuation on owned PTYs, fake HOME/key and loopback only.
 // Never prints raw terminal captures, payloads, headers, or assertion stacks.
 import http from 'node:http';
-import {createHash, createHmac} from 'node:crypto';
+import {createHash} from 'node:crypto';
 import {mkdtemp, mkdir, writeFile, readFile, readdir, stat, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -32,7 +32,9 @@ export async function fullResumeRegressions({app, pty, execute}) {
         const users = history.filter(m => m.role === 'user' && !JSON.stringify(m).includes('[Context material'));
         serverCheck = 'exact user history';
         assert(JSON.stringify(users[0]).includes('remember-resume-marker'));
-        assert.equal(users.length, requests <= 2 ? 1 : requests - 1);
+        // Request 4 used --no-log, so request 5 resumes the same persisted
+        // two-turn history rather than the discarded read-only continuation.
+        assert.equal(users.length, requests <= 2 ? 1 : requests === 3 ? 2 : 3);
         if (requests >= 3) assert(JSON.stringify(users.at(-1)).includes('resume-next-turn'));
         if (requests > 1) {
           serverCheck = 'native replay and closed tools';
@@ -84,7 +86,7 @@ export async function fullResumeRegressions({app, pty, execute}) {
       await mkdir(join(home, '.thin'), {recursive:true,mode:0o700});
       await mkdir(join(project, '.thin'), {recursive:true,mode:0o700});
       const configPath = join(home, '.thin', 'config.json');
-      const configObject = {limits:{low_price_input:false},provider:{kind:'opencode_zen',base_url:url,api_key_env:'THIN_FIXTURE_KEY'},model:{name:'fixture-model',protocol,context_tokens:32768}};
+      const configObject = {limits:{low_price_input:false},llm:{default:'local/fixture-model',providers:{local:{kind:'opencode_zen',base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol,context_tokens:32768}}}}}};
       const config = JSON.stringify(configObject);
       const settingsPath = join(project, '.thin', 'settings.json');
       const settings = '{"version":1,"reasoning_effort":"low"}\n';
@@ -97,7 +99,8 @@ export async function fullResumeRegressions({app, pty, execute}) {
         check = `PTY ${mode}`;
         const result = await execute(pty, [], {...env,THIN_APP_TEST_MODE:mode,...(id ? {THIN_APP_TEST_RESTORE_ID:id} : {}),...(expected ? {THIN_APP_TEST_RESTORE_ERROR:expected} : {})}, project);
         const reason = result.output.match(/^error: ([A-Za-z][A-Za-z0-9_]{0,63})$/m)?.[1] ?? 'unclassified';
-        check = `PTY ${mode} code ${result.code} ${reason} requests ${requests} ${serverCheck}`;
+        const line = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].map(match => match[1]).slice(0,8).join('-') || 'unknown';
+        check = `PTY ${mode} code ${result.code} ${reason} at ${line} requests ${requests} ${serverCheck}`;
         assert.equal(result.code, 0);
         assert(!fixtureFailed);
         return result.output.match(/PTY_SESSION_ID=([0-9a-f]{32})/)?.[1];
@@ -113,7 +116,7 @@ export async function fullResumeRegressions({app, pty, execute}) {
       assert(!first.includes(key));
       for (const path of [snapshotPath, markerPath]) assert.equal((await stat(path)).mode & 0o777, 0o600);
       assert.equal((await stat(sessions)).mode & 0o777, 0o700);
-      const stateOf = bytes => JSON.parse(bytes.subarray(68 + bytes.readUInt32LE(28)).toString());
+      const stateOf = bytes => JSON.parse(bytes.subarray(bytes[8] === 2 ? 17 + bytes.readUInt32LE(9) : 68 + bytes.readUInt32LE(28)).toString());
       const firstState = stateOf(first);
       // Session preface is persisted as context messages; turns are counted separately.
       const turnsOf = state => state.messages.filter(m => m.role !== 'context');
@@ -148,30 +151,38 @@ export async function fullResumeRegressions({app, pty, execute}) {
       };
       check = 'missing checkpoint refusal';
       await run('resume-failure', 'f'.repeat(32), 'ResumeNotFound');
-      await writeFile(configPath, JSON.stringify({...configObject,provider:{kind:'opencode_zen',base_url:url,api_key:'different-fake-key'}}));
-      await run('resume-failure', id, 'ResumeAuthenticationFailed');
+      await writeFile(configPath, JSON.stringify({...configObject,llm:{...configObject.llm,providers:{local:{...configObject.llm.providers.local,api_key_env:'',api_key:'different-fake-key'}}}}));
+      await run('resume-idle', id); // Rotation is not a history-load refusal.
+      assert.equal(requests,4);
       await writeFile(configPath, config);
-      const corrupted = Buffer.from(clean); corrupted[corrupted.length - 2] ^= 1;
-      await put(corrupted, cleanMarker);
-      await run('resume-failure', id, 'ResumeConflict');
+      await put(clean, Buffer.from('A')); // Active/stale marker is not authentication.
+      await run('resume-idle', id);
+      assert.equal(requests,4);
+      await put(clean.subarray(0, clean.length - 1), cleanMarker);
+      await run('resume-failure', id, 'InvalidResumeLength');
+      const corrupted = Buffer.from(clean); corrupted[corrupted.length - 1] = '!'.charCodeAt(0);
       await put(corrupted);
-      await run('resume-failure', id, 'ResumeAuthenticationFailed');
+      await run('resume-failure', id, 'InvalidJson');
       const versioned = Buffer.from(clean);
-      const payloadOffset = 68 + versioned.readUInt32LE(28);
+      const payloadOffset = versioned[8] === 2 ? 17 + versioned.readUInt32LE(9) : 68 + versioned.readUInt32LE(28);
       const versionAt = versioned.indexOf('"version":1', payloadOffset);
       assert(versionAt >= payloadOffset);
       versioned[versionAt + '"version":'.length] = '2'.charCodeAt(0);
-      const mac = createHmac('sha256', key).update('thin.resume.checkpoint.hmac-sha256.v1\0').update(versioned.subarray(0,36)).update(versioned.subarray(68)).digest();
-      mac.copy(versioned, 36);
       await put(versioned);
       await run('resume-failure', id, 'UnsupportedVersion');
       const activeMarker = Buffer.from(cleanMarker); activeMarker[0] = 'A'.charCodeAt(0);
       await put(clean, activeMarker);
-      await run('resume-failure', id, 'ResumeNotClosed');
+      await run('resume-idle', id);
+      assert.equal(requests,4);
       await put(clean, cleanMarker);
       assert.equal(requests, 4, 'refusal issued a request');
       assert.equal(await readFile(join(project, 'resume-sentinel.txt'), 'utf8'), 'once');
-      console.log(`PASS resume/${protocol}: 4 owned PTY stages, 6 refusals, exact context/native replay, original wire ID, minimal exit, local timezone, one side effect, silent no-log unchanged; requests=4`);
+      // No-key startup displays canonical history; /login activates it in place.
+      await writeFile(configPath, JSON.stringify({...configObject,llm:{...configObject.llm,providers:{local:{...configObject.llm.providers.local,api_key_env:'MISSING_RESUME_KEY'}}}}));
+      await run('resume-login', id);
+      assert.equal(requests,5,'login activation must send exactly one continuation');
+      assert.equal(await readFile(join(project,'resume-sentinel.txt'),'utf8'),'once');
+      console.log(`PASS resume/${protocol}: key/marker-independent loading, damaged/truncated refusal, no-key history/login/send, one side effect, no-log unchanged; requests=5`);
     } catch {
       const error = new Error('full resume fixture failed');
       error.fixtureCase = `resume/${protocol}`;

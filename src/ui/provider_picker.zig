@@ -76,7 +76,7 @@ pub fn rows(a: std.mem.Allocator, picker: Picker, available: Choices, configured
             .provider => |id| configured & (@as(u8, 1) << @intCast(@backingInt(id))) != 0,
         };
         if (saved) checked_mask |= @as(u16, 1) << @intCast(index - start);
-        const raw = try std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ if (selected == index) "> " else "  ", if (saved) "✓ " else "  ", item.label(), if (saved) " configured locally" else "" });
+        const raw = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ if (selected == index) "> " else "  ", if (saved) "✓ " else "  ", item.label() });
         defer a.free(raw);
         const line = try clip(a, raw, columns);
         errdefer a.free(line);
@@ -171,7 +171,7 @@ test "provider checked bits follow saved visible rows not navigation selection" 
             const prefix_bytes: usize = if (saved) 6 else 4;
             try std.testing.expectEqualStrings(if (saved) "✓ " else "  ", line[2..prefix_bytes]);
             try std.testing.expect(std.mem.startsWith(u8, line[prefix_bytes..], available.items[index].label()));
-            try std.testing.expect(std.mem.find(u8, line, "  configured locally") == null);
+            try std.testing.expectEqualStrings(available.items[index].label(), line[prefix_bytes..]);
             try std.testing.expect(std.mem.findScalar(u8, line, 0x1b) == null);
         }
     }
@@ -195,7 +195,7 @@ test "provider picker distinguishes Zen Go and local setup without holding keys"
     }
     try std.testing.expect(!rendered.can_confirm);
     try std.testing.expectEqual(@as(u16, 0b1110), rendered.checked_mask);
-    try std.testing.expectEqualStrings("> ✓ DeepSeek configured locally", rendered.lines[1]);
+    try std.testing.expectEqualStrings("> ✓ DeepSeek", rendered.lines[1]);
     try std.testing.expectEqualStrings("    Current endpoint", rendered.lines[0]);
     picker.clear();
     for (0..7) |height| {

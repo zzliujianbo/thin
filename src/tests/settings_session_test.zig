@@ -56,7 +56,7 @@ const Fixture = struct {
             var initial = try store.loadOrInitialize();
             defer cfg.release(&initial);
             initial.value.limits.low_price_input = false;
-            initial.value.model.reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } };
+            initial.value.registry = .{ .default = "deepseek/deepseek-flash", .providers = &.{.{ .name = "deepseek", .connection = @import("../app/provider_catalog.zig").connection(.deepseek), .models = &.{.{ .name = "deepseek-flash", .patch = .{ .reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } } } }} }} };
             try store.save(initial.value);
         }
         return Session.init(std.testing.allocator, std.testing.io, &self.env, project, .{}, true);
@@ -117,7 +117,7 @@ test "headless first entry creates settings and shares the mapped default with t
     const io = std.testing.io;
     try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(fixture.tmp.dir.handle, "home/.thin", 0o700));
     const config =
-        \\{"provider":{"base_url":"http://unused.invalid","api_key":"fake-default-key"},"model":{"name":"fixture","context_tokens":32768,"protocol":"chat","reasoning":{"map":{"medium":"balanced"}}}}
+        \\{"llm":{"default":"local/fixture","providers":{"local":{"base_url":"http://unused.invalid","api_key":"fake-default-key","models":{"fixture":{"context_tokens":32768,"protocol":"chat","reasoning":{"map":{"medium":"balanced"}}}}}}},"limits":{"low_price_input":false}}
     ;
     try fixture.tmp.dir.writeFile(io, .{ .sub_path = "home/.thin/config.json", .data = config });
     const app = try App.init(std.testing.allocator, io, &fixture.env, fixture.project, .{}, false);
@@ -149,7 +149,12 @@ test "headless uses cached derived maps and preserves unknown after successful c
     initial.value.provider = catalog.connection(.opencode_go);
     initial.value.model = catalog.find("opencode-go/gpt-6-luna").?.model;
     initial.value.model.reasoning_source = .metadata;
-    initial.value.credentials.opencode_go = "fake-headless-derived-key";
+    initial.value.registry = .{ .default = "opencode-go/gpt-6-luna", .providers = &.{.{ .name = "opencode-go", .connection = blk: {
+        var connection = catalog.connection(.opencode_go);
+        connection.api_key = "fake-headless-derived-key";
+        break :blk connection;
+    } }} };
+    initial.value.limits.low_price_input = false;
     try store.save(initial.value);
     _ = try metadata.commit(&store.root, 0, try metadata.parseDev(a, @embedFile("../app/models_dev_fixture.json")));
     var settings = try @import("../app/settings_store.zig").Store.open(a, io, fixture.project);

@@ -194,7 +194,8 @@ pub const Tools = struct {
             else => return,
         };
         const relative = try self.root.relative(path);
-        // 会话记录不作为普通模型文件输入，也不允许工具篡改自己的留档。
+        // 会话记录可作为普通只读输入，但不允许文件工具篡改自己的留档。
+        // 只放开路径策略；实际读取仍走 Root.read 的 OS 权限、NOFOLLOW、UTF-8 与大小限制。
         // 跳过点段和重复分隔符，保证绝对/相对路径别名使用同一规则。
         var parts = std.mem.tokenizeScalar(u8, relative, '/');
         var in_thin = false;
@@ -218,7 +219,11 @@ pub const Tools = struct {
                     if (exact) return error.ProtectedSettingsFile;
                 }
                 // 新档案放在 sessions；旧 logs 留档仍受保护，但不再写入或自动搬迁。
-                if (std.mem.eql(u8, part, "sessions") or std.mem.eql(u8, part, "logs")) return error.ProtectedSessionFile;
+                // 会话记录允许只读导入，但禁止模型写入/篡改自己的留档。
+                if (std.mem.eql(u8, part, "sessions") or std.mem.eql(u8, part, "logs")) {
+                    if (action == .write_file) return error.ProtectedSessionFile;
+                    break;
+                }
                 break;
             }
         }
@@ -494,8 +499,10 @@ test "project settings exact aliases protected at prepare and direct execute" {
     for ([_][]const u8{ ".thin/settings.jsonfoo", ".thin/sub/settings.json", "settings.json", ".thin/settings.json/child" }) |path| {
         try tools.checkFileAction(a, .{ .read_file = .{ .path = path } });
     }
-    try std.testing.expectError(error.ProtectedSessionFile, tools.checkFileAction(a, .{ .read_file = .{ .path = ".thin/sessions/x" } }));
-    try std.testing.expectError(error.ProtectedSessionFile, tools.checkFileAction(a, .{ .read_file = .{ .path = ".thin/logs/x" } }));
+    for ([_][]const u8{ ".thin/sessions/x", ".thin/logs/x" }) |path| {
+        try tools.checkFileAction(a, .{ .read_file = .{ .path = path } });
+        try std.testing.expectError(error.ProtectedSessionFile, tools.checkFileAction(a, .{ .write_file = .{ .path = path, .content = "x", .overwrite = true } }));
+    }
 }
 
 test "dangerous bash is marked for explicit approval and ordinary bash is not" {

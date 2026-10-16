@@ -367,15 +367,15 @@ pub fn main(init: std.process.Init) !void {
     const full_resume = std.mem.startsWith(u8, mode, "resume-") and !std.mem.eql(u8, mode, "resume-create");
     const restore_error: ?[]const u8 = if (std.mem.eql(u8, mode, "restore-failure") or std.mem.eql(u8, mode, "resume-failure")) try required(init, "THIN_APP_TEST_RESTORE_ERROR") else null;
     if (restore_error) |expected| {
-        try check(std.mem.eql(u8, expected, "SelectionNotFound") or std.mem.eql(u8, expected, "ApiKeyNotFound") or std.mem.eql(u8, expected, "SelectionEndpointUnavailable") or std.mem.eql(u8, expected, "ResumeNotFound") or std.mem.eql(u8, expected, "ResumeAuthenticationFailed") or std.mem.eql(u8, expected, "ResumeConflict") or std.mem.eql(u8, expected, "ResumeNotClosed") or std.mem.eql(u8, expected, "UnsupportedVersion") or std.mem.eql(u8, expected, "SessionInUse"));
+        try check(std.mem.eql(u8, expected, "SelectionNotFound") or std.mem.eql(u8, expected, "ApiKeyNotFound") or std.mem.eql(u8, expected, "SelectionEndpointUnavailable") or std.mem.eql(u8, expected, "ResumeNotFound") or std.mem.eql(u8, expected, "ResumeAuthenticationFailed") or std.mem.eql(u8, expected, "ResumeConflict") or std.mem.eql(u8, expected, "ResumeNotClosed") or std.mem.eql(u8, expected, "UnsupportedVersion") or std.mem.eql(u8, expected, "SessionInUse") or std.mem.eql(u8, expected, "InvalidResumeLength") or std.mem.eql(u8, expected, "InvalidJson"));
     }
-    const restore_mode = std.mem.eql(u8, mode, "restore-selection") or std.mem.eql(u8, mode, "restore-failure");
+    const restore_mode = std.mem.eql(u8, mode, "restore-selection") or std.mem.eql(u8, mode, "restore-idle") or std.mem.eql(u8, mode, "restore-no-key") or std.mem.eql(u8, mode, "restore-failure");
     // All child environment bytes are prepared before fork; missing-key case
     // terminates the env array before the fixture key, never inheriting HOME.
     const timezone = init.environ_map.get("THIN_APP_TEST_TZ") orelse "UTC0";
     try check(std.mem.eql(u8, timezone, "UTC0") or std.mem.eql(u8, timezone, "UTC-8"));
     const timezone_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "TZ={s}", .{timezone}), 0);
-    const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", timezone_env, if (restore_error != null and std.mem.eql(u8, restore_error.?, "ApiKeyNotFound")) null else "THIN_FIXTURE_KEY=fixture-secret-never-log" };
+    const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", timezone_env, if (std.mem.eql(u8, mode, "resume-login") or std.mem.eql(u8, mode, "restore-no-key") or (restore_error != null and std.mem.eql(u8, restore_error.?, "ApiKeyNotFound"))) null else "THIN_FIXTURE_KEY=fixture-secret-never-log" };
 
     const interactive_argv = [_:null]?[*:0]const u8{ bin, "--no-model-auto-refresh" };
     const print_argv = [_:null]?[*:0]const u8{ bin, "--print", "large-output" };
@@ -705,19 +705,33 @@ pub fn main(init: std.process.Init) !void {
         try d.waitText(start, "resume-first-answer");
         try d.waitIdle(start);
     } else if (full_resume) {
-        try d.waitFrame(0, "prior tools are NOT rerun");
+        try d.waitFrame(0, if (std.mem.eql(u8, mode, "resume-login")) "Not logged in" else "prior tools are NOT rerun");
         try check(std.mem.indexOf(u8, d.output[0..d.used], "resume-first-answer") != null);
         try check(std.mem.indexOf(u8, d.output[0..d.used], "PRIVATE-RESUME-REASONING") == null);
         try d.quiet(150); // No startup model request or historical execution.
+        if (std.mem.eql(u8, mode, "resume-login")) {
+            try d.waitFrame(0, "Not logged in");
+            try d.openAuth();
+            const login_start = d.used;
+            try d.send("fixture-secret-never-log\r");
+            // The restored-owner notice may follow this in the bounded hint
+            // row; check its visible save prefix, then exact continuation below.
+            try d.waitFrame(login_start, "Saved locally");
+            try check(std.mem.indexOf(u8, d.output[0..d.used], "resume-first-answer") != null);
+        }
         if (!std.mem.eql(u8, mode, "resume-idle")) {
             const start = d.used;
             try d.send("resume-next-turn\r");
             try d.waitText(start, "resume-next-answer");
             try d.waitIdle(start);
         }
+    } else if (std.mem.eql(u8, mode, "restore-idle") or std.mem.eql(u8, mode, "restore-no-key")) {
+        try d.waitFrame(0, if (std.mem.eql(u8, mode, "restore-no-key")) "Not logged in" else "history not restored");
+        try check(std.mem.indexOf(u8, d.output[0..d.used], "OLD-HISTORY-MUST-NOT-APPEAR") == null);
+        try d.quiet(150);
     } else if (std.mem.eql(u8, mode, "restore-selection")) {
         try d.waitFrame(0, "history not restored");
-        try check(std.mem.indexOf(u8, d.output[0..d.used], "\x1b[38;5;75mfixture-restored") != null);
+        try check(std.mem.indexOf(u8, d.output[0..d.used], "fixture-restored") != null);
         try check(std.mem.indexOf(u8, d.output[0..d.used], "OLD-HISTORY-MUST-NOT-APPEAR") == null);
         const start = d.used;
         try d.send("restore-new-turn\r");
@@ -1161,7 +1175,12 @@ pub fn main(init: std.process.Init) !void {
         try d.waitIdle(start);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "fixture-next") != null);
         // The initialized project preference (off) wins over the profile's low.
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;245mfixture-next\x1b[0m \x1b[0m?%\x1b[0m) > ") != null);
+        // ACK-safe redraws may emit only changed cells, not a complete ANSI
+        // footer. Inspect the resulting screen; wire assertions below still
+        // prove off -> minimal -> low -> medium rather than the profile's low.
+        const selected_next = try d.screen();
+        try check(selected_next.visible("fixture-next") and selected_next.visible("?%"));
+        try check(selected_next.row == 23 and !selected_next.visible("Search> "));
         start = d.used;
         try d.send("\x1b[Z\x1b[Z\x1b[Z"); // off -> minimal -> low -> medium.
         // Observe the acknowledged confirmation, then its automatic expiry.

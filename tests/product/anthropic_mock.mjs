@@ -45,7 +45,7 @@ const tool = (second = false) => ({ type: 'tool_use', id: second ? 'call_second'
 function toolBlocks(multi = false) {
   let s = blockStart(0, { type: 'thinking', thinking: '', signature: '' }) +
     delta(0, { type: 'thinking_delta', thinking: 'local ' }) + delta(0, { type: 'thinking_delta', thinking: 'plan' }) +
-    delta(0, { type: 'signature_delta', signature: 'replaced-fixture' }) + delta(0, { type: 'signature_delta', signature: 'fixture-signature-A+B/==' }) + blockStop(0) +
+    delta(0, { type: 'signature_delta', signature: 'fixture-signature-' }) + delta(0, { type: 'signature_delta', signature: 'A+B/==' }) + blockStop(0) +
     blockStart(1, nativePrefix[1]) + blockStop(1) +
     blockStart(2, { type: 'text', text: '' }) + delta(2, { type: 'text_delta', text: '你' }) + blockStop(2);
   for (let n = 0; n < (multi ? 2 : 1); n++) {

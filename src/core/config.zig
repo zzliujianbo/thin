@@ -127,7 +127,7 @@ pub const Limits = struct {
     max_event_bytes: u32 = 1048576,
 };
 
-/// 完整配置的根结构，对应 config.json 的顶层对象。
+/// Sparse user declarations under llm.providers.<alias>.models.<raw-id>.
 pub const ModelPatch = struct {
     protocol: ?protocol.Protocol = null,
     context_tokens: ?u32 = null,
@@ -182,16 +182,14 @@ fn validAlias(value: []const u8) bool {
     return true;
 }
 
+/// Owned application configuration. Disk input requires llm declarations;
+/// registry may be absent only for a pure in-memory Runtime snapshot.
 pub const Config = struct {
     registry: ?Registry = null,
     selected_provider: ?[]const u8 = null,
     selection_pending: bool = false,
     provider: Provider,
     model: Model,
-    /// Same-provider profiles; no discovery or credential overrides.
-    models: []const Model = &.{},
-    /// Private, independently saved credentials. Never session metadata.
-    credentials: providers.Credentials = .{},
     /// 未配置时使用 Limits 中的默认值。
     limits: Limits = .{},
 };
@@ -205,29 +203,21 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
     return parseBounded(allocator, bytes, max_config_bytes, true);
 }
 
-test "disk derived reasoning is dropped but trusted config clones retain active maps" {
-    const a = std.testing.allocator;
-    var parsed = try parse(a,
-        \\{"provider":{"base_url":"https://proxy.invalid"},"model":{"name":"model","protocol":"responses","context_tokens":32768,"reasoning_source":"metadata","reasoning_effort":"high","reasoning":{"map":{"high":"high"}}},"models":[{"name":"other","protocol":"responses","context_tokens":32768,"reasoning_source":"metadata","reasoning_effort":"high","reasoning":{"map":{"high":"high"}}}]}
-    );
-    defer release(&parsed);
-    try std.testing.expect(parsed.value.model.reasoning == null and parsed.value.model.reasoning_effort == null);
-    try std.testing.expect(parsed.value.models[0].reasoning == null and parsed.value.models[0].reasoning_effort == null);
-    var active = parsed.value;
+test "runtime-only config clones retain derived maps but cannot write disk" {
+    var active = testConfig();
     active.model.reasoning = .{ .map = .{ .high = "high" } };
     active.model.reasoning_effort = "high";
-    var copied = try clone(a, active);
+    active.model.reasoning_source = .metadata;
+    active.model.input_price_threshold = 100000;
+    var copied = try clone(std.testing.allocator, active);
     defer release(&copied);
     try std.testing.expectEqualStrings("high", copied.value.model.reasoning.?.map.high.?);
     try std.testing.expectEqualStrings("high", copied.value.model.reasoning_effort.?);
-    var stale = try parse(a,
-        \\{"provider":{"base_url":"https://proxy.invalid"},"model":{"name":"model","protocol":"responses","context_tokens":32768,"reasoning_source":"metadata","reasoning":{"format":"anthropic","map":{"high":"high"}}}}
-    );
-    defer release(&stale);
-    try std.testing.expect(stale.value.model.reasoning == null);
-    try std.testing.expectError(error.IncompatibleReasoningProtocol, parse(a,
-        \\{"provider":{"base_url":"https://proxy.invalid"},"model":{"name":"model","protocol":"responses","context_tokens":32768,"reasoning":{"format":"anthropic","map":{"high":"high"}}}}
-    ));
+    try std.testing.expectEqual(@as(?u32, 100000), copied.value.model.input_price_threshold);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.MissingRegistry, writeDisk(copied.value, &out.writer));
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
 }
 
 /// Clone an already bounded, validated application configuration. Re-encoding
@@ -263,13 +253,6 @@ fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, d
     // 语义校验失败时需要释放已解析的内存。
     parsed.arena.child_allocator = allocator;
     errdefer release(&parsed);
-    // Derived disk data is not authority, including a stale wire format after
-    // the user changes protocol. Validate actual options only after discarding
-    // it. Trusted clone() retains and validates active/frozen runtime mappings.
-    if (disk) {
-        parsed.value.model = parsed.value.model.persisted();
-        for (@constCast(parsed.value.models)) |*model| model.* = model.persisted();
-    }
     try validate(parsed.value);
     return parsed;
 }
@@ -296,12 +279,6 @@ fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
             }
         }
     }
-    // Legacy Config decoding must enforce the same exact numeric types as the
-    // registry branch; std.json's typed decoder otherwise coerces "90000".
-    if (T == Config) {
-        const fields = try object(value);
-        if (fields.get("limits")) |limits| _ = try decode(Limits, a, limits);
-    }
     return std.json.parseFromValueLeaky(T, a, value, json_options);
 }
 fn object(value: std.json.Value) !std.json.ObjectMap {
@@ -321,12 +298,12 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
     errdefer tree.deinit();
     const a = tree.arena.allocator();
     const root = try object(tree.value);
-    var result: Config = undefined;
-    if (root.get("llm")) |llm_value| {
-        var keys = root.iterator();
-        while (keys.next()) |entry| {
-            if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits")) return error.UnknownField;
-        }
+    var keys = root.iterator();
+    while (keys.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits")) return error.UnknownField;
+    }
+    const llm_value = root.get("llm") orelse return error.MissingField;
+    const result: Config = blk: {
         const llm = try object(llm_value);
         var lk = llm.iterator();
         while (lk.next()) |entry| {
@@ -369,14 +346,8 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         const limits = if (root.get("limits")) |v| try decode(Limits, a, v) else Limits{};
         if (limits.safety_tokens > 1024 * 1024) return error.InvalidBudget;
         const context: u32 = @max(32768, limits.safety_tokens + 2);
-        result = .{ .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
-    } else {
-        // Internal snapshots can only enter through trusted clone(), never disk.
-        if (root.contains("registry") or root.contains("selected_provider") or root.contains("selection_pending")) return error.UnknownField;
-        result = try decode(Config, a, tree.value);
-        result.model = result.model.persisted();
-        for (@constCast(result.models)) |*m| m.* = m.persisted();
-    }
+        break :blk .{ .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
+    };
     try validate(result);
     tree.arena.child_allocator = allocator;
     return .{ .arena = tree.arena, .value = result };
@@ -384,11 +355,13 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
 
 /// Writes declarations only; active cache-resolved models are not disk authority.
 pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
+    const registry = config.registry orelse return error.MissingRegistry;
+    try validate(config);
     var s: std.json.Stringify = .{ .writer = writer, .options = .{
-        .emit_null_optional_fields = config.registry == null,
+        .emit_null_optional_fields = false,
         .whitespace = .indent_2,
     } };
-    if (config.registry) |registry| {
+    {
         try s.beginObject();
         try s.objectField("llm");
         try s.beginObject();
@@ -417,38 +390,7 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
         try s.objectField("limits");
         try s.write(config.limits);
         try s.endObject();
-    } else {
-        const models = config.models;
-        // persisted() is applied per model, without allocating or leaking scratch keys.
-        try s.beginObject();
-        try s.objectField("provider");
-        try s.write(config.provider);
-        try s.objectField("model");
-        try writeDeclaredModel(&s, config.model);
-        try s.objectField("models");
-        try s.beginArray();
-        for (models) |m| try writeDeclaredModel(&s, m);
-        try s.endArray();
-        try s.objectField("credentials");
-        try s.write(config.credentials);
-        try s.objectField("limits");
-        try s.write(config.limits);
-        try s.endObject();
     }
-}
-
-/// Preserve the legacy disk shape without emitting the new cache-only price
-/// capability, even as null. Trusted clone/checkpoint encoding is independent.
-fn writeDeclaredModel(s: *std.json.Stringify, model: Model) !void {
-    const declaration = model.persisted();
-    try s.beginObject();
-    inline for (@typeInfo(Model).@"struct".field_names) |field| {
-        if (comptime !std.mem.eql(u8, field, "input_price_threshold")) {
-            try s.objectField(field);
-            try s.write(@field(declaration, field));
-        }
-    }
-    try s.endObject();
 }
 
 /// Candidate-only edits. Allocate replacement slices; never mutate shared registry memory.
@@ -516,7 +458,7 @@ pub fn release(parsed: *std.json.Parsed(Config)) void {
     parsed.* = undefined;
 }
 
-fn validateKeySource(provider: Provider) !void {
+pub fn validateKeySource(provider: Provider) !void {
     if (provider.api_key != null and provider.api_key_env.len != 0) return error.AmbiguousApiKey;
     if (provider.api_key) |key| {
         if (!validText(key, 16384)) return error.InvalidApiKey;
@@ -588,7 +530,6 @@ pub fn validate(config: Config) !void {
     if (config.provider.kind) |declared| if (providers.Id.fromUrl(config.provider.base_url)) |actual| {
         if (declared != actual) return error.ProviderEndpointMismatch;
     };
-    try config.credentials.validate();
     if (config.registry) |registry| try validateRegistry(registry, config.limits);
 
     const l = config.limits;
@@ -624,14 +565,6 @@ pub fn validate(config: Config) !void {
     // 窗口须留出输入与至少一个输出 token；输出上限按每次请求剩余空间收缩，摘要仍遵守显式上限。
     try validateModel(config.model, l);
     try validateReasoningProtocol(config.provider.base_url, config.model);
-    if (config.models.len > 64) return error.TooManyModels;
-    for (config.models, 0..) |model, i| {
-        try validateModel(model, l);
-        try validateReasoningProtocol(config.provider.base_url, model);
-        for (config.models[0..i]) |previous| {
-            if (std.mem.eql(u8, previous.name, model.name)) return error.DuplicateModel;
-        }
-    }
 
     // 压缩目标必须低于触发阈值，且触发阈值必须小于 100%，否则压缩永远无法生效或立即触发。
     if (!(l.compaction_target_percent < l.compaction_trigger_percent and l.compaction_trigger_percent < 100)) return error.InvalidCompactionRatio;
@@ -670,10 +603,9 @@ fn validateRegistry(registry: Registry, limits: Limits) !void {
     }
 }
 
-test "low price input defaults enabled and explicit optout survives both disk formats" {
+test "low price input defaults enabled and explicit optout survives disk roundtrip" {
     const a = std.testing.allocator;
     const prefixes = [_][]const u8{
-        "{\"provider\":{\"base_url\":\"https://fixture.invalid/v1\"},\"model\":{\"name\":\"m\",\"context_tokens\":32768},\"limits\":",
         "{\"llm\":{\"default\":\"local/m\",\"providers\":{\"local\":{\"base_url\":\"https://fixture.invalid/v1\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":32768}}}}},\"limits\":",
     };
     for (prefixes) |prefix| for ([_][]const u8{ "{}", "{\"low_price_input\":true}", "{\"low_price_input\":false}" }) |limits| {
@@ -699,18 +631,18 @@ test "low price input defaults enabled and explicit optout survives both disk fo
 test "thinking declarations strict owned config validation and protocol incompatibility" {
     const t = std.testing;
     var parsed = try parse(t.allocator,
-        \\{"provider":{"base_url":"https://proxy/v1"},"model":{"name":"custom","context_tokens":32768,"reasoning":{"map":{"off":"disabled","high":"own-wire"}}}}
+        \\{"llm":{"default":"p/custom","providers":{"p":{"base_url":"https://proxy/v1","models":{"custom":{"context_tokens":32768,"reasoning":{"map":{"off":"disabled","high":"own-wire"}}}}}}}}
     );
     defer release(&parsed);
-    try t.expectEqualStrings("own-wire", parsed.value.model.reasoning.?.map.high.?);
+    try t.expectEqualStrings("own-wire", parsed.value.registry.?.find("p").?.patchFor("custom").?.reasoning.?.map.high.?);
     try t.expectError(error.MissingField, parse(t.allocator,
-        \\{"provider":{"base_url":"https://proxy/v1"},"model":{"name":"custom","context_tokens":32768,"reasoning":{}}}
+        \\{"llm":{"default":"p/custom","providers":{"p":{"base_url":"https://proxy/v1","models":{"custom":{"reasoning":{}}}}}}}
     ));
     try t.expectError(error.InvalidReasoningMap, parse(t.allocator,
-        \\{"provider":{"base_url":"https://proxy/v1"},"model":{"name":"custom","context_tokens":32768,"reasoning":{"map":{}}}}
+        \\{"llm":{"default":"p/custom","providers":{"p":{"base_url":"https://proxy/v1","models":{"custom":{"reasoning":{"map":{}}}}}}}}
     ));
     try t.expectError(error.UnknownField, parse(t.allocator,
-        \\{"provider":{"base_url":"https://proxy/v1"},"model":{"name":"custom","context_tokens":32768,"reasoning":{"map":{"ultra":"x"}}}}
+        \\{"llm":{"default":"p/custom","providers":{"p":{"base_url":"https://proxy/v1","models":{"custom":{"reasoning":{"map":{"ultra":"x"}}}}}}}}
     ));
     var config = parsed.value;
     config.model.reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } };
@@ -725,12 +657,14 @@ test "thinking declarations strict owned config validation and protocol incompat
 
 test "Anthropic config is explicit and rejects foreign thinking controls" {
     var parsed = try parse(std.testing.allocator,
-        \\{"provider":{"base_url":"https://opencode.ai/inference/go/v1"},"model":{"name":"claude-haiku-5-5","context_tokens":32768,"protocol":"anthropic"}}
+        \\{"llm":{"default":"p/claude-haiku-5-5","providers":{"p":{"base_url":"https://opencode.ai/inference/go/v1","models":{"claude-haiku-5-5":{"context_tokens":32768,"protocol":"anthropic"}}}}}}
     );
     defer release(&parsed);
-    try std.testing.expect(parsed.value.model.protocol == .anthropic);
+    const patch = parsed.value.registry.?.find("p").?.patchFor("claude-haiku-5-5").?;
+    try std.testing.expect(patch.protocol.? == .anthropic);
     try validate(parsed.value);
     var config = parsed.value;
+    config.model = patch.apply(config.model);
     config.model.reasoning_effort = "high";
     try std.testing.expectError(error.UnsupportedAnthropicReasoning, validate(config));
     config.model.reasoning = .{ .format = .anthropic, .map = .{ .off = "disabled", .low = "low", .high = "high" } };
@@ -820,82 +754,37 @@ pub fn defaultPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
 pub fn resolveApiKey(allocator: std.mem.Allocator, config: Config, environ: *const std.process.Environ.Map) ![]u8 {
     try validateKeySource(config.provider);
     if (config.provider.api_key) |key| return allocator.dupe(u8, key);
-    if (config.provider.api_key_env.len == 0) {
-        // Do not infer key authority from a declared kind or a similar hostname.
-        // A proxy must supply an explicit key/env source, not borrow saved keys.
-        const id = providers.Id.fromUrl(config.provider.base_url) orelse return error.ApiKeyNotFound;
-        try config.credentials.validate();
-        const saved = config.credentials.get(id) orelse return error.ApiKeyNotFound;
-        return allocator.dupe(u8, saved);
-    }
+    if (config.provider.api_key_env.len == 0) return error.ApiKeyNotFound;
     const key = environ.get(config.provider.api_key_env) orelse return error.ApiKeyNotFound;
     // 拒绝空白或含控制字符的 key，防止 header 注入。
     if (!validText(key, 16384)) return error.InvalidApiKey;
     return allocator.dupe(u8, key);
 }
 
-test "named credentials are owned separate and never inferred for another endpoint" {
+test "official services without an explicit credential source never borrow keys" {
     const a = std.testing.allocator;
-    var parsed = try parse(a,
-        \\{"provider":{"base_url":"https://opencode.ai/zen/go/v1"},"model":{"name":"minimax-m2.7","context_tokens":204800,"protocol":"chat"},"credentials":{"deepseek":"fake-deepseek","opencode_zen":"fake-zen","opencode_go":"fake-go"}}
-    );
-    defer release(&parsed);
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
+    try env.put("DEEPSEEK_API_KEY", "fake-unselected");
+    var c = testConfig();
+    c.provider.api_key_env = "";
     for (providers.Id.all) |id| {
-        parsed.value.provider.base_url = id.baseUrl();
-        const key = try resolveApiKey(a, parsed.value, &env);
-        defer {
-            std.crypto.secureZero(u8, key);
-            a.free(key);
-        }
-        try std.testing.expectEqualStrings(parsed.value.credentials.get(id).?, key);
-        try std.testing.expect(key.ptr != parsed.value.credentials.get(id).?.ptr);
+        c.provider.base_url = id.baseUrl();
+        try std.testing.expectError(error.ApiKeyNotFound, resolveApiKey(a, c, &env));
     }
-    parsed.value.provider.base_url = "https://example.invalid/v1";
-    parsed.value.provider.kind = .opencode_go;
-    try std.testing.expectError(error.ApiKeyNotFound, resolveApiKey(a, parsed.value, &env));
-    parsed.value.provider.base_url = providers.Id.opencode_go.baseUrl();
-    parsed.value.provider.api_key_env = "EXPLICIT_MISSING_KEY";
-    try std.testing.expectError(error.ApiKeyNotFound, resolveApiKey(a, parsed.value, &env));
-    var invalid = parsed.value;
-    invalid.provider.kind = .opencode_zen;
-    try std.testing.expectError(error.ProviderEndpointMismatch, validate(invalid));
-    invalid.provider.kind = .opencode_go;
-    invalid.credentials.opencode_zen = "bad\rkey";
-    try std.testing.expectError(error.InvalidApiKey, validate(invalid));
+    c.provider.kind = .deepseek;
+    c.provider.base_url = providers.Id.opencode_go.baseUrl();
+    try std.testing.expectError(error.ProviderEndpointMismatch, validate(c));
 }
 
 /// 测试用的最小合法配置 JSON。
 const fixture =
-    \\{"provider":{"base_url":"https://example.invalid/v1","api_key_env":"TEST_KEY"},"model":{"name":"test-model","context_tokens":32768}}
+    \\{"llm":{"default":"local/test-model","providers":{"local":{"base_url":"https://example.invalid/v1","api_key_env":"TEST_KEY"}}}}
 ;
 
 /// 构造与 fixture 等价的 Config 值，供需要直接修改字段的测试使用。
 fn testConfig() Config {
     return .{ .provider = .{ .base_url = "https://example.invalid/v1", .api_key_env = "TEST_KEY" }, .model = .{ .name = "test-model", .context_tokens = 32768 } };
-}
-
-// 验证：省略的字段使用默认值，且解析结果不依赖输入缓冲区（释放输入后仍可读）。
-test "profiles use shared budgets and exact unique names with a bounded catalog" {
-    var config: Config = .{ .provider = .{ .base_url = "http://unused.invalid" }, .model = .{ .name = "a", .context_tokens = 32768 } };
-    const profile: Model = .{ .name = "a", .context_tokens = 32768 };
-    config.models = &.{profile};
-    try validate(config); // Selected name may also appear in the catalog.
-    config.models = &.{ profile, profile };
-    try std.testing.expectError(error.DuplicateModel, validate(config));
-    config.models = &.{.{ .name = "small", .context_tokens = 6144 }};
-    config.limits.max_output_tokens = 4096; // A ceiling may shrink on smaller profiles.
-    try validate(config);
-    config.models = &.{.{ .name = "unusable", .context_tokens = 4097 }};
-    try std.testing.expectError(error.InvalidBudget, validate(config));
-    var too_many: [65]Model = undefined;
-    @memset(&too_many, profile);
-    config.models = &too_many;
-    try std.testing.expectError(error.TooManyModels, validate(config));
-    const a = std.testing.allocator;
-    const unknown = "{\"provider\":{\"base_url\":\"http://unused.invalid\"},\"model\":{\"name\":\"a\",\"context_tokens\":32768},\"models\":[{\"name\":\"b\",\"context_tokens\":32768,\"api_key\":\"forbidden\"}]}";
-    try std.testing.expectError(error.UnknownField, parse(a, unknown));
 }
 
 test "minimal JSON uses defaults and owns strings" {
@@ -920,22 +809,23 @@ test "minimal JSON uses defaults and owns strings" {
 test "explicit protocol reasoning and limits overrides own their strings" {
     const a = std.testing.allocator;
     const input = try a.dupe(u8,
-        \\{"provider":{"base_url":"http://localhost:8080/v1","api_key_env":"KEY"},"model":{"name":"custom","context_tokens":65536,"protocol":"responses","reasoning_effort":"high"},"limits":{"max_rounds":10}}
+        \\{"llm":{"default":"p/custom","providers":{"p":{"base_url":"http://localhost:8080/v1","api_key_env":"KEY","models":{"custom":{"context_tokens":65536,"protocol":"responses","reasoning_effort":"high"}}}}},"limits":{"max_rounds":10}}
     );
     const parsed = try parse(a, input);
     defer parsed.deinit();
     @memset(input, 'x');
     a.free(input);
 
-    try std.testing.expectEqual(protocol.Protocol.responses, parsed.value.model.protocol);
-    try std.testing.expectEqualStrings("high", parsed.value.model.reasoning_effort.?);
+    const patch = parsed.value.registry.?.find("p").?.patchFor("custom").?;
+    try std.testing.expectEqual(protocol.Protocol.responses, patch.protocol.?);
+    try std.testing.expectEqualStrings("high", patch.reasoning_effort.?);
     try std.testing.expectEqual(@as(?u16, 10), parsed.value.limits.max_rounds);
 }
 
 // Defaults remain unlimited; serialization never guesses whether legacy 50 was explicit.
 test "round limits missing null and legacy numbers survive config serialization" {
     const a = std.testing.allocator;
-    const prefix = "{\"provider\":{\"base_url\":\"http://localhost\"},\"model\":{\"name\":\"fake\",\"context_tokens\":32768},\"limits\":";
+    const prefix = "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\"}}},\"limits\":";
     const cases = [_]struct { json: []const u8, expected: ?u16 }{
         .{ .json = "{}", .expected = null },
         .{ .json = "{\"max_rounds\":null}", .expected = null },
@@ -971,11 +861,11 @@ test "round limits missing null and legacy numbers survive config serialization"
 test "strict JSON rejects missing unknown duplicate and TOML fields" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.MissingField, parse(a, "{}"));
-    try std.testing.expectError(error.MissingField, parse(a, "{\"provider\":{}}"));
+    try std.testing.expectError(error.UnknownField, parse(a, "{\"provider\":{}}"));
     try std.testing.expectError(error.UnknownField, parse(a, "{\"unknown\":1}"));
 
-    // 内联 key 合法，但仍不能省略基础 URL 与模型。
-    try std.testing.expectError(error.MissingField, parse(a, "{\"provider\":{\"api_key\":\"fake-key\"}}"));
+    // Former root fields are rejected even when they contain a plausible key.
+    try std.testing.expectError(error.UnknownField, parse(a, "{\"provider\":{\"api_key\":\"fake-key\"}}"));
     try std.testing.expectError(error.DuplicateField, parse(a, "{\"provider\":{\"base_url\":\"x\",\"base_url\":\"y\"}}"));
     try std.testing.expectError(error.UnexpectedToken, parse(a, "[provider]\nbase_url = 'https://example.invalid'"));
 }
@@ -1172,7 +1062,7 @@ test "credential parser cleanup and release zero owned allocations" {
     };
     var observer = Observer{ .backing = std.testing.allocator };
     const inline_json =
-        \\{"provider":{"base_url":"https://example.invalid","api_key":"fake-inline"},"model":{"name":"test","context_tokens":32768}}
+        \\{"llm":{"default":"p/test","providers":{"p":{"base_url":"https://example.invalid","api_key":"fake-inline"}}}}
     ;
     var parsed = try parse(observer.allocator(), inline_json);
     try std.testing.expectEqualStrings("fake-inline", parsed.value.provider.api_key.?);
@@ -1181,7 +1071,7 @@ test "credential parser cleanup and release zero owned allocations" {
         \\{"provider":{"base_url":"https://example.invalid","api_key":"fake-inline","unknown":1}}
     ));
     try std.testing.expectError(error.InvalidApiKey, parse(observer.allocator(),
-        \\{"provider":{"base_url":"https://example.invalid","api_key":"fake\ninline"},"model":{"name":"test","context_tokens":32768}}
+        \\{"llm":{"default":"p/test","providers":{"p":{"base_url":"https://example.invalid","api_key":"fake\ninline"}}}}
     ));
     var registry_parsed = try parse(observer.allocator(),
         \\{"llm":{"default":"a/m","providers":{"a":{"base_url":"https://example.invalid"},"backup":{"base_url":"https://backup.invalid","api_key":"fake-backup"}}}}

@@ -23,7 +23,7 @@ test "low price policy owner snapshot reflects default and explicit optout befor
         defer tmp.cleanup();
         var buffer: [4096]u8 = undefined;
         const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
-        const raw = try std.mem.concat(a, u8, &.{ "{\"provider\":{\"base_url\":\"https://fixture.invalid/v1\",\"api_key_env\":\"MISSING_LOCAL_FIXTURE_KEY\"},\"model\":{\"name\":\"m\",\"protocol\":\"chat\",\"context_tokens\":32768},\"limits\":", limits, "}" });
+        const raw = try std.mem.concat(a, u8, &.{ "{\"llm\":{\"default\":\"local/m\",\"providers\":{\"local\":{\"base_url\":\"https://fixture.invalid/v1\",\"api_key_env\":\"MISSING_LOCAL_FIXTURE_KEY\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":32768}}}}},\"limits\":", limits, "}" });
         defer a.free(raw);
         try save(home, raw);
         var env = std.process.Environ.Map.init(a);
@@ -37,7 +37,7 @@ test "low price policy owner snapshot reflects default and explicit optout befor
     }
 }
 
-test "publication empty selection route constrains every capability before validation" {
+test "publication current capabilities stay isolated by model and route" {
     const resolver = @import("model_resolver.zig");
     var parsed = try cfg.parse(a,
         \\{"llm":{"default":"go/fresh","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","models":{"manual":{"context_tokens":65536},"conflict":{"protocol":"responses","context_tokens":65536},"probe":{"protocol":"auto","context_tokens":65536}}}}}}
@@ -54,34 +54,24 @@ test "publication empty selection route constrains every capability before valid
     row.dev_output_tokens = 128000;
     row.dev_input_price_threshold = 200000;
     cache.directory_mask = metadata.bit(.opencode_go);
-    try std.testing.expectError(error.UnknownModelContext, resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "fresh", .chat));
-    // Matching public evidence can restore the historical concrete route when
-    // current official metadata has no conflicting route/window declaration.
-    row.protocol = .auto;
-    row.tokens = null;
-    row.dev_protocol = .chat;
-    row.dev_context_tokens = 65536;
-    row.dev_output_tokens = 4096;
-    const restored = try resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "fresh", .chat);
-    try std.testing.expectEqual(.chat, restored.model.protocol);
-    try std.testing.expectEqual(@as(u32, 65536), restored.model.context_tokens);
-    try std.testing.expectEqual(@as(?u32, 4096), restored.model.output_tokens);
-    try std.testing.expectEqual(@as(?u32, 200000), restored.model.input_price_threshold);
-    row.dev_protocol = .responses;
-    const isolated = try resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "manual", .chat);
-    try std.testing.expectEqual(@as(?u32, null), isolated.model.input_price_threshold);
-    const preset = try resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "glm-5.3", .chat);
-    try std.testing.expectEqual(@import("provider_catalog.zig").find("opencode-go/glm-5.3").?.model.context_tokens, preset.model.context_tokens);
-    try std.testing.expect(preset.model.output_tokens == null);
-    const manual = try resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "manual", .chat);
-    try std.testing.expectEqual(@as(u32, 65536), manual.model.context_tokens);
-    try std.testing.expect(manual.model.output_tokens == null);
-    try std.testing.expectError(error.RestoredProtocolConflict, resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "conflict", .chat));
-    try std.testing.expectError(error.RestoredProtocolConflict, resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "probe", .chat));
-    try std.testing.expectError(error.UnknownModelProtocol, resolver.resolveRoute(parsed.arena.allocator(), parsed.value, &cache, "go", "manual", .auto));
+    const current = try resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "fresh", false);
+    try std.testing.expectEqual(.responses, current.model.protocol);
+    try std.testing.expectEqual(@as(u32, 1000000), current.model.context_tokens);
+    try std.testing.expectEqual(@as(?u32, 128000), current.model.output_tokens);
+    try std.testing.expectEqual(@as(?u32, 200000), current.model.input_price_threshold);
+    // Explicit route/context on another raw ID cannot inherit fresh's capabilities.
+    const isolated = try resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "conflict", false);
+    try std.testing.expectEqual(.responses, isolated.model.protocol);
+    try std.testing.expectEqual(@as(u32, 65536), isolated.model.context_tokens);
+    try std.testing.expect(isolated.model.output_tokens == null);
+    try std.testing.expect(isolated.model.input_price_threshold == null);
+    try std.testing.expectError(error.UnknownModelProtocol, resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "manual", false));
+    const probe = try resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "probe", false);
+    try std.testing.expectEqual(.auto, probe.model.protocol);
+    try std.testing.expect(probe.model.input_price_threshold == null);
 }
 
-test "publication Session empty restore rejects current-route capacity while full signed restore stays frozen" {
+test "publication Session current capability changes do not reject history loading" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
@@ -109,13 +99,14 @@ test "publication Session empty restore rejects current-route capacity while ful
         changed.directory.rows[0].output_tokens = 128000;
         _ = try metadata.commit(&source.store.root, metadata.bit(.opencode_go), changed);
     }
-    try std.testing.expectError(error.UnknownModelContext, Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = id, .logging = false }));
+    var selection_only = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = id, .logging = false });
+    defer selection_only.deinit();
+    try std.testing.expectEqual(@as(usize, 0), if (selection_only.app) |app| app.runtime.messages().len else 0);
     var full = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .resume_session = id, .logging = false });
     defer full.deinit();
-    try std.testing.expectEqual(.chat, full.app.?.config.value.model.protocol);
-    try std.testing.expectEqual(@as(u32, 65536), full.app.?.config.value.model.context_tokens);
-    try std.testing.expect(full.app.?.config.value.model.output_tokens == null);
-    try std.testing.expectEqual(@as(usize, 1), full.app.?.runtime.messages().len);
+    const history = full.connection().initial_history_fn.?(full.connection().context);
+    try std.testing.expectEqual(@as(usize, 1), history.len);
+    try std.testing.expectEqualStrings("signed route fixture", history[0].blocks[0].text);
 }
 
 const PublicationFetch = struct {
@@ -357,7 +348,7 @@ test "llm Session directory fields merge per alias and auth preserves all declar
     try std.testing.expect(disk.value.registry.?.find("go").?.models[0].patch.protocol == null);
 }
 
-test "llm Session custom full resume authenticates named endpoint and frozen budgets" {
+test "llm Session resume without login retains history and activates using current capabilities" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
@@ -380,14 +371,28 @@ test "llm Session custom full resume authenticates named endpoint and frozen bud
         try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "resume canonical fixture" }} });
         try std.testing.expect(try source.saveOnExit());
     }
-    var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .resume_session = id });
+    env.deinit();
+    env = std.process.Environ.Map.init(a);
+    try env.put("HOME", home);
+    try env.put("ALPHA_KEY", "fake-alpha");
+    var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .resume_session = id, .logging = false });
     defer restored.deinit();
+    try std.testing.expect(restored.app == null);
+    const connection = restored.connection();
+    const history = connection.initial_history_fn.?(connection.context);
+    try std.testing.expectEqual(@as(usize, 1), history.len);
+    try std.testing.expectEqualStrings("resume canonical fixture", history[0].blocks[0].text);
+    try std.testing.expect(connection.current().settings_notice != null);
+    try connection.configure("fake-beta-new");
+    try std.testing.expect(restored.app != null);
     try std.testing.expectEqualStrings("beta", restored.app.?.config.value.selected_provider.?);
     try std.testing.expectEqualStrings("https://beta.invalid/v1", restored.app.?.config.value.provider.base_url);
+    try std.testing.expectEqualStrings("Bearer fake-beta-new", restored.app.?.client.authorization);
     try std.testing.expectEqual(@as(usize, 1), restored.app.?.runtime.messages().len);
-    // No default re-resolution may overwrite authenticated frozen state.
-    try std.testing.expectEqual(@as(?u32, null), restored.app.?.config.value.model.output_tokens);
-    try std.testing.expectEqual(@as(u32, 65536), restored.app.?.config.value.model.context_tokens);
+    try std.testing.expectEqualStrings("resume canonical fixture", restored.app.?.runtime.messages()[0].blocks[0].text);
+    // Archived capabilities are not authority: use the current beta patch.
+    try std.testing.expectEqual(@as(?u32, 16384), restored.app.?.config.value.model.output_tokens);
+    try std.testing.expectEqual(@as(u32, 131072), restored.app.?.config.value.model.context_tokens);
 }
 
 test "llm Session failed default persistence publishes neither connection nor selection" {
@@ -547,7 +552,7 @@ test "llm Session manual effort and resolved metadata map stay frozen across sta
     try std.testing.expect(patch.reasoning == null);
 }
 
-test "llm Session dynamic frozen checkpoint survives lost window and delisting with known and unknown output" {
+test "llm Session dynamic history loads after lost window and delisting without trusting archived capabilities" {
     for ([_]?u32{ 128000, null }) |output| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -606,16 +611,19 @@ test "llm Session dynamic frozen checkpoint survives lost window and delisting w
             try std.testing.expect(try source.saveOnExit());
             try std.testing.expectEqualStrings("fake-frozen-go", source.global_config.?.value.registry.?.find("go").?.connection.api_key.?);
         }
-        try std.testing.expectError(error.UnknownModelContext, Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = id, .logging = false }));
+        {
+            var selection_only = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = id, .logging = false });
+            defer selection_only.deinit();
+            try std.testing.expectEqual(@as(usize, 0), if (selection_only.app) |app| app.runtime.messages().len else 0);
+        }
         {
             var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .resume_session = id });
             defer restored.deinit();
-            try std.testing.expectEqual(@as(u32, 1000000), restored.app.?.config.value.model.context_tokens);
-            try std.testing.expectEqual(output, restored.app.?.config.value.model.output_tokens);
-            try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, restored.app.?.config.value.model.input_price_threshold);
-            try std.testing.expectEqual(.chat, restored.app.?.config.value.model.protocol);
-            try std.testing.expectEqual(@as(usize, 1), restored.app.?.runtime.messages().len);
-            try std.testing.expect(try restored.saveOnExit());
+            const connection = restored.connection();
+            const history = connection.initial_history_fn.?(connection.context);
+            try std.testing.expectEqual(@as(usize, 1), history.len);
+            try std.testing.expectEqualStrings("frozen dynamic canonical fixture", history[0].blocks[0].text);
+            try std.testing.expect(restored.app == null); // No current context evidence, no send capability.
         }
         {
             // A later refresh removes the row and every models.dev capability.
@@ -625,13 +633,13 @@ test "llm Session dynamic frozen checkpoint survives lost window and delisting w
             _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
             var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .resume_session = id });
             defer restored.deinit();
-            try std.testing.expectEqual(@as(u32, 1000000), restored.app.?.config.value.model.context_tokens);
-            try std.testing.expectEqual(output, restored.app.?.config.value.model.output_tokens);
-            try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, restored.app.?.config.value.model.input_price_threshold);
-            try std.testing.expect(try restored.saveOnExit());
+            const connection = restored.connection();
+            const history = connection.initial_history_fn.?(connection.context);
+            try std.testing.expectEqual(@as(usize, 1), history.len);
+            try std.testing.expectEqualStrings("frozen dynamic canonical fixture", history[0].blocks[0].text);
+            try std.testing.expect(restored.app == null);
         }
-        // Valid lease/digest, but invalid HMAC and invalid payload JSON: auth
-        // must win over model resolution AND payload decoding on both paths.
+        // A damaged history payload is rejected even without authentication.
         var store = try Store.openExisting(a, std.testing.io, home);
         defer store.deinit();
         var parsed = try store.loadExisting();
@@ -639,21 +647,34 @@ test "llm Session dynamic frozen checkpoint survives lost window and delisting w
         parsed.value.selected_provider = "go";
         parsed.value.model = .{ .name = "cached.protochat", .protocol = .chat, .context_tokens = 1000000 };
         const snapshot = try selections.capture(parsed.value);
-        const wire = try codec.encode(a, id, &snapshot, "{bad-json", "fake-frozen-go", @splat(0));
+        const payload = "{\"version\":1,\"system\":\"hello\",\"messages\":[],\"selector\":{\"configured\":\"auto\",\"selected\":null},\"estimator\":{},\"last_context_tokens\":null,\"permission_id\":0}";
+        const wire = try codec.encode(a, id, &snapshot, payload);
         defer a.free(wire);
-        wire[36] ^= 1;
+        wire[wire.len - 1] = '!';
         var root = try @import("settings_store.zig").Store.open(a, std.testing.io, home);
         defer root.deinit();
         const resumes = @import("resume_store.zig");
         var lease = try resumes.Lease.open(&root.root, id, true);
-        try lease.save(&root.root, wire);
+        {
+            const previous = try lease.load(&root.root);
+            defer a.free(previous);
+            try lease.save(&root.root, wire);
+        }
         lease.deinit();
-        try std.testing.expectError(error.ResumeAuthenticationFailed, Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .resume_session = id }));
-        try std.testing.expectError(error.ResumeAuthenticationFailed, Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = id }));
+        if (Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .resume_session = id })) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.MalformedHistoryAccepted;
+        } else |_| {}
+        if (Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .restore_selection = id, .logging = false })) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.MalformedHistoryAccepted;
+        } else |_| {}
     }
 }
 
-test "llm selection optional provider name remains owned authenticated and legacy compatible" {
+test "llm selection optional provider name remains owned and legacy compatible" {
     var parsed = try cfg.parse(a, custom);
     defer cfg.release(&parsed);
     parsed.value.selected_provider = "alpha";
@@ -666,10 +687,9 @@ test "llm selection optional provider name remains owned authenticated and legac
     const owned = try selections.parse(a, writer.buffered(), id);
     @memset(&encoded, 0);
     try std.testing.expectEqualStrings("alpha", owned.providerName().?);
-    const framed = try codec.encode(a, id, &snapshot, "{}", "fake-key", @splat(0));
+    const framed = try codec.encode(a, id, &snapshot, "{\"version\":1,\"system\":\"\",\"messages\":[],\"selector\":{\"configured\":\"auto\",\"selected\":null},\"estimator\":{},\"last_context_tokens\":null,\"permission_id\":0}");
     defer a.free(framed);
-    var envelope = try codec.inspect(a, framed, id);
-    try codec.authenticate(&envelope, "fake-key");
+    const envelope = try codec.inspect(a, framed, id);
     try std.testing.expectEqualStrings("alpha", envelope.selection.providerName().?);
     const legacy = "{\"version\":1,\"session\":\"0123456789abcdef0123456789abcdef\",\"provider\":null,\"endpoint\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"model\":\"legacy\",\"protocol\":\"chat\",\"effort\":null,\"effort_hash\":null}";
     const old = try selections.parse(a, legacy, id);

@@ -90,8 +90,7 @@ export async function reviewRegressions(app) {
       if (kind === 'symlink-home') await symlink(home, alias);
       await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
       await writeFile(join(home, '.thin/config.json'), JSON.stringify({
-        provider: {base_url: `http://127.0.0.1:${server.address().port}`, api_key: KEY},
-        model: {name: 'fixture', protocol: 'chat', context_tokens: 32768},
+        llm: {default:'local/fixture',providers:{local:{base_url:`http://127.0.0.1:${server.address().port}`,api_key:KEY,models:{fixture:{protocol:'chat',context_tokens:32768}}}}},
         limits: {low_price_input: false, max_output_tokens: 100, summary_tokens: 100, safety_tokens: 100, request_timeout_ms: 5000, task_timeout_ms: 10000},
       }), {mode: 0o600});
       const args = ['--print', 'fixture-only', ...(kind === 'duplicate-tool-id' ? ['--trust'] : [])];

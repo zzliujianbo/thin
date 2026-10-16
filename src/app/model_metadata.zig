@@ -551,9 +551,7 @@ fn listingKey(id: providers.Id, key: ?[]const u8) ?[]const u8 {
 /// Private transport seam for owned loopback tests. Production callers can only
 /// reach it through fetch's fixed official endpoint, never through user URLs.
 fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8, limit: usize) ![]u8 {
-    var credentials: providers.Credentials = .{};
-    if (key) |k| credentials.set(.deepseek, k);
-    try credentials.validate();
+    try cfg.validateKeySource(.{ .base_url = url, .api_key = key });
     const authorization = if (key) |k| try std.fmt.allocPrint(a, "Bearer {s}", .{k}) else null;
     defer if (authorization) |header| {
         std.crypto.secureZero(u8, header);

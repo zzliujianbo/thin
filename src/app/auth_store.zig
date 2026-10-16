@@ -11,7 +11,16 @@ const Digest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
 /// 官方 DeepSeek 入门配置；未配置密钥时可加载，但不能发送提供方请求。
 const initial: cfg.Config = .{
-    .provider = .{ .base_url = "https://api.deepseek.com", .chat_max_tokens = true },
+    .registry = .{
+        .default = "deepseek/deepseek-flash",
+        .providers = &.{.{
+            .name = "deepseek",
+            .connection = .{ .base_url = "https://api.deepseek.com", .kind = .deepseek, .chat_max_tokens = true },
+            .models = &.{.{ .name = "deepseek-flash", .patch = .{ .protocol = .chat, .context_tokens = 1000000 } }},
+        }},
+    },
+    .selected_provider = "deepseek",
+    .provider = .{ .base_url = "https://api.deepseek.com", .kind = .deepseek, .chat_max_tokens = true },
     .model = .{ .name = "deepseek-flash", .context_tokens = 1000000, .protocol = .chat },
 };
 
@@ -119,7 +128,10 @@ pub const Store = struct {
         };
         errdefer bytes.deinit();
         var writer = std.Io.Writer.fixed(bytes.buffer);
-        cfg.writeDisk(config, &writer) catch return error.ConfigTooLarge;
+        cfg.writeDisk(config, &writer) catch |err| switch (err) {
+            error.WriteFailed => return error.ConfigTooLarge,
+            else => return err,
+        };
         writer.writeByte('\n') catch return error.ConfigTooLarge;
         bytes.len = writer.end;
         return bytes;
@@ -223,8 +235,11 @@ test "auth store missing and empty initialize once with private modes" {
     defer cfg.release(&parsed);
     try std.testing.expectEqualStrings("deepseek-flash", parsed.value.model.name);
     try std.testing.expectEqualStrings("https://api.deepseek.com", parsed.value.provider.base_url);
-    try std.testing.expectEqual(@as(u32, 1000000), parsed.value.model.context_tokens);
-    try std.testing.expectEqual(.chat, parsed.value.model.protocol);
+    try std.testing.expect(parsed.value.selection_pending);
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", parsed.value.registry.?.default);
+    const patch = parsed.value.registry.?.find("deepseek").?.patchFor("deepseek-flash").?;
+    try std.testing.expectEqual(@as(?u32, 1000000), patch.context_tokens);
+    try std.testing.expectEqual(.chat, patch.protocol.?);
     try std.testing.expect(parsed.value.provider.api_key == null);
     try std.testing.expect(parsed.value.provider.chat_max_tokens);
     try std.testing.expectEqualStrings("", parsed.value.provider.api_key_env);
@@ -255,7 +270,7 @@ test "auth store preserves every nonempty invalid file" {
     defer tmp.cleanup();
     var store = try testOpen(tmp.dir);
     defer store.deinit();
-    for ([_][]const u8{ "{", "not json", "{}", "\x00", "\x0b", "{\"provider\":{\"api_key\":\"fake-secret\"},\"unknown\":1}" }) |invalid| {
+    for ([_][]const u8{ "{", "not json", "{}", "\x00", "\x0b", "{\"provider\":{\"api_key\":\"fake-secret\"},\"unknown\":1}", "{\"provider\":{\"base_url\":\"https://api.deepseek.com\"},\"model\":{\"name\":\"deepseek-flash\",\"context_tokens\":1000000}}" }) |invalid| {
         try store.root.dir.writeFile(std.testing.io, .{ .sub_path = cfg.file_name, .data = invalid });
         if (store.loadOrInitialize()) |result| {
             var unexpected = result;
@@ -267,6 +282,35 @@ test "auth store preserves every nonempty invalid file" {
         try std.testing.expectEqualStrings(invalid, current.data());
         try std.testing.expect(store.expected_version == null);
     }
+}
+
+test "auth store rejects legacy disk and runtime-only saves without overwriting" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testOpen(tmp.dir);
+    defer store.deinit();
+    const legacy =
+        \\{"provider":{"base_url":"https://api.deepseek.com"},"model":{"name":"deepseek-flash","context_tokens":1000000}}
+    ;
+    try store.root.dir.writeFile(std.testing.io, .{ .sub_path = cfg.file_name, .data = legacy });
+    try std.testing.expectError(error.UnknownField, store.loadOrInitialize());
+    try std.testing.expectError(error.UnknownField, store.loadExisting());
+    try std.testing.expect(store.expected_version == null);
+    var old_bytes = (try store.read()).?;
+    defer old_bytes.deinit();
+    try std.testing.expectEqualStrings(legacy, old_bytes.data());
+    try store.root.dir.deleteFile(std.testing.io, cfg.file_name);
+    var parsed = try store.loadOrInitialize();
+    defer cfg.release(&parsed);
+    const version = store.expected_version.?;
+    var runtime_only = initial;
+    runtime_only.registry = null;
+    try std.testing.expectError(error.MissingRegistry, store.save(runtime_only));
+    try std.testing.expectEqual(version, store.expected_version.?);
+    var unchanged = try store.loadExisting();
+    defer cfg.release(&unchanged);
+    try std.testing.expectEqual(version, store.expected_version.?);
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", unchanged.value.registry.?.default);
 }
 
 test "auth store explicit save mode and version conflict" {
@@ -281,12 +325,13 @@ test "auth store explicit save mode and version conflict" {
     defer two.deinit();
     var second = try two.loadOrInitialize();
     defer cfg.release(&second);
-    var changed = initial;
-    changed.provider.api_key = "fake-secret-only";
+    var changed = try cfg.clone(std.testing.allocator, parsed.value);
+    defer cfg.release(&changed);
+    try cfg.setRegistryCredential(changed.arena.allocator(), &changed.value, "deepseek", "fake-secret-only");
     try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(one.root.dir.handle, cfg.file_name, 0o644, 0));
-    try one.save(changed);
+    try one.save(changed.value);
     try std.testing.expectError(error.AuthVersionConflict, two.save(initial));
-    try one.save(changed);
+    try one.save(changed.value);
     const stat = try one.root.dir.statFile(std.testing.io, cfg.file_name, .{});
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
     var loaded = try two.loadOrInitialize();
@@ -298,7 +343,7 @@ test "auth store explicit save mode and version conflict" {
     defer cfg.release(&stable);
     try std.testing.expectEqual(saved_version, two.expected_version.?);
     try one.root.dir.deleteFile(std.testing.io, cfg.file_name);
-    try std.testing.expectError(error.AuthVersionConflict, one.save(changed));
+    try std.testing.expectError(error.AuthVersionConflict, one.save(changed.value));
 }
 
 extern "c" fn mkfifoat(c_int, [*:0]const u8, c_uint) c_int;

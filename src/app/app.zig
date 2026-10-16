@@ -15,7 +15,6 @@ const session_context = @import("../core/session_context.zig");
 const model_resolver = @import("model_resolver.zig");
 
 fn rememberConfiguredKeys(journal: *Journal, config: cfg.Config, environ: *const std.process.Environ.Map) !void {
-    for (cfg.providers.Id.all) |id| if (config.credentials.get(id)) |saved| try journal.rememberKey(saved);
     if (config.registry) |registry| for (registry.providers) |provider| {
         if (provider.connection.api_key) |key| try journal.rememberKey(key);
         if (provider.connection.api_key_env.len != 0) {
@@ -66,7 +65,16 @@ pub const App = struct {
         const home = environ.get("HOME") orelse return error.MissingHome;
         const path = try cfg.defaultPath(a, home);
         defer a.free(path);
-        var parsed = try cfg.load(a, io, path);
+        var parsed = cfg.load(a, io, path) catch |err| switch (err) {
+            // Use the same new-schema initializer as interactive startup. A
+            // truncated nonempty document is rechecked, never overwritten.
+            error.FileNotFound, error.UnexpectedEndOfInput => blk: {
+                var store = try @import("auth_store.zig").Store.open(a, io, home);
+                defer store.deinit();
+                break :blk try store.loadOrInitialize();
+            },
+            else => return err,
+        };
         // Derived defaults are not embedded in config.json. Headless entry can
         // reuse a compatible cached profile without creating/fetching metadata.
         // Price thresholds are always derived, even with explicit reasoning/output.
@@ -77,16 +85,10 @@ pub const App = struct {
                 defer value.deinit();
                 cache = metadata.load(&value.root) catch metadata.Cache{};
             }
-            if (parsed.value.registry != null) {
-                model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &cache) catch |err| {
-                    cfg.release(&parsed);
-                    return err;
-                };
-            } else {
-                metadata.applyReasoning(&cache, &parsed.value);
-                metadata.applyOutput(&cache, &parsed.value);
-                model_resolver.applyInputThreshold(&cache, &parsed.value);
-            }
+            model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &cache) catch |err| {
+                cfg.release(&parsed);
+                return err;
+            };
         }
         // Headless entry creates the same missing project default as the TUI,
         // without changing the global configuration on disk.
@@ -299,6 +301,29 @@ pub const App = struct {
     }
 };
 
+test "headless missing and blank configuration use the same new schema without requests" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |blank| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [4096]u8 = undefined;
+        const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+        var store = try @import("auth_store.zig").Store.open(a, io, home);
+        defer store.deinit();
+        if (blank) try store.root.writeMode(cfg.file_name, " \t\n", false, 0o600);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        try std.testing.expectError(error.ApiKeyNotFound, App.init(a, io, &env, home, .{}, false));
+        var created = try store.loadExisting();
+        defer cfg.release(&created);
+        try std.testing.expect(created.value.registry != null);
+        try std.testing.expectEqualStrings("deepseek/deepseek-flash", created.value.registry.?.default);
+        try std.testing.expect(created.value.registry.?.providers[0].connection.api_key == null);
+    }
+}
+
 // 配置加载可经由符号链接，但文件工具必须保护最终实际文件，而非 HOME 的词法别名。
 test {
     _ = @import("llm_app_test.zig");
@@ -308,7 +333,7 @@ test "App protects actual configuration behind HOME and file symlinks" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const fake =
-        \\{"provider":{"base_url":"http://unused.invalid","api_key":"fake-review-key"},"model":{"name":"fake","context_tokens":32768,"protocol":"chat"}}
+        \\{"llm":{"default":"fixture/fake","providers":{"fixture":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat"}}}}}}
     ;
     for ([_]bool{ false, true }) |linked_file| {
         var tmp = std.testing.tmpDir(.{});

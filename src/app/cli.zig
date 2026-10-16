@@ -125,25 +125,25 @@ pub const help =
     \\content may remain. Records are not restored or automatically sent to the provider.
     \\Large fields are explicitly truncated/omitted; files rotate without deleting old records.
     \\View locally with ls -lt .thin/sessions and tail -f <chosen.jsonl>.
-    \\<session-id>.session is the authenticated checkpoint for that id. It stores the
+    \\<session-id>.session is the saved conversation for that id. It stores the
     \\full context and the committed provider/model/protocol/effort selection.
     \\It is rewritten after each completed model turn, tool result, compaction,
     \\cancellation, and again on normal exit. Each publish is an atomic rename plus fsync.
-    \\Resume accepts only a clean lock marker C. A crash during a tool leaves marker A
-    \\and refuses that generation. A crash during a model call keeps the previous C.
+    \\Loading checks bounded file structure, not API credentials or frozen request budgets.
+    \\Available saved history can be opened even after an interrupted run.
     \\--restore-selection reads that selection into a NEW EMPTY CHAT.
     \\It does NOT restore conversation history, tools, native replay or the old session ID.
-    \\Credentials are resolved locally; missing endpoints, keys or custom profiles are refused.
-    \\Old IDs without a clean checkpoint are not guessed. --print cannot restore a selection.
+    \\Missing providers, keys or usable model settings are shown in the dialogue interface.
+    \\Use /login or /model before sending. --print cannot restore a selection.
     \\--no-log disables checkpoint writes, but still allows reading an old checkpoint.
     \\--resume continues that SAME ID and model context, including native provider state.
     \\Loading never sends a request or reruns tools; only new input starts work.
     \\The exit command is printed only after a successful full save. Empty chats create none.
     \\Checkpoints are private PLAINTEXT (0600), not redacted or encrypted; they can contain
     \\prompts, tool output and opaque reasoning. API credentials are resolved locally.
-    \\Authentication is bound to the current key: key rotation or tampering refuses resume.
+    \\Changing an API key does not prevent loading. There is no key-bound authentication.
     \\Compacted context stays lossy; discarded pre-compaction history cannot be recovered.
-    \\No automatic crash recovery: interrupted/poisoned resumed sessions are refused.
+    \\Loading never replays an interrupted tool or grants historical approvals.
     \\--no-log writes no checkpoint and prints no command for unsaved changes.
     \\Resume uses the startup project and bypasses saved project selection preferences.
     \\No model probing or cache warming. Usage is reported when available;

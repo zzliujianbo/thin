@@ -5,6 +5,39 @@ const std = @import("std");
 const max_rows = 200;
 const max_bytes = 4 * 1024 * 1024;
 
+/// ACK-owned visible transcript immediately above the live tail, and rows
+/// temporarily borrowed into it by a popup. Never derived from canonical history:
+/// these are the exact styled rows actually written at this terminal width.
+pub const MenuHistory = struct {
+    arena: std.heap.ArenaAllocator,
+    above: []const []const u8,
+    borrowed: []const []const u8,
+
+    pub fn capture(a: std.mem.Allocator, above: []const []const u8, borrowed: []const []const u8) !MenuHistory {
+        if (above.len + borrowed.len > max_rows) return error.InvalidTailFrame;
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        var bytes: usize = 0;
+        const groups = [_][]const []const u8{ above, borrowed };
+        var owned: [2][]const []const u8 = undefined;
+        for (groups, 0..) |group, i| {
+            const copy = try arena.allocator().alloc([]const u8, group.len);
+            for (group, copy) |line, *row| {
+                if (line.len > max_bytes - bytes) return error.InvalidTailFrame;
+                bytes += line.len;
+                row.* = try arena.allocator().dupe(u8, line);
+            }
+            owned[i] = copy;
+        }
+        return .{ .arena = arena, .above = owned[0], .borrowed = owned[1] };
+    }
+
+    pub fn deinit(self: *MenuHistory) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Snapshot = struct {
     arena: std.heap.ArenaAllocator,
     rows: []const []const u8,
@@ -482,6 +515,22 @@ test "growing diff accepts exact combined row bound" {
     try std.testing.expectEqual(8191 * 2 + suffix.len, out.written().len);
     for (0..8191) |i| try std.testing.expectEqualStrings("\r\n", out.written()[i * 2 ..][0..2]);
     try std.testing.expectEqualStrings(suffix, out.written()[8191 * 2 ..]);
+}
+
+fn menuHistoryAllocationScenario(a: std.mem.Allocator) !void {
+    var raw = "committed row".*;
+    var history = try MenuHistory.capture(a, &.{&raw}, &.{stable});
+    defer history.deinit();
+    @memset(&raw, 'x');
+    try std.testing.expectEqualStrings("committed row", history.above[0]);
+    try std.testing.expectEqualStrings(stable, history.borrowed[0]);
+}
+
+test "popup history copies are independent bounded and allocation failure safe" {
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), menuHistoryAllocationScenario, .{});
+    var rows: [201][]const u8 = @splat("");
+    try std.testing.expectError(error.InvalidTailFrame, MenuHistory.capture(std.testing.allocator, &rows, &.{}));
 }
 
 test "exhaustive capture allocation failures leak no bytes" {

@@ -1,5 +1,6 @@
-//! Authenticated checkpoint payload, NOT diagnostic JSONL. Authenticate bytes before
-//! decode; validate against the locally resolved config before publishing any state.
+//! Untrusted displayable checkpoint payload, NOT diagnostic JSONL.
+//! Decode checks representability only. validateRequestHistory is a separate,
+//! mandatory pre-send check against the actual current request.
 //! No credentials, authorization grants, I/O or model execution live here.
 const std = @import("std");
 const p = @import("protocol.zig");
@@ -21,19 +22,15 @@ pub const State = struct {
     selector: llm.Selector,
     estimator: context.Estimator,
     last_context_tokens: ?u64,
-    /// Selected capacity; absent in legacy payloads. Apply after authentication
-    /// and before Runtime construction, never from diagnostic metadata.
+    /// Archived display/resave metadata; never overrides current declarations.
     context_tokens: ?u32 = null,
     /// UI provenance only; the parent Session owns saving/restoring this flag.
     context_official: bool = false,
-    /// Authenticated frozen output capability; frozen null deliberately means
-    /// unknown, not permission to refresh metadata during resume.
+    /// Archived output metadata, not permission to change current output policy.
     output_tokens: ?u32 = null,
     output_source: cfg.ReasoningSource = .explicit,
     output_budget_frozen: bool = false,
-    /// Frozen derived price metadata plus the user-authorized input policy.
-    /// Limits must still match current declarations; restore cannot silently
-    /// relax a newer policy or use a refreshed price step for an old task.
+    /// Archived input metadata for display/resave, not a trusted runtime policy.
     input_budget_frozen: bool = false,
     input_price_threshold: ?u32 = null,
     max_input_tokens: ?u32 = null,
@@ -183,23 +180,6 @@ fn utf8(s: []const u8) !void {
 
 fn basic(state: State) !void {
     if (state.version != 1) return error.UnsupportedVersion;
-    if (state.context_tokens) |tokens| {
-        if (tokens == 0 or tokens > 16 * 1024 * 1024) return error.InvalidContextTokens;
-    } else if (state.context_official) return error.InvalidContextSource;
-    if (state.output_tokens) |tokens| {
-        if (tokens == 0 or tokens > 1024 * 1024) return error.InvalidOutputTokens;
-    }
-    if (state.input_price_threshold) |tokens| {
-        if (tokens == 0 or tokens > 16 * 1024 * 1024) return error.InvalidInputBudget;
-    }
-    var policy: cfg.Limits = .{};
-    policy.max_input_tokens = state.max_input_tokens;
-    policy.low_price_input = state.low_price_input;
-    policy.input_margin_tokens = state.input_margin_tokens;
-    cfg.validateInputLimits(policy) catch return error.InvalidInputBudget;
-    if (!state.input_budget_frozen and
-        (state.input_price_threshold != null or state.max_input_tokens != null or state.low_price_input or state.input_margin_tokens != 5000))
-        return error.InvalidInputBudget;
     try utf8(state.system);
     if (state.messages.len > 1024) return error.InputLimit;
     var blocks: usize = 0;
@@ -227,44 +207,37 @@ fn basic(state: State) !void {
     }
 }
 
-pub fn validate(a: Allocator, state: State, config: cfg.Config, schemas: []const p.ToolSchema) !void {
+/// Structural bounds for owned copying or saving, never a request permission.
+pub fn validateStructure(state: State) !void {
     _ = try encodedSize(state);
-    if (state.poisoned) return error.PoisonedCheckpoint;
-    if (state.context_tokens) |tokens| {
-        if (tokens != config.model.context_tokens) return error.ContextBudgetMismatch;
-    }
-    if (state.output_budget_frozen and
-        (state.output_tokens != config.model.output_tokens or state.output_source != config.model.output_source))
-        return error.OutputBudgetMismatch;
-    if (state.input_budget_frozen and
-        (state.input_price_threshold != config.model.input_price_threshold or
-            state.max_input_tokens != config.limits.max_input_tokens or
-            state.low_price_input != config.limits.low_price_input or
-            state.input_margin_tokens != config.limits.input_margin_tokens))
-        return error.InputBudgetMismatch;
-    if (state.estimator.per_mille < 1000) return error.InvalidEstimator;
-    const selector = state.selector;
-    if (selector.configured != config.model.protocol or selector.selected == .auto or
-        (selector.configured != .auto and selector.selected != selector.configured)) return error.InvalidSelector;
-    if (selector.configured == .auto and selector.selected == null and llm.hasModelHistory(state.messages)) return error.InvalidSelector;
-    const proto = selector.effective();
-    const req = p.Request{
+}
+
+/// Legacy convenience for callers explicitly checking request compatibility.
+/// Never call this to decide whether a checkpoint can be displayed or saved.
+pub fn validate(a: Allocator, state: State, config: cfg.Config, schemas: []const p.ToolSchema) !void {
+    try validateStructure(state);
+    const proto = if (config.model.protocol == .auto) state.selector.effective() else config.model.protocol;
+    try validateRequestHistory(a, .{
         .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = proto },
         .system = state.system,
         .messages = state.messages,
         .tools = schemas,
-        // This request is encoded only to validate canonical/native history,
-        // never sent. Even an overfull archive must remain saveable/resumable
-        // for later compaction; Runtime independently rejects zero room before
-        // any real request. Use a positive validation-only sentinel in that case.
-        .max_output_tokens = context.outputBudget(config, .normal, state.estimator.tokens(context.rawTokens(state.system, schemas, state.messages))) catch 1,
-    };
+        .max_output_tokens = 1,
+    });
+}
+
+/// Validate the ACTUAL request, independent of persisted selectors, budgets or
+/// poison flags. Used before every model boundary, including fake models.
+pub fn validateRequestHistory(a: Allocator, req: p.Request) !void {
+    const proto = req.scope.protocol;
+    if (proto == .auto) return error.InvalidSelector;
+    try basic(.{ .system = req.system, .messages = req.messages, .selector = llm.Selector.init(proto), .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
     try common.validateRequest(req, proto);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const t = arena.allocator();
     var ids = std.StringHashMap(void).init(t);
-    for (state.messages) |m| {
+    for (req.messages) |m| {
         if (m.role == .tool and m.blocks.len == 0) return error.InvalidHistory;
         for (m.blocks) |b| switch (b) {
             .text => if (m.role == .tool) return error.InvalidHistory,
@@ -293,7 +266,7 @@ pub fn validate(a: Allocator, state: State, config: cfg.Config, schemas: []const
         }
     }
     // boundaries allocates before some errors; the temporary arena owns failures.
-    _ = try context.boundaries(t, state.messages);
+    _ = try context.boundaries(t, req.messages);
     // Exercise actual outgoing history validation, including native item expansion
     // count limits and Responses' native-reasoning requirement. No network calls.
     const wire = switch (proto) {
@@ -502,28 +475,31 @@ test "checkpoint legacy missing capacity and explicit defaults remain accepted" 
     }
 }
 
-test "checkpoint capacity bounds and provenance require valid capacity" {
+test "checkpoint display accepts representable stale budgets and provenance but not wrong types" {
     const a = std.testing.allocator;
     var state = fixture(.chat);
     for ([_]u32{ 0, 16 * 1024 * 1024 + 1, std.math.maxInt(u32) }) |tokens| {
         state.context_tokens = tokens;
-        try std.testing.expectError(error.InvalidContextTokens, encode(a, state));
-        try std.testing.expectError(error.InvalidContextTokens, validate(a, state, fixture_config, &.{}));
+        state.output_tokens = tokens;
+        state.input_price_threshold = tokens;
+        state.input_margin_tokens = tokens;
+        const bytes = try encode(a, state);
+        defer a.free(bytes);
+        const parsed = try decode(a, bytes);
+        defer parsed.deinit();
+        try std.testing.expectEqualDeep(state, parsed.value);
     }
     state.context_tokens = null;
     state.context_official = true;
-    try std.testing.expectError(error.InvalidContextSource, encode(a, state));
-    try std.testing.expectError(error.InvalidContextSource, validate(a, state, fixture_config, &.{}));
-    const bytes = try encode(a, fixture(.chat));
+    const bytes = try encode(a, state);
     defer a.free(bytes);
-    for ([_][]const u8{ "\"context_tokens\":0", "\"context_tokens\":16777217", "\"context_tokens\":\"32768\"", "\"context_tokens\":1.0", "\"context_tokens\":-1" }) |replacement| {
+    const parsed = try decode(a, bytes);
+    defer parsed.deinit();
+    for ([_][]const u8{ "\"context_tokens\":\"32768\"", "\"context_tokens\":1.0", "\"context_tokens\":-1", "\"context_tokens\":4294967296" }) |replacement| {
         const bad = try std.mem.replaceOwned(u8, a, bytes, "\"context_tokens\":null", replacement);
         defer a.free(bad);
         try badDecode(bad);
     }
-    const bad_source = try std.mem.replaceOwned(u8, a, bytes, "\"context_official\":false", "\"context_official\":true");
-    defer a.free(bad_source);
-    try std.testing.expectError(error.InvalidContextSource, decode(a, bad_source));
 }
 
 test "checkpoint exact capacity provenance roundtrip and config match preserve validation" {
@@ -539,12 +515,12 @@ test "checkpoint exact capacity provenance roundtrip and config match preserve v
                 const parsed = try decode(a, bytes);
                 defer parsed.deinit();
                 try std.testing.expectEqualDeep(state, parsed.value);
-                try std.testing.expectError(error.ContextBudgetMismatch, validate(a, parsed.value, fixture_config, &.{}));
+                try validate(a, parsed.value, fixture_config, &.{});
                 var config = fixture_config;
                 config.model.context_tokens = tokens;
                 try validate(a, parsed.value, config, &.{});
                 state.estimator.per_mille = 999;
-                try std.testing.expectError(error.InvalidEstimator, validate(a, state, config, &.{}));
+                try validate(a, state, config, &.{});
                 state.estimator = parsed.value.estimator;
                 state.messages = state.messages[0..3];
                 try std.testing.expectError(error.IncompleteToolGroup, validate(a, state, config, &.{}));
@@ -618,29 +594,19 @@ fn tryVersionPrefix(v: []const u8) []const u8 {
     return "\"version\":-1";
 }
 
-test "checkpoint rejects poison estimator selector and actual connection model protocol scope" {
+test "checkpoint loads poison estimator selector independently from pre-send scope checks" {
     const a = std.testing.allocator;
     var s = fixture(.chat);
     s.poisoned = true;
-    try std.testing.expectError(error.PoisonedCheckpoint, validate(a, s, fixture_config, &.{}));
+    s.estimator.per_mille = 0;
+    s.selector = .{ .configured = .anthropic, .selected = .auto };
+    const bytes = try encode(a, s);
+    defer a.free(bytes);
+    const parsed = try decode(a, bytes);
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(s, parsed.value);
     s = fixture(.chat);
-    s.estimator.per_mille = 999;
-    try std.testing.expectError(error.InvalidEstimator, validate(a, s, fixture_config, &.{}));
-    for ([_]llm.Selector{
-        .{ .configured = .chat, .selected = .chat },
-        .{ .configured = .auto, .selected = .auto },
-        .{ .configured = .auto, .selected = null },
-    }) |selector| {
-        s = fixture(.chat);
-        s.selector = selector;
-        try std.testing.expectError(error.InvalidSelector, validate(a, s, fixture_config, &.{}));
-    }
     var config = fixture_config;
-    config.model.protocol = .chat;
-    s.selector = .{ .configured = .chat, .selected = .responses };
-    try std.testing.expectError(error.InvalidSelector, validate(a, s, config, &.{}));
-    s = fixture(.chat);
-    config = fixture_config;
     config.provider.base_url = "https://other.invalid";
     try std.testing.expectError(error.ReplayScopeMismatch, validate(a, s, config, &.{}));
     config = fixture_config;

@@ -95,6 +95,11 @@ pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
     var pending: usize = 0;
     for (req.messages) |m| {
         if (m.role != .tool and pending != 0) return error.UnmatchedToolCall;
+        // Prefix normalization can leave a thinking-only assistant with no
+        // canonical blocks. It has no visible content and must not become an
+        // illegal empty API message. Native empty-thinking blocks are different:
+        // their signed replay must still be sent unchanged when valid.
+        if (m.role == .assistant and m.replay == null and m.blocks.len == 0) continue;
         var content = j.array(t);
         if (m.replay) |r| {
             const native = try c.parse(t, r.json);
@@ -164,6 +169,7 @@ pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
 const Item = struct {
     native: j.Value,
     text: c.Chunks = .{},
+    signature: c.Chunks = .{},
     args: c.Chunks = .{},
     tool_index: usize = 0,
 };
@@ -291,6 +297,13 @@ pub const Stream = struct {
             if (c.eq(kind, "text") or c.eq(kind, "thinking")) {
                 const s = try c.text(b, if (c.eq(kind, "text")) "text" else "thinking");
                 try item.text.add(self.a, s);
+                if (c.eq(kind, "thinking")) {
+                    if (j.get(b, "signature")) |signature| {
+                        const initial = j.string(signature) orelse return error.InvalidEvent;
+                        try item.signature.add(self.a, initial);
+                        if (initial.len > 0) self.observed = true;
+                    }
+                }
                 if (s.len > 0) {
                     self.observed = true;
                     try self.sink.emit(if (c.eq(kind, "text")) .{ .text_delta = s } else .{ .reasoning_delta = s });
@@ -324,8 +337,9 @@ pub const Stream = struct {
                 if (s.len > 0) self.observed = true;
                 try self.sink.emit(if (c.eq(kind, "text")) .{ .text_delta = s } else .{ .reasoning_delta = s });
             } else if (c.eq(kind, "thinking") and c.eq(dt, "signature_delta")) {
-                try j.put(self.a, &item.native, "signature", j.str(try self.a.dupe(u8, try c.text(delta, "signature"))));
-                self.observed = true;
+                const s = try c.text(delta, "signature");
+                try item.signature.add(self.a, s);
+                if (s.len > 0) self.observed = true;
             } else if (c.eq(kind, "tool_use") and c.eq(dt, "input_json_delta")) {
                 const s = try c.text(delta, "partial_json");
                 try item.args.add(self.a, s);
@@ -336,6 +350,7 @@ pub const Stream = struct {
         if (!c.eq(typ, "content_block_stop")) return error.InvalidEvent;
         if (c.eq(kind, "text") or c.eq(kind, "thinking")) {
             try j.put(self.a, &item.native, if (c.eq(kind, "text")) "text" else "thinking", j.str(try item.text.join(self.a)));
+            if (c.eq(kind, "thinking")) try j.put(self.a, &item.native, "signature", j.str(try item.signature.join(self.a)));
             // nativeBlocks validates replay signatures only on a successful
             // completed message; cap-truncated reasoning is never replayed.
         } else if (c.eq(kind, "tool_use") and item.args.len > 0) {

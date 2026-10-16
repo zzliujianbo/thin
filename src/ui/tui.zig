@@ -388,6 +388,11 @@ const Ui = struct {
     /// writes publish the candidate as a reusable acknowledged tail snapshot.
     frame_tail_snapshot: ?tail_frame.Snapshot = null,
     tail_snapshot: ?tail_frame.Snapshot = null,
+    menu_history: ?tail_frame.MenuHistory = null,
+    frame_menu_history: ?tail_frame.MenuHistory = null,
+    /// Rebuild a display-only history window after resize revokes a popup's
+    /// physical backing coordinates. Never replay these rows as model history.
+    menu_history_recovery: bool = false,
     /// Sparse relative edits cannot survive reflow: keep a full one-pass tail
     /// in the same frame arena for CAN/bottom recovery after any resize.
     frame_full_tail: []const u8 = "",
@@ -424,6 +429,8 @@ const Ui = struct {
         if (self.frame_arena) |*arena| arena.deinit();
         if (self.frame_tail_snapshot) |*snapshot| snapshot.deinit();
         if (self.tail_snapshot) |*snapshot| snapshot.deinit();
+        if (self.menu_history) |*history| history.deinit();
+        if (self.frame_menu_history) |*history| history.deinit();
         for (self.records.items) |*record| record.deinit(self.allocator);
         self.records.deinit(self.allocator);
         self.secret.deinit();
@@ -490,13 +497,15 @@ const Ui = struct {
             },
             .tool => for (message.blocks) |block| switch (block) {
                 .tool_result => |result| {
-                    const tool_name = find_name: {
+                    const tool_name: ?[]const u8 = find_name: {
                         for (messages[0..index]) |prior| for (prior.blocks) |candidate| {
                             if (candidate == .tool_call and std.mem.eql(u8, candidate.tool_call.id, result.call_id)) break :find_name candidate.tool_call.name;
                         };
-                        return error.OrphanToolResult;
+                        break :find_name null;
                     };
-                    const caption = try self.nextToolCaption(tool_name);
+                    // Display is not outgoing-history validation. A saved result
+                    // without its call is still readable and never executable.
+                    const caption = if (tool_name) |name| try self.nextToolCaption(name) else presentation.Caption{ .kind = .other, .label = try self.allocator.dupe(u8, "Saved tool result") };
                     defer caption.deinit(self.allocator);
                     try self.toolCompleted(caption, .{ .text = result.text, .is_error = result.is_error, .canceled = result.canceled, .truncated = result.truncated });
                 },
@@ -588,11 +597,13 @@ const Ui = struct {
             }
         }
         if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
-        if (notice.len == 0 and state.runtime == null) notice = "Not configured: /login";
+        if (notice.len == 0 and state.runtime == null and state.settings_notice == null) notice = "Not configured: /login";
         if (state.settings_error) |err| {
             notice = try std.fmt.allocPrint(a, "{s}{s}SETTINGS FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
         } else if (!model_failed) {
-            if (state.settings_notice) |warning| notice = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ notice, if (notice.len != 0) " | " else "", warning });
+            if (state.settings_notice) |warning| {
+                if (!std.mem.eql(u8, notice, warning)) notice = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ notice, if (notice.len != 0) " | " else "", warning });
+            }
         }
         if (state.log_error) |err| return std.fmt.allocPrint(a, "{s}{s}REC FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
         if (!state.logging_enabled) return std.fmt.allocPrint(a, "{s}{s}recording off", .{ notice, if (notice.len != 0) " | " else "" });
@@ -1025,7 +1036,7 @@ const Ui = struct {
                 }
                 try self.startCompaction(runtime);
             } else {
-                self.notice = "Not configured: use /login first";
+                self.notice = self.connection.current().settings_notice orelse "Not configured: use /login first";
             }
             return;
         }
@@ -1080,9 +1091,10 @@ const Ui = struct {
 
         if (std.mem.trim(u8, self.editor.bytes.items, " \t\r\n").len == 0) return;
 
-        const runtime = self.connection.current().runtime orelse {
+        const state = self.connection.current();
+        const runtime = state.runtime orelse {
             self.wipeEditor();
-            self.notice = "Not configured: use /login first";
+            self.notice = state.settings_notice orelse "Not configured: use /login first";
             return;
         };
 
@@ -1522,6 +1534,10 @@ const Ui = struct {
     fn resize(self: *Ui, dimensions: terminal_module.Size) void {
         if (dimensions.columns == self.size.columns and dimensions.rows == self.size.rows) return;
         self.size = dimensions;
+        if ((self.records.items.len != 0 and (self.provider_open or self.model_picker != null or self.commandMenuVisible())) or
+            (self.menu_history != null and self.menu_history.?.borrowed.len != 0) or
+            (self.frame_menu_history != null and self.frame_menu_history.?.borrowed.len != 0))
+            self.menu_history_recovery = true;
         self.displayed_permission = null;
         self.displayed_model_epoch = null;
         self.displayed_model_generation = null;
@@ -1583,6 +1599,12 @@ const Ui = struct {
             self.tail_snapshot = self.frame_tail_snapshot;
         } else if (self.frame_tail_snapshot) |*snapshot| snapshot.deinit();
         self.frame_tail_snapshot = null;
+        if (self.menu_history) |*history| history.deinit();
+        self.menu_history = null;
+        if (self.frame_fresh) {
+            self.menu_history = self.frame_menu_history;
+        } else if (self.frame_menu_history) |*history| history.deinit();
+        self.frame_menu_history = null;
         if (self.frame_arena) |*arena| arena.deinit();
         self.frame_arena = null;
         self.frame_full_tail = "";
@@ -1614,6 +1636,7 @@ const Ui = struct {
         if (!self.ctrl_d_exit or self.has_submitted or self.busy or self.future != null or
             self.frame.len != 0 or self.resize_rescue.len != 0 or !self.frame_fresh or
             self.abandon_tail or self.tail_snapshot == null or self.tail_height == 0 or
+            (self.menu_history != null and self.menu_history.?.borrowed.len != 0) or self.menu_history_recovery or
             self.tail_height > self.size.rows or self.tail_size.rows != self.size.rows or
             self.tail_size.columns != self.size.columns) return false;
         try writer.writeAll(terminal_module.sync_begin ++ "\x1b[?25l\r");
@@ -1688,12 +1711,25 @@ const Ui = struct {
         }
 
         self.frame_clear_end = out.written().len;
+        const history_valid = !self.abandon_tail and self.tail_size.columns == self.size.columns and
+            self.tail_size.rows == self.size.rows and self.menu_history != null;
+        var above: []const []const u8 = if (history_valid) self.menu_history.?.above else &.{};
+        var borrowed: []const []const u8 = if (history_valid) self.menu_history.?.borrowed else &.{};
 
         // Native scrollback is an appendable document, not a sliding window.
         // Streamed body prefixes may leave the mutable tail as DISPLAY previews;
         // canonical flags/history remain separate. Thinking is always transient.
         var lines: std.ArrayList([]const u8) = .empty;
-        const preview = self.scroll != 0;
+        if (self.menu_history_recovery) {
+            for (self.records.items) |record| {
+                // New real output returns to normal append/commit semantics.
+                if (!record.output and record.kind != .reasoning) {
+                    self.menu_history_recovery = false;
+                    break;
+                }
+            }
+        }
+        const preview = self.scroll != 0 or self.menu_history_recovery;
         const flow_allowed = !preview and self.size.rows >= 7 and cols >= 8 and
             self.permission == null and self.model_picker == null and !self.provider_open and
             !self.commandMenuVisible() and !self.secret_mode and !self.secret_quarantine;
@@ -1770,6 +1806,21 @@ const Ui = struct {
             }
             previous_kind = record.kind;
         }
+        // A real transcript advance releases the borrowed prefix at its original
+        // document coordinates before committing new rows. A menu-only redraw
+        // instead keeps it reversible (no scrollback duplication).
+        if (transcript_rows != 0 and borrowed.len != 0) {
+            var rebuilt: std.Io.Writer.Allocating = .init(a);
+            try rebuilt.writer.writeAll(out.written()[0..self.frame_clear_end]);
+            for (borrowed) |line| {
+                try rebuilt.writer.writeAll(line);
+                try rebuilt.writer.writeAll("\r\n");
+            }
+            try rebuilt.writer.writeAll(out.written()[self.frame_clear_end..]);
+            out = rebuilt;
+            transcript_rows += borrowed.len;
+            borrowed = &.{};
+        }
         if (!preview and self.active_tool != null) {
             if (previous_kind) |prior| if (prior != .tool) try lines.append(a, "");
             try lines.append(a, try self.pendingCommand(a, @max(1, cols)));
@@ -1808,18 +1859,20 @@ const Ui = struct {
         // Always reserve one EMPTY row between conversation and composer.
         const footer_rows: usize = 2 + @as(usize, @intFromBool(hint_line.len != 0));
         const body_limit = self.size.rows -| footer_rows;
-        const picker_rows = if (self.model_picker) |*picker| try picker.rowsWithState(a, state.selection_name orelse state.model, state.context_limit, state.models, cols, body_limit, .{ .current = state.context_official, .models = state.model_context_official }, state.model_disabled) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
-        const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, body_limit) else provider_picker_module.Rows{ .lines = &.{} };
+        const candidate_limit = body_limit -| 1; // Separate candidates from conversation even in short windows.
+        const picker_rows = if (self.model_picker) |*picker| try picker.rowsWithState(a, state.selection_name orelse state.model, state.context_limit, state.models, cols, candidate_limit, .{ .current = state.context_official, .models = state.model_context_official }, state.model_disabled) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
+        const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, candidate_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
         const menu_visible = self.commandMenuVisible();
-        const menu_rows = if (menu_visible) try command_menu_module.rows(a, self.command_matches, self.command_menu.selected, cols, body_limit) else command_menu_module.Rows{ .lines = &.{} };
+        const menu_rows = if (menu_visible) try command_menu_module.rows(a, self.command_matches, self.command_menu.selected, cols, candidate_limit) else command_menu_module.Rows{ .lines = &.{} };
         if (menu_visible) self.command_menu.selected = @min(self.command_menu.selected, self.command_matches.len - 1);
         // All candidate menus share one bottom-pinned popup slot. Secondary
         // pickers must not replace the top of the transcript body.
         const popup_lines = if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else menu_rows.lines;
         const selected_line = if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else menu_rows.selected_line;
         const checked_mask: u16 = if (self.provider_open) provider_rows.checked_mask else if (self.model_picker != null) picker_rows.checked_mask else 0;
-        const content_body_limit = body_limit -| popup_lines.len;
+        const popup_gap: usize = @intFromBool(popup_lines.len != 0);
+        const content_body_limit = body_limit -| (popup_lines.len + popup_gap);
         self.frame_model_epoch = null;
         self.frame_model_generation = null;
         const wanted_body = if (self.permission != null)
@@ -1830,7 +1883,45 @@ const Ui = struct {
         // Never shrink a tail without replacing it by committed rows: the editor
         // therefore stays on the physical bottom row, without absolute positioning.
         const available = if (self.tail_height == 0 or self.abandon_tail) self.size.rows else self.tail_height;
-        const rows = @min(self.size.rows, @max(footer_rows + popup_lines.len + wanted_body, available -| transcript_rows));
+        const rows = @min(self.size.rows, @max(footer_rows + popup_lines.len + popup_gap + wanted_body, available -| transcript_rows));
+        // Popups and history preview grow UP into exact ACKed transcript rows,
+        // without pushing duplicate content into native scrollback. Keep these
+        // restoration rows when returning from preview to the normal live tail.
+        // Unknown/reflowed/partially written rows never grant upward ownership.
+        const borrow_count = if ((popup_lines.len != 0 or preview) and transcript_rows == 0)
+            @min(rows -| self.tail_height, above.len)
+        else
+            0;
+        if (borrow_count != 0) {
+            var prefix: std.ArrayList([]const u8) = .empty;
+            try prefix.appendSlice(a, above[above.len - borrow_count ..]);
+            try prefix.appendSlice(a, borrowed);
+            borrowed = prefix.items;
+            above = above[0 .. above.len - borrow_count];
+            var rebuilt: std.Io.Writer.Allocating = .init(a);
+            try rebuilt.writer.writeAll(out.written()[0..self.frame_clear_end]);
+            try rebuilt.writer.print("\x1b[{d}A\r", .{borrow_count});
+            self.frame_clear_end = rebuilt.written().len;
+            out = rebuilt;
+        }
+        const active_lines = lines.items;
+        // Preview already contains the complete canonical history. Borrowed rows
+        // remain owned restoration data, not another prefix of that history.
+        if (!preview and borrowed.len != 0) {
+            var combined: std.ArrayList([]const u8) = .empty;
+            try combined.appendSlice(a, borrowed);
+            try combined.appendSlice(a, active_lines);
+            lines = combined;
+        }
+        var next_above: std.ArrayList([]const u8) = .empty;
+        try next_above.appendSlice(a, above);
+        if (transcript_rows != 0) {
+            var split = std.mem.splitSequence(u8, out.written()[self.frame_clear_end..], "\r\n");
+            for (0..transcript_rows) |_| try next_above.append(a, split.next() orelse return error.InvalidTailFrame);
+        }
+        const above_count = @min(next_above.items.len, self.size.rows -| rows);
+        var next_history: ?tail_frame.MenuHistory = try tail_frame.MenuHistory.capture(self.allocator, next_above.items[next_above.items.len - above_count ..], borrowed);
+        errdefer if (next_history) |*history| history.deinit();
 
         // Build the complete candidate tail before choosing full or sparse output.
         // Its bytes also provide recovery if resize interrupts a sparse frame.
@@ -1849,7 +1940,7 @@ const Ui = struct {
             // Menu rows are pinned to the bottom of the body, directly above the
             // composer, so the transcript above keeps its own scroll window.
             const popup_span = @min(popup_lines.len, body_rows);
-            const content_body_rows = body_rows -| popup_span;
+            const content_body_rows = body_rows -| (popup_span + popup_gap);
             if (self.secret_mode) {
                 const start = body_rows -| secret_lines.lines.len;
                 for (0..body_rows) |line| try putStyled(writer, 1 + line, if (line >= start and line - start < secret_lines.lines.len) secret_lines.lines[line - start] else "");
@@ -1886,21 +1977,26 @@ const Ui = struct {
             } else {
                 // 有界 live draft / retained history preview，不重写终端滚屏。
                 // 从底部向上回退 scroll 行，得到显示窗口的结束位置。
-                const content = lines.items[live_gap..];
-                const content_rows = content_body_rows -| live_gap;
+                const leading_gap = if (borrowed.len == 0) live_gap else 0;
+                const content = lines.items[leading_gap..];
+                const content_rows = content_body_rows -| leading_gap;
                 const end = content.len -| @min(self.scroll, content.len -| content_rows);
                 const start = end -| content_rows;
                 for (0..content_body_rows) |line| {
-                    const index = line -| live_gap;
-                    try putStyled(writer, 1 + line, if (line >= live_gap and start + index < end) content[start + index] else "");
+                    const index = line -| leading_gap;
+                    try putStyled(writer, 1 + line, if (line >= leading_gap and start + index < end) content[start + index] else "");
                 }
                 self.frame_permission = null;
             }
 
+            // Explicit empty separator belongs to the tail and is repaired on
+            // every frame, including short histories and narrow candidate windows.
+            if (popup_gap != 0 and body_rows > popup_span)
+                try putStyled(writer, 1 + content_body_rows, "");
             // Shared provider palette for root, provider and model candidates.
             for (0..popup_span) |line| {
                 const tone = if (selected_line == line) theme.accent else theme.muted;
-                try putCandidateLine(writer, a, 1 + content_body_rows + line, popup_lines[line], cols, tone, checked_mask & (@as(u16, 1) << @intCast(line)) != 0);
+                try putCandidateLine(writer, a, 1 + content_body_rows + @min(popup_gap, body_rows -| popup_span) + line, popup_lines[line], cols, tone, checked_mask & (@as(u16, 1) << @intCast(line)) != 0);
             }
             if (popup_span == popup_lines.len) {
                 if (self.provider_open and provider_rows.can_confirm) self.frame_provider_generation = self.provider_picker.generation;
@@ -2031,6 +2127,8 @@ const Ui = struct {
         self.frame_full_tail = tail_out.written();
         self.frame_sparse = sparse or growing;
         self.frame_tail_snapshot = candidate;
+        self.frame_menu_history = next_history;
+        next_history = null;
         self.frame = if (growing) growth_out.written() else out.written();
         self.frame_offset = 0;
         self.frame_arena = arena;
@@ -3310,6 +3408,8 @@ fn discardFixtureFrame(ui: *Ui) void {
     // tests freed only frame_arena; candidates now own a separate arena too.
     if (ui.frame_arena) |*arena| arena.deinit();
     if (ui.frame_tail_snapshot) |*snapshot| snapshot.deinit();
+    if (ui.frame_menu_history) |*history| history.deinit();
+    ui.frame_menu_history = null;
     ui.frame_arena = null;
     ui.frame_tail_snapshot = null;
     ui.frame_full_tail = "";
@@ -3546,6 +3646,35 @@ test "composer frame keeps context occupancy colors static while model and spinn
             ui.finishFrame();
         }
     }
+}
+
+test "pending restored history stays visible with an unmatched tool result and unavailable service" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = SelectionFixture{ .settings_notice = "Saved service unavailable; use /login or /model" };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    try ui.restoreHistory(&.{
+        .{ .role = .user, .blocks = &.{.{ .text = "retained question" }} },
+        .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "absent-call", .text = "retained result" } }} },
+        .{ .role = .assistant, .blocks = &.{.{ .text = "retained answer" }} },
+    });
+    const count = ui.records.items.len;
+    try std.testing.expect(count >= 4);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings(fixture.settings_notice.?, try ui.hint(arena.allocator(), ui.connection.current()));
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("new question\r", sink);
+    try std.testing.expectEqualStrings(fixture.settings_notice.?, ui.notice);
+    try std.testing.expectEqual(count, ui.records.items.len);
+    try std.testing.expect(ui.future == null and !ui.busy and ui.has_submitted);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "retained answer") != null);
 }
 
 test "composer reflects owner low price policy without reading runtime configuration" {
@@ -4024,6 +4153,7 @@ const SelectionFixture = struct {
     owned: ?[]u8 = null,
     limit: u32 = 32768,
     low_price_input: bool = false,
+    settings_notice: ?[]const u8 = null,
     effort: shared.ReasoningEffort = .none,
     levels: shared.activity.EffortSet = .{ .mask = 0x3f },
     selections: usize = 0,
@@ -4054,7 +4184,7 @@ const SelectionFixture = struct {
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .models = self.profiles_override orelse &profiles, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels };
+        return .{ .runtime = null, .model = self.name, .models = self.profiles_override orelse &profiles, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;
@@ -4171,8 +4301,8 @@ test "green checked candidates preserve full multibyte IDs and configured label 
     ui.connection = fixture.connection();
     ui.openProviderPicker();
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ "✓" ++ theme.accent ++ " DeepSeek configured locally") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "DeepSeek  configured locally") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ "✓" ++ theme.accent ++ " DeepSeek") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "configured locally") == null);
 }
 
 test "menus stay above composer share colors and Left returns to acknowledged parent" {
@@ -4470,7 +4600,7 @@ test "provider auth requires a visible full label and save failure wipes the key
     try std.testing.expect(!ui.secret_mode);
     ui.resize(.{ .columns = 80, .rows = 24 });
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "configured locally") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "DeepSeek") != null);
     ui.finishFrame();
     try ui.parser.feed("\rfake-ui-key\r", sink);
     // Entering secret mode deliberately discards the rest of that read.
@@ -4774,6 +4904,166 @@ test "slash menu rejects stale navigation generations and resize ABA" {
         ui.finishFrame();
         try ui.parser.feed("\r", sink);
         try std.testing.expect(ui.secret_mode);
+    }
+}
+
+test "popup close restores every visible transcript row for root provider and model menus" {
+    try text.initLocale();
+    for ([_]usize{ 2, 60 }) |history_length| {
+        for ([_]terminal_module.Size{
+            .{ .columns = 80, .rows = 24 }, .{ .columns = 16, .rows = 24 },
+            .{ .columns = 16, .rows = 12 }, .{ .columns = 16, .rows = 7 },
+            .{ .columns = 9, .rows = 7 },
+        }) |dimensions| {
+            for ([_][]const u8{ "/", "/login\r", "/model\r" }) |command| {
+                var cancel = p.Cancellation{};
+                var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+                defer bridge.deinit();
+                var fixture = SelectionFixture{};
+                defer fixture.deinit();
+                var ui = fixtureUi(&bridge, &cancel);
+                defer ui.deinit();
+                ui.connection = fixture.connection();
+                ui.connection.configure_provider_fn = SelectionFixture.configureProvider;
+                ui.size = dimensions;
+                var history: std.ArrayList(u8) = .empty;
+                defer history.deinit(std.testing.allocator);
+                for (0..history_length) |i| {
+                    const line = try std.fmt.allocPrint(std.testing.allocator, "{s}row-{d:0>3}", .{ if (i == 0) "" else "\n", i });
+                    defer std.testing.allocator.free(line);
+                    try history.appendSlice(std.testing.allocator, line);
+                }
+                _ = try ui.add(.assistant, history.items);
+                var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = dimensions.columns, .rows = dimensions.rows };
+                try ui.draw();
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                const before = screen.grid;
+                const history_before = screen.history_len;
+                const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+                try ui.parser.feed(command, sink);
+                try ui.draw();
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                // Locate the actual first candidate, not merely missing labels.
+                var first: ?usize = null;
+                for (screen.grid, 0..) |line, i| {
+                    if (std.mem.startsWith(u8, &line, "> ")) {
+                        first = i;
+                        break;
+                    }
+                }
+                try std.testing.expect(first != null and first.? > 0);
+                try std.testing.expectEqualStrings("", std.mem.trim(u8, &screen.grid[first.? - 1], " "));
+                // Popup borrowing is reversible and must not scroll long history.
+                try std.testing.expectEqual(history_before, screen.history_len);
+                try ui.parser.feed("\x1b", sink);
+                try ui.parser.expireEscape(sink);
+                try ui.parser.feed("\x15", sink);
+                try ui.draw();
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                for (before[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2]) |old, restored|
+                    try std.testing.expectEqualStrings(&old, &restored);
+                try std.testing.expectEqual(history_before, screen.history_len);
+                // A second ordinary frame must retain the repaired history too.
+                try ui.draw();
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                for (before[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2]) |old, restored|
+                    try std.testing.expectEqualStrings(&old, &restored);
+                if (history_length == 60) {
+                    // History preview is rebuilt from canonical records. Popup
+                    // restoration rows must not precede that complete history.
+                    const browsing_before = screen.grid;
+                    for (0..8) |_| try ui.parser.feed("\x1b[5~", sink);
+                    try ui.draw();
+                    try screen.replay(ui.frame);
+                    ui.finishFrame();
+                    const first_preview_row = dimensions.rows - ui.tail_height;
+                    try std.testing.expectEqualStrings("row-000", std.mem.trim(u8, &screen.grid[first_preview_row], " "));
+                    try std.testing.expectEqual(history_before, screen.history_len);
+                    for (0..8) |_| try ui.parser.feed("\x1b[6~", sink);
+                    try ui.draw();
+                    try screen.replay(ui.frame);
+                    ui.finishFrame();
+                    try std.testing.expectEqual(@as(usize, 0), ui.scroll);
+                    for (browsing_before[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2]) |old, restored|
+                        try std.testing.expectEqualStrings(&old, &restored);
+                    try std.testing.expectEqual(history_before, screen.history_len);
+                }
+                _ = try ui.add(.assistant, "new-row");
+                try ui.draw();
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                // Releasing a repaired prefix for subsequent output must not
+                // duplicate or lose ANY earlier line, including native history.
+                for (0..history_length) |i| {
+                    var marker: [16]u8 = undefined;
+                    const value = try std.fmt.bufPrint(&marker, "row-{d:0>3}", .{i});
+                    try std.testing.expectEqual(@as(usize, 1), screen.count(value));
+                }
+                try std.testing.expectEqual(@as(usize, 1), screen.count("new-row"));
+                const before_resize = screen.grid;
+                try ui.parser.feed(command, sink);
+                try ui.draw();
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                // A width ABA revokes all physical coordinates even though the
+                // final grid width is unchanged. Reconstruct from retained
+                // canonical display records, never reclaim the stale backing.
+                ui.resize(.{ .columns = dimensions.columns - 1, .rows = dimensions.rows });
+                ui.resize(dimensions);
+                try std.testing.expect(ui.menu_history_recovery);
+                try ui.draw();
+                try std.testing.expect(std.mem.find(u8, ui.frame[0..ui.frame_clear_end], "\x1b[999B") != null);
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                try ui.parser.feed("\x1b", sink);
+                try ui.parser.expireEscape(sink);
+                try ui.parser.feed("\x15", sink);
+                try ui.draw();
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                for (before_resize[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2]) |old, restored|
+                    try std.testing.expectEqualStrings(&old, &restored);
+                try ui.parser.feed(command, sink);
+                try ui.draw();
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                const resized: terminal_module.Size = if (dimensions.rows == 12)
+                    .{ .columns = 80, .rows = 24 }
+                else
+                    .{ .columns = 16, .rows = 12 };
+                ui.resize(resized);
+                // This bounded no-reflow grid models the changed geometry;
+                // every transcript marker fits both widths. No physical reflow
+                // behavior or native viewport position is inferred here.
+                screen.columns = resized.columns;
+                screen.rows = resized.rows;
+                screen.row = @min(screen.row, resized.rows - 1);
+                screen.col = @min(screen.col, resized.columns - 1);
+                try ui.draw();
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                try ui.parser.feed("\x1b", sink);
+                try ui.parser.expireEscape(sink);
+                try ui.parser.feed("\x15", sink);
+                try ui.draw();
+                try screen.replay(ui.frame);
+                ui.finishFrame();
+                const body_rows = resized.rows - 3;
+                const start = (history_length + 2) -| body_rows;
+                for (0..body_rows) |row| {
+                    const index = start + row;
+                    var marker: [16]u8 = undefined;
+                    const expected = if (index < history_length)
+                        try std.fmt.bufPrint(&marker, "row-{d:0>3}", .{index})
+                    else if (index == history_length + 1) "new-row" else "";
+                    try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, &screen.grid[row], " "));
+                }
+            }
+        }
     }
 }
 

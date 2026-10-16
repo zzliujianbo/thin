@@ -57,16 +57,20 @@ pub const Screen = struct {
     row: usize = 0,
     col: usize = 0,
     wrap: bool = false,
+    /// Bounded logical dimensions. Changing these directly is only valid before
+    /// output; this fixture deliberately does not emulate terminal text reflow.
+    columns: usize = width,
+    rows: usize = height,
 
     fn down(self: *Screen) !void {
-        if (self.row < height - 1) {
+        if (self.row < self.rows - 1) {
             self.row += 1;
         } else {
             if (self.history_len == self.history.len) return error.ScrollbackLimit;
             self.history[self.history_len] = self.grid[0];
             self.history_len += 1;
-            for (0..height - 1) |r| self.grid[r] = self.grid[r + 1];
-            self.grid[height - 1] = @splat(' ');
+            for (0..self.rows - 1) |r| self.grid[r] = self.grid[r + 1];
+            self.grid[self.rows - 1] = @splat(' ');
         }
     }
 
@@ -77,11 +81,13 @@ pub const Screen = struct {
             self.wrap = false;
         }
         self.grid[self.row][self.col] = value;
-        if (self.col == width - 1) self.wrap = true else self.col += 1;
+        if (self.col == self.columns - 1) self.wrap = true else self.col += 1;
     }
 
     /// Replay a complete bounded capture. Split/incomplete frames are rejected.
     pub fn replay(self: *Screen, bytes: []const u8) !void {
+        if (self.columns == 0 or self.columns > width or self.rows == 0 or self.rows > height)
+            return error.InvalidScreenSize;
         try rejectFullscreen(bytes);
         var i: usize = 0;
         while (i < bytes.len) {
@@ -101,7 +107,7 @@ pub const Screen = struct {
                     self.wrap = false;
                 },
                 '\t' => {
-                    self.col = @min(width - 1, (self.col / 8 + 1) * 8);
+                    self.col = @min(self.columns - 1, (self.col / 8 + 1) * 8);
                     self.wrap = false;
                 },
                 0x07, 0x18, 0x1a => {},
@@ -124,16 +130,16 @@ pub const Screen = struct {
                     const step = @max(1, n);
                     switch (final) {
                         'A' => self.row -|= step,
-                        'B' => self.row = @min(height - 1, self.row +| step),
-                        'C' => self.col = @min(width - 1, self.col +| step),
+                        'B' => self.row = @min(self.rows - 1, self.row +| step),
+                        'C' => self.col = @min(self.columns - 1, self.col +| step),
                         'D' => self.col -|= step,
                         'M' => {
                             // DL shifts only cursor..bottom, adds no scrollback,
                             // and does not move the cursor. No scroll region exists.
-                            const count_ = @min(step, height - self.row);
-                            for (self.row..height - count_) |row_index|
+                            const count_ = @min(step, self.rows - self.row);
+                            for (self.row..self.rows - count_) |row_index|
                                 self.grid[row_index] = self.grid[row_index + count_];
-                            for (height - count_..height) |row_index|
+                            for (self.rows - count_..self.rows) |row_index|
                                 self.grid[row_index] = @splat(' ');
                         },
                         'K' => switch (n) {

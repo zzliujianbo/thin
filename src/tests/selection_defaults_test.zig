@@ -40,9 +40,16 @@ const Fixture = struct {
         var config = parsed.value;
         config.provider.api_key_env = if (env_key) "THIN_SELECTION_FAKE_KEY" else "";
         config.provider.api_key = if (env_key) null else "fake-inline-deepseek-selection";
-        config.credentials.opencode_go = "fake-go-selection";
-        config.credentials.opencode_zen = "fake-zen-selection";
-        config.models = &.{.{ .name = "explicit-profile", .context_tokens = 65536, .protocol = .responses }};
+        var go = catalog.connection(.opencode_go);
+        go.api_key = "fake-go-selection";
+        var zen = catalog.connection(.opencode_zen);
+        zen.api_key = "fake-zen-selection";
+        config.registry = .{ .default = "deepseek/deepseek-flash", .providers = &.{
+            .{ .name = "deepseek", .connection = config.provider, .models = &.{.{ .name = "explicit-profile", .patch = .{ .context_tokens = 65536, .protocol = .responses } }} },
+            .{ .name = "opencode-go", .connection = go },
+            .{ .name = "opencode-zen", .connection = zen },
+        } };
+        config.limits.low_price_input = false;
         config.limits.max_rounds = 7;
         config.limits.max_tool_calls = 19;
         config.limits.read_bytes = 12345;
@@ -86,16 +93,19 @@ test "selection defaults empty ready cross-provider survives restart without cre
     try std.testing.expectEqualStrings("Bearer fake-go-selection", app.client.authorization);
     var disk = try session.store.loadExisting();
     defer cfg.release(&disk);
+    const empty_cache: @import("../app/model_metadata.zig").Cache = .{};
+    try @import("../app/model_resolver.zig").applyDefault(disk.arena.allocator(), &disk.value, &empty_cache);
     try std.testing.expectEqualStrings(cfg.providers.Id.opencode_go.baseUrl(), disk.value.provider.base_url);
     try std.testing.expectEqualStrings(selected.name, disk.value.model.name);
     try std.testing.expectEqual(selected.protocol, disk.value.model.protocol);
     try std.testing.expectEqual(selected.context_tokens, disk.value.model.context_tokens);
     try std.testing.expectEqualDeep(limits, disk.value.limits);
-    try std.testing.expectEqualStrings("fake-inline-deepseek-selection", disk.value.credentials.deepseek.?);
-    try std.testing.expectEqualStrings("fake-go-selection", disk.value.credentials.opencode_go.?);
-    try std.testing.expectEqualStrings("fake-zen-selection", disk.value.credentials.opencode_zen.?);
-    try std.testing.expectEqual(@as(usize, 0), disk.value.models.len);
-    try std.testing.expect(disk.value.provider.api_key == null);
+    const registry = disk.value.registry.?;
+    try std.testing.expectEqualStrings("fake-inline-deepseek-selection", registry.find("deepseek").?.connection.api_key.?);
+    try std.testing.expectEqualStrings("fake-go-selection", registry.find("opencode-go").?.connection.api_key.?);
+    try std.testing.expectEqualStrings("fake-zen-selection", registry.find("opencode-zen").?.connection.api_key.?);
+    try std.testing.expectEqual(@as(usize, 1), registry.find("deepseek").?.models.len);
+    try std.testing.expectEqualStrings("fake-go-selection", disk.value.provider.api_key.?);
     try fixture.noLogs();
     var restarted = try fixture.session();
     defer restarted.deinit();
@@ -250,10 +260,11 @@ test "selection defaults environment-backed same-provider change persists variab
     try session.connection().selectModel("deepseek/deepseek-v4-pro");
     var disk = try session.store.loadExisting();
     defer cfg.release(&disk);
-    try std.testing.expectEqualStrings("deepseek-v4-pro", disk.value.model.name);
-    try std.testing.expectEqualStrings("THIN_SELECTION_FAKE_KEY", disk.value.provider.api_key_env);
-    try std.testing.expect(disk.value.provider.api_key == null and disk.value.credentials.deepseek == null);
-    try std.testing.expectEqual(@as(usize, 1), disk.value.models.len);
+    try std.testing.expectEqualStrings("deepseek/deepseek-v4-pro", disk.value.registry.?.default);
+    const declared = disk.value.registry.?.find("deepseek").?;
+    try std.testing.expectEqualStrings("THIN_SELECTION_FAKE_KEY", declared.connection.api_key_env);
+    try std.testing.expect(declared.connection.api_key == null);
+    try std.testing.expectEqual(@as(usize, 1), declared.models.len);
     const bytes = try fixture.bytes();
     defer a.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "fake-resolved-env-selection-secret") == null);

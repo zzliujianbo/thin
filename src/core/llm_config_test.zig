@@ -11,7 +11,7 @@ test "llm registry presence isolation roundtrip frozen clone and candidate chang
     try t.expect(p.value.selection_pending);
     try t.expectEqualStrings("custom", p.value.selected_provider.?);
     try t.expectEqualStrings("vendor/model", p.value.model.name);
-    try t.expect(p.value.model.context_tokens == 32768 and p.value.models.len == 0);
+    try t.expect(p.value.model.context_tokens == 32768);
     const registry = p.value.registry.?;
     const patch = registry.find("custom").?.patchFor("vendor/model").?;
     try t.expect(patch.protocol == null and patch.reasoning_effort == null);
@@ -123,4 +123,70 @@ test "llm registry count limits and default need not be manually declared" {
     out.writer.end = prefix_len;
     try out.writer.writeAll(",\"extra\":{}}}}}}");
     try t.expectError(error.TooManyModels, cfg.parse(t.allocator, out.written()));
+}
+
+test "disk schema requires llm and rejects every former root and runtime field" {
+    try t.expectError(error.MissingField, cfg.parse(t.allocator, "{}"));
+    try t.expectError(error.MissingField, cfg.parse(t.allocator, "{\"limits\":{}}"));
+    inline for (.{ "provider", "model", "models", "credentials", "registry", "selected_provider", "selection_pending" }) |field| {
+        const old = "{\"" ++ field ++ "\":null}";
+        try t.expectError(error.UnknownField, cfg.parse(t.allocator, old));
+    }
+    try t.expectError(error.UnknownField, cfg.parse(t.allocator,
+        \\{"provider":{"base_url":"https://api.deepseek.com"},"model":{"name":"deepseek-flash","context_tokens":1000000}}
+    ));
+}
+
+test "registry limits and model patches reject coerced numeric and boolean values" {
+    const prefix = "{\"llm\":{\"default\":\"p/m\",\"providers\":{\"p\":{\"base_url\":\"https://x\"}}},\"limits\":";
+    for ([_][]const u8{ "{\"max_rounds\":\"50\"}", "{\"read_bytes\":1.0}", "{\"max_input_tokens\":\"90000\"}", "{\"low_price_input\":\"false\"}", "{\"read_bytes\":null}", "{\"unknown\":1}" }) |limits| {
+        const raw = try std.mem.concat(t.allocator, u8, &.{ prefix, limits, "}" });
+        defer t.allocator.free(raw);
+        if (cfg.parse(t.allocator, raw)) |value| {
+            var unexpected = value;
+            cfg.release(&unexpected);
+            return error.ExpectedRejection;
+        } else |_| {}
+    }
+    try t.expectError(error.InvalidNumber, cfg.parse(t.allocator,
+        \\{"llm":{"default":"p/m","providers":{"p":{"base_url":"https://x","models":{"m":{"context_tokens":"65536"}}}}}}
+    ));
+    try t.expectError(error.UnknownField, cfg.parse(t.allocator,
+        \\{"llm":{"default":"p/m","providers":{"p":{"base_url":"https://x","models":{"m":{"input_price_threshold":100000}}}}}}
+    ));
+}
+
+test "login credential edits replace only the selected registry source and own secrets" {
+    var parsed = try cfg.parse(t.allocator, fixture);
+    defer cfg.release(&parsed);
+    var candidate = try cfg.clone(t.allocator, parsed.value);
+    defer cfg.release(&candidate);
+    var key = [_]u8{ 'f', 'a', 'k', 'e', '-', 'n', 'e', 'w' };
+    try cfg.setRegistryCredential(candidate.arena.allocator(), &candidate.value, "custom", &key);
+    @memset(&key, 'x');
+    try t.expectEqualStrings("fake-new", candidate.value.provider.api_key.?);
+    try t.expectEqualStrings("", candidate.value.provider.api_key_env);
+    try t.expectEqualStrings("CUSTOM_KEY", parsed.value.provider.api_key_env);
+    try t.expect(parsed.value.provider.api_key == null);
+    try t.expectEqualStrings("fake-backup", candidate.value.registry.?.find("other").?.connection.api_key.?);
+    var env = std.process.Environ.Map.init(t.allocator);
+    defer env.deinit();
+    try env.put("CUSTOM_KEY", "fake-env");
+    const resolved = try cfg.resolveApiKey(t.allocator, candidate.value, &env);
+    defer {
+        std.crypto.secureZero(u8, resolved);
+        t.allocator.free(resolved);
+    }
+    try t.expectEqualStrings("fake-new", resolved);
+    try t.expect(resolved.ptr != candidate.value.provider.api_key.?.ptr);
+    var out: std.Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    try cfg.writeDisk(candidate.value, &out.writer);
+    var disk = try cfg.parse(t.allocator, out.written());
+    defer cfg.release(&disk);
+    try t.expectEqualStrings("fake-new", disk.value.provider.api_key.?);
+    try t.expectEqualStrings("", disk.value.provider.api_key_env);
+    try t.expectError(error.UnknownProvider, cfg.setRegistryCredential(candidate.arena.allocator(), &candidate.value, "missing", "fake"));
+    try t.expectError(error.InvalidApiKey, cfg.setRegistryCredential(candidate.arena.allocator(), &candidate.value, "custom", "bad\rkey"));
+    try t.expectEqualStrings("fake-new", candidate.value.provider.api_key.?);
 }

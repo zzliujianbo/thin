@@ -320,7 +320,8 @@ test "checkpoint runtime restores owned context without replaying tools or autho
     try std.testing.expectEqualDeep(original.messages(), restored.messages());
     try std.testing.expect(restored.messages().ptr != original.messages().ptr);
     try std.testing.expect(!restored.trusted);
-    try std.testing.expectEqual(@as(u64, 42), restored.permission_id);
+    // Historical approval counters do not become new request authority.
+    try std.testing.expectEqual(@as(u64, 0), restored.permission_id);
     try std.testing.expectEqual(@as(u32, 0), second.normal_calls);
     try std.testing.expectEqual(@as(u32, 0), second.executions);
     try std.testing.expectEqual(@as(u32, 0), second.terminals);
@@ -356,7 +357,7 @@ fn checkpointImportAllocation(a: std.mem.Allocator) !void {
     try std.testing.expect(!runtime.trusted);
 }
 
-test "checkpoint runtime allocation failure is transactional and busy poison fail closed" {
+test "checkpoint import is transactional while saving history does not bypass live poison" {
     var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(backing.allocator(), checkpointImportAllocation, .{});
     try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
@@ -368,7 +369,15 @@ test "checkpoint runtime allocation failure is transactional and busy poison fai
     try std.testing.expectError(error.Busy, runtime.checkpoint());
     runtime.busy.store(false, .release);
     runtime.poisoned = true;
-    try std.testing.expectError(error.UnsafeToContinue, runtime.checkpoint());
+    const saved = try runtime.checkpoint();
+    try std.testing.expectEqual(@as(usize, 0), saved.messages.len);
+    try std.testing.expect(runtime.poisoned);
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run("must not send", &cancel);
+    try std.testing.expectEqual(r.Status.failed, terminal.status);
+    try std.testing.expectEqual(error.CleanupFailed, terminal.detail.?);
+    try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 0), fake.executions);
 }
 
 test "tool duration measures success failure and cancellation but not denial or prepare failure" {
@@ -799,12 +808,14 @@ test "permission ids do not wrap into a non-monotonic host id" {
 test "Runtime unlimited default omitted and null exceed fifty rounds after checkpoint restore" {
     const a = std.testing.allocator;
     const inputs = [_][]const u8{
-        "{\"provider\":{\"base_url\":\"http://localhost\"},\"model\":{\"name\":\"fake\",\"context_tokens\":32768,\"protocol\":\"chat\"},\"limits\":{\"low_price_input\":false}}",
-        "{\"provider\":{\"base_url\":\"http://localhost\"},\"model\":{\"name\":\"fake\",\"context_tokens\":32768,\"protocol\":\"chat\"},\"limits\":{\"low_price_input\":false,\"max_rounds\":null}}",
+        "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\",\"models\":{\"fake\":{\"context_tokens\":32768,\"protocol\":\"chat\"}}}}},\"limits\":{\"low_price_input\":false}}",
+        "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\",\"models\":{\"fake\":{\"context_tokens\":32768,\"protocol\":\"chat\"}}}}},\"limits\":{\"low_price_input\":false,\"max_rounds\":null}}",
     };
     for (0..3) |variant| {
         var parsed = try cfg.parse(a, inputs[if (variant == 2) 1 else 0]);
         defer cfg.release(&parsed);
+        const empty_cache: @import("../app/model_metadata.zig").Cache = .{};
+        try @import("../app/model_resolver.zig").applyDefault(parsed.arena.allocator(), &parsed.value, &empty_cache);
         const config = if (variant == 0) configuration() else parsed.value;
         try std.testing.expect(config.limits.max_rounds == null);
         var fake: Fake = .{ .stop_after = 55, .requires_approval = false };
@@ -1502,9 +1513,9 @@ test "manual compaction empty or no candidate is zero-request and Busy is not ac
 test "output budget automatic config explicit caps and metadata provenance" {
     const t = std.testing;
     for ([_][]const u8{
-        \\{"provider":{"base_url":"http://localhost"},"model":{"name":"fake","context_tokens":131072}}
+        \\{"llm":{"default":"local/fake","providers":{"local":{"base_url":"http://localhost","models":{"fake":{"context_tokens":131072,"protocol":"chat"}}}}},"limits":{"low_price_input":false}}
         ,
-        \\{"provider":{"base_url":"http://localhost"},"model":{"name":"fake","context_tokens":131072},"limits":{"max_output_tokens":null}}
+        \\{"llm":{"default":"local/fake","providers":{"local":{"base_url":"http://localhost","models":{"fake":{"context_tokens":131072,"protocol":"chat"}}}}},"limits":{"low_price_input":false,"max_output_tokens":null}}
         ,
     }) |json| {
         var parsed = try cfg.parse(t.allocator, json);
@@ -1628,7 +1639,7 @@ test "output budget automatic context exhaustion sends no request" {
     try std.testing.expectEqual(@as(usize, 0), runtime.messages().len);
 }
 
-test "output budget checkpoints legacy frozen known and unknown" {
+test "archived output metadata is displayable without becoming a current budget gate" {
     const cp = @import("../core/checkpoint.zig");
     const t = std.testing;
     var state: cp.State = .{ .system = "", .messages = &.{}, .selector = .{ .configured = .chat, .selected = .chat }, .estimator = .{}, .last_context_tokens = null, .permission_id = 0 };
@@ -1653,13 +1664,17 @@ test "output budget checkpoints legacy frozen known and unknown" {
         config.model.output_source = .metadata;
         try cp.validate(t.allocator, decoded.value, config, &.{});
         config.model.output_source = .explicit;
-        try t.expectError(error.OutputBudgetMismatch, cp.validate(t.allocator, decoded.value, config, &.{}));
+        try cp.validate(t.allocator, decoded.value, config, &.{});
         config.model.output_source = .metadata;
         config.model.output_tokens = if (tokens == null) 1 else null;
-        try t.expectError(error.OutputBudgetMismatch, cp.validate(t.allocator, decoded.value, config, &.{}));
+        try cp.validate(t.allocator, decoded.value, config, &.{});
     }
     state.output_tokens = 0;
-    try t.expectError(error.InvalidOutputTokens, cp.encode(t.allocator, state));
+    const display_only = try cp.encode(t.allocator, state);
+    defer t.allocator.free(display_only);
+    const decoded_display = try cp.decode(t.allocator, display_only);
+    defer decoded_display.deinit();
+    try t.expectEqual(@as(?u32, 0), decoded_display.value.output_tokens);
 }
 
 // Runtime 忙时拒绝新的提交；宿主断开时停止执行，并报告 HostDisconnected。

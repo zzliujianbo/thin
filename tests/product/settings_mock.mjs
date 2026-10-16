@@ -55,10 +55,10 @@ export async function settingsRegressions({app,pty,execute,send}) {
       const settingsPath = p => join(p,'.thin/settings.json');
       let configBytes;
       async function configure({map=sparse,format='standard',effort='off',pending=false,unknown=false}={}) {
-        // Keep the strict /login baseline equality: supply schema defaults in
-        // the fixture rather than misclassifying nullable-field serialization.
-        const completeMap = Object.fromEntries(['off','minimal','low','medium','high','xhigh','max'].map(level => [level,map[level] ?? null]));
-        configBytes = JSON.stringify({provider:{base_url:url,api_key_env:pending?'':'THIN_FIXTURE_KEY',...(pending?{api_key:null}:{})},model:{name:'fixture-model',protocol,context_tokens:32768,reasoning_effort:effort,reasoning_source:'explicit',output_tokens:null,output_source:'explicit',...(unknown?{}:{reasoning:{format,map:completeMap}})},limits:{low_price_input:false,max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+        // Match the declaration-only writer's sparse nullable mappings while
+        // retaining strict /login baseline equality for all declared models.
+        const completeMap = Object.fromEntries(['off','minimal','low','medium','high','xhigh','max'].filter(level => map[level] != null).map(level => [level,map[level]]));
+        configBytes = JSON.stringify({llm:{default:'local/fixture-model',providers:{local:{base_url:url,api_key_env:pending?'':'THIN_FIXTURE_KEY',...(pending?{api_key:null}:{}),models:{'fixture-model':{protocol,context_tokens:32768,reasoning_effort:effort,...(unknown?{}:{reasoning:{format,map:completeMap}})}}}}},limits:{low_price_input:false,max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
         await writeFile(configPath,configBytes,{mode:0o600});
       }
       async function seed(p,raw) {
@@ -96,7 +96,9 @@ export async function settingsRegressions({app,pty,execute,send}) {
       // Never promote assertion messages (which can contain actual wire data).
       const safe = new Error('settings fixture failed');
       safe.fixtureCase = `settings/${kind}`;
-      safe.fixtureCheck = stage;
+      // Only a fixed source filename's numeric line, never assertion operands.
+      const line = /settings_mock\.mjs:(\d+):/.exec(error.stack ?? '')?.[1];
+      safe.fixtureCheck = line ? `${stage} at ${line}` : stage;
       throw safe;
     } finally {
       for (const socket of sockets) socket.destroy();
@@ -169,9 +171,9 @@ export async function settingsRegressions({app,pty,execute,send}) {
     await t.saved(t.project,'low');
     const disk = JSON.parse(await readFile(t.configPath,'utf8'));
     const baseline = JSON.parse(t.getConfig());
-    assert.deepEqual(disk.model,baseline.model);
-    assert.equal(disk.provider.base_url,baseline.provider.base_url);
-    assert.equal(disk.provider.api_key,KEY);
-    assert.equal(disk.model.reasoning_effort,'off');
+    assert.deepEqual(disk.llm.providers.local.models,baseline.llm.providers.local.models);
+    assert.equal(disk.llm.providers.local.base_url,baseline.llm.providers.local.base_url);
+    assert.equal(disk.llm.providers.local.api_key,KEY);
+    assert.equal(disk.llm.providers.local.models['fixture-model'].reasoning_effort,'off');
   });
 }

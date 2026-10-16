@@ -506,7 +506,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       const filename = kind === 'legacy-config' ? 'auth.json' : 'config.json';
       // 空白文件走交互初始化；待激活配置始终使用回环服务，绝不向公共端点发送密钥或消息。
       const provider = ['auth-activate','exit-unconfigured','exit-secret'].includes(kind) ? {base_url:url, api_key_env:'', api_key:null, chat_max_tokens:true} : {base_url:url, api_key_env:'THIN_FIXTURE_KEY'};
-      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({provider, model:{name:'fixture-model',protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined}, models:['model-select','model-select-empty'].includes(kind)?[{name:'fixture-next',protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}]:undefined, limits:{low_price_input:false,max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({llm:{default:'local/fixture-model',providers:{local:{...provider,models:{'fixture-model':{protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined},...(['model-select','model-select-empty'].includes(kind)?{'fixture-next':{protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}},'fixture-custom':{protocol,context_tokens:32768,reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}}:{})}}}}, limits:{low_price_input:false,max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
       await writeFile(join(home,'.thin',filename), content);
     }
 
@@ -555,8 +555,9 @@ async function scenario(name, protocol, kind, isPty = false) {
     }
     if (kind === 'auth-go') {
       const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
-      assert.equal(disk.credentials.opencode_go, 'fixture-secret-never-log');
-      assert.equal(disk.provider.base_url, url, 'login must not silently switch active/global provider');
+      assert.equal(disk.llm.providers['opencode-go'].api_key, 'fixture-secret-never-log');
+      assert.equal(disk.llm.default, 'local/fixture-model');
+      assert.equal(disk.llm.providers.local.base_url, url, 'login must not silently switch active/global provider');
       assert.equal((await stat(join(home,'.thin/config.json'))).mode & 0o777, 0o600);
       assert(!result.output.includes('fixture-secret-never-log'), 'secret leaked');
     }
@@ -569,7 +570,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       if (await exists(projectThin)) assert.deepEqual(await readdir(projectThin),['settings.json'], 'identity/no-submission created unexpected project storage');
       if (['exit-unconfigured','exit-secret'].includes(kind)) {
         const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
-        assert.equal(disk.provider.api_key,null, 'Ctrl+D secret exit must not save input');
+        assert.equal(disk.llm.providers.local.api_key,null, 'Ctrl+D secret exit must not save input');
       }
     }
     if (kind === 'exit-no-log') {
@@ -582,14 +583,31 @@ async function scenario(name, protocol, kind, isPty = false) {
       if (kind === 'exit-busy') assert(stalled);
     }
 
-    // help 与 no-config 不应发起任何请求，也不应创建 .thin 目录；非失败场景还要检查输出内容。
-    if (kind === 'help' || kind === 'no-config') {
+    // --help remains side-effect free. Missing canonical config initializes the
+    // same new schema as the TUI, but no key means no request or conversation state.
+    if (kind === 'help') {
       assert.equal(requests,0); assert(!await exists(join(home,'.thin'))); assert(!await exists(join(project,'.thin')));
-      if (kind==='help') assert(result.output.includes('Usage: thin'));
-    } else if (kind === 'legacy-config') {
+      assert(result.output.includes('Usage: thin'));
+    } else if (kind === 'no-config' || kind === 'legacy-config') {
       assert.equal(requests,0);
-      assert(!await exists(join(home,'.thin/config.json')));
-      assert(!await exists(join(project,'.thin')));
+      const path = join(home,'.thin/config.json');
+      const initialized = JSON.parse(await readFile(path,'utf8'));
+      assert.equal(initialized.llm.default,'deepseek/deepseek-flash');
+      assert.equal(initialized.llm.providers.deepseek.base_url,'https://api.deepseek.com');
+      assert(initialized.llm.providers.deepseek.api_key == null, 'initializer must not contain an API key');
+      assert(!('provider' in initialized) && !('model' in initialized) && !('credentials' in initialized));
+      assert(!('local' in initialized.llm.providers), 'old filename must not supply connection or credentials');
+      assert.equal((await stat(path)).mode & 0o777,0o600);
+      const projectThin = join(project,'.thin');
+      assert.deepEqual(await readdir(projectThin),['settings.json'], 'failed activation created conversation storage');
+      const settings = JSON.parse(await readFile(join(projectThin,'settings.json'),'utf8'));
+      assert.equal(settings.version,1);
+      assert(['off','minimal','low','medium','high','xhigh','max'].includes(settings.reasoning_effort));
+      assert.equal((await stat(join(projectThin,'settings.json'))).mode & 0o777,0o600);
+      if (kind === 'legacy-config') {
+        const ignored = JSON.parse(await readFile(join(home,'.thin/auth.json'),'utf8'));
+        assert.equal(ignored.llm.default,'local/fixture-model', 'ignored old filename was modified');
+      }
     } else if (!failureCase && !isPty) assert(result.output.includes('fixture-answer'));
 
     if (kind === 'auth-reject401' || kind === 'auth-reject403') {
@@ -611,7 +629,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       const authPath = join(home,'.thin/config.json');
       const auth = JSON.parse(await readFile(authPath,'utf8'));
       assert.equal((await stat(authPath)).mode & 0o777, 0o600, 'auth file must be private');
-      assert.equal(auth.provider.api_key_env, '');
+      assert.equal(auth.llm.providers[kind === 'auth-activate' ? 'local' : 'deepseek'].api_key_env ?? '', '');
       if (kind !== 'auth-activate') {
         assert(!await exists(join(project,'.thin/sessions')), 'initialization created session records without submission');
         // With no metadata/declaration, persist the logical medium preference
@@ -622,8 +640,11 @@ async function scenario(name, protocol, kind, isPty = false) {
         const settingsPath = join(project,'.thin/settings.json');
         assert.equal((await stat(settingsPath)).mode & 0o777, 0o600);
         assert.deepEqual(JSON.parse(await readFile(settingsPath,'utf8')), {version:1,reasoning_effort:'medium'});
-        assert.equal(auth.model.reasoning ?? null,null);
-        assert.equal(auth.model.reasoning_effort ?? null,null);
+        const declared = auth.llm.providers.deepseek.models['deepseek-flash'];
+        assert.equal(declared.protocol,'chat');
+        assert.equal(declared.context_tokens,1000000);
+        assert.equal(declared.reasoning ?? null,null);
+        assert.equal(declared.reasoning_effort ?? null,null);
       }
       if (kind === 'auth-activate') {
         const logs = join(project,'.thin/sessions');
@@ -639,18 +660,17 @@ async function scenario(name, protocol, kind, isPty = false) {
           }
         }
         assert(hasUser && hasFinished, 'activation conversation missing');
-        assert.equal(auth.provider.api_key, KEY);
-        assert.equal(auth.provider.base_url, url, 'activation must preserve loopback endpoint');
-        assert.equal(auth.model.name, 'fixture-model');
-        assert.equal(auth.model.protocol, protocol);
+        assert.equal(auth.llm.providers.local.api_key, KEY);
+        assert.equal(auth.llm.providers.local.base_url, url, 'activation must preserve loopback endpoint');
+        assert.equal(auth.llm.default, 'local/fixture-model');
+        assert.equal(auth.llm.providers.local.models['fixture-model'].protocol, protocol);
         assert.equal(requests, 1, 'activation must send exactly one request');
       } else {
-        assert(auth.provider.api_key == null || auth.provider.api_key === '', 'initialized template must not contain a key');
-        assert.equal(auth.provider.base_url, 'https://api.deepseek.com');
-        assert.equal(auth.model.name, 'deepseek-flash');
-        assert.equal(auth.model.context_tokens, 1000000);
-        assert.equal(auth.model.protocol, 'chat');
-        assert.equal(auth.provider.chat_max_tokens, true);
+        const connection = auth.llm.providers.deepseek;
+        assert(connection.api_key == null || connection.api_key === '', 'initialized template must not contain a key');
+        assert.equal(connection.base_url, 'https://api.deepseek.com');
+        assert.equal(auth.llm.default, 'deepseek/deepseek-flash');
+        assert(!('provider' in auth) && !('model' in auth) && !('credentials' in auth), 'legacy root fields persisted');
         assert.equal(requests, 0, 'initialization must not send requests');
         if (kind === 'auth-missing') assert.equal((await stat(join(home,'.thin'))).mode & 0o777, 0o700, 'created auth directory must be private');
       }
@@ -702,11 +722,10 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert.equal(requests,0, 'empty selection issued a request');
       const path = join(home,'.thin/config.json');
       const disk = JSON.parse(await readFile(path,'utf8'));
-      assert.equal(disk.model.name,'fixture-next');
-      assert.equal(disk.model.protocol,protocol);
-      assert.equal(disk.model.context_tokens,65536);
-      assert.equal(disk.models[0].name,'fixture-next');
-      assert.equal(disk.provider.api_key_env,'THIN_FIXTURE_KEY');
+      assert.equal(disk.llm.default,'local/fixture-next');
+      assert.equal(disk.llm.providers.local.models['fixture-next'].protocol,protocol);
+      assert.equal(disk.llm.providers.local.models['fixture-next'].context_tokens,65536);
+      assert.equal(disk.llm.providers.local.api_key_env,'THIN_FIXTURE_KEY');
       assert(!JSON.stringify(disk).includes(KEY), 'environment credential was persisted');
       assert.equal((await stat(path)).mode & 0o777,0o600);
       assert(!await exists(join(project,'.thin/sessions')), 'empty selection created session history');
@@ -714,11 +733,10 @@ async function scenario(name, protocol, kind, isPty = false) {
     if (kind === 'model-select') {
       assert.equal(requests,4, 'selection issued discovery or extra requests');
       const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
-      assert.equal(disk.model.name,'fixture-model');
-      assert.equal(disk.model.reasoning_effort,'none');
-      assert.equal(disk.model.context_tokens,32768);
-      assert.equal(disk.models[0].name,'fixture-next');
-      assert.equal(disk.models[0].reasoning_effort,'low');
+      assert.equal(disk.llm.default,'local/fixture-model');
+      assert.equal(disk.llm.providers.local.models['fixture-model'].reasoning_effort,'none');
+      assert.equal(disk.llm.providers.local.models['fixture-model'].context_tokens,32768);
+      assert.equal(disk.llm.providers.local.models['fixture-next'].reasoning_effort,'low');
       assert.deepEqual(JSON.parse(await readFile(join(project,'.thin/settings.json'),'utf8')), {version:1,reasoning_effort:'high'});
     }
     if (kind === 'regular-two') assert.equal(requests,2, 'regular two-turn request count');

@@ -250,7 +250,7 @@ test "unlimited round counter saturates without imposing a hidden limit" {
     try std.testing.expectEqual(std.math.maxInt(u32), usage.summary_calls);
 }
 
-test "runtime checkpoint exports capacity and restore rejects mismatch without config mutation" {
+test "runtime checkpoint restore ignores archived policy poison and estimator without config mutation" {
     const Stub = struct {
         fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
             return error.UnexpectedRequest;
@@ -269,29 +269,173 @@ test "runtime checkpoint exports capacity and restore rejects mismatch without c
     var state = try runtime.checkpoint();
     try std.testing.expectEqual(@as(?u32, 65536), state.context_tokens);
     try std.testing.expect(!state.context_official);
-    const original_system = try std.testing.allocator.dupe(u8, runtime.system);
-    defer std.testing.allocator.free(original_system);
     state.system = "restored";
     state.context_tokens = 32768;
     state.context_official = true;
-    try std.testing.expectError(error.ContextBudgetMismatch, runtime.restoreCheckpoint(state));
-    try std.testing.expectEqual(@as(u32, 65536), config.model.context_tokens);
-    try std.testing.expectEqualStrings(original_system, runtime.system);
-    try std.testing.expectEqual(@as(usize, 0), runtime.messages().len);
-    state.context_tokens = 65536;
+    state.output_tokens = 0;
+    state.output_budget_frozen = true;
+    state.input_budget_frozen = true;
+    state.max_input_tokens = 0;
+    state.input_margin_tokens = std.math.maxInt(u32);
+    state.poisoned = true;
+    state.permission_id = 999;
+    state.estimator.per_mille = 0;
     try runtime.restoreCheckpoint(state);
+    try std.testing.expect(!runtime.poisoned);
+    try std.testing.expectEqual(@as(u64, 0), runtime.permission_id);
+    try std.testing.expectEqual(@as(u64, 1000), runtime.estimator.per_mille);
+    try std.testing.expectEqual(@as(?u32, null), config.limits.max_input_tokens);
     try std.testing.expectEqual(@as(u32, 65536), config.model.context_tokens);
     try std.testing.expectEqualStrings("restored", runtime.system);
     const restored = try runtime.checkpoint();
-    try std.testing.expectEqual(state.context_tokens, restored.context_tokens);
+    try std.testing.expectEqual(@as(?u32, 65536), restored.context_tokens);
+    try std.testing.expectEqual(config.model.output_tokens, restored.output_tokens);
     // Provenance belongs to Session rather than mutable Runtime state.
     try std.testing.expect(!restored.context_official);
+    runtime.poisoned = true;
+    _ = try runtime.checkpoint(); // Saving displayable history is not permission to send.
+    try std.testing.expectError(error.UnsafeToContinue, runtime.restoreCheckpoint(state));
+    try std.testing.expectEqualStrings("restored", runtime.system);
+    try std.testing.expect(runtime.poisoned);
+    runtime.poisoned = false;
     state.context_tokens = null;
     state.context_official = false;
     state.system = "legacy";
     try runtime.restoreCheckpoint(state);
     try std.testing.expectEqual(@as(u32, 65536), config.model.context_tokens);
     try std.testing.expectEqualStrings("legacy", runtime.system);
+}
+
+test "restored foreign scope displays and resaves but normal and summary cannot reach fake model" {
+    const Fake = struct {
+        calls: usize = 0,
+        tools: usize = 0,
+        fn call(raw: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UnexpectedRequest;
+        }
+        fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !Prepared {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.tools += 1;
+            return error.UnexpectedTool;
+        }
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, _: Prepared, _: *const p.Cancellation) !Execution {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.tools += 1;
+            return error.UnexpectedTool;
+        }
+    };
+    const a = std.testing.allocator;
+    const archived = try a.alloc(u8, 4000);
+    defer a.free(archived);
+    @memset(archived, 'q');
+    inline for (.{ p.Protocol.chat, p.Protocol.responses, p.Protocol.anthropic }) |proto| {
+        var config: cfg.Config = .{ .provider = .{ .base_url = "https://current.invalid/v1" }, .model = .{ .name = "current", .context_tokens = 65536, .protocol = proto } };
+        config.limits.low_price_input = false;
+        var fake: Fake = .{};
+        var runtime = try Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "", true);
+        defer runtime.deinit();
+        const state: @import("checkpoint.zig").State = .{
+            .system = "archive",
+            .messages = &.{
+                .{ .role = .user, .blocks = &.{.{ .text = archived }} },
+                .{ .role = .assistant, .blocks = &.{.{ .text = "old" }}, .replay = .{ .scope = .{ .connection = "https://old.invalid/v1", .model = "old", .protocol = .chat }, .json = "{\"role\":\"assistant\",\"content\":\"old\"}" } },
+                .{ .role = .user, .blocks = &.{.{ .text = "second old goal" }} },
+                .{ .role = .assistant, .blocks = &.{.{ .text = "recent answer" }} },
+                .{ .role = .user, .blocks = &.{.{ .text = "retained goal" }} },
+            },
+            .selector = .{ .configured = .auto, .selected = .chat },
+            .estimator = .{},
+            .last_context_tokens = 100,
+            .permission_id = 999,
+            .context_tokens = 0,
+            .output_budget_frozen = true,
+            .output_tokens = 0,
+            .poisoned = true,
+        };
+        try runtime.restoreCheckpoint(state);
+        const bytes = try @import("checkpoint.zig").encode(a, try runtime.checkpoint());
+        defer a.free(bytes);
+        const decoded = try @import("checkpoint.zig").decode(a, bytes);
+        defer decoded.deinit();
+        try std.testing.expectEqualStrings("old", runtime.messages()[1].blocks[0].text);
+        var cancel: p.Cancellation = .{};
+        const normal = try runtime.run("new goal", &cancel);
+        try std.testing.expectEqual(error.ReplayScopeMismatch, normal.detail.?);
+        const summary = try runtime.compactContext(&cancel);
+        try std.testing.expectEqual(error.ReplayScopeMismatch, summary.detail.?);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+        try std.testing.expectEqual(@as(usize, 0), fake.tools);
+    }
+}
+
+test "compatible restored history sends under current budgets without any archived key binding" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn call(raw: *anyopaque, a: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .{ .success = .{ .finish = .stop, .message = try p.textMessage(a, .assistant, "new answer") } };
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !Prepared {
+            return error.UnexpectedTool;
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: Prepared, _: *const p.Cancellation) !Execution {
+            return error.UnexpectedTool;
+        }
+    };
+    var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1", .api_key = "rotated-fake-key" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
+    config.limits.low_price_input = false;
+    var fake: Fake = .{};
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "", true);
+    defer runtime.deinit();
+    var state = try runtime.checkpoint();
+    state.context_tokens = 1;
+    state.output_tokens = 0;
+    state.max_input_tokens = 0;
+    state.messages = &.{
+        .{ .role = .user, .blocks = &.{.{ .text = "previous goal" }} },
+        .{ .role = .assistant, .blocks = &.{.{ .text = "old" }}, .replay = .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .json = "{\"role\":\"assistant\",\"content\":\"old\"}" } },
+    };
+    try runtime.restoreCheckpoint(state);
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run("new goal", &cancel);
+    try std.testing.expectEqual(Status.success, terminal.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(u32, 65536), config.model.context_tokens);
+    try std.testing.expectEqual(@as(?u32, null), config.limits.max_input_tokens);
+}
+
+test "restored incomplete tool history never executes old tools or calls a fake model" {
+    const Stub = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            return error.UnexpectedRequest;
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !Prepared {
+            return error.UnexpectedTool;
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: Prepared, _: *const p.Cancellation) !Execution {
+            return error.UnexpectedTool;
+        }
+    };
+    var dummy: u8 = 0;
+    var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
+    config.limits.low_price_input = false;
+    config.limits.compaction_enabled = false;
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "", true);
+    defer runtime.deinit();
+    var state = try runtime.checkpoint();
+    state.messages = &.{
+        .{ .role = .user, .blocks = &.{.{ .text = "old goal" }} },
+        .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "old-call", .name = "never-execute", .arguments = "{}" } }} },
+    };
+    try runtime.restoreCheckpoint(state);
+    const saved = try @import("checkpoint.zig").encode(std.testing.allocator, try runtime.checkpoint());
+    defer std.testing.allocator.free(saved);
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run("new explicit goal", &cancel);
+    try std.testing.expectEqual(error.IncompleteToolGroup, terminal.detail.?);
 }
 
 test "selection preserves canonical history and closes retained auto fallback" {
@@ -671,7 +815,6 @@ pub const Runtime = struct {
     /// Runtime thread only, from inside `run` (the sole mutator). Same bytes as
     /// `checkpoint`, without the idle check that would reject this thread.
     pub fn exportCheckpoint(self: *const Runtime) !@import("checkpoint.zig").State {
-        if (self.poisoned) return error.UnsafeToContinue;
         const state: @import("checkpoint.zig").State = .{
             .system = self.system,
             .messages = self.messages(),
@@ -689,33 +832,59 @@ pub const Runtime = struct {
             .input_margin_tokens = self.config.limits.input_margin_tokens,
             .permission_id = self.permission_id,
         };
-        try @import("checkpoint.zig").validate(self.allocator, state, self.config.*, self.executor.schemas);
+        try @import("checkpoint.zig").validateStructure(state);
         return state;
     }
 
-    /// Import an already authenticated checkpoint into an empty idle Runtime.
-    /// Validation and all copies finish before publication; never invokes a
+    /// Import structurally representable history into an empty idle Runtime.
+    /// Bounds and all copies finish before publication; never invokes a
     /// model, a tool, a host callback or an old authorization decision.
     pub fn restoreCheckpoint(self: *Runtime, state: @import("checkpoint.zig").State) !void {
         if (self.busy.load(.acquire)) return error.Busy;
-        if (self.poisoned) return error.UnsafeToContinue;
         if (self.history.items.len != 0) return error.RuntimeNotEmpty;
-        try @import("checkpoint.zig").validate(self.allocator, state, self.config.*, self.executor.schemas);
+        // A new App can display a saved poison flag without inheriting it;
+        // importing a file must not reset this process's own cleanup failure.
+        if (self.poisoned) return error.UnsafeToContinue;
+        try @import("checkpoint.zig").validateStructure(state);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         var history: std.ArrayList(p.Message) = .empty;
         try history.ensureTotalCapacity(arena.allocator(), state.messages.len);
-        for (state.messages) |message| history.appendAssumeCapacity(try p.cloneMessage(arena.allocator(), message));
+        // Old archives may retain signatures whose prefix was replaced by a
+        // client summary. Normalize only borrowed views before owned cloning;
+        // the archive and its canonical visible history remain untouched.
+        const rewritten_prefix = context.hasSummaryPrefix(state.messages);
+        for (state.messages) |message| history.appendAssumeCapacity(if (rewritten_prefix) try context.cloneAfterPrefixRewrite(arena.allocator(), message) else try p.cloneMessage(arena.allocator(), message));
         const system = try self.allocator.dupe(u8, state.system);
         const old_system = self.system;
         var old_arena = self.arena;
         self.system = system;
         self.arena = arena;
         self.history = history;
-        self.selector = state.selector;
-        self.estimator = state.estimator;
+        self.selector = initialSelector(self.config.*);
+        if (self.config.model.protocol == .auto and llm.hasModelHistory(history.items)) {
+            // Prefer a representable native protocol, not a saved configuration.
+            // Mixed/foreign scopes remain displayable and fail at the send gate.
+            self.selector.selected = .responses;
+            for (history.items) |message| if (message.replay) |replay| {
+                if (replay.scope.protocol != .auto) {
+                    self.selector.selected = replay.scope.protocol;
+                    break;
+                }
+            };
+            if (self.selector.selected == .responses and state.selector.selected != null and state.selector.selected != .auto) {
+                const has_replay = for (history.items) |m| {
+                    if (m.replay != null) break true;
+                } else false;
+                if (!has_replay) self.selector.selected = state.selector.selected;
+            }
+            self.selector.initial_attempted = true;
+        }
+        self.estimator = if (state.estimator.per_mille < 1000) .{} else state.estimator;
         self.last_context_tokens = state.last_context_tokens;
-        self.permission_id = state.permission_id;
+        // No saved poison, approval counter or grants become live authority.
+        // Current declared context/output/input budgets are untouched.
+        self.poisoned = false;
         // runInner resets the protected boundary to the next explicit input.
         self.protected_index = history.items.len;
         if (self.applied_policy) |applied| applied.deinit(self.allocator);
@@ -1117,7 +1286,7 @@ pub const Runtime = struct {
             // back the staged input before its stack block can escape runInner.
             try self.retainCurrentInput(&input_retained);
             // 调用模型；协议选择与降级由 selector 处理。
-            const result = self.selector.call(self.model, result_arena.allocator(), try self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
+            const result = self.selector.call(self.checkedModel(), result_arena.allocator(), try self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
                 self.last_context_tokens = null;
                 return err;
             };
@@ -1156,6 +1325,18 @@ pub const Runtime = struct {
 
             try self.executeBatch(message.blocks, cancel, task);
         }
+    }
+
+    /// Every actual model invocation (normal, summary AND selector fallback)
+    /// crosses this gate, even when the underlying model is an unvalidated fake.
+    fn checkedModel(self: *Runtime) p.Model {
+        return .{ .context = self, .call_fn = checkedCall };
+    }
+
+    fn checkedCall(ctx: *anyopaque, a: std.mem.Allocator, req: p.Request, sink: p.ModelSink) !p.Outcome {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        try @import("checkpoint.zig").validateRequestHistory(a, req);
+        return self.model.call(a, req, sink);
     }
 
     /// Construct each purpose's independent budget from its complete input;
@@ -1287,7 +1468,7 @@ pub const Runtime = struct {
 
         // 摘要请求只使用 scratch arena，不影响主历史。
         task.summary_attempts +|= 1;
-        const result = self.selector.call(self.model, a, summary_request, .{}) catch |err| {
+        const result = self.selector.call(self.checkedModel(), a, summary_request, .{}) catch |err| {
             self.last_context_tokens = null;
             return err;
         };

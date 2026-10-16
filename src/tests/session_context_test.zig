@@ -428,7 +428,7 @@ test "app wires agents discovery and appends when the working directory changes"
     try mkdir(tmp.dir, "tree/other");
     try mkdir(tmp.dir, "tree/other/.git");
     const fake =
-        \\{"provider":{"base_url":"http://unused.invalid","api_key":"fake-review-key"},"model":{"name":"fake","context_tokens":32768,"protocol":"chat"},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"local/fake","providers":{"local":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat"}}}}},"limits":{"low_price_input":false}}
     ;
     try write(tmp.dir, "home/.thin/config.json", fake);
     try write(tmp.dir, "home/.thin/AGENTS.override.md", "APP_GLOBAL\n");

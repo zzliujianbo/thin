@@ -96,15 +96,16 @@ test "tools validate containment and Memory namespace before approval" {
         try std.testing.expectError(error.UseMemoryTool, tools.execute(temp, .{ .write_file = .{ .path = path, .content = "x" } }, &cancel));
     }
 
-    // 新旧会话目录的绝对/相对别名都受保护；直接执行也不能绕过。
+    // 新旧会话目录允许只读；prepare 不创建文件，写入在两个入口仍受保护。
     const session_path = try std.fs.path.join(temp, &.{ root.path, ".thin/sessions/session.jsonl" });
     const legacy_path = try std.fs.path.join(temp, &.{ root.path, ".thin/logs/session.jsonl" });
     for ([_][]const u8{ ".thin/sessions/session.jsonl", "./.thin//./sessions/session.jsonl", session_path, ".thin/logs/session.jsonl", "./.thin//./logs/session.jsonl", legacy_path }) |path| {
         const args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\"}}", .{path});
-        try std.testing.expectError(error.ProtectedSessionFile, executor.prepare_fn(executor.context, temp, .{ .id = "session", .name = "read_file", .arguments = args }));
+        const read = try executor.prepare_fn(executor.context, temp, .{ .id = "session", .name = "read_file", .arguments = args });
+        try std.testing.expect(!read.requires_approval);
         const write_args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
         try std.testing.expectError(error.ProtectedSessionFile, executor.prepare_fn(executor.context, temp, .{ .id = "session", .name = "write_file", .arguments = write_args }));
-        try std.testing.expectError(error.ProtectedSessionFile, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
+        try std.testing.expectError(error.FileNotFound, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
         try std.testing.expectError(error.ProtectedSessionFile, tools.execute(temp, .{ .write_file = .{ .path = path, .content = "x" } }, &cancel));
     }
 
@@ -126,6 +127,101 @@ test "tools validate containment and Memory namespace before approval" {
 
     // 审批之前不得创建 .thin 目录。
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
+}
+
+test "session and log reads retain file safety and credential guards without permitting mutations" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(a, io, buffer[0..n]);
+    defer root.deinit();
+    var store = mem.Store.init(&root, .{});
+    var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = undefined };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const executor = tools.executor();
+    var cancel = p.Cancellation{};
+
+    // Only synthetic temporary files: a text .session exercises permission, not resume decoding.
+    try tmp.dir.createDirPath(io, ".thin/sessions");
+    try tmp.dir.createDirPath(io, ".thin/logs");
+    const content = "{\"text\":\"中文\"}\n";
+    for ([_][]const u8{ ".thin/sessions/fake.session", ".thin/sessions/fake.jsonl", ".thin/logs/fake.jsonl" }) |canonical| {
+        try root.write(canonical, content, false);
+        const absolute = try std.fs.path.join(temp, &.{ root.path, canonical });
+        const alias = try std.fmt.allocPrint(temp, "./.thin//./{s}", .{canonical[6..]});
+        for ([_][]const u8{ canonical, alias, absolute }) |path| {
+            const args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\"}}", .{path});
+            const prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "read", .name = "read_file", .arguments = args });
+            try std.testing.expect(!prepared.requires_approval);
+            const read = try executor.execute_fn(executor.context, temp, prepared, &cancel);
+            const value = try j.parse(temp, read.text);
+            try std.testing.expectEqualStrings(content, j.string(j.get(value, "content")).?);
+            try std.testing.expectEqual(@as(?u64, content.len), j.uint(j.get(value, "bytes_read")));
+            try std.testing.expect(!read.truncated);
+            const direct = try tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel);
+            try std.testing.expectEqualStrings(read.text, direct.text);
+            for ([_]bool{ false, true }) |overwrite| {
+                const write_args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\",\"content\":\"not written\",\"overwrite\":{s}}}", .{ path, if (overwrite) "true" else "false" });
+                try std.testing.expectError(error.ProtectedSessionFile, executor.prepare_fn(executor.context, temp, .{ .id = "write", .name = "write_file", .arguments = write_args }));
+                try std.testing.expectError(error.ProtectedSessionFile, tools.execute(temp, .{ .write_file = .{ .path = path, .content = "not written", .overwrite = overwrite } }, &cancel));
+            }
+            // No file-delete tool exists. The only structured delete is Memory,
+            // whose topic validation must not permit targeting session/log paths.
+            const delete_args = try std.fmt.allocPrint(temp, "{{\"action\":\"delete\",\"topic\":\"{s}\",\"expected_version\":\"fake\"}}", .{path});
+            try std.testing.expectError(error.InvalidMemoryTopic, executor.prepare_fn(executor.context, temp, .{ .id = "delete", .name = "memory", .arguments = delete_args }));
+            try std.testing.expectError(error.InvalidTopic, tools.execute(temp, .{ .memory = .{ .action = .delete, .topic = path, .expected_version = "fake" } }, &cancel));
+            try std.testing.expectError(error.UnknownTool, executor.prepare_fn(executor.context, temp, .{ .id = "delete", .name = "delete_file", .arguments = args }));
+        }
+        const unchanged = try root.read(temp, canonical, 0, 128);
+        try std.testing.expectEqualStrings(content, unchanged.data);
+    }
+    for ([_][]const u8{ ".thin/sessions", "./.thin//./logs" }) |path| {
+        try std.testing.expectError(error.ProtectedSessionFile, tools.execute(temp, .{ .write_file = .{ .path = path, .content = "not written", .overwrite = true } }, &cancel));
+    }
+
+    const partial = try tools.execute(temp, .{ .read_file = .{ .path = ".thin/logs/fake.jsonl", .offset = 10, .limit = 3 } }, &cancel);
+    const partial_value = try j.parse(temp, partial.text);
+    try std.testing.expectEqualStrings("中", j.string(j.get(partial_value, "content")).?);
+    try std.testing.expectEqual(@as(?u64, 9), j.uint(j.get(partial_value, "offset")));
+    try std.testing.expectEqual(@as(?u64, 12), j.uint(j.get(partial_value, "next_offset")));
+    try std.testing.expect(partial.truncated and partial.file_stats.?.partial);
+    try std.testing.expectError(error.InvalidReadLimit, executor.prepare_fn(executor.context, temp, .{ .id = "large", .name = "read_file", .arguments = "{\"path\":\".thin/logs/fake.jsonl\",\"limit\":99999999}" }));
+
+    // Binary resume frames are NOT converted to text or exempted from validation.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/sessions/binary.session", .data = "frame\x00bytes" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/sessions/invalid.session", .data = "\xff" });
+    try std.testing.expectError(error.BinaryFile, tools.execute(temp, .{ .read_file = .{ .path = ".thin/sessions/binary.session" } }, &cancel));
+    try std.testing.expectError(error.InvalidUtf8, tools.execute(temp, .{ .read_file = .{ .path = ".thin/sessions/invalid.session" } }, &cancel));
+    try std.testing.expectError(error.NotRegularFile, tools.execute(temp, .{ .read_file = .{ .path = ".thin/sessions" } }, &cancel));
+    try std.testing.expectError(error.InvalidPath, tools.execute(temp, .{ .read_file = .{ .path = ".thin/sessions/../settings.json" } }, &cancel));
+    try std.testing.expectError(error.PathEscape, executor.prepare_fn(executor.context, temp, .{ .id = "escape", .name = "read_file", .arguments = "{\"path\":\".thin/sessions/../settings.json\"}" }));
+    try std.testing.expectError(error.OutsideRoot, tools.execute(temp, .{ .read_file = .{ .path = "/outside-not-read.session" } }, &cancel));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("fake.jsonl", root.dir.handle, ".thin/logs/link.jsonl"));
+    try std.testing.expectError(error.SymlinkNotAllowed, tools.execute(temp, .{ .read_file = .{ .path = ".thin/logs/link.jsonl" } }, &cancel));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("sessions", root.dir.handle, ".thin/linked"));
+    try std.testing.expectError(error.NotDir, tools.execute(temp, .{ .read_file = .{ .path = ".thin/linked/fake.session" } }, &cancel));
+
+    // Same auth_path guard for canonical config/credentials and even a protected
+    // file located in the newly readable namespace; the read allowance is not an early return.
+    for ([_][]const u8{ ".thin/config.json", "credentials.json", ".thin/sessions/private.jsonl" }) |canonical| {
+        try root.write(canonical, "fake-key-not-returned", false);
+        tools.auth_path = try std.fs.path.join(temp, &.{ root.path, canonical });
+        const alias = try std.fmt.allocPrint(temp, "./{s}", .{canonical});
+        for ([_][]const u8{ canonical, alias, tools.auth_path.? }) |path| {
+            const args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\"}}", .{path});
+            try std.testing.expectError(error.ProtectedAuthFile, executor.prepare_fn(executor.context, temp, .{ .id = "key", .name = "read_file", .arguments = args }));
+            try std.testing.expectError(error.ProtectedAuthFile, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
+            const denied: anyerror = if (std.mem.startsWith(u8, canonical, ".thin/sessions/")) error.ProtectedSessionFile else error.ProtectedAuthFile;
+            const write_args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\",\"content\":\"not written\",\"overwrite\":true}}", .{path});
+            try std.testing.expectError(denied, executor.prepare_fn(executor.context, temp, .{ .id = "key", .name = "write_file", .arguments = write_args }));
+            try std.testing.expectError(denied, tools.execute(temp, .{ .write_file = .{ .path = path, .content = "not written", .overwrite = true } }, &cancel));
+        }
+    }
 }
 
 // 验证：文件读取的 offset/limit 按字节计算但不切断 UTF-8 字符，bash 输出中的 UTF-8 保持完整。

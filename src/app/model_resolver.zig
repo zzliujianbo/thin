@@ -9,7 +9,6 @@ const Allocator = std.mem.Allocator;
 pub const Selection = struct {
     connection: cfg.Provider,
     model: cfg.Model,
-    models: []const cfg.Model,
     provider_name: []const u8,
     context_official: bool,
 };
@@ -52,14 +51,6 @@ fn officialContext(cache: *const metadata.Cache, entry: catalog.Entry, tokens: u
     return false;
 }
 
-/// Only authenticated full checkpoint state may supply these options. A new
-/// empty selection must resolve the current directory/manual configuration.
-pub const Frozen = struct {
-    protocol: @import("../core/protocol.zig").Protocol,
-    context_tokens: u32,
-    effort: ?[]const u8 = null,
-};
-
 /// Derived capabilities belong to the exact endpoint, model and concrete wire
 /// route. Always clear the preceding selection, including a frozen unknown.
 pub fn applyInputThreshold(cache: *const metadata.Cache, config: *cfg.Config) void {
@@ -73,16 +64,8 @@ pub fn applyInputThreshold(cache: *const metadata.Cache, config: *cfg.Config) vo
 }
 
 const ResolvedModel = struct { model: cfg.Model, official: bool };
-fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.NamedProvider, raw_id: []const u8, historical: bool, frozen: ?Frozen, restored_route: ?@import("../core/protocol.zig").Protocol) !ResolvedModel {
+fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.NamedProvider, raw_id: []const u8, historical: bool) !ResolvedModel {
     const patch = provider.patchFor(raw_id);
-    if (restored_route) |route| {
-        // Empty selections cannot authorize new probing or reinterpret a current
-        // route-specific manual declaration as options for a different route.
-        if (route == .auto) return error.UnknownModelProtocol;
-        if (patch) |manual| if (manual.protocol) |declared| {
-            if (declared != route) return error.RestoredProtocolConflict;
-        };
-    }
     // A service alias and kind are not authority to borrow another endpoint's
     // catalog. Only actual recognized official URLs authorize those records.
     const id = cfg.providers.Id.fromUrl(provider.connection.base_url);
@@ -95,7 +78,7 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
         }
         entry = metadata.restoreEntry(cache, service, raw_id);
     }
-    if (entry == null and patch == null and frozen == null) return error.DefaultModelUnavailable;
+    if (entry == null and patch == null) return error.DefaultModelUnavailable;
     var model: cfg.Model = if (entry) |item| item.model else .{ .name = raw_id, .context_tokens = 0 };
     var official = false;
     if (entry) |item| {
@@ -103,10 +86,8 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
         if (patch) |manual| if (manual.protocol) |protocol| {
             route.model.protocol = protocol;
         };
-        if (frozen) |accepted| route.model.protocol = accepted.protocol;
-        if (restored_route) |accepted| route.model.protocol = accepted;
         model.protocol = route.model.protocol;
-        // storedEntry's generic 32768 is for legacy display, not evidence that
+        // storedEntry's generic 32768 is for display, not evidence that
         // an arbitrary discovered model has a usable window. Only an exact,
         // compatible offline preset may supply a conservative local fallback.
         model.context_tokens = 0;
@@ -128,31 +109,23 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
         model.output_tokens = metadata.outputFor(cache, route);
         model.output_source = .metadata;
     }
-    if (restored_route) |route| model.protocol = route;
     if (patch) |manual| {
         model = manual.apply(model);
         if (manual.context_tokens != null) official = false;
     }
-    if (frozen) |accepted| {
-        model.protocol = accepted.protocol;
-        model.context_tokens = accepted.context_tokens;
-        model.reasoning_effort = accepted.effort;
-        official = false; // Caller restores the authenticated provenance too.
-    }
-    // Only explicit user intent (or authenticated prior intent) authorizes auto.
-    // Directory unknown must never become paid protocol probing.
-    if (frozen == null and model.protocol == .auto and (patch == null or patch.?.protocol == null)) return error.UnknownModelProtocol;
+    // Only the current declaration authorizes auto. An archive is history, not
+    // authority to probe a protocol or borrow stale request capabilities.
+    if (model.protocol == .auto and (patch == null or patch.?.protocol == null)) return error.UnknownModelProtocol;
     if (model.context_tokens == 0) return error.UnknownModelContext;
     var candidate = config;
     candidate.provider = provider.connection;
     candidate.model = model;
-    // Protocol patches and authenticated route selection must precede lookup.
+    // Current protocol patches must precede exact-route capability lookup.
     applyInputThreshold(cache, &candidate);
     model = candidate.model;
     try cfg.validateModel(model, config.limits);
     candidate.provider = provider.connection;
     candidate.model = model;
-    candidate.models = &.{};
     candidate.selection_pending = false;
     candidate.selected_provider = provider.name;
     try cfg.validate(candidate);
@@ -161,38 +134,12 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
 
 /// Results borrow no movable config/cache storage; allocate in an owned arena.
 pub fn resolve(a: Allocator, config: cfg.Config, cache: *const metadata.Cache, provider_name: []const u8, raw_id: []const u8, historical: bool) !Selection {
-    return resolveImpl(a, config, cache, provider_name, raw_id, historical, null, null);
-}
-
-/// Credential binding and HMAC authentication MUST precede this call. It never
-/// writes frozen options into registry patches or relies on a display fallback.
-pub fn resolveFrozen(a: Allocator, config: cfg.Config, cache: *const metadata.Cache, provider_name: []const u8, raw_id: []const u8, frozen: Frozen) !Selection {
-    return resolveImpl(a, config, cache, provider_name, raw_id, true, frozen, null);
-}
-
-/// Authenticated selection-only restore: current evidence must support this
-/// concrete route; unlike Frozen, this supplies no historical capabilities.
-pub fn resolveRoute(a: Allocator, config: cfg.Config, cache: *const metadata.Cache, provider_name: []const u8, raw_id: []const u8, route: @import("../core/protocol.zig").Protocol) !Selection {
-    return resolveImpl(a, config, cache, provider_name, raw_id, true, null, route);
-}
-
-fn resolveImpl(a: Allocator, config: cfg.Config, cache: *const metadata.Cache, provider_name: []const u8, raw_id: []const u8, historical: bool, frozen: ?Frozen, restored_route: ?@import("../core/protocol.zig").Protocol) !Selection {
     const registry = config.registry orelse return error.DefaultProviderUnavailable;
     const provider = registry.find(provider_name) orelse return error.DefaultProviderUnavailable;
-    const selected = try resolveOne(config, cache, provider, raw_id, historical, frozen, restored_route);
-    var profiles: std.ArrayList(cfg.Model) = .empty;
-    for (provider.models) |named| {
-        // A stale/incomplete OTHER profile is a disabled candidate, not a
-        // reason to reject the independently validated selected model. This
-        // validation step allocates nothing; ownership allocation below still
-        // propagates OutOfMemory normally.
-        const item = resolveOne(config, cache, provider, named.name, historical, null, null) catch continue;
-        try profiles.append(a, try ownModel(a, item.model));
-    }
+    const selected = try resolveOne(config, cache, provider, raw_id, historical);
     return .{
         .connection = try ownConnection(a, provider.connection),
         .model = try ownModel(a, selected.model),
-        .models = try profiles.toOwnedSlice(a),
         .provider_name = try a.dupe(u8, provider_name),
         .context_official = selected.official,
     };
@@ -201,13 +148,12 @@ fn resolveImpl(a: Allocator, config: cfg.Config, cache: *const metadata.Cache, p
 pub fn apply(config: *cfg.Config, selection: Selection) void {
     config.provider = selection.connection;
     config.model = selection.model;
-    config.models = selection.models;
     config.selected_provider = selection.provider_name;
     config.selection_pending = false;
 }
 
 pub fn applyDefault(a: Allocator, config: *cfg.Config, cache: *const metadata.Cache) !void {
-    const registry = config.registry orelse return;
+    const registry = config.registry orelse return error.DefaultProviderUnavailable;
     const slash = std.mem.findScalar(u8, registry.default, '/') orelse return error.InvalidDefaultModel;
     const selection = try resolve(a, config.*, cache, registry.default[0..slash], registry.default[slash + 1 ..], false);
     apply(config, selection);
@@ -276,11 +222,11 @@ test "registry unrelated incompatible partial profile cannot poison an independe
     cache.directory_mask = metadata.bit(.opencode_go);
     try applyDefault(parsed.arena.allocator(), &parsed.value, &cache);
     try std.testing.expectEqualStrings("ready", parsed.value.model.name);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.models.len);
+    try std.testing.expectEqualStrings("ready", parsed.value.model.name);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.registry.?.providers[0].models.len);
 }
 
-test "registry dynamic unknown window cannot adopt the generic legacy display fallback" {
+test "registry dynamic unknown window cannot adopt a display or archived capability" {
     var parsed = try cfg.parse(std.testing.allocator,
         \\{"llm":{"default":"go/never-a-preset","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1"}}}}
     );
@@ -292,18 +238,9 @@ test "registry dynamic unknown window cannot adopt the generic legacy display fa
     cache.directory_mask = metadata.bit(.opencode_go);
     try std.testing.expectError(error.UnknownModelContext, applyDefault(parsed.arena.allocator(), &parsed.value, &cache));
     try std.testing.expect(parsed.value.selection_pending);
-    const restored = try resolveFrozen(parsed.arena.allocator(), parsed.value, &cache, "go", "never-a-preset", .{
-        .protocol = .chat,
-        .context_tokens = 1000000,
-    });
-    try std.testing.expectEqual(@as(u32, 1000000), restored.model.context_tokens);
     try std.testing.expectEqual(@as(usize, 0), parsed.value.registry.?.providers[0].models.len);
-    cache.directory.count = 0; // Full restore also survives complete cache loss.
-    const without_cache = try resolveFrozen(parsed.arena.allocator(), parsed.value, &cache, "go", "never-a-preset", .{
-        .protocol = .chat,
-        .context_tokens = 1000000,
-    });
-    try std.testing.expectEqual(@as(u32, 1000000), without_cache.model.context_tokens);
+    cache.directory.count = 0;
+    try std.testing.expectError(error.DefaultModelUnavailable, applyDefault(parsed.arena.allocator(), &parsed.value, &cache));
 }
 
 test "registry default may be discovered without a manual entry and explicit custom entries remain isolated" {
@@ -330,5 +267,5 @@ test "registry default may be discovered without a manual entry and explicit cus
     row.available = false;
     try std.testing.expectError(error.DefaultModelUnavailable, resolve(arena.allocator(), parsed.value, &cache, "go", "org/model", false));
     try std.testing.expectError(error.UnknownModelContext, resolve(arena.allocator(), parsed.value, &cache, "go", "org/model", true));
-    _ = try resolveFrozen(arena.allocator(), parsed.value, &cache, "go", "org/model", .{ .protocol = .chat, .context_tokens = 262144 });
+    // Loading an archive is independent; it cannot manufacture current send capability.
 }
