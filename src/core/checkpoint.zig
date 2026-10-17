@@ -33,6 +33,7 @@ pub const State = struct {
     /// Archived input metadata for display/resave, not a trusted runtime policy.
     input_budget_frozen: bool = false,
     input_price_threshold: ?u32 = null,
+    input_price_flat_limit: ?u32 = null,
     max_input_tokens: ?u32 = null,
     low_price_input: bool = false,
     input_margin_tokens: u32 = 5000,

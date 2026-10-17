@@ -8,8 +8,7 @@ const tools = @import("../tools/tools.zig");
 const http = @import("../llm/http.zig");
 const r = @import("../core/runtime.zig");
 const Journal = @import("journal.zig").Journal;
-const Settings = @import("settings_store.zig").Store;
-const thinking = @import("../core/thinking.zig");
+const reasoning_defaults = @import("reasoning_defaults.zig");
 const metadata = @import("model_metadata.zig");
 const session_context = @import("../core/session_context.zig");
 const model_resolver = @import("model_resolver.zig");
@@ -90,20 +89,15 @@ pub const App = struct {
                 return err;
             };
         }
-        // Headless entry creates the same missing project default as the TUI,
-        // without changing the global configuration on disk.
-        var settings = Settings.open(a, io, project) catch |err| {
+        // Only anchor the project here. Empty sessions take model/thinking from
+        // global configuration; project settings are neither read nor created.
+        var root = fs.Root.open(a, io, project) catch |err| {
             cfg.release(&parsed);
             return err;
         };
-        defer settings.deinit();
-        const capabilities = thinking.resolve(parsed.value.provider.base_url, parsed.value.model.name, parsed.value.model.reasoning);
-        const saved = settings.loadOrInitialize(capabilities.defaultEffort(parsed.value.model.reasoning_effort)) catch |err| {
-            cfg.release(&parsed);
-            return err;
-        };
-        if (capabilities.known) parsed.value.model.reasoning_effort = capabilities.effective(saved.name());
-        return initConfiguredAnchored(a, io, environ, &settings.root, host, trusted, parsed);
+        defer root.deinit();
+        _ = reasoning_defaults.applyConfigured(&parsed.value);
+        return initConfiguredAnchored(a, io, environ, &root, host, trusted, parsed);
     }
 
     /// 接管 parsed（成功或失败均接管），供交互配置准备候选 App；此过程不发送模型请求。
@@ -321,7 +315,83 @@ test "headless missing and blank configuration use the same new schema without r
         try std.testing.expect(created.value.registry != null);
         try std.testing.expectEqualStrings("deepseek/deepseek-flash", created.value.registry.?.default);
         try std.testing.expect(created.value.registry.?.providers[0].connection.api_key == null);
+        try std.testing.expectError(error.FileNotFound, store.root.read(a, "settings.json", 0, 1024));
     }
+}
+
+test "headless global defaults ignore legacy settings and never create project settings" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const cases = [_]struct { json: []const u8, effort: ?[]const u8 }{
+        .{ .json =
+        \\{"llm":{"default":"fixture/fake","reasoning_effort":"high","providers":{"fixture":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat","reasoning_effort":"off","reasoning":{"map":{"off":"none","medium":"medium","high":"high"}}}}}}},"limits":{"low_price_input":false}}
+        , .effort = "high" },
+        .{ .json =
+        \\{"llm":{"default":"fixture/fake","providers":{"fixture":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat","reasoning_effort":"off","reasoning":{"map":{"off":"none","medium":"medium","high":"high"}}}}}}},"limits":{"low_price_input":false}}
+        , .effort = "off" },
+        .{ .json =
+        \\{"llm":{"default":"fixture/fake","providers":{"fixture":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat","reasoning":{"map":{"off":"none","medium":"medium","high":"high"}}}}}}},"limits":{"low_price_input":false}}
+        , .effort = "medium" },
+        .{ .json =
+        \\{"llm":{"default":"fixture/fake","reasoning_effort":"high","providers":{"fixture":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat","reasoning_effort":"custom"}}}}},"limits":{"low_price_input":false}}
+        , .effort = null },
+    };
+    // No Runtime.run: initialization uses owned config/cache fixtures only and
+    // must not contact even the deliberately unresolvable model endpoint.
+    for (cases) |case| for ([_]?[]const u8{ null, "{\"version\":1,\"reasoning_effort\":\"low\"}\n", "{broken settings" }) |legacy| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [4096]u8 = undefined;
+        const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+        var store = try @import("auth_store.zig").Store.open(a, io, home);
+        defer store.deinit();
+        try store.root.writeMode(cfg.file_name, case.json, false, 0o600);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(tmp.dir.handle, "project", 0o700));
+        const project = try std.fs.path.join(a, &.{ home, "project" });
+        defer a.free(project);
+        var root = try fs.Root.open(a, io, project);
+        defer root.deinit();
+        if (legacy) |content| {
+            try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(root.dir.handle, ".thin", 0o700));
+            try root.write(".thin/settings.json", content, false);
+        }
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        const app = try App.init(a, io, &env, project, .{}, false);
+        defer app.deinit();
+        try std.testing.expectEqualStrings("fake", app.config.value.model.name);
+        try std.testing.expectEqualStrings("fixture/fake", app.config.value.registry.?.default);
+        if (case.effort) |effort| {
+            try std.testing.expectEqualStrings(effort, app.config.value.model.reasoning_effort.?);
+        } else try std.testing.expect(app.config.value.model.reasoning_effort == null);
+        if (legacy) |content| {
+            const unchanged = try root.read(a, ".thin/settings.json", 0, 1024);
+            defer a.free(unchanged.data);
+            try std.testing.expectEqualStrings(content, unchanged.data);
+        } else try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
+        const unchanged_config = try store.root.read(a, cfg.file_name, 0, 8192);
+        defer a.free(unchanged_config.data);
+        try std.testing.expectEqualStrings(case.json, unchanged_config.data);
+
+        // App owns a duplicated dirfd after init's local Root has closed. A
+        // replacement pathname must never redirect its file operations.
+        try std.testing.expectEqual(@as(c_int, 0), std.c.renameat(tmp.dir.handle, "project", tmp.dir.handle, "retired"));
+        try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(tmp.dir.handle, "project", 0o700));
+        try app.root.write("anchored.txt", "original inode", false);
+        const anchored = try root.read(a, "anchored.txt", 0, 100);
+        defer a.free(anchored.data);
+        try std.testing.expectEqualStrings("original inode", anchored.data);
+        var replacement = try fs.Root.open(a, io, project);
+        defer replacement.deinit();
+        try std.testing.expectError(error.FileNotFound, replacement.read(a, "anchored.txt", 0, 100));
+        try std.testing.expectError(error.FileNotFound, fs.openDirectory(replacement.dir.handle, ".thin"));
+        try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("project", tmp.dir.handle, "project-alias"));
+        const alias = try std.fs.path.join(a, &.{ home, "project-alias" });
+        defer a.free(alias);
+        // Linux O_DIRECTORY | O_NOFOLLOW rejects the symlink as ENOTDIR.
+        try std.testing.expectError(error.NotDir, App.init(a, io, &env, alias, .{}, false));
+    };
 }
 
 // 配置加载可经由符号链接，但文件工具必须保护最终实际文件，而非 HOME 的词法别名。

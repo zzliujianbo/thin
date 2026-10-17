@@ -88,6 +88,132 @@ test "llm registry strict root fields duplicate fields and malformed declaration
     }
 }
 
+test "global reasoning preference roundtrips independently of model capability" {
+    for ([_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max", "none" }) |name| {
+        const raw = try std.fmt.allocPrint(
+            t.allocator,
+            "{{\"llm\":{{\"default\":\"p/m\",\"reasoning_effort\":\"{s}\",\"providers\":{{\"p\":{{\"base_url\":\"https://x\"}}}}}}}}",
+            .{name},
+        );
+        defer t.allocator.free(raw);
+        var parsed = try cfg.parse(t.allocator, raw);
+        defer cfg.release(&parsed);
+        try t.expectEqualStrings(name, parsed.value.registry.?.reasoning_effort.?);
+        // A preference alone must never authorize an unknown model capability.
+        try t.expect(parsed.value.model.reasoning == null);
+        try t.expect(parsed.value.model.reasoning_effort == null);
+        var copy = try cfg.clone(t.allocator, parsed.value);
+        defer cfg.release(&copy);
+        try t.expectEqualStrings(name, copy.value.registry.?.reasoning_effort.?);
+        try t.expect(copy.value.registry.?.reasoning_effort.?.ptr != parsed.value.registry.?.reasoning_effort.?.ptr);
+        var out: std.Io.Writer.Allocating = .init(t.allocator);
+        defer out.deinit();
+        try cfg.writeDisk(copy.value, &out.writer);
+        var disk = try cfg.parse(t.allocator, out.written());
+        defer cfg.release(&disk);
+        try t.expectEqualStrings(name, disk.value.registry.?.reasoning_effort.?);
+    }
+}
+
+test "global reasoning preference rejects unknown duplicate and wrong type" {
+    for ([_][]const u8{ "\"unknown\"", "\"HIGH\"", "\"\"", "\" high\"", "0", "true", "[]", "{}", "\"high\",\"reasoning_effort\":\"low\"" }) |value| {
+        const raw = try std.mem.concat(t.allocator, u8, &.{
+            "{\"llm\":{\"default\":\"p/m\",\"providers\":{\"p\":{\"base_url\":\"https://x\"}},\"reasoning_effort\":", value, "}}",
+        });
+        defer t.allocator.free(raw);
+        if (cfg.parse(t.allocator, raw)) |result| {
+            var unexpected = result;
+            cfg.release(&unexpected);
+            return error.ExpectedRejection;
+        } else |_| {}
+    }
+    var parsed = try cfg.parse(t.allocator, fixture);
+    defer cfg.release(&parsed);
+    parsed.value.registry.?.reasoning_effort = "unknown";
+    try t.expectError(error.InvalidReasoningEffort, cfg.validate(parsed.value));
+    try t.expectError(error.InvalidReasoningEffort, cfg.clone(t.allocator, parsed.value));
+}
+
+test "global reasoning preference setter owns normalizes and preserves declarations" {
+    var parsed = try cfg.parse(t.allocator, fixture);
+    defer cfg.release(&parsed);
+    try t.expect(parsed.value.registry.?.reasoning_effort == null);
+    var copy = try cfg.clone(t.allocator, parsed.value);
+    defer cfg.release(&copy);
+    const a = copy.arena.allocator();
+    const original = copy.value.registry.?;
+    const active = copy.value.model;
+    var name = [_]u8{ 'h', 'i', 'g', 'h' };
+    try cfg.setRegistryReasoningEffort(a, &copy.value, &name);
+    @memset(&name, 'x');
+    try t.expectEqualStrings("high", copy.value.registry.?.reasoning_effort.?);
+    try t.expect(parsed.value.registry.?.reasoning_effort == null);
+    const before = copy.value.registry.?.reasoning_effort.?;
+    try t.expectError(error.InvalidReasoningEffort, cfg.setRegistryReasoningEffort(a, &copy.value, "unknown"));
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    try t.expectError(error.OutOfMemory, cfg.setRegistryReasoningEffort(failing.allocator(), &copy.value, "low"));
+    try t.expect(copy.value.registry.?.reasoning_effort.?.ptr == before.ptr);
+    try cfg.setRegistryReasoningEffort(a, &copy.value, "none");
+    try t.expectEqualStrings("off", copy.value.registry.?.reasoning_effort.?);
+    try t.expectEqualStrings(original.default, copy.value.registry.?.default);
+    try t.expect(original.providers.ptr == copy.value.registry.?.providers.ptr);
+    try t.expectEqualDeep(active, copy.value.model);
+    try t.expectEqualDeep(parsed.value.provider, copy.value.provider);
+    try t.expectEqualDeep(parsed.value.limits, copy.value.limits);
+    try t.expectEqual(parsed.value.selection_pending, copy.value.selection_pending);
+    try t.expectEqualStrings(parsed.value.selected_provider.?, copy.value.selected_provider.?);
+    var runtime = parsed.value;
+    runtime.registry = null;
+    try t.expectError(error.MissingRegistry, cfg.setRegistryReasoningEffort(a, &runtime, "high"));
+
+    // Disk authority remains manual patches, never active metadata.
+    copy.value.model = .{ .name = "metadata-only", .context_tokens = 100000, .protocol = .responses, .reasoning_effort = "high", .reasoning = .{ .map = .{ .high = "metadata-wire" } }, .reasoning_source = .metadata, .output_tokens = 9999, .output_source = .metadata, .input_price_threshold = 50000, .input_price_flat_limit = 90000 };
+    const persisted = copy.value.model.persisted();
+    try t.expect(persisted.reasoning == null and persisted.reasoning_effort == null);
+    try t.expect(persisted.output_tokens == null and persisted.input_price_threshold == null and persisted.input_price_flat_limit == null);
+    var out: std.Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    try cfg.writeDisk(copy.value, &out.writer);
+    for ([_][]const u8{ "metadata-only", "metadata-wire", "9999", "input_price_threshold", "input_price_flat_limit" }) |forbidden| {
+        try t.expect(std.mem.find(u8, out.written(), forbidden) == null);
+    }
+    var disk = try cfg.parse(t.allocator, out.written());
+    defer cfg.release(&disk);
+    try t.expectEqualStrings("off", disk.value.registry.?.reasoning_effort.?);
+    try t.expectEqualDeep(original.providers, disk.value.registry.?.providers);
+}
+
+test "global preference does not reinterpret manual per model wire effort" {
+    var parsed = try cfg.parse(t.allocator,
+        \\{"llm":{"default":"p/m","reasoning_effort":"max","providers":{"p":{"base_url":"https://x","models":{"m":{"reasoning_effort":"custom-wire-value","output_tokens":1234}}}}}}
+    );
+    defer cfg.release(&parsed);
+    try cfg.setRegistryReasoningEffort(parsed.arena.allocator(), &parsed.value, "none");
+    try t.expectEqualStrings("custom-wire-value", parsed.value.registry.?.find("p").?.patchFor("m").?.reasoning_effort.?);
+    var out: std.Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    try cfg.writeDisk(parsed.value, &out.writer);
+    var disk = try cfg.parse(t.allocator, out.written());
+    defer cfg.release(&disk);
+    try t.expectEqualStrings("off", disk.value.registry.?.reasoning_effort.?);
+    try t.expectEqualStrings("custom-wire-value", disk.value.registry.?.find("p").?.patchFor("m").?.reasoning_effort.?);
+    try t.expectEqual(@as(u32, 1234), disk.value.registry.?.find("p").?.patchFor("m").?.output_tokens.?);
+}
+
+test "absent and null global reasoning preferences stay sparse" {
+    for ([_][]const u8{ "", ",\"reasoning_effort\":null" }) |field| {
+        const raw = try std.mem.concat(t.allocator, u8, &.{ "{\"llm\":{\"default\":\"p/m\",\"providers\":{\"p\":{\"base_url\":\"https://x\"}}", field, "}}" });
+        defer t.allocator.free(raw);
+        var parsed = try cfg.parse(t.allocator, raw);
+        defer cfg.release(&parsed);
+        try t.expect(parsed.value.registry.?.reasoning_effort == null);
+        var out: std.Io.Writer.Allocating = .init(t.allocator);
+        defer out.deinit();
+        try cfg.writeDisk(parsed.value, &out.writer);
+        try t.expect(std.mem.find(u8, out.written(), "reasoning_effort") == null);
+    }
+}
+
 fn allocationCase(a: std.mem.Allocator) !void {
     var p = try cfg.parse(a, fixture);
     defer cfg.release(&p);

@@ -79,16 +79,21 @@ pub fn inputBudget(config: cfg.Config) usize {
     const window = windowInputBudget(config);
     var ceiling: ?u32 = config.limits.max_input_tokens;
     if (config.limits.low_price_input) {
-        const step = config.model.input_price_threshold orelse return 0;
-        ceiling = if (ceiling) |manual| @min(manual, step) else step;
+        const price_limit = if (config.model.input_price_threshold) |step|
+            (if (config.model.input_price_flat_limit) |flat| @min(step, flat) else step)
+        else
+            config.model.input_price_flat_limit orelse return 0;
+        ceiling = if (ceiling) |manual| @min(manual, price_limit) else price_limit;
     }
     return if (ceiling) |limit| @min(window, @as(usize, limit) -| config.limits.input_margin_tokens) else window;
 }
 
 /// Enabled policy is conservative estimation, never an exact billing promise.
 /// Missing price metadata must not silently restore the full model window.
+/// A positively verified flat-price range is known metadata, not a missing tier.
 pub fn validateInputPolicy(config: cfg.Config) !void {
-    if (config.limits.low_price_input and config.model.input_price_threshold == null) return error.UnknownInputPriceThreshold;
+    if (config.limits.low_price_input and config.model.input_price_threshold == null and
+        config.model.input_price_flat_limit == null) return error.UnknownInputPriceThreshold;
     if (inputBudget(config) == 0) return inputBudgetError(config);
 }
 

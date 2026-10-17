@@ -31,17 +31,21 @@ test "input budget registry declarations roundtrip without persisting derived pr
         const empty_cache: @import("../app/model_metadata.zig").Cache = .{};
         try @import("../app/model_resolver.zig").applyDefault(parsed.arena.allocator(), &parsed.value, &empty_cache);
         parsed.value.model.input_price_threshold = 100000;
+        parsed.value.model.input_price_flat_limit = 1000000;
         var cloned = try cfg.clone(a, parsed.value);
         defer cfg.release(&cloned);
         try std.testing.expectEqual(@as(?u32, 100000), cloned.value.model.input_price_threshold);
+        try std.testing.expectEqual(@as(?u32, 1000000), cloned.value.model.input_price_flat_limit);
         var out: std.Io.Writer.Allocating = .init(a);
         defer out.deinit();
         try cfg.writeDisk(cloned.value, &out.writer);
         try std.testing.expect(std.mem.find(u8, out.written(), "\"input_price_threshold\"") == null);
+        try std.testing.expect(std.mem.find(u8, out.written(), "\"input_price_flat_limit\"") == null);
         var again = try cfg.parse(a, out.written());
         defer cfg.release(&again);
         try std.testing.expectEqualDeep(parsed.value.limits, again.value.limits);
         try std.testing.expect(again.value.model.input_price_threshold == null);
+        try std.testing.expect(again.value.model.input_price_flat_limit == null);
     }
     var config = configuration();
     config.limits.max_input_tokens = 5000;
@@ -60,6 +64,31 @@ test "input budget registry declarations roundtrip without persisting derived pr
             return error.ExpectedInvalidPolicy;
         } else |_| {}
     }
+}
+
+test "input budget known flat pricing is distinct from unknown and stays within its proven range" {
+    var config = configuration();
+    config.limits.low_price_input = true;
+    config.model.input_price_threshold = null;
+    config.model.input_price_flat_limit = 1000000;
+    try std.testing.expectEqual(@as(usize, 995000), c.inputBudget(config));
+    try c.checkInput(config, 995000);
+    try std.testing.expectError(error.InputBudgetExceeded, c.checkInput(config, 995001));
+    // A larger manual window cannot stretch the documented flat-price range.
+    config.model.context_tokens = 2000000;
+    try std.testing.expectEqual(@as(usize, 995000), c.inputBudget(config));
+    config.limits.max_input_tokens = 70000;
+    try std.testing.expectEqual(@as(usize, 65000), c.inputBudget(config));
+    config.limits.max_input_tokens = null;
+    config.model.input_price_threshold = 100000;
+    try std.testing.expectEqual(@as(usize, 95000), c.inputBudget(config));
+    config.model.input_price_threshold = null;
+    config.model.input_price_flat_limit = null;
+    try std.testing.expectError(error.UnknownInputPriceThreshold, c.checkInput(config, 1));
+    // Explicit opt-out remains explicit; a manual input cap still applies.
+    config.limits.low_price_input = false;
+    config.limits.max_input_tokens = 70000;
+    try std.testing.expectEqual(@as(usize, 65000), c.inputBudget(config));
 }
 
 test "input budget opt in min ceilings margin unknown and real output room" {
@@ -139,6 +168,40 @@ fn seed(runtime: *r.Runtime, old: []const u8) !void {
     try runtime.history.append(alloc, try p.textMessage(alloc, .user, "recent task"));
     try runtime.history.append(alloc, try p.textMessage(alloc, .assistant, "recent answer"));
     runtime.protected_index = 2;
+}
+
+test "input budget cold default DeepSeek runs with protection enabled and no public cache" {
+    const Store = @import("../app/auth_store.zig").Store;
+    const resolver = @import("../app/model_resolver.zig");
+    const metadata = @import("../app/model_metadata.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    var store = try Store.open(a, std.testing.io, home);
+    defer store.deinit();
+    var parsed = try store.loadOrInitialize();
+    defer cfg.release(&parsed);
+    const cache: metadata.Cache = .{};
+    try resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &cache);
+    try std.testing.expect(parsed.value.limits.low_price_input);
+    try std.testing.expect(parsed.value.model.input_price_threshold == null);
+    try std.testing.expectEqual(@as(?u32, 1000000), parsed.value.model.input_price_flat_limit);
+    var fake = Fake{ .config = &parsed.value };
+    var runtime = try r.Runtime.init(a, std.testing.io, &parsed.value, fake.model(), fake.executor(), .{}, "", true);
+    defer runtime.deinit();
+    var cancel: p.Cancellation = .{};
+    const result = try runtime.run("small first request", &cancel);
+    try std.testing.expectEqual(r.Status.success, result.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.normal);
+    try std.testing.expectEqual(@as(usize, 0), fake.summaries + fake.tools);
+    const state = try runtime.checkpoint();
+    try std.testing.expectEqual(@as(?u32, 1000000), state.input_price_flat_limit);
+    const bytes = try checkpoint.encode(a, state);
+    defer a.free(bytes);
+    const decoded = try checkpoint.decode(a, bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(state.input_price_flat_limit, decoded.value.input_price_flat_limit);
 }
 
 test "input budget unknown and oversized first goal pause before any inference and own the goal" {

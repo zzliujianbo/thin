@@ -6,7 +6,11 @@ const std = @import("std");
 const p = @import("../core/protocol.zig");
 const cfg = @import("../core/config.zig");
 const fs = @import("../platform/filesystem.zig");
-const settings = @import("../app/settings_store.zig");
+// Reserved legacy path: no preference reader/writer remains.
+const settings = struct {
+    const file_name = "settings.json";
+    const relative_path = ".thin/settings.json";
+};
 const mem = @import("memory.zig");
 const process = @import("../platform/process.zig");
 const j = @import("../util/json.zig");

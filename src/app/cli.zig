@@ -48,22 +48,23 @@ pub const help =
     \\       thin --help | --version
     \\
     \\Configuration: ~/.thin/config.json
-    \\Interactive startup initializes a missing/empty file for DeepSeek (deepseek-flash).
+    \\Startup initializes a missing/empty file for DeepSeek (deepseek-flash).
     \\Use /login in the TUI for hidden key entry; the key is saved locally with mode 0600.
     \\Never put a key in chat or command arguments. Saving never calls model inference.
     \\Successful /login returns to the prompt and refreshes that provider's official model list.
     \\Existing nonempty configurations are preserved. Advanced configuration example:
-    \\  {"provider":{"base_url":"https://your-provider.example/v1",
-    \\    "api_key_env":"THIN_API_KEY"},
-    \\   "model":{"name":"your-model","context_tokens":128000,"protocol":"auto"}}
-    \\Use either provider.api_key_env (environment variable) or provider.api_key, not both.
-    \\--print requires an already configured file; it does not open the setup UI.
+    \\  {"llm":{"default":"local/your-model","reasoning_effort":"medium",
+    \\    "providers":{"local":{"base_url":"https://your-provider.example/v1",
+    \\      "api_key_env":"THIN_API_KEY","models":{"your-model":{
+    \\        "context_tokens":128000,"protocol":"chat"}}}}}}
+    \\Use either api_key_env (environment variable) or api_key per provider, not both.
+    \\--print requires usable credentials/model settings; it never opens the setup UI.
     \\Protocols: auto (Responses then one explicitly supported fallback), responses, chat, anthropic.
     \\Anthropic Messages must be selected explicitly; auto never probes it.
     \\For Go Claude: /login OpenCode Go, then /model opencode-go/claude-haiku-5-5.
-    \\Haiku starts with a conservative 32.768K local budget (default, not an official limit).
+    \\Model context and effort use exact-route metadata or explicit local declarations.
     \\Anthropic uses x-api-key and signed native replay; custom base_url must end before /messages.
-    \\Anthropic effort overrides are not yet enabled; unverified thinking options are rejected.
+    \\Anthropic thinking uses verified capability maps; unverified options are not invented.
     \\Known DeepSeek thinking format selects Chat locally; it never probes Responses.
     \\
     \\Interactive uses regular terminal scrollback, not an alternate full-screen buffer.
@@ -82,23 +83,26 @@ pub const help =
     \\/ opens /model and /login choices; Up/Down wraps, Enter confirms (no Tab shortcut).
     \\Pickers: Up/Down selects, Enter confirms, Left returns, Esc cancels; at most 10 rows.
     \\Tab and PgUp/PgDn are not picker shortcuts. Esc also clears secret-paste quarantine.
-    \\/model opens a searchable picker; /model exact-id selects directly while idle.
+    \\/model directly lists models for locally logged-in aliases; /model exact-id selects while idle.
     \\/model --refresh refreshes official model availability and context metadata.
     \\First eligible interactive startup tries each configured provider once; failures do not auto-retry.
     \\--no-model-auto-refresh disables startup/login refresh (manual refresh remains available).
-    \\Cache: ~/.thin/model-metadata.json. Only official /models endpoints; no third-party data.
-    \\Missing official capacities retain defaults. Explicit local profiles take precedence.
+    \\Cache: ~/.thin/model-metadata.json. Refresh combines official /models and public models.dev data.
+    \\Missing capacities may use exact presets; unknown capacities remain unavailable.
+    \\Explicit local profiles take precedence.
     \\Successful listing refresh hides absent catalog entries; failed refresh keeps the last list.
     \\K/M are decimal token units; official/default is the capacity source, not actual usage.
     \\Green checks mean current model or credentials saved locally, not a verified online login.
     \\Refresh does not change the active budget; cached capacities apply on model selection.
     \\Model changes in an empty chat save defaults to ~/.thin/config.json.
     \\With conversation history, model changes stay in that session only.
-    \\Effort shortcuts are saved per startup project, not globally.
-    \\Optional models:[{name,context_tokens,protocol,reasoning_effort,reasoning}] profiles
-    \\share the endpoint (maximum 64); a custom ID inherits current context/options.
+    \\Empty-chat effort changes also save llm.reasoning_effort globally, even with --no-log.
+    \\With conversation history, effort changes stay in that session only.
+    \\Per-provider models:{raw_id:{context_tokens,protocol,reasoning_effort,reasoning}}
+    \\declares local profiles (maximum 64 total); custom IDs need explicit compatible profiles.
     \\Logical levels: off/minimal/low/medium/high/xhigh/max; only supported levels cycle.
-    \\Legacy none means off. Unknown model capabilities keep fixed configured options.
+    \\Legacy none means off. Global logical defaults wait for known capabilities.
+    \\Without a global override, unknown capabilities retain fixed model options.
     \\Custom/proxy models can declare reasoning:{format:"standard",map:{off:"none",high:"high"}}.
     \\A null/missing mapping is unsupported; DeepSeek format uses thinking.type (Chat only).
     \\Only explicitly mapped model protocols are offered; unknown API IDs are not guessed.
@@ -113,9 +117,9 @@ pub const help =
     \\--print cannot approve dangerous bash, so those calls are denied. --trust does not disable this check.
     \\--print returns the final committed visible answer with the same tool policy.
     \\
-    \\Project settings: <startup directory>/.thin/settings.json (last logical effort, 0600).
-    \\Normal startup initializes missing settings; explicit effort saves even with --no-log.
-    \\Restoring a selection never initializes or rewrites project settings.
+    \\Model and logical thinking defaults share ~/.thin/config.json (0600).
+    \\Legacy project settings.json is ignored, never created or rewritten.
+    \\Restoring history/selection alone does not rewrite global defaults.
     \\An unsupported saved level is adjusted effectively without rewriting the preference.
     \\Project Memory: <startup directory>/.thin/mem/*.md, changed through memory tools.
     \\Session records: <startup directory>/.thin/sessions/*.jsonl (local plaintext, 0600).
@@ -145,11 +149,20 @@ pub const help =
     \\Compacted context stays lossy; discarded pre-compaction history cannot be recovered.
     \\Loading never replays an interrupted tool or grants historical approvals.
     \\--no-log writes no checkpoint and prints no command for unsaved changes.
-    \\Resume uses the startup project and bypasses saved project selection preferences.
+    \\Resume uses the startup project's saved conversation, not current global selection defaults.
     \\No model probing or cache warming. Usage is reported when available;
     \\monetary cost is unknown without provider pricing.
     \\
 ;
+
+test "CLI help describes global defaults and actual metadata sources" {
+    try std.testing.expect(std.mem.indexOf(u8, help, "llm.reasoning_effort globally") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "official /models and public models.dev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Legacy project settings.json is ignored") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Global logical defaults wait for known capabilities") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "saved project selection preferences") == null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "no third-party data") == null);
+}
 
 // 交互与 --print 默认不审批普通工具；危险 bash 仍要明确批准。--trust 不关闭该检查。
 test "CLI selection restore is explicit bounded and interactive only" {

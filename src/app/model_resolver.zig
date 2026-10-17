@@ -55,12 +55,16 @@ fn officialContext(cache: *const metadata.Cache, entry: catalog.Entry, tokens: u
 /// route. Always clear the preceding selection, including a frozen unknown.
 pub fn applyInputThreshold(cache: *const metadata.Cache, config: *cfg.Config) void {
     config.model.input_price_threshold = null;
+    config.model.input_price_flat_limit = null;
     const service = cfg.providers.Id.fromUrl(config.provider.base_url) orelse return;
     if (config.provider.kind) |hint| if (hint != service) return;
     if (config.model.protocol == .auto) return;
     var entry = metadata.restoreEntry(cache, service, config.model.name) orelse return;
     entry.model.protocol = config.model.protocol;
     config.model.input_price_threshold = metadata.inputPriceThresholdFor(cache, entry);
+    if (config.model.input_price_threshold == null) {
+        config.model.input_price_flat_limit = metadata.inputPriceFlatLimitFor(cache, entry) orelse catalog.flatPriceLimit(entry);
+    }
 }
 
 const ResolvedModel = struct { model: cfg.Model, official: bool };
@@ -164,6 +168,46 @@ pub fn isUnresolved(err: anyerror) bool {
         error.DefaultProviderUnavailable, error.DefaultModelUnavailable, error.UnknownModelProtocol, error.UnknownModelContext => true,
         else => false,
     };
+}
+
+test "price proof resolves exact direct flat routes and clears on proxy protocol or raw ID changes" {
+    const a = std.testing.allocator;
+    var parsed = try cfg.parse(a,
+        \\{"llm":{"default":"ds/deepseek-flash","providers":{"ds":{"base_url":"https://api.deepseek.com","models":{"deepseek-flash":{"protocol":"chat","context_tokens":2000000},"deepseek-flash-future":{"protocol":"chat","context_tokens":2000000}}},"proxy":{"base_url":"https://proxy.invalid/v1","kind":"deepseek","models":{"deepseek-flash":{"protocol":"chat","context_tokens":2000000}}}}}}
+    );
+    defer cfg.release(&parsed);
+    var cache: metadata.Cache = .{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const flat = try resolve(arena.allocator(), parsed.value, &cache, "ds", "deepseek-flash", false);
+    try std.testing.expectEqual(@as(u32, 2000000), flat.model.context_tokens);
+    try std.testing.expectEqual(@as(?u32, 1000000), flat.model.input_price_flat_limit);
+    try std.testing.expect(flat.model.input_price_threshold == null);
+    const proxy = try resolve(arena.allocator(), parsed.value, &cache, "proxy", "deepseek-flash", false);
+    try std.testing.expect(proxy.model.input_price_flat_limit == null);
+    const future = try resolve(arena.allocator(), parsed.value, &cache, "ds", "deepseek-flash-future", false);
+    try std.testing.expect(future.model.input_price_flat_limit == null);
+    var candidate = parsed.value;
+    candidate.provider = flat.connection;
+    candidate.model = flat.model;
+    candidate.model.protocol = .responses;
+    applyInputThreshold(&cache, &candidate);
+    try std.testing.expect(candidate.model.input_price_flat_limit == null);
+    const row = try cache.directory.upsert(.deepseek, "deepseek-flash");
+    row.dev_protocol = .chat;
+    row.dev_input_price_threshold = 100000;
+    candidate.model = flat.model;
+    applyInputThreshold(&cache, &candidate);
+    try std.testing.expectEqual(@as(?u32, 100000), candidate.model.input_price_threshold);
+    try std.testing.expect(candidate.model.input_price_flat_limit == null);
+    row.dev_input_price_threshold = null;
+    row.dev_input_price_flat_limit = 500000;
+    applyInputThreshold(&cache, &candidate);
+    try std.testing.expectEqual(@as(?u32, 500000), candidate.model.input_price_flat_limit);
+    candidate.provider = proxy.connection;
+    applyInputThreshold(&cache, &candidate);
+    try std.testing.expect(candidate.model.input_price_flat_limit == null);
+    try std.testing.expect(candidate.model.input_price_threshold == null);
 }
 
 test "registry resolution merges fields but never borrows identity from a custom endpoint" {

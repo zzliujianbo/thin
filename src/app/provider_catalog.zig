@@ -62,6 +62,20 @@ pub const entries = [_]Entry{
     go("cat-jam-free", .chat),
 };
 
+/// Official pricing documents a flat context-length schedule within 1M for
+/// these two exact direct Chat routes (not reseller routes or name prefixes).
+/// Source: https://api-docs.deepseek.com/quick_start/pricing/
+/// Peak/off-peak and cache-hit prices still vary: this only covers length.
+/// Keep the proven range separate from the first tier surcharge threshold.
+/// Exact fetched surcharge thresholds take precedence in model_resolver.
+/// Unknown/future IDs deliberately have no fallback.
+pub fn flatPriceLimit(entry: Entry) ?u32 {
+    if (entry.provider != .deepseek or entry.model.protocol != .chat) return null;
+    if (std.mem.eql(u8, entry.model.name, "deepseek-flash") or
+        std.mem.eql(u8, entry.model.name, "deepseek-v4-pro")) return 1000000;
+    return null;
+}
+
 pub fn connection(id: Id) cfg.Provider {
     return .{ .kind = id, .base_url = id.baseUrl(), .chat_max_tokens = true };
 }
@@ -72,6 +86,23 @@ pub fn first(id: Id) Entry {
 pub fn find(selector: []const u8) ?Entry {
     for (entries) |entry| if (std.mem.eql(u8, selector, entry.selector)) return entry;
     return null;
+}
+
+test "documented flat price ranges are limited to exact direct DeepSeek Chat routes" {
+    for (entries) |entry| {
+        if (entry.provider == .deepseek and entry.model.protocol == .chat) {
+            try std.testing.expectEqual(@as(?u32, 1000000), flatPriceLimit(entry));
+        } else try std.testing.expect(flatPriceLimit(entry) == null);
+    }
+    var changed = first(.deepseek);
+    changed.model.name = "deepseek-flash-future";
+    try std.testing.expect(flatPriceLimit(changed) == null);
+    changed = first(.deepseek);
+    changed.model.protocol = .responses;
+    try std.testing.expect(flatPriceLimit(changed) == null);
+    changed = first(.deepseek);
+    changed.provider = .opencode_go;
+    try std.testing.expect(flatPriceLimit(changed) == null);
 }
 
 test "provider presets select exact protocols and keep Zen and Go separate" {

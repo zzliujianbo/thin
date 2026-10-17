@@ -236,6 +236,15 @@ pub const Prompt = struct {
     }
 };
 
+test "unselected model prompt shows no preset ID policy marker or percentage" {
+    for ([_]usize{ 1, 12, 80 }) |columns| {
+        const rendered = try prompt(std.testing.allocator, "", .{ .tokens = 0, .limit = 1000000 }, columns, .{ .low_price_input = true });
+        defer rendered.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("> ", rendered.plain);
+        try std.testing.expectEqualStrings("> ", rendered.styled);
+    }
+}
+
 pub const PromptActivity = struct {
     busy: bool = false,
     now_ms: u64 = 0,
@@ -253,6 +262,11 @@ pub const PromptActivity = struct {
 /// threshold color in both states. A transient effort confirmation retains its
 /// previous styling. Parentheses, spaces, marker and editor stay default.
 pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, motion: PromptActivity) !Prompt {
+    if (model.len == 0) {
+        const plain = try a.dupe(u8, "> ");
+        errdefer a.free(plain);
+        return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
+    }
     const value = if (motion.effort_flash) |level|
         try a.dupe(u8, level.name() orelse "?")
     else
@@ -564,7 +578,7 @@ test "model keeps effort and TPS waves while context percent has static occupanc
         defer percent.deinit(a);
         const percent_expected = try a.dupe(u8, percent.plain);
         defer a.free(percent_expected);
-        try std.testing.expectEqualStrings("(?%) > ", percent.plain);
+        try std.testing.expectEqualStrings("> ", percent.plain);
         try std.testing.expectEqualStrings(percent_expected, percent.styled);
         for (0..12) |columns| {
             for ([_]bool{ false, true }) |busy| {

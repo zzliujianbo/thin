@@ -48,12 +48,17 @@ pub const Model = struct {
     output_source: ReasoningSource = .explicit,
     /// Exact compatible price-step metadata; never a user declaration or window.
     input_price_threshold: ?u32 = null,
+    /// Verified range with no context-length price increase; null is unknown.
+    /// This is not a price step or a guarantee about time/cache-based prices.
+    input_price_flat_limit: ?u32 = null,
 
-    /// Derived maps/output limits and effort live in cache/project settings, not config
-    /// defaults. This prevents a fetched profile becoming an explicit override.
+    /// Derived maps/output limits and wire effort live in cache, not config
+    /// declarations. The global logical preference is stored separately in Registry.
+    /// This prevents a fetched profile becoming an explicit override.
     pub fn persisted(self: Model) Model {
         var result = self;
         result.input_price_threshold = null;
+        result.input_price_flat_limit = null;
         if (self.output_source == .metadata) result.output_tokens = null;
         if (self.reasoning_source == .metadata) {
             result.reasoning = null;
@@ -163,6 +168,9 @@ pub const NamedProvider = struct {
 };
 pub const Registry = struct {
     default: []const u8,
+    /// Global logical preference for empty sessions, never capability/wire authority.
+    /// Null preserves legacy fallback to existing model options or medium.
+    reasoning_effort: ?[]const u8 = null,
     providers: []const NamedProvider,
     pub fn find(self: Registry, name: []const u8) ?NamedProvider {
         for (self.providers) |p| if (std.mem.eql(u8, p.name, name)) return p;
@@ -307,7 +315,8 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         const llm = try object(llm_value);
         var lk = llm.iterator();
         while (lk.next()) |entry| {
-            if (!std.mem.eql(u8, entry.key_ptr.*, "default") and !std.mem.eql(u8, entry.key_ptr.*, "providers")) return error.UnknownField;
+            if (!std.mem.eql(u8, entry.key_ptr.*, "default") and !std.mem.eql(u8, entry.key_ptr.*, "providers") and
+                !std.mem.eql(u8, entry.key_ptr.*, "reasoning_effort")) return error.UnknownField;
         }
         const default = try string(llm.get("default") orelse return error.MissingField);
         const selection = try splitDefault(default);
@@ -341,7 +350,8 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
             }
             list[index] = .{ .name = entry.key_ptr.*, .connection = connection, .models = models };
         }
-        const registry: Registry = .{ .default = default, .providers = list };
+        const effort = if (llm.get("reasoning_effort")) |value| if (value == .null) null else try string(value) else null;
+        const registry: Registry = .{ .default = default, .reasoning_effort = effort, .providers = list };
         const chosen = registry.find(selection.provider) orelse return error.UnknownProvider;
         const limits = if (root.get("limits")) |v| try decode(Limits, a, v) else Limits{};
         if (limits.safety_tokens > 1024 * 1024) return error.InvalidBudget;
@@ -367,6 +377,10 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
         try s.beginObject();
         try s.objectField("default");
         try s.write(registry.default);
+        if (registry.reasoning_effort) |effort| {
+            try s.objectField("reasoning_effort");
+            try s.write(effort);
+        }
         try s.objectField("providers");
         try s.beginObject();
         for (registry.providers) |p| {
@@ -401,6 +415,23 @@ pub fn setRegistryDefault(a: std.mem.Allocator, config: *Config, provider_name: 
     const value = try std.fmt.allocPrint(a, "{s}/{s}", .{ provider_name, rawid });
     config.registry.?.default = value;
 }
+/// Edit only the logical preference; capability resolution belongs to the caller.
+/// Validate and allocate before publication, leaving config unchanged on failure.
+pub fn setRegistryReasoningEffort(a: std.mem.Allocator, config: *Config, name: []const u8) !void {
+    if (config.registry == null) return error.MissingRegistry;
+    try validateRegistryReasoningEffort(name);
+    const normalized = if (std.mem.eql(u8, name, "none")) "off" else name;
+    const owned = try a.dupe(u8, normalized);
+    config.registry.?.reasoning_effort = owned;
+}
+
+fn validateRegistryReasoningEffort(name: []const u8) !void {
+    for ([_][]const u8{ "off", "none", "minimal", "low", "medium", "high", "xhigh", "max" }) |allowed| {
+        if (std.mem.eql(u8, name, allowed)) return;
+    }
+    return error.InvalidReasoningEffort;
+}
+
 pub fn setRegistryCredential(a: std.mem.Allocator, config: *Config, provider_name: []const u8, key: []const u8) !void {
     const registry = config.registry orelse return error.MissingRegistry;
     const provider = registry.find(provider_name) orelse return error.UnknownProvider;
@@ -571,6 +602,7 @@ pub fn validate(config: Config) !void {
 }
 
 fn validateRegistry(registry: Registry, limits: Limits) !void {
+    if (registry.reasoning_effort) |effort| try validateRegistryReasoningEffort(effort);
     const selection = try splitDefault(registry.default);
     if (registry.find(selection.provider) == null) return error.UnknownProvider;
     if (registry.providers.len > 16) return error.TooManyProviders;
@@ -715,6 +747,7 @@ pub fn validateModel(model: Model, l: Limits) !void {
         l.safety_tokens > mib or
         @as(u64, l.safety_tokens) + 1 >= model.context_tokens) return error.InvalidBudget;
     if (model.input_price_threshold) |tokens| if (tokens == 0 or tokens > 16 * mib) return error.InvalidBudget;
+    if (model.input_price_flat_limit) |tokens| if (tokens == 0 or tokens > 16 * mib) return error.InvalidBudget;
     if (l.summary_tokens) |tokens| if (tokens == 0 or tokens > mib) return error.InvalidBudget;
     if (l.max_output_tokens) |cap| {
         // An explicit ceiling is preserved, but may shrink to available room

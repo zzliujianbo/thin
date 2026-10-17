@@ -144,7 +144,7 @@ test "selection defaults user-only canonical history changes only session select
     try std.testing.expectEqual(@as(usize, 1), app.runtime.messages().len);
     try std.testing.expectEqual(p.Role.user, app.runtime.messages()[0].role);
     try std.testing.expectEqualStrings(text, app.runtime.messages()[0].blocks[0].text);
-    const checkpoint_bytes = try session.resume_lease.?.load(&session.settings.root);
+    const checkpoint_bytes = try session.resume_lease.?.load(&session.project_root);
     defer a.free(checkpoint_bytes);
     const saved = try resume_codec.inspect(a, checkpoint_bytes, id);
     try std.testing.expectEqualStrings(catalog.find(target).?.model.name, saved.selection.model());

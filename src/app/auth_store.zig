@@ -13,6 +13,7 @@ const Digest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const initial: cfg.Config = .{
     .registry = .{
         .default = "deepseek/deepseek-flash",
+        .reasoning_effort = "medium",
         .providers = &.{.{
             .name = "deepseek",
             .connection = .{ .base_url = "https://api.deepseek.com", .kind = .deepseek, .chat_max_tokens = true },

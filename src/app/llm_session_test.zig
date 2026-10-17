@@ -651,14 +651,14 @@ test "llm Session dynamic history loads after lost window and delisting without 
         const wire = try codec.encode(a, id, &snapshot, payload);
         defer a.free(wire);
         wire[wire.len - 1] = '!';
-        var root = try @import("settings_store.zig").Store.open(a, std.testing.io, home);
+        var root = try @import("../platform/filesystem.zig").Root.open(a, std.testing.io, home);
         defer root.deinit();
         const resumes = @import("resume_store.zig");
-        var lease = try resumes.Lease.open(&root.root, id, true);
+        var lease = try resumes.Lease.open(&root, id, true);
         {
-            const previous = try lease.load(&root.root);
+            const previous = try lease.load(&root);
             defer a.free(previous);
-            try lease.save(&root.root, wire);
+            try lease.save(&root, wire);
         }
         lease.deinit();
         if (Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .resume_session = id })) |value| {

@@ -12,6 +12,184 @@ fn priceListing(cost: []const u8) !m.Listing {
     return m.parseDev(t.allocator, body);
 }
 
+test "exact decimal price schedules never round an increase or negative price into flat" {
+    const Case = struct { cost: []const u8, threshold: ?u32 = null, flat: ?u32 = null };
+    for ([_]Case{
+        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1.0000000000000001,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .threshold = 100000 },
+        .{ .cost = "{\"input\":1.0000000000000001,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}" },
+        .{ .cost = "{\"input\":1e-999,\"output\":2e-999,\"tiers\":[{\"input\":2e-999,\"output\":2e-999,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .threshold = 100000 },
+        .{ .cost = "{\"input\":2e-999,\"output\":2e-999,\"tiers\":[{\"input\":1e-999,\"output\":2e-999,\"tier\":{\"type\":\"context\",\"size\":100000}}]}" },
+        .{ .cost = "{\"input\":1,\"output\":1.0,\"tiers\":[{\"input\":10e-1,\"output\":100.00e-2,\"tier\":{\"type\":\"context\",\"size\":100000}},{\"input\":1.0,\"output\":1,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .flat = 1000000 },
+        .{ .cost = "{\"input\":0.0010e-996,\"output\":2e-999,\"tiers\":[{\"input\":10e-1000,\"output\":200e-1001,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .flat = 1000000 },
+        .{ .cost = "{\"input\":-1e-999,\"output\":2}" },
+        .{ .cost = "{\"input\":1,\"output\":-1e-999}" },
+        .{ .cost = "{\"input\":1,\"output\":2,\"cache_read\":-1e-999}" },
+        .{ .cost = "{\"input\":1,\"output\":2,\"cache_read\":-0}" },
+        .{ .cost = "{\"input\":1e100001,\"output\":2}" },
+        .{ .cost = "{\"input\":1e-100001,\"output\":2}" },
+        .{ .cost = "{\"input\":1e100000,\"output\":2e-100000}", .flat = 1000000 },
+        .{ .cost = "{\"input\":0,\"output\":0.0,\"tiers\":[{\"input\":0e999,\"output\":0.000e-999,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .flat = 1000000 },
+        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2.0000000000000001,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .threshold = 100000 },
+        .{ .cost = "{\"input\":0,\"output\":0,\"tiers\":[{\"input\":1e-999,\"output\":0,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .threshold = 100000 },
+        // Old f64 parsing missed the first increase and reported only 200K.
+        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1.0000000000000001,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}},{\"input\":2,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":200000}}]}", .threshold = 100000 },
+        // Same-size conflicts and unordered monotonicity must also use exact comparison.
+        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}},{\"input\":1.0000000000000001,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}" },
+        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":200000}},{\"input\":1.0000000000000001,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}" },
+        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000,\"future_schedule\":{}}}]}" },
+        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1.0000000000000001,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000,\"future_schedule\":{}}}]}", .threshold = 100000 },
+        .{ .cost = "{\"input\":1,\"output\":2,\"cache_read\":-1e-999,\"tiers\":[{\"input\":2,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .threshold = 100000 },
+    }) |case| {
+        const listing = try priceListing(case.cost);
+        const row = listing.directory.rows[0];
+        try t.expectEqual(case.threshold, row.dev_input_price_threshold);
+        try t.expectEqual(case.flat, row.dev_input_price_flat_limit);
+    }
+}
+
+test "verified flat price exact route and conservative threshold precedence" {
+    var cache: m.Cache = .{};
+    const row = try cache.directory.upsert(.opencode_go, "raw/id");
+    row.dev_protocol = .anthropic;
+    row.dev_present = true;
+    row.dev_input_price_flat_limit = 1000000;
+    const entry = m.restoreEntry(&cache, .opencode_go, "raw/id").?;
+    try t.expectEqual(@as(?u32, 1000000), m.inputPriceFlatLimitFor(&cache, entry));
+    var wrong = entry;
+    wrong.provider = .opencode_zen;
+    try t.expect(m.inputPriceFlatLimitFor(&cache, wrong) == null);
+    wrong = entry;
+    wrong.model.name = "opencode-go/raw/id";
+    try t.expect(m.inputPriceFlatLimitFor(&cache, wrong) == null);
+    wrong = entry;
+    for ([_]@import("../core/protocol.zig").Protocol{ .auto, .chat, .responses }) |api| {
+        wrong.model.protocol = api;
+        try t.expect(m.inputPriceFlatLimitFor(&cache, wrong) == null);
+    }
+    row.protocol = .chat;
+    try t.expect(m.inputPriceFlatLimitFor(&cache, entry) == null);
+    row.protocol = .auto;
+    row.dev_input_price_threshold = 100000;
+    try t.expect(m.inputPriceFlatLimitFor(&cache, entry) == null);
+    row.dev_input_price_threshold = null;
+    for ([_]?u32{ null, 0, 16777217 }) |invalid| {
+        row.dev_input_price_flat_limit = invalid;
+        try t.expect(m.inputPriceFlatLimitFor(&cache, entry) == null);
+    }
+    row.dev_input_price_flat_limit = 16777216;
+    try t.expectEqual(@as(?u32, 16777216), m.inputPriceFlatLimitFor(&cache, entry));
+}
+
+test "verified flat price v12 roundtrip merge publication clearing and bounds" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try rootFor(tmp.dir);
+    defer root.deinit();
+    var public: m.Listing = .{ .dev_done = true };
+    const row = try public.directory.upsert(.opencode_go, "raw/id");
+    row.dev_protocol = .anthropic;
+    row.dev_present = true;
+    row.dev_input_price_flat_limit = 1000000;
+    var joined: m.Listing = .{};
+    try m.mergeDev(&joined, &public);
+    try t.expectEqual(@as(?u32, 1000000), joined.directory.rows[0].dev_input_price_flat_limit);
+    const official = try m.parseListing(t.allocator, "{\"data\":[{\"id\":\"raw/id\",\"protocol\":\"anthropic\",\"context_window\":1000000}]}", .opencode_go);
+    try m.mergeOfficial(&joined, &official, .opencode_go);
+    try t.expectEqual(@as(?u32, 1000000), joined.directory.rows[0].dev_input_price_flat_limit);
+    const saved = try m.commitAt(&root, m.bit(.opencode_go), joined, 1000);
+    const entry = m.restoreEntry(&saved, .opencode_go, "raw/id").?;
+    const loaded = try m.load(&root);
+    try t.expectEqualDeep(saved, loaded);
+    try t.expectEqual(@as(?u32, 1000000), m.inputPriceFlatLimitFor(&loaded, entry));
+    var invalid = public;
+    invalid.directory.rows[0].dev_input_price_flat_limit = 16777217;
+    try t.expectError(error.InvalidMetadata, m.commitAt(&root, 0, invalid, 1010));
+    try t.expectEqualDeep(saved, try m.load(&root));
+    var cleared = joined;
+    try m.mergeDev(&cleared, &m.Listing{ .dev_done = true });
+    try t.expect(cleared.directory.rows[0].dev_input_price_flat_limit == null);
+    const removed = try m.commitAt(&root, 0, .{ .dev_done = true }, 1020);
+    try t.expect(m.inputPriceFlatLimitFor(&removed, entry) == null);
+    try t.expectEqual(@as(?u32, 1000000), removed.directory.rows[0].tokens);
+    for ([_]u32{ 11, 12 }) |version| {
+        for ([_][]const u8{ "0", "-1", "16777217", "4294967296", "1.0", "1e5", "\"100000\"", "true", "{}", "[]" }) |token| {
+            const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":{d},\"attempted\":0,\"records\":[],\"models\":[{{\"provider\":\"opencode_go\",\"id\":\"raw/id\",\"dev_input_price_flat_limit\":{s}}}]}}", .{ version, token });
+            defer t.allocator.free(body);
+            try root.writeMode(m.file_name, body, true, 0o600);
+            if (m.load(&root)) |_| return error.AcceptedInvalidFlatLimit else |_| {}
+        }
+    }
+}
+
+test "flat price v11 evidence is discarded without resetting generations or post-claim cooldown" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try rootFor(tmp.dir);
+    defer root.deinit();
+    try root.writeMode(m.file_name,
+        \\{"version":11,"attempted":128,"records":[],"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_present":true,"dev_input_price_threshold":200000,"dev_input_price_flat_limit":1000000}],"refresh":[{"generation":11},{"generation":12},{"generation":13},{"generation":14,"last_attempt_ms":900,"last_success_ms":800,"successful":false}]}
+    , true, 0o600);
+    const migrated = try m.load(&root);
+    try t.expect(migrated.directory.rows[0].dev_input_price_flat_limit == null);
+    // Old f64 evidence could miss a tiny increase at 100K and record 200K.
+    try t.expect(migrated.directory.rows[0].dev_input_price_threshold == null);
+    try t.expectEqual(@as(u64, 14), migrated.refresh[3].generation);
+    try t.expectEqual(@as(?u64, 800), migrated.refresh[3].last_success_ms);
+    const claimed = try m.claimAt(&root, m.dev_bit, false, 1000, .{});
+    try t.expectEqual(m.dev_bit, claimed.mask);
+    try t.expectEqual(@as(u64, 15), claimed.generations[3]);
+    for (0..3) |index| try t.expectEqual(@as(u64, 11) + index, claimed.generations[index]);
+    // No successful publication: the persisted v12 attempt still enforces cooldown.
+    try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, m.dev_bit, false, 1001, .{})).mask);
+    const public = try priceListing("{\"input\":1,\"output\":2}");
+    const stale = try m.commitClaimedAt(&root, 0, public, .{ 11, 12, 13, 14 }, 1010);
+    try t.expectEqual(@as(u8, 0), stale.accepted);
+    try t.expect(stale.cache.directory.rows[0].dev_input_price_flat_limit == null);
+    var invalid = public;
+    invalid.directory.rows[0].dev_input_price_flat_limit = 16777217;
+    try t.expectError(error.InvalidMetadata, m.commitClaimedAt(&root, 0, invalid, claimed.generations, 1020));
+    try t.expectEqualDeep(claimed.cache, try m.load(&root));
+    try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, m.dev_bit, false, 1021, .{})).mask);
+    const published = try m.commitClaimedAt(&root, 0, public, claimed.generations, 1030);
+    try t.expectEqual(m.dev_bit, published.accepted);
+    const loaded = try m.load(&root);
+    try t.expectEqualDeep(published.cache, loaded);
+    const entry = m.restoreEntry(&loaded, .opencode_go, "claude-haiku-5-5").?;
+    try t.expectEqual(@as(?u32, 1000000), m.inputPriceFlatLimitFor(&loaded, entry));
+}
+
+test "flat price v10 migration preserves source generations and grants one dev claim" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try rootFor(tmp.dir);
+    defer root.deinit();
+    try root.writeMode(m.file_name,
+        \\{"version":10,"attempted":135,"records":[],"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_input_price_threshold":100000,"dev_input_price_flat_limit":1000000}],"refresh":[{"generation":11,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":12,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":13,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":14,"last_attempt_ms":900,"last_success_ms":900,"successful":true}]}
+    , true, 0o600);
+    const migrated = try m.load(&root);
+    try t.expect(migrated.directory.rows[0].dev_input_price_flat_limit == null);
+    try t.expect(migrated.directory.rows[0].dev_input_price_threshold == null);
+    for (migrated.refresh, 0..) |timing, index| {
+        try t.expectEqual(@as(u64, 11) + index, timing.generation);
+        try t.expectEqual(@as(?u64, 900), timing.last_success_ms);
+        try t.expect(timing.successful);
+        try t.expectEqual(if (index == 3) @as(?u64, null) else @as(?u64, 900), timing.last_attempt_ms);
+    }
+    try t.expectEqual(m.dev_bit, m.eligible(&migrated, m.provider_mask | m.dev_bit, 1000, .{}));
+    const claimed = try m.claimAt(&root, m.dev_bit, false, 1000, .{});
+    try t.expectEqual(m.dev_bit, claimed.mask);
+    try t.expectEqual(@as(u64, 15), claimed.generations[3]);
+    for (0..3) |index| try t.expectEqual(@as(u64, 11) + index, claimed.generations[index]);
+    try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, m.dev_bit, false, 1001, .{})).mask);
+    var stale: m.Listing = .{ .dev_done = true };
+    const row = try stale.directory.upsert(.opencode_go, "raw/id");
+    row.dev_input_price_flat_limit = 1000000;
+    row.dev_protocol = .anthropic;
+    const rejected = try m.commitClaimedAt(&root, 0, stale, .{ 11, 12, 13, 14 }, 1010);
+    try t.expectEqual(@as(u8, 0), rejected.accepted);
+    try t.expect(rejected.cache.directory.rows[0].dev_input_price_flat_limit == null);
+}
+
 test "price threshold exact fixture independent of official context and output" {
     var listing = try m.parseDev(t.allocator, @embedFile("models_dev_fixture.json"));
     const public_index = listing.directory.find(.opencode_go, "claude-haiku-5-5").?;
@@ -146,18 +324,20 @@ test "price threshold v8 successful refresh gets one public upgrade claim withou
     try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, m.dev_bit, false, 1001, .{})).mask);
 }
 
-test "price threshold v10 strict cache tokens invalid publication rollback and legacy unknown" {
+test "price threshold v10-v12 strict cache tokens invalid publication rollback and legacy unknown" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
-    for ([_][]const u8{ "0", "-1", "16777217", "4294967296", "1.0", "1e5", "\"100000\"", "true", "{}", "[]" }) |token| {
-        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":10,\"attempted\":0,\"records\":[],\"models\":[{{\"provider\":\"opencode_go\",\"id\":\"same\",\"dev_input_price_threshold\":{s}}}]}}", .{token});
-        defer t.allocator.free(body);
-        try root.writeMode(m.file_name, body, true, 0o600);
-        if (m.load(&root)) |_| return error.AcceptedInvalidThreshold else |_| {}
+    for ([_]u32{ 10, 11, 12 }) |version| {
+        for ([_][]const u8{ "0", "-1", "16777217", "4294967296", "1.0", "1e5", "\"100000\"", "true", "{}", "[]" }) |token| {
+            const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":{d},\"attempted\":0,\"records\":[],\"models\":[{{\"provider\":\"opencode_go\",\"id\":\"same\",\"dev_input_price_threshold\":{s}}}]}}", .{ version, token });
+            defer t.allocator.free(body);
+            try root.writeMode(m.file_name, body, true, 0o600);
+            if (m.load(&root)) |_| return error.AcceptedInvalidThreshold else |_| {}
+        }
     }
-    for (1..10) |version| {
+    for (1..12) |version| {
         const models = if (version >= 5) ",\"models\":[{\"provider\":\"opencode_go\",\"id\":\"same\",\"dev_input_price_threshold\":100000}]" else "";
         const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":{d},\"attempted\":0,\"records\":[]{s}}}", .{ version, models });
         defer t.allocator.free(body);
@@ -828,7 +1008,7 @@ test "context cache v1-v6 unknown v6 output preserved and v7 migration refresh o
         defer t.allocator.free(bytes.data);
         var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, bytes.data, .{});
         defer parsed.deinit();
-        try t.expectEqual(@as(i64, 10), parsed.value.object.get("version").?.integer);
+        try t.expectEqual(@as(i64, 12), parsed.value.object.get("version").?.integer);
     }
 }
 

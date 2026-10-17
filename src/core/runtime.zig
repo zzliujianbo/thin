@@ -827,6 +827,7 @@ pub const Runtime = struct {
             .output_budget_frozen = true,
             .input_budget_frozen = true,
             .input_price_threshold = self.config.model.input_price_threshold,
+            .input_price_flat_limit = self.config.model.input_price_flat_limit,
             .max_input_tokens = self.config.limits.max_input_tokens,
             .low_price_input = self.config.limits.low_price_input,
             .input_margin_tokens = self.config.limits.input_margin_tokens,

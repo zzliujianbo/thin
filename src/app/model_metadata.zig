@@ -236,6 +236,18 @@ pub fn inputPriceThresholdFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
     return validContext(row.dev_input_price_threshold);
 }
 
+/// Verified flat span on the exact concrete route. A compatible tier threshold
+/// always takes precedence; absence of a threshold is not evidence of flat cost.
+pub fn inputPriceFlatLimitFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
+    const index = cache.directory.find(entry.provider, entry.model.name) orelse return null;
+    const row = cache.directory.rows[index];
+    const api = entry.model.protocol;
+    if (!compatibleRoute(row, api)) return null;
+    if (row.dev_protocol != api) return null;
+    if (validContext(row.dev_input_price_threshold) != null) return null;
+    return validContext(row.dev_input_price_flat_limit);
+}
+
 /// Shared cache-only resolver. Session owns freezing an accepted task's budget.
 pub fn applyOutput(cache: *const Cache, config: *cfg.Config) void {
     if (config.model.output_source == .explicit and config.model.output_tokens != null) return;
@@ -342,6 +354,7 @@ pub fn mergeOfficial(target: *Listing, source: *const Listing, id: providers.Id)
             dest.dev_output_tokens = previous.dev_output_tokens;
             dest.dev_context_tokens = previous.dev_context_tokens;
             dest.dev_input_price_threshold = previous.dev_input_price_threshold;
+            dest.dev_input_price_flat_limit = previous.dev_input_price_flat_limit;
             dest.dev_present = previous.dev_present;
         }
     }
@@ -363,6 +376,7 @@ pub fn mergeDev(target: *Listing, source: *const Listing) !void {
         row.dev_output_tokens = null;
         row.dev_context_tokens = null;
         row.dev_input_price_threshold = null;
+        row.dev_input_price_flat_limit = null;
         row.dev_present = false;
     }
     for (source.directory.rows[0..source.directory.count], 0..) |source_row, index| {
@@ -373,6 +387,7 @@ pub fn mergeDev(target: *Listing, source: *const Listing) !void {
         row.dev_output_tokens = source_row.dev_output_tokens;
         row.dev_context_tokens = source_row.dev_context_tokens;
         row.dev_input_price_threshold = source_row.dev_input_price_threshold;
+        row.dev_input_price_flat_limit = source_row.dev_input_price_flat_limit;
         row.dev_present = true;
     }
     target.directory = merged;
@@ -599,6 +614,7 @@ const DynamicRecord = struct {
     dev_output_tokens: ?u32 = null,
     dev_context_tokens: ?u32 = null,
     dev_input_price_threshold: ?u32 = null,
+    dev_input_price_flat_limit: ?u32 = null,
     available: ?bool = null,
     protocol: Protocol = .auto,
     dev_protocol: Protocol = .auto,
@@ -711,6 +727,13 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
                             else => return error.InvalidMetadata,
                         };
                     }
+                    if (doc.version >= 11) {
+                        if (model.object.get("dev_input_price_flat_limit")) |value| switch (value) {
+                            .null => {},
+                            .integer => |n| if (n <= 0 or n > max_tokens) return error.InvalidMetadata,
+                            else => return error.InvalidMetadata,
+                        };
+                    }
                     if (doc.version >= 10) {
                         if (model.object.get("dev_input_price_threshold")) |value| switch (value) {
                             .null => {},
@@ -729,7 +752,7 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
             }
         }
     }
-    if ((doc.version < 1 or doc.version > 10) or doc.attempted & ~(all_mask | dev_bit) != 0 or doc.records.len > catalog.entries.len or doc.models.len > directory.max_models or doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
+    if ((doc.version < 1 or doc.version > 12) or doc.attempted & ~(all_mask | dev_bit) != 0 or doc.records.len > catalog.entries.len or doc.models.len > directory.max_models or doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
     if (doc.version < 5 and (doc.directory_mask != 0 or doc.models.len != 0)) return error.InvalidMetadata;
     // Legacy caches never attempted dynamic discovery. Retain their successful
     // metadata, but permit one automatic directory/protocol refresh after upgrade.
@@ -738,15 +761,16 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
     if (doc.version < 9) for (&result.refresh) |*timing| {
         timing.generation = 0;
     };
-    // v8/v9 had refresh timing but lacked input price thresholds. Permit one
-    // public claim without resetting ANY existing generation: no ABA.
-    if (doc.version >= 8 and doc.version < 10) {
+    // v8..v11 lack exact-decimal/strict-descriptor price evidence. Even an old
+    // threshold may have rounded away an earlier surcharge. Permit
+    // one public claim without resetting ANY existing generation: no ABA.
+    if (doc.version >= 8 and doc.version < 12) {
         result.attempted &= ~dev_bit;
         result.refresh[3].last_attempt_ms = null;
     }
     // v5 lacked output and v6 lacked public context. Grant one public refresh
     // for either upgrade, preserving successful official and v6 output metadata.
-    // claim persists v10 timing/generations before fetching, so failures observe cooldown.
+    // claim persists v12 timing/generations before fetching, so failures observe cooldown.
     if (doc.version == 5 or doc.version == 6) result.attempted &= ~dev_bit;
     for (doc.models) |record| {
         if (record.context_window) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
@@ -754,7 +778,8 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
         const row = try result.directory.upsert(record.provider, record.id);
         row.tokens = record.context_window;
         if (doc.version >= 7) row.dev_context_tokens = record.dev_context_tokens;
-        if (doc.version >= 10) row.dev_input_price_threshold = record.dev_input_price_threshold;
+        if (doc.version >= 12) row.dev_input_price_threshold = record.dev_input_price_threshold;
+        if (doc.version >= 12) row.dev_input_price_flat_limit = record.dev_input_price_flat_limit;
         if (doc.version >= 6) {
             if (record.output_tokens != null and validOutput(record.output_tokens) == null) return error.InvalidMetadata;
             if (record.dev_output_tokens != null and validOutput(record.dev_output_tokens) == null) return error.InvalidMetadata;
@@ -829,6 +854,7 @@ fn save(root: *fs.Root, cache: Cache) !void {
     for (cache.directory.rows[0..cache.directory.count]) |row| {
         if (row.dev_context_tokens != null and validContext(row.dev_context_tokens) == null) return error.InvalidMetadata;
         if (row.dev_input_price_threshold != null and validContext(row.dev_input_price_threshold) == null) return error.InvalidMetadata;
+        if (row.dev_input_price_flat_limit != null and validContext(row.dev_input_price_flat_limit) == null) return error.InvalidMetadata;
         if (row.output_tokens != null and validOutput(row.output_tokens) == null) return error.InvalidMetadata;
         if (row.dev_output_tokens != null and validOutput(row.dev_output_tokens) == null) return error.InvalidMetadata;
     }
@@ -850,6 +876,7 @@ fn save(root: *fs.Root, cache: Cache) !void {
         .dev_output_tokens = row.dev_output_tokens,
         .dev_context_tokens = row.dev_context_tokens,
         .dev_input_price_threshold = row.dev_input_price_threshold,
+        .dev_input_price_flat_limit = row.dev_input_price_flat_limit,
         .available = row.available,
         .protocol = row.protocol,
         .dev_protocol = row.dev_protocol,
@@ -860,7 +887,7 @@ fn save(root: *fs.Root, cache: Cache) !void {
     const bytes = try root.allocator.alloc(u8, max_cache_bytes);
     defer root.allocator.free(bytes);
     var writer = std.Io.Writer.fixed(bytes);
-    try std.json.Stringify.value(Document{ .version = 10, .attempted = cache.attempted, .records = &records, .directory_mask = cache.directory_mask, .models = models, .refresh = cache.refresh }, .{}, &writer);
+    try std.json.Stringify.value(Document{ .version = 12, .attempted = cache.attempted, .records = &records, .directory_mask = cache.directory_mask, .models = models, .refresh = cache.refresh }, .{}, &writer);
     try writer.writeByte('\n');
     try root.writeMode(file_name, bytes[0..writer.end], true, 0o600);
 }
@@ -949,6 +976,7 @@ fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing
             row.dev_output_tokens = null;
             row.dev_context_tokens = null;
             row.dev_input_price_threshold = null;
+            row.dev_input_price_flat_limit = null;
             row.dev_present = false;
         }
     }
@@ -969,6 +997,7 @@ fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing
             row.dev_output_tokens = source.dev_output_tokens;
             row.dev_context_tokens = source.dev_context_tokens;
             row.dev_input_price_threshold = source.dev_input_price_threshold;
+            row.dev_input_price_flat_limit = source.dev_input_price_flat_limit;
             row.dev_present = true;
         }
     }
@@ -1230,7 +1259,7 @@ test "metadata malformed cache is never overwritten and selectors are validated"
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const bad = [_][]const u8{
-        "{\"version\":11,\"attempted\":0,\"records\":[]}",
+        "{\"version\":13,\"attempted\":0,\"records\":[]}",
         "{\"version\":1,\"attempted\":64,\"records\":[]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"unknown\",\"context_window\":1}]}",
         "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":0}]}",
@@ -1338,7 +1367,7 @@ test "metadata legacy cache upgrades to v10 with unknown directory availability 
     defer std.testing.allocator.free(bytes.data);
     var parsed = try std.json.parseFromSlice(Document, std.testing.allocator, bytes.data, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 10), parsed.value.version);
+    try std.testing.expectEqual(@as(u32, 12), parsed.value.version);
     try std.testing.expectEqualDeep(upgraded.cache, try load(&root));
     const nullable = try parseCache(std.testing.allocator, "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":null}]}");
     for (nullable.available) |v| try std.testing.expect(v == null);

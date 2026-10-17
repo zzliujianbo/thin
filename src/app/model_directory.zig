@@ -63,6 +63,8 @@ pub const Record = struct {
     dev_context_tokens: ?u32 = null,
     /// Earliest exact-route public context price increase; not a context window.
     dev_input_price_threshold: ?u32 = null,
+    /// Verified span with no context input-price increase; not inferred from absence.
+    dev_input_price_flat_limit: ?u32 = null,
     available: ?bool = null,
     protocol: Protocol = .auto,
     dev_protocol: Protocol = .auto,

@@ -514,6 +514,7 @@ async function scenario(name, protocol, kind, isPty = false) {
     const args = kind === 'help' ? ['--help'] : ['--print','fixture-task', ...(kind==='trust'?['--trust']:[])];
 
     const navigationConfig = kind === 'menu-navigation' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
+    const selectionConfig = kind === 'model-select' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
     // 运行 CLI 或 PTY 驱动（PTY 超时 90 秒，其它 30 秒）。
     const result = await execute(isPty?pty:app, isPty?[]:args, env, project, (child, owns) => {signalChild=child; ownsChild=owns;}, isPty?90000:30000);
 
@@ -529,6 +530,13 @@ async function scenario(name, protocol, kind, isPty = false) {
         const error = new Error('Go login PTY failed');
         error.fixtureCase = 'login/go';
         error.fixtureCheck = codes.replaceAll(', ', ' ') || 'no safe error code';
+        throw error;
+      }
+      if (kind === 'model-select' && result.code !== 0) {
+        const error = new Error('owned selection PTY failed');
+        const lines = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].slice(0,6).map(match => match[1]).join('-') || 'unknown';
+        error.fixtureCase = `selection/${protocol}`;
+        error.fixtureCheck = `PTY code ${result.code} at ${lines} requests ${requests}`;
         throw error;
       }
       assert.equal(result.code, 0, `${name}: exit ${result.code}; ${codes || 'no safe error code'}; captured ${result.output.length} bytes (not rendered)`);
@@ -563,11 +571,9 @@ async function scenario(name, protocol, kind, isPty = false) {
     }
     if (['exit-no-submit','exit-unconfigured','exit-secret','exit-batched','menu-navigation','auth-go'].includes(kind)) {
       assert.equal(requests,0, 'exit identity must not send a request');
-      // The TUI seeds the project default thinking level on startup, so the
-      // only allowed project artifact is the private settings file. Identity
-      // submission still must not create archives, history, or other storage.
+      // Global defaults need no project artifact before any submission.
       const projectThin = join(project,'.thin');
-      if (await exists(projectThin)) assert.deepEqual(await readdir(projectThin),['settings.json'], 'identity/no-submission created unexpected project storage');
+      assert(!await exists(projectThin), 'identity/no-submission created project storage');
       if (['exit-unconfigured','exit-secret'].includes(kind)) {
         const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
         assert.equal(disk.llm.providers.local.api_key,null, 'Ctrl+D secret exit must not save input');
@@ -598,12 +604,9 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert(!('provider' in initialized) && !('model' in initialized) && !('credentials' in initialized));
       assert(!('local' in initialized.llm.providers), 'old filename must not supply connection or credentials');
       assert.equal((await stat(path)).mode & 0o777,0o600);
+      assert.equal(initialized.llm.reasoning_effort,'medium');
       const projectThin = join(project,'.thin');
-      assert.deepEqual(await readdir(projectThin),['settings.json'], 'failed activation created conversation storage');
-      const settings = JSON.parse(await readFile(join(projectThin,'settings.json'),'utf8'));
-      assert.equal(settings.version,1);
-      assert(['off','minimal','low','medium','high','xhigh','max'].includes(settings.reasoning_effort));
-      assert.equal((await stat(join(projectThin,'settings.json'))).mode & 0o777,0o600);
+      assert(!await exists(projectThin), 'failed activation created project storage');
       if (kind === 'legacy-config') {
         const ignored = JSON.parse(await readFile(join(home,'.thin/auth.json'),'utf8'));
         assert.equal(ignored.llm.default,'local/fixture-model', 'ignored old filename was modified');
@@ -635,11 +638,9 @@ async function scenario(name, protocol, kind, isPty = false) {
         // With no metadata/declaration, persist the logical medium preference
         // without manufacturing a supported high level before authentication.
         // No submission may create archives or any other project artifact.
-        assert.deepEqual((await readdir(project)).sort(), ['.thin','seed.txt'], 'unexpected project files');
-        assert.deepEqual(await readdir(join(project,'.thin')), ['settings.json']);
-        const settingsPath = join(project,'.thin/settings.json');
-        assert.equal((await stat(settingsPath)).mode & 0o777, 0o600);
-        assert.deepEqual(JSON.parse(await readFile(settingsPath,'utf8')), {version:1,reasoning_effort:'medium'});
+        assert.deepEqual((await readdir(project)).sort(), ['seed.txt'], 'unexpected project files');
+        assert(!await exists(join(project,'.thin')), 'initialization created project settings');
+        assert.equal(auth.llm.reasoning_effort,'medium');
         const declared = auth.llm.providers.deepseek.models['deepseek-flash'];
         assert.equal(declared.protocol,'chat');
         assert.equal(declared.context_tokens,1000000);
@@ -737,7 +738,9 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert.equal(disk.llm.providers.local.models['fixture-model'].reasoning_effort,'none');
       assert.equal(disk.llm.providers.local.models['fixture-model'].context_tokens,32768);
       assert.equal(disk.llm.providers.local.models['fixture-next'].reasoning_effort,'low');
-      assert.deepEqual(JSON.parse(await readFile(join(project,'.thin/settings.json'),'utf8')), {version:1,reasoning_effort:'high'});
+      assert.equal(disk.llm.reasoning_effort ?? null,null);
+      assert.equal(await readFile(join(home,'.thin/config.json'),'utf8'),selectionConfig, 'history selections changed global defaults');
+      assert(!await exists(join(project,'.thin/settings.json')), 'history selections created retired project settings');
     }
     if (kind === 'regular-two') assert.equal(requests,2, 'regular two-turn request count');
     if (kind === 'keyboard-history') { assert.equal(requests,4); assert(stalled); }
@@ -782,7 +785,12 @@ async function watchdogRegression() {
 
 try {
   await watchdogRegression();
-  if (!watchdogOnly) {
+  if (process.argv.includes('--model-selection-only')) {
+    await scenario('PTY model/effort selection chat','chat','model-select',true);
+    await scenario('PTY model/effort selection responses','responses','model-select',true);
+  } else if (process.argv.includes('--settings-only')) {
+    await settingsRegressions({app,pty,execute,send});
+  } else if (!watchdogOnly) {
   // 运行全部场景：先测无配置的 help 与 print，再对 chat 与 responses 运行通用场景，最后运行 PTY 场景（仅 chat）。
   await scenario('PTY compact menu navigation','chat','menu-navigation',true);
   await scenario('PTY manual context compaction','chat','manual-compact',true);
@@ -818,7 +826,7 @@ try {
   // 中文：不要渲染捕获的终端或模型输出、响应头或请求体。
   // Do not render captured terminal/model output, headers, or request bodies.
   const label = /^(?:log|selection|settings|resume|login)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
-    ? `${error.fixtureCase}: ${error.fixtureCheck}` : 'offline fixture assertion failed (details withheld)';
+    ? `${error.fixtureCase}: ${error.fixtureCheck}` : `offline fixture assertion at app_mock.mjs:${/app_mock\.mjs:(\d+):/.exec(error.stack ?? '')?.[1] ?? 'unknown'} (details withheld)`;
   console.error(`FAIL application acceptance: ${label}`);
   process.exitCode = 1;
 }

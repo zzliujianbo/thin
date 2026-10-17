@@ -23,6 +23,8 @@ const shared = @import("../presentation.zig");
 const bridge_module = @import("bridge.zig");
 const Io = std.Io;
 
+pub const ModelProvider = picker_module.Provider;
+
 /// 单条显示记录的字节上限（128 KiB）。超出部分只影响显示，不影响模型历史。
 const record_limit = 128 * 1024;
 
@@ -198,6 +200,9 @@ pub const Connection = struct {
         session_id: ?[32]u8 = null,
         /// Metadata-only catalog for this endpoint; never a credential catalog.
         models: []const core_config.Model = &.{},
+        /// Nonsecret logged-in aliases filter the flat model list. Null is
+        /// legacy unfiltered ownership; empty never means all providers.
+        model_providers: ?[]const ModelProvider = null,
         model_context_official: []const bool = &.{},
         model_disabled: []const bool = &.{},
         context_official: bool = false,
@@ -212,6 +217,8 @@ pub const Connection = struct {
         low_price_input: bool = false,
         /// Immutable configured request option, not inferred from stream time.
         reasoning_effort: shared.ReasoningEffort = .unspecified,
+        /// Default preference awaiting an exact capability map; not a wire option.
+        pending_default_effort: ?shared.ReasoningEffort = null,
         /// Capability metadata prepared by the owner; zero means unknown.
         effort_levels: shared.activity.EffortSet = .{},
         settings_error: ?anyerror = null,
@@ -586,7 +593,12 @@ const Ui = struct {
         if (self.secret_quarantine) return std.fmt.allocPrint(a, "{s}; Esc closes", .{self.notice});
         if (self.secret_mode) return if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
         if (self.provider_open) return if (self.provider_picker.pasted) "Pasted selection; Esc cancels" else if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
-        if (self.model_picker) |picker| return if (picker.pasted) "Pasted selection; Esc cancels" else if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
+        if (self.model_picker) |picker| {
+            if (picker.pasted) return "Pasted selection; Esc cancels";
+            if (!std.mem.eql(u8, self.notice, "Ready")) return self.notice;
+            if (state.model_providers) |logged| if (logged.len == 0) return "No logged-in providers: /login, then /model";
+            return "";
+        }
         if (self.commandMenuVisible()) return "";
         var notice: []const u8 = "";
         var model_failed = false;
@@ -600,7 +612,10 @@ const Ui = struct {
             }
         }
         if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
-        if (notice.len == 0 and state.runtime == null and state.settings_notice == null) notice = "Not configured: /login";
+        if (notice.len == 0 and state.runtime == null and (state.settings_notice == null or state.model.len == 0)) notice = "Not configured: /login, then /model";
+        if (notice.len == 0 and state.settings_error == null) if (state.pending_default_effort) |effort| {
+            notice = try std.fmt.allocPrint(a, "Default thinking: {s}; awaiting model capabilities", .{effort.name() orelse "unknown"});
+        };
         if (state.settings_error) |err| {
             notice = try std.fmt.allocPrint(a, "{s}{s}SETTINGS FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
         } else if (!model_failed) {
@@ -905,12 +920,15 @@ const Ui = struct {
         try self.connection.selectModel(name);
         const state = self.connection.current();
         self.display = .{ .context = state.initial_context, .reasoning_effort = state.reasoning_effort };
-        self.effort_flash = null;
+        self.effort_flash = if (state.effort_levels.contains(state.reasoning_effort))
+            .{ .level = state.reasoning_effort.canonical(), .until_ms = self.clock_ms +| 2000 }
+        else
+            null;
         self.model_flow = .{};
         self.mode = null;
         self.last_terminal = null;
         self.closeModelPicker();
-        self.notice = if (inherited) "Selected for this session; inherited context budget; defaults unchanged" else "Selected for this session; defaults unchanged";
+        self.notice = if (inherited) "Model selected; inherited context budget" else "Model selected";
         self.dirty = true;
     }
     fn cycleEffort(self: *Ui) void {
@@ -996,7 +1014,7 @@ const Ui = struct {
             },
             .up, .down, .enter => {
                 const state = self.connection.current();
-                const choices = try picker.choicesWithDisabled(self.allocator, state.selection_name orelse state.model, state.context_limit, state.models, state.model_disabled);
+                const choices = try picker.choicesWithProviders(self.allocator, state.selection_name orelse state.model, state.context_limit, state.models, state.model_disabled, state.model_providers);
                 defer self.allocator.free(choices);
                 if (event_ == .enter) {
                     if (self.frame.len != 0 or picker.pasted or choices.len == 0 or self.displayed_model_epoch != self.model_epoch or self.displayed_model_generation != picker.generation) return;
@@ -1005,7 +1023,10 @@ const Ui = struct {
                         self.notice = "Protocol unknown; model cannot be selected";
                         return;
                     }
-                    self.selectModel(choice.name) catch {
+                    const name = try picker.selectionName(self.allocator, choice);
+                    defer self.allocator.free(name);
+                    if (!picker.modelShown(name)) return;
+                    self.selectModel(name) catch {
                         self.notice = "Could not switch; selection is unchanged";
                     };
                 } else picker.move(event_ == .down, choices.len);
@@ -1109,7 +1130,7 @@ const Ui = struct {
         const state = self.connection.current();
         const runtime = state.runtime orelse {
             self.wipeEditor();
-            self.notice = state.settings_notice orelse "Not configured: use /login first";
+            self.notice = if (state.model.len == 0) "Not configured: /login, then /model" else state.settings_notice orelse "Not configured: use /login first";
             return;
         };
 
@@ -1422,10 +1443,15 @@ const Ui = struct {
 
     fn pollMetadata(self: *Ui) void {
         const poll = self.connection.poll_models_fn orelse return;
+        const before = self.connection.current();
         if (!poll(self.connection.context, self.settingsIdle())) return;
+        const state = self.connection.current();
+        if (before.pending_default_effort != null and state.pending_default_effort == null and
+            state.effort_levels.contains(state.reasoning_effort))
+            self.effort_flash = .{ .level = state.reasoning_effort.canonical(), .until_ms = self.clock_ms +| 2000 };
         if (self.model_picker) |*picker| picker.changed();
         self.displayed_model_generation = null;
-        if (self.connection.current().metadata_notice) |notice| self.notice = notice;
+        if (state.metadata_notice) |notice| self.notice = notice;
         self.dirty = true;
     }
 
@@ -1594,6 +1620,12 @@ const Ui = struct {
         self.displayed_permission = if (self.frame_fresh) self.frame_permission else null;
         self.displayed_model_epoch = if (self.frame_fresh) self.frame_model_epoch else null;
         self.displayed_model_generation = if (self.frame_fresh) self.frame_model_generation else null;
+        if (self.model_picker) |*picker| {
+            if (self.displayed_model_epoch == self.model_epoch and self.displayed_model_generation == picker.generation)
+                picker.acknowledgeChoice()
+            else
+                picker.drawn_model_len = null;
+        }
         self.displayed_command_generation = if (self.frame_fresh) self.frame_command_generation else null;
         self.displayed_provider_generation = if (self.frame_fresh) self.frame_provider_generation else null;
         self.tail_height = self.frame_height;
@@ -1859,6 +1891,7 @@ const Ui = struct {
         const secret_destination = if (self.secret_mode) blk: {
             if (self.secret_provider) |id| break :blk try std.fmt.allocPrint(a, "API key for {s}\nBase URL: {s}\nSaved locally only; /model activates the saved key", .{ id.label(), id.baseUrl() });
             const state = self.connection.current();
+            if (state.model.len == 0) break :blk try std.fmt.allocPrint(a, "API key for current endpoint\nBase URL: {s}\nEnter saves locally; no network request is made here", .{state.base_url});
             break :blk try std.fmt.allocPrint(a, "API key for model {s}\nBase URL: {s}\nEnter saves locally; no network request is made here", .{ state.model, state.base_url });
         } else "";
         const empty_rendered: markdown.Rendered = .{ .lines = &.{}, .total_lines = 0, .truncated = false };
@@ -1875,7 +1908,8 @@ const Ui = struct {
         const footer_rows: usize = 2 + @as(usize, @intFromBool(hint_line.len != 0));
         const body_limit = self.size.rows -| footer_rows;
         const candidate_limit = body_limit -| 1; // Separate candidates from conversation even in short windows.
-        const picker_rows = if (self.model_picker) |*picker| try picker.rowsWithState(a, state.selection_name orelse state.model, state.context_limit, state.models, cols, candidate_limit, .{ .current = state.context_official, .models = state.model_context_official }, state.model_disabled) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
+        const picker_rows = if (self.model_picker) |*picker| try picker.rowsWithProviders(a, state.selection_name orelse state.model, state.context_limit, state.models, cols, candidate_limit, .{ .current = state.context_official, .models = state.model_context_official }, state.model_disabled, state.model_providers) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
+        if (self.model_picker) |*picker| try picker.captureChoice(a, picker_rows.selected_choice);
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, candidate_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
         const menu_visible = self.commandMenuVisible();
@@ -2039,7 +2073,7 @@ const Ui = struct {
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols - 1, 10)});
             } else if (self.model_picker) |picker| {
-                const decorated = "Search> ";
+                const decorated: []const u8 = "Search> ";
                 const prefix = try editorDisplay(a, picker.query.bytes.items[0..picker.query.cursor]);
                 var start: usize = 0;
                 var width = text.width(prefix);
@@ -4178,9 +4212,12 @@ const SelectionFixture = struct {
     provider_hint: ?core_config.providers.Id = null,
     configured_providers: u8 = 0,
     profiles_override: ?[]const core_config.Model = null,
+    model_providers: ?[]const ModelProvider = null,
     disabled_models: []const bool = &.{},
     refreshes: usize = 0,
     metadata_changed: bool = false,
+    pending_default: ?shared.ReasoningEffort = null,
+    metadata_effort: ?shared.ReasoningEffort = null,
     key_matched: bool = false,
     fail: bool = false,
     const profiles = [_]core_config.Model{.{ .name = "fixture-next", .context_tokens = 65536 }};
@@ -4192,6 +4229,11 @@ const SelectionFixture = struct {
         const self: *SelectionFixture = @ptrCast(@alignCast(ctx));
         if (!idle or !self.metadata_changed) return false;
         self.metadata_changed = false;
+        if (self.metadata_effort) |level| {
+            self.effort = level;
+            self.levels = .{ .mask = 0x7f };
+            self.pending_default = null;
+        }
         return true;
     }
     fn connection(self: *@This()) Connection {
@@ -4199,7 +4241,7 @@ const SelectionFixture = struct {
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .models = self.profiles_override orelse &profiles, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels };
+        return .{ .runtime = null, .model = self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;
@@ -4232,6 +4274,147 @@ const SelectionFixture = struct {
         if (self.owned) |name| std.testing.allocator.free(name);
     }
 };
+
+test "unselected startup prompts login and model with no placeholder ID or budget" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture: SelectionFixture = .{ .name = "", .model_providers = &.{}, .low_price_input = true, .settings_notice = "Saved thinking level not applied" };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/login, then /model") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "deepseek-flash") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "?%") == null);
+    ui.finishFrame();
+    ui.openModelPicker();
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "No logged-in providers") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "fixture-next") == null);
+    ui.finishFrame();
+    try ui.modelKey(.enter);
+    try std.testing.expect(ui.model_picker != null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+}
+
+test "model selection and late default completion flash the actual logical level" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture: SelectionFixture = .{ .effort = .medium };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.clock_ms = 123;
+    try ui.selectModel("fixture-next");
+    try std.testing.expectEqual(shared.ReasoningEffort.medium, ui.effort_flash.?.level);
+    try std.testing.expectEqual(@as(u64, 2123), ui.effort_flash.?.until_ms);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("fixture-next medium"));
+    ui.finishFrame();
+    fixture.effort = .unspecified;
+    fixture.levels = .{};
+    fixture.pending_default = .high;
+    try ui.selectModel("fixture-late");
+    try std.testing.expect(ui.effort_flash == null);
+    fixture.metadata_effort = .high;
+    fixture.metadata_changed = true;
+    ui.connection.poll_models_fn = SelectionFixture.pollMetadata;
+    ui.pollMetadata();
+    try std.testing.expectEqual(shared.ReasoningEffort.high, ui.effort_flash.?.level);
+    try ui.draw();
+    try std.testing.expectEqual(shared.ReasoningEffort.high, ui.display.reasoning_effort);
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("fixture-late high"));
+}
+
+test "pending default thinking is explicit and never claims an effective wire option" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture: SelectionFixture = .{ .effort = .unspecified };
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var state = fixture.connection().current();
+    state.runtime = @ptrFromInt(@alignOf(r.Runtime)); // Hint reads no Runtime memory.
+    state.pending_default_effort = .medium;
+    const hint_line = try ui.hint(std.testing.allocator, state);
+    defer std.testing.allocator.free(hint_line);
+    try std.testing.expect(std.mem.find(u8, hint_line, "Default thinking: medium") != null);
+    try std.testing.expect(std.mem.find(u8, hint_line, "awaiting model capabilities") != null);
+    try std.testing.expectEqual(shared.ReasoningEffort.unspecified, state.reasoning_effort);
+}
+
+test "flat logged model list directly shows models and requires exact ACK" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    const profiles = [_]core_config.Model{
+        .{ .name = "opencode-go/go-id", .context_tokens = 1000000 },
+        .{ .name = "proxy/org/model", .context_tokens = 65536 },
+        .{ .name = "not-logged/hidden-id", .context_tokens = 65536 },
+    };
+    const providers = [_]ModelProvider{ .{ .name = "opencode-go" }, .{ .name = "proxy", .allow_custom = true } };
+    var fixture: SelectionFixture = .{ .name = "opencode-go/go-id", .profiles_override = &profiles, .model_providers = &providers };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openModelPicker();
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Search> ") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Provider> ") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "go-id") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "proxy/org/model") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-id") == null);
+    ui.finishFrame();
+    try ui.modelKey(.left);
+    try std.testing.expect(ui.model_picker == null and ui.commandMenuVisible());
+    ui.openModelPicker();
+    try ui.modelKey(.down);
+    try ui.draw();
+    try ui.modelKey(.enter); // A partial frame must not authorize the new row.
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+    ui.finishFrame();
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.selections);
+    try std.testing.expectEqualStrings("proxy/org/model", fixture.name);
+}
+
+test "flat model confirmation rejects credential list replacement after ACK" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    const profiles = [_]core_config.Model{
+        .{ .name = "first/model", .context_tokens = 65536 },
+        .{ .name = "replacement/model", .context_tokens = 65536 },
+    };
+    var fixture: SelectionFixture = .{ .name = "first/model", .profiles_override = &profiles, .model_providers = &.{.{ .name = "first" }} };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openModelPicker();
+    try ui.draw();
+    ui.finishFrame();
+    fixture.model_providers = &.{.{ .name = "replacement" }};
+    try ui.modelKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.selections);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.modelKey(.enter);
+    try std.testing.expectEqualStrings("replacement/model", fixture.name);
+}
 
 test "model picker rejects disabled unknown protocol even after frame acknowledgement" {
     try text.initLocale();
@@ -4626,7 +4809,7 @@ test "provider auth requires a visible full label and save failure wipes the key
     try std.testing.expect(std.mem.find(u8, ui.notice, "Could not save") != null);
 }
 
-test "first DeepSeek login Shift Tab adopts discovered thinking without changing request budgets" {
+test "first DeepSeek login initializes default and Shift Tab preserves budgets and atomic saves" {
     const Session = @import("../app/session.zig").Session;
     const metadata = @import("../app/model_metadata.zig");
     const Fetch = struct {
@@ -4679,23 +4862,26 @@ test "first DeepSeek login Shift Tab adopts discovered thinking without changing
     if (job.dev_future) |*future| future.await(io);
     job.dev_future = null;
     try std.testing.expect(session.connection().poll_models_fn.?(session.connection().context, true));
-    // Refresh alone must not silently change an accepted request snapshot.
-    try std.testing.expectEqual(@as(u8, 0), session.connection().current().effort_levels.mask);
-    const saved_settings = try tmp.dir.readFileAlloc(io, ".thin/settings.json", a, .limited(1024));
+    // A fresh empty conversation initializes its original medium preference,
+    // clamped to this model's high, without cycling or changing request budgets.
+    try std.testing.expectEqual(@as(u8, 0x55), session.connection().current().effort_levels.mask);
+    try std.testing.expectEqual(shared.ReasoningEffort.high, session.connection().current().reasoning_effort);
+    try std.testing.expectEqual(shared.ReasoningEffort.medium, shared.ReasoningEffort.fromName(session.global_config.?.value.registry.?.reasoning_effort orelse "medium"));
+    const saved_settings = try tmp.dir.readFileAlloc(io, ".thin/config.json", a, .limited(65536));
     defer a.free(saved_settings);
-    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/settings.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data = "{}" });
     try ui.draw();
     ui.finishFrame();
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expect(std.mem.find(u8, ui.notice, "Could not save") != null);
-    try std.testing.expect(session.app.?.config.value.model.reasoning == null);
-    try std.testing.expect(session.app.?.config.value.model.reasoning_effort == null);
-    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/settings.json", .data = saved_settings });
+    try std.testing.expect(session.app.?.config.value.model.reasoning != null);
+    try std.testing.expectEqual(shared.ReasoningEffort.high, session.connection().current().reasoning_effort);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data = saved_settings });
     try ui.draw();
     ui.finishFrame();
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expectEqualStrings("Ready", ui.notice);
-    try std.testing.expectEqual(shared.ReasoningEffort.off, session.connection().current().reasoning_effort);
+    try std.testing.expectEqual(shared.ReasoningEffort.max, session.connection().current().reasoning_effort);
     try std.testing.expectEqual(before.context_tokens, session.app.?.config.value.model.context_tokens);
     try std.testing.expectEqual(before.output_tokens, session.app.?.config.value.model.output_tokens);
     try std.testing.expectEqual(before.input_price_threshold, session.app.?.config.value.model.input_price_threshold);
@@ -4705,8 +4891,12 @@ test "first DeepSeek login Shift Tab adopts discovered thinking without changing
     try ui.draw();
     ui.finishFrame();
     try ui.parser.feed("\x1b[Z", sink);
+    try std.testing.expectEqual(shared.ReasoningEffort.off, session.connection().current().reasoning_effort);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expectEqual(shared.ReasoningEffort.low, session.connection().current().reasoning_effort);
-    try std.testing.expectEqual(shared.ReasoningEffort.low, (try session.settings.load()).?);
+    try std.testing.expectEqual(shared.ReasoningEffort.low, shared.ReasoningEffort.fromName(session.global_config.?.value.registry.?.reasoning_effort));
     const wire = r.withReasoning(session.app.?.config.value, .{ .scope = .{ .connection = "https://api.deepseek.com", .model = "deepseek-flash", .protocol = .chat }, .system = "", .tools = &.{}, .messages = &.{}, .max_output_tokens = 128 });
     try std.testing.expectEqualStrings("low", wire.reasoning_effort.?);
     try std.testing.expect(wire.thinking.?);
@@ -4777,7 +4967,8 @@ test "effort confirmation expires after two seconds and repeated switches restar
     fixture.fail = false;
     ui.cycleEffort();
     try ui.selectModel("fixture-next");
-    try std.testing.expect(ui.effort_flash == null);
+    try std.testing.expectEqual(fixture.effort.canonical(), ui.effort_flash.?.level);
+    try std.testing.expectEqual(@as(u64, 6500), ui.effort_flash.?.until_ms);
 }
 
 test "effort shortcut follows declared levels and unknown or singleton sets never publish" {

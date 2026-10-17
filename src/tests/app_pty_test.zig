@@ -121,7 +121,7 @@ const Driver = struct {
 
     /// Completion has no label. Match the idle prefix's percentage tail only
     /// in new output: colored text resets before the neutral parentheses and
-    /// marker; unconfigured text needs no SGR. Keep the full-frame cursor ACK.
+    /// marker; unselected startup has a bare prompt. Keep the full-frame cursor ACK.
     fn waitIdle(self: *Driver, start: usize) !void {
         const until = now() + 10000;
         while (now() < until) {
@@ -133,6 +133,12 @@ const Driver = struct {
             }) |idle| if (std.mem.indexOf(u8, bytes, idle)) |marker| {
                 if (std.mem.indexOf(u8, bytes[marker + idle.len ..], "\x1b[?25h") != null) return;
             };
+            if (std.mem.indexOf(u8, bytes, "\x1b[0m> \x1b[0m\x1b[K")) |marker| {
+                if (std.mem.indexOf(u8, bytes[marker..], "\x1b[?25h") != null) {
+                    const visible = try self.screen();
+                    if (std.mem.startsWith(u8, &visible.grid[visible.row], "> ")) return;
+                }
+            }
             if (!self.owned) return error.EarlyExit;
         }
         return error.VisibleTextTimeout;
@@ -491,11 +497,29 @@ pub fn main(init: std.process.Init) !void {
     try check(std.mem.indexOf(u8, d.output[0..d.used], if (std.mem.eql(u8, timezone, "UTC-8")) " +0800" else " +0000") != null);
     try check(std.mem.indexOf(u8, d.output[0..d.used], "Zig ") == null);
     if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
-        // Default policy is visible even while configuration is pending. Do not
-        // enter a key or submit a prompt: no public endpoint may be contacted.
+        // A generated disk default is not an activated selection. Do not enter
+        // a key or submit a prompt: no public endpoint may be contacted.
         try d.waitText(0, "/login");
         const pending = try d.screen();
-        try check(std.mem.indexOf(u8, &pending.grid[pending.row], " L ") != null);
+        try check(pending.visible("/model"));
+        try check(!pending.visible("deepseek-flash") and !pending.visible("?%"));
+        try check(std.mem.startsWith(u8, &pending.grid[pending.row], "> "));
+        var start = d.used;
+        try d.send("/model\r");
+        try d.waitFrame(start, "No logged-in providers");
+        const no_providers = try d.screen();
+        try check(no_providers.visible("Search> ") and !no_providers.visible("Provider> ") and !no_providers.visible("deepseek-flash"));
+        start = d.used;
+        try d.send("\x1b");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("/login\r");
+        try d.waitFrame(start, "Provider> ");
+        const login = try d.screen();
+        try check(login.visible("DeepSeek") and login.visible("OpenCode Zen") and login.visible("OpenCode Go"));
+        start = d.used;
+        try d.send("\x1b");
+        try d.waitIdle(start);
     } else if (std.mem.eql(u8, mode, "manual-compact")) {
         var start = d.used;
         try d.send("manual-first\r");
@@ -591,11 +615,13 @@ pub fn main(init: std.process.Init) !void {
         start = d.used;
         try d.send("\r");
         try d.waitFrame(start, "Search> ");
+        const model_list = try d.screen();
+        try check(!model_list.visible("Provider> ") and !model_list.visible("deepseek-flash") and !model_list.visible("claude-haiku"));
         try d.checkMenu("fixture-model  (", "Search> ");
         const models = try d.screen();
         try check(!models.visible("Commands") and !models.visible("Configure provider"));
         start = d.used;
-        try d.send("\x1b[D"); // Model -> root.
+        try d.send("\x1b[D"); // Model -> root (no provider stage).
         try d.waitFrame(start, "");
         const model_parent = try d.screen();
         try check(model_parent.visible("/model") and model_parent.visible("/login") and !model_parent.visible("Search> "));
@@ -1097,8 +1123,11 @@ pub fn main(init: std.process.Init) !void {
             try d.waitText(0, "/login");
             var start = d.used;
             try d.send("\x1b[Z");
-            // Pending configuration still acknowledges its complete frame.
-            try d.waitFrame(start, "> ");
+            // Cycling a pending preference may leave the bare prompt pixels
+            // unchanged. Require a new complete frame, not an unchanged footer.
+            try d.waitFrame(start, "\x1b[?25l");
+            const pending = try d.screen();
+            try check(std.mem.startsWith(u8, &pending.grid[pending.row], "> ") and !pending.visible("fixture-model"));
             start = d.used;
             try d.openAuth();
             start = d.used;
@@ -1174,15 +1203,15 @@ pub fn main(init: std.process.Init) !void {
         try d.send("\r");
         try d.waitIdle(start);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "fixture-next") != null);
-        // The initialized project preference (off) wins over the profile's low.
-        // ACK-safe redraws may emit only changed cells, not a complete ANSI
-        // footer. Inspect the resulting screen; wire assertions below still
-        // prove off -> minimal -> low -> medium rather than the profile's low.
+        // No global override exists: the selected profile's configured low is
+        // now the default, not an obsolete project preference. ACK-safe redraws
+        // may emit changed cells only; inspect the resulting idle screen. The
+        // exact medium wire after ONE shortcut below proves low was applied.
         const selected_next = try d.screen();
         try check(selected_next.visible("fixture-next") and selected_next.visible("?%"));
         try check(selected_next.row == 23 and !selected_next.visible("Search> "));
         start = d.used;
-        try d.send("\x1b[Z\x1b[Z\x1b[Z"); // off -> minimal -> low -> medium.
+        try d.send("\x1b[Z"); // Selected profile low -> medium.
         // Observe the acknowledged confirmation, then its automatic expiry.
         // Intermediate levels may render if PTY input arrives in separate reads.
         try d.waitFrame(start, "(fixture-next medium) > ");
