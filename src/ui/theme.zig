@@ -79,7 +79,7 @@ pub fn effortColor(effort: activity.ReasoningEffort) []const u8 {
     };
 }
 
-/// Active tool prefix only; no blink/background and no animation after result.
+/// Shared active tool/composer indicator; no blink/background or idle animation.
 pub const command_pulse = [_][]const u8{
     "\x1b[38;5;173m", "\x1b[38;5;208m", "\x1b[38;5;214m", "\x1b[38;5;220m",
     "\x1b[38;5;223m", "\x1b[38;5;220m", "\x1b[38;5;214m", "\x1b[38;5;208m",

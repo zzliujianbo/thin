@@ -321,7 +321,7 @@ pub const Stream = struct {
                 for (self.content.items) |old| if (c.eq(try c.text(old, "type"), "tool_use") and c.eq(try c.text(old, "id"), id)) return error.DuplicateToolId;
                 self.tool_count += 1;
                 self.observed = true;
-                try self.sink.emit(.{ .tool_delta = .{ .index = item.tool_index, .arguments = "", .write_file = c.eq(name, "write_file"), .argument_bytes = 0 } });
+                try self.sink.emit(.{ .tool_delta = .{ .index = item.tool_index, .arguments = "", .name = try c.text(item.native, "name"), .call_id = try c.text(item.native, "id"), .write_file = c.eq(name, "write_file"), .argument_bytes = 0 } });
             } else return error.UnsupportedBlock;
             self.open = item;
             return;
@@ -343,7 +343,7 @@ pub const Stream = struct {
             } else if (c.eq(kind, "tool_use") and c.eq(dt, "input_json_delta")) {
                 const s = try c.text(delta, "partial_json");
                 try item.args.add(self.a, s);
-                try self.sink.emit(.{ .tool_delta = .{ .index = item.tool_index, .arguments = s, .write_file = c.eq(try c.text(item.native, "name"), "write_file"), .argument_bytes = item.args.len } });
+                try self.sink.emit(.{ .tool_delta = .{ .index = item.tool_index, .arguments = s, .name = try c.text(item.native, "name"), .call_id = try c.text(item.native, "id"), .write_file = c.eq(try c.text(item.native, "name"), "write_file"), .argument_bytes = item.args.len } });
             } else return error.InvalidDelta;
             return;
         }

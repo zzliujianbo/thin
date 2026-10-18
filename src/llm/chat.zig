@@ -649,6 +649,9 @@ pub const Stream = struct {
                 if (!c.eq(j.string(v) orelse return error.InvalidEvent, "function")) return error.InvalidEvent;
             }
 
+            // Metadata-only headers also publish a preview; unrelated JSON does not.
+            var emit_preview = j.get(delta, "id") != null;
+            var arguments: []const u8 = "";
             // 函数名与参数分块累积；参数增量同时实时转发为 tool_delta。
             if (j.get(delta, "function")) |f| {
                 if (f != .object) return error.InvalidEvent;
@@ -657,15 +660,30 @@ pub const Stream = struct {
                     if (fragment.len != 0) try call.name.add(self.a, fragment);
                     call.preview_write = writeName(call.name);
                 }
-                const arguments = if (j.get(f, "arguments")) |v| j.string(v) orelse return error.InvalidEvent else "";
+                arguments = if (j.get(f, "arguments")) |v| j.string(v) orelse return error.InvalidEvent else "";
                 if (j.get(f, "arguments") != null) try call.args.add(self.a, arguments);
-                if (j.get(f, "name") != null or j.get(f, "arguments") != null)
-                    try self.sink.emit(.{ .tool_delta = .{ .index = @intCast(index), .arguments = arguments, .write_file = call.preview_write, .argument_bytes = call.args.len } });
+                emit_preview = emit_preview or j.get(f, "name") != null or j.get(f, "arguments") != null;
                 // 函数对象中的其他未知字段保存到 call.function，用于原样回放。
                 var it = f.object.iterator();
                 while (it.next()) |kv| {
                     if (!c.eq(kv.key_ptr.*, "name") and !c.eq(kv.key_ptr.*, "arguments")) try c.put(self.a, &call.function, try self.a.dupe(u8, kv.key_ptr.*), try c.clone(self.a, kv.value_ptr.*));
                 }
+            }
+
+            if (emit_preview) {
+                // Borrow a bounded cumulative snapshot only for this callback. Never
+                // join into the response arena on each argument chunk.
+                var name_buffer: [1024]u8 = undefined;
+                var name: []const u8 = "";
+                if (call.name.len <= name_buffer.len) {
+                    var offset: usize = 0;
+                    for (call.name.parts.items) |part| {
+                        @memcpy(name_buffer[offset..][0..part.len], part);
+                        offset += part.len;
+                    }
+                    name = name_buffer[0..offset];
+                }
+                try self.sink.emit(.{ .tool_delta = .{ .index = @intCast(index), .arguments = arguments, .name = name, .call_id = call.id, .write_file = call.preview_write, .argument_bytes = call.args.len } });
             }
 
             // 除已知字段外的其他字段保存到 call.native。

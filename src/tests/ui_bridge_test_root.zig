@@ -9,6 +9,60 @@ const r = @import("../core/runtime.zig");
 const Io = std.Io;
 const t = std.testing;
 
+test "bridge typed tool views own snapshot strings flags and keys" {
+    var env = Env.init();
+    defer env.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = b.Bridge.init(t.allocator, env.backend.io(), &cancel);
+    defer bridge.deinit();
+    var source = [_]u8{ 'o', 'w', 'n' };
+    const key: p.ToolDisplayKey = .{ .generation = 9, .index = 41 };
+    try send(&bridge, .{ .tool_views = .{ .generation = 9, .phase = .begin } });
+    try send(&bridge, .{ .tool_view = .{ .key = key, .name = &source, .ready = true, .fields = .{
+        .path = .{ .text = &source },
+        .command = .{ .text = &source, .truncated = true },
+        .action = .{ .text = &source },
+        .topic = .{ .text = &source },
+    } } });
+    @memset(&source, 'x');
+    var begin = bridge.pop().?;
+    try t.expectEqual(@as(u64, 9), begin.event.tool_views.generation);
+    begin.deinit();
+    var item = bridge.pop().?;
+    defer item.deinit();
+    const view = item.event.tool_view;
+    try t.expect(view.ready and view.key.eql(key));
+    try t.expectEqualStrings("own", view.name);
+    inline for (.{ "path", "command", "action", "topic" }) |field_name|
+        try t.expectEqualStrings("own", @field(view.fields, field_name).?.text);
+    try t.expect(view.fields.command.?.truncated);
+    try t.expect(!view.fields.path.?.truncated);
+    try t.expect(!item.display_truncated);
+    try t.expectEqual(@as(usize, 15), item.storage.len);
+}
+
+test "bridge typed fields share two pass item cap and mark field clipping" {
+    var env = Env.init();
+    defer env.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = b.Bridge.init(t.allocator, env.backend.io(), &cancel);
+    defer bridge.deinit();
+    const huge = try t.allocator.alloc(u8, b.item_budget + 1);
+    defer t.allocator.free(huge);
+    @memset(huge, 'a');
+    try send(&bridge, .{ .tool_view = .{ .key = .{ .generation = 1, .index = 0 }, .name = "bash", .fields = .{
+        .command = .{ .text = huge },
+        .topic = .{ .text = "tail" },
+    } } });
+    var item = bridge.pop().?;
+    defer item.deinit();
+    try t.expectEqual(b.item_budget, item.storage.len);
+    try t.expect(item.display_truncated);
+    try t.expect(item.event.tool_view.fields.command.?.truncated);
+    try t.expect(item.event.tool_view.fields.topic.?.truncated);
+    try t.expectEqual(@as(usize, 0), item.event.tool_view.fields.topic.?.text.len);
+}
+
 // 测试环境：持有线程化 Io 后端，供 Io.concurrent 启动 worker 线程。
 const Env = struct {
     // 并发上限为 8，足够同时运行测试里的生产者线程。

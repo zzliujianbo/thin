@@ -84,6 +84,15 @@ pub fn caption(a: std.mem.Allocator, name: []const u8, arguments: []const u8) !C
     return fromCall(a, call);
 }
 
+/// A normal tool row can exist before all arguments are available. Unknown
+/// targets show the sanitized tool name, never a special receipt placeholder.
+pub fn fromToolView(a: std.mem.Allocator, name: []const u8, fields: @import("../core/tool_preview.zig").Snapshot) !Caption {
+    const call = try shared.tools.Call.fromFields(a, name, fields);
+    defer call.deinit(a);
+    if (call.detail == null) return .{ .kind = call.kind, .label = try singleLine(a, name, 512) };
+    return fromCall(a, call);
+}
+
 /// Terminal widths and labels adapt shared structured data; no JSON parsing here.
 pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
     const kind = call.kind;
@@ -149,6 +158,11 @@ fn prefixColor(outcome: Outcome) []const u8 {
     };
 }
 
+/// Composer and tool indicators share the same palette and pulse clock.
+fn activeIndicatorColor(now_ms: u64) []const u8 {
+    return theme.command_pulse[shared.activity.commandStep(now_ms)];
+}
+
 pub const CommandSpan = struct { start: usize, end: usize, outcome: Outcome, write_marks: ?WriteMarks = null };
 
 pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome) ![]const u8 {
@@ -198,7 +212,7 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         const has_prefix = begin == span.start and begin < body.len and std.mem.eql(u8, safe[begin..prefix_end], body[begin..text.nextCluster(body, begin, 0).end]);
         if (span.outcome == .pending and active_time_ms != null and has_prefix) {
             const now_ms = active_time_ms.?;
-            try out.writer.print("{s}{s}{s}{s}{s}", .{ theme.command_pulse[shared.activity.commandStep(now_ms)], activity.spinner(now_ms), theme.muted, safe[prefix_end..end], theme.reset });
+            try out.writer.print("{s}{s}{s}{s}{s}", .{ activeIndicatorColor(now_ms), activity.spinner(now_ms), theme.muted, safe[prefix_end..end], theme.reset });
         } else {
             if (has_prefix) try out.writer.print("{s}{s}{s}", .{ theme.reset, prefixColor(span.outcome), safe[begin..prefix_end] });
             const summary_start = if (has_prefix) prefix_end else begin;
@@ -261,7 +275,8 @@ pub const PromptActivity = struct {
 
 /// The model keeps idle effort/busy TPS styling; context occupancy has a static
 /// threshold color in both states. A transient effort confirmation retains its
-/// previous styling. Parentheses, spaces, marker and editor stay default.
+/// previous styling. Only the busy marker shares the tool indicator pulse;
+/// parentheses, spaces, idle marker and editor stay default.
 pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, motion: PromptActivity) !Prompt {
     if (model.len == 0) {
         const plain = try a.dupe(u8, "> ");
@@ -294,7 +309,7 @@ pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Context
     const slot_color = if (motion.effort_flash != null) idle_color else context_color;
     const styled_model = label.len != 0 and (motion.busy or !std.mem.eql(u8, idle_color, theme.reset));
     const styled_slot = slot_flow or !std.mem.eql(u8, slot_color, theme.reset) or (motion.low_price_input and !std.mem.eql(u8, context_color, theme.reset));
-    if ((label.len == 0 and !percent_only) or (!styled_model and !styled_slot)) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
+    if (!motion.busy and ((label.len == 0 and !percent_only) or (!styled_model and !styled_slot))) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     const palette = theme.modelPalette(motion.rate_band);
@@ -323,7 +338,9 @@ pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Context
         } else try out.writer.print("{s}{s}{s}", .{ slot_color, slot, theme.reset });
         try out.writer.writeAll(") ");
     }
-    try out.writer.print("{s} ", .{marker});
+    if (motion.busy) {
+        try out.writer.print("{s}{s}{s} ", .{ activeIndicatorColor(motion.now_ms), marker, theme.reset });
+    } else try out.writer.print("{s} ", .{marker});
     return .{ .plain = plain, .styled = try a.dupe(u8, out.written()) };
 }
 
@@ -343,6 +360,28 @@ fn contextLabel(a: std.mem.Allocator, snapshot: ?shared.ContextSnapshot) ![]cons
     const ratio = shared.state.contextRatio(snapshot orelse return a.dupe(u8, "?%")) orelse return a.dupe(u8, "?%");
     if (snapshot.?.tokens > snapshot.?.limit) return a.dupe(u8, ">100%");
     return std.fmt.allocPrint(a, "{d}.{d}%", .{ ratio / 10, ratio % 10 });
+}
+
+test "normal preview captions show names until reliable typed fields arrive" {
+    const a = std.testing.allocator;
+    const early = try fromToolView(a, "write_file", .{});
+    defer early.deinit(a);
+    try std.testing.expectEqualStrings("write_file", early.label);
+    const target = try fromToolView(a, "write_file", .{ .path = .{ .text = "src/中文.zig" } });
+    defer target.deinit(a);
+    try std.testing.expectEqualStrings("src/中文.zig", target.label);
+    try std.testing.expect(target.write_marks == null);
+    const hostile = try fromToolView(a, "unknown\x1b[2J\nname", .{});
+    defer hostile.deinit(a);
+    try std.testing.expect(std.mem.findScalar(u8, hostile.label, '\x1b') == null);
+    try std.testing.expect(std.mem.findScalar(u8, hostile.label, '\n') == null);
+    const body = try commandText(a, target, .pending);
+    defer a.free(body);
+    const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .pending }}, 80, null, null);
+    defer a.free(line);
+    try std.testing.expect(std.mem.find(u8, line, theme.reset ++ "w" ++ theme.muted ++ " src/中文.zig") != null);
+    try std.testing.expect(std.mem.find(u8, line, "⠋") == null);
+    try std.testing.expect(std.mem.find(u8, line, "0ms") == null);
 }
 
 test "command captions are bounded single line UTF8 with literal three dots" {
@@ -374,7 +413,7 @@ test "percent prompt has default input colors and real spinner not loading text"
     const active = try prompt(a, "deepseek-flash", null, 79, .{ .busy = true, .now_ms = 80, .phase = 2 });
     defer active.deinit(a);
     try std.testing.expectEqualStrings("(deepseek-flash ?%) ⠙ ", active.plain);
-    try std.testing.expect(std.mem.endsWith(u8, active.styled, theme.reset ++ ") ⠙ "));
+    try std.testing.expect(std.mem.endsWith(u8, active.styled, theme.reset ++ ") " ++ theme.command_pulse[0] ++ "⠙" ++ theme.reset ++ " "));
     try std.testing.expect(std.mem.find(u8, active.styled, "loading") == null);
     const narrow = try prompt(a, "long model name", null, 7, .{});
     defer narrow.deinit(a);
@@ -469,7 +508,7 @@ test "context percent thresholds follow displayed rounding without animation or 
             for ([_]usize{ 0, 11 }) |phase| {
                 const value = try prompt(a, "fixture", case.snapshot, 79, .{ .busy = busy, .now_ms = 80, .phase = phase, .rate_band = .fast, .reasoning_effort = .high });
                 defer value.deinit(a);
-                const suffix = try std.fmt.allocPrint(a, " {s}{s}{s}) {s} ", .{ case.color, case.label, theme.reset, if (busy) activity.spinner(80) else ">" });
+                const suffix = try std.fmt.allocPrint(a, " {s}{s}{s}) {s}{s}{s} ", .{ case.color, case.label, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
                 defer a.free(suffix);
                 try std.testing.expect(std.mem.endsWith(u8, value.styled, suffix));
                 try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
@@ -493,7 +532,7 @@ test "low price marker shares the full static context color and optout removes i
     for (cases) |case| for ([_]bool{ false, true }) |enabled| for ([_]bool{ false, true }) |busy| for ([_]usize{ 0, 11 }) |phase| {
         const value = try prompt(a, "fixture", case.snapshot, 79, .{ .busy = busy, .now_ms = 80, .phase = phase, .rate_band = .fast, .reasoning_effort = .high, .low_price_input = enabled });
         defer value.deinit(a);
-        const suffix = try std.fmt.allocPrint(a, " {s}{s}{s}{s}) {s} ", .{ case.color, if (enabled) "L" else "", case.label, theme.reset, if (busy) activity.spinner(80) else ">" });
+        const suffix = try std.fmt.allocPrint(a, " {s}{s}{s}{s}) {s}{s}{s} ", .{ case.color, if (enabled) "L" else "", case.label, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
         defer a.free(suffix);
         try std.testing.expect(std.mem.endsWith(u8, value.styled, suffix));
         const label = try std.mem.concat(a, u8, &.{ "L", case.label });
@@ -558,7 +597,7 @@ test "model keeps effort and TPS waves while context percent has static occupanc
                 for ("model", 0..) |byte, ordinal| {
                     try expected.writer.print("{s}{c}", .{ palette[(phase % palette.len + ordinal) % palette.len], byte });
                 }
-                try expected.writer.print("{s} {s}2.3%{s}) {s} ", .{ theme.reset, theme.success, theme.reset, activity.spinner(now) });
+                try expected.writer.print("{s} {s}2.3%{s}) {s}{s}{s} ", .{ theme.reset, theme.success, theme.reset, theme.command_pulse[shared.activity.commandStep(now)], activity.spinner(now), theme.reset });
                 for (efforts) |effort| {
                     const value = try prompt(a, "model", .{ .tokens = 22807, .limit = 1000000 }, 79, .{ .busy = true, .now_ms = now, .phase = phase, .rate_band = band, .reasoning_effort = effort });
                     defer value.deinit(a);
@@ -590,9 +629,34 @@ test "model keeps effort and TPS waves while context percent has static occupanc
                 const narrow = try prompt(a, "model", null, columns, .{ .busy = busy, .now_ms = 80, .reasoning_effort = effort });
                 defer narrow.deinit(a);
                 try std.testing.expectEqualStrings(if (busy) "⠙ " else "> ", narrow.plain);
-                try std.testing.expectEqualStrings(narrow.plain, narrow.styled);
+                if (busy) {
+                    try std.testing.expectEqualStrings(theme.command_pulse[0] ++ "⠙" ++ theme.reset ++ " ", narrow.styled);
+                } else try std.testing.expectEqualStrings(narrow.plain, narrow.styled);
             }
         }
+    }
+}
+
+test "composer busy indicator shares tool pulse including narrow widths without color bleed" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    for ([_]u64{ 0, 79, 80, 119, 120, 239, 960, std.math.maxInt(u64) }) |now| {
+        const color = theme.command_pulse[shared.activity.commandStep(now)];
+        const icon = activity.spinner(now);
+        const ending = try std.fmt.allocPrint(a, "{s}{s}{s} ", .{ color, icon, theme.reset });
+        defer a.free(ending);
+        const tool_prefix = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ color, icon, theme.muted });
+        defer a.free(tool_prefix);
+        const tool = try commandLine(a, "> target", &.{.{ .start = 0, .end = 8, .outcome = .pending }}, 80, null, now);
+        defer a.free(tool);
+        try std.testing.expect(std.mem.startsWith(u8, tool, tool_prefix));
+        for ([_]usize{ 0, 7, 12, 15, 80 }) |columns| for ([_]shared.activity.RateBand{ .slow, .fast, .unknown }) |band| {
+            const rendered = try prompt(a, "model", .{ .tokens = 10, .limit = 100 }, columns, .{ .busy = true, .now_ms = now, .phase = 7, .rate_band = band, .reasoning_effort = .high });
+            defer rendered.deinit(a);
+            try std.testing.expect(std.mem.endsWith(u8, rendered.styled, ending));
+            try std.testing.expectEqual(text.width(rendered.plain), @import("markdown_writer.zig").displayWidth(rendered.styled));
+            try std.testing.expect(text.width(rendered.plain) <= @max(columns, 2));
+        };
     }
 }
 

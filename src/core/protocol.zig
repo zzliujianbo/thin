@@ -198,6 +198,17 @@ pub const Request = struct {
     cancellation: ?*const Cancellation = null,
 };
 
+/// Display-only identity, separate from canonical call IDs and approval IDs.
+/// A generation identifies one actual normal-model attempt (or local batch).
+pub const ToolDisplayKey = struct {
+    generation: u64,
+    index: usize,
+
+    pub fn eql(self: ToolDisplayKey, other: ToolDisplayKey) bool {
+        return self.generation == other.generation and self.index == other.index;
+    }
+};
+
 /// Model deltas are UI drafts, not executable history. Success commits a complete
 /// Response. Event strings are borrowed for the duration of the callback only.
 /// 中文：流式增量只用于界面显示，不是可执行历史；只有成功时才会提交完整 Response。
@@ -209,6 +220,12 @@ pub const ModelEvent = union(enum) {
     tool_delta: struct {
         index: usize,
         arguments: []const u8,
+        /// Accumulated name snapshot, not just a fragment. Empty means unknown
+        /// or too large for bounded preview metadata; execution is unaffected.
+        name: []const u8 = "",
+        /// Canonical provider ID when known. Borrowed only during emit; this
+        /// never replaces the Runtime-owned host/approval identity.
+        call_id: ?[]const u8 = null,
         /// Presentation-only recognition of a complete streamed tool name.
         /// This grants no execution or file-write authority.
         write_file: bool = false,

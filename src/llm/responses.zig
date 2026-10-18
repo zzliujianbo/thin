@@ -654,7 +654,7 @@ pub const Stream = struct {
                 }
                 self.observed = true;
                 const initial_arguments = if (j.get(native, "arguments")) |value| j.string(value) orelse return error.InvalidEvent else "";
-                try self.sink.emit(.{ .tool_delta = .{ .index = index, .arguments = initial_arguments, .write_file = c.eq(name, "write_file"), .argument_bytes = item.args.len } });
+                try self.sink.emit(.{ .tool_delta = .{ .index = index, .arguments = initial_arguments, .name = item.name.?, .call_id = item.call_id, .write_file = c.eq(name, "write_file"), .argument_bytes = item.args.len } });
             } else if (c.eq(kind, "reasoning")) self.observed = true;
 
             try self.items.append(self.a, item);
@@ -675,7 +675,7 @@ pub const Stream = struct {
                 try item.args.add(self.a, delta);
                 item.args_seen = true;
                 self.observed = true;
-                try self.sink.emit(.{ .tool_delta = .{ .index = item.index, .arguments = delta, .write_file = c.eq(item.name.?, "write_file"), .argument_bytes = item.args.len } });
+                try self.sink.emit(.{ .tool_delta = .{ .index = item.index, .arguments = delta, .name = item.name.?, .call_id = item.call_id, .write_file = c.eq(item.name.?, "write_file"), .argument_bytes = item.args.len } });
             } else {
                 if (item.args_done != null) return error.InvalidStreamState;
                 const args = try c.text(v, "arguments");

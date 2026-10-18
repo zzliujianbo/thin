@@ -35,7 +35,7 @@ async function run(mode, home, project, url) {
   let owned = true, failure, size = 0;
   const chunks = [];
   const stop = signal => {
-    if (owned && child.pid) { try { process.kill(-child.pid, signal); } catch (e) { if (e.code !== 'ESRCH') failure ??= e; } }
+    if (owned && child.exitCode === null && child.signalCode === null && child.pid) { try { process.kill(-child.pid, signal); } catch (e) { if (e.code !== 'ESRCH') failure ??= e; } }
   };
   let rejectWait;
   const abandon = () => { child.stdout.destroy(); child.stderr.destroy(); rejectWait?.(failure); };
@@ -48,6 +48,7 @@ async function run(mode, home, project, url) {
   };
   child.stdout.on('data', capture); child.stderr.on('data', capture);
   child.once('exit', () => { owned = false; if (failure) abandon(); });
+  child.once('close', () => { owned = false; });
   try {
     const result = await new Promise((res, rej) => {
       rejectWait = rej;
@@ -78,9 +79,12 @@ async function fixture(name, decision, url) {
   const config = JSON.stringify({
     llm:{default:'local/fixture-model', providers:{local:{base_url:url, api_key_env:'THIN_FIXTURE_KEY', models:{
       'fixture-model':{protocol:'chat', context_tokens:32768},
-      ...(decision ? {judge:{protocol:'chat', context_tokens:32768}} : {}),
-    }}}},
-    ...(decision ? {decision:{model:'local/judge'}} : {}),
+    }},
+    zen:{base_url:'https://opencode.ai/zen/v1', api_key:'zen-fixture-key', models:{}},
+    go:{base_url:'https://opencode.ai/zen/go/v1', api_key:'go-fixture-key', models:{}},
+    ...(decision ? {native:{base_url:'https://opencode.ai/inference/systemone/v1', api_key:'native-fixture-key', models:{}}} : {}),
+    }},
+    ...(decision ? {decision:{backend:'systemone', model:'native/jev-1.13-free'}} : {}),
     limits:{low_price_input:true, max_output_tokens:100, summary_tokens:100, safety_tokens:100, request_timeout_ms:3000, task_timeout_ms:5000},
   }, null, 2) + '\n';
   const configPath = join(home, '.thin/config.json');
@@ -90,14 +94,18 @@ async function fixture(name, decision, url) {
 async function unchanged(f) {
   assert.equal(await readFile(f.configPath, 'utf8'), f.config, 'config declarations changed byte-for-byte');
 }
-async function values(f, low, decision) {
+async function values(f, low, decision, preset = false) {
   const expected = JSON.parse(f.config);
+  if (preset) {
+    expected.llm.providers['opencode-jev'] = {base_url:'https://opencode.ai/inference/systemone/v1', api_key_env:'', models:{}};
+    expected.decision = {backend:'systemone', model:'opencode-jev/jev-1.13-free'};
+  }
   // Mirror only known core/config.zig writeDisk canonical defaults, never
   // derive expected fields from the saved file (unknown additions must fail).
   // Provider fields are written individually, including optional nulls;
   // Limits/Decision structs omit optional nulls. ModelPatch stays sparse.
   for (const provider of Object.values(expected.llm.providers)) {
-    Object.assign(provider, {api_key:null, chat_max_tokens:false, kind:null, ...provider});
+    Object.assign(provider, {api_key:null, api_key_env:'', chat_max_tokens:false, kind:null, ...provider});
   }
   expected.limits = {
     command_timeout_ms:300000, command_max_timeout_ms:3600000,
@@ -168,7 +176,18 @@ try {
   await untouched(n.settings, baseline);
   await untouched(n.configPath, unconfigured);
   await unchanged(n);
-  for (const x of [f, n]) assert.deepEqual((await readdir(join(x.home, '.thin'))).sort(), ['config.json','settings.json']);
+  const p = await fixture('preset', false, url);
+  await writeFile(p.settings, existing, {mode:0o600});
+  const presetLegacy = await snapshot(p.settings);
+  await run('settings-global-preset', p.home, p.project, url);
+  await values(p, true, true, true);
+  await untouched(p.settings, presetLegacy);
+  const presetSaved = await snapshot(p.configPath);
+  await run('settings-global-verify', p.home, p.project, url);
+  await values(p, true, true, true);
+  await untouched(p.configPath, presetSaved);
+  await untouched(p.settings, presetLegacy);
+  for (const x of [f, n, p]) assert.deepEqual((await readdir(join(x.home, '.thin'))).sort(), ['config.json','settings.json']);
   console.log(`PASS test-settings: scenarios=${scenarios}, HTTP requests=${requests}, connections=${connections}`);
 } catch (error) {
   console.error(`FAIL test-settings: completed scenarios=${scenarios}, HTTP requests=${requests}, connections=${connections}`);

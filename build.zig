@@ -175,6 +175,28 @@ pub fn build(b: *std.Build) void {
     run_settings.setCwd(b.path("."));
     b.step("test-settings", "Run isolated global settings PTY acceptance without inference").dependOn(&run_settings.step);
 
+    const run_command = b.addSystemCommand(&.{"node"});
+    run_command.addFileArg(b.path("tests/product/local_command_mock.mjs"));
+    run_command.addArtifactArg(exe);
+    run_command.addArtifactArg(pty_driver);
+    run_command.setCwd(b.path("."));
+    b.step("test-command", "Run owned local-command approval, denial, cancellation and timeout PTYs").dependOn(&run_command.step);
+
+    const run_tool_preview = b.addSystemCommand(&.{"node"});
+    run_tool_preview.addFileArg(b.path("tests/product/tool_preview_mock.mjs"));
+    run_tool_preview.addArtifactArg(exe);
+    run_tool_preview.addArtifactArg(pty_driver);
+    run_tool_preview.setCwd(b.path("."));
+    b.step("test-tool-preview", "Run gated owned tool-preview streaming and cancellation PTYs").dependOn(&run_tool_preview.step);
+
+    const run_tool_presentation = b.addSystemCommand(&.{"node"});
+    run_tool_presentation.addFileArg(b.path("tests/product/app_mock.mjs"));
+    run_tool_presentation.addArtifactArg(exe);
+    run_tool_presentation.addArtifactArg(pty_driver);
+    run_tool_presentation.addArg("--tool-presentation-only");
+    run_tool_presentation.setCwd(b.path("."));
+    b.step("test-tool-presentation", "Run owned tool animation, result rows, file counts and Memory captions").dependOn(&run_tool_presentation.step);
+
     // 聚合步骤 `zig build test`：依次挂载所有离线测试（不含需要真实 API 的内容）。
     const test_all = b.step("test", "Run all offline unit, transport, application and foundation tests");
     test_all.dependOn(&run_unit.step);
@@ -185,6 +207,8 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_proxy.step);
     test_all.dependOn(&run_app.step);
     test_all.dependOn(&run_settings.step);
+    test_all.dependOn(&run_command.step);
+    test_all.dependOn(&run_tool_preview.step);
     test_all.dependOn(&run.step);
 }
 

@@ -104,7 +104,10 @@ test {
     _ = @import("tests/regular_screen.zig");
     _ = @import("ui/tui.zig");
 
+    _ = @import("tests/local_command_test.zig");
     _ = @import("tests/runtime_test.zig");
+    _ = @import("tests/tool_lifecycle_test.zig");
     _ = @import("tests/session_context_test.zig");
     _ = @import("tests/adapter_integration_test.zig");
+    _ = @import("tool_metadata_adapter_test.zig");
 }

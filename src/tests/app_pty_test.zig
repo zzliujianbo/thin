@@ -6,6 +6,7 @@ const c = std.c;
 const abi = @import("../platform/terminal_abi.zig");
 const openpty = abi.openpty;
 const regular = @import("regular_screen.zig");
+const spinner_theme = @import("../ui/theme.zig");
 
 // libc 符号声明：fork/exec、信号、进程组与 PTY 控制相关函数。
 extern "c" fn fork() c_int;
@@ -119,6 +120,27 @@ const Driver = struct {
         return error.VisibleTextTimeout;
     }
 
+    /// A generated/ready caption is already visible before execution. Observe
+    /// the current complete screen's braille row, not an earlier name match.
+    fn waitRunningFrame(self: *Driver, start: usize, command: []const u8) !void {
+        const view = try std.heap.page_allocator.create(regular.Screen);
+        defer std.heap.page_allocator.destroy(view);
+        var buffer: [512]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&buffer, "~ {s}", .{command});
+        const until = now() + 10000;
+        while (now() < until) {
+            try self.drain(20);
+            const raw = self.output[0..self.used];
+            const ack = std.mem.lastIndexOf(u8, raw, "\x1b[?25h") orelse continue;
+            if (ack < start) continue;
+            view.* = .{};
+            try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
+            if (view.visible(needle)) return;
+            if (!self.owned) return error.EarlyExit;
+        }
+        return error.RunningToolFrameTimeout;
+    }
+
     /// Completion has no label. Match the idle prefix's percentage tail only
     /// in new output: colored text resets before the neutral parentheses and
     /// marker; unselected startup has a bare prompt. Keep the full-frame cursor ACK.
@@ -155,9 +177,16 @@ const Driver = struct {
             const busy_prefix = "%\x1b[0m) "; // Static occupancy color resets before closing parenthesis.
             while (std.mem.indexOfPos(u8, bytes, from, busy_prefix)) |prefix| {
                 from = prefix + busy_prefix.len;
-                const marker = from; // No effort color (or other SGR) before neutral braille.
-                for ([_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }) |icon| {
-                    if (std.mem.startsWith(u8, bytes[marker..], icon) and std.mem.indexOf(u8, bytes[marker + icon.len ..], "\x1b[?25h") != null) return;
+                // Accept only the running-tool palette, with a reset before
+                // the editor's space. Neither TPS nor effort colors qualify.
+                for (spinner_theme.command_pulse) |tone| {
+                    if (!std.mem.startsWith(u8, bytes[from..], tone)) continue;
+                    const marker = from + tone.len;
+                    for ([_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }) |icon| {
+                        if (std.mem.startsWith(u8, bytes[marker..], icon) and
+                            std.mem.startsWith(u8, bytes[marker + icon.len ..], spinner_theme.reset ++ " ") and
+                            std.mem.indexOf(u8, bytes[marker + icon.len ..], "\x1b[?25h") != null) return;
+                    }
                 }
             }
             if (!self.owned) return error.EarlyExit;
@@ -361,8 +390,6 @@ fn settingsValues(d: *Driver, low: []const u8, decision: []const u8, selected: u
     try check(view.visible(try std.fmt.bufPrint(&buffer, "Low-price input  {s}", .{low})));
     try check(view.visible(try std.fmt.bufPrint(&buffer, "Decision model   {s}", .{decision})));
     try check(view.visible(if (selected == 0) "> Low-price input" else "> Decision model"));
-    try check(view.visible(if (selected == 0) "Protect input from price surcharges; unknown pricing pauses." else "Review commands, Memory and compaction via config.json decision"));
-    try check(view.visible("Up/Down select  Enter toggle  Left back  Esc close"));
 }
 
 // The Node owner checks config.json CAS persistence and ignored legacy files;
@@ -373,29 +400,40 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     const on = std.mem.eql(u8, mode, "settings-global-on");
     const verify = std.mem.eql(u8, mode, "settings-global-verify");
     const absent = std.mem.eql(u8, mode, "settings-global-unconfigured");
-    try check(off or on or verify or absent);
+    const preset = std.mem.eql(u8, mode, "settings-global-preset");
+    try check(off or on or verify or absent or preset);
     try d.waitIdle(0);
     try settingsKey(d, "/settings\r");
     const before = if (on) "off" else "on";
     const after = if (off) "off" else "on";
-    const decision_before = if (absent) "not configured" else before;
+    const decision_before = if (absent or preset or on) "off" else "OpenCode Jev Free";
+    const decision_after = if (absent or off) "off" else "OpenCode Jev Free";
     try settingsValues(d, before, decision_before, 0);
     if (off or on) {
         try settingsKey(d, "\r");
-        try settingsValues(d, after, before, 0);
+        try settingsValues(d, after, decision_before, 0);
     }
     try settingsKey(d, "\x1b[B");
     try settingsValues(d, after, decision_before, 1);
-    if (off or on or absent) {
+    try settingsKey(d, "\r");
+    const choice = try d.screen();
+    try check(choice.visible("Off") and choice.visible("OpenCode Jev Free"));
+    try settingsKey(d, "\x1b[D");
+    try settingsValues(d, after, decision_before, 1);
+    try settingsKey(d, "\r");
+    try settingsKey(d, "\x1b");
+    try settingsValues(d, after, decision_before, 1);
+    if (!verify) {
         try settingsKey(d, "\r");
-        try settingsValues(d, after, if (absent) "not configured" else after, 1);
-        if (absent) {
-            const view = try d.screen();
-            try check(view.visible("Configure decision in ~/.thin/config.json first"));
-        }
+        if (off) try settingsKey(d, "\x1b[A");
+        if (on or preset) try settingsKey(d, "\x1b[B");
+        const selected = try d.screen();
+        try check(selected.visible(if (on or preset) "> OpenCode Jev Free" else "> Off"));
+        try settingsKey(d, "\r");
+        try settingsValues(d, after, decision_after, 1);
     }
     try settingsKey(d, "\x1b[A");
-    try settingsValues(d, after, if (absent) "not configured" else after, 0);
+    try settingsValues(d, after, decision_after, 0);
     // Left returns to the root command list with settings selected. Tab
     // completes it, and a separately acknowledged Enter opens it again.
     try settingsKey(d, "\x1b[D");
@@ -405,7 +443,7 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     const completed = try d.screen();
     try check(completed.visible("/settings"));
     try settingsKey(d, "\r");
-    try settingsValues(d, after, if (absent) "not configured" else after, 0);
+    try settingsValues(d, after, decision_after, 0);
     const start = d.used;
     try d.send("\x1b");
     try d.waitIdle(start);
@@ -414,13 +452,204 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     // No fabricated L assertion: unknown pricing has no authoritative tier.
     // Reopening checks the owner's published values after Esc, not UI intent.
     try settingsKey(d, "/settings\r");
-    try settingsValues(d, after, if (absent) "not configured" else after, 0);
+    try settingsValues(d, after, decision_after, 0);
     const close_start = d.used;
     try d.send("\x1b");
     try d.waitIdle(close_start);
 }
 
+fn localCommand(d: *Driver, mode: []const u8) !void {
+    // Do not materialize another large Screen on this history driver's stack.
+    errdefer std.debug.print("command PTY tail: {s}\n", .{d.output[d.used -| 3000..d.used]});
+    try d.waitIdle(0);
+    const accept = std.mem.eql(u8, mode, "settings-command-accept");
+    const deny = std.mem.eql(u8, mode, "settings-command-deny");
+    const cancel = std.mem.eql(u8, mode, "settings-command-cancel");
+    const timeout = std.mem.eql(u8, mode, "settings-command-timeout");
+    try check(accept or deny or cancel or timeout);
+    // Empty command, bracketed paste and submit batch tail must not execute.
+    if (deny) {
+        var start = d.used;
+        try d.send("!\r");
+        try d.waitIdle(start);
+        start = d.used;
+        try d.send("\x1b[200~!touch pasted\n\x1b[201~");
+        try d.quiet(150);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
+        try d.send("\x15");
+        try d.quiet(100);
+    }
+    // CLI ordinary tools are process-trusted. A recursive deletion of an
+    // absent owned relative target deliberately exercises mandatory approval.
+    const command = if (accept) "printf 'OUT\\n'; printf 'ERR\\n' >&2; touch marker; rm -rf absent; exit 7" else if (deny) "rm -rf absent; touch denied" else "rm -rf absent; sleep 30 & echo $! > child; touch started; wait";
+    var line: [256]u8 = undefined;
+    const start = d.used;
+    // Prefix whitespace follows the same dispatch semantics as the composer.
+    try d.send(try std.fmt.bufPrint(&line, "  !{s}\r", .{command}));
+    // Both command preview and approval must belong to a completed new frame.
+    try d.waitFrame(start, command);
+    try d.waitFrame(start, "Approval #");
+    const answered = d.used;
+    try d.send(if (deny) "n" else "y");
+    if (cancel) {
+        try d.quiet(200);
+        try d.send("\x1b");
+        try d.waitText(answered, "Canceled");
+    }
+    try d.waitIdle(answered);
+    if (accept) {
+        // These labels do not occur in the command preview. They prove that
+        // actual local output is visible before any subsequent inference.
+        try d.waitFrame(answered, "stdout:");
+        try d.waitFrame(answered, "stderr:");
+        try d.waitFrame(answered, "exit: 7");
+        // Do not confuse OUT/ERR in the quoted command preview with actual
+        // decoded stream lines. Keep the large screen off the driver's stack.
+        const view = try std.heap.page_allocator.create(regular.Screen);
+        defer std.heap.page_allocator.destroy(view);
+        view.* = .{};
+        try view.replay(d.output[0..d.used]);
+        var stdout_line = false;
+        var stderr_line = false;
+        for (0..view.history_len + view.grid.len) |i| {
+            const row = if (i < view.history_len) &view.history[i] else &view.grid[i - view.history_len];
+            const value = std.mem.trim(u8, row, " \t");
+            stdout_line = stdout_line or std.mem.eql(u8, value, "OUT");
+            stderr_line = stderr_line or std.mem.eql(u8, value, "ERR");
+        }
+        try check(stdout_line and stderr_line);
+        // Exactly one explicit subsequent inference; the mock validates the
+        // preceding canonical bash call/result, including streams and exit 7.
+        const normal = d.used;
+        try d.send("command-normal-proof\r");
+        try d.waitText(normal, "command-pair-verified");
+        try d.waitIdle(normal);
+    }
+    if (deny) {
+        const batch = d.used;
+        try d.send("!rm -rf absent; touch batch-first\r!touch batch-tail\r");
+        try d.waitFrame(batch, "Approval #");
+        const rejected = d.used;
+        try d.send("n");
+        try d.waitIdle(rejected);
+        try d.quiet(150);
+        try check(std.mem.indexOf(u8, d.output[rejected..d.used], "Approval #") == null);
+    }
+}
+
 /// 验收入口：从环境变量读取二进制、项目目录、HOME 与测试 URL，创建 PTY 并 fork 启动应用，再按 THIN_APP_TEST_MODE 驱动对应的交互场景。
+// Tool-preview fixture handshakes are emitted only after replaying a complete
+// cursor-ACK frame. Node keeps the SSE response open until each owned gate.
+extern "c" fn access([*:0]const u8, c_int) c_int;
+
+fn previewAbsent(path: [*:0]const u8) !void {
+    try check(access(path, 0) == -1 and c._errno().* == 2);
+}
+
+fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const u8, pending: bool) !void {
+    const view = try a.create(regular.Screen);
+    defer a.destroy(view);
+    const until = now() + 10000;
+    while (now() < until) {
+        try d.drain(20);
+        const raw = d.output[0..d.used];
+        const ack = std.mem.lastIndexOf(u8, raw, "\x1b[?25h") orelse continue;
+        if (ack < start) continue;
+        const complete = raw[0 .. ack + "\x1b[?25h".len];
+        view.* = .{};
+        try view.replay(complete);
+        if (!view.visible(needle)) continue;
+        try check(view.count(needle) == 1);
+        var matched = false;
+        for (0..view.history_len + view.grid.len) |i| {
+            const row = if (i < view.history_len) &view.history[i] else &view.grid[i - view.history_len];
+            if (std.mem.indexOf(u8, row, needle) == null) continue;
+            const line = std.mem.trim(u8, row, " ");
+            // Normal tool rows occupy at most floor(80 * .8) cells.
+            try check(std.mem.trimEnd(u8, row, " ").len <= 64);
+            if (pending) try check(std.mem.startsWith(u8, line, "w "));
+            matched = true;
+        }
+        try check(matched);
+        if (pending) {
+            // Name/field preview is static neutral, never warm execution UI.
+            const expected = try std.fmt.allocPrint(a, "w{s} ", .{spinner_theme.muted});
+            defer a.free(expected);
+            try check(std.mem.indexOf(u8, complete[start..], expected) != null);
+        }
+        for ([_][]const u8{ "receiving arguments", "Preparing write", "PREVIEW_RAW_CONTENT_SECRET" }) |hidden|
+            try check(std.mem.indexOf(u8, complete, hidden) == null);
+        return;
+    }
+    return error.ToolPreviewFrameTimeout;
+}
+
+fn toolPreview(d: *Driver, init: std.process.Init, mode: []const u8, project: []const u8) !void {
+    const a = init.arena.allocator();
+    const target = try a.dupeSentinel(u8, try std.fs.path.join(a, &.{ project, "preview-owned.txt" }), 0);
+    const canceled = std.mem.eql(u8, mode, "tool-preview-cancel");
+    try d.waitIdle(0);
+    const start = d.used;
+    try d.send("preview-task\r");
+    try previewFrame(d, a, start, "write_file", true);
+    try previewAbsent(target);
+    std.debug.print("PREVIEW_GATE=header\n", .{});
+    // The server now sends an unclosed path. A bounded observation window
+    // proves it cannot leak the unreliable partial field into a normal row.
+    try d.quiet(200);
+    try previewFrame(d, a, start, "write_file", true);
+    try check(std.mem.indexOf(u8, d.output[start..d.used], "preview-owned") == null);
+    try previewAbsent(target);
+    std.debug.print("PREVIEW_GATE=partial\n", .{});
+    const path_start = d.used;
+    try previewFrame(d, a, path_start, "preview-owned.txt", true);
+    try previewAbsent(target);
+    std.debug.print("PREVIEW_GATE=path-absent\n", .{});
+    // Content is already arriving but the call remains unfinished at this gate.
+    try d.quiet(250);
+    try previewFrame(d, a, path_start, "preview-owned.txt", true);
+    try previewAbsent(target);
+    if (canceled) {
+        const cancel_start = d.used;
+        try d.send("\x1b");
+        try d.waitIdle(cancel_start);
+        try previewAbsent(target);
+        std.debug.print("PREVIEW_GATE=canceled\n", .{});
+    } else {
+        std.debug.print("PREVIEW_GATE=finish\n", .{});
+        const running = d.used;
+        try d.waitFrame(running, "sleep 0.7");
+        // A running *tool row*, not the busy composer, must have warm braille
+        // and elapsed time before the owned sleep completes.
+        const until = now() + 1500;
+        var witnessed = false;
+        while (now() < until and !witnessed) {
+            try d.drain(10);
+            const bytes = d.output[running..d.used];
+            for (spinner_theme.command_pulse) |tone| {
+                var from: usize = 0;
+                while (std.mem.indexOfPos(u8, bytes, from, tone)) |at| {
+                    from = at + tone.len;
+                    const end = std.mem.indexOfPos(u8, bytes, from, "\x1b[K") orelse continue;
+                    const line = bytes[from..end];
+                    if (std.mem.indexOf(u8, line, "sleep 0.7") != null and
+                        std.mem.indexOf(u8, line, "s\x1b[0m") != null and
+                        std.mem.indexOf(u8, bytes[end..], "\x1b[?25h") != null) witnessed = true;
+                }
+            }
+        }
+        try check(witnessed);
+        try d.waitFrame(start, "preview-final-answer");
+        try d.waitIdle(start);
+        try check(access(target, 0) == 0);
+        try previewFrame(d, a, start, "preview-owned.txt", false);
+        try previewFrame(d, a, start, "sleep 0.7", false);
+    }
+    for ([_][]const u8{ "receiving arguments", "Preparing write", "PREVIEW_RAW_CONTENT_SECRET", "preview-bash-proof" }) |hidden|
+        try check(std.mem.indexOf(u8, d.output[start..d.used], hidden) == null);
+    std.debug.print("PREVIEW_GATE=verified\n", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const bin = try a.dupeSentinel(u8, try required(init, "THIN_APP_BIN"), 0);
@@ -464,13 +693,13 @@ pub fn main(init: std.process.Init) !void {
     const resume_argv = [_:null]?[*:0]const u8{ bin, "--resume", restore_id };
     const resume_no_log_argv = [_:null]?[*:0]const u8{ bin, "--resume", restore_id, "--no-log" };
     // output 模式直接执行 --print 大输出；其余模式启动交互式界面。
-    const argv: [*:null]const ?[*:0]const u8 = if (full_resume) (if (std.mem.eql(u8, mode, "resume-readonly")) &resume_no_log_argv else &resume_argv) else if (restore_mode) &restore_argv else if (std.mem.eql(u8, mode, "output")) &print_argv else if (std.mem.eql(u8, mode, "exit-no-log") or std.mem.startsWith(u8, mode, "settings-")) &no_log_argv else &interactive_argv;
+    const argv: [*:null]const ?[*:0]const u8 = if (full_resume) (if (std.mem.eql(u8, mode, "resume-readonly")) &resume_no_log_argv else &resume_argv) else if (restore_mode) &restore_argv else if (std.mem.eql(u8, mode, "output")) &print_argv else if (std.mem.eql(u8, mode, "exit-no-log") or std.mem.startsWith(u8, mode, "settings-") or std.mem.startsWith(u8, mode, "tool-preview-")) &no_log_argv else &interactive_argv;
 
     var master: c_int = undefined;
     var slave: c_int = undefined;
 
     var size = std.mem.zeroes(c.winsize);
-    size.col = 80;
+    size.col = if (std.mem.startsWith(u8, mode, "settings-command-")) 160 else 80;
     size.row = 24;
 
     // 创建 PTY 对，初始窗口尺寸为 80x24。
@@ -850,7 +1079,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, mode, "exit-busy") or std.mem.eql(u8, mode, "exit-busy-tool")) {
         const start = d.used;
         try d.send("exit-busy-task\r");
-        if (std.mem.eql(u8, mode, "exit-busy-tool")) try d.waitFrame(start, "sleep 30") else try d.waitBusy(start);
+        if (std.mem.eql(u8, mode, "exit-busy-tool")) try d.waitRunningFrame(start, "sleep 30") else try d.waitBusy(start);
         // Ctrl+D at the shared tail below cancels and joins before restoration.
     } else if (std.mem.eql(u8, mode, "auth-activate")) {
         // 待激活配置指向本地 fixture。/login 使用独立的掩码输入，取消不能保存或污染聊天输入。
@@ -1050,7 +1279,7 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, d.output[0..start], "%\x1b[0m) > ") != null);
         try check(std.mem.indexOf(u8, d.output[0..start], "\x1b[38;5;75m>\x1b[0m") == null);
         try d.send("tool-icon-task\r");
-        try d.waitText(start, "sleep 1; cat r.json");
+        try d.waitRunningFrame(start, "sleep 1; cat r.json");
         const animation_start = d.used;
         try d.quiet(120);
         const first = try d.screen();
@@ -1081,7 +1310,7 @@ pub fn main(init: std.process.Init) !void {
         try check(first.row == 23 and second.row == 23);
         try check(std.mem.indexOf(u8, &first.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &first.grid[23], "%) ~") != null);
         for (first.grid[22]) |byte| try check(byte == ' ');
-        try d.waitText(start, "sleep 0.6; printf ok");
+        try d.waitRunningFrame(start, "sleep 0.6; printf ok");
         const next_pending = try d.screen();
         var completed_row: ?usize = null;
         var next_row: ?usize = null;
@@ -1165,6 +1394,10 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, &final.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &final.grid[23], "%) >") != null);
         try check(!final.visible("ctx ~"));
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\"written_bytes\"") == null);
+    } else if (std.mem.startsWith(u8, mode, "tool-preview-")) {
+        try toolPreview(&d, init, mode, project);
+    } else if (std.mem.startsWith(u8, mode, "settings-command-")) {
+        try localCommand(&d, mode);
     } else if (std.mem.startsWith(u8, mode, "settings-global")) {
         // Handle before the historical thinking-level settings-* dispatcher.
         // No prompt, model selection, refresh or inference is submitted here.
@@ -1381,7 +1614,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, mode, "esc-cancel-tool")) {
         const start = d.used;
         try d.send("esc-tool-task\r");
-        try d.waitFrame(start, "sleep 30");
+        try d.waitRunningFrame(start, "sleep 30");
         try d.send("\x1b");
         try d.waitText(start, "Canceled; prior side effects remain");
         try d.waitIdle(start);

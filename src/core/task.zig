@@ -17,7 +17,7 @@ pub const Job = struct {
     /// 用户输入，调用方需保证其生命周期覆盖整个任务。
     prompt: []const u8,
     /// Summary-only work does not add prompt to model history.
-    kind: enum { prompt, compact } = .prompt,
+    kind: enum { prompt, compact, command } = .prompt,
     /// 任务是否已结束（成功或失败均为 true）；读写使用 release/acquire 配对。
     done: std.atomic.Value(bool) = .init(false),
     /// 成功时的运行结果；失败或未完成时为 null。
@@ -32,6 +32,7 @@ pub const Job = struct {
         const outcome = switch (self.kind) {
             .prompt => self.runtime.run(self.prompt, self.cancel),
             .compact => self.runtime.compactContext(self.cancel),
+            .command => self.runtime.executeCommand(self.prompt, self.cancel),
         };
         self.terminal = outcome catch |err| {
             // 错误被保存到 failure，由 result() 在主线程中取出，不在 worker 中抛出。

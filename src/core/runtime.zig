@@ -10,6 +10,8 @@ const context = @import("context.zig");
 const decision = @import("decision.zig");
 const session_context = @import("session_context.zig");
 const Io = std.Io;
+const tool_stream = @import("tool_stream.zig");
+pub const ToolView = tool_stream.View;
 
 /// 单次工具执行的结果，由 Executor.execute_fn 返回或由 executeBatch 合成。
 pub const Execution = struct {
@@ -178,12 +180,14 @@ pub const Event = union(enum) {
     assistant_committed: []const p.Block,
     /// 工具参数的流式预览，尚未校验，不能用于执行。
     tool_preview: struct { index: usize, arguments: []const u8, write_file: bool = false, argument_bytes: ?usize = null },
+    tool_views: struct { generation: u64, phase: enum { begin, commit, discard } },
+    tool_view: ToolView,
     /// 请求用户授权（随后会调用 Host.authorize_fn）。
     permission: Permission,
     /// 工具开始执行。
-    tool_started: struct { id: u64, name: []const u8, started_ms: ?u64 = null },
+    tool_started: struct { id: u64, name: []const u8, started_ms: ?u64 = null, display_key: ?p.ToolDisplayKey = null },
     /// 工具结束（包括被拒绝、失败、取消）。
-    tool_result: struct { id: u64, name: []const u8, result: Execution },
+    tool_result: struct { id: u64, name: []const u8, result: Execution, display_key: ?p.ToolDisplayKey = null },
     /// 单次模型调用的权威用量（流内快照不累加）。
     usage: struct { purpose: p.Purpose, protocol: p.Protocol, value: p.Usage },
     /// 发生协议降级后的新协议。
@@ -735,6 +739,8 @@ pub const Runtime = struct {
     trusted: bool,
     /// 递增的调用/权限 ID（允许回绕），与宿主事件关联。
     permission_id: u64 = 0,
+    display_generation: u64 = 0,
+    display_links: tool_stream.Links = .{},
     /// 本轮用户输入在 history 中的起始下标，压缩规划时需保护该区段（规则见 context.plan）。
     protected_index: usize = 0,
     /// 存在无法安全继续的状态（清理失败、无法补全 tool_result）；置位后拒绝后续 run。
@@ -1119,14 +1125,20 @@ pub const Runtime = struct {
         return self.runTask(.compact, cancel);
     }
 
-    const Operation = union(enum) { prompt: []const u8, compact };
+    /// Execute an explicit user !command without primary inference or compaction.
+    /// Uses the same executor, decision review and host permissions as model tools.
+    pub fn executeCommand(self: *Runtime, full_text_with_bang: []const u8, cancel: *p.Cancellation) !Terminal {
+        return self.runTask(.{ .command = full_text_with_bang }, cancel);
+    }
+
+    const Operation = union(enum) { prompt: []const u8, compact, command: []const u8 };
 
     fn runTask(self: *Runtime, operation: Operation, cancel: *p.Cancellation) !Terminal {
         // 占用运行权；defer 保证任何退出路径都会释放，防止永久 Busy。
         if (self.busy.swap(true, .acq_rel)) return error.Busy;
         defer self.busy.store(false, .release);
         self.observer.notify(.{ .submitted = switch (operation) {
-            .prompt => |text| text,
+            .prompt, .command => |text| text,
             .compact => "/compact",
         } });
 
@@ -1145,6 +1157,7 @@ pub const Runtime = struct {
         const result = switch (operation) {
             .prompt => |text| self.runInner(text, cancel, &task),
             .compact => self.compactInner(cancel, &task),
+            .command => |text| self.commandInner(text, cancel, &task),
         };
         result catch |err| {
             task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached or err == error.DecisionUnavailable or inputBudgetPause(err)) .paused else .failed;
@@ -1169,6 +1182,71 @@ pub const Runtime = struct {
         task.terminal.context_snapshot = self.contextSnapshot();
         self.emit(.{ .finished = task.terminal }, cancel) catch {};
         return task.terminal;
+    }
+
+    fn commandInner(self: *Runtime, text: []const u8, cancel: *p.Cancellation, task: *Task) !void {
+        if (self.poisoned) return error.UnsafeToContinue;
+        try checkCanceled(cancel);
+        const input = std.mem.trimStart(u8, text, " \t\r\n");
+        if (input.len == 0 or input[0] != '!' or !std.unicode.utf8ValidateSlice(text) or std.mem.findScalar(u8, text, 0) != null) return error.InvalidInput;
+        // Only the ! marker is syntax. Shell whitespace may be escaped or part
+        // of a here-document, so validate emptiness without rewriting its bytes.
+        const command = input[1..];
+        if (std.mem.trim(u8, command, " \t\r\n").len == 0) return error.InvalidInput;
+        if (command.len > 32768 or text.len > self.config.limits.max_response_bytes) return error.InputTooLarge;
+        try self.syncSessionContext();
+
+        // Imported checkpoints need not share our permission counter. Bound both
+        // the scan and candidate count, and never re-execute any imported call.
+        var ids = std.StringHashMap(void).init(self.allocator);
+        defer ids.deinit();
+        var scanned: usize = 0;
+        for (self.history.items) |message| {
+            try checkCanceled(cancel);
+            for (message.blocks) |block| {
+                if (scanned % 256 == 0) try checkCanceled(cancel);
+                scanned +%= 1;
+                const id = switch (block) {
+                    .tool_call => |call| call.id,
+                    .tool_result => |result| result.call_id,
+                    else => continue,
+                };
+                if (!ids.contains(id)) {
+                    if (ids.count() == 65536) return error.ToolCallLimit;
+                    try ids.put(id, {});
+                }
+            }
+        }
+        var temporary = std.heap.ArenaAllocator.init(self.allocator);
+        defer temporary.deinit();
+        const a = temporary.allocator();
+        var id_buffer: [64]u8 = undefined;
+        var call_id: []const u8 = undefined;
+        var attempt: usize = 0;
+        while (attempt <= ids.count()) : (attempt += 1) {
+            try checkCanceled(cancel);
+            const candidate = try std.fmt.bufPrint(&id_buffer, "local_command_{d}", .{try self.allocatePermissionId()});
+            if (!ids.contains(candidate)) {
+                call_id = try a.dupe(u8, candidate);
+                break;
+            }
+        } else return error.PermissionIdExhausted;
+        const arguments = try std.json.Stringify.valueAlloc(a, .{ .command = command }, .{});
+        if (arguments.len > self.config.limits.max_response_bytes) return error.InputTooLarge;
+        const owned = self.arena.allocator();
+        const user = try p.cloneMessage(owned, .{ .role = .user, .blocks = &.{.{ .text = text }} });
+        const assistant = try p.cloneMessage(owned, .{ .role = .assistant, .blocks = &.{
+            .{ .text = "Program-generated bash call for the user's explicit !command; not LLM reasoning or a model response." },
+            .{ .tool_call = .{ .id = call_id, .name = "bash", .arguments = arguments } },
+        } });
+        try self.history.ensureUnusedCapacity(owned, 2);
+        self.protected_index = self.history.items.len;
+        self.history.appendAssumeCapacity(user);
+        self.history.appendAssumeCapacity(assistant);
+        // New canonical context invalidates only the display usage, not the
+        // estimator's learned calibration. executeBatch owns pairing on ALL exits.
+        self.last_context_tokens = null;
+        try self.executeBatch(assistant.blocks, cancel, task, .local);
     }
 
     fn compactInner(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
@@ -1478,10 +1556,11 @@ pub const Runtime = struct {
             if (response.finish == .stop) {
                 try self.emitContext(cancel);
                 try self.emit(.{ .assistant_committed = message.blocks }, cancel);
+                self.discardToolViews(cancel);
                 return;
             }
 
-            try self.executeBatch(message.blocks, cancel, task);
+            try self.executeBatch(message.blocks, cancel, task, .normal);
         }
     }
 
@@ -1500,13 +1579,57 @@ pub const Runtime = struct {
         const estimated = self.estimator.tokens(context.rawTokens(req.system, req.tools, req.messages));
         const cap = try context.outputBudget(self.config.*, req.purpose, estimated);
         if (req.max_output_tokens == 0 or req.max_output_tokens > cap) return error.ContextTooLarge;
+        // Display-only work must not alter Selector observation/fallback/accounting.
+        if (req.purpose != .normal) return self.callModel(a, req, sink);
+        var uncanceled: p.Cancellation = .{};
+        const cancel = req.cancellation orelse &uncanceled;
+        self.beginToolViews(cancel);
+        const controller = self.allocator.create(tool_stream.Controller) catch null;
+        defer if (controller) |value| self.allocator.destroy(value);
+        if (controller) |value| value.* = .{ .generation = self.display_generation, .schemas = req.tools };
+        var forward = PreviewForward{ .runtime = self, .controller = controller, .original = sink, .cancel = cancel };
+        const outcome = self.callModel(a, req, .{ .context = &forward, .emit_fn = PreviewForward.emit }) catch |err| {
+            self.discardToolViews(cancel);
+            return err;
+        };
+        if (outcome == .success) {
+            if (controller) |value| self.display_links = value.links();
+        } else self.discardToolViews(cancel);
+        return outcome;
+    }
+
+    fn callModel(self: *Runtime, a: std.mem.Allocator, req: p.Request, sink: p.ModelSink) !p.Outcome {
         return self.model.call(a, req, sink) catch |err| {
-            // A private proxy transport may retain an unreaped child. This is
-            // process safety, not poor model quality or a summary retry signal.
             if (err == error.CleanupFailed) self.poisoned = true;
             return err;
         };
     }
+
+    fn beginToolViews(self: *Runtime, cancel: *const p.Cancellation) void {
+        self.display_generation +%= 1;
+        self.display_links = .{ .generation = self.display_generation };
+        self.emit(.{ .tool_views = .{ .generation = self.display_generation, .phase = .begin } }, cancel) catch {};
+    }
+
+    fn discardToolViews(self: *Runtime, cancel: *const p.Cancellation) void {
+        self.display_links = .{ .generation = self.display_generation };
+        self.emit(.{ .tool_views = .{ .generation = self.display_generation, .phase = .discard } }, cancel) catch {};
+    }
+
+    const PreviewForward = struct {
+        runtime: *Runtime,
+        controller: ?*tool_stream.Controller,
+        original: p.ModelSink,
+        cancel: *const p.Cancellation,
+        fn emit(ctx: ?*anyopaque, event: p.ModelEvent) !void {
+            const self: *PreviewForward = @ptrCast(@alignCast(ctx.?));
+            if (event == .tool_delta) if (self.controller) |controller| {
+                if (controller.observe(event.tool_delta)) |view|
+                    self.runtime.emit(.{ .tool_view = view }, self.cancel) catch {};
+            };
+            try self.original.emit(event);
+        }
+    };
 
     /// Construct each purpose's independent budget from its complete input;
     /// summary uses explicit/automatic summary policy, normal uses response policy.
@@ -1837,7 +1960,9 @@ pub const Runtime = struct {
 
     /// 顺序执行 assistant 批次中的所有 tool_call，每个 call 都写入一条 tool_result。
     /// 不变量：批次一旦提交（emit assistant_committed），每个 tool_call 都必须获得结果，即使中途失败。
-    fn executeBatch(self: *Runtime, blocks: []const p.Block, cancel: *p.Cancellation, task: *Task) !void {
+    const BatchKind = enum { normal, local };
+
+    fn executeBatch(self: *Runtime, blocks: []const p.Block, cancel: *p.Cancellation, task: *Task, kind: BatchKind) !void {
         // 已处理到的块下标；errdefer 只为之后未处理的 call 补写结果。
         var next_block: usize = 0;
         // 执行已开始但结果尚未记录时，不得把分配/回填失败误写成“未执行”。
@@ -1867,6 +1992,27 @@ pub const Runtime = struct {
         try self.emitContext(cancel);
         try self.emit(.{ .assistant_committed = blocks }, cancel);
 
+        if (kind == .local) self.beginToolViews(cancel);
+        errdefer self.discardToolViews(cancel);
+        var display_keys: [64]p.ToolDisplayKey = undefined;
+        var display_count: usize = 0;
+        for (blocks) |block| if (block == .tool_call and display_count < display_keys.len) {
+            const call = block.tool_call;
+            var key = self.display_links.lookup(call.id) orelse self.display_links.fresh(display_keys[0..display_count]);
+            for (display_keys[0..display_count]) |previous| if (previous.eql(key)) {
+                key = self.display_links.fresh(display_keys[0..display_count]);
+                break;
+            };
+            display_keys[display_count] = key;
+            display_count += 1;
+            var extractor: @import("tool_preview.zig").Extractor = .{};
+            extractor.feed(call.arguments);
+            const valid = extractor.finish();
+            try self.emit(.{ .tool_view = .{ .key = key, .name = call.name, .fields = if (valid) extractor.snapshot() else .{}, .ready = true } }, cancel);
+        };
+        try self.emit(.{ .tool_views = .{ .generation = self.display_generation, .phase = .commit } }, cancel);
+        var display_ordinal: usize = 0;
+
         while (next_block < blocks.len) {
             const block = blocks[next_block];
             if (block != .tool_call) {
@@ -1877,6 +2023,8 @@ pub const Runtime = struct {
 
             // 模型给出的 call.id 只用于回填结果；事件使用 Runtime 分配的 host_id。
             const call = block.tool_call;
+            const display_key: ?p.ToolDisplayKey = if (display_ordinal < display_count) display_keys[display_ordinal] else null;
+            display_ordinal += 1;
 
             // Monotonic for this Bridge. Wrapping to 0 would be <= last_id and
             // surface as InvalidPermission; overflow rebases or refuses first.
@@ -1891,7 +2039,7 @@ pub const Runtime = struct {
                 const result = Execution{ .text = @errorName(err), .is_error = true };
                 try self.appendResult(call.id, result);
                 next_block += 1;
-                try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result } }, cancel);
+                try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result, .display_key = display_key } }, cancel);
                 try self.emitContext(cancel);
                 continue;
             };
@@ -1920,7 +2068,7 @@ pub const Runtime = struct {
                         const skipped: Execution = .{ .text = "Skipped: decision review found this memory write unnecessary; nothing was written." };
                         try self.appendResult(call.id, skipped);
                         next_block += 1;
-                        try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = skipped } }, cancel);
+                        try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = skipped, .display_key = display_key } }, cancel);
                         try self.emitContext(cancel);
                         continue;
                     },
@@ -1960,7 +2108,7 @@ pub const Runtime = struct {
                 const began = Io.Clock.awake.now(self.io);
                 // Dirty-marker failure returns before started_call, so this call
                 // is recorded as not executed and later calls in the batch are too.
-                try self.emit(.{ .tool_started = .{ .id = host_id, .name = call.name, .started_ms = @intCast(@max(0, began.toMilliseconds())) } }, cancel);
+                try self.emit(.{ .tool_started = .{ .id = host_id, .name = call.name, .started_ms = @intCast(@max(0, began.toMilliseconds())), .display_key = display_key } }, cancel);
                 task.tool_calls += 1;
 
                 // 执行错误转为 is_error 结果而不是 run 失败；Canceled 标记为 canceled。
@@ -1977,11 +2125,23 @@ pub const Runtime = struct {
             if (result.cleanup_failed) self.poisoned = true;
 
             // 超出上下文预算时截断输出。
-            result = try self.fitResult(a, call.id, result);
+            if (kind == .normal) {
+                result = try self.fitResult(a, call.id, result);
+            } else {
+                // Bound injected executors independently of unknown-price input
+                // policy. Align a split scalar in <=3 steps, then validate once:
+                // malformed prefixes must not cause quadratic rescanning.
+                var end = @min(result.text.len, self.config.limits.max_response_bytes);
+                var backed: usize = 0;
+                while (end < result.text.len and end > 0 and backed < 3 and (result.text[end] & 0xc0) == 0x80) : (backed += 1) end -= 1;
+                if (!std.unicode.utf8ValidateSlice(result.text[0..end])) return error.InvalidToolOutput;
+                result.truncated = result.truncated or end < result.text.len;
+                result.text = result.text[0..end];
+            }
             try self.appendResult(call.id, result);
             started_call = null;
             next_block += 1;
-            try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result } }, cancel);
+            try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result, .display_key = display_key } }, cancel);
             try self.emitContext(cancel);
 
             // 先写入结果并通知宿主，再因清理失败终止批次。

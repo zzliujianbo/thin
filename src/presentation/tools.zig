@@ -4,6 +4,7 @@ const std = @import("std");
 const p = @import("../core/protocol.zig");
 const r = @import("../core/runtime.zig");
 const clean = @import("../util/display_text.zig");
+const tool_preview = @import("../core/tool_preview.zig");
 pub const FileStats = @import("../util/line_stats.zig").File;
 pub const call_limit = 256;
 
@@ -56,6 +57,28 @@ pub const Call = struct {
         const value = parsed.value.object.get(if (kind == .bash) "command" else "path") orelse return .{ .kind = kind };
         if (value != .string) return .{ .kind = kind };
         return fromDetail(a, kind, value.string);
+    }
+
+    /// Typed, display-only fields, extracted before a Bridge can clip raw JSON.
+    /// Missing fields remain unknown; no string repair or execution validation.
+    pub fn fromFields(a: std.mem.Allocator, name: []const u8, fields: tool_preview.Snapshot) !Call {
+        const kind = Kind.fromName(name);
+        if (kind == .other) return .{ .kind = kind };
+        if (kind == .memory) {
+            const action = fields.action orelse return .{ .kind = kind };
+            if (action.truncated) return .{ .kind = kind };
+            if (!std.mem.eql(u8, action.text, "list") and !std.mem.eql(u8, action.text, "read") and !std.mem.eql(u8, action.text, "write") and !std.mem.eql(u8, action.text, "delete")) return .{ .kind = kind };
+            const target: ?tool_preview.Field = if (std.mem.eql(u8, action.text, "list")) .{ .text = "core/index" } else fields.topic;
+            const raw = if (target) |value| try std.fmt.allocPrint(a, "{s} {s}", .{ action.text, value.text }) else try a.dupe(u8, action.text);
+            defer a.free(raw);
+            var call = try fromDetail(a, kind, raw);
+            call.truncated = call.truncated or (if (target) |value| value.truncated else false);
+            return call;
+        }
+        const field = (if (kind == .bash) fields.command else fields.path) orelse return .{ .kind = kind };
+        var call = try fromDetail(a, kind, field.text);
+        call.truncated = call.truncated or field.truncated;
+        return call;
     }
 
     fn fromDetail(a: std.mem.Allocator, kind: Kind, bytes: []const u8) !Call {
@@ -165,6 +188,30 @@ pub const Queue = struct {
         return Call.init(a, name, "");
     }
 };
+
+test "typed tool fields keep unknown targets safe and preserve clipping provenance" {
+    const a = std.testing.allocator;
+    const missing = try Call.fromFields(a, "write_file", .{});
+    defer missing.deinit(a);
+    try std.testing.expect(missing.kind == .write and missing.detail == null);
+    const path = try Call.fromFields(a, "read_file", .{ .path = .{ .text = "中文\x1b[2J\nfile", .truncated = true } });
+    defer path.deinit(a);
+    try std.testing.expect(path.truncated and path.kind == .read);
+    try std.testing.expect(std.mem.findScalar(u8, path.detail.?, '\x1b') == null);
+    try std.testing.expect(std.mem.findScalar(u8, path.detail.?, '\n') == null);
+    const command = try Call.fromFields(a, "bash", .{ .path = .{ .text = "wrong" }, .command = .{ .text = "echo hello" } });
+    defer command.deinit(a);
+    try std.testing.expectEqualStrings("echo hello", command.detail.?);
+    const action = try Call.fromFields(a, "memory", .{ .action = .{ .text = "write" } });
+    defer action.deinit(a);
+    try std.testing.expectEqualStrings("write", action.detail.?);
+    const topic = try Call.fromFields(a, "memory", .{ .action = .{ .text = "read" }, .topic = .{ .text = "core" } });
+    defer topic.deinit(a);
+    try std.testing.expectEqualStrings("read core", topic.detail.?);
+    const invalid = try Call.fromFields(a, "memory", .{ .action = .{ .text = "write", .truncated = true }, .topic = .{ .text = "hidden" } });
+    defer invalid.deinit(a);
+    try std.testing.expect(invalid.detail == null);
+}
 
 test "memory descriptions include known action and topic without bodies versions or styles" {
     const a = std.testing.allocator;

@@ -80,6 +80,13 @@ const Copy = struct {
         return "";
     }
 
+    fn field(self: *Copy, src: ?@import("../core/tool_preview.zig").Field) ?@import("../core/tool_preview.zig").Field {
+        const value = src orelse return null;
+        const before = self.used;
+        const copied = self.text(value.text);
+        return .{ .text = copied, .truncated = value.truncated or self.used - before < value.text.len };
+    }
+
     /// 深拷贝一个 Block 中的所有字符串字段。
     fn block(self: *Copy, b: p.Block) p.Block {
         return switch (b) {
@@ -101,6 +108,15 @@ const Copy = struct {
             .text => |s| .{ .text = self.text(s) },
             .reasoning => |s| .{ .reasoning = self.text(s) },
             .tool_preview => |v| .{ .tool_preview = .{ .index = v.index, .arguments = self.text(v.arguments), .write_file = v.write_file, .argument_bytes = v.argument_bytes } },
+            .tool_view => |v| blk: {
+                var c = v;
+                c.name = self.text(v.name);
+                c.fields.path = self.field(v.fields.path);
+                c.fields.command = self.field(v.fields.command);
+                c.fields.action = self.field(v.fields.action);
+                c.fields.topic = self.field(v.fields.topic);
+                break :blk .{ .tool_view = c };
+            },
             .permission => |v| .{ .permission = .{ .id = v.id, .tool_name = self.text(v.tool_name), .description = self.text(v.description) } },
             .tool_started => |v| blk: {
                 var c = v;

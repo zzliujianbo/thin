@@ -21,6 +21,7 @@ const metadata = @import("model_metadata.zig");
 const directory = @import("model_directory.zig");
 const model_resolver = @import("model_resolver.zig");
 const fs = @import("../platform/filesystem.zig");
+const decision_selection = @import("decision_selection.zig");
 
 test {
     _ = @import("llm_session_test.zig");
@@ -408,7 +409,7 @@ pub const Session = struct {
 
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .decision_fn = setDecision, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -608,6 +609,7 @@ pub const Session = struct {
             .low_price_input_enabled = config.limits.low_price_input,
             .decision_enabled = config.decisionActive(),
             .decision_configured = config.decision != null,
+            .decision_jev_free = decision_selection.selected(self.global_config.?.value),
             .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .pending_default_effort = if (self.app != null and self.initial_default_pending and config.model.reasoning_effort == null) self.preferred_effort else null,
@@ -1088,9 +1090,7 @@ pub const Session = struct {
     fn setSetting(raw: *anyopaque, setting: tui.Connection.Setting, enabled: bool) !void {
         const self: *Session = @ptrCast(@alignCast(raw));
         try self.guardSelection();
-        const active_config = self.mutableConfig();
-        // Persist only the owned declaration, never cache-resolved model data
-        // or historical choices. The borrowed live/global arenas stay put.
+        // Persist only the owned declaration, never resolved/history metadata.
         var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
         defer cfg.release(&declaration);
         switch (setting) {
@@ -1099,20 +1099,39 @@ pub const Session = struct {
                 if (declaration.value.decision) |*value| value.enabled = enabled else return error.DecisionNotConfigured;
             },
         }
-        const low = declaration.value.limits.low_price_input;
-        const decision = declaration.value.decisionActive();
-        var prepared: ?App.SettingsReplacement = if (self.app) |app| try app.prepareSettings(declaration.value, self.environ) else null;
+        try self.persistSettings(&declaration, false);
+    }
+
+    fn setDecision(raw: *anyopaque, choice: tui.Connection.DecisionChoice) !void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        try self.guardSelection();
+        var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
+        defer cfg.release(&declaration);
+        if (!try decision_selection.apply(declaration.arena.allocator(), &declaration.value, switch (choice) {
+            .off => .off,
+            .opencode_jev_free => .opencode_jev_free,
+        })) return;
+        try self.persistSettings(&declaration, true);
+    }
+
+    /// Save is the final fallible operation. Swapping with the caller keeps its
+    /// deferred release responsible for wiping the previous global declaration.
+    fn persistSettings(self: *Session, declaration: *std.json.Parsed(cfg.Config), refresh: bool) !void {
+        var prepared: ?App.SettingsReplacement = if (self.app) |app| try app.prepareSettingsRefresh(declaration.value, self.environ, refresh) else null;
         defer if (prepared) |*value| value.deinit();
-        // Last fallible step. File CAS/write failure leaves live state intact.
+        var pending: ?std.json.Parsed(cfg.Config) = if (self.app == null)
+            try decision_selection.activeClone(self.allocator, self.pending.?.value, declaration.value)
+        else
+            null;
+        defer if (pending) |*value| cfg.release(value);
         try self.store.save(declaration.value);
-        self.global_config.?.value.limits.low_price_input = low;
-        if (self.global_config.?.value.decision) |*value| value.enabled = decision;
+        std.mem.swap(std.json.Parsed(cfg.Config), &self.global_config.?, declaration);
         if (prepared) |*value| {
             self.app.?.installSettings(value);
             self.initial_context = self.app.?.runtime.contextSnapshot();
         } else {
-            active_config.limits.low_price_input = low;
-            if (active_config.decision) |*value| value.enabled = decision;
+            std.mem.swap(std.json.Parsed(cfg.Config), &self.pending.?, &pending.?);
+            self.pending_base_model = self.global_config.?.value.model;
         }
         self.publishCheckpoint();
     }

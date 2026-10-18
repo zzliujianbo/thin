@@ -543,6 +543,13 @@ async function scenario(name, protocol, kind, isPty = false) {
         error.fixtureCheck = `PTY code ${result.code} at ${lines} requests ${requests}`;
         throw error;
       }
+      if (isPty && result.code !== 0) {
+        const error = new Error('owned PTY failed');
+        const lines = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].slice(0,6).map(match => match[1]).join('-') || 'unknown';
+        error.fixtureCase = `pty/${kind}`;
+        error.fixtureCheck = `PTY code ${result.code} at ${lines} requests ${requests}`;
+        throw error;
+      }
       assert.equal(result.code, 0, `${name}: exit ${result.code}; ${codes || 'no safe error code'}; captured ${result.output.length} bytes (not rendered)`);
     }
 
@@ -794,6 +801,8 @@ try {
     await scenario('PTY model/effort selection responses','responses','model-select',true);
   } else if (process.argv.includes('--settings-only')) {
     await settingsRegressions({app,pty,execute,send});
+  } else if (process.argv.includes('--tool-presentation-only')) {
+    for (const kind of ['tool-icons','file-stats','memory-summary']) await scenario(`PTY/${kind}`,'chat',kind,true);
   } else if (!watchdogOnly) {
   // 运行全部场景：先测无配置的 help 与 print，再对 chat 与 responses 运行通用场景，最后运行 PTY 场景（仅 chat）。
   await scenario('PTY compact menu navigation','chat','menu-navigation',true);
@@ -829,7 +838,7 @@ try {
 } catch (error) {
   // 中文：不要渲染捕获的终端或模型输出、响应头或请求体。
   // Do not render captured terminal/model output, headers, or request bodies.
-  const label = /^(?:log|selection|settings|resume|login)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
+  const label = /^(?:log|selection|settings|resume|login|pty)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
     ? `${error.fixtureCase}: ${error.fixtureCheck}` : `offline fixture assertion at app_mock.mjs:${/app_mock\.mjs:(\d+):/.exec(error.stack ?? '')?.[1] ?? 'unknown'} (details withheld)`;
   console.error(`FAIL application acceptance: ${label}`);
   process.exitCode = 1;

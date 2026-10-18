@@ -13,6 +13,9 @@ const picker_module = @import("model_picker.zig");
 const provider_picker_module = @import("provider_picker.zig");
 const command_menu_module = @import("command_menu.zig");
 const settings_menu_module = @import("settings_menu.zig");
+const decision_picker_module = @import("decision_picker.zig");
+const local_command_output = @import("local_command_output.zig");
+const tool_views_module = @import("tool_views.zig");
 const text = @import("text.zig");
 const markdown = @import("markdown.zig");
 const tail_frame = @import("tail_frame.zig");
@@ -36,7 +39,7 @@ const Kind = enum { user, assistant, reasoning, tool, notice };
 const Record = struct {
     /// 记录种类，决定标题与 Markdown 渲染方式。
     kind: Kind,
-    /// Every completed call owns one compact row, never a raw result block.
+    /// Compact completion caption; explicit local output uses a separate plain record.
     command_row: bool = false,
     /// Measured wall-clock execution time of this row; null when unobserved.
     duration_ms: ?u64 = null,
@@ -169,6 +172,24 @@ const Record = struct {
     }
 };
 
+// Strict adjacent shape is a display classification only, never authorization.
+// No historical call is executed, and ordinary model bash results stay compact.
+fn localHistoryCall(messages: []const p.Message, index: usize) ?[]const u8 {
+    if (index == 0 or index + 1 >= messages.len) return null;
+    const user = messages[index - 1];
+    const assistant = messages[index];
+    const result = messages[index + 1];
+    if (user.role != .user or user.blocks.len != 1 or user.blocks[0] != .text) return null;
+    const prompt = std.mem.trimStart(u8, user.blocks[0].text, " \t\r\n");
+    if (prompt.len == 0 or prompt[0] != '!') return null;
+    if (assistant.role != .assistant or assistant.blocks.len != 2 or assistant.blocks[0] != .text or assistant.blocks[1] != .tool_call) return null;
+    if (!std.mem.eql(u8, assistant.blocks[0].text, "Program-generated bash call for the user's explicit !command; not LLM reasoning or a model response.")) return null;
+    const call = assistant.blocks[1].tool_call;
+    if (!std.mem.eql(u8, call.name, "bash") or !std.mem.startsWith(u8, call.id, "local_command_") or call.id.len == "local_command_".len) return null;
+    if (result.role != .tool or result.blocks.len != 1 or result.blocks[0] != .tool_result or !std.mem.eql(u8, result.blocks[0].tool_result.call_id, call.id)) return null;
+    return call.id;
+}
+
 /// 当前等待用户审批的工具调用。description 由 Ui 的 allocator 持有，由 clearPermission 释放。
 /// clipped 表示预览被截断；pasted 表示审批期间出现过粘贴。两者任一为真时只能拒绝。
 const Permission = struct { id: u64, description: []const u8, clipped: bool, pasted: bool = false };
@@ -176,6 +197,8 @@ const Permission = struct { id: u64, description: []const u8, clipped: bool, pas
 /// UI-owned callbacks; the application owns the runtime and configuration lifetime.
 pub const Connection = struct {
     pub const Setting = enum { low_price_input, decision_enabled };
+    pub const DecisionChoice = enum { off, opencode_jev_free };
+    decision_fn: ?*const fn (*anyopaque, DecisionChoice) anyerror!void = null,
     setting_fn: ?*const fn (*anyopaque, Setting, bool) anyerror!void = null,
     context: *anyopaque,
     current_fn: *const fn (*anyopaque) State,
@@ -222,6 +245,7 @@ pub const Connection = struct {
         low_price_input_enabled: bool = true,
         decision_enabled: bool = false,
         decision_configured: bool = false,
+        decision_jev_free: bool = false,
         global_settings_available: bool = true,
         /// Immutable configured request option, not inferred from stream time.
         reasoning_effort: shared.ReasoningEffort = .unspecified,
@@ -272,7 +296,7 @@ pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge
     var terminal = try terminal_module.Terminal.open();
     // defer 逆序执行：先 ui.deinit（等待 worker 结束），再 terminal.deinit（恢复终端）。
     defer terminal.deinit();
-    var ui = Ui{ .allocator = a, .io = io, .connection = connection, .bridge = bridge, .cancel = cancel, .terminal = &terminal, .editor = .{ .allocator = a }, .job = undefined };
+    var ui = Ui{ .allocator = a, .io = io, .connection = connection, .bridge = bridge, .cancel = cancel, .terminal = &terminal, .editor = .{ .allocator = a }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" } };
     defer ui.deinit();
 
     var directory: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -327,6 +351,7 @@ const Ui = struct {
     provider_picker: provider_picker_module.Picker = .{},
     provider_open: bool = false,
     settings_open: bool = false,
+    decision_open: bool = false,
     settings_menu: settings_menu_module.Menu = .{},
     displayed_settings_generation: ?u64 = null,
     frame_settings_generation: ?u64 = null,
@@ -391,10 +416,10 @@ const Ui = struct {
     animation_tick: u64 = 0,
     display: shared.State = .{},
     model_flow: activity.Flow = .{},
-    active_tool: ?struct { id: u64, caption: presentation.Caption, started_ms: u64 } = null,
-    /// One transient receipt row, never a committed file-write result.
-    write_preview: ?struct { index: usize, argument_bytes: usize } = null,
-    /// Shared canonical FIFO; renderer adds terminal widths/icons later.
+    active_tool: ?struct { id: u64, caption: presentation.Caption, started_ms: u64, display_key: ?p.ToolDisplayKey = null } = null,
+    /// Mutable display-only tool rows; never released as immutable transcript.
+    tool_views: tool_views_module.Views = .{},
+    /// Shared canonical FIFO remains the fallback for restored/legacy events.
     tool_calls: shared.tools.Queue = .{},
     /// 上一次终态用于失败详情和cleanup安全检查，不显示统计栏。
     last_terminal: ?r.Terminal = null,
@@ -448,6 +473,7 @@ const Ui = struct {
         self.clearActiveTool();
         self.clearToolCaptions();
         self.tool_calls.deinit(self.allocator);
+        self.tool_views.deinit(self.allocator);
         if (self.frame_arena) |*arena| arena.deinit();
         if (self.frame_tail_snapshot) |*snapshot| snapshot.deinit();
         if (self.tail_snapshot) |*snapshot| snapshot.deinit();
@@ -492,7 +518,7 @@ const Ui = struct {
         return index;
     }
 
-    /// Display-only projection of authenticated, closed canonical history.
+    /// Display-only projection of locally loaded canonical history.
     /// No Bridge/observer events, execution, approvals or live reasoning replay.
     fn restoreHistory(self: *Ui, messages: []const p.Message) !void {
         if (messages.len == 0) return;
@@ -515,7 +541,8 @@ const Ui = struct {
             },
             .assistant => {
                 try self.captureToolCaptions(message.blocks);
-                try self.replaceCommitted(message.blocks, false, true);
+                if (localHistoryCall(messages, index) == null)
+                    try self.replaceCommitted(message.blocks, false, true);
             },
             .tool => for (message.blocks) |block| switch (block) {
                 .tool_result => |result| {
@@ -530,6 +557,9 @@ const Ui = struct {
                     const caption = if (tool_name) |name| try self.nextToolCaption(name) else presentation.Caption{ .kind = .other, .label = try self.allocator.dupe(u8, "Saved tool result") };
                     defer caption.deinit(self.allocator);
                     try self.toolCompleted(caption, .{ .text = result.text, .is_error = result.is_error, .canceled = result.canceled, .truncated = result.truncated });
+                    if (index > 0) if (localHistoryCall(messages, index - 1)) |id| {
+                        if (std.mem.eql(u8, id, result.call_id)) try self.localCommandOutput(result.text, result.truncated);
+                    };
                 },
                 else => {},
             },
@@ -569,6 +599,20 @@ const Ui = struct {
         return presentation.fromCall(self.allocator, call);
     }
 
+    /// Consume the canonical FIFO even when a pre-Bridge typed ready summary
+    /// supplies the caption. A provisional row never supplies execution text.
+    fn executionCaption(self: *Ui, name: []const u8, identity: ?p.ToolDisplayKey) !presentation.Caption {
+        const call = try self.tool_calls.take(name, self.allocator);
+        defer call.deinit(self.allocator);
+        // Preserve reliable canonical captions, including valid optional/null
+        // fields that the intentionally conservative preview extractor omits.
+        if (call.detail != null) return presentation.fromCall(self.allocator, call);
+        if (identity) |value| {
+            if (try self.tool_views.cloneReadyCaption(self.allocator, value)) |caption| return caption;
+        }
+        return presentation.fromCall(self.allocator, call);
+    }
+
     fn toolCompleted(self: *Ui, caption: presentation.Caption, result: r.Execution) !void {
         const completion = shared.tools.Completion.fromExecution(result);
         const outcome = completion.outcome;
@@ -582,6 +626,16 @@ const Ui = struct {
         try self.records.items[index].setCommand(self.allocator, observed, outcome, completion.duration_ms);
     }
 
+    fn localCommandOutput(self: *Ui, data: []const u8, truncated: bool) !void {
+        const output = try local_command_output.format(self.allocator, data);
+        defer self.allocator.free(output.text);
+        const index = try self.add(.tool, output.text);
+        self.records.items[index].clipped = output.clipped;
+        // A runtime or Bridge cap can cut the JSON envelope itself. Preserve
+        // that outer provenance even when the formatter falls back to literal.
+        if (truncated) _ = try self.add(.notice, "Local command result was truncated; some output is unavailable.");
+    }
+
     /// Only the currently running call is replaceable; every result owns a row.
     fn pendingCommand(self: *Ui, a: std.mem.Allocator, columns: usize) ![]const u8 {
         const label = try presentation.commandText(a, self.active_tool.?.caption, .pending);
@@ -590,13 +644,12 @@ const Ui = struct {
         return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, self.clock_ms -| start, self.clock_ms);
     }
 
-    fn writePreviewLine(self: *Ui, a: std.mem.Allocator, columns: usize) ![]const u8 {
-        const detail = try std.fmt.allocPrint(a, "receiving arguments ({d} B)", .{self.write_preview.?.argument_bytes});
-        defer a.free(detail);
-        const label = try presentation.commandText(a, .{ .kind = .write, .label = detail }, .pending);
+    fn waitingCommand(a: std.mem.Allocator, caption: presentation.Caption, columns: usize) ![]const u8 {
+        const label = try presentation.commandText(a, caption, .pending);
         defer a.free(label);
-        // Receipt is not execution: no duration or fabricated +added/-deleted.
-        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, null, self.clock_ms);
+        // Generation, queueing and approval are not execution: static prefix,
+        // no timer, no observed line counts and no fabricated result.
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, null, null);
     }
 
     /// Only actionable notices/errors use a temporary hint row. Completed,
@@ -689,10 +742,7 @@ const Ui = struct {
         self.dirty = true;
         self.display.observe(item.event, self.clock_ms);
         switch (item.event) {
-            .state => |state| {
-                self.mode = state;
-                self.write_preview = null;
-            },
+            .state => |state| self.mode = state,
             .text => |v| {
                 try self.appendDraft(.assistant, v);
                 if (item.display_truncated and self.draft != null) {
@@ -708,9 +758,10 @@ const Ui = struct {
                 }
             },
             .assistant_committed => |blocks| {
-                self.write_preview = null;
                 try self.captureToolCaptions(blocks);
-                try self.replaceCommitted(blocks, item.display_truncated, item.canonical_complete);
+                // Runtime's command marker is canonical provenance, not model prose.
+                if (self.job.kind != .command)
+                    try self.replaceCommitted(blocks, item.display_truncated, item.canonical_complete);
             },
             .permission => |permission| {
                 self.closeModelPicker();
@@ -721,25 +772,28 @@ const Ui = struct {
                 self.permission_scroll = 0;
             },
             .tool_started => |tool| {
-                self.write_preview = null;
                 self.clearActiveTool();
-                self.active_tool = .{ .id = tool.id, .caption = try self.nextToolCaption(tool.name), .started_ms = tool.started_ms orelse self.clock_ms };
+                self.active_tool = .{ .id = tool.id, .caption = try self.executionCaption(tool.name, tool.display_key), .started_ms = tool.started_ms orelse self.clock_ms, .display_key = tool.display_key };
             },
             .tool_result => |tool| {
                 // FIFO also covers prepare failures/denials without a start.
-                // Raw results stay in Runtime/archives, never UI JSON.
+                // Normal model tools keep captions; explicit local commands also
+                // project bounded literal streams without changing canonical data.
                 if (self.active_tool) |active| {
                     if (active.id == tool.id) {
                         // Both events may arrive in one UI tick; use the worker's
                         // measured result, never queue-drain time as execution time.
                         try self.toolCompleted(active.caption, tool.result);
+                        if (active.display_key) |identity| self.tool_views.remove(self.allocator, identity);
                         self.clearActiveTool();
                     }
                 } else {
-                    const caption = try self.nextToolCaption(tool.name);
+                    const caption = try self.executionCaption(tool.name, tool.display_key);
                     defer caption.deinit(self.allocator);
                     try self.toolCompleted(caption, tool.result);
+                    if (tool.display_key) |identity| self.tool_views.remove(self.allocator, identity);
                 }
+                if (self.job.kind == .command) try self.localCommandOutput(tool.result.text, tool.result.truncated or item.display_truncated);
             },
             .context_snapshot => {},
             .usage => {},
@@ -760,13 +814,14 @@ const Ui = struct {
             },
             // 这些事件对 UI 没有需要展示的内容。
             .finished => {},
-            .tool_preview => |preview| {
-                if (preview.write_file) {
-                    const before = if (self.write_preview) |old| if (old.index == preview.index) old.argument_bytes else 0 else 0;
-                    self.write_preview = .{ .index = preview.index, .argument_bytes = preview.argument_bytes orelse (before +| preview.arguments.len) };
-                } else if (self.write_preview) |old| {
-                    if (old.index == preview.index) self.write_preview = null;
-                }
+            // Raw arguments only feed the shared meter above. Visible rows use
+            // bounded typed snapshots produced before Bridge text clipping.
+            .tool_preview => {},
+            .tool_view => |view| try self.tool_views.upsert(self.allocator, view),
+            .tool_views => |stream| switch (stream.phase) {
+                .begin => self.tool_views.begin(self.allocator, stream.generation),
+                .commit => self.tool_views.commit(self.allocator, stream.generation),
+                .discard => self.tool_views.discard(self.allocator, stream.generation),
             },
         }
     }
@@ -859,7 +914,9 @@ const Ui = struct {
     }
     fn closeSettingsMenu(self: *Ui) void {
         self.settings_open = false;
+        self.decision_open = false;
         self.settings_menu.clear();
+        self.parser.stop_feed = true;
         self.displayed_settings_generation = null;
     }
     fn openSettingsMenu(self: *Ui) void {
@@ -872,7 +929,20 @@ const Ui = struct {
         self.parser.stop_feed = true;
         self.notice = "Ready";
     }
+    fn backToSettings(self: *Ui) void {
+        self.decision_open = false;
+        self.settings_menu.clear();
+        self.settings_menu.selected = 1;
+        self.displayed_settings_generation = null;
+        self.frame_settings_generation = null;
+        self.parser.stop_feed = true;
+        self.notice = "Ready";
+    }
     fn settingsKey(self: *Ui, event_: input.Event) !void {
+        if (self.decision_open and (event_ == .left or event_ == .escape or event_ == .cancel)) {
+            self.backToSettings();
+            return;
+        }
         switch (event_) {
             .escape, .cancel => self.closeSettingsMenu(),
             .quit => self.requestQuit(),
@@ -895,27 +965,43 @@ const Ui = struct {
                     self.notice = "Global settings unavailable; changes disabled";
                     return;
                 }
-                const decision = self.settings_menu.selected != 0;
-                if (decision and !state.decision_configured) {
-                    self.notice = "Configure decision in ~/.thin/config.json first";
+                if (!self.decision_open and self.settings_menu.selected != 0) {
+                    self.decision_open = true;
+                    self.settings_menu.clear();
+                    self.settings_menu.selected = @intFromBool(state.decision_enabled and state.decision_jev_free);
+                    self.frame_settings_generation = null;
+                    self.notice = "Ready";
                     return;
                 }
                 self.bridge.reset() catch {
                     self.notice = "Settings require a drained session bridge";
                     return;
                 };
-                const save = self.connection.setting_fn orelse {
-                    self.notice = "Global settings unavailable; changes disabled";
-                    return;
-                };
-                save(self.connection.context, if (decision) .decision_enabled else .low_price_input, !(if (decision) state.decision_enabled else state.low_price_input_enabled)) catch {
-                    self.notice = "Could not save setting; previous value kept";
-                    return;
-                };
+                if (self.decision_open) {
+                    const save = self.connection.decision_fn orelse {
+                        self.notice = "Global settings unavailable; changes disabled";
+                        return;
+                    };
+                    save(self.connection.context, if (self.settings_menu.selected == 0) .off else .opencode_jev_free) catch {
+                        self.notice = "Could not save setting; previous value kept";
+                        return;
+                    };
+                    self.backToSettings();
+                } else {
+                    const save = self.connection.setting_fn orelse {
+                        self.notice = "Global settings unavailable; changes disabled";
+                        return;
+                    };
+                    save(self.connection.context, .low_price_input, !state.low_price_input_enabled) catch {
+                        self.notice = "Could not save setting; previous value kept";
+                        return;
+                    };
+                }
                 // Owner publishes, UI never speculates or mutates the snapshot.
                 // Decision schema rewrites may explicitly invalidate context.
                 const updated = self.connection.current();
-                if (updated.initial_context) |context| self.display.context = context;
+                self.display.context = updated.initial_context;
+                self.frame_settings_generation = null;
                 self.notice = "Ready";
             },
             else => {},
@@ -1140,7 +1226,7 @@ const Ui = struct {
         }
         if (std.mem.eql(u8, command, "/help")) {
             self.wipeEditor();
-            _ = try self.add(.notice, "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)");
+            _ = try self.add(.notice, "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)\n!command  Run a local command without main-model inference");
             return;
         }
         if (std.mem.eql(u8, command, "/settings") or std.mem.startsWith(u8, command, "/settings ") or std.mem.startsWith(u8, command, "/settings\t")) {
@@ -1220,6 +1306,15 @@ const Ui = struct {
 
         if (std.mem.trim(u8, self.editor.bytes.items, " \t\r\n").len == 0) return;
 
+        const local_command = command[0] == '!';
+        if (local_command and (!self.settingsIdle() or self.editor_pasted or self.parser.pasted or self.parser.escape_len != 0 or self.parser.utf8_len != 0)) {
+            self.notice = "Commands require an idle, non-pasted fresh Enter";
+            return;
+        }
+        if (local_command and std.mem.trim(u8, command[1..], " \t\r\n").len == 0) {
+            self.notice = "Usage: !command";
+            return;
+        }
         const state = self.connection.current();
         const runtime = state.runtime orelse {
             self.wipeEditor();
@@ -1240,7 +1335,7 @@ const Ui = struct {
         errdefer @import("input_history.zig").History.discard(self.allocator, history_entry);
 
         _ = try self.add(.user, prompt);
-        self.job = .{ .runtime = runtime, .cancel = self.cancel, .prompt = prompt };
+        self.job = .{ .runtime = runtime, .cancel = self.cancel, .prompt = prompt, .kind = if (local_command) .command else .prompt };
 
         // 在独立线程中运行任务；&self.job 在 future 结束前必须保持有效（Ui 持有）。
         const future = try Io.concurrent(self.io, task.Job.run, .{&self.job});
@@ -1249,9 +1344,10 @@ const Ui = struct {
         self.prompt = prompt;
         self.has_submitted = true;
         self.busy = true;
-        self.mode = .calling_model;
+        self.mode = if (local_command) .executing_tool else .calling_model;
         self.last_terminal = null;
-        self.notice = "Running";
+        self.notice = if (local_command) "Running command" else "Running";
+        if (local_command) self.parser.stop_feed = true;
         self.display.reset(self.clock_ms);
         self.clearActiveTool();
         self.clearToolCaptions();
@@ -1587,8 +1683,8 @@ const Ui = struct {
         self.discardReasoning();
         self.draft = null;
         self.clearActiveTool();
-        self.write_preview = null;
         self.clearToolCaptions();
+        self.tool_views.clear(self.allocator);
         self.mode = null;
         self.dirty = true;
     }
@@ -1668,6 +1764,10 @@ const Ui = struct {
 
     fn resize(self: *Ui, dimensions: terminal_module.Size) void {
         if (dimensions.columns == self.size.columns and dimensions.rows == self.size.rows) return;
+        // A full ACK proves ownership before resize, not after terminal reflow
+        // or cursor clamping (even height-only). Never erase guessed old rows.
+        // Conservative recovery can retain old visual previews in scrollback;
+        // those are not canonical transcript or completed execution records.
         self.size = dimensions;
         if ((self.records.items.len != 0 and (self.settings_open or self.provider_open or self.model_picker != null or self.commandMenuVisible())) or
             (self.menu_history != null and self.menu_history.?.borrowed.len != 0) or
@@ -1964,14 +2064,29 @@ const Ui = struct {
             transcript_rows += borrowed.len;
             borrowed = &.{};
         }
-        if (!preview and self.active_tool != null) {
-            if (previous_kind) |prior| if (prior != .tool) try lines.append(a, "");
-            try lines.append(a, try self.pendingCommand(a, @max(1, cols)));
-        } else if (!preview and self.write_preview != null) {
-            if (previous_kind) |prior| if (prior != .tool) try lines.append(a, "");
-            try lines.append(a, try self.writePreviewLine(a, @max(1, cols)));
+        if (!preview) {
+            const detached_active = if (self.active_tool) |active| if (active.display_key) |identity| self.tool_views.get(identity) == null else true else false;
+            if (self.tool_views.entries.items.len != 0 or detached_active) {
+                if (previous_kind) |prior| if (prior != .tool) try lines.append(a, "");
+                // Bound the mutable window, keeping the executing/next-ready
+                // call visible instead of burying it above 64 queued rows.
+                const view_limit = @max(1, self.size.rows -| 5);
+                var view_start = if (self.tool_views.ready_count != 0) 0 else self.tool_views.entries.items.len -| view_limit;
+                if (self.active_tool) |active| if (active.display_key) |identity| {
+                    for (self.tool_views.entries.items, 0..) |entry, i| if (identity.eql(entry.key)) {
+                        view_start = i;
+                        break;
+                    };
+                };
+                const view_end = @min(self.tool_views.entries.items.len, view_start + view_limit);
+                for (self.tool_views.entries.items[view_start..view_end]) |entry| {
+                    const running = if (self.active_tool) |active| if (active.display_key) |identity| identity.eql(entry.key) else false else false;
+                    try lines.append(a, if (running) try self.pendingCommand(a, @max(1, cols)) else try waitingCommand(a, entry.caption, @max(1, cols)));
+                }
+                if (detached_active) try lines.append(a, try self.pendingCommand(a, @max(1, cols)));
+            }
         }
-        const thinking = if (self.show_reasoning and !preview and self.draft == null) self.reasoning else null;
+        const thinking = if (self.show_reasoning and !preview and self.draft == null and self.tool_views.entries.items.len == 0 and self.active_tool == null) self.reasoning else null;
         var thinking_lines: []const []const u8 = &.{};
         if (thinking) |index| {
             const record = &self.records.items[index];
@@ -2008,10 +2123,11 @@ const Ui = struct {
         if (self.model_picker) |*picker| try picker.captureChoice(a, picker_rows.selected_choice);
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, candidate_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
-        const settings_rows = if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, .{
+        const settings_rows = if (self.settings_open and self.decision_open) try decision_picker_module.rows(a, self.settings_menu, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, .{
             .low_price_input_enabled = state.low_price_input_enabled,
             .decision_enabled = state.decision_enabled,
             .decision_configured = state.decision_configured,
+            .decision_jev_free = state.decision_jev_free,
             .global_settings_available = state.global_settings_available,
         }, cols, candidate_limit) else settings_menu_module.Rows{ .lines = &.{} };
         self.frame_settings_generation = null;
@@ -2235,7 +2351,7 @@ const Ui = struct {
                 const tail = visible[cursor..];
                 const suffix = try editorDisplay(a, tail[0..(std.mem.findScalar(u8, tail, '\n') orelse tail.len)]);
                 const suffix_end = fittingBytes(suffix, cols -| (decoration_width + width));
-                // Only model letters carry SGR; marker/editor are default colors.
+                // Decoration owns bounded SGR; the marker reset keeps editor text default.
                 const input_line = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ decoration.styled, prefix[start..], suffix[0..suffix_end] });
                 try putStyled(writer, rows, input_line);
 
@@ -2396,7 +2512,139 @@ const FixtureConnection = struct {
 
 /// 测试用 Ui 构造器：使用 testing allocator，运行时与终端字段为 undefined（测试中不会访问）。
 fn fixtureUi(bridge: *bridge_module.Bridge, cancel: *p.Cancellation) Ui {
-    return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = undefined, .editor = .{ .allocator = std.testing.allocator }, .job = undefined, .size = .{ .columns = 80, .rows = 24 } };
+    return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = undefined, .editor = .{ .allocator = std.testing.allocator }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" }, .size = .{ .columns = 80, .rows = 24 } };
+}
+
+test "local command bridge clipping preserves outer truncation provenance" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.job.kind = .command;
+    const stdout = try a.alloc(u8, bridge_module.item_budget + 4096);
+    defer a.free(stdout);
+    @memset(stdout, 'x');
+    const result = try std.fmt.allocPrint(a, "{{\"stdout\":\"{s}\",\"stderr\":\"UNAVAILABLE_BRIDGE_TAIL\",\"exit_code\":7}}", .{stdout});
+    defer a.free(result);
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 1, .name = "bash", .result = .{ .text = result, .is_error = true, .truncated = false } } }, &cancel);
+    var item = bridge.pop() orelse return error.MissingToolUiEvent;
+    defer item.deinit();
+    try std.testing.expect(item.display_truncated);
+    try std.testing.expect(!item.event.tool_result.result.truncated);
+    try std.testing.expect(item.event.tool_result.result.text.len < result.len);
+    try ui.event(item);
+    try std.testing.expectEqual(@as(usize, 3), ui.records.items.len);
+    try std.testing.expect(ui.records.items[0].command_row);
+    try std.testing.expectEqualStrings(item.event.tool_result.result.text, ui.records.items[1].body.items);
+    try std.testing.expect(!ui.records.items[1].clipped); // Below the formatter's independent cap.
+    try std.testing.expectEqual(Kind.notice, ui.records.items[2].kind);
+    try std.testing.expect(std.mem.indexOf(u8, ui.records.items[2].body.items, "result was truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ui.records.items[1].body.items, "UNAVAILABLE_BRIDGE_TAIL") == null);
+    try std.testing.expect(std.mem.endsWith(u8, result, "\"exit_code\":7}"));
+    try ui.draw();
+    try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Local command result was truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ui.frame, "exit: 7") == null);
+}
+
+test "local command outer truncation remains visible with incomplete JSON" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.localCommandOutput("{\"stdout\":\"partial", true);
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expectEqualStrings("{\"stdout\":\"partial", ui.records.items[0].body.items);
+    try std.testing.expectEqual(Kind.notice, ui.records.items[1].kind);
+    try std.testing.expect(std.mem.indexOf(u8, ui.records.items[1].body.items, "result was truncated") != null);
+    try std.testing.expect(ui.future == null);
+}
+
+test "local command live streams are visible literal and normal tools stay captions" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.job.kind = .command;
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .assistant_committed = &.{
+        .{ .text = "Program-generated bash call for the user's explicit !command; not LLM reasoning or a model response." },
+        .{ .tool_call = .{ .id = "local_command_1", .name = "bash", .arguments = "{\"command\":\"exit 7\"}" } },
+    } }, &cancel);
+    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 1, .name = "bash", .result = .{ .text = "{\"stdout\":\"**literal**\\n\\u001b[2J\",\"stderr\":\"visible-error\",\"exit_code\":7}", .is_error = true } } }, &cancel);
+    while (bridge.pop()) |value| {
+        var item = value;
+        defer item.deinit();
+        try ui.event(item);
+    }
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expect(ui.records.items[0].command_row);
+    try std.testing.expect(!ui.records.items[1].command_row and ui.records.items[1].kind == .tool);
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    for ([_][]const u8{ "stdout:", "stderr:", "**literal**", "visible-error", "exit: 7" }) |label| try std.testing.expectEqual(@as(usize, 1), screen.count(label));
+    try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Program-generated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ui.frame, "\x1b[2J") == null);
+    try ui.records.items[1].layout(std.testing.allocator, 5);
+    for (ui.records.items[1].lines) |line| {
+        var offset: usize = 0;
+        var columns: usize = 0;
+        while (offset < line.len) {
+            const cluster = text.nextStyledCluster(line, offset, columns);
+            columns += cluster.width;
+            offset = cluster.end;
+        }
+        try std.testing.expect(columns <= 5);
+    }
+    ui.job.kind = .prompt;
+    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 2, .name = "bash", .result = .{ .text = "normal-hidden-output" } } }, &cancel);
+    while (bridge.pop()) |value| {
+        var item = value;
+        defer item.deinit();
+        try ui.event(item);
+    }
+    try std.testing.expectEqual(@as(usize, 3), ui.records.items.len);
+    try std.testing.expect(ui.records.items[2].command_row);
+    try std.testing.expect(std.mem.indexOf(u8, ui.records.items[2].body.items, "normal-hidden-output") == null);
+}
+
+test "local command restore is adjacent display only with paired result" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const messages = [_]p.Message{
+        .{ .role = .user, .blocks = &.{.{ .text = "  !exit 7" }} },
+        .{ .role = .assistant, .blocks = &.{
+            .{ .text = "Program-generated bash call for the user's explicit !command; not LLM reasoning or a model response." },
+            .{ .tool_call = .{ .id = "local_command_1", .name = "bash", .arguments = "{\"command\":\"must-not-execute\"}" } },
+        } },
+        .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "local_command_1", .text = "{\"stdout\":\"restored-stream\",\"stderr\":\"restored-error\",\"exit_code\":7}", .is_error = true } }} },
+    };
+    try std.testing.expect(localHistoryCall(&messages, 1) != null);
+    try ui.restoreHistory(&messages);
+    try std.testing.expect(bridge.pop() == null);
+    try std.testing.expect(!ui.busy);
+    try std.testing.expectEqual(@as(usize, 4), ui.records.items.len);
+    try std.testing.expect(ui.records.items[2].command_row);
+    try std.testing.expect(!ui.records.items[3].command_row);
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    for ([_][]const u8{ "stdout:", "stderr:", "restored-stream", "restored-error", "exit: 7" }) |label| try std.testing.expectEqual(@as(usize, 1), screen.count(label));
+    try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Program-generated") == null);
+    var ordinary = messages;
+    ordinary[0] = .{ .role = .user, .blocks = &.{.{ .text = "model command" }} };
+    try std.testing.expect(localHistoryCall(&ordinary, 1) == null);
+    ordinary = messages;
+    ordinary[2] = .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "other", .text = "hidden" } }} };
+    try std.testing.expect(localHistoryCall(&ordinary, 1) == null);
 }
 
 test "command elapsed time uses source timestamps freezes results and resets per call" {
@@ -2840,7 +3088,185 @@ test "rolling thinking keeps latest bounded UTF8 suffix and can be hidden" {
     ui.finishFrame();
 }
 
-test "write arguments show an early transient row and only results carry committed counts" {
+fn emitToolUi(ui: *Ui, event_: r.Event) !void {
+    const host = ui.bridge.host();
+    try host.emit_fn(host.context, event_, ui.cancel);
+    var item = ui.bridge.pop() orelse return error.MissingToolUiEvent;
+    defer item.deinit();
+    try ui.event(item);
+}
+
+fn replayToolFrame(ui: *Ui, screen: *@import("../tests/regular_screen.zig").Screen) !void {
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+}
+
+test "typed tool row updates in place before execution and uses ready metadata after Bridge clipping" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const screen = try a.create(@import("../tests/regular_screen.zig").Screen);
+    defer a.destroy(screen);
+    screen.* = .{};
+    ui.mode = .calling_model;
+    ui.clock_ms = 5000;
+    try ui.appendDraft(.reasoning, "transient-reasoning");
+    const key: p.ToolDisplayKey = .{ .generation = 9, .index = 3 };
+    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 9, .phase = .begin } });
+    try emitToolUi(&ui, .{ .tool_view = .{ .key = key, .name = "write_file" } });
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ "w" ++ theme.muted ++ " write_file") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "transient-reasoning") == null);
+    try std.testing.expect(ui.active_tool == null);
+    const in_flight = try a.dupe(u8, ui.frame);
+    defer a.free(in_flight);
+    try emitToolUi(&ui, .{ .tool_view = .{ .key = key, .name = "write_file", .fields = .{ .path = .{ .text = "src/preview.zig" } } } });
+    // Updating captions cannot mutate/release a partially written frame.
+    try std.testing.expectEqualStrings(in_flight, ui.frame);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    for (0..3) |_| {
+        try replayToolFrame(&ui, screen);
+        try std.testing.expectEqual(@as(usize, 1), screen.count("src/preview.zig"));
+        try std.testing.expectEqual(@as(usize, 0), screen.count("write_file"));
+        try std.testing.expect(ui.active_tool == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len); // reasoning only
+    const filler = try a.alloc(u8, 70 * 1024);
+    defer a.free(filler);
+    @memset(filler, 'x');
+    const arguments = try std.fmt.allocPrint(a, "{{\"content\":\"PRIVATE_PAYLOAD{s}\",\"path\":\"src/preview.zig\"}}", .{filler});
+    defer a.free(arguments);
+    const blocks = [_]p.Block{.{ .tool_call = .{ .id = "canonical-write", .name = "write_file", .arguments = arguments } }};
+    try emitToolUi(&ui, .{ .assistant_committed = &blocks });
+    // The canonical display copy is clipped before path. A typed ready snapshot
+    // must remain available without repairing that partial JSON.
+    try emitToolUi(&ui, .{ .tool_view = .{ .key = key, .name = "write_file", .fields = .{ .path = .{ .text = "src/preview.zig" } }, .ready = true } });
+    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 9, .phase = .commit } });
+    try replayToolFrame(&ui, screen);
+    try std.testing.expect(ui.active_tool == null and ui.records.items.len == 0);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("src/preview.zig"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("PRIVATE_PAYLOAD"));
+    try emitToolUi(&ui, .{ .tool_started = .{ .id = 77, .name = "write_file", .started_ms = 5000, .display_key = key } });
+    ui.clock_ms = 5400;
+    try std.testing.expectEqualStrings("src/preview.zig", ui.active_tool.?.caption.label);
+    try std.testing.expectEqual(@as(u64, 5000), ui.active_tool.?.started_ms);
+    try replayToolFrame(&ui, screen);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("src/preview.zig"));
+    try emitToolUi(&ui, .{ .tool_result = .{ .id = 77, .name = "write_file", .display_key = key, .result = .{ .text = "not display JSON", .duration_ms = 41, .file_stats = .{ .changes = .{ .added = 3, .removed = 2 } } } } });
+    try replayToolFrame(&ui, screen);
+    try std.testing.expect(ui.active_tool == null and ui.tool_views.entries.items.len == 0);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqual(@as(?u64, 41), ui.records.items[0].duration_ms);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("src/preview.zig"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("+3"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("file unavailable"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("receiving arguments"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("Preparing write"));
+}
+
+test "same-name typed rows keep canonical order and denied calls do not consume another view" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const screen = try a.create(@import("../tests/regular_screen.zig").Screen);
+    defer a.destroy(screen);
+    screen.* = .{};
+    ui.mode = .calling_model;
+    const first: p.ToolDisplayKey = .{ .generation = 21, .index = 7 };
+    const second: p.ToolDisplayKey = .{ .generation = 21, .index = 2 };
+    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 21, .phase = .begin } });
+    // Arrival/index order is not the final canonical execution order.
+    try emitToolUi(&ui, .{ .tool_view = .{ .key = second, .name = "bash", .fields = .{ .command = .{ .text = "echo SECOND" } } } });
+    try emitToolUi(&ui, .{ .tool_view = .{ .key = first, .name = "bash", .fields = .{ .command = .{ .text = "echo FIRST" } } } });
+    const blocks = [_]p.Block{
+        .{ .tool_call = .{ .id = "first", .name = "bash", .arguments = "{\"command\":\"echo FIRST\"}" } },
+        .{ .tool_call = .{ .id = "second", .name = "bash", .arguments = "{\"command\":\"echo SECOND\"}" } },
+    };
+    try emitToolUi(&ui, .{ .assistant_committed = &blocks });
+    try emitToolUi(&ui, .{ .tool_view = .{ .key = first, .name = "bash", .fields = .{ .command = .{ .text = "echo FIRST" } }, .ready = true } });
+    try emitToolUi(&ui, .{ .tool_view = .{ .key = second, .name = "bash", .fields = .{ .command = .{ .text = "echo SECOND" } }, .ready = true } });
+    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 21, .phase = .commit } });
+    try std.testing.expect(ui.tool_views.entries.items[0].key.eql(first));
+    try replayToolFrame(&ui, screen);
+    try std.testing.expect(ui.active_tool == null);
+    try emitToolUi(&ui, .{ .tool_result = .{ .id = 80, .name = "bash", .display_key = first, .result = .{ .text = "Denied, not executed", .is_error = true } } });
+    try std.testing.expect(ui.active_tool == null);
+    try std.testing.expectEqual(@as(usize, 1), ui.tool_views.entries.items.len);
+    try emitToolUi(&ui, .{ .tool_started = .{ .id = 81, .name = "bash", .display_key = second } });
+    try std.testing.expectEqualStrings("echo SECOND", ui.active_tool.?.caption.label);
+    try replayToolFrame(&ui, screen);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("echo FIRST"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("echo SECOND"));
+    try emitToolUi(&ui, .{ .tool_result = .{ .id = 81, .name = "bash", .display_key = second, .result = .{ .text = "done", .duration_ms = 7 } } });
+    try replayToolFrame(&ui, screen);
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expect(ui.tool_views.entries.items.len == 0);
+    try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "echo FIRST") != null);
+    try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "echo SECOND") != null);
+    const next: p.ToolDisplayKey = .{ .generation = 22, .index = 7 };
+    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 22, .phase = .begin } });
+    try emitToolUi(&ui, .{ .tool_view = .{ .key = next, .name = "read_file", .fields = .{ .path = .{ .text = "canceled-preview.txt" } } } });
+    try replayToolFrame(&ui, screen);
+    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 21, .phase = .discard } });
+    try std.testing.expectEqual(@as(usize, 1), ui.tool_views.entries.items.len);
+    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 22, .phase = .discard } });
+    try replayToolFrame(&ui, screen);
+    try std.testing.expect(ui.tool_views.entries.items.len == 0 and ui.records.items.len == 2);
+    try std.testing.expectEqual(@as(usize, 0), screen.count("canceled-preview.txt"));
+}
+
+test "canonical caption keeps valid detail omitted by conservative preview extraction" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const identity: p.ToolDisplayKey = .{ .generation = 30, .index = 0 };
+    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 30, .phase = .begin } });
+    try emitToolUi(&ui, .{ .assistant_committed = &.{.{ .tool_call = .{ .id = "memory-list", .name = "memory", .arguments = "{\"action\":\"list\",\"topic\":null}" } }} });
+    try emitToolUi(&ui, .{ .tool_view = .{ .key = identity, .name = "memory", .ready = true } });
+    try emitToolUi(&ui, .{ .tool_started = .{ .id = 1, .name = "memory", .display_key = identity } });
+    try std.testing.expectEqualStrings("list core/index", ui.active_tool.?.caption.label);
+    try std.testing.expectEqual(ui.tool_calls.items.items.len, ui.tool_calls.cursor);
+}
+
+test "bounded tool window keeps the first actual execution visible in a full batch" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.size.rows = 10;
+    ui.mode = .calling_model;
+    const screen = try a.create(@import("../tests/regular_screen.zig").Screen);
+    defer a.destroy(screen);
+    screen.* = .{};
+    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 31, .phase = .begin } });
+    for (0..64) |i| try emitToolUi(&ui, .{ .tool_view = .{
+        .key = .{ .generation = 31, .index = i },
+        .name = "bash",
+        .fields = .{ .command = .{ .text = if (i == 0) "FIRST_ACTIVE_TOOL" else "queued" } },
+        .ready = true,
+    } });
+    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 31, .phase = .commit } });
+    try emitToolUi(&ui, .{ .tool_started = .{ .id = 1, .name = "bash", .display_key = .{ .generation = 31, .index = 0 } } });
+    try replayToolFrame(&ui, screen);
+    try std.testing.expect(screen.visible("FIRST_ACTIVE_TOOL"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("FIRST_ACTIVE_TOOL"));
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+}
+
+test "raw write deltas alone never display JSON or invent execution" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -2852,7 +3278,7 @@ test "write arguments show an early transient row and only results carry committ
         .{ .tool_preview = .{ .index = 2, .arguments = "", .write_file = true, .argument_bytes = 0 } },
         .{ .tool_preview = .{ .index = 2, .arguments = "RAW_WRITE_BYTES", .write_file = true, .argument_bytes = 4096 } },
     };
-    for (previews, 0..) |event_, index| {
+    for (previews) |event_| {
         try host.emit_fn(host.context, event_, &cancel);
         var item = bridge.pop().?;
         defer item.deinit();
@@ -2860,8 +3286,9 @@ test "write arguments show an early transient row and only results carry committ
         try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
         try std.testing.expect(ui.active_tool == null);
         try ui.draw();
-        try std.testing.expect(std.mem.find(u8, ui.frame, "receiving arguments") != null);
-        try std.testing.expect(std.mem.find(u8, ui.frame, if (index == 0) "0 B" else "4096 B") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "Preparing write") == null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "receiving arguments") == null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "received") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "RAW_WRITE_BYTES") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "+3") == null);
         ui.finishFrame();
@@ -2876,8 +3303,23 @@ test "write arguments show an early transient row and only results carry committ
         var item = bridge.pop().?;
         defer item.deinit();
         try ui.event(item);
-        try std.testing.expect(ui.write_preview == null);
         if (index < 2) try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+        try ui.draw();
+        try std.testing.expect(std.mem.find(u8, ui.frame, "Preparing write") == null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "receiving arguments") == null);
+        if (index == 0) {
+            try std.testing.expect(ui.active_tool == null);
+            try std.testing.expect(std.mem.find(u8, ui.frame, "preview.txt") == null);
+        } else if (index == 1) {
+            try std.testing.expect(ui.active_tool != null);
+            try std.testing.expect(std.mem.find(u8, ui.frame, theme.command_pulse[0] ++ "⠋" ++ theme.muted ++ " preview.txt") != null);
+            try std.testing.expect(std.mem.find(u8, ui.frame, "+3") == null);
+        } else {
+            try std.testing.expect(ui.active_tool == null);
+            try std.testing.expect(std.mem.find(u8, ui.frame, "preview.txt") != null);
+            try std.testing.expect(std.mem.find(u8, ui.frame, "+3") != null);
+        }
+        ui.finishFrame();
     }
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "+3") != null);
@@ -3765,7 +4207,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     for ([_]u64{ 1100, 3100, 9100 }) |now| {
         ui.clock_ms = now;
         try ui.draw();
-        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}) {s} input-default", .{ theme.reset, activity.spinner(now) });
+        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}) {s}{s}{s} input-default", .{ theme.reset, theme.command_pulse[shared.activity.commandStep(now)], activity.spinner(now), theme.reset });
         defer std.testing.allocator.free(marker);
         try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, theme.effortColor(.high)) == null);
@@ -3798,7 +4240,7 @@ test "composer frame keeps context occupancy colors static while model and spinn
             ui.clock_ms = 80;
             _ = try ui.editor.insert("default-input");
             try ui.draw();
-            const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}.0%{s}) {s} default-input", .{ if (tokens == 0) theme.success else if (tokens == 25) "\x1b[38;5;220m" else theme.failure, tokens, theme.reset, if (busy) activity.spinner(80) else ">" });
+            const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}.0%{s}) {s}{s}{s} default-input", .{ if (tokens == 0) theme.success else if (tokens == 25) "\x1b[38;5;220m" else theme.failure, tokens, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
             defer std.testing.allocator.free(expected);
             try std.testing.expect(std.mem.find(u8, ui.frame, expected) != null);
             ui.finishFrame();
@@ -3902,7 +4344,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     _ = try ui.editor.insert("typed-default-color");
     try ui.draw();
     for ([_][]const u8{ "TPS:", "TTFT:", "tokens in:", "summary in:", "cost:", "loading", "Completed", "calling_model" }) |removed| try std.testing.expect(std.mem.find(u8, ui.frame, removed) == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ ") " ++ "⠧ typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ ") " ++ theme.command_pulse[5] ++ "⠧" ++ theme.reset ++ " typed-default-color") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.model_flow[ui.model_flow.step()]) != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
@@ -3913,7 +4355,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     ui.finishFrame();
     ui.clock_ms = 680;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "⠇ typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.command_pulse[5] ++ "⠇" ++ theme.reset ++ " typed-default-color") != null);
     ui.finishFrame();
     ui.mode = null;
     ui.draft = null;
@@ -4624,6 +5066,15 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
             return self.state;
         }
         fn configure(_: *anyopaque, _: []const u8) !void {}
+        fn choose(raw: *anyopaque, choice: Connection.DecisionChoice) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.SaveFailed;
+            self.state.decision_enabled = choice != .off;
+            self.state.decision_jev_free = choice == .opencode_jev_free;
+            self.state.decision_configured = choice != .off;
+            self.state.initial_context = .{ .tokens = 42, .limit = 100 };
+        }
         fn save(raw: *anyopaque, setting: Connection.Setting, enabled: bool) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
@@ -4640,7 +5091,7 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    ui.connection = .{ .context = &fixture, .current_fn = Fixture.current, .configure_fn = Fixture.configure, .setting_fn = Fixture.save };
+    ui.connection = .{ .context = &fixture, .current_fn = Fixture.current, .configure_fn = Fixture.configure, .setting_fn = Fixture.save, .decision_fn = Fixture.choose };
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("/settings\r\r", sink);
     try std.testing.expect(ui.settings_open);
@@ -4663,19 +5114,43 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     try ui.draw();
     ui.finishFrame();
     try ui.parser.feed("\r", sink);
-    try std.testing.expect(fixture.state.decision_enabled);
+    try std.testing.expect(ui.decision_open and !fixture.state.decision_enabled);
+    const before_choice = fixture.calls;
+    try ui.parser.feed("\x1b[B\r", sink); // Stale navigation cannot confirm.
+    try std.testing.expectEqual(before_choice, fixture.calls);
+    try ui.draw();
+    ui.frame_offset = 1;
+    try ui.parser.feed("\r", sink); // Partial child output cannot confirm.
+    try std.testing.expectEqual(before_choice, fixture.calls);
+    ui.finishFrame();
+    fixture.state.decision_configured = false; // Preset may be saved with no declaration/key.
+    try ui.parser.feed("\r\r\x1b[A", sink);
+    try std.testing.expect(fixture.state.decision_enabled and fixture.state.decision_jev_free);
+    try std.testing.expect(!ui.decision_open and ui.settings_menu.selected == 1);
+    try std.testing.expectEqual(@as(u32, 42), ui.display.context.?.tokens);
     fixture.fail = true;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink); // Open selected Jev, not toggle.
+    try std.testing.expect(ui.decision_open);
+    try ui.parser.feed("\x1b[A", sink); // Off.
     try ui.draw();
     ui.finishFrame();
     try ui.parser.feed("\r", sink);
     try std.testing.expect(fixture.state.decision_enabled);
     try std.testing.expectEqualStrings("Could not save setting; previous value kept", ui.notice);
-    fixture.state.decision_configured = false;
+    const calls = fixture.calls;
+    try ui.parser.feed("\r", sink); // Failed save revoked authority.
+    try std.testing.expectEqual(calls, fixture.calls);
+    try ui.parser.feed("\x1b[D\r", sink); // Left discards read tail, retains Decision.
+    try std.testing.expect(!ui.decision_open and ui.settings_menu.selected == 1);
+    try std.testing.expectEqual(calls, fixture.calls);
     try ui.draw();
     ui.finishFrame();
-    const calls = fixture.calls;
     try ui.parser.feed("\r", sink);
-    try std.testing.expectEqualStrings("Configure decision in ~/.thin/config.json first", ui.notice);
+    try std.testing.expect(ui.decision_open);
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(!ui.decision_open and ui.settings_menu.selected == 1);
     try std.testing.expectEqual(calls, fixture.calls);
     fixture.state.global_settings_available = false;
     try ui.parser.feed("\x1b[A", sink);
@@ -4708,6 +5183,80 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     try ui.parser.feed("\x1b[D", sink);
     try std.testing.expect(!ui.settings_open);
     try std.testing.expectEqual(command_menu_module.Command.settings, ui.command_menu.choice(ui.command_matches).?);
+}
+
+test "decision child requires full fresh unclipped ACK and never saves pasted batch tails" {
+    try text.initLocale();
+    const Fixture = struct {
+        state: Connection.State = .{ .runtime = null, .model = "", .base_url = "" },
+        calls: usize = 0,
+        fn current(raw: *anyopaque) Connection.State {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).state;
+        }
+        fn configure(_: *anyopaque, _: []const u8) !void {}
+        fn choose(raw: *anyopaque, choice: Connection.DecisionChoice) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.state.decision_enabled = choice != .off;
+            self.state.decision_jev_free = choice == .opencode_jev_free;
+        }
+    };
+    var fixture: Fixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = .{ .context = &fixture, .current_fn = Fixture.current, .configure_fn = Fixture.configure, .decision_fn = Fixture.choose };
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    ui.openSettingsMenu();
+    try ui.parser.feed("\x1b[B", sink);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r\r", sink);
+    try std.testing.expect(ui.decision_open);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try ui.parser.feed("\x1b[B", sink);
+    try ui.draw();
+    try ui.parser.feed("\r", sink);
+    ui.frame_offset = 1;
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    ui.finishFrame();
+    const size = ui.size;
+    ui.resize(.{ .columns = 8, .rows = size.rows });
+    ui.resize(size);
+    try ui.parser.feed("\r", sink); // Resize ABA.
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    ui.resize(.{ .columns = 17, .rows = size.rows });
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink); // Jev identifier clipped by one cell.
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    ui.resize(size);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[200~\r\x1b[D\x1b[201~\r", sink);
+    try std.testing.expect(ui.decision_open);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try ui.parser.feed("\x1b[D\r", sink);
+    try std.testing.expect(!ui.decision_open and ui.settings_menu.selected == 1);
+    try ui.parser.feed("\r", sink); // Old child ACK cannot open parent.
+    try std.testing.expect(!ui.decision_open);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(ui.decision_open);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r\r", sink); // Off works without a declaration.
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expect(!fixture.state.decision_enabled and !ui.decision_open);
+    try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
+    try std.testing.expect(ui.displayed_settings_generation == null and ui.frame_settings_generation == null);
 }
 
 test "menus stay above composer share colors and Left returns to acknowledged parent" {
@@ -5940,6 +6489,60 @@ test "compact slash menu requires acknowledged choice then joins a summary-only 
     };
     try std.testing.expectEqual(p.Role.context, runtime.messages()[0].role);
     try std.testing.expect(!ui.last_terminal.?.context_snapshot.?.known);
+}
+
+test "bang commands use local job with zero main calls and reject unsafe submissions" {
+    var config = core_config.Config{ .provider = .{ .base_url = "http://localhost/unused" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = AuthFixture{ .configured = true };
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fixture, .call_fn = AuthFixture.call }, .{ .context = &fixture, .schemas = &.{}, .prepare_fn = AuthFixture.prepare, .execute_fn = AuthFixture.execute }, bridge.host(), "", false);
+    defer runtime.deinit();
+    fixture.runtime = &runtime;
+    var ui = fixtureUi(&bridge, &cancel);
+    ui.connection = fixture.connection();
+    defer ui.deinit();
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    for (0..6) |case| {
+        ui.wipeEditor();
+        _ = try ui.editor.insert(if (case == 0) " ! \t" else "!echo fixture");
+        ui.busy = case == 1;
+        ui.poisoned = case == 2;
+        ui.editor_pasted = case == 3;
+        ui.parser.escape_len = if (case == 4) 2 else 0;
+        ui.want_exit = case == 5;
+        try ui.submit();
+        try std.testing.expect(ui.future == null and ui.prompt == null);
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+        ui.busy = false;
+        ui.poisoned = false;
+        ui.want_exit = false;
+        ui.parser.escape_len = 0;
+    }
+    ui.wipeEditor();
+    try ui.parser.feed("\x1b[200~!echo pasted\x1b[201~\r", sink);
+    try std.testing.expect(ui.future == null);
+    try ui.parser.feed("\r", sink); // Sticky paste remains untrusted.
+    try std.testing.expect(ui.future == null);
+    ui.wipeEditor();
+    try ui.parser.feed("  !echo fixture  ", sink);
+    try ui.parser.feed("\r!echo batch-tail\r", sink);
+    try std.testing.expect(ui.busy and ui.future != null);
+    try std.testing.expectEqual(.command, ui.job.kind);
+    try std.testing.expectEqualStrings("  !echo fixture  ", ui.job.prompt);
+    try std.testing.expectEqual(.executing_tool, ui.mode);
+    try std.testing.expectEqualStrings("Running command", ui.notice);
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+    try ui.complete();
+    try std.testing.expect(ui.future == null and !ui.busy);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    fixture.runtime = null;
+    fixture.configured = false;
+    try ui.parser.feed("!echo unavailable\r", sink);
+    try std.testing.expect(ui.future == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
 }
 
 test "compact command rejects busy pasted poisoned and unconfigured states without a job" {

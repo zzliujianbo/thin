@@ -189,8 +189,7 @@ pub const App = struct {
     }
 
     pub const SettingsReplacement = struct {
-        low_price_input: bool,
-        decision_enabled: bool,
+        config: ?std.json.Parsed(cfg.Config) = null,
         replace_decision: bool,
         changes_tools: bool,
         decision: ?*DecisionClient = null,
@@ -199,24 +198,44 @@ pub const App = struct {
         pub fn deinit(self: *SettingsReplacement) void {
             if (self.decision) |client| client.deinit();
             if (self.prefix) |*prefix| prefix.deinit();
+            if (self.config) |*config| cfg.release(config);
         }
     };
 
     /// Prepare all fallible work before writing global settings. No requests,
     /// primary reconnect or canonical mutations occur here.
     pub fn prepareSettings(self: *App, declaration: cfg.Config, environ: *const std.process.Environ.Map) !SettingsReplacement {
+        return self.prepareSettingsRefresh(declaration, environ, false);
+    }
+
+    pub fn prepareSettingsRefresh(self: *App, declaration: cfg.Config, environ: *const std.process.Environ.Map, force_decision_refresh: bool) !SettingsReplacement {
         if (self.runtime.busy.load(.acquire)) return error.Busy;
         if (self.runtime.poisoned) return error.UnsafeToContinue;
-        const low_price_input = declaration.limits.low_price_input;
+        if (self.decision_client) |client| {
+            const service = client.service();
+            if (service.check_fn) |check| try check(service.context);
+        }
         const decision_enabled = declaration.decisionActive();
-        if (decision_enabled and self.config.value.decision == null) return error.DecisionNotConfigured;
+        // Low-price-only edits preserve the auxiliary lifecycle. Explicit
+        // reselect forces a fresh independently owned global credential source.
+        var before: std.Io.Writer.Allocating = .init(self.allocator);
+        defer {
+            std.crypto.secureZero(u8, before.written());
+            before.deinit();
+        }
+        var after: std.Io.Writer.Allocating = .init(self.allocator);
+        defer {
+            std.crypto.secureZero(u8, after.written());
+            after.deinit();
+        }
+        try std.json.Stringify.value(self.config.value.decision, .{}, &before.writer);
+        try std.json.Stringify.value(declaration.decision, .{}, &after.writer);
         var result: SettingsReplacement = .{
-            .low_price_input = low_price_input,
-            .decision_enabled = decision_enabled,
-            .replace_decision = self.config.value.decisionActive() != decision_enabled,
+            .replace_decision = force_decision_refresh or !std.mem.eql(u8, before.written(), after.written()),
             .changes_tools = self.config.value.decisionActive() != decision_enabled,
         };
         errdefer result.deinit();
+        result.config = try @import("decision_selection.zig").activeClone(self.allocator, self.config.value, declaration);
         if (result.replace_decision) {
             // Login may have replaced the global declaration since this chat's
             // frozen config was installed. Own the latest auxiliary credentials
@@ -233,8 +252,14 @@ pub const App = struct {
     /// Called only after settings save. Owned, idle publication cannot fail.
     pub fn installSettings(self: *App, replacement: *SettingsReplacement) void {
         std.debug.assert(!self.runtime.busy.load(.acquire));
-        self.config.value.limits.low_price_input = replacement.low_price_input;
-        if (self.config.value.decision) |*declaration| declaration.enabled = replacement.decision_enabled;
+        var previous_config = self.config;
+        self.config = replacement.config.?;
+        replacement.config = null;
+        // Keep the used pool/authorization/proxy storage in its original slot.
+        self.client.config = &self.config.value;
+        self.runtime.config = &self.config.value;
+        self.executor.config = &self.config.value;
+        defer cfg.release(&previous_config);
         if (replacement.prefix) |*prefix| {
             self.runtime.installToolPrefix(prefix);
             replacement.prefix = null;

@@ -7,20 +7,22 @@ pub const Snapshot = struct {
     low_price_input_enabled: bool = true,
     decision_enabled: bool = false,
     decision_configured: bool = false,
+    decision_jev_free: bool = false,
     global_settings_available: bool = true,
 };
 pub fn label(selected: usize) []const u8 {
     return if (selected == 0) "Low-price input" else "Decision model";
 }
 pub fn value(state: Snapshot, selected: usize) []const u8 {
-    if (selected != 0 and !state.decision_configured) return "not configured";
-    return if (if (selected == 0) state.low_price_input_enabled else state.decision_enabled) "on" else "off";
+    if (selected == 0) return if (state.low_price_input_enabled) "on" else "off";
+    if (!state.decision_enabled) return "off";
+    return if (state.decision_jev_free) "OpenCode Jev Free" else "Configured";
 }
 pub fn description(selected: usize) []const u8 {
     return if (selected == 0)
         "Protect input from price surcharges; unknown pricing pauses. Flat pricing: no L."
     else
-        "Review commands, Memory and compaction via config.json decision; may cost more.";
+        "Review commands, Memory and compaction. Enter selects Off or OpenCode Jev Free.";
 }
 pub const Rows = struct {
     lines: []const []const u8,
@@ -46,7 +48,7 @@ pub fn rows(a: std.mem.Allocator, menu: Menu, state: Snapshot, columns: usize, m
         try append(a, &out, raw, columns);
     }
     if (max_rows > out.items.len) try append(a, &out, description(selected), columns);
-    if (max_rows > out.items.len) try append(a, &out, "Up/Down select  Enter toggle  Left back  Esc close", columns);
+    if (max_rows > out.items.len) try append(a, &out, "Up/Down select  Enter change  Left back  Esc close", columns);
     if (!state.global_settings_available and max_rows > out.items.len) try append(a, &out, "Global settings unavailable; changes disabled", columns);
     return .{
         .lines = try out.toOwnedSlice(a),
@@ -71,8 +73,9 @@ test "settings values descriptions and complete identifier clipping" {
     const a = std.testing.allocator;
     try std.testing.expectEqualStrings("on", value(.{}, 0));
     try std.testing.expectEqualStrings("off", value(.{ .low_price_input_enabled = false }, 0));
-    try std.testing.expectEqualStrings("not configured", value(.{}, 1));
-    try std.testing.expectEqualStrings("on", value(.{ .decision_configured = true, .decision_enabled = true }, 1));
+    try std.testing.expectEqualStrings("off", value(.{}, 1));
+    try std.testing.expectEqualStrings("Configured", value(.{ .decision_configured = true, .decision_enabled = true }, 1));
+    try std.testing.expectEqualStrings("OpenCode Jev Free", value(.{ .decision_enabled = true, .decision_jev_free = true }, 1));
     try std.testing.expect(std.mem.find(u8, description(0), "unknown") != null);
     try std.testing.expect(std.mem.find(u8, description(1), "Memory") != null);
     for (0..2) |selected| for (0..60) |columns| {

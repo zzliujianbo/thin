@@ -412,6 +412,8 @@ pub const Journal = struct {
                 .text => |v| try self.firstResponse(a, "text", v.len),
                 .reasoning => |v| try self.firstResponse(a, "reasoning", v.len),
                 .tool_preview => |v| try self.firstResponse(a, "tool_preview", v.arguments.len),
+                // Ephemeral display snapshots are not canonical archive data.
+                .tool_views, .tool_view => {},
                 .state => |v| {
                     if (v == .calling_model or v == .compacting) self.first = false;
                     try self.record(a, "state", .{ .state = v });
