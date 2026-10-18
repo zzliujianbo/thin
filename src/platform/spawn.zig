@@ -60,6 +60,12 @@ fn failed(fd: c.fd_t) noreturn {
 }
 
 pub fn start(allocator: std.mem.Allocator, root: []const u8, cwd_dir: ?std.Io.Dir, executable: []const u8, script: []const u8, environ: *const std.process.Environ.Map, test_mode: TestMode) !Child {
+    return startWithInput(allocator, root, cwd_dir, executable, script, environ, test_mode, null);
+}
+
+/// Borrow input without closing or rewinding it in the parent. The duplicate
+/// shares its open-file offset; ownership of only the duplicate is transferred.
+pub fn startWithInput(allocator: std.mem.Allocator, root: []const u8, cwd_dir: ?std.Io.Dir, executable: []const u8, script: []const u8, environ: *const std.process.Environ.Map, test_mode: TestMode, input: ?std.Io.File) !Child {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -95,10 +101,16 @@ pub fn start(allocator: std.mem.Allocator, root: []const u8, cwd_dir: ?std.Io.Di
     // Only the read end is nonblocking; stdout/stderr writers stay blocking.
     const nonblock: u32 = @bitCast(c.O{ .NONBLOCK = true });
     if (c.fcntl(report[0], c.F.SETFL, @as(c_int, @intCast(nonblock))) < 0) return error.SpawnFdFailed;
-    const raw_null = c.open("/dev/null", .{ .CLOEXEC = true });
-    if (raw_null < 0) return error.SpawnFdFailed;
-    const null_fd = try aboveStdio(raw_null);
-    defer _ = c.close(null_fd);
+    const input_fd = if (input) |file| blk: {
+        const fd = c.fcntl(file.handle, c.F.DUPFD_CLOEXEC, @as(c_int, 3));
+        if (fd < 0) return error.SpawnFdFailed;
+        break :blk fd;
+    } else blk: {
+        const fd = c.open("/dev/null", .{ .CLOEXEC = true });
+        if (fd < 0) return error.SpawnFdFailed;
+        break :blk try aboveStdio(fd);
+    };
+    defer _ = c.close(input_fd);
     // Duplicate the anchor before fork, so it too cannot alias fd 0/1/2.
     const dir_fd = if (cwd_dir) |dir| c.fcntl(dir.handle, c.F.DUPFD_CLOEXEC, @as(c_int, 3)) else -1;
     if (cwd_dir != null and dir_fd < 0) return error.SpawnFdFailed;
@@ -127,7 +139,7 @@ pub fn start(allocator: std.mem.Allocator, root: []const u8, cwd_dir: ?std.Io.Di
             if (c.sigaction(sig, &defaults, null) != 0) failed(report[1]);
         }
         if (c.sigprocmask(std.os.linux.SIG.SETMASK, &defaults.mask, null) != 0) failed(report[1]);
-        if (c.dup2(null_fd, 0) < 0 or c.dup2(out[1], 1) < 0 or c.dup2(err[1], 2) < 0) failed(report[1]);
+        if (c.dup2(input_fd, 0) < 0 or c.dup2(out[1], 1) < 0 or c.dup2(err[1], 2) < 0) failed(report[1]);
         const changed = if (dir_fd >= 0) c.fchdir(dir_fd) else c.chdir(cwd.ptr);
         if (changed != 0) failed(report[1]);
         _ = c.close(out[0]);
@@ -135,7 +147,11 @@ pub fn start(allocator: std.mem.Allocator, root: []const u8, cwd_dir: ?std.Io.Di
         _ = c.close(err[0]);
         _ = c.close(err[1]);
         _ = c.close(report[0]);
-        _ = c.close(null_fd);
+        _ = c.close(input_fd);
+        // Even a borrowed non-CLOEXEC source must not leak through exec.
+        if (input) |file| {
+            if (file.handle > 2) _ = c.close(file.handle);
+        }
         if (dir_fd >= 0) _ = c.close(dir_fd);
         // Test-only controlled pre-exec stall; there is no such branch in the
         // product build. The parent must still cancel/timeout and KILL/reap it.

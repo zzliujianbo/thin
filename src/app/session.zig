@@ -24,6 +24,7 @@ const fs = @import("../platform/filesystem.zig");
 
 test {
     _ = @import("llm_session_test.zig");
+    _ = @import("global_preferences_test.zig");
 }
 
 const MetadataTokens = [catalog.entries.len]?u32;
@@ -337,7 +338,21 @@ pub const Session = struct {
 
     fn prepareLoadedHistory(self: *Session, candidate: *App) !void {
         const loaded = self.loaded_checkpoint orelse return;
-        try candidate.runtime.restoreCheckpoint(loaded.value);
+        var state = loaded.value;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        // Legacy archives cannot prove their tool prefix. A current decision
+        // declaration must not replay old signed thinking under changed tools.
+        // Normalize display data before restore, even for a poisoned archive;
+        // loading history itself must not require permission to run a task.
+        if (state.tool_schema_hash == null and self.global_config.?.value.decision != null) {
+            const messages = try scratch.allocator().alloc(@import("../core/protocol.zig").Message, state.messages.len);
+            for (state.messages, 0..) |message, i|
+                messages[i] = try @import("../core/context.zig").cloneAfterPrefixRewrite(scratch.allocator(), message);
+            state.messages = messages;
+            state.last_context_tokens = null;
+        }
+        try candidate.runtime.restoreCheckpoint(state);
         candidate.journal.seq = loaded.value.journal_seq;
         candidate.journal.turn = loaded.value.journal_turn;
         candidate.journal.resumed = true;
@@ -393,7 +408,7 @@ pub const Session = struct {
 
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -587,7 +602,13 @@ pub const Session = struct {
             // an unknown raw ID cannot inherit another model's capabilities.
             .allow_custom_models = config.registry == null and allowsCustomModels(config.provider),
             .context_limit = if (unselected or config.selection_pending) 0 else config.model.context_tokens,
-            .low_price_input = config.limits.low_price_input,
+            // L reports active protection against a known price step, not
+            // the global switch. Flat/unknown/pending models have no marker.
+            .low_price_input = self.app != null and !unselected and !config.selection_pending and config.limits.low_price_input and config.model.input_price_threshold != null,
+            .low_price_input_enabled = config.limits.low_price_input,
+            .decision_enabled = config.decisionActive(),
+            .decision_configured = config.decision != null,
+            .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .pending_default_effort = if (self.app != null and self.initial_default_pending and config.model.reasoning_effort == null) self.preferred_effort else null,
             .effort_levels = self.capabilitiesFor(config).levels,
@@ -1062,6 +1083,38 @@ pub const Session = struct {
             self.global_config = value;
             candidate.* = null;
         }
+    }
+
+    fn setSetting(raw: *anyopaque, setting: tui.Connection.Setting, enabled: bool) !void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        try self.guardSelection();
+        const active_config = self.mutableConfig();
+        // Persist only the owned declaration, never cache-resolved model data
+        // or historical choices. The borrowed live/global arenas stay put.
+        var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
+        defer cfg.release(&declaration);
+        switch (setting) {
+            .low_price_input => declaration.value.limits.low_price_input = enabled,
+            .decision_enabled => {
+                if (declaration.value.decision) |*value| value.enabled = enabled else return error.DecisionNotConfigured;
+            },
+        }
+        const low = declaration.value.limits.low_price_input;
+        const decision = declaration.value.decisionActive();
+        var prepared: ?App.SettingsReplacement = if (self.app) |app| try app.prepareSettings(declaration.value, self.environ) else null;
+        defer if (prepared) |*value| value.deinit();
+        // Last fallible step. File CAS/write failure leaves live state intact.
+        try self.store.save(declaration.value);
+        self.global_config.?.value.limits.low_price_input = low;
+        if (self.global_config.?.value.decision) |*value| value.enabled = decision;
+        if (prepared) |*value| {
+            self.app.?.installSettings(value);
+            self.initial_context = self.app.?.runtime.contextSnapshot();
+        } else {
+            active_config.limits.low_price_input = low;
+            if (active_config.decision) |*value| value.enabled = decision;
+        }
+        self.publishCheckpoint();
     }
 
     fn selectModel(raw: *anyopaque, name: []const u8) !void {
@@ -1590,8 +1643,8 @@ test "empty HOME hides placeholder selection but retains initialized defaults" {
     try std.testing.expect(state.selection_name == null);
     try std.testing.expect(state.initial_context == null);
     try std.testing.expectEqual(@as(u32, 0), state.context_limit);
-    // Hide the marker in the empty-model renderer, not by lying about policy.
-    try std.testing.expect(state.low_price_input);
+    // No active priced model: the UI flag is not the global policy toggle.
+    try std.testing.expect(!state.low_price_input);
     try std.testing.expect(state.model_providers != null);
     try std.testing.expectEqual(@as(usize, 0), state.model_providers.?.len);
     try std.testing.expectEqualStrings("deepseek-flash", session.pending.?.value.model.name);

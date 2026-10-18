@@ -101,7 +101,12 @@ test "input budget opt in min ceilings margin unknown and real output room" {
     try std.testing.expectEqual(@as(u32, 128000), try c.outputBudget(config, .normal, 95000));
     try std.testing.expectEqual(@as(u32, 128000), c.summaryBudget(config));
     try std.testing.expectError(error.InputBudgetExceeded, c.outputBudget(config, .normal, 95001));
-    try std.testing.expectError(error.InputBudgetExceeded, c.outputBudget(config, .summary, 95001));
+    try std.testing.expectEqual(@as(u32, 128000), try c.outputBudget(config, .summary, 95001));
+    try std.testing.expectEqual(@as(usize, 995903), c.inputBudgetFor(config, .summary));
+    config.model.input_price_threshold = null;
+    try std.testing.expectError(error.UnknownInputPriceThreshold, c.outputBudget(config, .normal, 100));
+    try std.testing.expectEqual(@as(u32, 128000), try c.outputBudget(config, .summary, 100000));
+    config.model.input_price_threshold = 100000;
     config.limits.max_input_tokens = 70000;
     try std.testing.expectEqual(@as(usize, 65000), c.inputBudget(config));
     config.model.context_tokens = 32768;
@@ -120,6 +125,7 @@ const Fake = struct {
     config: *const cfg.Config,
     normal: usize = 0,
     summaries: usize = 0,
+    last_summary_input: usize = 0,
     tools: usize = 0,
     tool_mode: bool = false,
     exhausted: bool = false,
@@ -131,9 +137,10 @@ const Fake = struct {
     fn call(raw: *anyopaque, alloc: std.mem.Allocator, req: p.Request, _: p.ModelSink) !p.Outcome {
         const self: *Fake = @ptrCast(@alignCast(raw));
         const estimate = c.rawTokens(req.system, req.tools, req.messages);
-        try std.testing.expect(estimate <= c.inputBudget(self.config.*));
+        try std.testing.expect(estimate <= c.inputBudgetFor(self.config.*, req.purpose));
         if (req.purpose == .summary) {
             self.summaries += 1;
+            self.last_summary_input = estimate;
             try std.testing.expectEqual(@as(usize, 0), self.normal);
             if (self.exhausted) return .{ .failure = .{ .kind = .output_limit, .message = "fixture cap", .usage = .{ .input_tokens = estimate, .output_tokens = req.max_output_tokens } } };
             switch (self.summary_fault) {
@@ -273,7 +280,15 @@ test "input budget appended summary instruction cannot escape the complete reque
     const old: [4000]u8 = @splat('x');
     try seed(&runtime, &old);
     const before = runtime.messages().ptr;
-    config.limits.max_input_tokens = @intCast(runtime.estimatedTokens() + config.limits.input_margin_tokens);
+    // The actual pure-text summary view (not native/full history) must fit.
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const alloc = scratch.allocator();
+    const selection = try c.planManual(alloc, config, runtime.estimator, runtime.system, &.{}, runtime.messages(), 2);
+    const instruction = try c.summaryInstruction(alloc, selection, runtime.messages());
+    const view = try c.summaryView(alloc, selection, runtime.messages());
+    const message: p.Message = .{ .role = .user, .blocks = &.{.{ .text = view }} };
+    config.limits.max_input_tokens = @intCast(c.rawTokens(instruction, &.{}, &.{message}) + config.limits.input_margin_tokens - 1);
     var cancel: p.Cancellation = .{};
     const result = try runtime.compactContext(&cancel);
     try std.testing.expectEqual(r.Status.paused, result.status);
@@ -335,6 +350,54 @@ test "input budget failed paid summary stops no fallback or automatic repeated a
             try std.testing.expectEqual(@as(?u16, 503), result.http_status);
         }
     }
+}
+
+test "input budget summary crosses 95K price tier while normal remains blocked and unknown price manual remains independent" {
+    const old: [300000]u8 = @splat('x');
+    for ([_]bool{ false, true }) |unknown| {
+        var config = configuration();
+        config.limits.low_price_input = true;
+        if (unknown) config.model.input_price_threshold = null;
+        var fake = Fake{ .config = &config };
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+        defer runtime.deinit();
+        try seed(&runtime, &old);
+        try std.testing.expect(runtime.estimatedTokens() > 95000);
+        try std.testing.expectError(if (unknown) error.UnknownInputPriceThreshold else error.InputBudgetExceeded, c.checkInput(config, runtime.estimatedTokens()));
+        var cancel: p.Cancellation = .{};
+        const summary = try runtime.compactContext(&cancel);
+        try std.testing.expectEqual(r.Status.success, summary.status);
+        try std.testing.expect(fake.last_summary_input > 95000 and fake.last_summary_input < c.inputBudgetFor(config, .summary));
+        try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+        try std.testing.expectEqual(@as(usize, 0), fake.normal);
+        try std.testing.expect(runtime.estimatedTokens() < 95000);
+        try std.testing.expect(config.limits.low_price_input);
+        if (unknown) {
+            // Commit used physical summary budget, not a fabricated normal proof.
+            try std.testing.expectError(error.UnknownInputPriceThreshold, c.checkInput(config, runtime.estimatedTokens()));
+            const next = try runtime.run("continue", &cancel);
+            try std.testing.expectEqual(r.Status.paused, next.status);
+            try std.testing.expectEqual(error.UnknownInputPriceThreshold, next.detail.?);
+            try std.testing.expectEqual(@as(usize, 0), fake.normal);
+            try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+        } else try c.checkInput(config, runtime.estimatedTokens());
+    }
+}
+
+test "input budget summary explicit caps physical window and nonzero output remain enforced" {
+    var config = configuration();
+    config.limits.max_output_tokens = null;
+    config.limits.low_price_input = true;
+    try std.testing.expectEqual(@as(u32, 128000), try c.outputBudget(config, .summary, 100001));
+    config.limits.max_input_tokens = 100000;
+    try std.testing.expectError(error.InputBudgetExceeded, c.outputBudget(config, .summary, 95001));
+    config.limits.max_input_tokens = null;
+    const physical = config.model.context_tokens - config.limits.safety_tokens;
+    try std.testing.expectEqual(@as(u32, 1), try c.outputBudget(config, .summary, physical - 1));
+    try std.testing.expectError(error.InputBudgetExceeded, c.outputBudget(config, .summary, physical));
+    config.model.input_price_threshold = null;
+    try std.testing.expectEqual(@as(u32, 1), try c.outputBudget(config, .summary, physical - 1));
+    try std.testing.expectError(error.UnknownInputPriceThreshold, c.outputBudget(config, .normal, physical - 1));
 }
 
 test "input budget checkpoint loads history across changed current policies" {

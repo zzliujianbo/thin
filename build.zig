@@ -80,6 +80,36 @@ pub fn build(b: *std.Build) void {
     run_http.setCwd(b.path("."));
     b.step("test-http", "Run local product HTTP/SSE integration tests (requires Node and OpenSSL)").dependOn(&run_http.step);
 
+    const proxy_tests = b.addTest(.{
+        .use_llvm = false,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/proxy_http_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_proxy = b.addSystemCommand(&.{"node"});
+    run_proxy.addFileArg(b.path("tests/product/proxy_mock.mjs"));
+    run_proxy.addArtifactArg(proxy_tests);
+    run_proxy.setCwd(b.path("."));
+    b.step("test-proxy", "Run owned allowlisted HTTP CONNECT and destination TLS fixtures").dependOn(&run_proxy.step);
+
+    const systemone_tests = b.addTest(.{
+        .use_llvm = false,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/systemone_http_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_systemone = b.addSystemCommand(&.{"node"});
+    run_systemone.addFileArg(b.path("tests/product/systemone_mock.mjs"));
+    run_systemone.addArtifactArg(systemone_tests);
+    run_systemone.setCwd(b.path("."));
+    b.step("test-systemone", "Run owned SystemOne/curl HTTP, proxy and TLS fixtures").dependOn(&run_systemone.step);
+
     const anthropic_tests = b.addTest(.{
         .use_llvm = false,
         .root_module = b.createModule(.{
@@ -136,13 +166,25 @@ pub fn build(b: *std.Build) void {
     run_app.setCwd(b.path("."));
     b.step("test-app", "Run isolated CLI and PTY application acceptance (requires Node)").dependOn(&run_app.step);
 
+    // Global settings acceptance reuses both application artifacts; the Node
+    // fixture owns its loopback server and serial PTY launches.
+    const run_settings = b.addSystemCommand(&.{"node"});
+    run_settings.addFileArg(b.path("tests/product/global_settings_mock.mjs"));
+    run_settings.addArtifactArg(exe);
+    run_settings.addArtifactArg(pty_driver);
+    run_settings.setCwd(b.path("."));
+    b.step("test-settings", "Run isolated global settings PTY acceptance without inference").dependOn(&run_settings.step);
+
     // 聚合步骤 `zig build test`：依次挂载所有离线测试（不含需要真实 API 的内容）。
     const test_all = b.step("test", "Run all offline unit, transport, application and foundation tests");
     test_all.dependOn(&run_unit.step);
     test_all.dependOn(&run_presentation.step);
     test_all.dependOn(&run_http.step);
     test_all.dependOn(&run_anthropic.step);
+    test_all.dependOn(&run_systemone.step);
+    test_all.dependOn(&run_proxy.step);
     test_all.dependOn(&run_app.step);
+    test_all.dependOn(&run_settings.step);
     test_all.dependOn(&run.step);
 }
 

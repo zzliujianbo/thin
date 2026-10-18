@@ -347,6 +347,79 @@ fn settingsColor(d: *const Driver, start: usize, level: []const u8) !void {
     return error.SettingsColorMismatch;
 }
 
+/// Each input waits for a new completed frame; sparse diffs need not reprint
+/// unchanged labels. Assertions below inspect the replayed owned screen.
+fn settingsKey(d: *Driver, bytes: []const u8) !void {
+    const start = d.used;
+    try d.send(bytes);
+    try d.waitFrame(start, "\x1b[?25l");
+}
+
+fn settingsValues(d: *Driver, low: []const u8, decision: []const u8, selected: usize) !void {
+    const view = try d.screen();
+    var buffer: [100]u8 = undefined;
+    try check(view.visible(try std.fmt.bufPrint(&buffer, "Low-price input  {s}", .{low})));
+    try check(view.visible(try std.fmt.bufPrint(&buffer, "Decision model   {s}", .{decision})));
+    try check(view.visible(if (selected == 0) "> Low-price input" else "> Decision model"));
+    try check(view.visible(if (selected == 0) "Protect input from price surcharges; unknown pricing pauses." else "Review commands, Memory and compaction via config.json decision"));
+    try check(view.visible("Up/Down select  Enter toggle  Left back  Esc close"));
+}
+
+// The Node owner checks config.json CAS persistence and ignored legacy files;
+// this driver intentionally keeps the existing labels, keys and mode API.
+// Omitted decision.enabled defaults on only when decision is configured.
+fn globalSettings(d: *Driver, mode: []const u8) !void {
+    const off = std.mem.eql(u8, mode, "settings-global-off");
+    const on = std.mem.eql(u8, mode, "settings-global-on");
+    const verify = std.mem.eql(u8, mode, "settings-global-verify");
+    const absent = std.mem.eql(u8, mode, "settings-global-unconfigured");
+    try check(off or on or verify or absent);
+    try d.waitIdle(0);
+    try settingsKey(d, "/settings\r");
+    const before = if (on) "off" else "on";
+    const after = if (off) "off" else "on";
+    const decision_before = if (absent) "not configured" else before;
+    try settingsValues(d, before, decision_before, 0);
+    if (off or on) {
+        try settingsKey(d, "\r");
+        try settingsValues(d, after, before, 0);
+    }
+    try settingsKey(d, "\x1b[B");
+    try settingsValues(d, after, decision_before, 1);
+    if (off or on or absent) {
+        try settingsKey(d, "\r");
+        try settingsValues(d, after, if (absent) "not configured" else after, 1);
+        if (absent) {
+            const view = try d.screen();
+            try check(view.visible("Configure decision in ~/.thin/config.json first"));
+        }
+    }
+    try settingsKey(d, "\x1b[A");
+    try settingsValues(d, after, if (absent) "not configured" else after, 0);
+    // Left returns to the root command list with settings selected. Tab
+    // completes it, and a separately acknowledged Enter opens it again.
+    try settingsKey(d, "\x1b[D");
+    const root = try d.screen();
+    try check(root.visible("> /settings") and root.visible("/model") and !root.visible("Low-price input"));
+    try settingsKey(d, "\t");
+    const completed = try d.screen();
+    try check(completed.visible("/settings"));
+    try settingsKey(d, "\r");
+    try settingsValues(d, after, if (absent) "not configured" else after, 0);
+    const start = d.used;
+    try d.send("\x1b");
+    try d.waitIdle(start);
+    const closed = try d.screen();
+    try check(!closed.visible("Low-price input") and !closed.visible("Decision model"));
+    // No fabricated L assertion: unknown pricing has no authoritative tier.
+    // Reopening checks the owner's published values after Esc, not UI intent.
+    try settingsKey(d, "/settings\r");
+    try settingsValues(d, after, if (absent) "not configured" else after, 0);
+    const close_start = d.used;
+    try d.send("\x1b");
+    try d.waitIdle(close_start);
+}
+
 /// 验收入口：从环境变量读取二进制、项目目录、HOME 与测试 URL，创建 PTY 并 fork 启动应用，再按 THIN_APP_TEST_MODE 驱动对应的交互场景。
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
@@ -561,7 +634,7 @@ pub fn main(init: std.process.Init) !void {
         // Inspect logical terminal cells, not raw SGR/padding substrings.
         var description_column: ?usize = null;
         var descriptions: usize = 0;
-        for ([_][]const u8{ "Select model", "Configure provider", "Compact conversation" }) |description| {
+        for ([_][]const u8{ "Select model", "Configure provider", "Compact conversation", "Global settings" }) |description| {
             var found = false;
             for (commands.grid) |line| {
                 if (std.mem.indexOf(u8, &line, description)) |column| {
@@ -573,7 +646,7 @@ pub fn main(init: std.process.Init) !void {
             try check(found);
             descriptions += 1;
         }
-        try check(descriptions == 3);
+        try check(descriptions == 4);
         try d.send("\x1b[B"); // /model -> /login; /compact is the third root row.
         try d.waitFrame(start, "");
         start = d.used;
@@ -1092,6 +1165,10 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, &final.grid[23], "(fixture-model ") != null and std.mem.indexOf(u8, &final.grid[23], "%) >") != null);
         try check(!final.visible("ctx ~"));
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\"written_bytes\"") == null);
+    } else if (std.mem.startsWith(u8, mode, "settings-global")) {
+        // Handle before the historical thinking-level settings-* dispatcher.
+        // No prompt, model selection, refresh or inference is submitted here.
+        try globalSettings(&d, mode);
     } else if (std.mem.startsWith(u8, mode, "settings-")) {
         // All settings processes are real owned PTYs with --no-log. Check an
         // acknowledged initial frame before typing; a missing preference is initialized.

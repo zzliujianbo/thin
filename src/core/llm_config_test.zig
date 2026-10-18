@@ -1,6 +1,319 @@
 const std = @import("std");
 const cfg = @import("config.zig");
 const t = std.testing;
+
+const proxy_prefix = "{\"llm\":{\"default\":\"p/vendor/raw/id\",\"providers\":{\"p\":{\"base_url\":\"https://fixture.invalid/v1\"},\"other\":{\"base_url\":\"https://fixture.invalid/v1\"}}}";
+const proxy_fixture = proxy_prefix ++ ",\"proxy\":{\"address\":\"::1\",\"port\":8080,\"models\":[\"p/vendor/raw/id\"]}}";
+
+test "HTTP proxy exact alias routing owned clone and sparse roundtrip" {
+    const a = t.allocator;
+    const input = try a.dupe(u8, proxy_fixture);
+    defer a.free(input);
+    var p = try cfg.parse(a, input);
+    defer cfg.release(&p);
+    @memset(input, 'x');
+    try t.expectEqualStrings("::1", p.value.proxy.?.address);
+    try t.expectEqualStrings("p/vendor/raw/id", p.value.proxy.?.models[0]);
+    try t.expect(p.value.proxyFor("p", "vendor/raw/id") != null);
+    try t.expect(p.value.proxyFor(null, "vendor/raw/id") == null);
+    try t.expect(p.value.proxyFor("other", "vendor/raw/id") == null);
+    try t.expect(p.value.proxyFor("P", "vendor/raw/id") == null);
+    try t.expect(p.value.proxyFor("p", "vendor/raw/ID") == null);
+    try t.expect(p.value.proxyFor("p", "vendor/raw/id/extra") == null);
+    try t.expect(p.value.registry.?.find("p").?.patchFor("vendor/raw/id") == null);
+    const url = try p.value.proxy.?.url(a);
+    defer a.free(url);
+    try t.expectEqualStrings("http://[::1]:8080", url);
+    var copy = try cfg.clone(a, p.value);
+    defer cfg.release(&copy);
+    try t.expect(copy.value.proxy.?.address.ptr != p.value.proxy.?.address.ptr);
+    try t.expect(copy.value.proxy.?.models.ptr != p.value.proxy.?.models.ptr);
+    try t.expect(copy.value.proxy.?.models[0].ptr != p.value.proxy.?.models[0].ptr);
+    try cfg.setRegistryCredential(copy.arena.allocator(), &copy.value, "p", "fixture-key");
+    try cfg.setRegistryDefault(copy.arena.allocator(), &copy.value, "other", "new/raw/id");
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try cfg.writeDisk(copy.value, &out.writer);
+    var disk = try cfg.parse(a, out.written());
+    defer cfg.release(&disk);
+    try t.expectEqualDeep(p.value.proxy, disk.value.proxy);
+    try t.expectEqualStrings("https://fixture.invalid/v1", disk.value.provider.base_url);
+    try t.expectEqualStrings("other/new/raw/id", disk.value.registry.?.default);
+    try t.expectEqualStrings("p/vendor/raw/id", p.value.registry.?.default);
+    try t.expectEqual(@as(?u32, null), disk.value.model.input_price_threshold);
+    for ([_][]const u8{ "}", ",\"proxy\":null}" }) |suffix| {
+        const bytes = try std.mem.concat(a, u8, &.{ proxy_prefix, suffix });
+        defer a.free(bytes);
+        var absent = try cfg.parse(a, bytes);
+        defer cfg.release(&absent);
+        try t.expect(absent.value.proxyFor("p", "vendor/raw/id") == null);
+        var sparse: std.Io.Writer.Allocating = .init(a);
+        defer sparse.deinit();
+        try cfg.writeDisk(absent.value, &sparse.writer);
+        try t.expect(std.mem.find(u8, sparse.written(), "\"proxy\"") == null);
+    }
+    copy.value.proxy.?.models = &.{};
+    try t.expect(copy.value.proxyFor("p", "vendor/raw/id") == null);
+    // Runtime-only snapshots may retain explicit routing without a registry.
+    copy.value.registry = null;
+    copy.value.proxy.?.models = &.{"p/vendor/raw/id"};
+    try cfg.validate(copy.value);
+}
+
+test "HTTP proxy rejects malformed hosts numbers fields lists and alias guesses" {
+    const a = t.allocator;
+    for ([_][]const u8{
+        "{}",                                                        "[]",                                                              "true",                                                          "1",                                                       "\"host\"",
+        "{\"address\":\"host\"}",                                    "{\"port\":80}",                                                   "{\"address\":\"host\",\"port\":0}",                             "{\"address\":\"host\",\"port\":65536}",                   "{\"address\":\"host\",\"port\":-1}",
+        "{\"address\":\"host\",\"port\":80.0}",                      "{\"address\":\"host\",\"port\":8e1}",                             "{\"address\":\"host\",\"port\":true}",                          "{\"address\":\"host\",\"port\":\"80\"}",                  "{\"address\":\"host\",\"port\":null}",
+        "{\"address\":\"host\",\"port\":80,\"extra\":1}",            "{\"address\":\"host\",\"address\":\"other\",\"port\":80}",        "{\"address\":\"host\",\"port\":80,\"port\":81}",                "{\"address\":\"host\",\"port\":80,\"models\":null}",      "{\"address\":\"host\",\"port\":80,\"models\":\"p/m\"}",
+        "{\"address\":\"host\",\"port\":80,\"models\":[1]}",         "{\"address\":\"host\",\"port\":80,\"models\":[\"p/m\",\"p/m\"]}", "{\"address\":\"host\",\"port\":80,\"models\":[\"missing/m\"]}", "{\"address\":\"host\",\"port\":80,\"models\":[\"p/*\"]}", "{\"address\":\"host\",\"port\":80,\"models\":[\"p/m?\"]}",
+        "{\"address\":\"host\",\"port\":80,\"models\":[\"p/[m]\"]}", "{\"address\":\"host\",\"port\":80,\"models\":[\"m\"]}",           "{\"address\":\"host\",\"port\":80,\"models\":[\"p/\"]}",
+    }) |value| {
+        const text = try std.mem.concat(a, u8, &.{ proxy_prefix, ",\"proxy\":", value, "}" });
+        defer a.free(text);
+        if (cfg.parse(a, text)) |v| {
+            var unexpected = v;
+            cfg.release(&unexpected);
+            return error.ExpectedRejection;
+        } else |_| {}
+    }
+    var p = try cfg.parse(a, proxy_fixture);
+    defer cfg.release(&p);
+    for ([_][]const u8{ "", "http://host", "https://host", "user@host", "host:80", "host/path", "host?query", "host#frag", "[::1]", "::g", "fe80::1%eth0", " host", "host\n", "host\x00", "中文", ".", "a..b", "-host", "host-", "host_1", "host\\path" }) |host| {
+        p.value.proxy.?.address = host;
+        try t.expectError(error.InvalidProxyAddress, cfg.validate(p.value));
+        try t.expectError(error.InvalidProxyAddress, p.value.proxy.?.url(a));
+    }
+    var long: [254]u8 = undefined;
+    @memset(&long, 'a');
+    p.value.proxy.?.address = &long;
+    try t.expectError(error.InvalidProxyAddress, cfg.validate(p.value));
+    for ([_][]const u8{ "localhost", "proxy.example", "127.0.0.1", "::1", "2001:db8::1" }) |host| {
+        p.value.proxy.?.address = host;
+        p.value.proxy.?.port = 65535;
+        try cfg.validate(p.value);
+        const url = try p.value.proxy.?.url(a);
+        defer a.free(url);
+        try t.expect(std.mem.startsWith(u8, url, "http://"));
+    }
+    var names: [129][]const u8 = undefined;
+    for (&names) |*name| name.* = "p/m";
+    p.value.proxy.?.models = &names;
+    try t.expectError(error.TooManyProxyModels, cfg.validate(p.value));
+}
+
+test "HTTP proxy empty list explicit persistence and 128 exact dynamic IDs" {
+    const a = t.allocator;
+    var p = try cfg.parse(a, proxy_prefix ++ ",\"proxy\":{\"address\":\"proxy.example\",\"port\":1}}");
+    defer cfg.release(&p);
+    try t.expectEqual(@as(usize, 0), p.value.proxy.?.models.len);
+    try t.expect(p.value.proxyFor("p", "vendor/raw/id") == null);
+    const url = try p.value.proxy.?.url(a);
+    defer a.free(url);
+    try t.expectEqualStrings("http://proxy.example:1", url);
+    var names: [128][]const u8 = undefined;
+    for (&names, 0..) |*name, i| name.* = try std.fmt.allocPrint(p.arena.allocator(), "p/dynamic/raw/{d}", .{i});
+    p.value.proxy.?.models = &names;
+    try cfg.validate(p.value);
+    try t.expect(p.value.proxyFor("p", "dynamic/raw/127") != null);
+    try t.expect(p.value.proxyFor("other", "dynamic/raw/127") == null);
+    var copy = try cfg.clone(a, p.value);
+    defer cfg.release(&copy);
+    try t.expect(copy.value.proxy.?.models.ptr != names[0..].ptr);
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try cfg.writeDisk(copy.value, &out.writer);
+    var disk = try cfg.parse(a, out.written());
+    defer cfg.release(&disk);
+    try t.expectEqualDeep(copy.value.proxy, disk.value.proxy);
+    try t.expectError(error.DuplicateField, cfg.parse(a, proxy_prefix ++ ",\"proxy\":null,\"proxy\":null}"));
+}
+
+fn proxyAllocationExercise(a: std.mem.Allocator) !void {
+    var p = try cfg.parse(a, proxy_fixture);
+    defer cfg.release(&p);
+    var copy = try cfg.clone(a, p.value);
+    defer cfg.release(&copy);
+    const url = try copy.value.proxy.?.url(a);
+    defer a.free(url);
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    // This in-memory Allocating writer can fail writes only through its
+    // backing allocator; restore the OOM category for the exhaustive sweep.
+    cfg.writeDisk(copy.value, &out.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    var disk = try cfg.parse(a, out.written());
+    defer cfg.release(&disk);
+    try t.expectEqualDeep(copy.value.proxy, disk.value.proxy);
+}
+
+test "HTTP proxy parse clone url disk allocation failures release ownership" {
+    try t.checkAllAllocationFailures(t.allocator, proxyAllocationExercise, .{});
+}
+
+test "optional global decision owns qualified model and sparsely persists" {
+    const a = t.allocator;
+    const prefix = "{\"llm\":{\"default\":\"p/chat\",\"providers\":{\"p\":{\"base_url\":\"https://fixture.invalid\"},\"aux\":{\"base_url\":\"https://aux.invalid\"}}}";
+    var baseline = try cfg.parse(a, prefix ++ "}");
+    defer cfg.release(&baseline);
+    try t.expect(!baseline.value.decisionActive());
+    var absent: std.Io.Writer.Allocating = .init(a);
+    defer absent.deinit();
+    try cfg.writeDisk(baseline.value, &absent.writer);
+    try t.expect(std.mem.find(u8, absent.written(), "decision") == null);
+    var explicit_null = try cfg.parse(a, prefix ++ ",\"decision\":null}");
+    defer cfg.release(&explicit_null);
+    try t.expect(!explicit_null.value.decisionActive());
+    var null_out: std.Io.Writer.Allocating = .init(a);
+    defer null_out.deinit();
+    try cfg.writeDisk(explicit_null.value, &null_out.writer);
+    try t.expectEqualStrings(absent.written(), null_out.written());
+    var parsed = try cfg.parse(a, prefix ++ ",\"decision\":{\"model\":\"aux/vendor/raw/id\"}}");
+    defer cfg.release(&parsed);
+    try t.expect(parsed.value.decision.?.enabled);
+    try t.expect(parsed.value.decisionActive());
+    try t.expectEqualStrings("p/chat", parsed.value.registry.?.default);
+    try t.expectEqualStrings("vendor/raw/id", (try cfg.splitDefault(parsed.value.decision.?.model)).model);
+    try t.expectEqual(@as(u32, 30000), parsed.value.decision.?.request_timeout_ms);
+    try t.expectEqual(@as(u32, 8192), parsed.value.decision.?.max_input_tokens);
+    try t.expectEqual(@as(u32, 1024), parsed.value.decision.?.max_output_tokens);
+    var copy = try cfg.clone(a, parsed.value);
+    defer cfg.release(&copy);
+    try t.expect(copy.value.decision.?.model.ptr != parsed.value.decision.?.model.ptr);
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try cfg.writeDisk(copy.value, &out.writer);
+    var disk = try cfg.parse(a, out.written());
+    defer cfg.release(&disk);
+    try t.expectEqualDeep(copy.value.decision, disk.value.decision);
+    // Reference validation never invents a protocol/window or borrows chat capabilities.
+    try t.expect(disk.value.registry.?.find("aux").?.patchFor("vendor/raw/id") == null);
+    for ([_][]const u8{
+        "{}",                                               "[]",                                             "false",                                             "1",                                                    "\"aux/m\"",
+        "{\"model\":\"missing/m\"}",                        "{\"model\":\"m\"}",                              "{\"model\":\"p/\"}",                                "{\"model\":1}",                                        "{\"model\":null}",
+        "{\"model\":\"p/m\",\"model\":\"p/n\"}",            "{\"model\":\"p/m\",\"extra\":true}",             "{\"model\":\"p/m\",\"request_timeout_ms\":0}",      "{\"model\":\"p/m\",\"request_timeout_ms\":3600001}",   "{\"model\":\"p/m\",\"request_timeout_ms\":1.0}",
+        "{\"model\":\"p/m\",\"request_timeout_ms\":\"1\"}", "{\"model\":\"p/m\",\"max_input_tokens\":1}",     "{\"model\":\"p/m\",\"max_input_tokens\":16777217}", "{\"model\":\"p/m\",\"max_output_tokens\":0}",          "{\"model\":\"p/m\",\"max_output_tokens\":16777217}",
+        "{\"model\":\"p/m\",\"max_output_tokens\":null}",   "{\"model\":\"p/m\",\"max_output_tokens\":true}", "{\"model\":\"p/m\",\"max_output_tokens\":-1}",      "{\"model\":\"p/m\",\"max_output_tokens\":4294967296}",
+    }) |value| {
+        const raw = try std.mem.concat(a, u8, &.{ prefix, ",\"decision\":", value, "}" });
+        defer a.free(raw);
+        if (cfg.parse(a, raw)) |v| {
+            var unexpected = v;
+            cfg.release(&unexpected);
+            return error.ExpectedRejection;
+        } else |_| {}
+    }
+    copy.value.decision.?.max_input_tokens = 1;
+    try t.expectError(error.InvalidLimit, cfg.clone(a, copy.value));
+    copy.value.decision.?.max_input_tokens = 2;
+    copy.value.decision.?.request_timeout_ms = 3600000;
+    copy.value.decision.?.max_output_tokens = 16777216;
+    try cfg.validate(copy.value);
+    copy.value.registry = null;
+    try t.expectError(error.MissingRegistry, cfg.validate(copy.value));
+}
+
+test "decision enabled strict bool rejects null duplicates unknown and root overlay" {
+    const a = t.allocator;
+    for ([_][]const u8{ "true", "false" }) |value| {
+        const raw = try std.mem.concat(a, u8, &.{ proxy_prefix, ",\"decision\":{\"model\":\"p/aux\",\"enabled\":", value, "}}" });
+        defer a.free(raw);
+        var parsed = try cfg.parse(a, raw);
+        defer cfg.release(&parsed);
+        try t.expectEqual(std.mem.eql(u8, value, "true"), parsed.value.decisionActive());
+    }
+    for ([_][]const u8{
+        "null", "0", "1", "0.0", "1e0", "\"false\"", "[]", "{}",
+    }) |value| {
+        const raw = try std.mem.concat(a, u8, &.{ proxy_prefix, ",\"decision\":{\"model\":\"p/aux\",\"enabled\":", value, "}}" });
+        defer a.free(raw);
+        if (cfg.parse(a, raw)) |v| {
+            var unexpected = v;
+            cfg.release(&unexpected);
+            return error.ExpectedRejection;
+        } else |_| {}
+    }
+    try t.expectError(error.DuplicateField, cfg.parse(a, proxy_prefix ++ ",\"decision\":{\"model\":\"p/aux\",\"enabled\":false,\"enabled\":true}}"));
+    try t.expectError(error.UnknownField, cfg.parse(a, proxy_prefix ++ ",\"decision\":{\"model\":\"p/aux\",\"enabled\":false,\"unknown\":true}}"));
+    try t.expectError(error.UnknownField, cfg.parse(a, proxy_prefix ++ ",\"decision_enabled\":false}"));
+    try t.expectError(error.UnknownField, cfg.parse(a, proxy_prefix ++ ",\"decision_enabled\":true,\"decision\":{\"model\":\"p/aux\",\"enabled\":false}}"));
+}
+
+test "disabled decision roundtrip preserves declarations backend credentials limits and proxy" {
+    const a = t.allocator;
+    const input =
+        \\{"llm":{"default":"p/chat","reasoning_effort":"high","providers":{"p":{"base_url":"https://fixture.invalid/v1","api_key":"fixture-key","models":{"chat":{"context_tokens":65536},"aux/raw":{"output_tokens":1234}}},"other":{"base_url":"https://other.invalid","api_key_env":"FIXTURE_KEY"}}},"decision":{"model":"p/aux/raw","enabled":false,"backend":"systemone","request_timeout_ms":1234,"max_input_tokens":4321,"max_output_tokens":321,"max_state_bytes":8192},"limits":{"low_price_input":false,"max_input_tokens":50000},"proxy":{"address":"localhost","port":8080,"models":["p/aux/raw"]}}
+    ;
+    var parsed = try cfg.parse(a, input);
+    defer cfg.release(&parsed);
+    try t.expect(!parsed.value.decision.?.enabled);
+    try t.expect(!parsed.value.decisionActive());
+    var copy = try cfg.clone(a, parsed.value);
+    defer cfg.release(&copy);
+    try t.expect(!copy.value.decisionActive());
+    try t.expectEqualDeep(parsed.value.decision, copy.value.decision);
+    // A resolved runtime model must not replace persisted model declarations.
+    copy.value.model.name = "runtime-only-model";
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try cfg.writeDisk(copy.value, &out.writer);
+    try t.expect(std.mem.find(u8, out.written(), "decision_enabled") == null);
+    try t.expect(std.mem.find(u8, out.written(), "runtime-only-model") == null);
+    var disk = try cfg.parse(a, out.written());
+    defer cfg.release(&disk);
+    try t.expect(!disk.value.decisionActive());
+    try t.expectEqualDeep(parsed.value.decision, disk.value.decision);
+    try t.expectEqualDeep(parsed.value.registry, disk.value.registry);
+    try t.expectEqualDeep(parsed.value.limits, disk.value.limits);
+    try t.expectEqualDeep(parsed.value.proxy, disk.value.proxy);
+    try t.expectEqualStrings("fixture-key", disk.value.registry.?.find("p").?.connection.api_key.?);
+    try t.expectEqualStrings("FIXTURE_KEY", disk.value.registry.?.find("other").?.connection.api_key_env);
+    copy.value.decision.?.enabled = true;
+    try t.expect(copy.value.decisionActive());
+    try t.expect(!parsed.value.decisionActive());
+    try t.expect(!disk.value.decisionActive());
+}
+
+test "SystemOne backend explicitly owns URL and byte bounds without primary protocol guesses" {
+    const prefix = "{\"llm\":{\"default\":\"main/chat\",\"providers\":{\"main\":{\"base_url\":\"https://api.deepseek.com\"},\"aux\":{\"base_url\":\"https://opencode.ai/inference/systemone/v1\"}}}";
+    var p = try cfg.parse(t.allocator, prefix ++ ",\"decision\":{\"model\":\"aux/jev-1.13-free\",\"backend\":\"systemone\",\"max_state_bytes\":8192}}");
+    defer cfg.release(&p);
+    try t.expect(p.value.decision.?.backend == .systemone);
+    try t.expectEqual(@as(u32, 8192), p.value.decision.?.max_state_bytes);
+    try t.expect(p.value.registry.?.find("aux").?.patchFor("jev-1.13-free") == null);
+    var copy = try cfg.clone(t.allocator, p.value);
+    defer cfg.release(&copy);
+    var out: std.Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    try cfg.writeDisk(copy.value, &out.writer);
+    var roundtrip = try cfg.parse(t.allocator, out.written());
+    defer cfg.release(&roundtrip);
+    try t.expectEqualDeep(copy.value.decision, roundtrip.value.decision);
+    for ([_][]const u8{
+        "{\"model\":\"aux/m\",\"backend\":\"chat\"}",
+        "{\"model\":\"aux/m\",\"backend\":null}",
+        "{\"model\":\"aux/m\",\"max_state_bytes\":0}",
+        "{\"model\":\"aux/m\",\"max_state_bytes\":65537}",
+        "{\"model\":\"aux/m\",\"max_state_bytes\":2.0}",
+    }) |bad| {
+        const text = try std.mem.concat(t.allocator, u8, &.{ prefix, ",\"decision\":", bad, "}" });
+        defer t.allocator.free(text);
+        if (cfg.parse(t.allocator, text)) |parsed| {
+            var unexpected = parsed;
+            cfg.release(&unexpected);
+            return error.ExpectedRejection;
+        } else |_| {}
+    }
+    const providers = @constCast(copy.value.registry.?.providers);
+    providers[1].connection.base_url = "https://opencode.ai/zen/go/v1";
+    try t.expectError(error.InvalidDecisionEndpoint, cfg.validate(copy.value));
+    providers[1].connection.base_url = "https://opencode.ai/zen/v1";
+    try t.expectError(error.InvalidDecisionEndpoint, cfg.validate(copy.value));
+}
+
 const fixture =
     \\{"llm":{"default":"custom/vendor/model","providers":{"custom":{"base_url":"https://proxy.invalid/v1","api_key_env":"CUSTOM_KEY","models":{"vendor/model":{"context_tokens":65536,"reasoning_effort":null},"auto":{"protocol":"auto"}}},"other":{"base_url":"https://other.invalid","api_key":"fake-backup","models":{"vendor/model":{"output_tokens":1234,"reasoning":{"format":"anthropic","map":{"high":"high"}}}}}}}}
 ;

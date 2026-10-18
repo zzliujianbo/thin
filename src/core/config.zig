@@ -190,9 +190,74 @@ fn validAlias(value: []const u8) bool {
     return true;
 }
 
+/// Allocator-owned URL bytes; caller must free with the allocator passed to url.
+pub const OwnedURL = []u8;
+
+/// Explicit HTTP forward proxy, independent of provider endpoints and model scope.
+/// HTTP only, not SOCKS and not an API URL. Address is an unbracketed DNS/IP
+/// host, never a URL or credentials; port is separate.
+pub const ProxyConfig = struct {
+    address: []const u8,
+    port: u16,
+    models: []const []const u8 = &.{},
+
+    /// Caller owns the returned URL. Validate even for in-memory callers.
+    pub fn url(self: ProxyConfig, a: std.mem.Allocator) !OwnedURL {
+        try validateProxyAddress(self.address);
+        if (self.port == 0) return error.InvalidProxyPort;
+        if (std.mem.findScalar(u8, self.address, ':') != null)
+            return std.fmt.allocPrint(a, "http://[{s}]:{d}", .{ self.address, self.port });
+        return std.fmt.allocPrint(a, "http://{s}:{d}", .{ self.address, self.port });
+    }
+};
+
+fn validateProxyAddress(address: []const u8) !void {
+    if (address.len == 0 or address.len > 253) return error.InvalidProxyAddress;
+    if (std.mem.findScalar(u8, address, ':') != null) {
+        // No zone identifiers, brackets, credentials or URI escapes.
+        for (address) |c| if (!std.ascii.isHex(c) and c != ':' and c != '.') return error.InvalidProxyAddress;
+        _ = std.Io.net.IpAddress.parse(address, 1) catch return error.InvalidProxyAddress;
+        return;
+    }
+    const dns = if (address[address.len - 1] == '.') address[0 .. address.len - 1] else address;
+    var labels = std.mem.splitScalar(u8, dns, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63 or label[0] == '-' or label[label.len - 1] == '-') return error.InvalidProxyAddress;
+        for (label) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return error.InvalidProxyAddress;
+    }
+}
+
+fn validateProxy(proxy: ProxyConfig, registry: ?Registry) !void {
+    try validateProxyAddress(proxy.address);
+    if (proxy.port == 0) return error.InvalidProxyPort;
+    if (proxy.models.len > 128) return error.TooManyProxyModels;
+    for (proxy.models, 0..) |name, i| {
+        const selection = splitDefault(name) catch return error.InvalidProxyModel;
+        for (name) |c| if (c == '*' or c == '?' or c == '[' or c == ']') return error.InvalidProxyModel;
+        for (proxy.models[0..i]) |previous| if (std.mem.eql(u8, name, previous)) return error.DuplicateProxyModel;
+        if (registry) |r| if (r.find(selection.provider) == null) return error.UnknownProvider;
+    }
+}
+
+/// Optional global auxiliary model; never a chat selection or capability source.
+pub const DecisionConfig = struct {
+    model: []const u8,
+    enabled: bool = true,
+    /// Explicit auxiliary API, never inferred from a model name or chat protocol.
+    backend: enum { model, systemone } = .model,
+    request_timeout_ms: u32 = 30000,
+    /// Generative backend only; SystemOne has no max_tokens/message context API.
+    max_input_tokens: u32 = 8192,
+    max_output_tokens: u32 = 1024,
+    /// Local SystemOne state bound, not a claim about supplier context capacity.
+    max_state_bytes: u32 = 16384,
+};
+
 /// Owned application configuration. Disk input requires llm declarations;
 /// registry may be absent only for a pure in-memory Runtime snapshot.
 pub const Config = struct {
+    proxy: ?ProxyConfig = null,
+    decision: ?DecisionConfig = null,
     registry: ?Registry = null,
     selected_provider: ?[]const u8 = null,
     selection_pending: bool = false,
@@ -200,6 +265,23 @@ pub const Config = struct {
     model: Model,
     /// 未配置时使用 Limits 中的默认值。
     limits: Limits = .{},
+
+    pub fn decisionActive(self: Config) bool {
+        const decision = self.decision orelse return false;
+        return decision.enabled;
+    }
+
+    /// Exact alias/raw-ID allowlist; absent identity or an empty list is direct.
+    /// Returned slices borrow this Config's lifetime.
+    pub fn proxyFor(self: Config, provider_alias: ?[]const u8, raw_id: []const u8) ?ProxyConfig {
+        const alias = provider_alias orelse return null;
+        const proxy = self.proxy orelse return null;
+        for (proxy.models) |name| {
+            const selection = splitDefault(name) catch continue;
+            if (std.mem.eql(u8, selection.provider, alias) and std.mem.eql(u8, selection.model, raw_id)) return proxy;
+        }
+        return null;
+    }
 };
 
 /// 配置文件的大小上限（64 KiB），超过则直接拒绝，防止占用过多内存。
@@ -268,8 +350,9 @@ fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, d
 const json_options: std.json.ParseOptions = .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" };
 
 fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
-    if (T == ModelPatch or T == Limits) {
+    if (T == ModelPatch or T == Limits or T == DecisionConfig or T == ProxyConfig) {
         const fields = try object(value);
+        if (T == DecisionConfig) _ = try string(fields.get("model") orelse return error.MissingField);
         var it = fields.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.* == .float or entry.value_ptr.* == .number_string) return error.InvalidNumber;
@@ -308,7 +391,7 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
     const root = try object(tree.value);
     var keys = root.iterator();
     while (keys.next()) |entry| {
-        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits")) return error.UnknownField;
+        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "decision") and !std.mem.eql(u8, entry.key_ptr.*, "proxy")) return error.UnknownField;
     }
     const llm_value = root.get("llm") orelse return error.MissingField;
     const result: Config = blk: {
@@ -356,7 +439,9 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         const limits = if (root.get("limits")) |v| try decode(Limits, a, v) else Limits{};
         if (limits.safety_tokens > 1024 * 1024) return error.InvalidBudget;
         const context: u32 = @max(32768, limits.safety_tokens + 2);
-        break :blk .{ .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
+        const decision = if (root.get("decision")) |v| if (v == .null) null else try decode(DecisionConfig, a, v) else null;
+        const proxy = if (root.get("proxy")) |v| if (v == .null) null else try decode(ProxyConfig, a, v) else null;
+        break :blk .{ .proxy = proxy, .decision = decision, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
     };
     try validate(result);
     tree.arena.child_allocator = allocator;
@@ -403,6 +488,14 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
         try s.endObject();
         try s.objectField("limits");
         try s.write(config.limits);
+        if (config.proxy) |proxy| {
+            try s.objectField("proxy");
+            try s.write(proxy);
+        }
+        if (config.decision) |decision| {
+            try s.objectField("decision");
+            try s.write(decision);
+        }
         try s.endObject();
     }
 }
@@ -558,10 +651,27 @@ fn validateUrl(url: []const u8) !void {
 pub fn validate(config: Config) !void {
     try validateUrl(config.provider.base_url);
     try validateKeySource(config.provider);
-    if (config.provider.kind) |declared| if (providers.Id.fromUrl(config.provider.base_url)) |actual| {
+    if (config.provider.kind) |declared| if (providers.Id.fromUrl(config.provider.base_url) orelse providers.Id.fromSystemOneUrl(config.provider.base_url)) |actual| {
         if (declared != actual) return error.ProviderEndpointMismatch;
     };
     if (config.registry) |registry| try validateRegistry(registry, config.limits);
+    if (config.proxy) |proxy| try validateProxy(proxy, config.registry);
+    if (config.decision) |decision| {
+        const selection = try splitDefault(decision.model);
+        const registry = config.registry orelse return error.MissingRegistry;
+        const auxiliary = registry.find(selection.provider) orelse return error.UnknownProvider;
+        if (decision.backend == .systemone) {
+            // A known official connection cannot silently change API families.
+            // Custom SystemOne URLs remain explicit user declarations.
+            if (providers.Id.fromUrl(auxiliary.connection.base_url) != null and
+                !std.mem.eql(u8, std.mem.trimEnd(u8, auxiliary.connection.base_url, "/"), "https://opencode.ai/inference/systemone/v1"))
+                return error.InvalidDecisionEndpoint;
+        }
+        if (decision.max_state_bytes < 2 or decision.max_state_bytes > 65536) return error.InvalidLimit;
+        if (decision.request_timeout_ms == 0 or decision.request_timeout_ms > 3600000 or
+            decision.max_input_tokens < 2 or decision.max_input_tokens > 16 * 1024 * 1024 or
+            decision.max_output_tokens == 0 or decision.max_output_tokens > 16 * 1024 * 1024) return error.InvalidLimit;
+    }
 
     const l = config.limits;
     // Null means unlimited rounds / automatic output; explicit limits are positive.
@@ -612,7 +722,7 @@ fn validateRegistry(registry: Registry, limits: Limits) !void {
         for (registry.providers[0..i]) |previous| if (std.mem.eql(u8, previous.name, p.name)) return error.DuplicateProvider;
         try validateUrl(p.connection.base_url);
         try validateKeySource(p.connection);
-        if (p.connection.kind) |declared| if (providers.Id.fromUrl(p.connection.base_url)) |actual| {
+        if (p.connection.kind) |declared| if (providers.Id.fromUrl(p.connection.base_url) orelse providers.Id.fromSystemOneUrl(p.connection.base_url)) |actual| {
             if (declared != actual) return error.ProviderEndpointMismatch;
         };
         total += p.models.len;

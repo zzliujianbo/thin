@@ -15,6 +15,39 @@ const configuration = cfg.Config{
     .model = .{ .name = "fake", .context_tokens = 32768 },
 };
 
+test "executor selects decision-aware descriptions without changing tool parameters" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buffer);
+    var root = try fs.Root.open(a, std.testing.io, buffer[0..n]);
+    defer root.deinit();
+    var store = mem.Store.init(&root, .{});
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    var config = configuration;
+    var tools = t.Tools{ .root = &root, .memory = &store, .config = &config, .environment = &environment };
+    const plain = tools.executor().schemas;
+    try std.testing.expect(std.mem.indexOf(u8, plain[2].description, "decision review disabled") != null);
+    for ([_]cfg.DecisionConfig{
+        .{ .model = "judge/fake" },
+        .{ .model = "judge/jev-fixture", .backend = .systemone },
+    }) |decision| {
+        config.decision = decision;
+        const reviewed = tools.executor().schemas;
+        try std.testing.expectEqual(plain.len, reviewed.len);
+        for (plain, reviewed) |old, current| {
+            try std.testing.expectEqualStrings(old.name, current.name);
+            try std.testing.expectEqualStrings(old.parameters_json, current.parameters_json);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=false removes") != null);
+        try std.testing.expect(std.mem.indexOf(u8, reviewed[3].description, "write candidates are reviewed") != null);
+    }
+    config.decision = null;
+    try std.testing.expectEqualStrings(plain[2].description, tools.executor().schemas[2].description);
+}
+
 test "file observations reflect actual returned ranges and pre-write snapshot changes" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -357,5 +390,51 @@ test "mutating file and Memory tool allocation failures precede commits" {
             break;
         }
         try std.testing.expect(reached_success);
+    }
+}
+
+test "tools prepare decision inputs without side effects and honor explicit no deadline" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(a, io, buffer[0..n]);
+    defer root.deinit();
+    var config = configuration;
+    config.limits.command_timeout_ms = 1;
+    var store = mem.Store.init(&root, config.limits);
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    var tools = t.Tools{ .root = &root, .memory = &store, .config = &config, .environment = &environment };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const executor = tools.executor();
+    const write = try executor.prepare_fn(executor.context, alloc, .{
+        .id = "memory",
+        .name = "memory",
+        .arguments = "{\"action\":\"write\",\"topic\":\"style\",\"content\":\"Prefer concise reports.\"}",
+    });
+    try std.testing.expectEqualStrings("style", write.decision_input.?.memory_write.topic);
+    try std.testing.expect(write.requires_approval);
+    try std.testing.expectError(error.FileNotFound, store.read(alloc, "style"));
+    const list = try executor.prepare_fn(executor.context, alloc, .{ .id = "list", .name = "memory", .arguments = "{\"action\":\"list\"}" });
+    try std.testing.expect(list.decision_input == null);
+    var cancel = p.Cancellation{};
+    for ([_]@import("../core/decision.zig").Timeout{ .none, .{ .milliseconds = 1000 } }) |timeout| {
+        var prepared = try executor.prepare_fn(executor.context, alloc, .{
+            .id = "command",
+            .name = "bash",
+            .arguments = "{\"command\":\"sleep 0.02; printf ready\"}",
+        });
+        try std.testing.expectEqual(@as(u32, config.limits.command_max_timeout_ms), prepared.decision_input.?.command.max_timeout_ms);
+        prepared.command_timeout = timeout;
+        const result = try executor.execute_fn(executor.context, alloc, prepared, &cancel);
+        try std.testing.expect(!result.is_error);
+        const value = try j.parse(alloc, result.text);
+        try std.testing.expectEqualStrings("ready", j.string(j.get(value, "stdout")).?);
+        try std.testing.expectEqual(false, j.get(value, "timed_out").?.bool);
     }
 }

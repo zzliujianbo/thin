@@ -2,12 +2,13 @@
 const std = @import("std");
 const text = @import("text.zig");
 
-pub const Command = enum { model, auth, compact };
+pub const Command = enum { model, auth, compact, settings };
 pub const Item = struct { command: Command, value: []const u8, arguments: []const u8 = "", description: []const u8 };
 pub const items = [_]Item{
     .{ .command = .model, .value = "/model", .arguments = "[exact-id|--refresh]", .description = "Select model" },
     .{ .command = .auth, .value = "/login", .description = "Configure provider" },
     .{ .command = .compact, .value = "/compact", .description = "Compact conversation" },
+    .{ .command = .settings, .value = "/settings", .description = "Global settings" },
 };
 
 pub const Matches = struct {
@@ -129,7 +130,7 @@ pub const Menu = struct {
 
 test "slash suggestions preserve model login compact order and support local fuzzy search" {
     const all = suggestions("/", 1, false);
-    try std.testing.expectEqual(@as(usize, 3), all.len);
+    try std.testing.expectEqual(@as(usize, 4), all.len);
     try std.testing.expectEqual(Command.model, all.commands[0]);
     try std.testing.expectEqual(Command.auth, all.commands[1]);
     try std.testing.expectEqual(Command.compact, all.commands[2]);
@@ -163,7 +164,7 @@ test "command rows are bounded clipped and mark the selection" {
         for (rendered.lines) |line| a.free(line);
         a.free(rendered.lines);
     }
-    try std.testing.expectEqual(@as(usize, 3), rendered.lines.len);
+    try std.testing.expectEqual(@as(usize, 4), rendered.lines.len);
     try std.testing.expect(rendered.can_confirm);
     try std.testing.expectEqual(@as(usize, 1), rendered.selected_line.?);
     try std.testing.expect(std.mem.indexOf(u8, rendered.lines[1], "> ") != null);
@@ -288,7 +289,7 @@ test "slash selection wraps and dismissal lasts until an edit" {
     var menu: Menu = .{};
     const all = suggestions("/", 1, false);
     menu.move(false, all.len);
-    try std.testing.expectEqual(Command.compact, menu.choice(all).?);
+    try std.testing.expectEqual(Command.settings, menu.choice(all).?);
     menu.move(true, all.len);
     try std.testing.expectEqual(Command.model, menu.choice(all).?);
     menu.move(true, all.len);

@@ -254,7 +254,8 @@ pub const PromptActivity = struct {
     /// Transient level confirmation: temporarily replaces the context percentage
     /// in the prefix with the chosen level name; the owner expires it.
     effort_flash: ?shared.ReasoningEffort = null,
-    /// Owner snapshot of the input policy, independent of latest usage.
+    /// Owner says tiered-price protection is active for the selected model;
+    /// not merely the global toggle, and never inferred from latest usage.
     low_price_input: bool = false,
 };
 
@@ -272,7 +273,7 @@ pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Context
     else
         try contextLabel(a, snapshot);
     defer a.free(value);
-    const percentage = try std.fmt.allocPrint(a, "{s}{s}", .{ if (motion.low_price_input) "L " else "", value });
+    const percentage = try std.fmt.allocPrint(a, "{s}{s}", .{ if (motion.low_price_input) "L" else "", value });
     defer a.free(percentage);
     const marker = if (motion.busy) activity.spinner(motion.now_ms) else ">";
     const reserve: usize = @min(@as(usize, 24), columns / 3);
@@ -312,8 +313,8 @@ pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Context
         // the policy marker into a TPS animation or a reasoning-level color.
         const separate_marker = motion.low_price_input and motion.effort_flash != null;
         if (separate_marker) {
-            try out.writer.print("{s}L{s} ", .{ context_color, theme.reset });
-            ordinal += 2;
+            try out.writer.print("{s}L{s}", .{ context_color, theme.reset });
+            ordinal += 1;
         }
         const slot = if (separate_marker) value else percentage;
         if (slot_flow) {
@@ -492,10 +493,13 @@ test "low price marker shares the full static context color and optout removes i
     for (cases) |case| for ([_]bool{ false, true }) |enabled| for ([_]bool{ false, true }) |busy| for ([_]usize{ 0, 11 }) |phase| {
         const value = try prompt(a, "fixture", case.snapshot, 79, .{ .busy = busy, .now_ms = 80, .phase = phase, .rate_band = .fast, .reasoning_effort = .high, .low_price_input = enabled });
         defer value.deinit(a);
-        const suffix = try std.fmt.allocPrint(a, " {s}{s}{s}{s}) {s} ", .{ case.color, if (enabled) "L " else "", case.label, theme.reset, if (busy) activity.spinner(80) else ">" });
+        const suffix = try std.fmt.allocPrint(a, " {s}{s}{s}{s}) {s} ", .{ case.color, if (enabled) "L" else "", case.label, theme.reset, if (busy) activity.spinner(80) else ">" });
         defer a.free(suffix);
         try std.testing.expect(std.mem.endsWith(u8, value.styled, suffix));
-        try std.testing.expectEqual(enabled, std.mem.find(u8, value.plain, "L ") != null);
+        const label = try std.mem.concat(a, u8, &.{ "L", case.label });
+        defer a.free(label);
+        try std.testing.expectEqual(enabled, std.mem.find(u8, value.plain, label) != null);
+        try std.testing.expect(std.mem.find(u8, value.plain, "L ") == null);
         try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
     };
     for (0..80) |columns| {
@@ -503,7 +507,7 @@ test "low price marker shares the full static context color and optout removes i
         defer value.deinit(a);
         try std.testing.expect(text.width(value.plain) <= @max(columns, 2));
         try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
-        if (std.mem.find(u8, value.plain, "L ") != null) try std.testing.expect(std.mem.find(u8, value.plain, "L 10.0%") != null);
+        if (std.mem.findScalar(u8, value.plain, 'L') != null) try std.testing.expect(std.mem.find(u8, value.plain, "L10.0%") != null);
     }
 }
 
@@ -512,8 +516,9 @@ test "low price marker stays context colored during effort flashes" {
     for ([_]bool{ false, true }) |busy| {
         const value = try prompt(a, "fixture", .{ .tokens = 50, .limit = 100 }, 79, .{ .busy = busy, .reasoning_effort = .medium, .effort_flash = .medium, .phase = 7, .low_price_input = true });
         defer value.deinit(a);
-        try std.testing.expect(std.mem.find(u8, value.plain, "L medium") != null);
-        try std.testing.expect(std.mem.find(u8, value.styled, theme.failure ++ "L" ++ theme.reset ++ " ") != null);
+        try std.testing.expect(std.mem.find(u8, value.plain, "Lmedium") != null);
+        try std.testing.expect(std.mem.find(u8, value.styled, theme.failure ++ "L" ++ theme.reset) != null);
+        try std.testing.expect(std.mem.find(u8, value.plain, "L ") == null);
         try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
     }
 }

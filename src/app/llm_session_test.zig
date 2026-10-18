@@ -17,7 +17,7 @@ fn save(home: []const u8, text: []const u8) !void {
     try store.root.writeMode(cfg.file_name, text, false, 0o600);
 }
 
-test "low price policy owner snapshot reflects default and explicit optout before configuration" {
+test "pending model has no low price marker while global defaults and explicit optout stay unchanged" {
     for ([_][]const u8{ "{}", "{\"low_price_input\":true}", "{\"low_price_input\":false}" }) |limits| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -32,9 +32,126 @@ test "low price policy owner snapshot reflects default and explicit optout befor
         var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
         defer session.deinit();
         const state = session.connection().current();
-        try std.testing.expectEqual(std.mem.find(u8, limits, "false") == null, state.low_price_input);
+        try std.testing.expectEqual(std.mem.find(u8, limits, "false") == null, session.global_config.?.value.limits.low_price_input);
+        try std.testing.expect(!state.low_price_input);
         try std.testing.expect(state.runtime == null); // Still pending, no inference.
     }
+}
+
+test "current model marker needs enabled known price step rather than flat unknown or a model name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home,
+        \\{"llm":{"default":"route/fixture","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-local-only","models":{"fixture":{"protocol":"chat","context_tokens":1000000}}}}}}
+    );
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    defer session.deinit();
+    try std.testing.expect(session.app != null);
+    const active = &session.app.?.config.value;
+    const context = @import("../core/context.zig");
+    const cases = [_]struct { name: []const u8, step: ?u32, flat: ?u32, marker: bool }{
+        .{ .name = "deepseek-flash", .step = null, .flat = 1000000, .marker = false },
+        .{ .name = "claude-haiku-5-5", .step = 100000, .flat = null, .marker = true },
+        .{ .name = "claude-haiku-5-5", .step = null, .flat = null, .marker = false },
+        .{ .name = "unrelated-name", .step = 100000, .flat = null, .marker = true },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |enabled| {
+        // Synthetic resolved capabilities, never written to disk or fetched.
+        active.model.name = case.name;
+        active.model.input_price_threshold = case.step;
+        active.model.input_price_flat_limit = case.flat;
+        active.limits.low_price_input = enabled;
+        const budget = context.inputBudget(active.*);
+        const state = session.connection().current();
+        try std.testing.expectEqual(enabled and case.marker, state.low_price_input);
+        try std.testing.expectEqual(@as(u32, 1000000), state.context_limit);
+        try std.testing.expectEqual(enabled, active.limits.low_price_input);
+        try std.testing.expectEqual(budget, context.inputBudget(active.*));
+        if (enabled and case.step == null and case.flat == null)
+            try std.testing.expectError(error.UnknownInputPriceThreshold, context.validateInputPolicy(active.*));
+    };
+    active.limits.low_price_input = true;
+    active.selection_pending = true;
+    try std.testing.expect(!session.connection().current().low_price_input);
+}
+
+fn expectInactiveHistoryWithoutLowPriceMarker(session: *Session, read_only: bool) !void {
+    const context = @import("../core/context.zig");
+    try std.testing.expect(session.app == null and session.read_only == read_only);
+    const config = &session.pending.?.value;
+    try std.testing.expect(!config.selection_pending);
+    try std.testing.expectEqual(@as(?u32, 20000), config.model.input_price_threshold);
+    const budget = context.inputBudget(config.*);
+    const connection = session.connection();
+    const state = connection.current();
+    try std.testing.expect(state.runtime == null and !state.low_price_input);
+    try std.testing.expect(state.low_price_input_enabled and config.limits.low_price_input);
+    try std.testing.expectEqual(@as(u32, 65536), state.context_limit);
+    try std.testing.expectEqual(@as(u64, 65536), state.initial_context.?.limit);
+    try std.testing.expectEqual(budget, context.inputBudget(config.*));
+    try context.validateInputPolicy(config.*);
+    const history = connection.initial_history_fn.?(connection.context);
+    try std.testing.expectEqual(@as(usize, 2), history.len);
+    try std.testing.expectEqualStrings("owned marker history", history[0].blocks[0].text);
+    try std.testing.expectEqualStrings("owned marker answer", history[1].blocks[0].text);
+}
+
+test "restored known price history has no L without ready runtime for missing key or readonly lease" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const declaration =
+        \\{"llm":{"default":"go/fixture","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key_env":"MARKER_FIXTURE_KEY","models":{"fixture":{"protocol":"chat","context_tokens":65536}}}}}}
+    ;
+    try save(home, declaration);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("MARKER_FIXTURE_KEY", "fake-owned-marker-key");
+    {
+        var store = try Store.openExisting(a, io, home);
+        defer store.deinit();
+        var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"fixture\",\"protocol\":\"chat\",\"context_window\":65536}]}", .opencode_go);
+        listing.dev_done = true;
+        const row = &listing.directory.rows[0];
+        row.dev_present = true;
+        row.dev_protocol = .chat;
+        row.dev_context_tokens = 65536;
+        row.dev_input_price_threshold = 20000;
+        _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+    }
+    var id: @import("session_id.zig").Id = undefined;
+    {
+        var source = try Session.initWithOptions(a, io, &env, home, .{}, true, .{});
+        defer source.deinit();
+        id = source.session_id;
+        const app = source.app.?;
+        try std.testing.expect(source.connection().current().low_price_input);
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "owned marker history" }} });
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .assistant, .blocks = &.{.{ .text = "owned marker answer" }} });
+        try std.testing.expect(try source.saveOnExit());
+    }
+    {
+        var holder = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id });
+        defer holder.deinit();
+        try std.testing.expect(holder.app != null and holder.resume_lease.?.writable);
+        var readonly = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id });
+        defer readonly.deinit();
+        try expectInactiveHistoryWithoutLowPriceMarker(&readonly, true);
+    }
+    var missing_env = std.process.Environ.Map.init(a);
+    defer missing_env.deinit();
+    try missing_env.put("HOME", home);
+    var missing = try Session.initWithOptions(a, io, &missing_env, home, .{}, true, .{ .resume_session = id, .logging = false });
+    defer missing.deinit();
+    try expectInactiveHistoryWithoutLowPriceMarker(&missing, false);
 }
 
 test "publication current capabilities stay isolated by model and route" {

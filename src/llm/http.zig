@@ -10,7 +10,9 @@ const responses = @import("responses.zig");
 const anthropic = @import("anthropic.zig");
 const common = @import("common.zig");
 const pool = @import("http_pool.zig");
+const curl = @import("decision_http.zig");
 const Io = std.Io;
+const uncanceled: p.Cancellation = .{};
 
 /// 模型客户端：持有 API 密钥的 Authorization 头副本与底层 std.http.Client。
 /// 同一个 Client 的请求在 worker 中串行化（锁等待也可取消/计入预算）；
@@ -27,12 +29,21 @@ pub const Client = struct {
     /// Guards request ownership and the timestamp, not merely pool traversal.
     request_mutex: Io.Mutex = .init,
     last_request_finish: ?Io.Timestamp = null,
+    /// Only explicitly listed identities use curl's verified CONNECT + target
+    /// TLS. Direct requests retain the native pool and never read proxy env.
+    proxy_http: ?curl.Client = null,
     /// OpenCode routing identity, stable across requests. The application can
     /// replace the local headless fallback with its immutable session ID.
     session_id: ?[32]u8 = null,
 
     /// 创建客户端并校验密钥。密钥需非空、长度不超过 16KB，且不含控制字符（防止 HTTP 头注入）。
     pub fn init(allocator: std.mem.Allocator, io: Io, config: *const cfg.Config, key: []const u8) !Client {
+        var empty = std.process.Environ.Map.init(allocator);
+        defer empty.deinit();
+        return initWithEnv(allocator, io, config, key, &empty);
+    }
+
+    pub fn initWithEnv(allocator: std.mem.Allocator, io: Io, config: *const cfg.Config, key: []const u8, env: *const std.process.Environ.Map) !Client {
         // 控制字符会破坏 HTTP 头格式，因此在这里拒绝。
         if (key.len == 0 or key.len > 16384) return error.InvalidApiKey;
         for (key) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidApiKey;
@@ -42,11 +53,22 @@ pub const Client = struct {
             try io.randomSecure(&random);
             break :blk std.fmt.bytesToHex(random, .lower);
         } else null;
+        const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{key});
+        errdefer {
+            std.crypto.secureZero(u8, authorization);
+            allocator.free(authorization);
+        }
+        const proxy_http: ?curl.Client = if (config.proxyFor(config.selected_provider, config.model.name)) |route| blk: {
+            const url = try route.url(allocator);
+            defer allocator.free(url);
+            break :blk try curl.Client.initRouted(allocator, io, env, url);
+        } else null;
         return .{
             .allocator = allocator,
             .io = io,
             .config = config,
-            .authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{key}),
+            .authorization = authorization,
+            .proxy_http = proxy_http,
             .http = .{ .allocator = allocator, .io = io },
             .session_id = session_id,
         };
@@ -55,6 +77,7 @@ pub const Client = struct {
     /// 释放连接池与密钥副本。
     pub fn deinit(self: *Client) void {
         self.http.deinit();
+        if (self.proxy_http) |*transport| transport.deinit();
         // 先清零再释放，减少密钥在堆内存中残留的时间。
         std.crypto.secureZero(u8, self.authorization);
         self.allocator.free(self.authorization);
@@ -92,6 +115,8 @@ pub const Client = struct {
         // 回放作用域必须与当前连接、模型一致，避免把历史 replay 发送到其他端点。
         if (!std.mem.eql(u8, request.scope.connection, self.config.provider.base_url) or
             !std.mem.eql(u8, request.scope.model, self.config.model.name)) return error.ReplayScopeMismatch;
+        try self.checkProxyCleanup();
+        try self.checkProxyRoute();
         // 开始传输前已取消则直接返回，不启动 worker。
         if (request.cancellation) |cancel| if (cancel.isRequested())
             return failure(.canceled, "Model request canceled before transport", null, false);
@@ -109,6 +134,7 @@ pub const Client = struct {
             if (request.cancellation) |cancel| {
                 if (cancel.isRequested()) {
                     _ = future.cancel(self.io) catch {};
+                    try self.checkProxyCleanup();
                     var outcome = failure(.canceled, "Model request canceled", null, job.observed.load(.acquire));
                     outcome.failure.usage = job.last_usage;
                     return outcome;
@@ -116,6 +142,7 @@ pub const Client = struct {
             }
             if (start.untilNow(self.io, .awake).toMilliseconds() >= self.config.limits.request_timeout_ms) {
                 _ = future.cancel(self.io) catch {};
+                try self.checkProxyCleanup();
                 var outcome = failure(.timeout, "Model request exceeded its time limit", null, job.observed.load(.acquire));
                 outcome.failure.usage = job.last_usage;
                 return outcome;
@@ -124,6 +151,7 @@ pub const Client = struct {
             // worker before its result arena or request data may be released.
             Io.sleep(self.io, .fromMilliseconds(5), .awake) catch |err| {
                 _ = future.cancel(self.io) catch {};
+                try self.checkProxyCleanup();
                 if (err != error.Canceled) return err;
                 var outcome = failure(.canceled, "Model request canceled", null, job.observed.load(.acquire));
                 outcome.failure.usage = job.last_usage;
@@ -133,7 +161,7 @@ pub const Client = struct {
 
         // worker 已结束，取回结果；OOM 原样上抛，取消与其他错误转换为对应的失败类型。
         var outcome = future.await(self.io) catch |err| switch (err) {
-            error.OutOfMemory => return err,
+            error.OutOfMemory, error.CleanupFailed => return err,
             error.Canceled => failure(.canceled, "Model request canceled", null, job.observed.load(.acquire)),
             error.RequestTimeout => failure(.timeout, "Model request exceeded its time limit", null, job.observed.load(.acquire)),
             else => failure(.transport, "Model transport failed", null, job.observed.load(.acquire)),
@@ -143,7 +171,7 @@ pub const Client = struct {
         if (outcome == .failure) {
             common.mergeUsage(&outcome.failure.usage, job.last_usage);
         }
-        return outcome;
+        return job.complete(outcome);
     }
 
     /// 一次请求在 I/O worker 与主协程之间共享的状态。
@@ -170,6 +198,21 @@ pub const Client = struct {
                 return error.RequestTimeout;
         }
 
+        /// A worker can finish between poll ticks, including after child
+        /// cleanup. Never publish a late success or discard its paid usage.
+        fn complete(self: *const Job, outcome: p.Outcome) p.Outcome {
+            self.checkBudget() catch |err| {
+                var expired = failure(if (err == error.Canceled) .canceled else .timeout, if (err == error.Canceled) "Model request canceled" else "Model request exceeded its time limit", null, self.observed.load(.acquire));
+                expired.failure.usage = self.last_usage;
+                common.mergeUsage(&expired.failure.usage, switch (outcome) {
+                    .success => |response| response.usage,
+                    .failure => |detail| detail.usage,
+                });
+                return expired;
+            };
+            return outcome;
+        }
+
         /// 由流解析器调用的事件回调：记录最新 usage 快照，并转发给调用方的 sink。
         fn emit(context: ?*anyopaque, event: p.ModelEvent) !void {
             const self: *Job = @ptrCast(@alignCast(context.?));
@@ -180,6 +223,88 @@ pub const Client = struct {
             try self.sink.emit(event);
         }
     };
+
+    /// Configuration is borrowed read-only. If a caller nevertheless replaces
+    /// its route, refuse the stale client rather than silently sending direct.
+    fn checkProxyRoute(self: *const Client) !void {
+        const route = self.config.proxyFor(self.config.selected_provider, self.config.model.name);
+        if (route) |selected| {
+            const transport = if (self.proxy_http) |*t| t else return error.ProxyRouteChanged;
+            const actual = transport.proxy_url orelse return error.ProxyRouteChanged;
+            const expected = try selected.url(self.allocator);
+            defer self.allocator.free(expected);
+            if (!std.mem.eql(u8, expected, actual)) return error.ProxyRouteChanged;
+        } else if (self.proxy_http != null) return error.ProxyRouteChanged;
+    }
+
+    fn checkProxyCleanup(self: *const Client) !void {
+        if (self.proxy_http) |*transport| if (transport.poisoned) return error.CleanupFailed;
+    }
+
+    const ProxyBody = struct {
+        job: *Job,
+        decoder: *sse.Decoder,
+        allocator: std.mem.Allocator,
+        error_body: std.ArrayList(u8) = .empty,
+        head: ?curl.StreamHead = null,
+
+        fn check(raw: *anyopaque) !void {
+            const self: *ProxyBody = @ptrCast(@alignCast(raw));
+            try self.job.checkBudget();
+        }
+
+        fn write(raw: *anyopaque, head: curl.StreamHead, bytes: []const u8) !void {
+            const self: *ProxyBody = @ptrCast(@alignCast(raw));
+            try self.job.checkBudget();
+            self.head = head;
+            if (head.status != 200) {
+                if (bytes.len > 65536 - self.error_body.items.len) return error.CurlResponseTooLarge;
+                return self.error_body.appendSlice(self.allocator, bytes);
+            }
+            if (!head.is_sse) return error.ExpectedSse;
+            self.decoder.feed(bytes) catch |err| switch (err) {
+                error.OutOfMemory, error.Canceled => return err,
+                else => return error.InvalidModelEvent,
+            };
+        }
+    };
+
+    fn performProxy(job: *Job, transport: *curl.Client, a: std.mem.Allocator, address: []const u8, payload: []const u8) !p.Outcome {
+        try job.checkBudget();
+        try job.client.checkProxyCleanup();
+        var header_buffer: [4]std.http.Header = undefined;
+        const extra = try job.client.requestHeaders(job.request.scope.protocol, &header_buffer);
+        var headers: [5]std.http.Header = undefined;
+        @memcpy(headers[0..extra.len], extra);
+        var count = extra.len;
+        if (job.request.scope.protocol != .anthropic) {
+            headers[count] = .{ .name = "authorization", .value = job.client.authorization };
+            count += 1;
+        }
+        var stream: Stream = switch (job.request.scope.protocol) {
+            .chat => .{ .chat = chat.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
+            .responses => .{ .responses = responses.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
+            .anthropic => .{ .anthropic = anthropic.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
+            .auto => unreachable,
+        };
+        var decoder = sse.Decoder.init(job.client.allocator, job.client.config.limits.max_event_bytes, .{ .context = &stream, .emit_fn = Stream.feed });
+        defer decoder.deinit();
+        var body: ProxyBody = .{ .job = job, .decoder = &decoder, .allocator = a };
+        const remaining: u32 = @intCast(@max(1, @as(i64, job.client.config.limits.request_timeout_ms) - job.start.untilNow(job.client.io, .awake).toMilliseconds()));
+        const head = transport.streamPost(a, address, headers[0..count], payload, @max(1, remaining), job.client.config.limits.max_response_bytes, .{ .context = &body, .write_fn = ProxyBody.write, .check_fn = ProxyBody.check }, job.request.cancellation orelse &uncanceled) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled, error.CleanupFailed, error.RequestTimeout => return err,
+            error.Timeout => return error.RequestTimeout,
+            error.InvalidHttpHead, error.ExpectedSse, error.InvalidModelEvent, error.CurlResponseTooLarge => return failure(.protocol, "Invalid or oversized proxied model response", if (body.head) |h| h.status else null, stream.observed()),
+            else => return failure(.transport, "Model proxy transport failed", if (body.head) |h| h.status else null, stream.observed()),
+        };
+        if (head.status != 200) return classifyHttpError(job.allocator, head.status, body.error_body.items);
+        if (!head.is_sse) return failure(.protocol, "Expected an SSE response", head.status, false);
+        decoder.finish() catch return failure(.protocol, "Incomplete SSE event", head.status, stream.observed());
+        return stream.finish() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => failure(.protocol, "Model response did not complete safely", head.status, stream.observed()),
+        };
+    }
 
     /// Retry acquisition only. std 0.17 request() validates URI/CA and
     /// acquires TCP/TLS (or a pooled connection), but sends no model headers
@@ -224,6 +349,8 @@ pub const Client = struct {
 
         // 去掉 base_url 结尾的斜杠，再拼接各协议固定的端点路径。
         const address = try requestAddress(a, self.config.provider.base_url, protocol);
+
+        if (self.proxy_http) |*transport| return performProxy(job, transport, a, address, payload);
 
         // Before acquiring a socket, drop expired/closed/unread idle connections.
         // This sends nothing and never retries a POST. boot includes suspend time.
@@ -419,6 +546,55 @@ const Stream = union(enum) {
 /// 构造失败结果。message 必须是静态字符串或不含上游敏感内容的文本，避免泄露 API 返回的原始信息。
 fn failure(kind: p.FailureKind, message: []const u8, status: ?u16, observed: bool) p.Outcome {
     return .{ .failure = .{ .kind = kind, .message = message, .http_status = status, .observed_content = observed } };
+}
+
+test "completed worker cannot publish late tools or hide usage at the final deadline gate" {
+    var config: cfg.Config = .{ .provider = .{ .base_url = "https://example.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 32768 }, .limits = .{ .request_timeout_ms = 1 } };
+    var client = try Client.init(std.testing.allocator, std.testing.io, &config, "fake");
+    defer client.deinit();
+    var cancel: p.Cancellation = .{};
+    var job: Client.Job = .{
+        .client = &client,
+        .allocator = std.testing.allocator,
+        .request = .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = "fixed", .tools = &.{}, .messages = &.{}, .max_output_tokens = 1, .cancellation = &cancel },
+        .sink = .{},
+        .start = Io.Clock.awake.now(std.testing.io),
+        .last_usage = .{ .output_tokens = 2 },
+    };
+    const response: p.Outcome = .{ .success = .{
+        .message = .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "complete", .name = "lookup", .arguments = "{}" } }} },
+        .finish = .tool_calls,
+        .usage = .{ .input_tokens = 7, .output_tokens = 3 },
+    } };
+    try Io.sleep(std.testing.io, .fromMilliseconds(3), .awake);
+    job.done.store(true, .release); // The polling loop would not run again.
+    const late = job.complete(response);
+    try std.testing.expect(late == .failure and late.failure.kind == .timeout);
+    try std.testing.expectEqual(@as(?u64, 7), late.failure.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 3), late.failure.usage.output_tokens);
+    cancel.cancel();
+    try std.testing.expect(job.complete(response).failure.kind == .canceled);
+}
+
+test "model proxy route cannot silently reuse a stale direct client after alias change" {
+    var config: cfg.Config = .{
+        .provider = .{ .base_url = "https://example.invalid/v1" },
+        .selected_provider = "other",
+        .model = .{ .name = "vendor/id", .context_tokens = 32768 },
+        .proxy = .{ .address = "127.0.0.1", .port = 7890, .models = &.{"listed/vendor/id"} },
+    };
+    var client = try Client.init(std.testing.allocator, std.testing.io, &config, "fake");
+    defer client.deinit();
+    try client.checkProxyRoute();
+    config.selected_provider = "listed";
+    try std.testing.expectError(error.ProxyRouteChanged, client.checkProxyRoute());
+    var listed = try Client.init(std.testing.allocator, std.testing.io, &config, "fake");
+    defer listed.deinit();
+    try listed.checkProxyRoute();
+    config.proxy.?.port = 7891;
+    try std.testing.expectError(error.ProxyRouteChanged, listed.checkProxyRoute());
+    config.selected_provider = "other";
+    try std.testing.expectError(error.ProxyRouteChanged, listed.checkProxyRoute());
 }
 
 test "OpenCode routing headers are stable explicit and absent on other services" {

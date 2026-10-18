@@ -12,6 +12,7 @@ pub fn write(writer: *std.Io.Writer, label: []const u8, detail: ?anyerror, kind:
         try writer.print(": {s}", .{@errorName(err)});
         if (err == error.InputBudgetExceeded) try writer.writeAll("; estimated input budget reached; compact context or adjust input policy");
         if (err == error.InputBudgetSummaryFailed) try writer.writeAll("; summary failed; history kept, no further inference sent");
+        if (err == error.DecisionUnavailable) try writer.writeAll("; decision review unavailable; operation not executed, no further inference sent");
         if (err == error.UnknownInputPriceThreshold) try writer.writeAll("; low-price threshold unavailable; refresh metadata and reselect, or explicitly disable limits.low_price_input");
     }
     if (kind) |failure| {

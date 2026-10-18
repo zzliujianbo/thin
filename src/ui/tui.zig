@@ -12,6 +12,7 @@ const input = @import("input.zig");
 const picker_module = @import("model_picker.zig");
 const provider_picker_module = @import("provider_picker.zig");
 const command_menu_module = @import("command_menu.zig");
+const settings_menu_module = @import("settings_menu.zig");
 const text = @import("text.zig");
 const markdown = @import("markdown.zig");
 const tail_frame = @import("tail_frame.zig");
@@ -174,6 +175,8 @@ const Permission = struct { id: u64, description: []const u8, clipped: bool, pas
 
 /// UI-owned callbacks; the application owns the runtime and configuration lifetime.
 pub const Connection = struct {
+    pub const Setting = enum { low_price_input, decision_enabled };
+    setting_fn: ?*const fn (*anyopaque, Setting, bool) anyerror!void = null,
     context: *anyopaque,
     current_fn: *const fn (*anyopaque) State,
     configure_fn: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -213,8 +216,13 @@ pub const Connection = struct {
         configured_providers: u8 = 0,
         allow_custom_models: bool = true,
         context_limit: u32 = 0,
-        /// Immutable owner policy snapshot; never inferred from token usage.
+        /// Owner snapshot: known tiered-price protection active for this model,
+        /// not the global toggle; never inferred from token usage.
         low_price_input: bool = false,
+        low_price_input_enabled: bool = true,
+        decision_enabled: bool = false,
+        decision_configured: bool = false,
+        global_settings_available: bool = true,
         /// Immutable configured request option, not inferred from stream time.
         reasoning_effort: shared.ReasoningEffort = .unspecified,
         /// Default preference awaiting an exact capability map; not a wire option.
@@ -318,6 +326,10 @@ const Ui = struct {
     model_picker: ?picker_module.Picker = null,
     provider_picker: provider_picker_module.Picker = .{},
     provider_open: bool = false,
+    settings_open: bool = false,
+    settings_menu: settings_menu_module.Menu = .{},
+    displayed_settings_generation: ?u64 = null,
+    frame_settings_generation: ?u64 = null,
     provider_choices: provider_picker_module.Choices = .{},
     displayed_provider_generation: ?u64 = null,
     frame_provider_generation: ?u64 = null,
@@ -592,6 +604,7 @@ const Ui = struct {
     fn hint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
         if (self.secret_quarantine) return std.fmt.allocPrint(a, "{s}; Esc closes", .{self.notice});
         if (self.secret_mode) return if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
+        if (self.settings_open) return if (self.settings_menu.pasted) "Pasted selection; Esc cancels" else if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
         if (self.provider_open) return if (self.provider_picker.pasted) "Pasted selection; Esc cancels" else if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
         if (self.model_picker) |picker| {
             if (picker.pasted) return "Pasted selection; Esc cancels";
@@ -603,7 +616,7 @@ const Ui = struct {
         var notice: []const u8 = "";
         var model_failed = false;
         if (self.last_terminal) |result| {
-            if (result.status != .success and (result.status != .paused or result.model_failure == .output_limit or r.inputBudgetPause(result.detail))) {
+            if (result.status != .success and (result.status != .paused or result.model_failure == .output_limit or r.policyPause(result.detail))) {
                 var formatted: std.Io.Writer.Allocating = .init(a);
                 defer formatted.deinit();
                 try shared.failure.write(&formatted.writer, self.notice, result.detail, result.model_failure, result.http_status);
@@ -740,7 +753,10 @@ const Ui = struct {
                 _ = try self.add(.notice, message);
             },
             .compaction_failed => |err| {
-                _ = try self.add(.notice, @errorName(err));
+                _ = try self.add(.notice, if (err == error.NoCompactionCandidate)
+                    "No history can be safely compacted yet; context was not changed."
+                else
+                    @errorName(err));
             },
             // 这些事件对 UI 没有需要展示的内容。
             .finished => {},
@@ -773,7 +789,7 @@ const Ui = struct {
     /// Refresh the slash menu from the current editor bytes. The menu is only
     /// meaningful on an idle, non-pasted session with no modal surface open.
     fn refreshCommandMenu(self: *Ui) void {
-        const active = self.settingsIdle() and self.model_picker == null and !self.provider_open and !self.editor_pasted;
+        const active = self.settingsIdle() and self.model_picker == null and !self.provider_open and !self.settings_open and !self.editor_pasted;
         if (!active) {
             self.command_matches = .{};
             return;
@@ -788,7 +804,7 @@ const Ui = struct {
         self.command_matches = matches;
     }
     fn commandMenuVisible(self: *const Ui) bool {
-        return self.settingsIdle() and !self.editor_pasted and self.command_matches.len != 0 and !self.command_menu.dismissed and self.model_picker == null and !self.provider_open;
+        return self.settingsIdle() and !self.editor_pasted and self.command_matches.len != 0 and !self.command_menu.dismissed and self.model_picker == null and !self.provider_open and !self.settings_open;
     }
     fn closeCommandMenu(self: *Ui) void {
         self.command_matches = .{};
@@ -830,6 +846,7 @@ const Ui = struct {
         try self.editor.bytes.ensureTotalCapacity(self.editor.allocator, 1);
         self.closeModelPicker();
         self.closeProviderPicker();
+        self.closeSettingsMenu();
         self.wipeEditor();
         self.editor.bytes.appendSliceAssumeCapacity("/");
         self.editor.cursor = 1;
@@ -839,6 +856,70 @@ const Ui = struct {
             if (command == selected) self.command_menu.selected = index;
         }
         self.notice = "Ready";
+    }
+    fn closeSettingsMenu(self: *Ui) void {
+        self.settings_open = false;
+        self.settings_menu.clear();
+        self.displayed_settings_generation = null;
+    }
+    fn openSettingsMenu(self: *Ui) void {
+        self.closeModelPicker();
+        self.closeProviderPicker();
+        self.closeCommandMenu();
+        self.closeSettingsMenu();
+        self.settings_menu.selected = 0;
+        self.settings_open = true;
+        self.parser.stop_feed = true;
+        self.notice = "Ready";
+    }
+    fn settingsKey(self: *Ui, event_: input.Event) !void {
+        switch (event_) {
+            .escape, .cancel => self.closeSettingsMenu(),
+            .quit => self.requestQuit(),
+            .left => try self.backToCommands(.settings),
+            .paste_start => self.settings_menu.markPaste(),
+            .text => |value| if (value.pasted) {
+                self.settings_menu.markPaste();
+            },
+            .up, .down => self.settings_menu.move(event_ == .down, 2),
+            .enter => {
+                if (!self.settingsIdle() or self.editor_pasted or self.frame.len != 0 or self.settings_menu.pasted or
+                    self.displayed_settings_generation != self.settings_menu.generation) return;
+                // Revoke before any attempt, including failed saves. Discard the
+                // read batch tail; only a new complete frame can authorize again.
+                self.settings_menu.generation +%= 1;
+                self.displayed_settings_generation = null;
+                self.parser.stop_feed = true;
+                const state = self.connection.current();
+                if (!state.global_settings_available) {
+                    self.notice = "Global settings unavailable; changes disabled";
+                    return;
+                }
+                const decision = self.settings_menu.selected != 0;
+                if (decision and !state.decision_configured) {
+                    self.notice = "Configure decision in ~/.thin/config.json first";
+                    return;
+                }
+                self.bridge.reset() catch {
+                    self.notice = "Settings require a drained session bridge";
+                    return;
+                };
+                const save = self.connection.setting_fn orelse {
+                    self.notice = "Global settings unavailable; changes disabled";
+                    return;
+                };
+                save(self.connection.context, if (decision) .decision_enabled else .low_price_input, !(if (decision) state.decision_enabled else state.low_price_input_enabled)) catch {
+                    self.notice = "Could not save setting; previous value kept";
+                    return;
+                };
+                // Owner publishes, UI never speculates or mutates the snapshot.
+                // Decision schema rewrites may explicitly invalidate context.
+                const updated = self.connection.current();
+                if (updated.initial_context) |context| self.display.context = context;
+                self.notice = "Ready";
+            },
+            else => {},
+        }
     }
     fn closeProviderPicker(self: *Ui) void {
         self.provider_open = false;
@@ -932,7 +1013,7 @@ const Ui = struct {
         self.dirty = true;
     }
     fn cycleEffort(self: *Ui) void {
-        if (!self.settingsIdle() or self.editor_pasted or self.model_picker != null or self.provider_open) {
+        if (!self.settingsIdle() or self.editor_pasted or self.model_picker != null or self.provider_open or self.settings_open) {
             self.notice = "Thinking selection requires an idle, non-pasted session";
             return;
         }
@@ -1057,6 +1138,18 @@ const Ui = struct {
             self.notice = "Refreshing official model metadata...";
             return;
         }
+        if (std.mem.eql(u8, command, "/help")) {
+            self.wipeEditor();
+            _ = try self.add(.notice, "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)");
+            return;
+        }
+        if (std.mem.eql(u8, command, "/settings") or std.mem.startsWith(u8, command, "/settings ") or std.mem.startsWith(u8, command, "/settings\t")) {
+            const no_arguments = command.len == "/settings".len;
+            const allowed = self.settingsIdle() and !self.editor_pasted;
+            self.wipeEditor();
+            if (!allowed) self.notice = "Settings require an idle, non-pasted session" else if (!no_arguments) self.notice = "Usage: /settings (no arguments)" else self.openSettingsMenu();
+            return;
+        }
         if (compactCommand(command)) {
             const no_arguments = std.mem.trim(u8, command["/compact".len..], " \t").len == 0;
             const allowed = self.settingsIdle() and !self.editor_pasted;
@@ -1104,7 +1197,7 @@ const Ui = struct {
             const idle = self.settingsIdle() and !self.editor_pasted;
             self.wipeEditor();
             if (!auth) {
-                self.notice = "Unknown command; use /model, /login (no key argument) or /compact";
+                self.notice = "Unknown command; use /help, /model, /login, /compact or /settings";
             } else if (!idle) {
                 self.notice = "Setup requires an idle, non-pasted session";
             } else {
@@ -1320,6 +1413,7 @@ const Ui = struct {
             return;
         }
 
+        if (self.settings_open and self.permission == null) return self.settingsKey(event_);
         if (self.provider_open and self.permission == null) return self.providerKey(event_);
         if (self.model_picker != null and self.permission == null) return self.modelKey(event_);
         switch (event_) {
@@ -1484,7 +1578,7 @@ const Ui = struct {
         self.notice = switch (result.status) {
             .success => "Ready",
             .canceled => "Canceled; prior side effects remain",
-            .paused => if (result.model_failure == .output_limit or r.inputBudgetPause(result.detail)) "Paused" else "Paused at round limit; send a message to continue",
+            .paused => if (result.model_failure == .output_limit or r.policyPause(result.detail)) "Paused" else "Paused at round limit; send a message to continue",
             .failed => "Failed",
         };
 
@@ -1575,7 +1669,7 @@ const Ui = struct {
     fn resize(self: *Ui, dimensions: terminal_module.Size) void {
         if (dimensions.columns == self.size.columns and dimensions.rows == self.size.rows) return;
         self.size = dimensions;
-        if ((self.records.items.len != 0 and (self.provider_open or self.model_picker != null or self.commandMenuVisible())) or
+        if ((self.records.items.len != 0 and (self.settings_open or self.provider_open or self.model_picker != null or self.commandMenuVisible())) or
             (self.menu_history != null and self.menu_history.?.borrowed.len != 0) or
             (self.frame_menu_history != null and self.frame_menu_history.?.borrowed.len != 0))
             self.menu_history_recovery = true;
@@ -1584,6 +1678,7 @@ const Ui = struct {
         self.displayed_model_generation = null;
         self.displayed_command_generation = null;
         self.displayed_provider_generation = null;
+        self.displayed_settings_generation = null;
         self.frame_fresh = false;
         if (self.tail_snapshot) |*snapshot| snapshot.deinit();
         self.tail_snapshot = null;
@@ -1628,6 +1723,7 @@ const Ui = struct {
         }
         self.displayed_command_generation = if (self.frame_fresh) self.frame_command_generation else null;
         self.displayed_provider_generation = if (self.frame_fresh) self.frame_provider_generation else null;
+        self.displayed_settings_generation = if (self.frame_fresh) self.frame_settings_generation else null;
         self.tail_height = self.frame_height;
         self.tail_size = self.frame_size;
         for (self.records.items) |*record| {
@@ -1778,7 +1874,7 @@ const Ui = struct {
         }
         const preview = self.scroll != 0 or self.menu_history_recovery;
         const flow_allowed = !preview and self.size.rows >= 7 and cols >= 8 and
-            self.permission == null and self.model_picker == null and !self.provider_open and
+            self.permission == null and self.model_picker == null and !self.provider_open and !self.settings_open and
             !self.commandMenuVisible() and !self.secret_mode and !self.secret_quarantine;
         const mutable_rows = @max(1, self.size.rows -| 4);
         var flow_continuation = false;
@@ -1912,13 +2008,20 @@ const Ui = struct {
         if (self.model_picker) |*picker| try picker.captureChoice(a, picker_rows.selected_choice);
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, candidate_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
+        const settings_rows = if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, .{
+            .low_price_input_enabled = state.low_price_input_enabled,
+            .decision_enabled = state.decision_enabled,
+            .decision_configured = state.decision_configured,
+            .global_settings_available = state.global_settings_available,
+        }, cols, candidate_limit) else settings_menu_module.Rows{ .lines = &.{} };
+        self.frame_settings_generation = null;
         const menu_visible = self.commandMenuVisible();
         const menu_rows = if (menu_visible) try command_menu_module.rows(a, self.command_matches, self.command_menu.selected, cols, candidate_limit) else command_menu_module.Rows{ .lines = &.{} };
         if (menu_visible) self.command_menu.selected = @min(self.command_menu.selected, self.command_matches.len - 1);
         // All candidate menus share one bottom-pinned popup slot. Secondary
         // pickers must not replace the top of the transcript body.
-        const popup_lines = if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else menu_rows.lines;
-        const selected_line = if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else menu_rows.selected_line;
+        const popup_lines = if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else menu_rows.lines;
+        const selected_line = if (self.settings_open) settings_rows.selected_line else if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else menu_rows.selected_line;
         const checked_mask: u16 = if (self.provider_open) provider_rows.checked_mask else if (self.model_picker != null) picker_rows.checked_mask else 0;
         const popup_gap: usize = @intFromBool(popup_lines.len != 0);
         const content_body_limit = body_limit -| (popup_lines.len + popup_gap);
@@ -2048,6 +2151,7 @@ const Ui = struct {
                 try putCandidateLine(writer, a, 1 + content_body_rows + @min(popup_gap, body_rows -| popup_span) + line, popup_lines[line], cols, tone, checked_mask & (@as(u16, 1) << @intCast(line)) != 0);
             }
             if (popup_span == popup_lines.len) {
+                if (self.settings_open and settings_rows.can_confirm) self.frame_settings_generation = self.settings_menu.generation;
                 if (self.provider_open and provider_rows.can_confirm) self.frame_provider_generation = self.provider_picker.generation;
                 if (self.model_picker) |picker| {
                     if (picker_rows.can_confirm) {
@@ -2068,6 +2172,10 @@ const Ui = struct {
                 try putInputLine(writer, a, rows, "API key> ", masks[0..count], cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols, count + 10) - 1});
+            } else if (self.settings_open) {
+                try putInputLine(writer, a, rows, "Settings> ", "", cols);
+                cursor_offset = tail_out.written().len;
+                try writer.print("\r\x1b[{d}C", .{@min(cols - 1, 10)});
             } else if (self.provider_open) {
                 try putInputLine(writer, a, rows, "Provider> ", "", cols);
                 cursor_offset = tail_out.written().len;
@@ -2141,7 +2249,7 @@ const Ui = struct {
         // Include release in the trusted cursor suffix so full/sparse/recovery
         // tails all close synchronization; cursor-show remains the final marker.
         try writer.writeAll(terminal_module.sync_end ++ "\x1b[?25h");
-        const snapshot_allowed = self.permission == null and self.model_picker == null and !self.provider_open and !menu_visible and !self.secret_mode and !self.secret_quarantine;
+        const snapshot_allowed = self.permission == null and self.model_picker == null and !self.provider_open and !self.settings_open and !menu_visible and !self.secret_mode and !self.secret_quarantine;
         var candidate = if (snapshot_allowed) try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset) else null;
         errdefer if (candidate) |*snapshot| snapshot.deinit();
         const can_diff = !self.abandon_tail and snapshot_allowed and
@@ -3557,7 +3665,7 @@ test "output limit paused hint retains cause and budget advice instead of round-
     try std.testing.expect(std.mem.find(u8, line, "round limit") == null);
 }
 
-test "input budget pauses explain input policy rather than round limit" {
+test "input and decision policy pauses explain their cause rather than round limit" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -3565,7 +3673,8 @@ test "input budget pauses explain input policy rather than round limit" {
     defer ui.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    for ([_]anyerror{ error.InputBudgetExceeded, error.UnknownInputPriceThreshold, error.InputBudgetSummaryFailed }) |detail| {
+    for ([_]anyerror{ error.InputBudgetExceeded, error.UnknownInputPriceThreshold, error.InputBudgetSummaryFailed, error.DecisionUnavailable }) |detail| {
+        try std.testing.expect(r.policyPause(detail));
         ui.last_terminal = .{ .status = .paused, .detail = detail };
         ui.notice = "Paused";
         const line = try ui.hint(arena.allocator(), ui.connection.current());
@@ -3740,9 +3849,10 @@ test "composer reflects owner low price policy without reading runtime configura
         const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
         try ui.parser.feed("typed", sink);
         try ui.draw();
-        const prefix = if (enabled) theme.success ++ "L 3.1%" ++ theme.reset else theme.success ++ "3.1%" ++ theme.reset;
+        const prefix = if (enabled) theme.success ++ "L3.1%" ++ theme.reset else theme.success ++ "3.1%" ++ theme.reset;
         try std.testing.expect(std.mem.find(u8, ui.frame, prefix) != null);
-        try std.testing.expectEqual(enabled, std.mem.find(u8, ui.frame, "L 3.1%") != null);
+        try std.testing.expectEqual(enabled, std.mem.find(u8, ui.frame, "L3.1%") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "L ") == null);
         try std.testing.expectEqualStrings("typed", ui.editor.bytes.items);
         try std.testing.expectEqual(@as(usize, 5), ui.editor.cursor);
         var screen: @import("../tests/regular_screen.zig").Screen = .{};
@@ -4503,6 +4613,103 @@ test "green checked candidates preserve full multibyte IDs and configured label 
     try std.testing.expect(std.mem.find(u8, ui.frame, "configured locally") == null);
 }
 
+test "settings callbacks owner publication ACK paste batch and cursor" {
+    try text.initLocale();
+    const Fixture = struct {
+        state: Connection.State = .{ .runtime = null, .model = "fixture", .base_url = "", .decision_configured = true },
+        calls: usize = 0,
+        fail: bool = false,
+        fn current(raw: *anyopaque) Connection.State {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.state;
+        }
+        fn configure(_: *anyopaque, _: []const u8) !void {}
+        fn save(raw: *anyopaque, setting: Connection.Setting, enabled: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.SaveFailed;
+            switch (setting) {
+                .low_price_input => self.state.low_price_input_enabled = enabled,
+                .decision_enabled => self.state.decision_enabled = enabled,
+            }
+        }
+    };
+    var fixture: Fixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = .{ .context = &fixture, .current_fn = Fixture.current, .configure_fn = Fixture.configure, .setting_fn = Fixture.save };
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("/settings\r\r", sink);
+    try std.testing.expect(ui.settings_open);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try ui.draw();
+    try ui.parser.feed("\r", sink); // No complete ACK.
+    ui.frame_offset = 1;
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 10), screen.col);
+    ui.finishFrame();
+    try ui.parser.feed("\r\r\x1b[B", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expect(!fixture.state.low_price_input_enabled and ui.settings_menu.selected == 0);
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try ui.parser.feed("\x1b[B", sink);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(fixture.state.decision_enabled);
+    fixture.fail = true;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(fixture.state.decision_enabled);
+    try std.testing.expectEqualStrings("Could not save setting; previous value kept", ui.notice);
+    fixture.state.decision_configured = false;
+    try ui.draw();
+    ui.finishFrame();
+    const calls = fixture.calls;
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqualStrings("Configure decision in ~/.thin/config.json first", ui.notice);
+    try std.testing.expectEqual(calls, fixture.calls);
+    fixture.state.global_settings_available = false;
+    try ui.parser.feed("\x1b[A", sink);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(calls, fixture.calls);
+    fixture.state.global_settings_available = true;
+    try ui.draw();
+    ui.finishFrame();
+    const original = ui.size;
+    ui.resize(.{ .columns = 8, .rows = original.rows });
+    ui.resize(original); // Resize ABA cannot restore authority.
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(calls, fixture.calls);
+    ui.resize(.{ .columns = 12, .rows = original.rows });
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(calls, fixture.calls);
+    ui.resize(original);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[200~pasted\x1b[201~\r", sink);
+    try std.testing.expectEqual(calls, fixture.calls);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(calls, fixture.calls);
+    try ui.parser.feed("\x1b[D", sink);
+    try std.testing.expect(!ui.settings_open);
+    try std.testing.expectEqual(command_menu_module.Command.settings, ui.command_menu.choice(ui.command_matches).?);
+}
+
 test "menus stay above composer share colors and Left returns to acknowledged parent" {
     try text.initLocale();
     var cancel: p.Cancellation = .{};
@@ -4528,9 +4735,9 @@ test "menus stay above composer share colors and Left returns to acknowledged pa
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "> /login") != null);
     try screen.replay(ui.frame);
     ui.finishFrame();
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[19], "  /model"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[20], "> /login"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], "  /compact"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[18], "  /model"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[19], "> /login"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[20], "  /compact"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("menu-prior-answer"));
     try ui.parser.feed("\r", sink);
     try ui.draw();
@@ -5118,6 +5325,7 @@ test "slash menu Tab canonicalizes filtered commands without opening surfaces or
         .{ .prefix = "/mo", .full = "/model" },
         .{ .prefix = "/LG", .full = "/login" },
         .{ .prefix = "/cpt", .full = "/compact" },
+        .{ .prefix = "/stg", .full = "/settings" },
     }) |case| {
         var cancel: p.Cancellation = .{};
         var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);

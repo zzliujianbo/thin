@@ -17,6 +17,8 @@ const Allocator = std.mem.Allocator;
 pub const max_bytes: usize = 16 * 1024 * 1024;
 pub const State = struct {
     version: u32 = 1,
+    /// Tool-prefix provenance only, never configuration or send authority.
+    tool_schema_hash: ?[32]u8 = null,
     system: []const u8,
     messages: []const p.Message,
     selector: llm.Selector,
@@ -134,6 +136,15 @@ fn shape(comptime T: type, v: j.Value) !void {
                 if (v.array.items.len > 1024) return error.InputLimit;
                 for (v.array.items) |item| try shape(info.child, item);
             }
+        },
+        .array => |info| {
+            // std.json renders UTF-8 byte arrays as fixed-length strings.
+            if (info.child == u8 and v == .string) {
+                if (v.string.len != info.len) return error.InvalidType;
+                return;
+            }
+            if (v != .array or v.array.items.len != info.len) return error.InvalidType;
+            for (v.array.items) |item| try shape(info.child, item);
         },
         .@"struct" => |info| {
             if (v != .object) return error.InvalidType;

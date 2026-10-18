@@ -12,6 +12,7 @@ const reasoning_defaults = @import("reasoning_defaults.zig");
 const metadata = @import("model_metadata.zig");
 const session_context = @import("../core/session_context.zig");
 const model_resolver = @import("model_resolver.zig");
+const DecisionClient = @import("decision_client.zig").Client;
 
 fn rememberConfiguredKeys(journal: *Journal, config: cfg.Config, environ: *const std.process.Environ.Map) !void {
     if (config.registry) |registry| for (registry.providers) |provider| {
@@ -52,6 +53,9 @@ pub const App = struct {
     executor: tools.Tools,
     /// LLM HTTP 客户端，初始化时传入 API key。
     client: http.Client,
+    /// Optional, independently owned auxiliary route. Never archived or inherited
+    /// from a restored selection; initialized lazily without startup requests.
+    decision_client: ?*DecisionClient = null,
 
     /// Agent 运行时，最后初始化，依赖前面所有字段。
     runtime: r.Runtime,
@@ -169,16 +173,81 @@ pub const App = struct {
         self.environment = try tools.commandEnvironmentMany(a, environ, secret_names[0..secret_count]);
         errdefer self.environment.deinit();
         self.executor = .{ .root = &self.root, .memory = &self.memory, .config = &self.config.value, .environment = &self.environment, .auth_path = self.auth_path };
-        self.client = try http.Client.init(a, io, &self.config.value, key);
+        self.client = try http.Client.initWithEnv(a, io, &self.config.value, key, environ);
         errdefer self.client.deinit();
+        self.decision_client = try DecisionClient.create(a, io, self.config.value, environ);
+        errdefer if (self.decision_client) |decision| decision.deinit();
 
         const snapshot = try self.memory.snapshot(a);
         defer a.free(snapshot);
         self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, snapshot, trusted);
+        self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
         self.runtime.session_loader = .{ .context = self, .load_fn = loadSessionPolicy };
         self.runtime.observer = self.journal.observer();
         self.recordSelection();
         return self;
+    }
+
+    pub const SettingsReplacement = struct {
+        low_price_input: bool,
+        decision_enabled: bool,
+        replace_decision: bool,
+        changes_tools: bool,
+        decision: ?*DecisionClient = null,
+        prefix: ?r.Runtime.ToolPrefix = null,
+
+        pub fn deinit(self: *SettingsReplacement) void {
+            if (self.decision) |client| client.deinit();
+            if (self.prefix) |*prefix| prefix.deinit();
+        }
+    };
+
+    /// Prepare all fallible work before writing global settings. No requests,
+    /// primary reconnect or canonical mutations occur here.
+    pub fn prepareSettings(self: *App, declaration: cfg.Config, environ: *const std.process.Environ.Map) !SettingsReplacement {
+        if (self.runtime.busy.load(.acquire)) return error.Busy;
+        if (self.runtime.poisoned) return error.UnsafeToContinue;
+        const low_price_input = declaration.limits.low_price_input;
+        const decision_enabled = declaration.decisionActive();
+        if (decision_enabled and self.config.value.decision == null) return error.DecisionNotConfigured;
+        var result: SettingsReplacement = .{
+            .low_price_input = low_price_input,
+            .decision_enabled = decision_enabled,
+            .replace_decision = self.config.value.decisionActive() != decision_enabled,
+            .changes_tools = self.config.value.decisionActive() != decision_enabled,
+        };
+        errdefer result.deinit();
+        if (result.replace_decision) {
+            // Login may have replaced the global declaration since this chat's
+            // frozen config was installed. Own the latest auxiliary credentials
+            // without rebinding the primary config/client. Redaction may only
+            // expand on a failed prepare/save; never publish an unredacted key.
+            try rememberConfiguredKeys(&self.journal, declaration, environ);
+            result.decision = try DecisionClient.create(self.allocator, self.root.io, declaration, environ);
+        }
+        if (result.changes_tools and self.runtime.selector.effective() == .anthropic)
+            result.prefix = try self.runtime.prepareToolPrefix();
+        return result;
+    }
+
+    /// Called only after settings save. Owned, idle publication cannot fail.
+    pub fn installSettings(self: *App, replacement: *SettingsReplacement) void {
+        std.debug.assert(!self.runtime.busy.load(.acquire));
+        self.config.value.limits.low_price_input = replacement.low_price_input;
+        if (self.config.value.decision) |*declaration| declaration.enabled = replacement.decision_enabled;
+        if (replacement.prefix) |*prefix| {
+            self.runtime.installToolPrefix(prefix);
+            replacement.prefix = null;
+        }
+        if (replacement.replace_decision) {
+            const previous = self.decision_client;
+            self.decision_client = replacement.decision;
+            replacement.decision = null;
+            self.runtime.decision_service = if (self.decision_client) |client| client.service() else null;
+            if (previous) |client| client.deinit();
+        }
+        self.runtime.executor = self.executor.executor();
+        if (replacement.changes_tools) self.runtime.last_context_tokens = null;
     }
 
     /// Heap-placed until publication: the unused client borrows this config.
@@ -187,11 +256,13 @@ pub const App = struct {
         owner: *App,
         config: std.json.Parsed(cfg.Config),
         client: http.Client,
+        decision_client: ?*DecisionClient = null,
         plan: r.Runtime.SelectionPlan,
 
         pub fn deinit(self: *ConnectionReplacement) void {
             const a = self.owner.allocator;
             self.client.deinit();
+            if (self.decision_client) |decision| decision.deinit();
             cfg.release(&self.config);
             a.destroy(self);
         }
@@ -216,7 +287,9 @@ pub const App = struct {
         replacement.owner = self;
         replacement.config = owned;
         replacement.plan = plan;
-        replacement.client = try http.Client.init(self.allocator, self.root.io, &replacement.config.value, key);
+        replacement.client = try http.Client.initWithEnv(self.allocator, self.root.io, &replacement.config.value, key, environ);
+        errdefer replacement.client.deinit();
+        replacement.decision_client = try DecisionClient.create(self.allocator, self.root.io, replacement.config.value, environ);
         return replacement;
     }
 
@@ -234,6 +307,10 @@ pub const App = struct {
         self.runtime.config = &self.config.value;
         self.executor.config = &self.config.value;
         self.runtime.model = self.client.model();
+        const previous_decision = self.decision_client;
+        self.decision_client = replacement.decision_client;
+        self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
+        if (previous_decision) |decision| decision.deinit();
         self.recordSelection();
         self.allocator.destroy(replacement);
         cfg.release(&previous);
@@ -282,6 +359,7 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         const a = self.allocator;
         self.runtime.deinit();
+        if (self.decision_client) |decision| decision.deinit();
         self.journal.deinit();
         self.client.deinit();
         self.environment.deinit();
@@ -414,6 +492,8 @@ test "App protects actual configuration behind HOME and file symlinks" {
         try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(home_dir.handle, ".thin", 0o700));
         const target = if (linked_file) "credentials.json" else ".thin/config.json";
         try home_dir.writeFile(io, .{ .sub_path = target, .data = fake });
+        // Retired global settings are not a second configuration source.
+        try home_dir.writeFile(io, .{ .sub_path = ".thin/settings.json", .data = "{broken legacy preferences" });
         if (linked_file) try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("../credentials.json", home_dir.handle, ".thin/config.json"));
         try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("home", tmp.dir.handle, "alias"));
         var buffer: [4096]u8 = undefined;
@@ -427,6 +507,7 @@ test "App protects actual configuration behind HOME and file symlinks" {
             try env.put("HOME", home);
             const app = try App.init(a, io, &env, project, .{}, false);
             defer app.deinit();
+            try std.testing.expect(app.config.value.limits.low_price_input and !app.config.value.decisionActive());
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const allocator = arena.allocator();
@@ -440,4 +521,41 @@ test "App protects actual configuration behind HOME and file symlinks" {
             }
         }
     }
+}
+
+test "App unavailable decision key never blocks startup and chat replacement keeps independent reference" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(a, io, buffer[0..n]);
+    defer root.deinit();
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", root.path);
+    var parsed = try cfg.parse(a,
+        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"context_tokens":32768,"protocol":"chat"},"alternate":{"context_tokens":32768,"protocol":"chat"}}},"judge":{"base_url":"http://judge.invalid/v1","api_key_env":"MISSING_JUDGE_KEY","models":{"mini":{"context_tokens":16384,"protocol":"responses"}}}}},"decision":{"model":"judge/mini"}}
+    );
+    model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &.{}) catch |err| {
+        cfg.release(&parsed);
+        return err;
+    };
+    const app = try App.initConfiguredAnchoredAuth(a, io, &env, &root, "/unused/private/config.json", .{}, false, parsed);
+    defer app.deinit();
+    try std.testing.expect(app.decision_client != null and app.runtime.decision_service != null);
+    try std.testing.expect(app.decision_client.?.resolved == null and app.decision_client.?.calls == 0);
+    const previous = app.decision_client.?;
+    var candidate = try cfg.clone(a, app.config.value);
+    candidate.value.model.name = "alternate";
+    const replacement = try app.prepareConnection(candidate, &env);
+    app.installConnection(replacement);
+    try std.testing.expectEqualStrings("alternate", app.config.value.model.name);
+    try std.testing.expect(app.decision_client.? != previous);
+    try std.testing.expectEqualStrings("judge/mini", app.decision_client.?.source.value.decision.?.model);
+    try std.testing.expect(app.runtime.decision_service.?.context == @as(*anyopaque, @ptrCast(app.decision_client.?)));
+    const checkpoint = try app.runtime.checkpoint();
+    try std.testing.expect(!@hasField(@TypeOf(checkpoint), "decision"));
+    try std.testing.expect(!@hasField(@TypeOf(checkpoint), "decision_service"));
 }

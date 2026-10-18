@@ -38,6 +38,10 @@ pub const Id = enum {
         if (std.mem.eql(u8, normalized, "https://opencode.ai/inference/v1")) return .opencode_zen;
         return null;
     }
+    /// Native decision identity is NOT authority for the generative catalog.
+    pub fn fromSystemOneUrl(url: []const u8) ?Id {
+        return if (std.mem.eql(u8, std.mem.trimEnd(u8, url, "/"), "https://opencode.ai/inference/systemone/v1")) .opencode_zen else null;
+    }
     pub fn fromSlug(value: []const u8) ?Id {
         for (all) |id| if (std.mem.eql(u8, value, id.slug())) return id;
         return null;
@@ -60,4 +64,8 @@ test "provider services have distinct exact endpoints" {
     try t.expectEqual(Id.opencode_go, Id.fromUrl("https://opencode.ai/inference/go/v1/").?);
     try t.expectEqual(Id.opencode_zen, Id.fromUrl("https://opencode.ai/inference/v1").?);
     try t.expect(Id.fromUrl("https://opencode.ai/inference/go/v10") == null);
+    try t.expectEqual(Id.opencode_zen, Id.fromSystemOneUrl("https://opencode.ai/inference/systemone/v1/").?);
+    try t.expect(Id.fromUrl("https://opencode.ai/inference/systemone/v1") == null);
+    try t.expect(Id.fromUrl("https://opencode.ai/inference/systemone/v10") == null);
+    try t.expect(Id.fromUrl("https://opencode.ai.example/inference/systemone/v1") == null);
 }

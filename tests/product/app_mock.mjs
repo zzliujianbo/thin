@@ -212,14 +212,18 @@ async function scenario(name, protocol, kind, isPty = false) {
 
       // tool_choice 为 none 表示 CLI 发起的摘要请求（自动压缩）。
       const summary = body.tool_choice === 'none';
-      if (kind === 'compact') {
-        // 压缩期间 system 指令与工具 schema 必须保持不变，以保证前缀可被缓存复用。
+      if (kind === 'compact' && !summary) {
+        // 普通请求的 system/schema 保持稳定；摘要独立使用纯数据视图。
         const prefix = JSON.stringify([protocol === 'chat' ? body.messages.filter(m=>m.role==='system') : body.instructions, body.tools]);
         stable ??= prefix; assert.equal(prefix, stable, 'system/schema changed during compaction');
       }
 
       // 摘要请求直接返回固定的摘要文本。
       if (summary) {
+        assert(!body.tools || body.tools.length === 0, 'summary must not declare tools');
+        assert.equal(outputs.size, 0, 'summary must not replay historical structured results');
+        const dataView = JSON.stringify(protocol === 'chat' ? body.messages : body.input);
+        assert(dataView.includes('UNTRUSTED HISTORY DATA'), 'summary requires labelled data view');
         if (kind === 'manual-compact') {
           assert.equal(rounds, 2, 'manual compaction must follow two completed turns');
           assert(!body.messages.some(m => m.role === 'user' && m.content === '/compact'), 'slash command leaked into model history');

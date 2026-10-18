@@ -16,38 +16,54 @@ const process = @import("../platform/process.zig");
 const j = @import("../util/json.zig");
 const runtime = @import("../core/runtime.zig");
 const command_risk = @import("command_risk.zig");
+const decision = @import("../core/decision.zig");
 
 /// 暴露给模型的工具 schema 列表；顺序是对外契约（测试依赖 read_file 在 0、memory 在 3）。
 pub const schemas = [_]p.ToolSchema{
     .{
         .name = "read_file",
-        .description = "Read a UTF-8 file inside the startup project. offset is a zero-based BYTE offset and limit is a BYTE count, NOT line numbers. A start inside a character rounds back at most 3 bytes; offset in the result is the actual start. Output is bounded; continue with returned next_offset when truncated.",
+        .description = "Read UTF-8 inside the startup project. offset is a zero-based BYTE offset; limit is a BYTE count, not lines. Mid-character starts round back at most 3 bytes; returned offset is the actual start. When truncated, use returned next_offset as the next call's offset.",
         .parameters_json =
         \\{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}
         ,
     },
     .{
         .name = "write_file",
-        .description = "Atomically write a UTF-8 file inside the project after user approval. Parent directory must exist. Existing files require overwrite=true.",
+        .description = "Atomically write UTF-8 inside the startup project after host authorization. Read relevant content before replacing it. Parent directory must exist; overwrite=true is required to replace a file. Denied writes make no change.",
         .parameters_json =
         \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["path","content"],"additionalProperties":false}
         ,
     },
     .{
         .name = "bash",
-        .description = "Run a bash command in the startup project. Ordinary commands follow the process trust policy. High-risk commands (recursive delete, mkfs or dd onto devices, curl|bash and wget|sh, chmod/chown of sensitive paths, fork bombs, writes to /etc or ~/.ssh) always require an explicit user allow and are not auto-run when the process is trusted. A denial returns an error and does not execute. Default timeout is 5 minutes. Bounded stdout/stderr retain head and tail; commands do not persist a changed working directory.",
+        .description = "Run bash in the startup project; cwd changes do not persist. With decision review disabled, ordinary commands follow host trust; classified high-risk commands require explicit approval even in a trusted process. Denial means no execution. timeout_ms follows host limits; built-in default is 5 minutes. stdout/stderr retain bounded head/tail, not full logs.",
         .parameters_json =
         \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}
         ,
     },
     .{
         .name = "memory",
-        .description = "Project-local explicit Memory. list reads the current core/index; read returns content and version. write creates with no expected_version, or updates with the read version. delete requires the read version. Writes/deletes require approval. topic core is startup core memory; other topics are ASCII slugs. Conflicts require rereading, never overwrite blindly.",
+        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. The host authorizes writes/deletes. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.",
         .parameters_json =
         \\{"type":"object","properties":{"action":{"type":"string","enum":["list","read","write","delete"]},"topic":{"type":"string"},"content":{"type":"string"},"expected_version":{"type":["string","null"]}},"required":["action"],"additionalProperties":false}
         ,
     },
 };
+
+// The configured reviewer, not the legacy shell classifier, owns the extra
+// command-confirmation decision. These static variants add no prompt allocation
+// and preserve tool IDs, order and parameter schemas.
+const decision_bash_description = "Run bash in the startup project; cwd changes do not persist. The configured reviewer's ask=true requires approval even in a trusted process; ask=false removes the extra command-approval prompt. The reviewer also chooses the command deadline. Unavailable or invalid review pauses without executing. Denial means no execution. Hard validation, task deadlines, cancellation and output limits apply. stdout/stderr retain bounded head/tail, not full logs.";
+const decision_memory_description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Only write candidates are reviewed for durable value; skipped writes make no change, and a useful candidate is not authorization. The host still authorizes writes/deletes. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.";
+const reviewed_schemas = blk: {
+    var result = schemas;
+    result[2].description = decision_bash_description;
+    result[3].description = decision_memory_description;
+    break :blk result;
+};
+fn schemasForDecision(enabled: bool) []const p.ToolSchema {
+    return if (enabled) &reviewed_schemas else &schemas;
+}
 
 /// read_file 的解析结果；offset 为字节偏移，limit 为空时使用配置的 read_bytes。
 pub const Read = struct { path: []const u8, offset: u64 = 0, limit: ?u32 = null };
@@ -241,7 +257,7 @@ pub const Tools = struct {
 
     /// 把 Tools 包装成 runtime.Executor，供运行时调度 prepare 与 execute。
     pub fn executor(self: *Tools) runtime.Executor {
-        return .{ .context = self, .schemas = &schemas, .prepare_fn = prepare, .execute_fn = executePrepared };
+        return .{ .context = self, .schemas = schemasForDecision(self.config.decisionActive()), .prepare_fn = prepare, .execute_fn = executePrepared };
     }
 
     /// 解析并做路径校验，生成待授权的 Prepared；此阶段不产生任何副作用。
@@ -257,20 +273,38 @@ pub const Tools = struct {
             description = try std.fmt.allocPrint(a, "DANGEROUS bash ({s}). Process trust does not auto-run this; y runs it once, and t still asks for the next dangerous command.\n{s}", .{ finding.label, description });
             break :blk try std.fmt.allocPrint(a, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow and is not covered by process trust.", .{finding.label});
         } else null;
-        return .{ .payload = action, .description = description, .requires_approval = action.requiresApproval(), .explicit_denial = denial };
+        const review: ?decision.Input = switch (action.*) {
+            .bash => |b| .{ .command = .{
+                .command = b.command,
+                .proposed_timeout_ms = b.timeout_ms,
+                .max_timeout_ms = self.config.limits.command_max_timeout_ms,
+                .risk = if (command_risk.classify(b.command)) |finding| finding.label else null,
+            } },
+            .memory => |m| if (m.action == .write) .{ .memory_write = .{
+                .topic = m.topic.?,
+                .content = m.content.?,
+                .expected_version = m.expected_version,
+            } } else null,
+            else => null,
+        };
+        return .{ .payload = action, .description = description, .requires_approval = action.requiresApproval(), .explicit_denial = denial, .decision_input = review };
     }
 
     /// 从 prepare 生成的 payload 取回 Action 并执行；payload 指向同一个 arena 中的 Action。
     fn executePrepared(context_: *anyopaque, a: std.mem.Allocator, prepared: runtime.Prepared, cancel: *const p.Cancellation) !Execution {
         const self: *Tools = @ptrCast(@alignCast(context_));
         const action: *const Action = @ptrCast(@alignCast(prepared.payload));
-        return self.execute(a, action.*, cancel);
+        return self.executeWithTimeout(a, action.*, prepared.command_timeout, cancel);
     }
 
     /// Authorization is a Runtime responsibility. Never call this for an
     /// unapproved mutating action. This function does no terminal I/O.
     /// 按 Action 执行具体副作用，并把结果编码为 JSON 文本；本函数不做任何终端输入输出。
     pub fn execute(self: *Tools, a: std.mem.Allocator, action: Action, cancel: *const p.Cancellation) !Execution {
+        return self.executeWithTimeout(a, action, null, cancel);
+    }
+
+    fn executeWithTimeout(self: *Tools, a: std.mem.Allocator, action: Action, timeout: ?decision.Timeout, cancel: *const p.Cancellation) !Execution {
         // 执行前已取消则直接返回，不触碰磁盘或子进程。
         if (cancel.isRequested()) return .{ .text = "Canceled before execution", .is_error = true, .canceled = true };
 
@@ -306,8 +340,12 @@ pub const Tools = struct {
 
             .bash => |b| {
                 // 超时、取消与输出上限都交给 process.run；返回的标记用于区分失败原因。
+                const limit: ?u32 = if (timeout) |policy| switch (policy) {
+                    .none => null,
+                    .milliseconds => |ms| if (ms == 0 or ms > self.config.limits.command_max_timeout_ms) return error.InvalidTimeout else ms,
+                } else b.timeout_ms orelse self.config.limits.command_timeout_ms;
                 const result = try process.run(a, self.root.io, self.root.path, b.command, self.environment, .{
-                    .timeout_ms = b.timeout_ms orelse self.config.limits.command_timeout_ms,
+                    .timeout_ms = limit,
                     .output_bytes = self.config.limits.output_bytes,
                     .term_grace_ms = self.config.limits.cleanup_grace_ms,
                     .cleanup_timeout_ms = self.config.limits.cleanup_timeout_ms,
@@ -438,10 +476,29 @@ test "tool schemas have stable order and valid JSON" {
     try std.testing.expectEqualStrings("read_file", schemas[0].name);
     try std.testing.expectEqualStrings("memory", schemas[3].name);
 
-    for (schemas) |schema| {
+    for ([_]bool{ false, true }) |review| for (schemasForDecision(review), schemas) |schema, original| {
+        try std.testing.expectEqualStrings(original.name, schema.name);
+        try std.testing.expectEqualStrings(original.parameters_json, schema.parameters_json);
         const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, schema.parameters_json, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value == .object);
+    };
+}
+
+test "tool descriptions distinguish configured decision review from legacy approval" {
+    const plain = schemasForDecision(false);
+    const reviewed = schemasForDecision(true);
+    try std.testing.expect(std.mem.indexOf(u8, plain[2].description, "decision review disabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain[2].description, "high-risk commands require explicit approval") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=true requires approval even in a trusted process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=false removes the extra command-approval prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "Unavailable or invalid review pauses without executing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed[3].description, "a useful candidate is not authorization") != null);
+    for ([_]usize{ 0, 1 }) |i| try std.testing.expectEqualStrings(plain[i].description, reviewed[i].description);
+    for ([_]bool{ false, true }) |review| {
+        const selected = schemasForDecision(review);
+        try std.testing.expect(std.mem.indexOf(u8, selected[0].description, "next_offset as the next call's offset") != null);
+        try std.testing.expect(std.mem.indexOf(u8, selected[3].description, "read's version as expected_version") != null);
     }
 }
 
