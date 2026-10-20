@@ -39,10 +39,7 @@ pub const Prepared = struct {
     payload: *anyopaque,
     /// 展示给用户的操作描述（权限询问时显示）。
     description: []const u8,
-    /// 是否需要用户授权。trusted 时普通调用会跳过询问。
-    requires_approval: bool,
-    /// 非空：本次必须人工批准，--trust / trust_process 不能自动放行。
-    /// allow_once 与 trust_process 都只放行这一次；之后的非空调用仍会询问。
+    /// 非空：本次必须人工批准；批准只放行这一次，之后的非空调用仍会询问。
     /// 用户拒绝（或 --print 无法询问）时，这段文案作为工具错误回给模型。
     explicit_denial: ?[]const u8 = null,
     decision_input: ?decision.Input = null,
@@ -98,9 +95,8 @@ pub const Executor = struct {
 /// 权限询问。id 由 Runtime 递增分配，与 tool_started / tool_result 事件关联。
 pub const Permission = struct { id: u64, tool_name: []const u8, description: []const u8 };
 
-/// 用户对权限询问的答复。trust_process 会让本 Runtime 之后的普通调用不再询问。
-/// explicit_denial 非空的调用（危险 bash）仍会询问；该决定只放行当前这一次。
-pub const Decision = enum { allow_once, deny, trust_process };
+/// 用户对本次权限询问的答复，不授予后续调用权限。
+pub const Decision = enum { allow_once, deny };
 
 /// Runtime 当前阶段，供 UI 展示；每次切换前都会先发出 state 事件。
 pub const State = enum { calling_model, awaiting_permission, executing_tool, compacting };
@@ -259,7 +255,7 @@ test "thinking runtime normal and summary requests map current model" {
     };
     var dummy: u8 = 0;
     var config: cfg.Config = .{ .provider = .{ .base_url = "https://api.deepseek.com" }, .model = .{ .name = "deepseek-flash", .context_tokens = 32768, .protocol = .chat, .reasoning_effort = "medium", .reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } } }, .limits = .{ .low_price_input = false } };
-    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "", false);
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "");
     defer runtime.deinit();
     const cancel: p.Cancellation = .{};
     for ([_]p.Purpose{ .normal, .summary }) |purpose| {
@@ -311,7 +307,7 @@ test "runtime checkpoint restore ignores archived policy poison and estimator wi
     };
     var dummy: u8 = 0;
     var config: cfg.Config = .{ .provider = .{ .base_url = "http://unused.invalid" }, .model = .{ .name = "test", .context_tokens = 65536, .protocol = .chat } };
-    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "original", false);
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "original");
     defer runtime.deinit();
     var state = try runtime.checkpoint();
     try std.testing.expectEqual(@as(?u32, 65536), state.context_tokens);
@@ -387,7 +383,7 @@ test "restored foreign scope blocks normal replay but permits text-only summary 
         var config: cfg.Config = .{ .provider = .{ .base_url = "https://current.invalid/v1" }, .model = .{ .name = "current", .context_tokens = 65536, .protocol = proto } };
         config.limits.low_price_input = false;
         var fake: Fake = .{};
-        var runtime = try Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "", true);
+        var runtime = try Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
         defer runtime.deinit();
         const state: @import("checkpoint.zig").State = .{
             .system = "archive",
@@ -441,7 +437,7 @@ test "compatible restored history sends under current budgets without any archiv
     var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1", .api_key = "rotated-fake-key" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
     config.limits.low_price_input = false;
     var fake: Fake = .{};
-    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "", true);
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
     defer runtime.deinit();
     var state = try runtime.checkpoint();
     state.context_tokens = 1;
@@ -476,7 +472,7 @@ test "restored incomplete tool history never executes old tools or calls a fake 
     var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
     config.limits.low_price_input = false;
     config.limits.compaction_enabled = false;
-    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "", true);
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "");
     defer runtime.deinit();
     var state = try runtime.checkpoint();
     state.messages = &.{
@@ -505,7 +501,7 @@ test "selection preserves canonical history and closes retained auto fallback" {
     };
     var dummy: u8 = 0;
     var config: cfg.Config = .{ .provider = .{ .base_url = "http://unused.invalid" }, .model = .{ .name = "old", .context_tokens = 32768, .protocol = .chat } };
-    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "", false);
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "");
     defer runtime.deinit();
     const source: p.Message = .{ .role = .assistant, .blocks = &.{ .{ .reasoning = "native-only summary" }, .{ .text = "retained" }, .{ .tool_call = .{ .id = "id", .item_id = "old-native-item", .name = "test", .arguments = "{}" } } }, .replay = .{ .scope = .{ .connection = "c", .model = "old", .protocol = .chat }, .json = "[]" } };
     try runtime.history.append(runtime.arena.allocator(), try p.cloneMessage(runtime.arena.allocator(), source));
@@ -583,7 +579,7 @@ test "default low price policy refuses unknown pricing before inference and expl
         var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .protocol = .chat, .context_tokens = 32768 } };
         if (!use_default) config.limits.low_price_input = false;
         var fake: Fake = .{};
-        var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "", true);
+        var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
         defer runtime.deinit();
         var cancel: p.Cancellation = .{};
         const result = try runtime.run("fixture goal", &cancel);
@@ -633,6 +629,8 @@ const AppliedPolicy = struct {
     cwd: []u8,
     shell: []u8,
     project_root: []u8,
+    os: std.Target.Os.Tag,
+    arch: std.Target.Cpu.Arch,
     agents: []u8,
 
     fn deinit(self: AppliedPolicy, a: std.mem.Allocator) void {
@@ -653,6 +651,8 @@ const AppliedPolicy = struct {
             .cwd = cwd,
             .shell = shell,
             .project_root = project_root,
+            .os = snap.os,
+            .arch = snap.arch,
             .agents = try a.dupe(u8, snap.agents),
         };
     }
@@ -661,6 +661,7 @@ const AppliedPolicy = struct {
         return std.mem.eql(u8, self.cwd, snap.cwd) and
             std.mem.eql(u8, self.shell, snap.shell) and
             std.mem.eql(u8, self.project_root, snap.project_root) and
+            self.os == snap.os and self.arch == snap.arch and
             std.mem.eql(u8, self.agents, snap.agents);
     }
 };
@@ -687,7 +688,7 @@ test "poisoned actual model gate wins over pre-cancellation and invalid request 
         .schemas = &.{},
         .prepare_fn = Stub.prepare,
         .execute_fn = Stub.execute,
-    }, .{}, "", true);
+    }, .{}, "");
     defer runtime.deinit();
     runtime.poisoned = true;
     var cancel: p.Cancellation = .{};
@@ -735,8 +736,6 @@ pub const Runtime = struct {
     last_context_tokens: ?u64 = 0,
     /// 运行中标志：run 入口 swap 置位，defer 清除，防止重入。
     busy: std.atomic.Value(bool) = .init(false),
-    /// 已信任：为 true 后不再弹出权限询问。
-    trusted: bool,
     /// 递增的调用/权限 ID（允许回绕），与宿主事件关联。
     permission_id: u64 = 0,
     display_generation: u64 = 0,
@@ -760,7 +759,7 @@ pub const Runtime = struct {
     tool_blocked: bool = false,
 
     /// 创建 Runtime：校验配置，并把启动时的 Memory 快照以 JSON 字符串嵌入系统提示词。
-    pub fn init(a: std.mem.Allocator, io: Io, config: *const cfg.Config, model: p.Model, executor: Executor, host: Host, startup_memory: []const u8, trusted: bool) !Runtime {
+    pub fn init(a: std.mem.Allocator, io: Io, config: *const cfg.Config, model: p.Model, executor: Executor, host: Host, startup_memory: []const u8) !Runtime {
         // A registry declaration is not executable until cache/manual fields
         // have resolved it; never turn a directory unknown into paid auto probing.
         if (config.selection_pending) return error.DefaultModelUnavailable;
@@ -790,7 +789,6 @@ pub const Runtime = struct {
             .system = system,
             .arena = std.heap.ArenaAllocator.init(a),
             .selector = initialSelector(config.*),
-            .trusted = trusted,
         };
     }
 
@@ -1336,7 +1334,7 @@ pub const Runtime = struct {
                     return;
                 }
                 const agents = !agentsMatches(self.history.items, snap.agents);
-                const environment = !environmentMatches(self.history.items, snap.cwd, snap.shell, snap.project_root);
+                const environment = !environmentMatches(self.history.items, session_context.environmentOf(snap));
                 if (!agents and !environment) return;
                 try self.appendPolicy(snap, true, agents, environment);
                 return;
@@ -1349,7 +1347,7 @@ pub const Runtime = struct {
             return;
         }
         const agents_changed = !agentsMatches(self.history.items, snap.agents);
-        const env_changed = !environmentMatches(self.history.items, snap.cwd, snap.shell, snap.project_root);
+        const env_changed = !environmentMatches(self.history.items, session_context.environmentOf(snap));
         if (!agents_changed and !env_changed) {
             try self.storeApplied(snap);
             return;
@@ -1360,7 +1358,8 @@ pub const Runtime = struct {
     fn envDiffers(applied: AppliedPolicy, snap: session_context.Snapshot) bool {
         return !std.mem.eql(u8, applied.cwd, snap.cwd) or
             !std.mem.eql(u8, applied.shell, snap.shell) or
-            !std.mem.eql(u8, applied.project_root, snap.project_root);
+            !std.mem.eql(u8, applied.project_root, snap.project_root) or
+            applied.os != snap.os or applied.arch != snap.arch;
     }
 
     fn appendPolicy(self: *Runtime, snap: session_context.Snapshot, update: bool, agents: bool, environment: bool) !void {
@@ -1393,17 +1392,19 @@ pub const Runtime = struct {
     /// tail when compaction removed it. Failure happens before the history swap.
     fn reinstallPolicy(self: *const Runtime, a: std.mem.Allocator, history: *std.ArrayList(p.Message)) !void {
         const applied = self.applied_policy orelse return;
-        const agents = !agentsMatches(history.items, applied.agents);
-        const environment = !environmentMatches(history.items, applied.cwd, applied.shell, applied.project_root);
-        if (!agents and !environment) return;
         const snap = session_context.Snapshot{
             .cwd = applied.cwd,
             .shell = applied.shell,
             .project_root = applied.project_root,
+            .os = applied.os,
+            .arch = applied.arch,
             .agents = applied.agents,
             .agents_text = "",
             .truncated = false,
         };
+        const agents = !agentsMatches(history.items, applied.agents);
+        const environment = !environmentMatches(history.items, session_context.environmentOf(snap));
+        if (!agents and !environment) return;
         if (agents) try appendContextAgents(a, history, snap, true);
         if (environment) try appendContextEnvironment(a, history, snap, true);
     }
@@ -1441,12 +1442,13 @@ pub const Runtime = struct {
         return session_context.agentsEquivalent(session_context.parseAgentsBody(text).?, agents);
     }
 
-    fn environmentMatches(items: []const p.Message, cwd: []const u8, shell: []const u8, project_root: []const u8) bool {
+    fn environmentMatches(items: []const p.Message, expected: session_context.Environment) bool {
         const text = lastContextText(items, &session_context.parseEnvironment) orelse return false;
         const parsed = session_context.parseEnvironment(text).?;
-        return std.mem.eql(u8, parsed.cwd, cwd) and
-            std.mem.eql(u8, parsed.shell, shell) and
-            std.mem.eql(u8, parsed.project_root, project_root);
+        return std.mem.eql(u8, parsed.cwd, expected.cwd) and
+            std.mem.eql(u8, parsed.shell, expected.shell) and
+            std.mem.eql(u8, parsed.project_root, expected.project_root) and
+            parsed.os == expected.os and parsed.arch == expected.arch;
     }
 
     fn lastContextText(items: []const p.Message, parse: anytype) ?[]const u8 {
@@ -2060,7 +2062,6 @@ pub const Runtime = struct {
                 switch (input) {
                     .command => {
                         prepared.command_timeout = output.command.timeout;
-                        prepared.requires_approval = output.command.ask;
                         prepared.explicit_denial = if (output.command.ask)
                             "Decision requires explicit approval; command was not executed."
                         else
@@ -2080,8 +2081,8 @@ pub const Runtime = struct {
 
             var allowed = true;
 
-            // 普通调用在 trusted 时跳过。危险 bash 带 explicit_denial，即使 trusted 也要问。
-            if (prepared.requires_approval and (prepared.explicit_denial != null or !self.trusted)) {
+            // 仅本次明确要求批准的调用询问；普通操作直接执行。
+            if (prepared.explicit_denial != null) {
                 const permission = Permission{ .id = host_id, .tool_name = call.name, .description = prepared.description };
                 try self.emit(.{ .state = .awaiting_permission }, cancel);
                 try self.emit(.{ .permission = permission }, cancel);
@@ -2095,8 +2096,6 @@ pub const Runtime = struct {
                 switch (approval) {
                     .allow_once => {},
                     .deny => allowed = false,
-                    // 信任只影响本 Runtime 之后、未标记 explicit_denial 的调用。当前调用已经过明确选择。
-                    .trust_process => self.trusted = true,
                 }
             }
 

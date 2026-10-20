@@ -22,10 +22,13 @@ const directory = @import("model_directory.zig");
 const model_resolver = @import("model_resolver.zig");
 const fs = @import("../platform/filesystem.zig");
 const decision_selection = @import("decision_selection.zig");
+const settings_preferences = @import("../core/settings.zig");
 
 test {
     _ = @import("llm_session_test.zig");
     _ = @import("global_preferences_test.zig");
+    _ = @import("settings_preferences_test.zig");
+    _ = @import("decision_model_selection_test.zig");
 }
 
 const MetadataTokens = [catalog.entries.len]?u32;
@@ -100,7 +103,6 @@ pub const Session = struct {
     environ: *const std.process.Environ.Map,
     project: []const u8,
     host: r.Host,
-    trusted: bool,
     logging: bool = true,
     /// Generated once before activation/logging; never read from the writer.
     session_id: ids.Id,
@@ -128,6 +130,8 @@ pub const Session = struct {
     /// baseline; selections with history never leak into credential saves.
     global_config: ?std.json.Parsed(cfg.Config) = null,
     display_models: []cfg.Model = &.{},
+    /// Independently resolved reviewer candidates; never use primary limits.
+    display_decision_models: []cfg.Model = &.{},
     // cfg registry parsing/validation rejects more than 16 providers. Names
     // borrow the global registry arena; current() rebuilds after each save.
     display_providers: [16]tui.ModelProvider = undefined,
@@ -165,11 +169,11 @@ pub const Session = struct {
     pub const Options = struct { restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, logging: bool = true, auto_refresh_models: bool = false };
 
     /// 只做本地初始化；缺少凭证时保持 pending，不发起试探请求。
-    pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, trusted: bool) !Session {
-        return initWithOptions(a, io, environ, project, host, trusted, .{});
+    pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host) !Session {
+        return initWithOptions(a, io, environ, project, host, .{});
     }
 
-    pub fn initWithOptions(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, trusted: bool, options: Options) !Session {
+    pub fn initWithOptions(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, options: Options) !Session {
         const home = environ.get("HOME") orelse return error.MissingHome;
         if (options.resume_session != null and options.restore_selection != null) return error.InvalidArguments;
         const id = options.resume_session orelse try ids.generate(io);
@@ -206,7 +210,6 @@ pub const Session = struct {
             .environ = environ,
             .project = project,
             .host = host,
-            .trusted = trusted,
             .logging = options.logging,
             .session_id = id,
             .store = auth_store,
@@ -260,6 +263,7 @@ pub const Session = struct {
         }
         const config = &self.pending.?.value;
         self.display_models = try self.buildModels(config.*, self.global_config.?.value);
+        self.display_decision_models = try self.buildDecisionModels(self.global_config.?.value);
         if (self.selected_alias == null) self.selected_alias = try self.aliasFor(config.*);
         if (self.read_only) {
             self.settings_notice = "Session is open elsewhere or not writable; read-only history";
@@ -375,7 +379,7 @@ pub const Session = struct {
             return err;
         };
         defer self.allocator.free(protected);
-        const candidate = try App.initConfiguredAnchoredAuth(self.allocator, self.io, self.environ, &self.project_root, protected, self.host, self.trusted, parsed);
+        const candidate = try App.initConfiguredAnchoredAuth(self.allocator, self.io, self.environ, &self.project_root, protected, self.host, parsed);
         errdefer candidate.deinit();
         // Pin while the fresh journal still has zero counters. Imported sequence
         // numbers belong to the archive, not to a second pin operation.
@@ -390,6 +394,7 @@ pub const Session = struct {
         self.releaseLoadedHistory();
         if (self.metadata_job) |job| job.destroy();
         self.freeDisplayModels(self.display_models);
+        self.freeDisplayModels(self.display_decision_models);
         if (self.selected_alias) |alias| self.allocator.free(alias);
         if (self.global_config) |*global| cfg.release(global);
         if (self.app) |app| app.deinit();
@@ -409,7 +414,7 @@ pub const Session = struct {
 
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .decision_fn = setDecision, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -606,10 +611,14 @@ pub const Session = struct {
             // L reports active protection against a known price step, not
             // the global switch. Flat/unknown/pending models have no marker.
             .low_price_input = self.app != null and !unselected and !config.selection_pending and config.limits.low_price_input and config.model.input_price_threshold != null,
+            .limits = config.limits,
+            .decision_timeout_ms = if (config.decision) |decision| decision.request_timeout_ms else null,
             .low_price_input_enabled = config.limits.low_price_input,
             .decision_enabled = config.decisionActive(),
             .decision_configured = config.decision != null,
             .decision_jev_free = decision_selection.selected(self.global_config.?.value),
+            .decision_models = self.display_decision_models,
+            .decision_model = if (config.decision) |value| (if (value.enabled and value.backend == .model) value.model else null) else null,
             .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .pending_default_effort = if (self.app != null and self.initial_default_pending and config.model.reasoning_effort == null) self.preferred_effort else null,
@@ -617,7 +626,6 @@ pub const Session = struct {
             .settings_error = self.settings_error,
             .settings_notice = self.settings_notice,
             .base_url = config.provider.base_url,
-            .tools_trusted = self.trusted,
             .logging_enabled = self.logging and !self.read_only,
             // Journal failures already render as REC FAILED. Checkpoint saves use
             // that same channel when the journal itself is still healthy.
@@ -866,8 +874,16 @@ pub const Session = struct {
                 self.metadata_notice = if (job.manual) "Metadata display could not be updated; previous values kept" else null;
                 return true;
             };
+            const decision_models = self.buildDecisionModels(self.global_config.?.value) catch {
+                self.freeDisplayModels(models);
+                self.metadata_cache = previous;
+                self.metadata_notice = if (job.manual) "Metadata display could not be updated; previous values kept" else null;
+                return true;
+            };
             self.freeDisplayModels(self.display_models);
+            self.freeDisplayModels(self.display_decision_models);
             self.display_models = models;
+            self.display_decision_models = decision_models;
             _ = self.completeInitialDefault(idle) catch false;
             const official_requested = job.requested & metadata.provider_mask;
             self.metadata_notice = if (!job.manual) null else if (!finished)
@@ -995,6 +1011,26 @@ pub const Session = struct {
         return models.toOwnedSlice(self.allocator);
     }
 
+    /// Resolve the same catalog with auxiliary caps before filtering. A small
+    /// reviewer window must not become unusable due to the main safety margin.
+    fn buildDecisionModels(self: *Session, global: cfg.Config) ![]cfg.Model {
+        var independent = global;
+        independent.limits = (global.decision orelse cfg.DecisionConfig{ .model = "" }).modelLimits();
+        const models = try self.buildModels(independent, independent);
+        var count: usize = 0;
+        for (models) |model| {
+            if (decision_selection.genericCandidate(independent, model)) {
+                models[count] = model;
+                count += 1;
+            } else self.freeDisplayModel(model);
+        }
+        errdefer {
+            for (models[0..count]) |model| self.freeDisplayModel(model);
+            self.allocator.free(models);
+        }
+        return self.allocator.realloc(models, count);
+    }
+
     fn appendRegistryCandidate(self: *Session, models: *std.ArrayList(cfg.Model), global: cfg.Config, provider: []const u8, raw_id: []const u8) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -1102,14 +1138,43 @@ pub const Session = struct {
         try self.persistSettings(&declaration, false);
     }
 
+    fn setPreference(raw: *anyopaque, key: settings_preferences.Key, value: ?u32) !void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        try self.guardSelection();
+        var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
+        defer cfg.release(&declaration);
+        try settings_preferences.apply(&declaration.value, key, value);
+        try self.persistSettings(&declaration, false);
+    }
+
     fn setDecision(raw: *anyopaque, choice: tui.Connection.DecisionChoice) !void {
         const self: *Session = @ptrCast(@alignCast(raw));
         try self.guardSelection();
+        // Revalidate at the owner, not merely in a previously drawn picker.
+        // No unknown raw IDs, other aliases or now-missing credentials may save.
+        switch (choice) {
+            .model => |name| {
+                const ref = try cfg.splitDefault(name);
+                const registry = self.global_config.?.value.registry orelse return error.MissingRegistry;
+                const provider = registry.find(ref.provider) orelse return error.UnknownProvider;
+                if (!self.hasLocalCredential(provider.connection)) return error.ApiKeyNotFound;
+                var found = false;
+                for (self.display_decision_models) |model| {
+                    if (std.mem.eql(u8, name, model.name) and decision_selection.genericCandidate(self.global_config.?.value, model)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return error.UnknownDecisionModel;
+            },
+            else => {},
+        }
         var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
         defer cfg.release(&declaration);
         if (!try decision_selection.apply(declaration.arena.allocator(), &declaration.value, switch (choice) {
             .off => .off,
             .opencode_jev_free => .opencode_jev_free,
+            .model => |name| .{ .model = name },
         })) return;
         try self.persistSettings(&declaration, true);
     }
@@ -1117,6 +1182,7 @@ pub const Session = struct {
     /// Save is the final fallible operation. Swapping with the caller keeps its
     /// deferred release responsible for wiping the previous global declaration.
     fn persistSettings(self: *Session, declaration: *std.json.Parsed(cfg.Config), refresh: bool) !void {
+        try cfg.validate(declaration.value);
         var prepared: ?App.SettingsReplacement = if (self.app) |app| try app.prepareSettingsRefresh(declaration.value, self.environ, refresh) else null;
         defer if (prepared) |*value| value.deinit();
         var pending: ?std.json.Parsed(cfg.Config) = if (self.app == null)
@@ -1217,6 +1283,8 @@ pub const Session = struct {
         defer if (defaults) |*value| cfg.release(value);
         const models = try self.buildModels(owned.value, if (defaults) |value| value.value else self.global_config.?.value);
         errdefer self.freeDisplayModels(models);
+        const decision_models = try self.buildDecisionModels(if (defaults) |value| value.value else self.global_config.?.value);
+        errdefer self.freeDisplayModels(decision_models);
         var replacement: ?*App.ConnectionReplacement = null;
         var initial: ?*App = null;
         errdefer if (replacement) |value| value.deinit();
@@ -1262,6 +1330,8 @@ pub const Session = struct {
         self.selected_alias = alias;
         self.freeDisplayModels(self.display_models);
         self.display_models = models;
+        self.freeDisplayModels(self.display_decision_models);
+        self.display_decision_models = decision_models;
         self.active_context_official = context_official;
         self.preferred_effort = wanted;
         // A replacement is also a new model selection: metadata may arrive
@@ -1335,6 +1405,8 @@ pub const Session = struct {
         }
         const models = try self.buildModels(if (initial) |value| value.config.value else active, baseline.value);
         errdefer self.freeDisplayModels(models);
+        const decision_models = try self.buildDecisionModels(baseline.value);
+        errdefer self.freeDisplayModels(decision_models);
         if (self.app) |app| try app.journal.rememberKey(key);
         try self.store.save(baseline.value);
         if (self.global_config) |*old| cfg.release(old);
@@ -1355,6 +1427,8 @@ pub const Session = struct {
         }
         self.freeDisplayModels(self.display_models);
         self.display_models = models;
+        self.freeDisplayModels(self.display_decision_models);
+        self.display_decision_models = decision_models;
         if (self.metadata_login_auto) if (id) |service| {
             self.metadata_login_pending |= metadata.bit(service);
         };
@@ -1598,7 +1672,7 @@ const SessionTestFixture = struct {
     }
 
     fn open(self: *SessionTestFixture, options: Session.Options) !Session {
-        return Session.initWithOptions(std.testing.allocator, std.testing.io, &self.env, self.home, .{}, false, options);
+        return Session.initWithOptions(std.testing.allocator, std.testing.io, &self.env, self.home, .{}, options);
     }
 
     fn saveHistory(self: *SessionTestFixture) !ids.Id {
@@ -1653,7 +1727,7 @@ test "empty HOME hides placeholder selection but retains initialized defaults" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, false, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     try std.testing.expect(session.app == null);
     try std.testing.expect(session.loaded_checkpoint == null);
@@ -1752,7 +1826,7 @@ test "resume without key displays and saves history then custom login imports it
     const id = try fixture.saveHistory();
     // Actual new-format fixture removes the saved inline key.
     try writeSessionTestConfig(fixture.tmp.dir, session_test_config);
-    var resumed = try Session.initWithOptions(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{ .context = &counter, .emit_fn = Counter.emit, .authorize_fn = Counter.authorize }, false, .{ .resume_session = id });
+    var resumed = try Session.initWithOptions(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{ .context = &counter, .emit_fn = Counter.emit, .authorize_fn = Counter.authorize }, .{ .resume_session = id });
     defer resumed.deinit();
     try std.testing.expect(resumed.app == null);
     try std.testing.expect(resumed.loaded_checkpoint != null);
@@ -1766,7 +1840,6 @@ test "resume without key displays and saves history then custom login imports it
     try std.testing.expectEqual(@as(u64, 2), resumed.app.?.journal.turn);
     try std.testing.expectEqual(@as(u64, 77), resumed.initial_context.?.tokens);
     try std.testing.expect(resumed.app.?.journal.resumed);
-    try std.testing.expect(!resumed.app.?.runtime.trusted);
     try resumed.connection().selectModel("archive/saved");
     try expectSessionTestHistory(&resumed);
     try std.testing.expectEqual(@as(usize, 0), counter.started);
@@ -2107,7 +2180,7 @@ test "Anthropic displayable session resume preserves signed replay and never exe
         }
     };
     {
-        var source = try Session.init(a, io, &env, home, .{}, true);
+        var source = try Session.init(a, io, &env, home, .{});
         defer source.deinit();
         try source.connection().configureProvider(.opencode_go, "fake-anthropic-resume");
         try source.connection().selectModel("opencode-go/claude-haiku-5-5");
@@ -2134,7 +2207,7 @@ test "Anthropic displayable session resume preserves signed replay and never exe
         try std.testing.expect(try source.saveOnExit());
     }
     {
-        var restored = try Session.initWithOptions(a, io, &env, home, .{}, false, .{ .resume_session = id, .logging = false });
+        var restored = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id, .logging = false });
         defer restored.deinit();
         try std.testing.expectEqual(id, restored.session_id);
         try std.testing.expect(restored.app.?.runtime.selector.selected == .anthropic);
@@ -2143,7 +2216,6 @@ test "Anthropic displayable session resume preserves signed replay and never exe
         const actual = try Wire.encode(a, &restored);
         defer a.free(actual);
         try std.testing.expectEqualStrings(expected.?, actual);
-        try std.testing.expect(!restored.app.?.runtime.trusted);
         try std.testing.expect(!restored.resume_lease.?.active);
         try std.testing.expect(!try restored.saveOnExit());
         try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "must-not-run.txt", .{}));
@@ -2162,7 +2234,7 @@ test "closed turn checkpoint is resumable before exit" {
     try env.put("HOME", home);
     var id: ids.Id = undefined;
     {
-        var source = try Session.init(a, io, &env, home, .{}, true);
+        var source = try Session.init(a, io, &env, home, .{});
         defer source.deinit();
         try source.connection().configure("fake-incremental-checkpoint");
         id = source.session_id;
@@ -2187,7 +2259,7 @@ test "closed turn checkpoint is resumable before exit" {
         releaseLease(&source);
     }
     {
-        var resumed = try Session.initWithOptions(a, io, &env, home, .{}, false, .{ .resume_session = id, .logging = false });
+        var resumed = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id, .logging = false });
         defer resumed.deinit();
         try std.testing.expectEqual(@as(usize, 2), resumed.app.?.runtime.messages().len);
         try std.testing.expectEqualStrings("incremental question", resumed.app.?.runtime.messages()[0].blocks[0].text);
@@ -2331,7 +2403,7 @@ test "initial default adopts late public metadata without cycling or normalizing
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false, .auto_refresh_models = true });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = true });
     defer session.deinit();
     Fetch.release.store(false, .release);
     defer Fetch.release.store(true, .release);
@@ -2385,7 +2457,7 @@ test "DeepSeek then Go Haiku selection applies global default with early or late
             var env = std.process.Environ.Map.init(a);
             defer env.deinit();
             try env.put("HOME", home);
-            var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+            var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
             defer session.deinit();
             try setGlobalEffortForTest(&session, wanted);
             session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.deepseek), try metadata.parseListing(a,
@@ -2462,7 +2534,7 @@ test "first activation defaults clamp without changing preference and own late c
             try writeSessionTestConfig(tmp.dir,
                 \\{"llm":{"default":"opencode-go/gpt-6-luna","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go"}}},"limits":{"low_price_input":false}}
             );
-            var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+            var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
             defer session.deinit();
             try setGlobalEffortForTest(&session, saved);
             const listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"effort\":{\"supported_levels\":[\"off\",\"low\",\"high\",\"max\"]}}]}", .opencode_go);
@@ -2514,7 +2586,7 @@ test "initial default stops after journal start and never overwrites an accepted
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-default-journal");
     try session.connection().selectModel("opencode-go/gpt-6-luna");
@@ -2560,7 +2632,7 @@ test "effort action cannot borrow official reasoning for a proxy kind hint" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     const listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", .deepseek);
     session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.deepseek), listing);
@@ -2593,7 +2665,7 @@ test "timed automatic metadata refresh repeats while active capabilities stay fr
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .deepseek);
     Fixture.calls.store(0, .monotonic);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .auto_refresh_models = true, .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true, .logging = false });
     defer session.deinit();
     session.metadata_fetch = Fixture.fetch;
     session.metadata_dev_fetch = MetadataFixture.dev;
@@ -2639,7 +2711,7 @@ test "manual metadata refresh filters obsolete credentials even with automatic r
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .deepseek);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false, .auto_refresh_models = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = false });
     defer session.deinit();
     session.metadata_fetch = MetadataFixture.fetch;
     session.metadata_dev_fetch = MetadataFixture.dev;
@@ -2685,7 +2757,7 @@ test "models.dev completion survives a stalled official source and owner teardow
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     session.metadata_fetch = MetadataFixture.stall;
     session.metadata_dev_fetch = LayeredMetadataFixture.dev;
@@ -2716,7 +2788,7 @@ test "official results publish while models.dev retains an independent longer de
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     session.metadata_fetch = LayeredMetadataFixture.official;
     session.metadata_dev_fetch = LayeredMetadataFixture.devStall;
@@ -2773,7 +2845,7 @@ test "login with new credentials refreshes official metadata without waiting for
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false, .auto_refresh_models = true });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = true });
     defer session.deinit();
     session.metadata_fetch = Fixture.official;
     session.metadata_dev_fetch = LayeredMetadataFixture.devStall;
@@ -2827,7 +2899,7 @@ test "login refreshes only saved provider despite prior attempt and queues behin
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .auto_refresh_models = true });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true });
     defer session.deinit();
     session.metadata_fetch = Fixture.fetch;
     session.metadata_dev_fetch = MetadataFixture.dev;
@@ -2901,7 +2973,7 @@ test "manual refresh asynchronously discovers new IDs and preserves public proto
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .deepseek);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     session.metadata_fetch = Fixture.official;
     session.metadata_dev_fetch = Fixture.public;
@@ -2960,7 +3032,7 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
     LayeredMetadataFixture.official_effort.store(false, .release);
     LayeredMetadataFixture.dev_calls.store(0, .monotonic);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .auto_refresh_models = true, .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true, .logging = false });
     defer session.deinit();
     session.metadata_fetch = LayeredMetadataFixture.official;
     session.metadata_dev_fetch = LayeredMetadataFixture.dev;
@@ -2989,7 +3061,7 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     const disk = try metadata.load(&session.store.root);
     try std.testing.expectEqualStrings("disabled", disk.dev_reasoning[index].?.map.off.?);
     {
-        var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .auto_refresh_models = true, .logging = false });
+        var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true, .logging = false });
         defer again.deinit();
         again.metadata_fetch = MetadataFixture.fail;
         again.metadata_dev_fetch = LayeredMetadataFixture.devFail;
@@ -3059,7 +3131,7 @@ test "dynamic official IDs select for all providers and reject unknown protocols
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .deepseek);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     for (ProviderId.all) |id| try session.connection().configureProvider(id, "fake-dynamic-key");
     session.metadata_cache.directory_mask = metadata.provider_mask;
@@ -3125,7 +3197,7 @@ test "login refresh opt out remains offline and explicit profiles survive availa
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.init(a, std.testing.io, &env, home, .{}, true);
+    var session = try Session.init(a, std.testing.io, &env, home, .{});
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-go-offline");
     try std.testing.expect(!Session.pollModels(&session, true));
@@ -3155,7 +3227,7 @@ test "display candidates own names and explicit wires across cache and config re
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-owned-display-key");
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
@@ -3203,7 +3275,7 @@ test "raw explicit profile hides only the same provider dynamic identity" {
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-go-profile-key");
     try session.connection().configureProvider(.opencode_zen, "fake-zen-profile-key");
@@ -3234,7 +3306,7 @@ test "explicit user reasoning overrides metadata and survives default persistenc
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer source.deinit();
     // A manual registry patch is explicit; value/name similarity to metadata must not erase it.
     var parsed = try cfg.parse(a,
@@ -3267,7 +3339,7 @@ test "derived reasoning stays in cache and cannot revive after a tied refresh or
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer source.deinit();
     try source.connection().configureProvider(.opencode_go, "fake-provenance-go");
     source.metadata_cache = try metadata.commit(&source.store.root, 0, try metadata.parseDev(a, @embedFile("models_dev_fixture.json")));
@@ -3316,7 +3388,7 @@ test "derived reasoning stays in cache and cannot revive after a tied refresh or
         try std.testing.expect(request.reasoning_effort == null and request.thinking == null);
     }
     {
-        var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+        var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
         defer again.deinit();
         try std.testing.expect(!again.capabilitiesFor(again.mutableConfig().*).known);
         try std.testing.expect(again.mutableConfig().model.reasoning == null);
@@ -3342,7 +3414,7 @@ test "official cached effort metadata overrides the models.dev fallback" {
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.init(a, std.testing.io, &env, home, .{}, true);
+    var session = try Session.init(a, std.testing.io, &env, home, .{});
     defer session.deinit();
 
     const entry = catalog.find("opencode-go/gpt-6-luna").?;
@@ -3375,7 +3447,7 @@ test "explicit raw and qualified profiles override dynamic rows including explic
     try writeSessionTestConfig(tmp.dir,
         \\{"llm":{"default":"opencode-go/minimax-m2.7","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"raw-override":{"context_tokens":32768,"protocol":"auto"},"qualified-override":{"context_tokens":32768,"protocol":"chat"}}}}},"limits":{"low_price_input":false}}
     );
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-explicit-key");
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
@@ -3412,7 +3484,7 @@ test "new raw custom model never inherits the previous model output capability" 
     try writeSessionTestConfig(tmp.dir,
         \\{"llm":{"default":"custom/previous","providers":{"custom":{"base_url":"https://custom.invalid/v1","models":{"previous":{"protocol":"chat","context_tokens":131072,"output_tokens":65536},"custom-next":{"protocol":"chat","context_tokens":131072},"custom-declared":{"protocol":"chat","context_tokens":131072,"output_tokens":4096}}}}},"limits":{"low_price_input":false}}
     );
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     try std.testing.expectEqual(@as(?u32, 65536), session.mutableConfig().model.output_tokens);
     try session.connection().selectModel("custom-next");
@@ -3432,7 +3504,7 @@ test "pending auth retains trusted derived map while saving only cache backed de
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .deepseek);
-    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer source.deinit();
     var listing: metadata.Listing = .{};
     const index = Session.metadataIndex(source.mutableConfig().*).?;
@@ -3451,7 +3523,7 @@ test "pending auth retains trusted derived map while saving only cache backed de
     var disk = try source.store.loadExisting();
     defer cfg.release(&disk);
     try std.testing.expect(disk.value.model.reasoning == null and disk.value.model.reasoning_effort == null);
-    var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer again.deinit();
     try std.testing.expectEqualStrings("max", again.mutableConfig().model.reasoning_effort.?);
     try std.testing.expect(again.capabilitiesFor(again.mutableConfig().*).known);
@@ -3467,7 +3539,7 @@ test "derived metadata protocol or format mismatch clears stale mapping and effo
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, true, .{ .logging = false });
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer source.deinit();
     const entry = catalog.find("opencode-go/gpt-6-luna").?;
     const index = LayeredMetadataFixture.index(entry.selector);

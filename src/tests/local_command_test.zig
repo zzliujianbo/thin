@@ -39,7 +39,7 @@ const Fake = struct {
         const args = try std.json.parseFromSliceLeaky(struct { command: []const u8 }, alloc, call.arguments, .{});
         try std.testing.expect(args.command.len != 0);
         if (self.prepare_error) return error.BadCommand;
-        return .{ .payload = self, .description = args.command, .requires_approval = true, .decision_input = .{ .command = .{ .command = args.command, .max_timeout_ms = 1000 } } };
+        return .{ .payload = self, .description = args.command, .explicit_denial = "Fixture requires explicit approval; not executed.", .decision_input = .{ .command = .{ .command = args.command, .max_timeout_ms = 1000 } } };
     }
     fn execute(raw: *anyopaque, _: std.mem.Allocator, prepared: r.Prepared, cancel: *const p.Cancellation) !r.Execution {
         const self: *Fake = @ptrCast(@alignCast(raw));
@@ -76,7 +76,7 @@ const Fake = struct {
         if (observation == .submitted) self.submitted += 1;
     }
     fn init(self: *Fake, config: *const cfg.Config, default_host: bool) !r.Runtime {
-        var runtime = try r.Runtime.init(a, std.testing.io, config, .{ .context = self, .call_fn = model }, .{ .context = self, .schemas = &schemas, .prepare_fn = prepare, .execute_fn = execute }, .{ .context = self, .emit_fn = event, .authorize_fn = if (default_host) (r.Host{}).authorize_fn else authorize }, "", false);
+        var runtime = try r.Runtime.init(a, std.testing.io, config, .{ .context = self, .call_fn = model }, .{ .context = self, .schemas = &schemas, .prepare_fn = prepare, .execute_fn = execute }, .{ .context = self, .emit_fn = event, .authorize_fn = if (default_host) (r.Host{}).authorize_fn else authorize }, "");
         runtime.observer = .{ .context = self, .notify_fn = observe };
         return runtime;
     }
@@ -165,7 +165,6 @@ test "local command decision ask timeout and failure preserve pairing" {
         var runtime = try fake.init(&config, false);
         defer runtime.deinit();
         fake.runtime = &runtime;
-        runtime.trusted = true;
         runtime.decision_service = .{ .context = &fake, .decide_fn = Fake.review };
         var cancel: p.Cancellation = .{};
         const terminal = try runtime.executeCommand("!review", &cancel);

@@ -1,4 +1,4 @@
-//! Session preface for the model: two AGENTS.md sources plus cwd, shell, and project root.
+//! Session preface: two AGENTS.md sources plus cwd, shell, project root and process platform.
 //! Global files live in the thin home (`<HOME>/.thin`). Project files live only at the
 //! git root of the session cwd, or at that cwd when it is not inside a git work tree.
 //! Intermediate parents and subdirectories are not searched. Override files win over
@@ -6,6 +6,7 @@
 //! 中文：只注入两处 AGENTS（thin 主目录、仓库根），缺文件就跳过；总正文不超过 32KiB。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fs = @import("../platform/filesystem.zig");
 
 /// Combined raw AGENTS file bytes injected into one session preface.
@@ -20,6 +21,9 @@ pub const Snapshot = struct {
     cwd: []const u8,
     shell: []const u8,
     project_root: []const u8,
+    /// Platform of the running Thin binary, not a remote host or physical CPU probe.
+    os: std.Target.Os.Tag = builtin.os.tag,
+    arch: std.Target.Cpu.Arch = builtin.cpu.arch,
     /// Formatted layer text. Empty when both sources are absent.
     agents: []const u8,
     /// Concatenated file bytes only, in discovery order. Never above max_agents_bytes.
@@ -31,6 +35,9 @@ pub const Environment = struct {
     cwd: []const u8,
     shell: []const u8,
     project_root: []const u8,
+    /// Legacy history lacks these fields. Never label it with today's platform.
+    os: ?std.Target.Os.Tag = null,
+    arch: ?std.Target.Cpu.Arch = null,
 };
 
 /// SHELL is used when it is a single UTF-8 line. Otherwise the session reports bash.
@@ -56,18 +63,22 @@ fn requireField(value: []const u8, absolute: bool) !void {
 }
 
 pub fn environmentOf(snap: Snapshot) Environment {
-    return .{ .cwd = snap.cwd, .shell = snap.shell, .project_root = snap.project_root };
+    return .{ .cwd = snap.cwd, .shell = snap.shell, .project_root = snap.project_root, .os = snap.os, .arch = snap.arch };
 }
 
 pub fn formatEnvironment(a: std.mem.Allocator, env: Environment, update: bool) ![]u8 {
     try requireField(env.cwd, true);
     try requireField(env.shell, false);
     try requireField(env.project_root, true);
-    return std.fmt.allocPrint(a, "{s}\ncwd: {s}\nshell: {s}\nproject_root: {s}\n", .{
+    const os = env.os orelse return error.InvalidSessionContext;
+    const arch = env.arch orelse return error.InvalidSessionContext;
+    return std.fmt.allocPrint(a, "{s}\ncwd: {s}\nshell: {s}\nproject_root: {s}\nos: {s}\narch: {s}\n", .{
         if (update) "environment update" else "environment",
         env.cwd,
         env.shell,
         env.project_root,
+        @tagName(os),
+        @tagName(arch),
     });
 }
 
@@ -79,7 +90,14 @@ pub fn parseEnvironment(text: []const u8) ?Environment {
     const cwd = oneField(&rest, "cwd: ") orelse return null;
     const shell = oneField(&rest, "shell: ") orelse return null;
     const project_root = oneField(&rest, "project_root: ") orelse return null;
-    return .{ .cwd = cwd, .shell = shell, .project_root = project_root };
+    var env: Environment = .{ .cwd = cwd, .shell = shell, .project_root = project_root };
+    if (rest.len == 0) return env; // Archived three-field preface remains readable.
+    const os = oneField(&rest, "os: ") orelse return null;
+    const arch = oneField(&rest, "arch: ") orelse return null;
+    if (rest.len != 0) return null;
+    env.os = std.meta.stringToEnum(std.Target.Os.Tag, os) orelse return null;
+    env.arch = std.meta.stringToEnum(std.Target.Cpu.Arch, arch) orelse return null;
+    return env;
 }
 
 pub fn parseAgentsBody(text: []const u8) ?[]const u8 {

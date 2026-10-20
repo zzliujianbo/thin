@@ -106,17 +106,8 @@ pub const Client = struct {
         state.config = try cfg.clone(a, self.source.value);
         errdefer cfg.release(&state.config);
         const config = &state.config.value;
-        // Auxiliary caps are explicit and independent of primary price policy.
-        config.limits = .{
-            .low_price_input = false,
-            .input_margin_tokens = 1,
-            .safety_tokens = 256,
-            .max_input_tokens = declared.max_input_tokens,
-            .max_output_tokens = declared.max_output_tokens,
-            .request_timeout_ms = declared.request_timeout_ms,
-            .max_response_bytes = 128 * 1024,
-            .max_event_bytes = 64 * 1024,
-        };
+        // Picker and actual reviewer resolve with the same independent caps.
+        config.limits = declared.modelLimits();
         const cache = try a.create(metadata.Cache);
         defer a.destroy(cache);
         cache.* = .{};

@@ -271,21 +271,21 @@ test "reliable tool result waits then queues when consumer makes room" {
     try t.expectEqualStrings("reliable", result.event.tool_result.result.text);
 }
 
-// 权限决策：允许提前决定，拒绝错误、过期或重复的 ID；reset 会清除信任状态。
-test "permission accepts early decision, rejects wrong stale and duplicate IDs; reset removes trust" {
+// 权限决策：允许提前决定，拒绝错误、过期或重复的 ID；reset 会清除待处理批准。
+test "permission accepts early decision, rejects wrong stale and duplicate IDs; reset revokes pending approval" {
     var env = Env.init();
     defer env.deinit();
     var cancel = p.Cancellation{};
     var bridge = b.Bridge.init(t.allocator, env.backend.io(), &cancel);
     defer bridge.deinit();
-    try t.expect(!bridge.decide(1, .trust_process));
+    try t.expect(!bridge.decide(1, .allow_once));
 
     try send(&bridge, .{ .permission = .{ .id = 1, .tool_name = "x", .description = "y" } });
     try t.expect(!bridge.decide(2, .allow_once));
-    try t.expect(bridge.decide(1, .trust_process));
+    try t.expect(bridge.decide(1, .allow_once));
     try t.expect(!bridge.decide(1, .deny));
     try t.expectEqual(r.Decision.deny, try auth(&bridge, 2));
-    try t.expectEqual(r.Decision.trust_process, try auth(&bridge, 1));
+    try t.expectEqual(r.Decision.allow_once, try auth(&bridge, 1));
     try t.expect(!bridge.decide(1, .allow_once));
     try t.expectEqual(r.Decision.deny, try auth(&bridge, 1));
 
@@ -295,16 +295,16 @@ test "permission accepts early decision, rejects wrong stale and duplicate IDs; 
     bridge.close();
     try bridge.reset();
     try t.expect(!cancel.isRequested());
-    try t.expect(!bridge.decide(1, .trust_process));
+    try t.expect(!bridge.decide(1, .allow_once));
     try t.expectError(error.InvalidPermission, send(&bridge, .{ .permission = .{ .id = 1, .tool_name = "x", .description = "y" } }));
     try send(&bridge, .{ .permission = .{ .id = 2, .tool_name = "x", .description = "y" } });
-    try t.expect(!bridge.decide(1, .trust_process));
+    try t.expect(!bridge.decide(1, .allow_once));
     try t.expect(bridge.decide(2, .deny));
     try t.expectEqual(r.Decision.deny, try auth(&bridge, 2));
     drain(&bridge);
 
     try send(&bridge, .{ .permission = .{ .id = 3, .tool_name = "x", .description = "y" } });
-    try t.expect(bridge.decide(3, .trust_process));
+    try t.expect(bridge.decide(3, .allow_once));
     drain(&bridge);
     try bridge.reset();
     try t.expectEqual(r.Decision.deny, try auth(&bridge, 3));
@@ -344,7 +344,7 @@ test "permission installed before enqueue; cancel while awaiting permission clea
 
     cancel.cancel();
     try t.expectError(error.Canceled, worker.await(bridge.io));
-    try t.expect(!bridge.decide(8, .trust_process));
+    try t.expect(!bridge.decide(8, .allow_once));
     try t.expect(bridge.pending == null and bridge.answer == null);
 }
 
@@ -401,7 +401,7 @@ test "allocation failure rolls back reservation and permission; terminal needs n
     try t.expectError(error.OutOfMemory, send(&bridge, .{ .permission = .{ .id = 1, .tool_name = "tool", .description = "description" } }));
     try t.expectEqual(@as(usize, 0), bridge.bytes);
     try t.expect(bridge.pending == null and bridge.answer == null);
-    try t.expect(!bridge.decide(1, .trust_process));
+    try t.expect(!bridge.decide(1, .allow_once));
     try fill(&bridge);
 
     try send(&bridge, .{ .finished = .{ .status = .failed, .detail = error.OutOfMemory } });

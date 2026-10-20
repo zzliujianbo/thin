@@ -21,7 +21,7 @@ const Stub = struct {
 };
 
 fn runtime(config: *cfg.Config, dummy: *u8) !r.Runtime {
-    return r.Runtime.init(std.testing.allocator, std.testing.io, config, .{ .context = dummy, .call_fn = Stub.call }, .{ .context = dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "", false);
+    return r.Runtime.init(std.testing.allocator, std.testing.io, config, .{ .context = dummy, .call_fn = Stub.call }, .{ .context = dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "");
 }
 
 test "explicit mapped standard wire off survives normal and summary adapter encoding" {

@@ -59,7 +59,7 @@ test "prefix rewrite automatic and manual compaction sends canonical Anthropic t
         config.limits.max_output_tokens = 100;
         var fake: PrefixFake = .{};
         var unused: Fake = .{};
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = PrefixFake.call }, unused.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = PrefixFake.call }, unused.executor(), .{}, "");
         defer runtime.deinit();
         const alloc = runtime.arena.allocator();
         try runtime.history.append(alloc, try p.textMessage(alloc, .user, "old goal"));
@@ -110,7 +110,7 @@ test "prefix rewrite restore clears only summarized Anthropic owned replay and l
         config.model.protocol = protocol;
         config.model.reasoning.?.format = if (protocol == .anthropic) .anthropic else .standard;
         var fake: Fake = .{};
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "original", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "original");
         defer runtime.deinit();
         var state = try runtime.checkpoint();
         const source = [_]p.Message{
@@ -135,7 +135,7 @@ fn normalizedRestoreAllocation(alloc: std.mem.Allocator) !void {
     config.model.protocol = .anthropic;
     config.model.reasoning.?.format = .anthropic;
     var fake: Fake = .{};
-    var runtime = try r.Runtime.init(alloc, std.testing.io, &config, fake.model(), fake.executor(), .{}, "before", true);
+    var runtime = try r.Runtime.init(alloc, std.testing.io, &config, fake.model(), fake.executor(), .{}, "before");
     defer runtime.deinit();
     const system = runtime.system;
     var state = try runtime.checkpoint();
@@ -167,7 +167,7 @@ test "prefix rewrite restored summarized Anthropic history sends without stale p
     config.limits.max_output_tokens = 100;
     var fake: PrefixFake = .{};
     var unused: Fake = .{};
-    var runtime = try r.Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = PrefixFake.call }, unused.executor(), .{}, "", true);
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = PrefixFake.call }, unused.executor(), .{}, "");
     defer runtime.deinit();
     var state = try runtime.checkpoint();
     state.messages = &.{
@@ -285,7 +285,7 @@ test "compaction native sixteen same-user closed groups refinement rollback canc
         var cancel: p.Cancellation = .{};
         var fake: LongTurn = .{ .mode = mode, .cancel = &cancel };
         var unused: Fake = .{};
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = LongTurn.call }, unused.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = LongTurn.call }, unused.executor(), .{}, "");
         defer runtime.deinit();
         if (mode != .absent) runtime.decision_service = .{ .context = &fake, .decide_fn = LongTurn.decide };
         try seedNativeTurn(&runtime);
@@ -355,7 +355,7 @@ test "automatic compaction refinement cleanup failure blocks fitting normal infe
         .schemas = &.{},
         .prepare_fn = Effects.prepare,
         .execute_fn = Effects.execute,
-    }, .{}, "", true);
+    }, .{}, "");
     defer runtime.deinit();
     runtime.decision_service = .{ .context = &fake, .decide_fn = LongTurn.decide };
     try seedNativeTurn(&runtime);
@@ -504,7 +504,7 @@ test "compaction policy disabled skips automatic summaries but enforces hard inp
         config.limits.max_output_tokens = 100;
         config.limits.compaction_enabled = false;
         var fake: Fake = .{};
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         // Size synthetic history against actual prompt overhead, not fixed bytes.
         // Keep the real budget and both the >80% and hard-stop assertions intact.
@@ -540,7 +540,7 @@ test "compaction policy disabled still allows manual auto-budget summary without
         config.limits.compaction_enabled = false;
         config.limits.max_output_tokens = 16384;
         var fake: Fake = .{};
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         try seed(&runtime, &old);
         var cancel: p.Cancellation = .{};
@@ -560,7 +560,7 @@ test "compaction policy rejected summaries preserve canonical history and never 
         var config = configuration();
         config.model.output_tokens = 32;
         var fake: Fake = .{ .exhausted = exhausted, .oversized = !exhausted };
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         try seed(&runtime, &old);
         const before = runtime.messages().ptr;
@@ -583,7 +583,7 @@ test "compaction policy exhausted automatic summary pauses without followup infe
     config.limits.safety_tokens = 100;
     config.limits.max_output_tokens = 100;
     var fake: Fake = .{ .exhausted = true };
-    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
     defer runtime.deinit();
     try seed(&runtime, &old);
     var cancel: p.Cancellation = .{};

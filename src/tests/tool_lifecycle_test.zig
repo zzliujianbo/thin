@@ -54,7 +54,7 @@ const Fixture = struct {
         try t.expectEqual(@as(usize, if (self.local) 1 else 2), self.ready);
         try t.expectEqual(@as(usize, 1), self.commits);
         if (self.prepare_error) return error.BadArguments;
-        return .{ .payload = raw, .description = "fixture", .requires_approval = self.deny or self.cancel_permission != null };
+        return .{ .payload = raw, .description = "fixture", .explicit_denial = if (self.deny or self.cancel_permission != null) "Fixture requires explicit approval" else null };
     }
     fn execute(raw: *anyopaque, _: std.mem.Allocator, _: r.Prepared, _: *const p.Cancellation) !r.Execution {
         const self: *Fixture = @ptrCast(@alignCast(raw));
@@ -112,7 +112,7 @@ const Fixture = struct {
             .schemas = &schemas,
             .prepare_fn = prepare,
             .execute_fn = execute,
-        }, .{ .context = self, .emit_fn = event, .authorize_fn = authorize }, "", false);
+        }, .{ .context = self, .emit_fn = event, .authorize_fn = authorize }, "");
     }
 };
 fn configuration() cfg.Config {

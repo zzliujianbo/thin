@@ -458,6 +458,257 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     try d.waitIdle(close_start);
 }
 
+// Node validates the saved whole JSON and request counts before releasing
+// each owned gate. Marker emission follows a complete replayed UI frame.
+fn decisionModelGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
+    const path = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "{s}/decision-model-release-{s}", .{ project, name }), 0);
+    try check(access(path, 0) == -1 and c._errno().* == 2);
+    std.debug.print("DECISION_MODEL_GATE={s}\n", .{name});
+    const until = now() + 10000;
+    while (now() < until) {
+        if (access(path, 0) == 0) return;
+        try check(c._errno().* == 2);
+        try d.drain(20);
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.DecisionModelGateTimeout;
+}
+
+// Screens are large: keep these extra acceptance helpers off the main stack.
+fn decisionModelScreen(d: *Driver, a: std.mem.Allocator, required_text: []const []const u8, hidden: []const []const u8) !void {
+    const view = try a.create(regular.Screen);
+    defer a.destroy(view);
+    view.* = .{};
+    try view.replay(d.output[0..d.used]);
+    for (required_text) |needle| try check(view.visible(needle));
+    for (hidden) |needle| try check(!view.visible(needle));
+}
+
+fn decisionModel(d: *Driver, init: std.process.Init, mode: []const u8, project: []const u8) !void {
+    const a = init.arena.allocator();
+    const alias = std.mem.eql(u8, mode, "settings-decision-model-alias");
+    try check(alias or std.mem.eql(u8, mode, "settings-decision-model-raw"));
+    try d.waitIdle(0);
+    var start = d.used;
+    try d.send("decision-warmup-history-private-marker\r");
+    try d.waitText(start, "decision-warmup-answer");
+    try d.waitIdle(start);
+    try settingsKey(d, "/settings\r");
+    try settingsKey(d, "\x1b[B");
+    try decisionModelScreen(d, a, &.{"> Decision model"}, &.{});
+    try settingsKey(d, "\r");
+    try decisionModelScreen(d, a, &.{ "> Off", "OpenCode Jev Free", "Logged-in model" }, &.{});
+    try settingsKey(d, "\x1b[B");
+    try settingsKey(d, "\x1b[B");
+    try decisionModelScreen(d, a, &.{"> Logged-in model"}, &.{});
+    try settingsKey(d, "\r");
+    try decisionModelScreen(d, a, &.{ "Search> ", "aux/family/judge  (" }, &.{"locked/secret-model  ("});
+    try decisionModelGate(d, a, project, "opened");
+
+    // Searching an unauthenticated declared identity may echo it in the
+    // composer, but must never produce a selectable candidate row.
+    try settingsKey(d, "locked/secret-model");
+    try decisionModelScreen(d, a, &.{"Search> locked/secret-model"}, &.{ "locked/secret-model  (", "aux/family/judge  (" });
+    try d.send("\r");
+    try d.quiet(150);
+    try decisionModelScreen(d, a, &.{"Search> locked/secret-model"}, &.{"Decision model selected"});
+    try settingsKey(d, "\x1b[D");
+    try decisionModelScreen(d, a, &.{"> Logged-in model"}, &.{"Search> "});
+    try settingsKey(d, "\r");
+    try settingsKey(d, "aux/family/judge");
+    try decisionModelScreen(d, a, &.{"aux/family/judge  ("}, &.{});
+    try settingsKey(d, "\x1b");
+    try decisionModelScreen(d, a, &.{"> Logged-in model"}, &.{"Search> "});
+    try decisionModelGate(d, a, project, "canceled");
+
+    try settingsKey(d, "\r");
+    try settingsKey(d, if (alias) "aux/family/judge" else "family/judge");
+    try decisionModelScreen(d, a, &.{ ">   aux/family/judge  (", "Search> " }, &.{"locked/secret-model  ("});
+    start = d.used;
+    try d.send("\r");
+    try d.waitFrame(start, "Decision model selected; chat model unchanged");
+    try decisionModelScreen(d, a, &.{ "> Decision model", "Decision model   Configured" }, &.{ "Search> ", "> Logged-in model" });
+    try decisionModelGate(d, a, project, "selected");
+    start = d.used;
+    try d.send("\x1b");
+    try d.waitIdle(start);
+    try decisionModelScreen(d, a, &.{"fixture-main"}, &.{"family/judge"});
+    start = d.used;
+    try d.send("decision-normal-task-private-marker\r");
+    // The server only emits this AFTER inspecting the canonical bash result,
+    // not when a command preview or ready caption happens to become visible.
+    try d.waitFrame(start, "decision-tool-result-verified");
+    try d.waitIdle(start);
+    try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
+    try decisionModelScreen(d, a, &.{"fixture-main"}, &.{});
+}
+
+// New settings-value journey only; old fixtures and their navigation stay intact.
+fn settingsValueGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
+    const raw = try std.fmt.allocPrint(a, "{s}/settings-values-release-{s}", .{ project, name });
+    defer a.free(raw);
+    const path = try a.dupeSentinel(u8, raw, 0);
+    defer a.free(path);
+    try check(access(path, 0) == -1 and c._errno().* == 2);
+    std.debug.print("SETTINGS_VALUES_GATE={s}\n", .{name});
+    const until = now() + 5000;
+    while (now() < until) {
+        if (access(path, 0) == 0) return;
+        try check(c._errno().* == 2);
+        try d.drain(5);
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.SettingsValueGateTimeout;
+}
+
+// Bounded candidate navigation, not fixed preset indices: current custom values
+// may insert another row. Heap screen avoids inflating the acceptance stack.
+fn settingsValueSelect(d: *Driver, a: std.mem.Allocator, label: []const u8) !void {
+    const needle = try std.fmt.allocPrint(a, "> {s}", .{label});
+    defer a.free(needle);
+    const view = try a.create(regular.Screen);
+    defer a.destroy(view);
+    for (0..12) |_| {
+        view.* = .{};
+        try view.replay(d.output[0..d.used]);
+        if (view.visible(needle)) return;
+        try settingsKey(d, "\x1b[B");
+    }
+    return error.SettingsValueCandidateMissing;
+}
+
+fn settingsValueMenuOrder(d: *Driver, a: std.mem.Allocator, labels: []const []const u8) !void {
+    for (labels) |label| {
+        const selected = try std.fmt.allocPrint(a, "> {s}", .{label});
+        defer a.free(selected);
+        try decisionModelScreen(d, a, &.{selected}, &.{});
+        try settingsKey(d, "\x1b[B");
+    }
+}
+
+fn settingsValueOpen(d: *Driver, a: std.mem.Allocator, label: []const u8) !void {
+    try settingsValueSelect(d, a, label);
+    try settingsKey(d, "\r");
+}
+
+fn settingsValueChoose(d: *Driver, a: std.mem.Allocator, label: []const u8, parent: []const u8) !void {
+    try settingsValueOpen(d, a, label);
+    const selected = try std.fmt.allocPrint(a, "> {s}", .{parent});
+    defer a.free(selected);
+    try decisionModelScreen(d, a, &.{selected}, &.{"Custom ("});
+}
+
+fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8) !void {
+    const a = init.arena.allocator();
+    try d.waitIdle(0);
+    var start = d.used;
+    try d.send("values-warmup-private-marker\r");
+    try d.waitText(start, "values-warmup-answer");
+    try d.waitIdle(start);
+    try settingsKey(d, "/settings\r");
+    try decisionModelScreen(d, a, &.{ "> Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Output limit", "Task timeout" }, &.{});
+    try settingsValueMenuOrder(d, a, &.{ "Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Output limit", "Task timeout" });
+    try settingsValueGate(d, a, project, "opened");
+    try settingsValueOpen(d, a, "Auto compaction"); // Boolean toggle, no numeric picker.
+    try decisionModelScreen(d, a, &.{ "> Auto compaction", "Auto compaction  off" }, &.{});
+    try settingsValueGate(d, a, project, "compaction");
+
+    try settingsValueOpen(d, a, "Command timeout");
+    try decisionModelScreen(d, a, &.{ "> 123456 ms (current)", "Custom (ms)..." }, &.{});
+    try settingsValueGate(d, a, project, "current");
+    try settingsValueOpen(d, a, "Custom (ms)...");
+    try decisionModelScreen(d, a, &.{ "Custom: _ ms", "Enter stages" }, &.{});
+    // Invalid candidates may intentionally have no confirmable ACK and emit
+    // no new frame on Enter. Observe the existing screen, not waitFrame.
+    try d.send("\r");
+    try d.quiet(30);
+    try decisionModelScreen(d, a, &.{"Custom: _ ms"}, &.{"(staged)"});
+    try settingsValueGate(d, a, project, "invalid-empty");
+    try settingsKey(d, "0");
+    try d.send("\r");
+    try d.quiet(30);
+    try decisionModelScreen(d, a, &.{"Custom: 0_ ms"}, &.{"(staged)"});
+    try settingsValueGate(d, a, project, "invalid-zero");
+    try settingsKey(d, "\x15"); // Ctrl-U must clear all digits, not edit the composer.
+    try decisionModelScreen(d, a, &.{"Custom: _ ms"}, &.{});
+    try settingsKey(d, "4294967296");
+    try d.send("\r");
+    try d.quiet(30);
+    try decisionModelScreen(d, a, &.{"Custom: 4294967296_ ms"}, &.{"(staged)"});
+    try settingsValueGate(d, a, project, "invalid-overflow");
+    try settingsKey(d, "\x1b[D"); // edit -> candidate list, not parent Settings.
+    try decisionModelScreen(d, a, &.{"> Custom (ms)..."}, &.{"Custom:"});
+    try settingsValueGate(d, a, project, "edit-cancel");
+    try settingsKey(d, "\r");
+    try decisionModelScreen(d, a, &.{"Custom: _ ms"}, &.{});
+    try settingsKey(d, "120001");
+    // Two Enters in ONE input batch must only stage. The owner drops remaining
+    // batch input, publishes a fresh generation, and waits for its frame ACK.
+    try settingsKey(d, "\r\r");
+    try decisionModelScreen(d, a, &.{"> 120001 ms (staged)"}, &.{"Custom:"});
+    try settingsValueGate(d, a, project, "staged-cancel");
+    try settingsKey(d, "\x1b"); // staged candidate -> parent, no save.
+    try decisionModelScreen(d, a, &.{"> Command timeout"}, &.{"Custom ("});
+    try settingsValueGate(d, a, project, "canceled");
+
+    try settingsValueOpen(d, a, "Command timeout");
+    try decisionModelScreen(d, a, &.{"> 123456 ms (current)"}, &.{"120001 ms"});
+    try settingsValueOpen(d, a, "Custom (ms)...");
+    try settingsKey(d, "120000");
+    try settingsKey(d, "\r\r");
+    try decisionModelScreen(d, a, &.{"> 120000 ms (staged)"}, &.{"Custom:"});
+    try settingsValueGate(d, a, project, "command-staged");
+    try settingsKey(d, "\r"); // Separate Enter only after fresh ACK and disk gate.
+    try decisionModelScreen(d, a, &.{ "> Command timeout", "120000 ms" }, &.{"Custom ("});
+    try settingsValueGate(d, a, project, "command");
+
+    try settingsValueOpen(d, a, "Request timeout");
+    try decisionModelScreen(d, a, &.{"> 10000 ms (current)"}, &.{});
+    try settingsValueChoose(d, a, "60000 ms", "Request timeout");
+    try settingsValueGate(d, a, project, "request");
+    try settingsValueOpen(d, a, "Output limit");
+    try decisionModelScreen(d, a, &.{"> 100 tokens (current)"}, &.{});
+    try settingsValueChoose(d, a, "4096 tokens", "Output limit");
+    try settingsValueGate(d, a, project, "output");
+    try settingsValueOpen(d, a, "Output limit");
+    try settingsValueChoose(d, a, "Auto", "Output limit");
+    try settingsValueGate(d, a, project, "output-auto");
+    try settingsValueOpen(d, a, "Output limit");
+    try decisionModelScreen(d, a, &.{"> Auto (current)"}, &.{});
+    try settingsValueChoose(d, a, "4096 tokens", "Output limit");
+    try settingsValueGate(d, a, project, "output-restored");
+    try settingsValueOpen(d, a, "Task timeout");
+    try settingsValueChoose(d, a, "900000 ms", "Task timeout");
+    try settingsValueGate(d, a, project, "task");
+
+    try settingsValueOpen(d, a, "Decision model");
+    try decisionModelScreen(d, a, &.{ "> Logged-in model", "Off", "OpenCode Jev Free", "Request timeout" }, &.{});
+    try settingsKey(d, "\x1b[A");
+    try settingsKey(d, "\x1b[A");
+    try settingsValueMenuOrder(d, a, &.{ "Off", "OpenCode Jev Free", "Logged-in model", "Request timeout" });
+    try settingsValueOpen(d, a, "Request timeout");
+    try settingsValueChoose(d, a, "60000 ms", "Request timeout");
+    try settingsValueGate(d, a, project, "decision");
+    try settingsKey(d, "\x1b[D"); // decision -> root Settings.
+    try decisionModelScreen(d, a, &.{"> Decision model"}, &.{"Logged-in model"});
+    try settingsKey(d, "\x1b[D"); // Settings -> root commands.
+    try decisionModelScreen(d, a, &.{"> /settings"}, &.{"Low-price input"});
+    start = d.used;
+    try d.send("\x1b");
+    try d.waitIdle(start);
+    try decisionModelScreen(d, a, &.{"fixture-main"}, &.{"family/judge"});
+    // Back-to-commands deliberately restores "/". Esc dismisses that menu
+    // without discarding the user's input; clear it before a normal prompt.
+    try settingsKey(d, "\x15");
+    try settingsValueGate(d, a, project, "closed");
+    start = d.used;
+    try d.send("values-task-private-marker\r");
+    try d.waitFrame(start, "values-tool-result-verified");
+    try d.waitIdle(start);
+    try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
+    try decisionModelScreen(d, a, &.{"fixture-main"}, &.{});
+}
+
 fn localCommand(d: *Driver, mode: []const u8) !void {
     // Do not materialize another large Screen on this history driver's stack.
     errdefer std.debug.print("command PTY tail: {s}\n", .{d.output[d.used -| 3000..d.used]});
@@ -479,7 +730,7 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         try d.send("\x15");
         try d.quiet(100);
     }
-    // CLI ordinary tools are process-trusted. A recursive deletion of an
+    // Ordinary CLI tools need no approval. A recursive deletion of an
     // absent owned relative target deliberately exercises mandatory approval.
     const command = if (accept) "printf 'OUT\\n'; printf 'ERR\\n' >&2; touch marker; rm -rf absent; exit 7" else if (deny) "rm -rf absent; touch denied" else "rm -rf absent; sleep 30 & echo $! > child; touch started; wait";
     var line: [256]u8 = undefined;
@@ -1396,6 +1647,10 @@ pub fn main(init: std.process.Init) !void {
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\"written_bytes\"") == null);
     } else if (std.mem.startsWith(u8, mode, "tool-preview-")) {
         try toolPreview(&d, init, mode, project);
+    } else if (std.mem.eql(u8, mode, "settings-values")) {
+        try settingsValuesJourney(&d, init, project);
+    } else if (std.mem.startsWith(u8, mode, "settings-decision-model-")) {
+        try decisionModel(&d, init, mode, project);
     } else if (std.mem.startsWith(u8, mode, "settings-command-")) {
         try localCommand(&d, mode);
     } else if (std.mem.startsWith(u8, mode, "settings-global")) {

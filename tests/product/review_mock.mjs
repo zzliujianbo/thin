@@ -93,7 +93,7 @@ export async function reviewRegressions(app) {
         llm: {default:'local/fixture',providers:{local:{base_url:`http://127.0.0.1:${server.address().port}`,api_key:KEY,models:{fixture:{protocol:'chat',context_tokens:32768}}}}},
         limits: {low_price_input: false, max_output_tokens: 100, summary_tokens: 100, safety_tokens: 100, request_timeout_ms: 5000, task_timeout_ms: 10000},
       }), {mode: 0o600});
-      const args = ['--print', 'fixture-only', ...(kind === 'duplicate-tool-id' ? ['--trust'] : [])];
+      const args = ['--print', 'fixture-only'];
       const result = await run(app, args, kind === 'symlink-home' ? alias : home, project);
       if (fixtureError) throw fixtureError;
       assert(!credentialInHistory, 'configuration credential entered model history');

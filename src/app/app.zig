@@ -64,7 +64,7 @@ pub const App = struct {
     /// these fields, so returning a self-referential value would invalidate them.
     /// 按依赖顺序初始化各组件，并用 errdefer 保证任一步失败时已创建的部分被回滚。
     /// API key 来自配置指定的凭证源；临时副本使用后清零，客户端持有自己的副本。
-    pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, trusted: bool) !*App {
+    pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host) !*App {
         const home = environ.get("HOME") orelse return error.MissingHome;
         const path = try cfg.defaultPath(a, home);
         defer a.free(path);
@@ -101,27 +101,27 @@ pub const App = struct {
         };
         defer root.deinit();
         _ = reasoning_defaults.applyConfigured(&parsed.value);
-        return initConfiguredAnchored(a, io, environ, &root, host, trusted, parsed);
+        return initConfiguredAnchored(a, io, environ, &root, host, parsed);
     }
 
     /// 接管 parsed（成功或失败均接管），供交互配置准备候选 App；此过程不发送模型请求。
-    pub fn initConfigured(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, trusted: bool, parsed: std.json.Parsed(cfg.Config)) !*App {
-        return initConfiguredRoot(a, io, environ, project, null, null, host, trusted, parsed);
+    pub fn initConfigured(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
+        return initConfiguredRoot(a, io, environ, project, null, null, host, parsed);
     }
 
     /// Duplicate an already anchored project; never re-open its replaceable
     /// pathname during activation. parsed is consumed on success AND failure.
-    pub fn initConfiguredAnchored(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, host: r.Host, trusted: bool, parsed: std.json.Parsed(cfg.Config)) !*App {
-        return initConfiguredRoot(a, io, environ, root.path, root, null, host, trusted, parsed);
+    pub fn initConfiguredAnchored(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
+        return initConfiguredRoot(a, io, environ, root.path, root, null, host, parsed);
     }
 
     /// Delayed activation must retain the Auth Store's startup pathname in the
     /// SAME lexical namespace as root, not rediscover a replaced HOME path.
-    pub fn initConfiguredAnchoredAuth(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, protected_auth: []const u8, host: r.Host, trusted: bool, parsed: std.json.Parsed(cfg.Config)) !*App {
-        return initConfiguredRoot(a, io, environ, root.path, root, protected_auth, host, trusted, parsed);
+    pub fn initConfiguredAnchoredAuth(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, protected_auth: []const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
+        return initConfiguredRoot(a, io, environ, root.path, root, protected_auth, host, parsed);
     }
 
-    fn initConfiguredRoot(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, anchored: ?*const fs.Root, protected_auth: ?[]const u8, host: r.Host, trusted: bool, parsed: std.json.Parsed(cfg.Config)) !*App {
+    fn initConfiguredRoot(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, anchored: ?*const fs.Root, protected_auth: ?[]const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
         var owned = parsed;
         errdefer cfg.release(&owned);
         if (owned.value.selection_pending) return error.DefaultModelUnavailable;
@@ -180,7 +180,7 @@ pub const App = struct {
 
         const snapshot = try self.memory.snapshot(a);
         defer a.free(snapshot);
-        self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, snapshot, trusted);
+        self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, snapshot);
         self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
         self.runtime.session_loader = .{ .context = self, .load_fn = loadSessionPolicy };
         self.runtime.observer = self.journal.observer();
@@ -412,7 +412,7 @@ test "headless missing and blank configuration use the same new schema without r
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         try env.put("HOME", home);
-        try std.testing.expectError(error.ApiKeyNotFound, App.init(a, io, &env, home, .{}, false));
+        try std.testing.expectError(error.ApiKeyNotFound, App.init(a, io, &env, home, .{}));
         var created = try store.loadExisting();
         defer cfg.release(&created);
         try std.testing.expect(created.value.registry != null);
@@ -461,7 +461,7 @@ test "headless global defaults ignore legacy settings and never create project s
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         try env.put("HOME", home);
-        const app = try App.init(a, io, &env, project, .{}, false);
+        const app = try App.init(a, io, &env, project, .{});
         defer app.deinit();
         try std.testing.expectEqualStrings("fake", app.config.value.model.name);
         try std.testing.expectEqualStrings("fixture/fake", app.config.value.registry.?.default);
@@ -493,7 +493,7 @@ test "headless global defaults ignore legacy settings and never create project s
         const alias = try std.fs.path.join(a, &.{ home, "project-alias" });
         defer a.free(alias);
         // Linux O_DIRECTORY | O_NOFOLLOW rejects the symlink as ENOTDIR.
-        try std.testing.expectError(error.NotDir, App.init(a, io, &env, alias, .{}, false));
+        try std.testing.expectError(error.NotDir, App.init(a, io, &env, alias, .{}));
     };
 }
 
@@ -530,7 +530,7 @@ test "App protects actual configuration behind HOME and file symlinks" {
             var env = std.process.Environ.Map.init(a);
             defer env.deinit();
             try env.put("HOME", home);
-            const app = try App.init(a, io, &env, project, .{}, false);
+            const app = try App.init(a, io, &env, project, .{});
             defer app.deinit();
             try std.testing.expect(app.config.value.limits.low_price_input and !app.config.value.decisionActive());
             var arena = std.heap.ArenaAllocator.init(a);
@@ -567,7 +567,7 @@ test "App unavailable decision key never blocks startup and chat replacement kee
         cfg.release(&parsed);
         return err;
     };
-    const app = try App.initConfiguredAnchoredAuth(a, io, &env, &root, "/unused/private/config.json", .{}, false, parsed);
+    const app = try App.initConfiguredAnchoredAuth(a, io, &env, &root, "/unused/private/config.json", .{}, parsed);
     defer app.deinit();
     try std.testing.expect(app.decision_client != null and app.runtime.decision_service != null);
     try std.testing.expect(app.decision_client.?.resolved == null and app.decision_client.?.calls == 0);

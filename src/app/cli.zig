@@ -4,10 +4,9 @@ const std = @import("std");
 const ids = @import("session_id.zig");
 
 /// 解析后的选项。prompt 为 null 表示交互模式；非 null 表示 --print 一次性模式。
-/// 当前 CLI 默认信任本进程的普通工具调用，不逐次审批；--trust 仅保留兼容。
-/// 危险 bash 在执行前按命令内容分类，即使 trusted 也必须本次明确批准。
+/// 普通工具调用直接执行；危险 bash 在执行前按命令内容分类，必须逐次明确批准。
 /// 这不是沙箱。--print 没有审批界面，因此直接拒绝危险命令。
-pub const Options = struct { prompt: ?[]const u8 = null, restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, trusted: bool = true, logging: bool = true, auto_refresh_models: bool = true, help: bool = false, version: bool = false };
+pub const Options = struct { prompt: ?[]const u8 = null, restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, logging: bool = true, auto_refresh_models: bool = true, help: bool = false, version: bool = false };
 
 /// 解析 argv。args[0] 是程序名，因此从 1 开始遍历。
 /// 无效参数返回错误（InvalidArguments、UnknownOption），由调用方决定如何提示。
@@ -19,7 +18,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         // --print 要求后面紧跟一个 prompt，且不允许重复指定，避免静默覆盖。
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) result.help = true else if (std.mem.eql(u8, arg, "--version")) result.version = true else if (std.mem.eql(u8, arg, "--trust")) result.trusted = true else if (std.mem.eql(u8, arg, "--no-log")) result.logging = false else if (std.mem.eql(u8, arg, "--no-model-auto-refresh")) result.auto_refresh_models = false else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) result.help = true else if (std.mem.eql(u8, arg, "--version")) result.version = true else if (std.mem.eql(u8, arg, "--no-log")) result.logging = false else if (std.mem.eql(u8, arg, "--no-model-auto-refresh")) result.auto_refresh_models = false else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
             if (result.prompt != null or i + 1 >= args.len) return error.InvalidArguments;
             i += 1;
             result.prompt = args[i];
@@ -41,8 +40,8 @@ pub fn parse(args: []const [:0]const u8) !Options {
 pub const help =
     \\thin - minimal local agent (Linux x86_64, Zig 0.17.0)
     \\
-    \\Usage: thin [--trust] [--no-log]
-    \\       thin --print "prompt" [--trust] [--no-log]
+    \\Usage: thin [--no-log]
+    \\       thin --print "prompt" [--no-log]
     \\       thin --restore-selection <32-lowerhex-session-id> [--no-log]
     \\       thin --resume <32-lowerhex-session-id> [--no-log]
     \\       thin --help | --version
@@ -107,14 +106,14 @@ pub const help =
     \\A null/missing mapping is unsupported; DeepSeek format uses thinking.type (Chat only).
     \\Only explicitly mapped model protocols are offered; unknown API IDs are not guessed.
     \\No trial inference requests or automatic changes to global defaults.
-    \\Ordinary tool calls are trusted for THIS PROCESS and run without approval prompts.
+    \\Ordinary tool calls run without approval prompts.
     \\Commands run with your account permissions; bash is NOT a sandbox.
-    \\High-risk bash is classified before it runs and always asks, even when this process is trusted.
+    \\High-risk bash is classified before it runs and requires explicit approval each time.
     \\Patterns: recursive rm, find -delete, git clean -f, mkfs and dd onto devices,
     \\writes or chmod/chown of /etc, /usr, /bin, /root or ~/.ssh, curl|bash and wget|sh, and fork bombs.
-    \\y runs that command once. t runs it once and trusts later ordinary tools; the next
-    \\dangerous command still asks. n denies it. The model gets an error and nothing runs.
-    \\--print cannot approve dangerous bash, so those calls are denied. --trust does not disable this check.
+    \\y runs that command once. n denies it. The next dangerous command asks again.
+    \\On denial the model gets an error and nothing runs.
+    \\--print cannot approve dangerous bash, so those calls are denied.
     \\--print returns the final committed visible answer with the same tool policy.
     \\
     \\Model and logical thinking defaults share ~/.thin/config.json (0600).
@@ -164,7 +163,7 @@ test "CLI help describes global defaults and actual metadata sources" {
     try std.testing.expect(std.mem.indexOf(u8, help, "no third-party data") == null);
 }
 
-// 交互与 --print 默认不审批普通工具；危险 bash 仍要明确批准。--trust 不关闭该检查。
+// 交互与 --print 不审批普通工具；危险 bash 逐次明确批准。
 test "CLI selection restore is explicit bounded and interactive only" {
     const id = "0123456789abcdef0123456789abcdef";
     const options = try parse(&.{ "thin", "--restore-selection", id, "--no-log" });
@@ -190,18 +189,13 @@ test "CLI resume is distinct same-session interactive selection and rejects conf
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--resume", id, "--print", "go" }));
 }
 
-test "CLI tools are trusted by default and print requires a prompt" {
-    const options = try parse(&.{ "thin", "--print", "hello", "--trust" });
-    try std.testing.expect(options.trusted);
+test "CLI ordinary tools run directly and print requires a prompt" {
+    const options = try parse(&.{ "thin", "--print", "hello" });
     try std.testing.expectEqualStrings("hello", options.prompt.?);
-    try std.testing.expect((try parse(&.{"thin"})).trusted);
-    try std.testing.expect((try parse(&.{ "thin", "--print", "hello" })).trusted);
-    try std.testing.expect((try parse(&.{ "thin", "--no-log" })).trusted);
     try std.testing.expect(std.mem.indexOf(u8, help, "run without approval prompts") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "No automatic command-risk classifier") == null);
     try std.testing.expect(std.mem.indexOf(u8, help, "High-risk bash is classified") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "even when this process is trusted") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "--trust does not disable this check") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "requires explicit approval each time") != null);
     try std.testing.expect((try parse(&.{"thin"})).logging);
     try std.testing.expect((try parse(&.{"thin"})).auto_refresh_models);
     try std.testing.expect(!(try parse(&.{ "thin", "--no-model-auto-refresh" })).auto_refresh_models);

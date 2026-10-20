@@ -34,7 +34,7 @@ test "registry headless resolves manual declarations without requests and protec
     );
     defer fixture.deinit();
     try fixture.env.put("PATH", "fake-registry-inactive");
-    const app = try App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{}, false);
+    const app = try App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{});
     defer app.deinit();
     try std.testing.expectEqualStrings("work", app.config.value.selected_provider.?);
     try std.testing.expectEqualStrings("org/model", app.config.value.model.name);
@@ -79,7 +79,7 @@ test "registry headless default resolves exact cached directory with no handwrit
         .directory_mask = cache.directory_mask,
         .dev_done = true,
     });
-    const app = try App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{}, false);
+    const app = try App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{});
     defer app.deinit();
     try std.testing.expectEqual(.responses, app.config.value.model.protocol);
     try std.testing.expectEqual(@as(u32, 1000000), app.config.value.model.context_tokens);
@@ -106,6 +106,6 @@ test "registry headless unknown default fails locally without changing settings 
         \\{"llm":{"default":"go/not-cached","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key":"fake-registry-unknown"}}}}
     );
     defer fixture.deinit();
-    try std.testing.expectError(error.DefaultModelUnavailable, App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{}, false));
+    try std.testing.expectError(error.DefaultModelUnavailable, App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{}));
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, ".thin/settings.json", .{}));
 }

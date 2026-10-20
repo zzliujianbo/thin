@@ -1,5 +1,5 @@
 //! 危险 bash 命令的词法分类。这不是 shell 解释器，也不替代沙箱。
-//! prepare 在授权前调用 classify；命中的命令即使 Runtime.trusted 也必须本次明确批准。
+//! prepare 在授权前调用 classify；命中的命令必须逐次明确批准。
 //!
 //! 规则（宁可略严，单引号里的字面文本不算执行）：
 //! - 递归删除：rm 带 -r/-R/--recursive，find -delete / find -exec rm，git clean 带 -f/--force

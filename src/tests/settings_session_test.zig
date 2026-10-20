@@ -57,7 +57,7 @@ const Fixture = struct {
     }
 
     fn session(self: *Fixture, project: []const u8) !Session {
-        return Session.initWithOptions(a, io, &self.env, project, .{}, true, .{ .logging = false, .auto_refresh_models = false });
+        return Session.initWithOptions(a, io, &self.env, project, .{}, .{ .logging = false, .auto_refresh_models = false });
     }
 
     fn seed(self: *Fixture, selector: []const u8, preference: ?[]const u8) !void {
@@ -175,7 +175,7 @@ test "headless and UI share global preference and capability clamp without rewri
     try fixture.env.put("OWNED_SETTINGS_KEY", "fake-headless-key");
     const before = try fixture.bytes();
     defer a.free(before);
-    const app = try App.init(a, io, &fixture.env, fixture.project, .{}, false);
+    const app = try App.init(a, io, &fixture.env, fixture.project, .{});
     defer app.deinit();
     try std.testing.expectEqualStrings("high", app.config.value.model.reasoning_effort.?);
     try expectWire(app.config.value, "intensive");
@@ -217,7 +217,7 @@ test "unknown capabilities never turn global preference into a wire option" {
     try std.testing.expect(activeConfig(&session).model.reasoning_effort == null);
     try std.testing.expectError(error.UnsupportedReasoningEffort, session.connection().setEffort(.high));
     try expectWire(activeConfig(&session).*, null);
-    const app = try App.init(a, io, &fixture.env, fixture.other, .{}, false);
+    const app = try App.init(a, io, &fixture.env, fixture.other, .{});
     defer app.deinit();
     try expectWire(app.config.value, null);
     try fixture.expectDefaults("local/unknown", "max");
@@ -353,7 +353,7 @@ test "legacy project settings malformed oversized and inaccessible are ignored a
             try std.testing.expectEqual(effort.medium, session.connection().current().reasoning_effort);
             try session.connection().setEffort(.high);
             try session.connection().selectModel("local/first");
-            const app = try App.init(a, io, &fixture.env, fixture.project, .{}, false);
+            const app = try App.init(a, io, &fixture.env, fixture.project, .{});
             defer app.deinit();
             try std.testing.expectEqualStrings("high", app.config.value.model.reasoning_effort.?);
             const stat = try fixture.tmp.dir.statFile(io, "project/.thin/settings.json", .{});

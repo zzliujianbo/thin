@@ -65,7 +65,7 @@ const Fixture = struct {
     }
 
     fn session(self: *Fixture) !Session {
-        return Session.initWithOptions(a, io, &self.env, self.project, .{}, false, .{ .auto_refresh_models = false });
+        return Session.initWithOptions(a, io, &self.env, self.project, .{}, .{ .auto_refresh_models = false });
     }
 
     fn bytes(self: *Fixture) ![]u8 {

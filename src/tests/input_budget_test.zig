@@ -156,7 +156,7 @@ const Fake = struct {
         return .{ .success = .{ .finish = .stop, .message = try p.textMessage(alloc, .assistant, "Earlier work completed."), .usage = .{ .input_tokens = estimate, .output_tokens = 8 } } };
     }
     fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !r.Prepared {
-        return .{ .payload = raw, .description = "fixture", .requires_approval = false };
+        return .{ .payload = raw, .description = "fixture" };
     }
     fn execute(raw: *anyopaque, _: std.mem.Allocator, _: r.Prepared, _: *const p.Cancellation) !r.Execution {
         const self: *Fake = @ptrCast(@alignCast(raw));
@@ -195,7 +195,7 @@ test "input budget cold default DeepSeek runs with protection enabled and no pub
     try std.testing.expect(parsed.value.model.input_price_threshold == null);
     try std.testing.expectEqual(@as(?u32, 1000000), parsed.value.model.input_price_flat_limit);
     var fake = Fake{ .config = &parsed.value };
-    var runtime = try r.Runtime.init(a, std.testing.io, &parsed.value, fake.model(), fake.executor(), .{}, "", true);
+    var runtime = try r.Runtime.init(a, std.testing.io, &parsed.value, fake.model(), fake.executor(), .{}, "");
     defer runtime.deinit();
     var cancel: p.Cancellation = .{};
     const result = try runtime.run("small first request", &cancel);
@@ -220,7 +220,7 @@ test "input budget unknown and oversized first goal pause before any inference a
         config.limits.max_input_tokens = 2000;
         config.limits.input_margin_tokens = 100;
         var fake = Fake{ .config = &config };
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         var cancel: p.Cancellation = .{};
         var goal = "fixture goal".*;
@@ -241,7 +241,7 @@ test "input budget large tool output is bounded or pauses with closed canonical 
         config.limits.max_input_tokens = 2000;
         config.limits.input_margin_tokens = 100;
         var fake = Fake{ .config = &config, .tool_mode = true };
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         var cancel: p.Cancellation = .{};
         if (tight) {
@@ -275,7 +275,7 @@ test "input budget appended summary instruction cannot escape the complete reque
     config.limits.max_input_tokens = 5000;
     config.limits.input_margin_tokens = 100;
     var fake = Fake{ .config = &config };
-    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
     defer runtime.deinit();
     const old: [4000]u8 = @splat('x');
     try seed(&runtime, &old);
@@ -306,7 +306,7 @@ test "input budget proactive summary uses policy threshold not one million windo
         config.limits.max_input_tokens = 5000;
         config.limits.input_margin_tokens = 100;
         var fake = Fake{ .config = &config, .exhausted = exhausted };
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         try seed(&runtime, &old);
         var cancel: p.Cancellation = .{};
@@ -334,7 +334,7 @@ test "input budget failed paid summary stops no fallback or automatic repeated a
         config.limits.max_input_tokens = 5000;
         config.limits.input_margin_tokens = 100;
         var fake = Fake{ .config = &config, .summary_fault = fault };
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         try seed(&runtime, &old);
         var cancel: p.Cancellation = .{};
@@ -359,7 +359,7 @@ test "input budget summary crosses 95K price tier while normal remains blocked a
         config.limits.low_price_input = true;
         if (unknown) config.model.input_price_threshold = null;
         var fake = Fake{ .config = &config };
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         try seed(&runtime, &old);
         try std.testing.expect(runtime.estimatedTokens() > 95000);
@@ -406,7 +406,7 @@ test "input budget checkpoint loads history across changed current policies" {
         config.model.input_price_threshold = price;
         config.limits.max_input_tokens = 90000;
         var fake = Fake{ .config = &config };
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         const state = try runtime.exportCheckpoint();
         try std.testing.expect(state.input_budget_frozen);

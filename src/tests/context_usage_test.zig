@@ -121,7 +121,7 @@ const FakeContext = struct {
 };
 
 fn init(config: *const cfg.Config, fake: *FakeContext) !r.Runtime {
-    return r.Runtime.init(t.allocator, t.io, config, fake.model(), fake.executor(), fake.host(), "", false);
+    return r.Runtime.init(t.allocator, t.io, config, fake.model(), fake.executor(), fake.host(), "");
 }
 fn expectSnapshot(snapshot: r.ContextSnapshot, total: ?u64, limit: u32) !void {
     try t.expectEqual(total != null, snapshot.known);

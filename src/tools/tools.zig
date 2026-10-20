@@ -1,6 +1,6 @@
 //! ThinAgent 内置工具层：定义工具 schema、解析并校验模型参数、执行已授权的动作。
 //! 参数解析发生在授权之前；文件、命令与 memory 的真实副作用只在 execute 中产生。
-//! bash 在 prepare 里做危险命令分类。命中的命令带 explicit_denial，Runtime 即使 trusted 也会询问。
+//! bash 在 prepare 里做危险命令分类。命中的命令带 explicit_denial，Runtime 逐次询问。
 
 const std = @import("std");
 const p = @import("../core/protocol.zig");
@@ -29,21 +29,21 @@ pub const schemas = [_]p.ToolSchema{
     },
     .{
         .name = "write_file",
-        .description = "Atomically write UTF-8 inside the startup project after host authorization. Read relevant content before replacing it. Parent directory must exist; overwrite=true is required to replace a file. Denied writes make no change.",
+        .description = "Atomically write UTF-8 inside the startup project after host validation. Read relevant content before replacing it. Parent directory must exist; overwrite=true is required to replace a file. Denied writes make no change.",
         .parameters_json =
         \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["path","content"],"additionalProperties":false}
         ,
     },
     .{
         .name = "bash",
-        .description = "Run bash in the startup project; cwd changes do not persist. With decision review disabled, ordinary commands follow host trust; classified high-risk commands require explicit approval even in a trusted process. Denial means no execution. timeout_ms follows host limits; built-in default is 5 minutes. stdout/stderr retain bounded head/tail, not full logs.",
+        .description = "Run bash in the startup project; cwd changes do not persist. With decision review disabled, ordinary commands run without approval prompts; classified high-risk commands require explicit approval each time. Denial means no execution. timeout_ms follows host limits; built-in default is 5 minutes. stdout/stderr retain bounded head/tail, not full logs.",
         .parameters_json =
         \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}
         ,
     },
     .{
         .name = "memory",
-        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. The host authorizes writes/deletes. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.",
+        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.",
         .parameters_json =
         \\{"type":"object","properties":{"action":{"type":"string","enum":["list","read","write","delete"]},"topic":{"type":"string"},"content":{"type":"string"},"expected_version":{"type":["string","null"]}},"required":["action"],"additionalProperties":false}
         ,
@@ -53,8 +53,8 @@ pub const schemas = [_]p.ToolSchema{
 // The configured reviewer, not the legacy shell classifier, owns the extra
 // command-confirmation decision. These static variants add no prompt allocation
 // and preserve tool IDs, order and parameter schemas.
-const decision_bash_description = "Run bash in the startup project; cwd changes do not persist. The configured reviewer's ask=true requires approval even in a trusted process; ask=false removes the extra command-approval prompt. The reviewer also chooses the command deadline. Unavailable or invalid review pauses without executing. Denial means no execution. Hard validation, task deadlines, cancellation and output limits apply. stdout/stderr retain bounded head/tail, not full logs.";
-const decision_memory_description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Only write candidates are reviewed for durable value; skipped writes make no change, and a useful candidate is not authorization. The host still authorizes writes/deletes. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.";
+const decision_bash_description = "Run bash in the startup project; cwd changes do not persist. The configured reviewer's ask=true requires approval for this call; ask=false removes the extra command-approval prompt. The reviewer also chooses the command deadline. Unavailable or invalid review pauses without executing. Denial means no execution. Hard validation, task deadlines, cancellation and output limits apply. stdout/stderr retain bounded head/tail, not full logs.";
+const decision_memory_description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Only write candidates are reviewed for durable value; skipped writes make no change, and a useful candidate is not authorization. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.";
 const reviewed_schemas = blk: {
     var result = schemas;
     result[2].description = decision_bash_description;
@@ -90,15 +90,6 @@ pub const Action = union(enum) {
     write_file: Write,
     bash: Bash,
     memory: Memory,
-
-    /// 只读的 read_file 与 memory list/read 无需授权；写文件、bash、memory 写入/删除需要用户批准。
-    pub fn requiresApproval(self: Action) bool {
-        return switch (self) {
-            .read_file => false,
-            .write_file, .bash => true,
-            .memory => |m| m.action == .write or m.action == .delete,
-        };
-    }
 
     /// 生成展示给用户的授权描述；写入 memory 时附带完整内容，便于用户审阅后再批准。
     pub fn description(self: Action, a: std.mem.Allocator) ![]const u8 {
@@ -266,12 +257,12 @@ pub const Tools = struct {
         const action = try a.create(Action);
         action.* = try parse(a, call.name, call.arguments, self.config.limits);
         try self.checkFileAction(a, action.*);
-        // 危险 bash 在授权前打标。Runtime 看到 explicit_denial 后，即使 trusted 也会询问。
+        // 危险 bash 在授权前打标。Runtime 看到 explicit_denial 后逐次询问。
         var description = try action.description(a);
         const denial: ?[]const u8 = if (action.* == .bash) blk: {
             const finding = command_risk.classify(action.bash.command) orelse break :blk null;
-            description = try std.fmt.allocPrint(a, "DANGEROUS bash ({s}). Process trust does not auto-run this; y runs it once, and t still asks for the next dangerous command.\n{s}", .{ finding.label, description });
-            break :blk try std.fmt.allocPrint(a, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow and is not covered by process trust.", .{finding.label});
+            description = try std.fmt.allocPrint(a, "DANGEROUS bash ({s}). Explicit approval is required each time; y runs it once, n denies it.\n{s}", .{ finding.label, description });
+            break :blk try std.fmt.allocPrint(a, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow each time.", .{finding.label});
         } else null;
         const review: ?decision.Input = switch (action.*) {
             .bash => |b| .{ .command = .{
@@ -287,7 +278,7 @@ pub const Tools = struct {
             } } else null,
             else => null,
         };
-        return .{ .payload = action, .description = description, .requires_approval = action.requiresApproval(), .explicit_denial = denial, .decision_input = review };
+        return .{ .payload = action, .description = description, .explicit_denial = denial, .decision_input = review };
     }
 
     /// 从 prepare 生成的 payload 取回 Action 并执行；payload 指向同一个 arena 中的 Action。
@@ -297,8 +288,8 @@ pub const Tools = struct {
         return self.executeWithTimeout(a, action.*, prepared.command_timeout, cancel);
     }
 
-    /// Authorization is a Runtime responsibility. Never call this for an
-    /// unapproved mutating action. This function does no terminal I/O.
+    /// Explicit approval is a Runtime responsibility. Never call this for an
+    /// operation requiring approval before it is granted. This function does no terminal I/O.
     /// 按 Action 执行具体副作用，并把结果编码为 JSON 文本；本函数不做任何终端输入输出。
     pub fn execute(self: *Tools, a: std.mem.Allocator, action: Action, cancel: *const p.Cancellation) !Execution {
         return self.executeWithTimeout(a, action, null, cancel);
@@ -490,7 +481,7 @@ test "tool descriptions distinguish configured decision review from legacy appro
     const reviewed = schemasForDecision(true);
     try std.testing.expect(std.mem.indexOf(u8, plain[2].description, "decision review disabled") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain[2].description, "high-risk commands require explicit approval") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=true requires approval even in a trusted process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=true requires approval for this call") != null);
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=false removes the extra command-approval prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "Unavailable or invalid review pauses without executing") != null);
     try std.testing.expect(std.mem.indexOf(u8, reviewed[3].description, "a useful candidate is not authorization") != null);
@@ -502,16 +493,16 @@ test "tool descriptions distinguish configured decision review from legacy appro
     }
 }
 
-// 参数必须严格校验（路径越界、版本缺失、未知字段等），并确认只读工具无需授权。
-test "tool arguments are strict and permissions reflect mutations" {
+// 参数必须严格校验（路径越界、版本缺失、未知字段等），保留动作类型。
+test "tool arguments remain strict" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const read = try parse(a, "read_file", "{\"path\":\"a.zig\"}", .{});
-    try std.testing.expect(!read.requiresApproval());
+    try std.testing.expect(read == .read_file);
     const write = try parse(a, "write_file", "{\"path\":\"a.zig\",\"content\":\"hello\"}", .{});
-    try std.testing.expect(write.requiresApproval());
+    try std.testing.expect(write == .write_file);
     try std.testing.expectError(error.PathEscape, parse(a, "read_file", "{\"path\":\"../secret\"}", .{}));
     try std.testing.expectError(error.InvalidReadLimit, parse(a, "read_file", "{\"path\":\"a\",\"limit\":99999999}", .{}));
     try std.testing.expectError(error.MissingMemoryVersion, parse(a, "memory", "{\"action\":\"delete\",\"topic\":\"core\"}", .{}));
@@ -581,14 +572,12 @@ test "dangerous bash is marked for explicit approval and ordinary bash is not" {
     const a = arena.allocator();
 
     const dangerous = try Tools.prepare(&tools, a, .{ .id = "d", .name = "bash", .arguments = "{\"command\":\"rm -rf build\"}" });
-    try std.testing.expect(dangerous.requires_approval);
     try std.testing.expect(dangerous.explicit_denial != null);
     try std.testing.expect(std.mem.indexOf(u8, dangerous.explicit_denial.?, "recursive delete") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dangerous.explicit_denial.?, "not covered by process trust") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dangerous.explicit_denial.?, "explicit user allow each time") != null);
     try std.testing.expect(std.mem.indexOf(u8, dangerous.description, "DANGEROUS bash") != null);
 
     const safe = try Tools.prepare(&tools, a, .{ .id = "s", .name = "bash", .arguments = "{\"command\":\"printf ok\"}" });
-    try std.testing.expect(safe.requires_approval);
     try std.testing.expect(safe.explicit_denial == null);
     try std.testing.expect(std.mem.indexOf(u8, safe.description, "DANGEROUS") == null);
 }

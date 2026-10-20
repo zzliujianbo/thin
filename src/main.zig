@@ -102,7 +102,7 @@ fn run(init: std.process.Init) !u8 {
         // --print 分支：单次任务，只输出最终已提交的回答。
         var console = Console{ .allocator = init.gpa };
         defer console.deinit();
-        const app = try App.init(init.gpa, init.io, init.environ_map, ".", console.host(), options.trusted);
+        const app = try App.init(init.gpa, init.io, init.environ_map, ".", console.host());
         defer app.deinit();
         app.setLogging(options.logging);
 
@@ -161,13 +161,12 @@ fn run(init: std.process.Init) !u8 {
         return code;
     }
 
-    // 交互模式分支：Bridge 把 Runtime 事件转发给 TUI。CLI 默认信任工具，
-    // 不进入人工审批；Bridge 的授权接口仍可供其他宿主策略使用。
+    // 交互模式分支：Bridge 把 Runtime 事件和本次明确要求的审批转发给 TUI。
     var bridge = Bridge.init(init.gpa, init.io, &cancellation);
     defer bridge.deinit();
 
     // 先建立可处于未配置状态的会话，再进入 TUI；/login 保存后才发布可用 Runtime。
-    var session = try Session.initWithOptions(init.gpa, init.io, init.environ_map, ".", bridge.host(), options.trusted, .{ .logging = options.logging, .restore_selection = options.restore_selection, .resume_session = options.resume_session, .auto_refresh_models = options.auto_refresh_models });
+    var session = try Session.initWithOptions(init.gpa, init.io, init.environ_map, ".", bridge.host(), .{ .logging = options.logging, .restore_selection = options.restore_selection, .resume_session = options.resume_session, .auto_refresh_models = options.auto_refresh_models });
     defer session.deinit();
 
     var guard = try interrupt.Guard.install();

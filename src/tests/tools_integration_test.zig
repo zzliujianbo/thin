@@ -135,7 +135,7 @@ test "tools validate containment and Memory namespace before approval" {
     for ([_][]const u8{ ".thin/sessions/session.jsonl", "./.thin//./sessions/session.jsonl", session_path, ".thin/logs/session.jsonl", "./.thin//./logs/session.jsonl", legacy_path }) |path| {
         const args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\"}}", .{path});
         const read = try executor.prepare_fn(executor.context, temp, .{ .id = "session", .name = "read_file", .arguments = args });
-        try std.testing.expect(!read.requires_approval);
+        try std.testing.expect(read.explicit_denial == null);
         const write_args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
         try std.testing.expectError(error.ProtectedSessionFile, executor.prepare_fn(executor.context, temp, .{ .id = "session", .name = "write_file", .arguments = write_args }));
         try std.testing.expectError(error.FileNotFound, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
@@ -155,7 +155,7 @@ test "tools validate containment and Memory namespace before approval" {
         .name = "memory",
         .arguments = "{\"action\":\"write\",\"topic\":\"core\",\"content\":\"project fact\"}",
     });
-    try std.testing.expect(action.requires_approval);
+    try std.testing.expect(action.explicit_denial == null);
     try std.testing.expect(std.mem.find(u8, action.description, "project fact") != null);
 
     // 审批之前不得创建 .thin 目录。
@@ -190,7 +190,7 @@ test "session and log reads retain file safety and credential guards without per
         for ([_][]const u8{ canonical, alias, absolute }) |path| {
             const args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\"}}", .{path});
             const prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "read", .name = "read_file", .arguments = args });
-            try std.testing.expect(!prepared.requires_approval);
+            try std.testing.expect(prepared.explicit_denial == null);
             const read = try executor.execute_fn(executor.context, temp, prepared, &cancel);
             const value = try j.parse(temp, read.text);
             try std.testing.expectEqualStrings(content, j.string(j.get(value, "content")).?);
@@ -418,7 +418,7 @@ test "tools prepare decision inputs without side effects and honor explicit no d
         .arguments = "{\"action\":\"write\",\"topic\":\"style\",\"content\":\"Prefer concise reports.\"}",
     });
     try std.testing.expectEqualStrings("style", write.decision_input.?.memory_write.topic);
-    try std.testing.expect(write.requires_approval);
+    try std.testing.expect(write.explicit_denial == null);
     try std.testing.expectError(error.FileNotFound, store.read(alloc, "style"));
     const list = try executor.prepare_fn(executor.context, alloc, .{ .id = "list", .name = "memory", .arguments = "{\"action\":\"list\"}" });
     try std.testing.expect(list.decision_input == null);

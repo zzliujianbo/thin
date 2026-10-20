@@ -28,6 +28,9 @@ const reads = [_]p.Block{
 const Fixture = struct {
     /// 是否批准所有需要授权的操作。
     allowed: bool,
+    tools: *tools_module.Tools,
+    explicit_approval: bool,
+
     /// 模型已被调用的轮数，决定脚本走哪一步。
     calls: usize = 0,
     /// 收到的权限请求次数。
@@ -36,6 +39,28 @@ const Fixture = struct {
     finished: usize = 0,
     /// 首轮 system prompt，用于验证后续轮次保持不变（启动时冻结）。
     first_system: ?[]const u8 = null,
+
+    // Only the denial fixture injects an explicit requirement. Real ordinary
+    // tools use their unchanged preparation and must not ask the host.
+    fn executor(self: *Fixture) r.Executor {
+        var result = self.tools.executor();
+        result.context = self;
+        result.prepare_fn = prepare;
+        result.execute_fn = execute;
+        return result;
+    }
+    fn prepare(raw: *anyopaque, a: std.mem.Allocator, call_: p.ToolCall) !r.Prepared {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        const delegate = self.tools.executor();
+        var prepared = try delegate.prepare_fn(delegate.context, a, call_);
+        if (self.explicit_approval) prepared.explicit_denial = "Fixture requires explicit approval; not executed.";
+        return prepared;
+    }
+    fn execute(raw: *anyopaque, a: std.mem.Allocator, prepared: r.Prepared, cancel: *const p.Cancellation) !r.Execution {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        const delegate = self.tools.executor();
+        return delegate.execute_fn(delegate.context, a, prepared, cancel);
+    }
 
     /// 把 Fixture 包装为 p.Model 接口。
     fn model(self: *Fixture) p.Model {
@@ -109,8 +134,8 @@ const Fixture = struct {
     }
 };
 
-// 验证：显式批准时工具真实执行，文件、命令输出与 memory 写入均生效，且启动快照保持冻结。
-test "headless real tools: explicit approval, frozen startup Memory and live reads" {
+// 普通真实操作无需询问；文件、命令与 Memory 写入均生效，启动快照保持冻结。
+test "headless real tools: ordinary operations never ask, frozen startup Memory and live reads" {
     try scenario(true);
 }
 
@@ -150,17 +175,17 @@ fn scenario(allowed: bool) !void {
 
     var tools = tools_module.Tools{ .root = &root, .memory = &memory, .config = &config, .environment = &environment };
 
-    var fixture = Fixture{ .allowed = allowed };
+    var fixture = Fixture{ .allowed = allowed, .tools = &tools, .explicit_approval = !allowed };
 
-    // 运行时使用脚本化模型与真实工具执行器，宿主回调由 Fixture 提供。
-    var runtime = try r.Runtime.init(a, io, &config, fixture.model(), tools.executor(), fixture.host(), snapshot, false);
+    // 拒绝场景由 fake Prepared 明确要求批准，其余使用真实准备结果。
+    var runtime = try r.Runtime.init(a, io, &config, fixture.model(), fixture.executor(), fixture.host(), snapshot);
     defer runtime.deinit();
 
     var cancel = p.Cancellation{};
 
     const terminal = try runtime.run("Run the owned local fixture", &cancel);
     try t.expectEqual(r.Status.success, terminal.status);
-    try t.expectEqual(@as(usize, 3), fixture.permissions);
+    try t.expectEqual(@as(usize, if (allowed) 0 else 3), fixture.permissions);
     try t.expectEqual(@as(usize, 1), fixture.finished);
     try t.expectEqual(@as(usize, if (allowed) 5 else 0), fixture.started);
     try t.expectEqual(@as(?u64, if (allowed) 300 else 200), terminal.usage.normal.input_tokens);
@@ -185,11 +210,11 @@ fn scenario(allowed: bool) !void {
     }
 }
 
-// trusted 会话里：危险 bash 仍要审批；拒绝不执行；批准才执行。普通命令不询问。
-test "trusted runtime asks before dangerous bash and still runs ordinary bash" {
-    try bashTrust("rm -rf marker", .deny, true, false);
-    try bashTrust("rm -rf marker", .allow_once, true, true);
-    try bashTrust("printf ok > safe.txt", .deny, false, true);
+// 危险 bash 逐次审批；拒绝不执行；普通命令不询问。
+test "runtime asks before dangerous bash and runs ordinary bash without asking" {
+    try bashApproval("rm -rf marker", .deny, true, false);
+    try bashApproval("rm -rf marker", .allow_once, true, true);
+    try bashApproval("printf ok > safe.txt", .deny, false, true);
 }
 
 const BashProbe = struct {
@@ -241,7 +266,7 @@ const BashProbe = struct {
     }
 };
 
-fn bashTrust(command: []const u8, decision: r.Decision, ask: bool, run: bool) !void {
+fn bashApproval(command: []const u8, decision: r.Decision, ask: bool, run: bool) !void {
     const a = t.allocator;
     const io = t.io;
     var tmp = t.tmpDir(.{});
@@ -262,12 +287,11 @@ fn bashTrust(command: []const u8, decision: r.Decision, ask: bool, run: bool) !v
 
     var tools = tools_module.Tools{ .root = &root, .memory = &memory, .config = &config, .environment = &environment };
     var probe = BashProbe{ .command = command, .decision = decision };
-    var runtime = try r.Runtime.init(a, io, &config, probe.model(), tools.executor(), probe.host(), "", true);
+    var runtime = try r.Runtime.init(a, io, &config, probe.model(), tools.executor(), probe.host(), "");
     defer runtime.deinit();
     var cancel = p.Cancellation{};
     const terminal = try runtime.run("classify this command", &cancel);
     try t.expectEqual(r.Status.success, terminal.status);
-    try t.expect(runtime.trusted);
     try t.expectEqual(@as(usize, if (ask) 1 else 0), probe.permissions);
     try t.expectEqual(@as(usize, if (run) 1 else 0), probe.started);
     const removes_marker = std.mem.startsWith(u8, command, "rm ");

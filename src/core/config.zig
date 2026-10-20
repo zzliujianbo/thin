@@ -251,6 +251,21 @@ pub const DecisionConfig = struct {
     max_output_tokens: u32 = 1024,
     /// Local SystemOne state bound, not a claim about supplier context capacity.
     max_state_bytes: u32 = 16384,
+
+    /// Shared by generic auxiliary resolution and its local model picker.
+    /// Never use primary price policy or command limits to resolve a reviewer.
+    pub fn modelLimits(self: DecisionConfig) Limits {
+        return .{
+            .low_price_input = false,
+            .input_margin_tokens = 1,
+            .safety_tokens = 256,
+            .max_input_tokens = self.max_input_tokens,
+            .max_output_tokens = self.max_output_tokens,
+            .request_timeout_ms = self.request_timeout_ms,
+            .max_response_bytes = 128 * 1024,
+            .max_event_bytes = 64 * 1024,
+        };
+    }
 };
 
 /// Owned application configuration. Disk input requires llm declarations;
@@ -290,7 +305,7 @@ pub const max_config_bytes = 64 * 1024;
 /// Every string is owned by the returned arena, never by `bytes`.
 /// 中文：解析后的字符串复制到 allocator 中，因此调用方可以擦除 bytes；结果需调用 release 释放。
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Config) {
-    return parseBounded(allocator, bytes, max_config_bytes, true);
+    return parseBounded(allocator, bytes, max_config_bytes, true, false);
 }
 
 test "runtime-only config clones retain derived maps but cannot write disk" {
@@ -313,18 +328,28 @@ test "runtime-only config clones retain derived maps but cannot write disk" {
 /// Clone an already bounded, validated application configuration. Re-encoding
 /// default fields may exceed the input-file limit; it does not relax disk reads.
 pub fn clone(allocator: std.mem.Allocator, config: Config) !std.json.Parsed(Config) {
+    return cloneConfig(allocator, config, false);
+}
+
+/// Own a display-only missing-route selection while editing global preferences.
+/// Never use this instead of clone()/validate() to activate or send a request.
+pub fn clonePendingSettings(allocator: std.mem.Allocator, config: Config) !std.json.Parsed(Config) {
+    return cloneConfig(allocator, config, true);
+}
+
+fn cloneConfig(allocator: std.mem.Allocator, config: Config, comptime unresolved: bool) !std.json.Parsed(Config) {
     if (config.provider.base_url.len > max_config_bytes) return error.ConfigTooLarge;
-    try validate(config);
+    if (unresolved) try validatePendingSettings(config) else try validate(config);
     var wiping = WipingAllocator{ .backing = allocator };
     const bytes = try std.json.Stringify.valueAlloc(wiping.allocator(), config, .{ .emit_null_optional_fields = false });
     defer {
         std.crypto.secureZero(u8, bytes);
         allocator.free(bytes);
     }
-    return parseBounded(allocator, bytes, 512 * 1024, false);
+    return parseBounded(allocator, bytes, 512 * 1024, false, unresolved);
 }
 
-fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, disk: bool) !std.json.Parsed(Config) {
+fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, disk: bool, comptime unresolved: bool) !std.json.Parsed(Config) {
     if (bytes.len > limit) return error.ConfigTooLarge;
 
     if (disk) return parseDisk(allocator, bytes);
@@ -343,7 +368,7 @@ fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, d
     // 语义校验失败时需要释放已解析的内存。
     parsed.arena.child_allocator = allocator;
     errdefer release(&parsed);
-    try validate(parsed.value);
+    if (unresolved) try validatePendingSettings(parsed.value) else try validate(parsed.value);
     return parsed;
 }
 
@@ -649,11 +674,25 @@ fn validateUrl(url: []const u8) !void {
 /// 校验整个配置：URL、环境变量名、模型名、各项限额以及 token 预算与压缩比例。
 /// 任一项不合法都会返回对应的错误。
 pub fn validate(config: Config) !void {
-    try validateUrl(config.provider.base_url);
-    try validateKeySource(config.provider);
-    if (config.provider.kind) |declared| if (providers.Id.fromUrl(config.provider.base_url) orelse providers.Id.fromSystemOneUrl(config.provider.base_url)) |actual| {
-        if (declared != actual) return error.ProviderEndpointMismatch;
-    };
+    try validateConfig(config, false);
+}
+
+/// Preferences may update an unresolved, display-only restored selection.
+/// Keep structural/budget checks, but no primary endpoint exists to validate.
+/// This is never send authorization: validate() remains mandatory for requests.
+pub fn validatePendingSettings(config: Config) !void {
+    if (!config.selection_pending or config.provider.base_url.len != 0) return error.InvalidConfig;
+    try validateConfig(config, true);
+}
+
+fn validateConfig(config: Config, comptime unresolved: bool) !void {
+    if (!unresolved) {
+        try validateUrl(config.provider.base_url);
+        try validateKeySource(config.provider);
+        if (config.provider.kind) |declared| if (providers.Id.fromUrl(config.provider.base_url) orelse providers.Id.fromSystemOneUrl(config.provider.base_url)) |actual| {
+            if (declared != actual) return error.ProviderEndpointMismatch;
+        };
+    }
     if (config.registry) |registry| try validateRegistry(registry, config.limits);
     if (config.proxy) |proxy| try validateProxy(proxy, config.registry);
     if (config.decision) |decision| {
@@ -705,7 +744,7 @@ pub fn validate(config: Config) !void {
 
     // 窗口须留出输入与至少一个输出 token；输出上限按每次请求剩余空间收缩，摘要仍遵守显式上限。
     try validateModel(config.model, l);
-    try validateReasoningProtocol(config.provider.base_url, config.model);
+    if (!unresolved) try validateReasoningProtocol(config.provider.base_url, config.model);
 
     // 压缩目标必须低于触发阈值，且触发阈值必须小于 100%，否则压缩永远无法生效或立即触发。
     if (!(l.compaction_target_percent < l.compaction_trigger_percent and l.compaction_trigger_percent < 100)) return error.InvalidCompactionRatio;

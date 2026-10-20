@@ -15,7 +15,7 @@ test "Decision native preset no-key roundtrip CAS and primary identity" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     const initial = try read(home, cfg.file_name);
     defer a.free(initial);
@@ -50,7 +50,7 @@ test "Decision native preset no-key roundtrip CAS and primary identity" {
     try std.testing.expect(profiles.selected(parsed.value));
     try std.testing.expectEqualStrings("route/first", parsed.value.registry.?.default);
     try std.testing.expectEqualStrings("fake-owned-only", parsed.value.registry.?.find("route").?.connection.api_key.?);
-    var restarted = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer restarted.deinit();
     try std.testing.expect(restarted.connection().current().decision_jev_free);
     try std.testing.expect(restarted.app.?.decision_client.?.key == null);
@@ -93,7 +93,7 @@ test "Decision pending selection owns active and declaration after save" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     try std.testing.expect(session.app == null);
     try choose(&session, .opencode_jev_free);
@@ -178,7 +178,7 @@ test "global config switches survive selection restart and headless without a se
     defer env.deinit();
     try env.put("HOME", home);
     {
-        var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
         defer session.deinit();
         // The retired settings file is ignored, even if it disagrees.
         try std.testing.expect(session.connection().current().low_price_input_enabled);
@@ -204,10 +204,10 @@ test "global config switches survive selection restart and headless without a se
         defer a.free(old);
         try std.testing.expectEqualStrings(legacy, old);
     }
-    var restarted = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer restarted.deinit();
     try std.testing.expect(!restarted.connection().current().low_price_input_enabled);
-    const headless = try App.init(a, io, &env, home, .{}, true);
+    const headless = try App.init(a, io, &env, home, .{});
     defer headless.deinit();
     try std.testing.expect(!headless.config.value.limits.low_price_input);
     try std.testing.expectEqualStrings("second", headless.config.value.model.name);
@@ -222,7 +222,7 @@ test "config CAS save failure is atomic and decision toggles normalize Anthropic
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     const app = session.app.?;
     const client = app.decision_client.?;
@@ -267,7 +267,7 @@ test "config CAS save failure is atomic and decision toggles normalize Anthropic
     }
     try std.testing.expect(description_changed);
     {
-        const headless = try App.init(a, io, &env, home, .{}, true);
+        const headless = try App.init(a, io, &env, home, .{});
         defer headless.deinit();
         try std.testing.expect(headless.config.value.decision != null and !headless.config.value.decision.?.enabled);
         try std.testing.expect(headless.decision_client == null and headless.runtime.decision_service == null);
@@ -290,7 +290,7 @@ test "history restore adopts current config switches rather than archived budget
     try env.put("HOME", home);
     var id: @import("session_id.zig").Id = undefined;
     {
-        var source = try Session.initWithOptions(a, io, &env, home, .{}, true, .{});
+        var source = try Session.initWithOptions(a, io, &env, home, .{}, .{});
         defer source.deinit();
         id = source.session_id;
         const app = source.app.?;
@@ -312,7 +312,7 @@ test "history restore adopts current config switches rather than archived budget
         declaration.value.decision.?.enabled = false;
         try store.save(declaration.value);
     }
-    var restored = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .resume_session = id, .logging = false });
+    var restored = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id, .logging = false });
     defer restored.deinit();
     const state = restored.connection().current();
     try std.testing.expect(!state.low_price_input_enabled and !state.decision_enabled);
@@ -337,7 +337,7 @@ test "settings auxiliary credentials follow login addition rotation and failed s
     defer env.deinit();
     try env.put("HOME", home);
     try env.put("PRIMARY_FIXTURE_KEY", "fake-frozen-primary");
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     const app = session.app.?;
     const primary_config = app.config.arena;
@@ -406,7 +406,7 @@ test "settings prepare owns latest declaration and extends redaction without pub
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     try toggle(&session, .decision_enabled, false);
     const app = session.app.?;
@@ -447,7 +447,7 @@ test "obsolete settings file is ignored and preserved even when malformed" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, true, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     const state = session.connection().current();
     try std.testing.expect(state.global_settings_available and state.decision_enabled and state.low_price_input_enabled);
@@ -456,7 +456,7 @@ test "obsolete settings file is ignored and preserved even when malformed" {
     const bytes = try read(home, "settings.json");
     defer a.free(bytes);
     try std.testing.expectEqualStrings(bad, bytes);
-    const headless = try App.init(a, io, &env, home, .{}, true);
+    const headless = try App.init(a, io, &env, home, .{});
     defer headless.deinit();
     try std.testing.expect(!headless.config.value.decisionActive());
 }

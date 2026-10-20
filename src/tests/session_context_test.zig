@@ -50,6 +50,8 @@ test "agents discovery order is global then git root and skips other directories
     try std.testing.expect(std.mem.endsWith(u8, snap.project_root, "/tree/repo"));
     try std.testing.expect(!std.mem.endsWith(u8, snap.project_root, "/leaf"));
     try std.testing.expectEqualStrings("/bin/zsh", snap.shell);
+    try std.testing.expectEqual(@import("builtin").os.tag, snap.os);
+    try std.testing.expectEqual(@import("builtin").cpu.arch, snap.arch);
     try std.testing.expectEqualStrings("GLOBAL_BASE\nPROJECT_BASE\n", snap.agents_text);
     const global_at = std.mem.indexOf(u8, snap.agents, "GLOBAL_BASE").?;
     const project_at = std.mem.indexOf(u8, snap.agents, "PROJECT_BASE").?;
@@ -248,7 +250,7 @@ fn stubExecute(_: *anyopaque, _: std.mem.Allocator, _: r.Prepared, _: *const p.C
 var stub_dummy: u8 = 0;
 
 fn openRuntime(config: *const cfg.Config, box: *Box) !r.Runtime {
-    var runtime = try r.Runtime.init(std.testing.allocator, io, config, .{ .context = &stub_dummy, .call_fn = stubCall }, .{ .context = &stub_dummy, .schemas = &.{}, .prepare_fn = stubPrepare, .execute_fn = stubExecute }, .{}, "", false);
+    var runtime = try r.Runtime.init(std.testing.allocator, io, config, .{ .context = &stub_dummy, .call_fn = stubCall }, .{ .context = &stub_dummy, .schemas = &.{}, .prepare_fn = stubPrepare, .execute_fn = stubExecute }, .{}, "");
     runtime.session_loader = .{ .context = box, .load_fn = Box.load };
     return runtime;
 }
@@ -284,6 +286,32 @@ fn encodeWire(a: std.mem.Allocator, runtime: *r.Runtime, protocol: p.Protocol) !
     };
 }
 
+test "environment platform format roundtrip and legacy unknown are distinct" {
+    const a = std.testing.allocator;
+    var snap = baseSnap("");
+    snap.os = .linux;
+    snap.arch = .x86_64;
+    for ([_]bool{ false, true }) |update| {
+        const text = try session_context.formatEnvironment(a, session_context.environmentOf(snap), update);
+        defer a.free(text);
+        try std.testing.expect(std.mem.endsWith(u8, text, "project_root: /proj\nos: linux\narch: x86_64\n"));
+        const parsed = session_context.parseEnvironment(text).?;
+        try std.testing.expectEqualStrings(snap.cwd, parsed.cwd);
+        try std.testing.expectEqualStrings(snap.shell, parsed.shell);
+        try std.testing.expectEqualStrings(snap.project_root, parsed.project_root);
+        try std.testing.expect(parsed.os == .linux and parsed.arch == .x86_64);
+    }
+    const legacy = "environment\ncwd: /proj/cwd\nshell: /bin/zsh\nproject_root: /proj\n";
+    const parsed = session_context.parseEnvironment(legacy).?;
+    try std.testing.expect(parsed.os == null and parsed.arch == null);
+    try std.testing.expectError(error.InvalidSessionContext, session_context.formatEnvironment(a, parsed, false));
+    for ([_][]const u8{ "os: linux\n", "arch: x86_64\n", "os: unknown-os\narch: x86_64\n", "os: linux\narch: unknown-cpu\n", "os: linux\narch: x86_64\nextra: data\n", "os: linux\narch: x86_64" }) |tail| {
+        const invalid = try std.mem.concat(a, u8, &.{ legacy, tail });
+        defer a.free(invalid);
+        try std.testing.expect(session_context.parseEnvironment(invalid) == null);
+    }
+}
+
 test "environment preface is injected before the user turn for chat responses and anthropic" {
     var config = cfg.Config{
         .limits = .{ .low_price_input = false },
@@ -291,6 +319,8 @@ test "environment preface is injected before the user turn for chat responses an
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
     };
     var box = Box{ .snap = baseSnap("source: global\npath: /home/u/.thin/AGENTS.md\nGLOBAL_RULE\n") };
+    box.snap.os = .windows;
+    box.snap.arch = .aarch64;
     var runtime = try openRuntime(&config, &box);
     defer runtime.deinit();
     var cancel = p.Cancellation{};
@@ -304,6 +334,9 @@ test "environment preface is injected before the user turn for chat responses an
     try std.testing.expect(std.mem.indexOf(u8, textOf(runtime.messages()[1]), "cwd: /proj/cwd\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, textOf(runtime.messages()[1]), "shell: /bin/zsh\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, textOf(runtime.messages()[1]), "project_root: /proj\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, textOf(runtime.messages()[1]), "os: windows\narch: aarch64\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime.system, "\nos: ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime.system, "\narch: ") == null);
     try std.testing.expectEqualStrings("hello-user", textOf(runtime.messages()[2]));
     try std.testing.expect(runtime.system.ptr == system.ptr);
     try std.testing.expect(std.mem.indexOf(u8, runtime.system, "/proj/cwd") == null);
@@ -320,7 +353,71 @@ test "environment preface is injected before the user turn for chat responses an
         try std.testing.expect(preface < user);
         try std.testing.expect(std.mem.indexOf(u8, bytes, "/bin/zsh") != null);
         try std.testing.expect(std.mem.indexOf(u8, bytes, "project_root: /proj") != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "os: windows"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "arch: aarch64"));
     }
+}
+
+test "platform changes append once without rewriting prior context or main system" {
+    var config: cfg.Config = .{
+        .limits = .{ .low_price_input = false },
+        .provider = .{ .base_url = "http://localhost" },
+        .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
+    };
+    var box = Box{ .snap = baseSnap("") };
+    box.snap.os = .linux;
+    box.snap.arch = .x86_64;
+    var runtime = try openRuntime(&config, &box);
+    defer runtime.deinit();
+    var cancel: p.Cancellation = .{};
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("first", &cancel)).status);
+    const original = try std.testing.allocator.dupe(u8, textOf(runtime.messages()[0]));
+    defer std.testing.allocator.free(original);
+    const system = try std.testing.allocator.dupe(u8, runtime.system);
+    defer std.testing.allocator.free(system);
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("same", &cancel)).status);
+    try std.testing.expectEqual(@as(usize, 5), runtime.messages().len);
+    box.snap.arch = .aarch64;
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("new arch", &cancel)).status);
+    try std.testing.expect(std.mem.startsWith(u8, textOf(runtime.messages()[5]), "environment update\n"));
+    try std.testing.expect(std.mem.indexOf(u8, textOf(runtime.messages()[5]), "os: linux\narch: aarch64\n") != null);
+    box.snap.os = .windows;
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("new os", &cancel)).status);
+    try std.testing.expect(std.mem.indexOf(u8, textOf(runtime.messages()[8]), "os: windows\narch: aarch64\n") != null);
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("same platform", &cancel)).status);
+    try std.testing.expectEqual(@as(usize, 13), runtime.messages().len);
+    try std.testing.expectEqual(@as(usize, 2), countPrefix(runtime.messages(), "environment update\n"));
+    try std.testing.expectEqualStrings(original, textOf(runtime.messages()[0]));
+    try std.testing.expectEqualStrings(system, runtime.system);
+}
+
+test "legacy environment restore appends current platform once and keeps archive system" {
+    var config: cfg.Config = .{
+        .limits = .{ .low_price_input = false },
+        .provider = .{ .base_url = "http://localhost" },
+        .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
+    };
+    var box = Box{ .snap = baseSnap("") };
+    var runtime = try openRuntime(&config, &box);
+    defer runtime.deinit();
+    const legacy = "environment\ncwd: /proj/cwd\nshell: /bin/zsh\nproject_root: /proj\n";
+    var state = try runtime.checkpoint();
+    state.system = "archived-system-must-stay";
+    state.messages = &.{
+        .{ .role = .context, .blocks = &.{.{ .text = legacy }} },
+        .{ .role = .user, .blocks = &.{.{ .text = "earlier" }} },
+        .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} },
+    };
+    try runtime.restoreCheckpoint(state);
+    var cancel: p.Cancellation = .{};
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("next", &cancel)).status);
+    try std.testing.expectEqualStrings(legacy, textOf(runtime.messages()[0]));
+    try std.testing.expect(std.mem.startsWith(u8, textOf(runtime.messages()[3]), "environment update\n"));
+    const parsed = session_context.parseEnvironment(textOf(runtime.messages()[3])).?;
+    try std.testing.expect(parsed.os == box.snap.os and parsed.arch == box.snap.arch);
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("again", &cancel)).status);
+    try std.testing.expectEqual(@as(usize, 1), countPrefix(runtime.messages(), "environment update\n"));
+    try std.testing.expectEqualStrings("archived-system-must-stay", runtime.system);
 }
 
 test "cwd change appends a new preface and does not mutate the original messages" {
@@ -446,7 +543,7 @@ test "app wires agents discovery and appends when the working directory changes"
     try env.put("SHELL", "/bin/zsh");
     const project = try absolute(a, tmp.dir, "tree/repo/mid");
     defer a.free(project);
-    const app = try App.init(a, io, &env, project, .{}, false);
+    const app = try App.init(a, io, &env, project, .{});
     defer app.deinit();
     app.runtime.model = .{ .context = &stub_dummy, .call_fn = stubCall };
 
@@ -578,12 +675,16 @@ const SummaryGate = struct {
         if (self.summaries > 0) {
             var saw_rule = false;
             var saw_cwd = false;
+            var saw_platform = false;
             for (req.messages) |message| {
                 if (message.role != .context or message.blocks.len != 1 or message.blocks[0] != .text) continue;
                 if (std.mem.indexOf(u8, message.blocks[0].text, "PROJECT_RULE") != null) saw_rule = true;
                 if (std.mem.indexOf(u8, message.blocks[0].text, "cwd: /proj/cwd\n") != null) saw_cwd = true;
+                if (session_context.parseEnvironment(message.blocks[0].text)) |env| {
+                    if (env.os == .windows and env.arch == .aarch64) saw_platform = true;
+                }
             }
-            self.saw_policy_after_summary = saw_rule and saw_cwd;
+            self.saw_policy_after_summary = saw_rule and saw_cwd and saw_platform;
         }
         return .{ .success = .{
             .message = .{ .role = .assistant, .blocks = &.{.{ .text = "ok" }} },
@@ -600,6 +701,8 @@ test "compaction reinstalls the policy after the retained prefix" {
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
     };
     var box = Box{ .snap = baseSnap("source: project\npath: /proj/AGENTS.md\nPROJECT_RULE\n") };
+    box.snap.os = .windows;
+    box.snap.arch = .aarch64;
     var gate = SummaryGate{};
     var runtime = try openRuntime(&config, &box);
     defer runtime.deinit();

@@ -3,7 +3,7 @@
 // node tests/product/app_mock.mjs /absolute/path/thin /absolute/path/thin-app-pty
 // 文件概览：应用级验收脚本，驱动 thin CLI 与 thin-app-pty（PTY）驱动，
 // 并由本地伪造的 OpenAI 兼容服务（chat 与 responses 两种协议）提供固定回复。
-// 覆盖：帮助与无配置、普通对话、权限拒绝与信任、自动压缩、畸形与截断响应、取消、输出超限、审批、Unicode 与 PTY 场景。
+// 覆盖：帮助与无配置、普通对话、默认工具执行与审批、自动压缩、畸形与截断响应、取消、输出超限、Unicode 与 PTY 场景。
 // 任何断言失败都会以非零退出码结束；错误信息经过脱敏，不输出捕获的终端或模型原文。
 // 依赖 Node 内置模块：http 提供伪造服务，child_process 启动 CLI 与 PTY 驱动，assert 做断言。
 
@@ -19,6 +19,8 @@ import assert from 'node:assert/strict';
 import {reviewRegressions} from './review_mock.mjs';
 import {logRegressions} from './log_mock.mjs';
 import {settingsRegressions} from './settings_mock.mjs';
+import {decisionModelRegressions} from './decision_model_mock.mjs';
+import {settingsValuesRegressions} from './settings_values_mock.mjs';
 import {selectionRestoreRegressions} from './selection_restore_mock.mjs';
 import {fullResumeRegressions} from './full_resume_mock.mjs';
 
@@ -157,7 +159,7 @@ async function execute(bin, args, env, cwd, onChild, timeout = 30000, spawnChild
 /**
  * 运行一个应用验收场景：创建临时 HOME 与项目目录，启动伪造 OpenAI 兼容服务（chat 或 responses），
  * 写入 config.json，然后运行 CLI 或 PTY 驱动，并按 kind 断言结果。
- * kind 取值：help、no-config、legacy-config、plain、auto、trust、compact、malformed、truncated、stall、auto-tools、
+ * kind 取值：help、no-config、legacy-config、plain、auto、ordinary-tools、compact、malformed、truncated、stall、auto-tools、
  * cancel、term、output、unicode、auth-missing、auth-empty、auth-activate。场景结束时关闭服务器并删除临时目录。
  */
 async function scenario(name, protocol, kind, isPty = false) {
@@ -455,8 +457,8 @@ async function scenario(name, protocol, kind, isPty = false) {
         send(res,protocol,'',[tool(`read_${rounds}`,'read_file',{path:'seed.txt'})]); return;
       }
 
-      // 默认信任与兼容 --trust：真实执行写文件、Memory 与 shell，且子进程看不到假密钥。
-      if ((kind === 'auto' || kind === 'trust') && rounds === 1) {
+      // 普通操作默认放行：真实执行写文件、Memory 与 shell，且子进程看不到假密钥。
+      if ((kind === 'auto' || kind === 'ordinary-tools') && rounds === 1) {
         send(res,protocol,'',[
           tool('write','write_file',{path:'written.txt',content:'actual-write'}),
           tool('memory','memory',{action:'write',topic:'acceptance',content:'actual-memory'}),
@@ -470,7 +472,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       }
 
       // 第 2 轮：断言三个工具结果与磁盘副作用均已发生。
-      if ((kind === 'auto' || kind === 'trust') && rounds === 2) {
+      if ((kind === 'auto' || kind === 'ordinary-tools') && rounds === 2) {
         assert.equal(outputs.size, 3);
         assert(outputs.get('shell').includes('child-key-omitted'), 'shell saw key or did not run');
         assert.equal(await readFile(join(project,'written.txt'),'utf8'),'actual-write');
@@ -514,8 +516,8 @@ async function scenario(name, protocol, kind, isPty = false) {
       await writeFile(join(home,'.thin',filename), content);
     }
 
-    // 启动参数：help 使用 --help；其它使用 --print 任务，trust 场景追加 --trust；PTY 不传参数。
-    const args = kind === 'help' ? ['--help'] : ['--print','fixture-task', ...(kind==='trust'?['--trust']:[])];
+    // 启动参数：help 使用 --help；其它使用 --print 任务；PTY 不传参数。
+    const args = kind === 'help' ? ['--help'] : ['--print','fixture-task'];
 
     const navigationConfig = kind === 'menu-navigation' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
     const selectionConfig = kind === 'model-select' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
@@ -701,13 +703,13 @@ async function scenario(name, protocol, kind, isPty = false) {
       for (let i=1;i<=8;i++) assert(observations.get(`read_${i}`)?.includes('seed-content-'), `read ${i} result missing`);
     }
 
-    // 畸形与截断的工具调用仍不得执行，即使默认信任。
+    // 畸形与截断的工具调用仍不得执行，与普通操作默认放行无关。
     if (kind==='malformed' || kind==='truncated') {
       for (const path of ['written.txt','shell.txt','forbidden.txt','.thin/mem/acceptance.md']) assert(!await exists(join(project,path)), `unexpected effect: ${path}`);
     }
 
     // 默认执行不进入审批；文件、shell 与 Memory 的真实结果仍正确回填。
-    if (kind === 'auto' || kind === 'trust' || kind === 'auto-tools') {
+    if (kind === 'auto' || kind === 'ordinary-tools' || kind === 'auto-tools') {
       assert(!result.output.includes('Approval #'), 'default tool execution requested approval');
       assert(!result.output.includes('privileged tools denied'), 'default tool execution denied');
       if (kind === 'auto-tools') {
@@ -799,6 +801,10 @@ try {
   if (process.argv.includes('--model-selection-only')) {
     await scenario('PTY model/effort selection chat','chat','model-select',true);
     await scenario('PTY model/effort selection responses','responses','model-select',true);
+  } else if (process.argv.includes('--settings-values-only')) {
+    await settingsValuesRegressions({app,pty,execute,send});
+  } else if (process.argv.includes('--decision-model-only')) {
+    await decisionModelRegressions({app,pty,execute,send});
   } else if (process.argv.includes('--settings-only')) {
     await settingsRegressions({app,pty,execute,send});
   } else if (process.argv.includes('--tool-presentation-only')) {
@@ -821,7 +827,7 @@ try {
 
   // 对两种协议分别运行全部通用场景。
   for (const protocol of ['chat','responses']) {
-    for (const kind of ['plain','auto','trust','compact','malformed','truncated','stall','idle-peer']) await scenario(`${protocol}/${kind}`,protocol,kind);
+    for (const kind of ['plain','auto','ordinary-tools','compact','malformed','truncated','stall','idle-peer']) await scenario(`${protocol}/${kind}`,protocol,kind);
   }
 
   // PTY 场景：通过 thin-app-pty 驱动交互式终端，仅使用 chat 协议。
@@ -829,6 +835,8 @@ try {
   await reviewRegressions(app);
   await logRegressions(app,pty);
   await settingsRegressions({app,pty,execute,send});
+  await decisionModelRegressions({app,pty,execute,send});
+  await settingsValuesRegressions({app,pty,execute,send});
   await selectionRestoreRegressions({app,pty,execute});
   await fullResumeRegressions({app,pty,execute});
   console.log('Application fixture suite passed; general PTY tests exercise chat, model selection also covers responses.');
