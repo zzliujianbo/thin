@@ -1,6 +1,7 @@
 //! Bounded parser for the public models.dev catalog (no credentials).
 //! Exact provider/model IDs are retained. Protocol comes from the declared AI SDK
-//! adapter (`npm`), never from model names; `reasoning: true` is not a profile.
+//! adapter (`npm`) or exact native API URL, never from model names;
+//! `reasoning: true` is not a profile.
 //! Structural JSON errors fail the whole document; an unusable or unknown option
 //! only makes that one model's profile unusable.
 const std = @import("std");
@@ -20,12 +21,11 @@ pub const max_value_bytes = 2048;
 /// Separate from the smaller by-value output directory limit.
 pub const max_records = 65536;
 
-pub const Source = enum { exact, majority };
-pub const Resolution = struct {
+const Source = enum { exact, majority };
+const Resolution = struct {
     declaration: ?thinking.Declaration = null,
     source: ?Source = null,
 };
-pub const Listing = [catalog.entries.len]Resolution;
 
 const Profile = struct {
     map: thinking.LevelMap = .{},
@@ -41,6 +41,8 @@ const Record = struct {
     profile: Profile,
     npm: ?[]const u8 = null,
     override_invalid: bool = false,
+    /// Null means absent descriptor; explicit unknown/invalid API stays auto.
+    described_api: ?protocol.Protocol = null,
     api: protocol.Protocol = .auto,
     output_tokens: ?u32 = null,
     context_tokens: ?u32 = null,
@@ -98,7 +100,7 @@ fn formatFor(provider: []const u8, api: protocol.Protocol) ?thinking.Format {
         .anthropic => .anthropic,
         .chat => if (equal(provider, "deepseek")) .deepseek else .standard,
         .responses => .standard,
-        .auto => null,
+        .auto, .systemone => null,
     };
 }
 
@@ -107,7 +109,8 @@ fn addLevel(profile: *Profile, value: []const u8) void {
         profile.unsupported = true;
         return;
     }
-    const level = activity.ReasoningEffort.fromName(value).canonical();
+    // Provider wire spelling, not a logical Effort alias.
+    const level: activity.ReasoningEffort = if (equal(value, "none")) .off else activity.ReasoningEffort.fromName(value);
     if (level == .off) {
         const spelling: ?[]const u8 = if (equal(value, "off")) "off" else if (equal(value, "none")) "none" else null;
         if (spelling == null or profile.off_spelling != null) profile.unsupported = true else profile.off_spelling = spelling;
@@ -244,8 +247,61 @@ fn overrideNpm(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !Adapte
     return .{ .npm = npm, .invalid = seen and npm == null };
 }
 
+/// Only an exact model-level api.url has native routing authority. SDK/id
+/// annotations do not invalidate a valid native description. Other URLs never
+/// replace the declared connection: ordinary protocols retain their SDK source.
+/// Null inherits that source; auto revokes it for a malformed/unknown descriptor.
+fn parseAPI(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?protocol.Protocol {
+    if (!(try at(scanner, .object_begin))) {
+        try scanner.skipValue();
+        return .auto;
+    }
+    try expect(scanner, allocator, .object_begin);
+    var api_url: ?[]const u8 = null;
+    var npm: ?[]const u8 = null;
+    var seen: u8 = 0;
+    var invalid = false;
+    while (!(try at(scanner, .object_end))) {
+        const field = try nextString(scanner, allocator);
+        const bit: u8 = if (equal(field, "url")) 1 else if (equal(field, "npm")) 2 else if (equal(field, "id")) 4 else 0;
+        if (bit == 0) {
+            invalid = true;
+            try scanner.skipValue();
+            continue;
+        }
+        if (seen & bit != 0) return error.InvalidModelsDev;
+        seen |= bit;
+        const value = try optionalString(scanner, allocator);
+        if (value == null or value.?.len == 0) {
+            invalid = true;
+            continue;
+        }
+        for (value.?) |byte| if (byte < 0x20 or byte == 0x7f) {
+            invalid = true;
+        };
+        switch (bit) {
+            1 => {
+                api_url = value;
+                const uri = std.Uri.parse(value.?) catch {
+                    invalid = true;
+                    continue;
+                };
+                if ((!equal(uri.scheme, "https") and !equal(uri.scheme, "http")) or uri.host == null) invalid = true;
+            },
+            2 => npm = value,
+            4 => {}, // Annotation only; never rewrite the selected raw model ID.
+            else => unreachable,
+        }
+    }
+    try expect(scanner, allocator, .object_end);
+    if (invalid) return .auto;
+    if (api_url) |value| if (providers.Id.fromSystemOneUrl(value) != null) return .systemone;
+    if (npm) |value| return protocolFor(value);
+    return null;
+}
+
 const Limits = struct { output: ?u32 = null, context: ?u32 = null };
-const ModelRow = struct { npm: ?[]const u8 = null, profile: Profile = .{}, override_invalid: bool = false, limits: Limits = .{}, input_price_threshold: ?u32 = null, input_price_flat: bool = false };
+const ModelRow = struct { npm: ?[]const u8 = null, profile: Profile = .{}, override_invalid: bool = false, described_api: ?protocol.Protocol = null, limits: Limits = .{}, input_price_threshold: ?u32 = null, input_price_flat: bool = false };
 
 // Independent public capabilities. Only integer limit.output / limit.context
 // count, never input/output sums, reasoning budgets or same-ID majority votes.
@@ -524,11 +580,16 @@ fn parseModel(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !ModelRo
     var row: ModelRow = .{};
     var saw_options = false;
     var saw_provider = false;
+    var saw_api = false;
     var saw_limit = false;
     var saw_cost = false;
     while (!(try at(scanner, .object_end))) {
         const field = try nextString(scanner, allocator);
-        if (equal(field, "cost")) {
+        if (equal(field, "api")) {
+            if (saw_api) return error.InvalidModelsDev;
+            saw_api = true;
+            row.described_api = try parseAPI(scanner, allocator);
+        } else if (equal(field, "cost")) {
             if (saw_cost) return error.InvalidModelsDev;
             saw_cost = true;
             const schedule = try parseCost(scanner, allocator);
@@ -567,7 +628,7 @@ fn parseModels(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provide
         if ((try seen.getOrPut(allocator, model)).found_existing) return error.InvalidModelsDev;
         if (records.items.len >= max_records) return error.MetadataTooLarge;
         const row = try parseModel(scanner, allocator);
-        try records.append(allocator, .{ .provider = provider, .model = model, .profile = row.profile, .npm = row.npm, .override_invalid = row.override_invalid, .output_tokens = row.limits.output, .context_tokens = row.limits.context, .input_price_threshold = row.input_price_threshold, .input_price_flat_limit = if (row.input_price_flat) row.limits.context else null });
+        try records.append(allocator, .{ .provider = provider, .model = model, .profile = row.profile, .npm = row.npm, .override_invalid = row.override_invalid, .described_api = row.described_api, .output_tokens = row.limits.output, .context_tokens = row.limits.context, .input_price_threshold = row.input_price_threshold, .input_price_flat_limit = if (row.input_price_flat) row.limits.context else null });
     }
     try expect(scanner, allocator, .object_end);
 }
@@ -609,7 +670,7 @@ fn parseProvider(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provi
     }
     try expect(scanner, allocator, .object_end);
     for (records.items[first..]) |*record| {
-        record.api = if (record.override_invalid) .auto else protocolFor(record.npm orelse provider_npm);
+        record.api = if (record.override_invalid) .auto else record.described_api orelse protocolFor(record.npm orelse provider_npm);
         record.declaration = declarationFor(record.profile, record.api, provider);
     }
 }
@@ -690,18 +751,6 @@ fn scan(a: std.mem.Allocator, body: []const u8) ![]const Record {
     return records.items;
 }
 
-/// Compatibility output for existing catalog-indexed callers.
-pub fn parse(allocator: std.mem.Allocator, body: []const u8) !Listing {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const records = try scan(arena.allocator(), body);
-    var result: Listing = @splat(.{});
-    for (catalog.entries, 0..) |entry, index| {
-        result[index] = resolveIn(records, providerName(entry.provider), entry.model.name, entry.model.protocol);
-    }
-    return result;
-}
-
 fn providerId(name: []const u8) ?providers.Id {
     for (providers.Id.all) |id| if (equal(name, providerName(id))) return id;
     return null;
@@ -720,12 +769,25 @@ pub fn parseDirectory(allocator: std.mem.Allocator, body: []const u8) !directory
         const row = try result.upsert(id, record.model);
         row.dev_present = true;
         row.dev_protocol = record.api;
+        if (record.api == .systemone) continue; // Identity only: no generative capabilities.
         row.dev_output_tokens = if (record.api != .auto) record.output_tokens else null;
         row.dev_context_tokens = if (record.api != .auto) record.context_tokens else null;
         row.dev_input_price_threshold = if (record.api != .auto) record.input_price_threshold else null;
         row.dev_input_price_flat_limit = if (record.api != .auto) record.input_price_flat_limit else null;
         const resolved = resolveIn(records, record.provider, record.model, record.api);
         if (resolved.declaration) |declaration| row.dev_reasoning = try directory.Profile.from(declaration);
+    }
+    // Missing supported presets may borrow only a complete reasoning profile
+    // voted for their exact raw ID and verified preset route. No public listing,
+    // window, output or price evidence is manufactured by this fallback.
+    for (catalog.entries) |entry| {
+        if (result.find(entry.provider, entry.model.name) != null) continue;
+        const resolved = resolveIn(records, providerName(entry.provider), entry.model.name, entry.model.protocol);
+        const declaration = resolved.declaration orelse continue;
+        const row = try result.upsert(entry.provider, entry.model.name);
+        row.dev_present = true;
+        row.dev_protocol = entry.model.protocol;
+        row.dev_reasoning = try directory.Profile.from(declaration);
     }
     return result;
 }
@@ -747,6 +809,54 @@ test "models.dev exact usable profile wins and majority votes complete profiles"
     try t.expectEqualStrings("medium", majority.declaration.?.map.medium.?);
 }
 
+test "model API URLs identify SystemOne without SDK or name inference" {
+    const a = std.testing.allocator;
+    const result = try parseDirectory(a,
+        \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"shared":{"api":{"url":"https://opencode.ai/inference/systemone/v1"},"limit":{"context":100000,"output":32000},"cost":{"input":1,"output":2},"reasoning_options":[{"type":"effort","values":["high"]}]},"no-window":{"api":{"url":"https://opencode.ai/inference/systemone/v1/"}},"jev-name-only":{},"bad-url":{"api":{"url":"https://opencode.ai.example/inference/systemone/v1"}},"bad-shape":{"api":"https://opencode.ai/inference/systemone/v1"},"bad-value":{"api":{"url":false}},"no-url":{"api":{}},"unrecognized":{"api":{"url":"https://opencode.ai/inference/systemone/v1","unknown":true}}}},"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"shared":{}}}}
+    );
+    for ([_][]const u8{ "shared", "no-window" }) |name| {
+        const row = result.rows[result.find(.opencode_zen, name).?];
+        try std.testing.expectEqual(protocol.Protocol.systemone, row.dev_protocol);
+        try std.testing.expect(row.dev_reasoning == null);
+        try std.testing.expect(row.dev_output_tokens == null);
+        try std.testing.expect(row.dev_context_tokens == null);
+        try std.testing.expect(row.dev_input_price_threshold == null);
+        try std.testing.expect(row.dev_input_price_flat_limit == null);
+    }
+    try std.testing.expectEqual(protocol.Protocol.chat, result.rows[result.find(.opencode_go, "shared").?].dev_protocol);
+    try std.testing.expectEqual(protocol.Protocol.chat, result.rows[result.find(.opencode_zen, "jev-name-only").?].dev_protocol);
+    for ([_][]const u8{ "bad-shape", "bad-value", "unrecognized" }) |name| {
+        try std.testing.expectEqual(protocol.Protocol.auto, result.rows[result.find(.opencode_zen, name).?].dev_protocol);
+    }
+    // Neither an empty descriptor nor an untrusted URL may override a known
+    // SDK with SystemOne or redirect credentials to the metadata URL.
+    for ([_][]const u8{ "bad-url", "no-url" }) |name| {
+        try std.testing.expectEqual(protocol.Protocol.chat, result.rows[result.find(.opencode_zen, name).?].dev_protocol);
+    }
+    try std.testing.expectError(error.InvalidModelsDev, parseDirectory(a,
+        \\{"opencode":{"models":{"x":{"api":{"url":"https://opencode.ai/inference/systemone/v1","url":"https://opencode.ai/inference/systemone/v1"}}}}}
+    ));
+    try std.testing.expectError(error.InvalidModelsDev, parseDirectory(a,
+        \\{"opencode":{"models":{"x":{"api":{},"api":{}}}}}
+    ));
+}
+
+test "API SDK and ID annotations preserve native and ordinary protocol sources" {
+    const result = try parseDirectory(std.testing.allocator,
+        \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"native":{"api":{"id":"native","npm":"@ai-sdk/openai-compatible","url":"https://opencode.ai/inference/systemone/v1"}},"ordinary":{"api":{"id":"ordinary","npm":"@ai-sdk/anthropic","url":"https://vendor.invalid/v1"},"limit":{"context":32768}},"inherited":{"api":{"id":"inherited","url":"https://vendor.invalid/v1"},"limit":{"context":32768}},"unknown":{"api":{"npm":"@ai-sdk/unknown"}},"malformed":{"api":{"url":"not-an-absolute-url"}}}}}
+    );
+    const native = result.rows[result.find(.opencode_zen, "native").?];
+    try std.testing.expectEqual(protocol.Protocol.systemone, native.dev_protocol);
+    try std.testing.expect(native.dev_context_tokens == null);
+    try std.testing.expectEqual(protocol.Protocol.anthropic, result.rows[result.find(.opencode_zen, "ordinary").?].dev_protocol);
+    const inherited = result.rows[result.find(.opencode_zen, "inherited").?];
+    try std.testing.expectEqual(protocol.Protocol.chat, inherited.dev_protocol);
+    try std.testing.expectEqual(@as(?u32, 32768), inherited.dev_context_tokens);
+    for ([_][]const u8{ "unknown", "malformed" }) |name| {
+        try std.testing.expectEqual(protocol.Protocol.auto, result.rows[result.find(.opencode_zen, name).?].dev_protocol);
+    }
+}
+
 test "models.dev ties, protocol mismatch, missing profiles and exact-name boundaries stay unknown" {
     const t = std.testing;
     const left: thinking.Declaration = .{ .map = .{ .low = "low", .high = "high" } };
@@ -766,45 +876,56 @@ test "models.dev parser keeps catalog IDs, derives SDK protocols, and isolates b
     const body =
         \\{"opencode-go":{"id":"opencode-go","npm":"@ai-sdk/openai-compatible","models":{"gpt-6-luna":{"id":"gpt-6-luna","reasoning_options":[{"type":"effort","values":["none","low","medium","high","xhigh","max"]}],"provider":{"npm":"@ai-sdk/openai"}},"claude-haiku-5-5":{"id":"claude-haiku-5-5","reasoning_options":[],"provider":{"npm":"@ai-sdk/anthropic"}},"unlisted":{"id":"unlisted","reasoning_options":[{"type":"effort","values":["low"]}]}}},"anthropic":{"id":"anthropic","npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"id":"claude-haiku-5-5","reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low","medium","high","xhigh","max","extreme"]}]}}}}
     ;
-    const parsed = try parse(t.allocator, body);
-    const luna = for (catalog.entries, 0..) |entry, index| {
-        if (equal(entry.selector, "opencode-go/gpt-6-luna")) break index;
-    } else unreachable;
-    try t.expectEqual(Source.exact, parsed[luna].source.?);
-    try t.expectEqual(thinking.Format.standard, parsed[luna].declaration.?.format);
-    try t.expectEqualStrings("none", parsed[luna].declaration.?.map.off.?);
-    const haiku = for (catalog.entries, 0..) |entry, index| {
-        if (equal(entry.selector, "opencode-go/claude-haiku-5-5")) break index;
-    } else unreachable;
+    const parsed = try parseDirectory(t.allocator, body);
+    const luna = parsed.rows[parsed.find(.opencode_go, "gpt-6-luna").?].dev_reasoning.?.declaration();
+    try t.expectEqual(thinking.Format.standard, luna.format);
+    try t.expectEqualStrings("none", luna.map.off.?);
+    const haiku = parsed.rows[parsed.find(.opencode_go, "claude-haiku-5-5").?];
     // The exact Go row has no usable option; the anthropic-provider row is not
     // used because "extreme" makes that whole option set unusable.
-    try t.expect(parsed[haiku].declaration == null);
+    try t.expect(haiku.dev_reasoning == null);
     try t.expectEqual(protocol.Protocol.responses, protocolFor("@ai-sdk/openai"));
     try t.expectEqual(protocol.Protocol.chat, protocolFor("@ai-sdk/openai-compatible"));
     try t.expectEqual(protocol.Protocol.anthropic, protocolFor("@ai-sdk/anthropic"));
     try t.expectEqual(protocol.Protocol.auto, protocolFor("@ai-sdk/google"));
 }
 
-fn fixtureIndex(selector: []const u8) usize {
-    for (catalog.entries, 0..) |entry, i| if (equal(entry.selector, selector)) return i;
-    unreachable;
-}
-
 test "models.dev Haiku majority is a complete normalized profile, not a union" {
     // Synthetic offline fixture only. Never included in production data.
-    const parsed = try parse(std.testing.allocator, @embedFile("models_dev_fixture.json"));
-    const haiku = parsed[fixtureIndex("opencode-go/claude-haiku-5-5")];
-    try std.testing.expectEqual(Source.majority, haiku.source.?);
-    const declaration = haiku.declaration.?;
+    const parsed = try parseDirectory(std.testing.allocator, @embedFile("models_dev_fixture.json"));
+    const haiku = parsed.rows[parsed.find(.opencode_go, "claude-haiku-5-5").?];
+    const declaration = haiku.dev_reasoning.?.declaration();
     try std.testing.expectEqual(thinking.Format.anthropic, declaration.format);
     try std.testing.expectEqualStrings("disabled", declaration.map.off.?);
     try std.testing.expectEqualStrings("low", declaration.map.low.?);
     try std.testing.expectEqualStrings("high", declaration.map.high.?);
     try std.testing.expectEqualStrings("max", declaration.map.max.?);
     try std.testing.expect(declaration.map.medium == null); // Minority profile is not merged.
-    const luna = parsed[fixtureIndex("opencode-go/gpt-6-luna")];
-    try std.testing.expectEqual(Source.exact, luna.source.?);
-    try std.testing.expectEqualStrings("none", luna.declaration.?.map.off.?);
+    const luna = parsed.rows[parsed.find(.opencode_go, "gpt-6-luna").?];
+    try std.testing.expectEqualStrings("none", luna.dev_reasoning.?.declaration().map.off.?);
+}
+
+test "models.dev absent presets receive reasoning only and exact route conflicts never fallback" {
+    const a = std.testing.allocator;
+    const absent = try parseDirectory(a,
+        \\{"foreign":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"limit":{"context":1000000,"output":8192},"cost":{"input":1,"output":2},"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
+    );
+    const row = absent.rows[absent.find(.opencode_go, "claude-haiku-5-5").?];
+    try std.testing.expectEqual(protocol.Protocol.anthropic, row.dev_protocol);
+    try std.testing.expectEqualStrings("high", row.dev_reasoning.?.declaration().map.high.?);
+    try std.testing.expect(row.available == null);
+    try std.testing.expect(row.tokens == null);
+    try std.testing.expect(row.output_tokens == null);
+    try std.testing.expect(row.dev_context_tokens == null);
+    try std.testing.expect(row.dev_output_tokens == null);
+    try std.testing.expect(row.dev_input_price_threshold == null);
+    try std.testing.expect(row.dev_input_price_flat_limit == null);
+    const conflict = try parseDirectory(a,
+        \\{"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"claude-haiku-5-5":{}}},"foreign":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
+    );
+    const exact = conflict.rows[conflict.find(.opencode_go, "claude-haiku-5-5").?];
+    try std.testing.expectEqual(protocol.Protocol.chat, exact.dev_protocol);
+    try std.testing.expect(exact.dev_reasoning == null);
 }
 
 test "models.dev format mismatch cannot turn DeepSeek thinking toggle into standard effort" {
@@ -815,7 +936,7 @@ test "models.dev format mismatch cannot turn DeepSeek thinking toggle into stand
 
 test "models.dev malformed toggle values neither authorize exact profiles nor cast votes" {
     const a = std.testing.allocator;
-    const index = fixtureIndex("opencode-go/claude-haiku-5-5");
+
     for ([_][]const u8{ "42", "null", "[]", "[false]", "[\"high\",false]", "[\"high\",\"high\"]" }) |bad_values| {
         const bad = try std.mem.concat(a, u8, &.{
             \\{"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"reasoning_options":[{"type":"toggle","values":
@@ -825,16 +946,17 @@ test "models.dev malformed toggle values neither authorize exact profiles nor ca
             ,
         });
         defer a.free(bad);
-        try std.testing.expect((try parse(a, bad))[index].declaration == null);
+        const bad_directory = try parseDirectory(a, bad);
+        try std.testing.expect(bad_directory.rows[bad_directory.find(.opencode_go, "claude-haiku-5-5").?].dev_reasoning == null);
         const fallback = try std.mem.concat(a, u8, &.{
             bad[0 .. bad.len - 1],
             \\,"valid":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
             ,
         });
         defer a.free(fallback);
-        const resolved = (try parse(a, fallback))[index];
-        try std.testing.expectEqual(Source.majority, resolved.source.?);
-        try std.testing.expectEqualStrings("high", resolved.declaration.?.map.high.?);
+        const fallback_directory = try parseDirectory(a, fallback);
+        const resolved = fallback_directory.rows[fallback_directory.find(.opencode_go, "claude-haiku-5-5").?];
+        try std.testing.expectEqualStrings("high", resolved.dev_reasoning.?.declaration().map.high.?);
         const tied = try std.mem.concat(a, u8, &.{
             fallback[0 .. fallback.len - 1],
             \\,"other":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low"]}]}}}}
@@ -842,7 +964,8 @@ test "models.dev malformed toggle values neither authorize exact profiles nor ca
         });
         defer a.free(tied);
         // The malformed high row must not break the valid high/low tie.
-        try std.testing.expect((try parse(a, tied))[index].declaration == null);
+        const tied_directory = try parseDirectory(a, tied);
+        try std.testing.expect(tied_directory.rows[tied_directory.find(.opencode_go, "claude-haiku-5-5").?].dev_reasoning == null);
     }
 }
 
@@ -921,7 +1044,6 @@ test "models.dev new model keys and recognized schema duplicates are rejected" {
         ,
     }) |body| {
         try t.expectError(error.InvalidModelsDev, parseDirectory(t.allocator, body));
-        try t.expectError(error.InvalidModelsDev, parse(t.allocator, body));
     }
     for ([_][]const u8{
         \\{"opencode-go":{"models":{"":{}}}}
@@ -948,11 +1070,6 @@ test "unrelated provider IDs do not inherit the supported directory key limit" {
         const row = result.rows[result.find(.opencode_zen, "gpt-5.2").?];
         try t.expectEqual(protocol.Protocol.responses, row.dev_protocol);
         try t.expectEqualStrings("high", row.dev_reasoning.?.declaration().map.high.?);
-        const legacy = try parse(t.allocator, body);
-        const index = for (catalog.entries, 0..) |entry, i| {
-            if (entry.provider == .opencode_zen and equal(entry.model.name, "gpt-5.2")) break i;
-        } else unreachable;
-        try t.expectEqualStrings("high", legacy[index].declaration.?.map.high.?);
     }
 }
 
@@ -968,8 +1085,6 @@ test "models.dev directory capacity is explicit rather than truncated" {
     }
     try body.appendSlice(a, "}}}");
     try std.testing.expectError(error.MetadataTooLarge, parseDirectory(a, body.items));
-    // Compatibility output does not inherit the by-value directory row limit.
-    _ = try parse(a, body.items);
 }
 
 test "models.dev scan enforces the all-provider record limit" {
@@ -984,7 +1099,6 @@ test "models.dev scan enforces the all-provider record limit" {
     }
     try body.appendSlice(a, "}}}");
     try std.testing.expectError(error.MetadataTooLarge, parseDirectory(a, body.items));
-    try std.testing.expectError(error.MetadataTooLarge, parse(a, body.items));
 }
 
 test "models.dev absent and unknown provider adapters never borrow a protocol" {
@@ -1052,8 +1166,8 @@ test "models.dev malformed options and explicit invalid adapters are model-local
     const body =
         \\{"opencode-go":{"npm":"@ai-sdk/openai","models":{"gpt-6-luna":{"provider":{"npm":42},"reasoning_options":[{"type":"effort","values":["low"]}]},"claude-haiku-5-5":{"provider":{"npm":"@ai-sdk/anthropic"},"reasoning_options":[false,null,12]},"mimo-v2.5":{"reasoning":true}}}}
     ;
-    const parsed = try parse(std.testing.allocator, body);
-    try std.testing.expect(parsed[fixtureIndex("opencode-go/gpt-6-luna")].declaration == null);
-    try std.testing.expect(parsed[fixtureIndex("opencode-go/claude-haiku-5-5")].declaration == null);
-    try std.testing.expect(parsed[fixtureIndex("opencode-go/mimo-v2.5")].declaration == null);
+    const parsed = try parseDirectory(std.testing.allocator, body);
+    for ([_][]const u8{ "gpt-6-luna", "claude-haiku-5-5", "mimo-v2.5" }) |name| {
+        try std.testing.expect(parsed.rows[parsed.find(.opencode_go, name).?].dev_reasoning == null);
+    }
 }

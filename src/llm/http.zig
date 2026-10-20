@@ -44,6 +44,7 @@ pub const Client = struct {
     }
 
     pub fn initWithEnv(allocator: std.mem.Allocator, io: Io, config: *const cfg.Config, key: []const u8, env: *const std.process.Environ.Map) !Client {
+        if (config.model.protocol == .systemone or cfg.providers.Id.fromSystemOneUrl(config.provider.base_url) != null) return error.UnsupportedProtocol;
         // 控制字符会破坏 HTTP 头格式，因此在这里拒绝。
         if (key.len == 0 or key.len > 16384) return error.InvalidApiKey;
         for (key) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidApiKey;
@@ -110,6 +111,9 @@ pub const Client = struct {
     /// 执行一次模型请求。在独立的 I/O worker 中完成网络操作，主协程负责轮询取消与超时。
     fn invoke(context: *anyopaque, allocator: std.mem.Allocator, request: p.Request, sink: p.ModelSink) !p.Outcome {
         const self: *Client = @ptrCast(@alignCast(context));
+        if (request.scope.protocol == .systemone or self.config.model.protocol == .systemone or
+            cfg.providers.Id.fromSystemOneUrl(self.config.provider.base_url) != null)
+            return failure(.unsupported_protocol, "SystemOne does not support chat generation", null, false);
         // auto 只能是配置层的占位值，进入 HTTP 层前必须已解析为具体协议。
         if (request.scope.protocol == .auto) return error.UnselectedProtocol;
         // 回放作用域必须与当前连接、模型一致，避免把历史 replay 发送到其他端点。
@@ -285,6 +289,7 @@ pub const Client = struct {
             .chat => .{ .chat = chat.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
             .responses => .{ .responses = responses.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
             .anthropic => .{ .anthropic = anthropic.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
+            .systemone => return error.UnsupportedProtocol,
             .auto => unreachable,
         };
         var decoder = sse.Decoder.init(job.client.allocator, job.client.config.limits.max_event_bytes, .{ .context = &stream, .emit_fn = Stream.feed });
@@ -344,6 +349,7 @@ pub const Client = struct {
             .chat => try chat.encodeWithOptions(a, job.request, self.config.provider.chat_max_tokens),
             .responses => try responses.encode(a, job.request),
             .anthropic => try anthropic.encode(a, job.request),
+            .systemone => return error.UnsupportedProtocol,
             .auto => unreachable,
         };
 
@@ -415,6 +421,7 @@ pub const Client = struct {
             .chat => .{ .chat = chat.Stream.init(job.allocator, job.request.scope, sink) },
             .responses => .{ .responses = responses.Stream.init(job.allocator, job.request.scope, sink) },
             .anthropic => .{ .anthropic = anthropic.Stream.init(job.allocator, job.request.scope, sink) },
+            .systemone => return error.UnsupportedProtocol,
             .auto => unreachable,
         };
 
@@ -496,6 +503,7 @@ test {
 /// Keep persisted connection identity stable. Go uses its documented inference
 /// routes; custom endpoints are never rewritten by provider hint or model ID.
 fn requestAddress(a: std.mem.Allocator, base_url: []const u8, protocol: p.Protocol) ![]u8 {
+    if (protocol == .systemone or cfg.providers.Id.fromSystemOneUrl(base_url) != null) return error.UnsupportedProtocol;
     const normalized = std.mem.trimEnd(u8, base_url, "/");
     const base = blk: {
         if (cfg.providers.Id.fromUrl(normalized)) |id| switch (id) {
@@ -511,6 +519,7 @@ fn requestAddress(a: std.mem.Allocator, base_url: []const u8, protocol: p.Protoc
         .chat => "/chat/completions",
         .responses => "/responses",
         .anthropic => "/messages",
+        .systemone => return error.UnsupportedProtocol,
         .auto => return error.UnselectedProtocol,
     };
     return std.fmt.allocPrint(a, "{s}{s}", .{ base, suffix });
@@ -546,6 +555,33 @@ const Stream = union(enum) {
 /// 构造失败结果。message 必须是静态字符串或不含上游敏感内容的文本，避免泄露 API 返回的原始信息。
 fn failure(kind: p.FailureKind, message: []const u8, status: ?u16, observed: bool) p.Outcome {
     return .{ .failure = .{ .kind = kind, .message = message, .http_status = status, .observed_content = observed } };
+}
+
+test "SystemOne cannot enter chat HTTP via protocol endpoint or stale client" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedProtocol, requestAddress(a, "http://127.0.0.1:1", .systemone));
+    for ([_]p.Protocol{ .auto, .chat, .responses, .anthropic, .systemone }) |api| {
+        try std.testing.expectError(error.UnsupportedProtocol, requestAddress(a, "https://opencode.ai/inference/systemone/v1/", api));
+    }
+    var config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1:1" }, .model = .{ .name = "reviewer", .protocol = .systemone, .context_tokens = 0 } };
+    try std.testing.expectError(error.UnsupportedProtocol, Client.init(a, std.testing.io, &config, "fake"));
+    // Early rejection must precede worker/clock/proxy access, even if a caller
+    // bypassed init or mutated the config after constructing a chat client.
+    var client: Client = undefined;
+    client.config = &config;
+    const request: p.Request = .{
+        .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat },
+        .system = "",
+        .tools = &.{},
+        .messages = &.{},
+        .max_output_tokens = 1,
+    };
+    const result = try client.model().call(a, request, .{});
+    try std.testing.expectEqual(p.FailureKind.unsupported_protocol, result.failure.kind);
+    config.model.protocol = .chat;
+    config.provider.base_url = "https://opencode.ai/inference/systemone/v1";
+    const endpoint = try client.model().call(a, request, .{});
+    try std.testing.expectEqual(p.FailureKind.unsupported_protocol, endpoint.failure.kind);
 }
 
 test "completed worker cannot publish late tools or hide usage at the final deadline gate" {

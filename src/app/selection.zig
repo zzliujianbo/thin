@@ -4,7 +4,6 @@ const std = @import("std");
 const cfg = @import("../core/config.zig");
 const p = @import("../core/protocol.zig");
 const fs = @import("../platform/filesystem.zig");
-const ids = @import("session_id.zig");
 const activity = @import("../presentation/activity.zig");
 
 pub const max_bytes = 4096;
@@ -91,25 +90,9 @@ pub fn capture(config: cfg.Config) !Snapshot {
     return snapshot;
 }
 
-pub fn encode(writer: *std.Io.Writer, id: ids.Id, snapshot: *const Snapshot) !void {
-    if (!ids.valid(id)) return error.InvalidSessionID;
-    if (snapshot.providerName() == null) {
-        // Keep legacy metadata byte shape; the additive field is registry-only.
-        try std.json.Stringify.value(.{
-            .version = 1,
-            .session = @as([]const u8, &id),
-            .provider = snapshot.provider,
-            .endpoint = @as([]const u8, &snapshot.endpoint),
-            .model = snapshot.model(),
-            .protocol = snapshot.protocol,
-            .effort = snapshot.effort,
-            .effort_hash = snapshot.view().effort_hash,
-        }, .{}, writer);
-        return;
-    }
+pub fn encode(writer: *std.Io.Writer, snapshot: *const Snapshot) !void {
     try std.json.Stringify.value(.{
-        .version = 1,
-        .session = @as([]const u8, &id),
+        .version = 2,
         .provider = snapshot.provider,
         .provider_name = snapshot.providerName(),
         .endpoint = @as([]const u8, &snapshot.endpoint),
@@ -124,19 +107,16 @@ fn string(value: std.json.Value) ![]const u8 {
     return if (value == .string) value.string else error.InvalidSelection;
 }
 
-pub fn parse(a: std.mem.Allocator, bytes: []const u8, expected_id: ids.Id) !Snapshot {
-    if (!ids.valid(expected_id)) return error.InvalidSessionID;
+pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Snapshot {
     if (bytes.len > max_bytes) return error.SelectionTooLarge;
     try fs.validateText(bytes);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSelection;
     const object = parsed.value.object;
-    if (object.count() != 8 + @as(usize, if (object.contains("provider_name")) 1 else 0)) return error.InvalidSelection;
+    if (object.count() != 8) return error.InvalidSelection;
     const version = object.get("version") orelse return error.InvalidSelection;
-    if (version != .integer or version.integer != 1) return error.InvalidSelectionVersion;
-    const id = try string(object.get("session") orelse return error.InvalidSelection);
-    if (!std.mem.eql(u8, id, &expected_id)) return error.SelectionIdentityMismatch;
+    if (version != .integer or version.integer != 2) return error.InvalidSelectionVersion;
     const fingerprint = try string(object.get("endpoint") orelse return error.InvalidSelection);
     if (fingerprint.len != 64) return error.InvalidSelection;
     for (fingerprint) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidSelection;
@@ -158,37 +138,39 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, expected_id: ids.Id) !Snap
         for (hash) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidSelection;
         snapshot.effort_hash = hash[0..64].*;
     }
-    if (object.get("provider_name")) |name| if (name != .null) try setProviderName(&snapshot, try string(name));
+    const name = object.get("provider_name") orelse return error.InvalidSelection;
+    if (name != .null) try setProviderName(&snapshot, try string(name));
     @memcpy(&snapshot.endpoint, fingerprint);
     try setModel(&snapshot, try string(object.get("model") orelse return error.InvalidSelection));
     return snapshot;
 }
 
-const test_id: ids.Id = "0123456789abcdef0123456789abcdef".*;
-
 fn fixtureSnapshot() !Snapshot {
     return capture(.{ .provider = .{ .base_url = "https://opencode.ai/zen/go/v1" }, .model = .{ .name = "gpt-5.6-luna", .protocol = .responses, .context_tokens = 1050000, .reasoning_effort = "high" } });
 }
 
-test "selection strict schema owns metadata and binds the exact session identity" {
+test "selection v2 strict schema owns metadata and requires all eight fields" {
+    const a = std.testing.allocator;
     var snapshot = try fixtureSnapshot();
     var buffer: [max_bytes]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try encode(&writer, test_id, &snapshot);
-    const restored = try parse(std.testing.allocator, writer.buffered(), test_id);
+    try encode(&writer, &snapshot);
+    const restored = try parse(a, writer.buffered());
     try std.testing.expectEqualStrings(snapshot.model(), restored.model());
     try std.testing.expectEqual(cfg.providers.Id.opencode_go, restored.provider.?);
     try std.testing.expectEqual(activity.ReasoningEffort.high, restored.effort.?);
     try std.testing.expect(std.mem.find(u8, writer.buffered(), "https://") == null);
-    try std.testing.expectError(error.SelectionIdentityMismatch, parse(std.testing.allocator, writer.buffered(), "1123456789abcdef0123456789abcdef".*));
-    for ([_][]const u8{ "{}", "[]", "{\"version\":1,\"version\":1}", "\xff" }) |invalid| {
-        if (parse(std.testing.allocator, invalid, test_id)) |_| return error.AcceptedInvalidSelection else |_| {}
+    const missing = try std.mem.replaceOwned(u8, a, writer.buffered(), "\"provider_name\":null,", "");
+    defer a.free(missing);
+    try std.testing.expectError(error.InvalidSelection, parse(a, missing));
+    for ([_][]const u8{ "{}", "[]", "{\"version\":2,\"version\":2}", "\xff" }) |invalid| {
+        if (parse(a, invalid)) |_| return error.AcceptedInvalidSelection else |_| {}
     }
-    const tail = writer.buffered()["{\"version\":1".len..];
-    for ([_][]const u8{ "{\"version\":2", "{\"version\":\"1\"", "{\"version\":1.0", "{\"extra\":0,\"version\":1" }) |prefix| {
-        const invalid = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, tail });
-        defer std.testing.allocator.free(invalid);
-        if (parse(std.testing.allocator, invalid, test_id)) |_| return error.AcceptedInvalidSelection else |_| {}
+    const tail = writer.buffered()["{\"version\":2".len..];
+    for ([_][]const u8{ "{\"version\":1", "{\"version\":\"2\"", "{\"version\":2.0", "{\"extra\":0,\"version\":2" }) |prefix| {
+        const invalid = try std.mem.concat(a, u8, &.{ prefix, tail });
+        defer a.free(invalid);
+        if (parse(a, invalid)) |_| return error.AcceptedInvalidSelection else |_| {}
     }
     @memset(&buffer, 'x');
     try std.testing.expectEqualStrings("gpt-5.6-luna", restored.model());

@@ -243,10 +243,7 @@ fn validateProxy(proxy: ProxyConfig, registry: ?Registry) !void {
 pub const DecisionConfig = struct {
     model: []const u8,
     enabled: bool = true,
-    /// Explicit auxiliary API, never inferred from a model name or chat protocol.
-    backend: enum { model, systemone } = .model,
-    request_timeout_ms: u32 = 30000,
-    /// Generative backend only; SystemOne has no max_tokens/message context API.
+    /// Generative protocols only; SystemOne has no max_tokens/message context API.
     max_input_tokens: u32 = 8192,
     max_output_tokens: u32 = 1024,
     /// Local SystemOne state bound, not a claim about supplier context capacity.
@@ -254,14 +251,14 @@ pub const DecisionConfig = struct {
 
     /// Shared by generic auxiliary resolution and its local model picker.
     /// Never use primary price policy or command limits to resolve a reviewer.
-    pub fn modelLimits(self: DecisionConfig) Limits {
+    pub fn modelLimits(self: DecisionConfig, shared_request_timeout_ms: u32) Limits {
         return .{
             .low_price_input = false,
             .input_margin_tokens = 1,
             .safety_tokens = 256,
             .max_input_tokens = self.max_input_tokens,
             .max_output_tokens = self.max_output_tokens,
-            .request_timeout_ms = self.request_timeout_ms,
+            .request_timeout_ms = shared_request_timeout_ms,
             .max_response_bytes = 128 * 1024,
             .max_event_bytes = 64 * 1024,
         };
@@ -308,6 +305,128 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
     return parseBounded(allocator, bytes, max_config_bytes, true, false);
 }
 
+const decision_fixture =
+    \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://127.0.0.1:1/v1","api_key":"fake-inline","models":{"main":{"protocol":"chat","context_tokens":32768},"org/reviewer":{"protocol":"systemone"}}}}},"limits":{"request_timeout_ms":123456},"decision":{"model":"p/org/reviewer","enabled":true,"max_input_tokens":8192,"max_output_tokens":1024,"max_state_bytes":16384}}
+;
+
+fn decisionAllocationCase(a: std.mem.Allocator) !void {
+    var parsed = try parse(a, decision_fixture);
+    defer release(&parsed);
+    try std.testing.expectEqual(protocol.Protocol.systemone, parsed.value.registry.?.find("p").?.patchFor("org/reviewer").?.protocol.?);
+    var copied = try clone(a, parsed.value);
+    defer release(&copied);
+    copied.value.provider.base_url = "";
+    copied.value.selection_pending = true;
+    var pending = try clonePendingSettings(a, copied.value);
+    defer release(&pending);
+    try std.testing.expect(pending.value.selection_pending);
+    try std.testing.expectEqualStrings("", pending.value.provider.base_url);
+    try std.testing.expectEqual(@as(u32, 123456), pending.value.decision.?.modelLimits(pending.value.limits.request_timeout_ms).request_timeout_ms);
+    try std.testing.expectEqual(protocol.Protocol.chat, pending.value.registry.?.find("p").?.patchFor("main").?.protocol.?);
+    try std.testing.expectEqualStrings("fake-inline", pending.value.provider.api_key.?);
+    var wiping = WipingAllocator{ .backing = a };
+    var out: std.Io.Writer.Allocating = .init(wiping.allocator());
+    defer out.deinit();
+    // This allocating writer maps allocation failures to WriteFailed.
+    // Expose OOM to the exhaustive test harness without changing production.
+    writeDisk(parsed.value, &out.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    var again = try parse(a, out.written());
+    defer release(&again);
+    try std.testing.expectEqual(protocol.Protocol.systemone, again.value.registry.?.find("p").?.patchFor("org/reviewer").?.protocol.?);
+    try std.testing.expectEqual(@as(u32, 123456), again.value.limits.request_timeout_ms);
+}
+
+test "explicit decision protocol round trips with shared timeout" {
+    try decisionAllocationCase(std.testing.allocator);
+    var parsed = try parse(std.testing.allocator, decision_fixture);
+    defer release(&parsed);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeDisk(parsed.value, &out.writer);
+    var tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer tree.deinit();
+    const decision = tree.value.object.get("decision").?.object;
+    try std.testing.expect(decision.get("backend") == null);
+    try std.testing.expect(decision.get("request_timeout_ms") == null);
+    try std.testing.expectEqual(@as(usize, 5), decision.count());
+    var again = try parse(std.testing.allocator, out.written());
+    defer release(&again);
+    try std.testing.expectEqual(protocol.Protocol.systemone, again.value.registry.?.find("p").?.patchFor("org/reviewer").?.protocol.?);
+}
+
+test "decision declarations and owned pending clones are allocation failure safe" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, decisionAllocationCase, .{});
+}
+
+const decision_test_prefix = "{\"llm\":{\"default\":\"p/m\",\"providers\":{\"p\":{\"base_url\":\"https://fixture.invalid/v1\",\"api_key\":\"fake-inline\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":32768}}}}},\"decision\":";
+
+fn expectUnknownDecisionField(a: std.mem.Allocator, raw: []const u8) !void {
+    var parsed = parse(a, raw) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.UnknownField, err);
+        return;
+    };
+    defer release(&parsed);
+    return error.TestExpectedError;
+}
+
+fn rejectedDecisionAllocationCase(a: std.mem.Allocator) !void {
+    for ([_]bool{ true, false }) |enabled| {
+        for ([_][]const u8{ "\"model\"", "\"systemone\"", "\"other\"", "null", "17", "1.5" }) |backend| {
+            const raw = try std.fmt.allocPrint(std.testing.allocator, "{s}{{\"model\":\"p/m\",\"enabled\":{},\"backend\":{s}}}}}", .{ decision_test_prefix, enabled, backend });
+            defer std.testing.allocator.free(raw);
+            try expectUnknownDecisionField(a, raw);
+        }
+        for ([_][]const u8{ "1", "17", "0", "-1", "3600001", "\"1\"", "null", "true", "1.5", "1e100" }) |timeout| {
+            const raw = try std.fmt.allocPrint(std.testing.allocator, "{s}{{\"model\":\"p/m\",\"enabled\":{},\"request_timeout_ms\":{s}}}}}", .{ decision_test_prefix, enabled, timeout });
+            defer std.testing.allocator.free(raw);
+            try expectUnknownDecisionField(a, raw);
+        }
+    }
+}
+
+test "decision rejects removed fields even when disabled without protocol migration" {
+    try rejectedDecisionAllocationCase(std.testing.allocator);
+    const a = std.testing.allocator;
+    const cases = .{
+        .{ "{\"model\":\"p/m\",\"unknown\":1}", error.UnknownField },
+        .{ "{\"model\":\"p/m\",\"model\":\"p/m\"}", error.DuplicateField },
+        .{ "{\"model\":\"p/m\",\"backend\":\"model\",\"backend\":\"systemone\"}", error.DuplicateField },
+        .{ "{\"model\":\"p/m\",\"request_timeout_ms\":1,\"request_timeout_ms\":2}", error.DuplicateField },
+        .{ "{\"model\":\"p/m\",\"max_state_bytes\":1.5}", error.InvalidNumber },
+    };
+    inline for (cases) |case| {
+        const raw = try std.mem.concat(a, u8, &.{ decision_test_prefix, case[0], "}" });
+        defer a.free(raw);
+        try std.testing.expectError(case[1], parse(a, raw));
+    }
+    var parsed = try parse(a, decision_test_prefix ++ "{\"model\":\"p/m\"}}");
+    defer release(&parsed);
+    try std.testing.expectEqual(protocol.Protocol.chat, parsed.value.registry.?.find("p").?.patchFor("m").?.protocol.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.registry.?.find("p").?.models.len);
+}
+
+test "SystemOne has no required generative window but retains field and budget safety" {
+    var model: Model = .{ .name = "reviewer", .protocol = .systemone, .context_tokens = 0 };
+    try validateModel(model, .{});
+    model.reasoning_effort = "off";
+    try std.testing.expectError(error.IncompatibleReasoningProtocol, validateModel(model, .{}));
+    model.reasoning_effort = null;
+    model.reasoning = .{ .map = .{ .high = "high" } };
+    try std.testing.expectError(error.IncompatibleReasoningProtocol, validateModel(model, .{}));
+    model.reasoning = null;
+    try std.testing.expectError(error.InvalidBudget, validateModel(model, .{ .max_output_tokens = 0 }));
+    try std.testing.expectError(error.InvalidBudget, validateModel(model, .{ .max_output_tokens = 100, .summary_tokens = 101 }));
+    model.context_tokens = 16 * 1024 * 1024 + 1;
+    try std.testing.expectError(error.InvalidBudget, validateModel(model, .{}));
+    model.context_tokens = 0;
+    model.protocol = .chat;
+    try std.testing.expectError(error.InvalidBudget, validateModel(model, .{}));
+}
+
 test "runtime-only config clones retain derived maps but cannot write disk" {
     var active = testConfig();
     active.model.reasoning = .{ .map = .{ .high = "high" } };
@@ -342,10 +461,10 @@ fn cloneConfig(allocator: std.mem.Allocator, config: Config, comptime unresolved
     if (unresolved) try validatePendingSettings(config) else try validate(config);
     var wiping = WipingAllocator{ .backing = allocator };
     const bytes = try std.json.Stringify.valueAlloc(wiping.allocator(), config, .{ .emit_null_optional_fields = false });
-    defer {
-        std.crypto.secureZero(u8, bytes);
-        allocator.free(bytes);
-    }
+    // Allocator.free poisons memory before calling rawFree in safety builds.
+    // Keep the wiping wrapper at the final free boundary, just as for the
+    // stringify writer's intermediate buffers and the parsed arena's release.
+    defer wiping.allocator().free(bytes);
     return parseBounded(allocator, bytes, 512 * 1024, false, unresolved);
 }
 
@@ -380,6 +499,14 @@ fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
         if (T == DecisionConfig) _ = try string(fields.get("model") orelse return error.MissingField);
         var it = fields.iterator();
         while (it.next()) |entry| {
+            // Reject unknown decision keys regardless of the value's type.
+            // No removed field is interpreted or imported into declarations.
+            if (T == DecisionConfig) {
+                const known = inline for (@typeInfo(T).@"struct".field_names) |field| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, field)) break true;
+                } else false;
+                if (!known) return error.UnknownField;
+            }
             if (entry.value_ptr.* == .float or entry.value_ptr.* == .number_string) return error.InvalidNumber;
             inline for (@typeInfo(T).@"struct".field_names) |field| {
                 if (std.mem.eql(u8, entry.key_ptr.*, field)) {
@@ -538,13 +665,12 @@ pub fn setRegistryDefault(a: std.mem.Allocator, config: *Config, provider_name: 
 pub fn setRegistryReasoningEffort(a: std.mem.Allocator, config: *Config, name: []const u8) !void {
     if (config.registry == null) return error.MissingRegistry;
     try validateRegistryReasoningEffort(name);
-    const normalized = if (std.mem.eql(u8, name, "none")) "off" else name;
-    const owned = try a.dupe(u8, normalized);
+    const owned = try a.dupe(u8, name);
     config.registry.?.reasoning_effort = owned;
 }
 
 fn validateRegistryReasoningEffort(name: []const u8) !void {
-    for ([_][]const u8{ "off", "none", "minimal", "low", "medium", "high", "xhigh", "max" }) |allowed| {
+    for ([_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |allowed| {
         if (std.mem.eql(u8, name, allowed)) return;
     }
     return error.InvalidReasoningEffort;
@@ -698,17 +824,9 @@ fn validateConfig(config: Config, comptime unresolved: bool) !void {
     if (config.decision) |decision| {
         const selection = try splitDefault(decision.model);
         const registry = config.registry orelse return error.MissingRegistry;
-        const auxiliary = registry.find(selection.provider) orelse return error.UnknownProvider;
-        if (decision.backend == .systemone) {
-            // A known official connection cannot silently change API families.
-            // Custom SystemOne URLs remain explicit user declarations.
-            if (providers.Id.fromUrl(auxiliary.connection.base_url) != null and
-                !std.mem.eql(u8, std.mem.trimEnd(u8, auxiliary.connection.base_url, "/"), "https://opencode.ai/inference/systemone/v1"))
-                return error.InvalidDecisionEndpoint;
-        }
+        _ = registry.find(selection.provider) orelse return error.UnknownProvider;
         if (decision.max_state_bytes < 2 or decision.max_state_bytes > 65536) return error.InvalidLimit;
-        if (decision.request_timeout_ms == 0 or decision.request_timeout_ms > 3600000 or
-            decision.max_input_tokens < 2 or decision.max_input_tokens > 16 * 1024 * 1024 or
+        if (decision.max_input_tokens < 2 or decision.max_input_tokens > 16 * 1024 * 1024 or
             decision.max_output_tokens == 0 or decision.max_output_tokens > 16 * 1024 * 1024) return error.InvalidLimit;
     }
 
@@ -862,6 +980,7 @@ pub fn chatOnly(base_url: []const u8, model: Model) bool {
 }
 
 fn validateReasoningProtocol(base_url: []const u8, model: Model) !void {
+    if (providers.Id.fromSystemOneUrl(base_url) != null and model.protocol != .systemone and model.protocol != .auto) return error.IncompatibleModelProtocol;
     if ((model.protocol == .responses or model.protocol == .anthropic) and chatOnly(base_url, model)) return error.IncompatibleReasoningProtocol;
 }
 
@@ -877,6 +996,7 @@ pub fn validateInputLimits(l: Limits) !void {
 /// Shared profile validation uses the same limits as the selected model.
 pub fn validateModel(model: Model, l: Limits) !void {
     if (!validText(model.name, 1024)) return error.InvalidModel;
+    if (model.protocol == .systemone and (model.reasoning_effort != null or model.reasoning != null)) return error.IncompatibleReasoningProtocol;
     if (model.reasoning_effort) |effort| {
         if (!validText(effort, 128)) return error.InvalidReasoningEffort;
     }
@@ -892,9 +1012,9 @@ pub fn validateModel(model: Model, l: Limits) !void {
     if (model.output_tokens) |tokens| {
         if (tokens == 0 or tokens > mib) return error.InvalidBudget;
     }
-    if (model.context_tokens == 0 or model.context_tokens > 16 * mib or
-        l.safety_tokens > mib or
-        @as(u64, l.safety_tokens) + 1 >= model.context_tokens) return error.InvalidBudget;
+    if (model.context_tokens > 16 * mib or l.safety_tokens > mib) return error.InvalidBudget;
+    if (model.protocol != .systemone and
+        (model.context_tokens == 0 or @as(u64, l.safety_tokens) + 1 >= model.context_tokens)) return error.InvalidBudget;
     if (model.input_price_threshold) |tokens| if (tokens == 0 or tokens > 16 * mib) return error.InvalidBudget;
     if (model.input_price_flat_limit) |tokens| if (tokens == 0 or tokens > 16 * mib) return error.InvalidBudget;
     if (l.summary_tokens) |tokens| if (tokens == 0 or tokens > mib) return error.InvalidBudget;
@@ -1248,6 +1368,9 @@ test "credential parser cleanup and release zero owned allocations" {
     ;
     var parsed = try parse(observer.allocator(), inline_json);
     try std.testing.expectEqualStrings("fake-inline", parsed.value.provider.api_key.?);
+    var copied = try clone(observer.allocator(), parsed.value);
+    try std.testing.expectEqualStrings("fake-inline", copied.value.provider.api_key.?);
+    release(&copied);
     release(&parsed);
     try std.testing.expectError(error.UnknownField, parse(observer.allocator(),
         \\{"provider":{"base_url":"https://example.invalid","api_key":"fake-inline","unknown":1}}
@@ -1262,6 +1385,32 @@ test "credential parser cleanup and release zero owned allocations" {
     try std.testing.expectError(error.InvalidApiKey, parse(observer.allocator(),
         \\{"llm":{"default":"a/m","providers":{"a":{"base_url":"https://example.invalid"},"backup":{"base_url":"https://backup.invalid","api_key":"fake\nbackup"}}}}
     ));
+    // Observe production allocations inside each OOM attempt, not the testing
+    // harness's own non-secret allocation bookkeeping.
+    const FailureCase = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var watched = Observer{ .backing = a };
+            decisionAllocationCase(watched.allocator()) catch |err| {
+                try std.testing.expect(!watched.dirty_free);
+                return err;
+            };
+            try std.testing.expect(!watched.dirty_free);
+        }
+
+        fn reject(a: std.mem.Allocator) !void {
+            var watched = Observer{ .backing = a };
+            // Test-input construction bypasses the observer; only production
+            // parse allocations belong to the final rawFree wiping contract.
+            rejectedDecisionAllocationCase(watched.allocator()) catch |err| {
+                try std.testing.expect(!watched.dirty_free);
+                return err;
+            };
+            try std.testing.expect(watched.frees > 0);
+            try std.testing.expect(!watched.dirty_free);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.reject, .{});
     try std.testing.expect(observer.frees > 0);
     try std.testing.expect(!observer.dirty_free);
 }

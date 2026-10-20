@@ -69,7 +69,7 @@ pub fn modelPalette(band: activity.RateBand) []const []const u8 {
 pub fn effortColor(effort: activity.ReasoningEffort) []const u8 {
     return switch (effort) {
         .unspecified, .unknown => reset,
-        .off, .none => muted,
+        .off => muted,
         .minimal => "\x1b[38;5;117m",
         .low => success,
         .medium => reset,

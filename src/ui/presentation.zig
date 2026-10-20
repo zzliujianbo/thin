@@ -584,7 +584,7 @@ test "effort confirmation replaces only the context slot and medium stays defaul
 
 test "model keeps effort and TPS waves while context percent has static occupancy color" {
     const a = std.testing.allocator;
-    const efforts = [_]shared.ReasoningEffort{ .unspecified, .unknown, .none, .minimal, .low, .medium, .high, .xhigh };
+    const efforts = [_]shared.ReasoningEffort{ .unspecified, .unknown, .off, .minimal, .low, .medium, .high, .xhigh };
     for ([_]shared.activity.RateBand{ .slow, .standard, .fast, .unknown }) |band| {
         const palette = theme.modelPalette(band);
         for ([_]usize{ 0, 2, 11, std.math.maxInt(usize) }) |phase| {

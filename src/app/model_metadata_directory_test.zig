@@ -80,7 +80,7 @@ test "verified flat price exact route and conservative threshold precedence" {
     try t.expectEqual(@as(?u32, 16777216), m.inputPriceFlatLimitFor(&cache, entry));
 }
 
-test "verified flat price v12 roundtrip merge publication clearing and bounds" {
+test "verified flat price current roundtrip merge publication clearing and bounds" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
@@ -111,9 +111,9 @@ test "verified flat price v12 roundtrip merge publication clearing and bounds" {
     const removed = try m.commitAt(&root, 0, .{ .dev_done = true }, 1020);
     try t.expect(m.inputPriceFlatLimitFor(&removed, entry) == null);
     try t.expectEqual(@as(?u32, 1000000), removed.directory.rows[0].tokens);
-    for ([_]u32{ 11, 12 }) |version| {
+    for ([_]u32{m.cache_version}) |version| {
         for ([_][]const u8{ "0", "-1", "16777217", "4294967296", "1.0", "1e5", "\"100000\"", "true", "{}", "[]" }) |token| {
-            const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":{d},\"attempted\":0,\"records\":[],\"models\":[{{\"provider\":\"opencode_go\",\"id\":\"raw/id\",\"dev_input_price_flat_limit\":{s}}}]}}", .{ version, token });
+            const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":{d},\"models\":[{{\"provider\":\"opencode_go\",\"id\":\"raw/id\",\"dev_input_price_flat_limit\":{s}}}]}}", .{ version, token });
             defer t.allocator.free(body);
             try root.writeMode(m.file_name, body, true, 0o600);
             if (m.load(&root)) |_| return error.AcceptedInvalidFlatLimit else |_| {}
@@ -121,18 +121,17 @@ test "verified flat price v12 roundtrip merge publication clearing and bounds" {
     }
 }
 
-test "flat price v11 evidence is discarded without resetting generations or post-claim cooldown" {
+test "flat price current evidence and independent generations preserve post-claim cooldown" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     try root.writeMode(m.file_name,
-        \\{"version":11,"attempted":128,"records":[],"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_present":true,"dev_input_price_threshold":200000,"dev_input_price_flat_limit":1000000}],"refresh":[{"generation":11},{"generation":12},{"generation":13},{"generation":14,"last_attempt_ms":900,"last_success_ms":800,"successful":false}]}
+        \\{"version":14,"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_present":true,"dev_input_price_threshold":200000,"dev_input_price_flat_limit":1000000}],"refresh":[{"generation":11},{"generation":12},{"generation":13},{"generation":14,"last_success_ms":800,"successful":false}]}
     , true, 0o600);
     const migrated = try m.load(&root);
-    try t.expect(migrated.directory.rows[0].dev_input_price_flat_limit == null);
-    // Old f64 evidence could miss a tiny increase at 100K and record 200K.
-    try t.expect(migrated.directory.rows[0].dev_input_price_threshold == null);
+    try t.expectEqual(@as(?u32, 1000000), migrated.directory.rows[0].dev_input_price_flat_limit);
+    try t.expectEqual(@as(?u32, 200000), migrated.directory.rows[0].dev_input_price_threshold);
     try t.expectEqual(@as(u64, 14), migrated.refresh[3].generation);
     try t.expectEqual(@as(?u64, 800), migrated.refresh[3].last_success_ms);
     const claimed = try m.claimAt(&root, m.dev_bit, false, 1000, .{});
@@ -144,7 +143,7 @@ test "flat price v11 evidence is discarded without resetting generations or post
     const public = try priceListing("{\"input\":1,\"output\":2}");
     const stale = try m.commitClaimedAt(&root, 0, public, .{ 11, 12, 13, 14 }, 1010);
     try t.expectEqual(@as(u8, 0), stale.accepted);
-    try t.expect(stale.cache.directory.rows[0].dev_input_price_flat_limit == null);
+    try t.expectEqual(@as(?u32, 1000000), stale.cache.directory.rows[0].dev_input_price_flat_limit);
     var invalid = public;
     invalid.directory.rows[0].dev_input_price_flat_limit = 16777217;
     try t.expectError(error.InvalidMetadata, m.commitClaimedAt(&root, 0, invalid, claimed.generations, 1020));
@@ -156,38 +155,6 @@ test "flat price v11 evidence is discarded without resetting generations or post
     try t.expectEqualDeep(published.cache, loaded);
     const entry = m.restoreEntry(&loaded, .opencode_go, "claude-haiku-5-5").?;
     try t.expectEqual(@as(?u32, 1000000), m.inputPriceFlatLimitFor(&loaded, entry));
-}
-
-test "flat price v10 migration preserves source generations and grants one dev claim" {
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try rootFor(tmp.dir);
-    defer root.deinit();
-    try root.writeMode(m.file_name,
-        \\{"version":10,"attempted":135,"records":[],"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_input_price_threshold":100000,"dev_input_price_flat_limit":1000000}],"refresh":[{"generation":11,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":12,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":13,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":14,"last_attempt_ms":900,"last_success_ms":900,"successful":true}]}
-    , true, 0o600);
-    const migrated = try m.load(&root);
-    try t.expect(migrated.directory.rows[0].dev_input_price_flat_limit == null);
-    try t.expect(migrated.directory.rows[0].dev_input_price_threshold == null);
-    for (migrated.refresh, 0..) |timing, index| {
-        try t.expectEqual(@as(u64, 11) + index, timing.generation);
-        try t.expectEqual(@as(?u64, 900), timing.last_success_ms);
-        try t.expect(timing.successful);
-        try t.expectEqual(if (index == 3) @as(?u64, null) else @as(?u64, 900), timing.last_attempt_ms);
-    }
-    try t.expectEqual(m.dev_bit, m.eligible(&migrated, m.provider_mask | m.dev_bit, 1000, .{}));
-    const claimed = try m.claimAt(&root, m.dev_bit, false, 1000, .{});
-    try t.expectEqual(m.dev_bit, claimed.mask);
-    try t.expectEqual(@as(u64, 15), claimed.generations[3]);
-    for (0..3) |index| try t.expectEqual(@as(u64, 11) + index, claimed.generations[index]);
-    try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, m.dev_bit, false, 1001, .{})).mask);
-    var stale: m.Listing = .{ .dev_done = true };
-    const row = try stale.directory.upsert(.opencode_go, "raw/id");
-    row.dev_input_price_flat_limit = 1000000;
-    row.dev_protocol = .anthropic;
-    const rejected = try m.commitClaimedAt(&root, 0, stale, .{ 11, 12, 13, 14 }, 1010);
-    try t.expectEqual(@as(u8, 0), rejected.accepted);
-    try t.expect(rejected.cache.directory.rows[0].dev_input_price_flat_limit == null);
 }
 
 test "price threshold exact fixture independent of official context and output" {
@@ -265,22 +232,22 @@ test "price threshold adapter unknown and bounded tiers do not poison other capa
     try t.expectEqual(@as(?u32, 16384), bounded.directory.rows[0].dev_output_tokens);
 }
 
-test "price threshold v9 migration preserves generations success and one refresh then stale isolation" {
+test "price threshold current generation success manual refresh and stale isolation" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     const legacy =
-        \\{"version":9,"attempted":135,"records":[],"directory_mask":4,"models":[{"provider":"opencode_go","id":"claude-haiku-5-5","context_window":1000000,"output_tokens":8192,"dev_output_tokens":16384,"dev_input_price_threshold":123,"protocol":"anthropic","dev_protocol":"anthropic","available":true,"dev_present":true}],"refresh":[{"generation":11,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":12,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":13,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":14,"last_attempt_ms":900,"last_success_ms":900,"successful":true}]}
+        \\{"version":14,"directory_mask":4,"models":[{"provider":"opencode_go","id":"claude-haiku-5-5","context_window":1000000,"output_tokens":8192,"dev_output_tokens":16384,"dev_input_price_threshold":123,"protocol":"anthropic","dev_protocol":"anthropic","available":true,"dev_present":true}],"refresh":[{"generation":11,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":12,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":13,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":14,"last_attempt_ms":900,"last_success_ms":900,"successful":true}]}
     ;
     try root.writeMode(m.file_name, legacy, true, 0o600);
     const migrated = try m.load(&root);
-    try t.expect(migrated.directory.rows[0].dev_input_price_threshold == null);
+    try t.expectEqual(@as(?u32, 123), migrated.directory.rows[0].dev_input_price_threshold);
     try t.expectEqual(@as(?u32, 8192), migrated.directory.rows[0].output_tokens);
     try t.expectEqual(@as(?u64, 900), migrated.refresh[3].last_success_ms);
     try t.expectEqual(@as(u64, 14), migrated.refresh[3].generation);
     try t.expectEqual(@as(u8, 0), m.eligible(&migrated, m.bit(.opencode_go), 1000, .{}));
-    const first = try m.claimAt(&root, m.dev_bit, false, 1000, .{});
+    const first = try m.claimAt(&root, m.dev_bit, true, 1000, .{});
     try t.expectEqual(m.dev_bit, first.mask);
     try t.expectEqual(@as(u64, 15), first.generations[3]);
     try t.expectEqual(@as(u64, 11), first.generations[0]);
@@ -306,45 +273,20 @@ test "price threshold v9 migration preserves generations success and one refresh
     try t.expectEqual(@as(?u32, 8192), m.outputFor(&removed, entry));
 }
 
-test "price threshold v8 successful refresh gets one public upgrade claim without cooldown bypass" {
+test "price threshold current strict cache tokens and invalid publication rollback" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
-    try root.writeMode(m.file_name,
-        \\{"version":8,"attempted":128,"records":[],"refresh":[{},{},{},{"last_attempt_ms":900,"last_success_ms":900,"successful":true}]}
-    , true, 0o600);
-    const migrated = try m.load(&root);
-    try t.expectEqual(@as(?u64, 900), migrated.refresh[3].last_success_ms);
-    try t.expectEqual(@as(u64, 0), migrated.refresh[3].generation);
-    try t.expectEqual(m.dev_bit, m.eligible(&migrated, m.dev_bit, 1000, .{}));
-    const claimed = try m.claimAt(&root, m.dev_bit, false, 1000, .{});
-    try t.expectEqual(m.dev_bit, claimed.mask);
-    try t.expectEqual(@as(u64, 1), claimed.generations[3]);
-    try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, m.dev_bit, false, 1001, .{})).mask);
-}
-
-test "price threshold v10-v12 strict cache tokens invalid publication rollback and legacy unknown" {
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try rootFor(tmp.dir);
-    defer root.deinit();
-    for ([_]u32{ 10, 11, 12 }) |version| {
+    for ([_]u32{m.cache_version}) |version| {
         for ([_][]const u8{ "0", "-1", "16777217", "4294967296", "1.0", "1e5", "\"100000\"", "true", "{}", "[]" }) |token| {
-            const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":{d},\"attempted\":0,\"records\":[],\"models\":[{{\"provider\":\"opencode_go\",\"id\":\"same\",\"dev_input_price_threshold\":{s}}}]}}", .{ version, token });
+            const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":{d},\"models\":[{{\"provider\":\"opencode_go\",\"id\":\"same\",\"dev_input_price_threshold\":{s}}}]}}", .{ version, token });
             defer t.allocator.free(body);
             try root.writeMode(m.file_name, body, true, 0o600);
             if (m.load(&root)) |_| return error.AcceptedInvalidThreshold else |_| {}
         }
     }
-    for (1..12) |version| {
-        const models = if (version >= 5) ",\"models\":[{\"provider\":\"opencode_go\",\"id\":\"same\",\"dev_input_price_threshold\":100000}]" else "";
-        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":{d},\"attempted\":0,\"records\":[]{s}}}", .{ version, models });
-        defer t.allocator.free(body);
-        try root.writeMode(m.file_name, body, true, 0o600);
-        const legacy = try m.load(&root);
-        if (version >= 5) try t.expect(legacy.directory.rows[0].dev_input_price_threshold == null);
-    }
+    try root.writeMode(m.file_name, "{\"version\":14}", true, 0o600);
     const public = try priceListing(price_cost);
     const saved = try m.commitAt(&root, 0, public, 1000);
     var invalid = public;
@@ -407,30 +349,30 @@ test "publication generations reject delayed sources independently and distingui
     try t.expectEqual(@as(?u64, 4000), independent.cache.refresh[0].last_success_ms);
 }
 
-test "publication v9 generation strict tokens exhaustion and v8 timing migration" {
+test "publication current generation strict tokens exhaustion and durable timing" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     for ([_][]const u8{ "\"1\"", "1.0", "1e3", "-1", "9223372036854775808", "null" }) |token| {
-        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":9,\"attempted\":0,\"records\":[],\"refresh\":[{{\"generation\":{s}}},{{}},{{}},{{}}]}}", .{token});
+        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":14,\"refresh\":[{{\"generation\":{s}}},{{}},{{}},{{}}]}}", .{token});
         defer t.allocator.free(body);
         try root.writeMode(m.file_name, body, true, 0o600);
         if (m.load(&root)) |_| return error.AcceptedInvalidGeneration else |_| {}
     }
-    const exhausted = "{\"version\":9,\"attempted\":0,\"records\":[],\"refresh\":[{\"generation\":9223372036854775807},{},{},{}]}";
+    const exhausted = "{\"version\":14,\"refresh\":[{\"generation\":9223372036854775807},{},{},{}]}";
     try root.writeMode(m.file_name, exhausted, true, 0o600);
     const before = try m.load(&root);
     try t.expectError(error.MetadataGenerationExhausted, m.claimAt(&root, m.bit(.deepseek) | m.dev_bit, true, 1000, .{}));
     try t.expectEqualDeep(before, try m.load(&root));
-    try root.writeMode(m.file_name, "{\"version\":8,\"attempted\":1,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":65536}],\"refresh\":[{\"last_attempt_ms\":100,\"last_success_ms\":110,\"successful\":true},{},{},{}]}", true, 0o600);
-    const migrated = try m.claimAt(&root, m.bit(.deepseek), true, 120, .{});
-    try t.expectEqual(@as(u64, 1), migrated.generations[0]);
-    try t.expectEqual(@as(?u64, 110), migrated.cache.refresh[0].last_success_ms);
-    try t.expectEqual(@as(?u32, 65536), migrated.cache.tokens[0]);
+    try root.writeMode(m.file_name, "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":65536,\"available\":true}],\"refresh\":[{\"last_attempt_ms\":100,\"last_success_ms\":110,\"successful\":true},{},{},{}]}", true, 0o600);
+    const claimed = try m.claimAt(&root, m.bit(.deepseek), true, 120, .{});
+    try t.expectEqual(@as(u64, 1), claimed.generations[0]);
+    try t.expectEqual(@as(?u64, 110), claimed.cache.refresh[0].last_success_ms);
+    try t.expectEqual(@as(?u32, 65536), claimed.cache.directory.rows[0].tokens);
 }
 
-test "refresh timing exact TTL cooldown restart independent manual rollback and migration" {
+test "refresh timing exact TTL cooldown restart independent manual rollback" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
@@ -441,15 +383,14 @@ test "refresh timing exact TTL cooldown restart independent manual rollback and 
     try t.expectEqual(both, (try m.claimAt(&root, both, false, 1000, policy)).mask);
     // Reload/second process observes the durable pre-launch claim.
     try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, both, false, 1049, policy)).mask);
-    var listing: m.Listing = .{};
-    listing.tokens[0] = 131072;
+    const listing = try m.parseListing(t.allocator, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":131072}]}", .deepseek);
     var cache = try m.commitAt(&root, official, listing, 1010);
     try t.expectEqual(@as(u8, 0), m.eligible(&cache, both, 1049, policy));
     try t.expectEqual(m.dev_bit, m.eligible(&cache, both, 1050, policy));
     try t.expectEqual(m.dev_bit, (try m.claimAt(&root, both, false, 1050, policy)).mask);
     // Failure keeps successful capabilities and last-success time.
     cache = try m.commitAt(&root, 0, .{}, 1051);
-    try t.expectEqual(@as(?u32, 131072), cache.tokens[0]);
+    try t.expectEqual(@as(?u32, 131072), cache.directory.rows[0].tokens);
     try t.expectEqual(@as(?u64, 1010), cache.refresh[0].last_success_ms);
     try t.expectEqual(@as(u8, 0), m.eligible(&cache, official, 1409, policy));
     try t.expectEqual(official, m.eligible(&cache, official, 1410, policy));
@@ -463,13 +404,6 @@ test "refresh timing exact TTL cooldown restart independent manual rollback and 
     try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, official, false, 500, policy)).mask);
     try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, official, false, 549, policy)).mask);
     try t.expectEqual(official, (try m.claimAt(&root, official, false, 550, policy)).mask);
-    // v7 has capabilities but no clock: due once, and immediately persisted v8.
-    try root.writeMode(m.file_name, "{\"version\":7,\"attempted\":135,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":12345}]}", true, 0o600);
-    const migrated = try m.claimAt(&root, both, false, 2000, policy);
-    try t.expectEqual(both, migrated.mask);
-    try t.expectEqual(@as(?u32, 12345), migrated.cache.tokens[0]);
-    try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, both, false, 2049, policy)).mask);
-    try t.expectEqual(both, (try m.claimAt(&root, both, false, 2050, policy)).mask);
 }
 
 test "refresh timing default deadlines and public success are independent" {
@@ -495,12 +429,12 @@ test "refresh timing timestamps require bounded nonnegative integer JSON tokens"
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     for ([_][]const u8{ "\"123\"", "1.0", "1e3", "-1", "253402300800000" }) |token| {
-        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":8,\"attempted\":0,\"records\":[],\"refresh\":[{{\"last_attempt_ms\":{s}}},{{}},{{}},{{}}]}}", .{token});
+        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":14,\"refresh\":[{{\"last_attempt_ms\":{s}}},{{}},{{}},{{}}]}}", .{token});
         defer t.allocator.free(body);
         try root.writeMode(m.file_name, body, true, 0o600);
         if (m.load(&root)) |_| return error.AcceptedInvalidTimestamp else |_| {}
     }
-    try root.writeMode(m.file_name, "{\"version\":8,\"attempted\":0,\"records\":[],\"refresh\":[{\"last_attempt_ms\":0},{\"last_success_ms\":253402300799999},{},{}]}", true, 0o600);
+    try root.writeMode(m.file_name, "{\"version\":14,\"refresh\":[{\"last_attempt_ms\":0},{\"last_success_ms\":253402300799999},{},{}]}", true, 0o600);
     const valid = try m.load(&root);
     try t.expectEqual(@as(?u64, 0), valid.refresh[0].last_attempt_ms);
     try t.expectEqual(@as(?u64, m.max_timestamp_ms), valid.refresh[1].last_success_ms);
@@ -601,20 +535,14 @@ test "output official protocol cannot authorize a conflicting public route" {
     try t.expect(config.model.output_tokens == null);
 }
 
-test "output cache v1-v5 default unknown and v6 rejects unbounded values transactionally" {
+test "output cache current schema rejects unbounded values transactionally" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     var buffer: [1024]u8 = undefined;
-    for (1..6) |version| {
-        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":{d},\"attempted\":0,\"records\":[]}}", .{version});
-        try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = body });
-        const cache = try m.load(&root);
-        try t.expect(m.outputFor(&cache, @import("provider_catalog.zig").entries[0]) == null);
-    }
     for ([_][]const u8{ "0", "1048577", "4294967296", "1.5", "\"100\"", "-1" }) |value| {
-        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":6,\"attempted\":0,\"records\":[],\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"output_tokens\":{s}}}]}}", .{value});
+        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":14,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"output_tokens\":{s}}}]}}", .{value});
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = body });
         const before = try root.dir.statFile(root.io, m.file_name, .{});
         if (m.commit(&root, 0, .{})) |_| return error.ExpectedInvalidCache else |_| {}
@@ -733,7 +661,6 @@ test "dynamic metadata official protocol wins while unknown adapter removes deri
 }
 
 test "dynamic metadata source merges roll back every field when the shared directory is full" {
-    const catalog = @import("provider_catalog.zig");
     const directory = @import("model_directory.zig");
     var target: m.Listing = .{ .dev_done = true };
     var name: [32]u8 = undefined;
@@ -746,11 +673,6 @@ test "dynamic metadata source merges roll back every field when the shared direc
     target.directory.rows[0].dev_context_tokens = 777;
     target.directory.rows[0].protocol = .chat;
     target.directory.rows[0].dev_protocol = .chat;
-    const legacy = for (catalog.entries, 0..) |entry, index| {
-        if (entry.provider == .opencode_go) break index;
-    } else unreachable;
-    target.tokens[legacy] = 111;
-    target.dev[legacy] = .{ .map = .{ .high = "high" } };
     const used = target.directory.used;
     var source: m.Listing = .{ .directory_mask = m.bit(.opencode_go), .dev_done = true };
     for ([_][]const u8{ "merge-0", "overflow-new" }) |id| {
@@ -763,10 +685,7 @@ test "dynamic metadata source merges roll back every field when the shared direc
         row.dev_protocol = .responses;
         row.dev_present = true;
     }
-    source.tokens[legacy] = 222;
-    source.dev[legacy] = .{ .map = .{ .low = "low" } };
     try t.expectError(error.MetadataTooLarge, m.mergeOfficial(&target, &source, .opencode_go));
-    try t.expectEqual(@as(?u32, 111), target.tokens[legacy]);
     try t.expectEqual(@as(?u32, 111), target.directory.rows[0].tokens);
     try t.expectEqual(.chat, target.directory.rows[0].protocol);
     try t.expectEqual(@as(u8, 0), target.directory_mask);
@@ -775,19 +694,17 @@ test "dynamic metadata source merges roll back every field when the shared direc
     try t.expectEqual(@as(?u32, 333), target.directory.rows[0].output_tokens);
     try t.expectEqual(@as(?u32, 444), target.directory.rows[0].dev_output_tokens);
     try t.expectEqual(@as(?u32, 777), target.directory.rows[0].dev_context_tokens);
-    try t.expectEqualStrings("high", target.dev[legacy].?.map.high.?);
-    try t.expect(target.dev[legacy].?.map.low == null);
     try t.expect(target.dev_done);
     try t.expectEqual(used, target.directory.used);
     try t.expectEqual(@as(usize, directory.max_models), target.directory.count);
 }
 
-test "legacy official fields survive public-only directory publication" {
+test "official row fields survive public-only directory publication" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
-    const legacy = "{\"version\":4,\"attempted\":135,\"records\":[{\"selector\":\"opencode-zen/gpt-5.2\",\"context_window\":100000,\"available\":true,\"reasoning\":{\"map\":{\"high\":\"high\"}}}]}";
+    const legacy = "{\"version\":14,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true,\"reasoning\":{\"map\":{\"high\":\"high\"}}}]}";
     try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = legacy });
     var cache = try m.commit(&root, 0, try m.parseDev(t.allocator,
         \\{"opencode":{"npm":"@ai-sdk/openai","models":{"gpt-5.2":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
@@ -817,25 +734,6 @@ test "legacy official fields survive public-only directory publication" {
     const updated = m.findEntry(&cache, "opencode-zen/gpt-5.2").?;
     try t.expect(m.capacityFor(&cache, updated) == null);
     try t.expectEqualStrings("low", m.entryDeclaration(&cache, updated).?.map.low.?);
-}
-
-test "dynamic metadata v4 upgrade preserves data and grants one automatic directory attempt" {
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try rootFor(tmp.dir);
-    defer root.deinit();
-    const legacy = "{\"version\":4,\"attempted\":135,\"records\":[{\"selector\":\"opencode-zen/gpt-5.2\",\"context_window\":100000,\"available\":true,\"dev_reasoning\":{\"map\":{\"high\":\"high\"}}}]}";
-    try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = legacy });
-    const requested = m.provider_mask | m.dev_bit;
-    const claimed = try m.claim(&root, requested, false);
-    try t.expectEqual(requested, claimed.mask);
-    const old = m.findEntry(&claimed.cache, "opencode-zen/gpt-5.2").?;
-    try t.expectEqual(@as(?u32, 100000), m.capacityFor(&claimed.cache, old));
-    try t.expectEqualStrings("high", m.entryDeclaration(&claimed.cache, old).?.map.high.?);
-    try t.expectEqual(@as(u8, 0), (try m.claim(&root, requested, false)).mask);
-    const cache = try m.load(&root);
-    try t.expectEqual(requested, cache.attempted);
-    try t.expect(!m.hasDirectory(&cache, .opencode_zen));
 }
 
 test "context public exact SDK routes roundtrip official precedence and frozen entries" {
@@ -951,12 +849,12 @@ test "context public only integer limit context bounds no peer inference or outp
     }) |bad| try t.expectError(error.InvalidModelsDev, m.parseDev(t.allocator, bad));
 }
 
-test "context public replaces preset fallback but preserves compatible legacy official window" {
+test "context public replaces preset fallback but preserves compatible official window" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
-    const legacy = "{\"version\":4,\"attempted\":135,\"records\":[{\"selector\":\"opencode-zen/gpt-5.2\",\"context_window\":100000,\"available\":true}]}";
+    const legacy = "{\"version\":14,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true}]}";
     try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = legacy });
     const public = try m.parseDev(t.allocator,
         \\{"opencode":{"npm":"@ai-sdk/openai","models":{"gpt-5.2":{"limit":{"context":262144}}}}}
@@ -980,46 +878,14 @@ test "context public replaces preset fallback but preserves compatible legacy of
     try t.expectEqual(preset.model.context_tokens, m.restoreEntry(&cache, .opencode_zen, "gpt-5.2").?.model.context_tokens);
 }
 
-test "context cache v1-v6 unknown v6 output preserved and v7 migration refresh once" {
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try rootFor(tmp.dir);
-    defer root.deinit();
-    var buffer: [2048]u8 = undefined;
-    for (1..7) |version| {
-        const models = if (version >= 5)
-            \\,"directory_mask":1,"models":[{"provider":"deepseek","id":"same","context_window":65536,"available":true,"protocol":"chat","dev_protocol":"chat","dev_context_tokens":262144,"output_tokens":8192,"dev_output_tokens":4096}]
-        else
-            "";
-        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":{d},\"attempted\":135,\"records\":[]{s}}}", .{ version, models });
-        try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = body });
-        const old = try m.load(&root);
-        if (version >= 5) {
-            try t.expect(old.directory.rows[0].dev_context_tokens == null);
-            try t.expectEqual(@as(?u32, 65536), old.directory.rows[0].tokens);
-            try t.expectEqual(if (version >= 6) @as(?u32, 8192) else null, old.directory.rows[0].output_tokens);
-            try t.expectEqual(if (version >= 6) @as(?u32, 4096) else null, old.directory.rows[0].dev_output_tokens);
-            try t.expectEqual(m.provider_mask, old.attempted);
-        }
-        const first = try m.claim(&root, m.dev_bit, false);
-        try t.expectEqual(m.dev_bit, first.mask);
-        try t.expectEqual(@as(u8, 0), (try m.claim(&root, m.dev_bit, false)).mask);
-        const bytes = try root.read(t.allocator, m.file_name, 0, m.max_cache_bytes);
-        defer t.allocator.free(bytes.data);
-        var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, bytes.data, .{});
-        defer parsed.deinit();
-        try t.expectEqual(@as(i64, 12), parsed.value.object.get("version").?.integer);
-    }
-}
-
-test "context v7 invalid cache values and invalid commit roll back durable fields" {
+test "context current invalid cache values and invalid commit roll back durable fields" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     var buffer: [1024]u8 = undefined;
     for ([_][]const u8{ "0", "16777217", "4294967296", "1.5", "1e5", "\"100\"", "-1", "true", "{}", "[]" }) |value| {
-        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":7,\"attempted\":0,\"records\":[],\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"dev_context_tokens\":{s}}}]}}", .{value});
+        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":14,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"dev_context_tokens\":{s}}}]}}", .{value});
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = body });
         const before = try root.dir.statFile(root.io, m.file_name, .{});
         if (m.claim(&root, m.dev_bit, false)) |_| return error.ExpectedInvalidCache else |_| {}
@@ -1029,7 +895,7 @@ test "context v7 invalid cache values and invalid commit roll back durable field
         defer t.allocator.free(after.data);
         try t.expectEqualStrings(body, after.data);
     }
-    try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = "{\"version\":7,\"attempted\":128,\"records\":[]}" });
+    try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = "{\"version\":14}" });
     var listing = try m.parseDev(t.allocator,
         \\{"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"same":{"limit":{"context":65536,"output":4096}}}}}
     );
@@ -1038,4 +904,29 @@ test "context v7 invalid cache values and invalid commit roll back durable field
     listing.directory.rows[0].dev_output_tokens = 8192;
     try t.expectError(error.InvalidMetadata, m.commit(&root, 0, listing));
     try t.expectEqualDeep(saved, try m.load(&root));
+}
+
+test "reasoning-only preset vote survives reload but cannot defeat an authoritative empty listing" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try rootFor(tmp.dir);
+    defer root.deinit();
+    const public = try m.parseDev(t.allocator,
+        \\{"foreign":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"limit":{"context":1000000,"output":8192},"cost":{"input":1,"output":2},"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
+    );
+    _ = try m.commitAt(&root, 0, public, 1000);
+    const first = try m.load(&root);
+    const entry = m.restoreEntry(&first, .opencode_go, "claude-haiku-5-5").?;
+    const empty = try m.parseListing(t.allocator, "{\"data\":[]}", .opencode_go);
+    _ = try m.commitAt(&root, m.bit(.opencode_go), empty, 1100);
+    const reloaded = try m.load(&root);
+    const row = reloaded.directory.rows[reloaded.directory.find(.opencode_go, "claude-haiku-5-5").?];
+    try t.expectEqualStrings("high", row.dev_reasoning.?.declaration().map.high.?);
+    try t.expect(m.hasDirectory(&reloaded, .opencode_go));
+    try t.expect(row.available != true);
+    try t.expect(m.dynamicEntry(&reloaded, .opencode_go, "claude-haiku-5-5") == null);
+    try t.expect(m.contextFor(&reloaded, entry) == null);
+    try t.expect(m.outputFor(&reloaded, entry) == null);
+    try t.expect(m.inputPriceThresholdFor(&reloaded, entry) == null);
+    try t.expect(m.inputPriceFlatLimitFor(&reloaded, entry) == null);
 }

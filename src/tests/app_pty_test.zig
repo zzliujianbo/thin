@@ -392,22 +392,33 @@ fn settingsValues(d: *Driver, low: []const u8, decision: []const u8, selected: u
     try check(view.visible(if (selected == 0) "> Low-price input" else "> Decision model"));
 }
 
+fn settingsDecisionChoose(d: *Driver, name: []const u8, backwards: bool) !void {
+    var buffer: [1200]u8 = undefined;
+    const selected = try std.fmt.bufPrint(&buffer, "> {s}", .{name});
+    for (0..64) |_| {
+        const view = try d.screen();
+        if (view.visible(selected)) return;
+        try settingsKey(d, if (backwards) "\x1b[A" else "\x1b[B");
+    }
+    return error.DecisionChoiceUnavailable;
+}
+
 // The Node owner checks config.json CAS persistence and ignored legacy files;
-// this driver intentionally keeps the existing labels, keys and mode API.
+// choices are exact model references, never a dedicated Jev preset.
 // Omitted decision.enabled defaults on only when decision is configured.
 fn globalSettings(d: *Driver, mode: []const u8) !void {
     const off = std.mem.eql(u8, mode, "settings-global-off");
     const on = std.mem.eql(u8, mode, "settings-global-on");
     const verify = std.mem.eql(u8, mode, "settings-global-verify");
     const absent = std.mem.eql(u8, mode, "settings-global-unconfigured");
-    const preset = std.mem.eql(u8, mode, "settings-global-preset");
-    try check(off or on or verify or absent or preset);
+    const native = std.mem.eql(u8, mode, "settings-global-native");
+    try check(off or on or verify or absent or native);
     try d.waitIdle(0);
     try settingsKey(d, "/settings\r");
     const before = if (on) "off" else "on";
     const after = if (off) "off" else "on";
-    const decision_before = if (absent or preset or on) "off" else "OpenCode Jev Free";
-    const decision_after = if (absent or off) "off" else "OpenCode Jev Free";
+    const decision_before = if (absent or native or on) "off" else "Configured";
+    const decision_after = if (absent or off) "off" else "Configured";
     try settingsValues(d, before, decision_before, 0);
     if (off or on) {
         try settingsKey(d, "\r");
@@ -417,7 +428,13 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     try settingsValues(d, after, decision_before, 1);
     try settingsKey(d, "\r");
     const choice = try d.screen();
-    try check(choice.visible("Off") and choice.visible("OpenCode Jev Free"));
+    try check(!choice.visible("OpenCode Jev Free") and !choice.visible("Logged-in model") and !choice.visible("Request timeout"));
+    // The selected native row may be beyond the first bounded window. Verify
+    // both exact choices are navigable, not that every candidate fits at once.
+    try settingsDecisionChoose(d, "Off", false);
+    try check((try d.screen()).visible("> Off"));
+    try settingsDecisionChoose(d, "native/family/native-review", false);
+    try check((try d.screen()).visible("> native/family/native-review"));
     try settingsKey(d, "\x1b[D");
     try settingsValues(d, after, decision_before, 1);
     try settingsKey(d, "\r");
@@ -425,10 +442,7 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     try settingsValues(d, after, decision_before, 1);
     if (!verify) {
         try settingsKey(d, "\r");
-        if (off) try settingsKey(d, "\x1b[A");
-        if (on or preset) try settingsKey(d, "\x1b[B");
-        const selected = try d.screen();
-        try check(selected.visible(if (on or preset) "> OpenCode Jev Free" else "> Off"));
+        try settingsDecisionChoose(d, if (on or native) "native/family/native-review" else "Off", false);
         try settingsKey(d, "\r");
         try settingsValues(d, after, decision_after, 1);
     }
@@ -486,8 +500,8 @@ fn decisionModelScreen(d: *Driver, a: std.mem.Allocator, required_text: []const 
 
 fn decisionModel(d: *Driver, init: std.process.Init, mode: []const u8, project: []const u8) !void {
     const a = init.arena.allocator();
-    const alias = std.mem.eql(u8, mode, "settings-decision-model-alias");
-    try check(alias or std.mem.eql(u8, mode, "settings-decision-model-raw"));
+    const backwards = std.mem.eql(u8, mode, "settings-decision-model-wrap");
+    try check(backwards or std.mem.eql(u8, mode, "settings-decision-model-down") or std.mem.eql(u8, mode, "settings-decision-model-native"));
     try d.waitIdle(0);
     var start = d.used;
     try d.send("decision-warmup-history-private-marker\r");
@@ -497,37 +511,25 @@ fn decisionModel(d: *Driver, init: std.process.Init, mode: []const u8, project: 
     try settingsKey(d, "\x1b[B");
     try decisionModelScreen(d, a, &.{"> Decision model"}, &.{});
     try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{ "> Off", "OpenCode Jev Free", "Logged-in model" }, &.{});
-    try settingsKey(d, "\x1b[B");
-    try settingsKey(d, "\x1b[B");
-    try decisionModelScreen(d, a, &.{"> Logged-in model"}, &.{});
-    try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{ "Search> ", "aux/family/judge  (" }, &.{"locked/secret-model  ("});
+    try decisionModelScreen(d, a, &.{ "> Off", "aux/family/judge", "primary/fixture-main" }, &.{ "locked/secret-model", "OpenCode Jev Free", "Logged-in model", "Search> ", "Request timeout" });
     try decisionModelGate(d, a, project, "opened");
-
-    // Searching an unauthenticated declared identity may echo it in the
-    // composer, but must never produce a selectable candidate row.
-    try settingsKey(d, "locked/secret-model");
-    try decisionModelScreen(d, a, &.{"Search> locked/secret-model"}, &.{ "locked/secret-model  (", "aux/family/judge  (" });
-    try d.send("\r");
+    try settingsDecisionChoose(d, "aux/family/judge", backwards);
+    // A pasted identity plus Enter cannot save or fabricate a candidate.
+    try d.send("\x1b[200~locked/secret-model\x1b[201~\r");
     try d.quiet(150);
-    try decisionModelScreen(d, a, &.{"Search> locked/secret-model"}, &.{"Decision model selected"});
-    try settingsKey(d, "\x1b[D");
-    try decisionModelScreen(d, a, &.{"> Logged-in model"}, &.{"Search> "});
-    try settingsKey(d, "\r");
-    try settingsKey(d, "aux/family/judge");
-    try decisionModelScreen(d, a, &.{"aux/family/judge  ("}, &.{});
+    try decisionModelScreen(d, a, &.{"aux/family/judge"}, &.{ "locked/secret-model", "Decision model selected" });
     try settingsKey(d, "\x1b");
-    try decisionModelScreen(d, a, &.{"> Logged-in model"}, &.{"Search> "});
+    try decisionModelScreen(d, a, &.{"> Decision model"}, &.{"Search> "});
     try decisionModelGate(d, a, project, "canceled");
 
     try settingsKey(d, "\r");
-    try settingsKey(d, if (alias) "aux/family/judge" else "family/judge");
-    try decisionModelScreen(d, a, &.{ ">   aux/family/judge  (", "Search> " }, &.{"locked/secret-model  ("});
-    start = d.used;
-    try d.send("\r");
-    try d.waitFrame(start, "Decision model selected; chat model unchanged");
-    try decisionModelScreen(d, a, &.{ "> Decision model", "Decision model   Configured" }, &.{ "Search> ", "> Logged-in model" });
+    try settingsDecisionChoose(d, "aux/family/judge", backwards);
+    try decisionModelScreen(d, a, &.{"> aux/family/judge"}, &.{ "locked/secret-model", "Search> " });
+    // Settings now returns a generic Ready notice. Authorize success from the
+    // completed owner-published frame and the following whole-JSON gate, not a
+    // removed selection-specific caption.
+    try settingsKey(d, "\r");
+    try decisionModelScreen(d, a, &.{ "> Decision model", "Decision model   Configured" }, &.{ "Search> ", "Logged-in model" });
     try decisionModelGate(d, a, project, "selected");
     start = d.used;
     try d.send("\x1b");
@@ -543,7 +545,7 @@ fn decisionModel(d: *Driver, init: std.process.Init, mode: []const u8, project: 
     try decisionModelScreen(d, a, &.{"fixture-main"}, &.{});
 }
 
-// New settings-value journey only; old fixtures and their navigation stay intact.
+// Shared request-timeout and main-preference journey, with direct Decision choices.
 fn settingsValueGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
     const raw = try std.fmt.allocPrint(a, "{s}/settings-values-release-{s}", .{ project, name });
     defer a.free(raw);
@@ -682,13 +684,8 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try settingsValueGate(d, a, project, "task");
 
     try settingsValueOpen(d, a, "Decision model");
-    try decisionModelScreen(d, a, &.{ "> Logged-in model", "Off", "OpenCode Jev Free", "Request timeout" }, &.{});
-    try settingsKey(d, "\x1b[A");
-    try settingsKey(d, "\x1b[A");
-    try settingsValueMenuOrder(d, a, &.{ "Off", "OpenCode Jev Free", "Logged-in model", "Request timeout" });
-    try settingsValueOpen(d, a, "Request timeout");
-    try settingsValueChoose(d, a, "60000 ms", "Request timeout");
-    try settingsValueGate(d, a, project, "decision");
+    try decisionModelScreen(d, a, &.{ "> aux/family/judge", "Off", "primary/fixture-main" }, &.{ "OpenCode Jev Free", "Logged-in model", "Request timeout" });
+    try settingsValueGate(d, a, project, "decision-menu");
     try settingsKey(d, "\x1b[D"); // decision -> root Settings.
     try decisionModelScreen(d, a, &.{"> Decision model"}, &.{"Logged-in model"});
     try settingsKey(d, "\x1b[D"); // Settings -> root commands.

@@ -1,4 +1,4 @@
-//! Pure, transactional edits of the six user-facing preferences.
+//! Pure, transactional edits of the five user-facing preferences.
 const cfg = @import("config.zig");
 
 pub const Key = enum {
@@ -7,7 +7,6 @@ pub const Key = enum {
     request_timeout_ms,
     max_output_tokens,
     task_timeout_ms,
-    decision_timeout_ms,
 };
 
 /// Validate a shallow candidate before publishing even its scalar fields.
@@ -24,10 +23,6 @@ pub fn apply(config: *cfg.Config, key: Key, value: ?u32) !void {
         .command_timeout_ms => candidate.limits.command_timeout_ms = value orelse return error.InvalidLimit,
         .request_timeout_ms => candidate.limits.request_timeout_ms = value orelse return error.InvalidLimit,
         .task_timeout_ms => candidate.limits.task_timeout_ms = value orelse return error.InvalidLimit,
-        .decision_timeout_ms => {
-            const decision = if (candidate.decision) |*decision| decision else return error.DecisionNotConfigured;
-            decision.request_timeout_ms = value orelse return error.InvalidLimit;
-        },
     }
     try cfg.validate(candidate);
     config.* = candidate;

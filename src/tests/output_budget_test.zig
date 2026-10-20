@@ -50,6 +50,7 @@ test "output budget provider matrix uses one shared ceiling and the declared wir
                             .chat => try chat.encodeWithOptions(allocator, request, connection.chat_max_tokens),
                             .responses => try responses.encode(allocator, request),
                             .anthropic => try anthropic.encode(allocator, request),
+                            .systemone => return error.SystemOneNotChatModel, // Not a generative wire encoder.
                             .auto => unreachable,
                         };
                         const parsed = try std.json.parseFromSlice(j.Value, allocator, encoded, .{});

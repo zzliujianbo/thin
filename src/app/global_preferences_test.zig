@@ -6,12 +6,12 @@ fn choose(session: *Session, choice: @import("../ui/tui.zig").Connection.Decisio
     try connection.decision_fn.?(connection.context, choice);
 }
 
-test "Decision native preset no-key roundtrip CAS and primary identity" {
+test "Decision declared native model roundtrip CAS and primary identity" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
     const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
-    try seed(home, plain, null);
+    try seed(home, native_declared, null);
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
@@ -29,48 +29,50 @@ test "Decision native preset no-key roundtrip CAS and primary identity" {
     const global = session.global_config.?.arena;
     const history = app.runtime.messages().len;
     try session.store.root.writeMode(cfg.file_name, "{}", true, 0o600);
-    try std.testing.expectError(error.AuthVersionConflict, choose(&session, .opencode_jev_free));
+    try std.testing.expectError(error.AuthVersionConflict, choose(&session, .{ .model = "reviewer/arbitrary/raw" }));
     try std.testing.expect(app.config.arena == arena and session.global_config.?.arena == global);
-    try std.testing.expect(app.decision_client == null and app.config.value.registry.?.providers.len == 1);
+    try std.testing.expect(app.decision_client == null and app.config.value.registry.?.providers.len == 2);
     try std.testing.expectEqual(history, app.runtime.messages().len);
     try session.store.root.writeMode(cfg.file_name, initial, true, 0o600);
-    try choose(&session, .opencode_jev_free);
-    try std.testing.expect(session.connection().current().decision_jev_free);
+    try choose(&session, .{ .model = "reviewer/arbitrary/raw" });
+    try std.testing.expectEqualStrings("reviewer/arbitrary/raw", session.connection().current().decision_model.?);
     try std.testing.expect(app.client.authorization.ptr == auth);
     try std.testing.expect(app.client.config == &app.config.value and app.runtime.config == &app.config.value);
     const judge = app.decision_client.?;
-    try std.testing.expect(judge.calls == 0 and judge.key == null and judge.resolved == null);
-    const provider = app.config.value.registry.?.find("opencode-jev").?;
-    try std.testing.expect(provider.connection.api_key == null and provider.connection.api_key_env.len == 0);
-    try std.testing.expect(provider.models.len == 0 and provider.connection.kind == null);
+    try std.testing.expect(judge.calls == 0 and judge.native != null and judge.resolved == null);
+    try std.testing.expectEqualStrings("fake-native-own-key", judge.key.?);
+    const provider = app.config.value.registry.?.find("reviewer").?;
+    try std.testing.expect(provider.patchFor("arbitrary/raw").?.protocol == .systemone);
+    try std.testing.expect(provider.models.len == 1 and provider.connection.kind == null);
     const saved = try read(home, cfg.file_name);
     defer a.free(saved);
     var parsed = try cfg.parse(a, saved);
     defer cfg.release(&parsed);
-    try std.testing.expect(profiles.selected(parsed.value));
+    try std.testing.expect(parsed.value.decisionActive());
     try std.testing.expectEqualStrings("route/first", parsed.value.registry.?.default);
     try std.testing.expectEqualStrings("fake-owned-only", parsed.value.registry.?.find("route").?.connection.api_key.?);
     var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer restarted.deinit();
-    try std.testing.expect(restarted.connection().current().decision_jev_free);
-    try std.testing.expect(restarted.app.?.decision_client.?.key == null);
-    // Custom login persists only the native alias; reselect loads the key.
+    try std.testing.expectEqualStrings("reviewer/arbitrary/raw", restarted.connection().current().decision_model.?);
+    try std.testing.expectEqualStrings("fake-native-own-key", restarted.app.?.decision_client.?.key.?);
+    // Explicit reselection loads only the independent reviewer's latest key.
     var credentials = try cfg.clone(a, session.global_config.?.value);
     defer cfg.release(&credentials);
-    try cfg.setRegistryCredential(credentials.arena.allocator(), &credentials.value, "opencode-jev", "fake-native-own-key");
+    try cfg.setRegistryCredential(credentials.arena.allocator(), &credentials.value, "reviewer", "fake-native-rotated");
     try session.store.save(credentials.value);
     std.mem.swap(std.json.Parsed(cfg.Config), &session.global_config.?, &credentials);
     try toggle(&session, .low_price_input, false);
-    try std.testing.expect(app.decision_client.? == judge and judge.key == null);
-    try choose(&session, .opencode_jev_free);
-    try std.testing.expectEqualStrings("fake-native-own-key", app.decision_client.?.key.?);
+    try std.testing.expect(app.decision_client.? == judge);
+    try std.testing.expectEqualStrings("fake-native-own-key", judge.key.?);
+    try choose(&session, .{ .model = "reviewer/arbitrary/raw" });
+    try std.testing.expectEqualStrings("fake-native-rotated", app.decision_client.?.key.?);
     try std.testing.expect(app.decision_client.?.calls == 0 and app.client.authorization.ptr == auth);
     app.decision_client.?.native.?.poisoned = true;
-    try std.testing.expectError(error.CleanupFailed, choose(&session, .opencode_jev_free));
+    try std.testing.expectError(error.CleanupFailed, choose(&session, .{ .model = "reviewer/arbitrary/raw" }));
     try std.testing.expectError(error.CleanupFailed, toggle(&session, .low_price_input, true));
     app.decision_client.?.native.?.poisoned = false;
     try choose(&session, .off);
-    try std.testing.expect(!session.connection().current().decision_jev_free and app.decision_client == null);
+    try std.testing.expect(!session.connection().current().decision_enabled and app.decision_client == null);
 }
 
 test "Decision pending selection owns active and declaration after save" {
@@ -78,7 +80,7 @@ test "Decision pending selection owns active and declaration after save" {
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
     const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
-    var declaration = try cfg.parse(a, plain);
+    var declaration = try cfg.parse(a, native_declared);
     defer cfg.release(&declaration);
     try cfg.setRegistryCredential(declaration.arena.allocator(), &declaration.value, "route", "fake-unused");
     // Remove the primary key without ever consulting a real HOME.
@@ -96,8 +98,8 @@ test "Decision pending selection owns active and declaration after save" {
     var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
     try std.testing.expect(session.app == null);
-    try choose(&session, .opencode_jev_free);
-    try std.testing.expect(session.app == null and profiles.selected(session.pending.?.value));
+    try choose(&session, .{ .model = "reviewer/arbitrary/raw" });
+    try std.testing.expect(session.app == null and session.pending.?.value.decisionActive());
     try std.testing.expect(session.pending.?.arena != session.global_config.?.arena);
     try std.testing.expectEqualStrings("first", session.pending.?.value.model.name);
     try choose(&session, .off);
@@ -105,36 +107,20 @@ test "Decision pending selection owns active and declaration after save" {
     try std.testing.expectEqualStrings("first", session.pending_base_model.?.name);
 }
 
-test "Decision pure provider exact selection ambiguity aliases and bounds" {
-    var parsed = try cfg.parse(a, plain);
+test "Decision pure editing preserves exact declared provider identity without synthesis" {
+    var parsed = try cfg.parse(a, native_declared);
     defer cfg.release(&parsed);
     const arena = parsed.arena.allocator();
-    var providers: [16]cfg.NamedProvider = undefined;
-    providers[0] = parsed.value.registry.?.providers[0];
-    providers[1] = .{ .name = "opencode-jev", .connection = .{ .base_url = "https://proxy.invalid/v1", .kind = .opencode_zen } };
-    parsed.value.registry.?.providers = providers[0..2];
-    try std.testing.expect(try profiles.apply(arena, &parsed.value, .opencode_jev_free));
-    try std.testing.expectEqualStrings("opencode-jev-1/jev-1.13-free", parsed.value.decision.?.model);
-    const native = parsed.value.registry.?.providers[2];
-    providers[2] = native;
-    providers[3] = .{ .name = "second", .connection = .{ .base_url = profiles.native_url ++ "/", .api_key_env = "OWN_KEY" } };
-    parsed.value.registry.?.providers = providers[0..4];
-    // The referenced exact native provider wins even with multiple accounts.
-    try std.testing.expect(try profiles.apply(arena, &parsed.value, .opencode_jev_free));
-    try std.testing.expectEqualStrings("opencode-jev-1/jev-1.13-free", parsed.value.decision.?.model);
-    parsed.value.decision = null;
-    try std.testing.expectError(error.AmbiguousDecisionProvider, profiles.apply(arena, &parsed.value, .opencode_jev_free));
-    providers[2] = providers[3];
-    parsed.value.registry.?.providers = providers[0..3];
-    try std.testing.expect(try profiles.apply(arena, &parsed.value, .opencode_jev_free));
-    try std.testing.expectEqualStrings("second/jev-1.13-free", parsed.value.decision.?.model);
-    try std.testing.expectEqualStrings("OWN_KEY", parsed.value.registry.?.find("second").?.connection.api_key_env);
-    parsed.value.decision.?.backend = .model;
-    try std.testing.expect(!profiles.selected(parsed.value));
-    parsed.value.decision = null;
-    for (2..16) |i| providers[i] = .{ .name = try std.fmt.allocPrint(arena, "p{d}", .{i}), .connection = .{ .base_url = "https://fixture.invalid/v1" } };
-    parsed.value.registry.?.providers = &providers;
-    try std.testing.expectError(error.TooManyProviders, profiles.apply(arena, &parsed.value, .opencode_jev_free));
+    const providers = parsed.value.registry.?.providers;
+    try std.testing.expect(try profiles.apply(arena, &parsed.value, .{ .model = "reviewer/arbitrary/raw" }));
+    try std.testing.expectEqualStrings("reviewer/arbitrary/raw", parsed.value.decision.?.model);
+    try std.testing.expect(parsed.value.registry.?.providers.ptr == providers.ptr);
+    try std.testing.expectEqual(@as(usize, 2), providers.len);
+    try std.testing.expectError(error.UnknownProvider, profiles.apply(arena, &parsed.value, .{ .model = "Reviewer/arbitrary/raw" }));
+    try std.testing.expectEqualStrings("reviewer/arbitrary/raw", parsed.value.decision.?.model);
+    try std.testing.expect(try profiles.apply(arena, &parsed.value, .off));
+    try std.testing.expect(!parsed.value.decisionActive());
+    try std.testing.expectEqualStrings("reviewer/arbitrary/raw", parsed.value.decision.?.model);
 }
 
 const std = @import("std");
@@ -147,6 +133,9 @@ const a = std.testing.allocator;
 const io = std.testing.io;
 const plain =
     \\{"llm":{"default":"route/first","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-owned-only","models":{"first":{"protocol":"chat","context_tokens":65536},"second":{"protocol":"chat","context_tokens":131072}}}}}}
+;
+const native_declared =
+    \\{"llm":{"default":"route/first","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-owned-only","models":{"first":{"protocol":"chat","context_tokens":65536}}},"reviewer":{"base_url":"https://opencode.ai/inference/systemone/v1","api_key":"fake-native-own-key","models":{"arbitrary/raw":{"protocol":"systemone"}}}}}}
 ;
 const reviewed =
     \\{"llm":{"default":"route/first","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-owned-only","models":{"first":{"protocol":"anthropic","context_tokens":65536},"judge":{"protocol":"chat","context_tokens":32768}}}}},"decision":{"model":"route/judge"}}

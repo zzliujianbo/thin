@@ -170,7 +170,7 @@ test "proxy: actual SystemOne and generic judge identities independent of primar
     var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });
     defer backend.deinit();
     const a = t.allocator;
-    for ([_][]const u8{ "systemone", "model" }) |decision_backend| {
+    for ([_][]const u8{ "systemone", "chat" }) |decision_protocol| {
         for ([_]bool{ false, true }) |listed| {
             var env = try transportEnv(a, true);
             defer env.deinit();
@@ -180,8 +180,8 @@ test "proxy: actual SystemOne and generic judge identities independent of primar
             }
             const base = if (listed) try origin("THIN_PROXY_HTTPS", "https", "127.0.0.1") else try origin("THIN_PROXY_HTTP", "http", "127.0.0.1");
             const text = try std.fmt.allocPrint(a,
-                \\{{"llm":{{"default":"main/chat","providers":{{"main":{{"base_url":"{s}/unused","api_key":"fake-primary","models":{{"chat":{{"protocol":"chat","context_tokens":32768}}}}}},"aux":{{"base_url":"{s}/{s}-{s}","api_key":"fake-proxy-key","models":{{"jev":{{"protocol":"chat","context_tokens":32768}}}}}}}}}},"decision":{{"model":"aux/jev","backend":"{s}","request_timeout_ms":3000}},"proxy":{{"address":"127.0.0.1","port":{d},"models":["{s}"]}}}}
-            , .{ try origin("THIN_PROXY_HTTP", "http", "127.0.0.1"), base, if (std.mem.eql(u8, decision_backend, "systemone")) "decision" else "judge", if (listed) "listed" else "direct", decision_backend, try proxyPort(false), if (listed) "aux/jev" else "main/chat" });
+                \\{{"llm":{{"default":"main/chat","providers":{{"main":{{"base_url":"{s}/unused","api_key":"fake-primary","models":{{"chat":{{"protocol":"chat","context_tokens":32768}}}}}},"aux":{{"base_url":"{s}/{s}-{s}","api_key":"fake-proxy-key","models":{{"jev":{{"protocol":"{s}","context_tokens":32768}}}}}}}}}},"decision":{{"model":"aux/jev"}},"limits":{{"request_timeout_ms":3000}},"proxy":{{"address":"127.0.0.1","port":{d},"models":["{s}"]}}}}
+            , .{ try origin("THIN_PROXY_HTTP", "http", "127.0.0.1"), base, if (std.mem.eql(u8, decision_protocol, "systemone")) "decision" else "judge", if (listed) "listed" else "direct", decision_protocol, try proxyPort(false), if (listed) "aux/jev" else "main/chat" });
             defer a.free(text);
             var parsed = try cfg.parse(a, text);
             defer cfg.release(&parsed);
@@ -192,7 +192,10 @@ test "proxy: actual SystemOne and generic judge identities independent of primar
             defer decision.freeOutput(a, out);
             try t.expect(out.memory_write);
             try t.expect(client.calls == 1);
-            try t.expect((client.resolved == null) == std.mem.eql(u8, decision_backend, "systemone"));
+            const resolved = client.resolved orelse return error.MissingDecisionResolution;
+            try t.expect((resolved.client == null) == std.mem.eql(u8, decision_protocol, "systemone"));
+            try t.expect((resolved.config.value.model.protocol == .systemone) == std.mem.eql(u8, decision_protocol, "systemone"));
+            try t.expectEqual(@as(u32, 3000), resolved.config.value.limits.request_timeout_ms);
             try t.expectEqualStrings("main/chat", client.source.value.registry.?.default);
         }
     }

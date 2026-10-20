@@ -4,7 +4,7 @@
 const std = @import("std");
 
 /// auto probes only Responses/Chat. Anthropic Messages is selected explicitly.
-pub const Protocol = enum { auto, chat, responses, anthropic };
+pub const Protocol = enum { auto, chat, responses, anthropic, systemone };
 /// 请求用途：normal 为普通对话，summary 为上下文压缩时生成滚动摘要。
 pub const Purpose = enum { normal, summary };
 /// 消息角色；context 为滚动摘要等注入的上下文，不是用户真实输入。

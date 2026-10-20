@@ -6,11 +6,11 @@ const Effort = @import("../presentation/activity.zig").ReasoningEffort;
 
 pub fn preference(config: cfg.Config) ?Effort {
     if (config.registry) |registry| if (registry.reasoning_effort) |name|
-        return Effort.fromName(name).canonical();
+        return Effort.fromName(name);
     const configured = Effort.fromName(config.model.reasoning_effort);
     // A fixed custom wire option is not a logical default to reinterpret.
     if (configured == .unknown) return null;
-    return if (configured.name() != null) configured.canonical() else thinking.default_level;
+    return if (configured.name() != null) configured else thinking.default_level;
 }
 
 pub fn apply(config: *cfg.Config, wanted: ?Effort, global_preference: bool) ?[]const u8 {
@@ -51,4 +51,8 @@ test "global logical default overrides configured level only with capability aut
     parsed.value.model.reasoning_effort = "provider-custom";
     _ = applyConfigured(&parsed.value);
     try std.testing.expectEqualStrings("provider-custom", parsed.value.model.reasoning_effort.?);
+    parsed.value.model.reasoning_effort = "none";
+    try std.testing.expect(preference(parsed.value) == null);
+    _ = applyConfigured(&parsed.value);
+    try std.testing.expectEqualStrings("none", parsed.value.model.reasoning_effort.?);
 }

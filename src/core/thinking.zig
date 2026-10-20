@@ -13,7 +13,7 @@ pub const LevelMap = struct {
     max: ?[]const u8 = null,
 
     pub fn get(self: LevelMap, effort: activity.ReasoningEffort) ?[]const u8 {
-        return switch (effort.canonical()) {
+        return switch (effort) {
             .off => self.off,
             .minimal => self.minimal,
             .low => self.low,
@@ -101,7 +101,7 @@ test "project default uses medium adjusted to known capabilities and explicit lo
     const standard = resolve("https://api.openai.com/v1", "gpt-5.2", .{ .map = .{ .off = "none", .low = "low", .medium = "medium", .high = "high" } });
     try t.expectEqual(activity.ReasoningEffort.medium, standard.defaultEffort(null));
     try t.expectEqual(activity.ReasoningEffort.low, standard.defaultEffort("low"));
-    try t.expectEqual(activity.ReasoningEffort.off, standard.defaultEffort("none"));
+    try t.expectEqual(activity.ReasoningEffort.off, standard.defaultEffort("off"));
     try t.expectEqual(activity.ReasoningEffort.high, resolve("https://api.deepseek.com", "deepseek-flash", .{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } }).defaultEffort(null));
     try t.expectEqual(activity.ReasoningEffort.off, resolve("https://api.openai.com/v1", "gpt-4o", .{ .map = .{ .off = "none" } }).defaultEffort(null));
     const unknown = resolve("https://proxy.invalid", "custom", null);
@@ -128,6 +128,8 @@ test "no builtin capabilities exist for official endpoints or recognized model n
     try t.expectEqualStrings("low", cap.effective("minimal").?);
     try t.expectEqualStrings("xhigh", cap.effective("max").?);
     try t.expectEqualStrings("none", cap.wire("none").effort.?);
+    try t.expectEqualStrings("none", cap.wire("off").effort.?);
+    try t.expectEqual(activity.ReasoningEffort.high, cap.defaultEffort("none"));
     try t.expect(cap.wire(null).effort == null and cap.wire(null).thinking == null);
     const unknown = resolve("https://api.openai.com/v1", "gpt-4o", null);
     try t.expect(!unknown.known);
@@ -155,7 +157,9 @@ test "deepseek wire and custom maps preserve unspecified validate bounded string
     try t.expect(!pro.levels.contains(.low));
     const custom = resolve("https://proxy", "custom", .{ .map = .{ .off = "disabled", .high = "intensive" } });
     try t.expectEqualStrings("intensive", custom.wire("low").effort.?);
-    try t.expectEqualStrings("disabled", custom.wire("none").effort.?);
+    try t.expectEqualStrings("disabled", custom.wire("off").effort.?);
+    // Raw model wire options are opaque, not logical off aliases.
+    try t.expectEqualStrings("none", custom.wire("none").effort.?);
     try t.expectError(error.InvalidReasoningMap, (Declaration{ .map = .{} }).validate());
     try t.expectError(error.InvalidReasoningMap, (Declaration{ .format = .deepseek, .map = .{ .high = "high" } }).validate());
     const too_long: [129]u8 = @splat('x');

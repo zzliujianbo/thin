@@ -282,11 +282,12 @@ fn encodeWire(a: std.mem.Allocator, runtime: *r.Runtime, protocol: p.Protocol) !
         .chat => chat.encode(a, req),
         .responses => responses.encode(a, req),
         .anthropic => anthropic.encode(a, req),
+        .systemone => error.SystemOneNotChatModel,
         .auto => unreachable,
     };
 }
 
-test "environment platform format roundtrip and legacy unknown are distinct" {
+test "environment platform format roundtrip rejects old three field prefaces" {
     const a = std.testing.allocator;
     var snap = baseSnap("");
     snap.os = .linux;
@@ -302,9 +303,7 @@ test "environment platform format roundtrip and legacy unknown are distinct" {
         try std.testing.expect(parsed.os == .linux and parsed.arch == .x86_64);
     }
     const legacy = "environment\ncwd: /proj/cwd\nshell: /bin/zsh\nproject_root: /proj\n";
-    const parsed = session_context.parseEnvironment(legacy).?;
-    try std.testing.expect(parsed.os == null and parsed.arch == null);
-    try std.testing.expectError(error.InvalidSessionContext, session_context.formatEnvironment(a, parsed, false));
+    try std.testing.expect(session_context.parseEnvironment(legacy) == null);
     for ([_][]const u8{ "os: linux\n", "arch: x86_64\n", "os: unknown-os\narch: x86_64\n", "os: linux\narch: unknown-cpu\n", "os: linux\narch: x86_64\nextra: data\n", "os: linux\narch: x86_64" }) |tail| {
         const invalid = try std.mem.concat(a, u8, &.{ legacy, tail });
         defer a.free(invalid);
@@ -391,7 +390,7 @@ test "platform changes append once without rewriting prior context or main syste
     try std.testing.expectEqualStrings(system, runtime.system);
 }
 
-test "legacy environment restore appends current platform once and keeps archive system" {
+test "changed environment restore appends current platform once and keeps archive system" {
     var config: cfg.Config = .{
         .limits = .{ .low_price_input = false },
         .provider = .{ .base_url = "http://localhost" },
@@ -400,18 +399,18 @@ test "legacy environment restore appends current platform once and keeps archive
     var box = Box{ .snap = baseSnap("") };
     var runtime = try openRuntime(&config, &box);
     defer runtime.deinit();
-    const legacy = "environment\ncwd: /proj/cwd\nshell: /bin/zsh\nproject_root: /proj\n";
+    const archived = "environment\ncwd: /proj/cwd\nshell: /bin/zsh\nproject_root: /proj\nos: windows\narch: aarch64\n";
     var state = try runtime.checkpoint();
     state.system = "archived-system-must-stay";
     state.messages = &.{
-        .{ .role = .context, .blocks = &.{.{ .text = legacy }} },
+        .{ .role = .context, .blocks = &.{.{ .text = archived }} },
         .{ .role = .user, .blocks = &.{.{ .text = "earlier" }} },
         .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} },
     };
     try runtime.restoreCheckpoint(state);
     var cancel: p.Cancellation = .{};
     try std.testing.expectEqual(r.Status.success, (try runtime.run("next", &cancel)).status);
-    try std.testing.expectEqualStrings(legacy, textOf(runtime.messages()[0]));
+    try std.testing.expectEqualStrings(archived, textOf(runtime.messages()[0]));
     try std.testing.expect(std.mem.startsWith(u8, textOf(runtime.messages()[3]), "environment update\n"));
     const parsed = session_context.parseEnvironment(textOf(runtime.messages()[3])).?;
     try std.testing.expect(parsed.os == box.snap.os and parsed.arch == box.snap.arch);

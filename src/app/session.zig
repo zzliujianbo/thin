@@ -269,6 +269,10 @@ pub const Session = struct {
             self.settings_notice = "Session is open elsewhere or not writable; read-only history";
             return self;
         }
+        if (config.model.protocol == .systemone) {
+            self.settings_notice = "SystemOne is decision-only; history available, select a chat model";
+            return self;
+        }
         if (config.selection_pending) return self;
         const key = cfg.resolveApiKey(a, self.pending.?.value, environ) catch |err| {
             if (err == error.ApiKeyNotFound or err == error.InvalidApiKey) {
@@ -568,9 +572,11 @@ pub const Session = struct {
         }
         for (self.display_models, 0..) |model, index| {
             self.display_origins[index] = false;
-            self.display_disabled[index] = false;
+            self.display_disabled[index] = model.protocol == .systemone;
             if (config.registry) |registry| {
-                self.display_disabled[index] = model.context_tokens == 0;
+                // Resolver leaves undeclared/unknown protocols at zero context;
+                // an explicitly declared auto remains valid for primary Chat/Responses probing.
+                self.display_disabled[index] = model.protocol == .systemone or model.context_tokens == 0;
                 if (std.mem.findScalar(u8, model.name, '/')) |slash| {
                     if (registry.find(model.name[0..slash])) |provider| {
                         const raw_id = model.name[slash + 1 ..];
@@ -612,13 +618,10 @@ pub const Session = struct {
             // the global switch. Flat/unknown/pending models have no marker.
             .low_price_input = self.app != null and !unselected and !config.selection_pending and config.limits.low_price_input and config.model.input_price_threshold != null,
             .limits = config.limits,
-            .decision_timeout_ms = if (config.decision) |decision| decision.request_timeout_ms else null,
             .low_price_input_enabled = config.limits.low_price_input,
             .decision_enabled = config.decisionActive(),
-            .decision_configured = config.decision != null,
-            .decision_jev_free = decision_selection.selected(self.global_config.?.value),
             .decision_models = self.display_decision_models,
-            .decision_model = if (config.decision) |value| (if (value.enabled and value.backend == .model) value.model else null) else null,
+            .decision_model = if (config.decision) |value| (if (value.enabled) value.model else null) else null,
             .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .pending_default_effort = if (self.app != null and self.initial_default_pending and config.model.reasoning_effort == null) self.preferred_effort else null,
@@ -635,14 +638,6 @@ pub const Session = struct {
 
     fn officialCapacity(self: *const Session, entry: catalog.Entry) ?u32 {
         return metadata.capacityFor(&self.metadata_cache, entry);
-    }
-
-    fn metadataIndex(config: cfg.Config) ?usize {
-        return metadata.reasoningIndex(config);
-    }
-
-    fn metadataDeclaration(self: *const Session, config: cfg.Config, index: usize) ?thinking.Declaration {
-        return metadata.reasoningDeclaration(&self.metadata_cache, config, index);
     }
 
     fn applyReasoningMetadata(self: *const Session, config: *cfg.Config) void {
@@ -710,7 +705,6 @@ pub const Session = struct {
         // automatic retry on every start, and concurrent sessions share the claim.
         const claim = try metadata.claimAt(&self.store.root, requested | metadata.dev_bit, manual, self.metadataNow(), self.refreshPolicy());
         self.metadata_cache.refresh = claim.cache.refresh;
-        self.metadata_cache.attempted = claim.cache.attempted;
         job.requested = claim.mask;
         job.generations = claim.generations;
         for (ProviderId.all) |id| {
@@ -788,7 +782,6 @@ pub const Session = struct {
         job.future = try std.Io.concurrent(self.io, MetadataJob.run, .{job});
         job.manual = true;
         self.metadata_cache.refresh = claim.cache.refresh;
-        self.metadata_cache.attempted = claim.cache.attempted;
         self.metadata_login_pending &= ~claim.mask;
     }
 
@@ -1015,11 +1008,13 @@ pub const Session = struct {
     /// reviewer window must not become unusable due to the main safety margin.
     fn buildDecisionModels(self: *Session, global: cfg.Config) ![]cfg.Model {
         var independent = global;
-        independent.limits = (global.decision orelse cfg.DecisionConfig{ .model = "" }).modelLimits();
+        independent.limits = (global.decision orelse cfg.DecisionConfig{ .model = "" }).modelLimits(global.limits.request_timeout_ms);
         const models = try self.buildModels(independent, independent);
         var count: usize = 0;
         for (models) |model| {
-            if (decision_selection.genericCandidate(independent, model)) {
+            const ref = cfg.splitDefault(model.name) catch unreachable;
+            const provider = independent.registry.?.find(ref.provider).?;
+            if (decision_selection.genericCandidate(independent, model) and self.hasLocalCredential(provider.connection)) {
                 models[count] = model;
                 count += 1;
             } else self.freeDisplayModel(model);
@@ -1159,7 +1154,11 @@ pub const Session = struct {
                 const provider = registry.find(ref.provider) orelse return error.UnknownProvider;
                 if (!self.hasLocalCredential(provider.connection)) return error.ApiKeyNotFound;
                 var found = false;
-                for (self.display_decision_models) |model| {
+                // Rebuild membership from current metadata/declaration and
+                // credentials rather than trusting a stale published row.
+                const candidates = try self.buildDecisionModels(self.global_config.?.value);
+                defer self.freeDisplayModels(candidates);
+                for (candidates) |model| {
                     if (std.mem.eql(u8, name, model.name) and decision_selection.genericCandidate(self.global_config.?.value, model)) {
                         found = true;
                         break;
@@ -1173,7 +1172,6 @@ pub const Session = struct {
         defer cfg.release(&declaration);
         if (!try decision_selection.apply(declaration.arena.allocator(), &declaration.value, switch (choice) {
             .off => .off,
-            .opencode_jev_free => .opencode_jev_free,
             .model => |name| .{ .model = name },
         })) return;
         try self.persistSettings(&declaration, true);
@@ -1210,6 +1208,12 @@ pub const Session = struct {
 
     fn selectRegistryModel(self: *Session, selector: []const u8) !void {
         const previous = self.mutableConfig().*;
+        // Even a frozen historical SystemOne selection is display-only. Never
+        // let the retained-selection shortcut activate it as primary chat.
+        if (previous.model.protocol == .systemone and
+            (std.mem.eql(u8, selector, previous.model.name) or
+                (self.selected_alias != null and std.mem.eql(u8, selector, self.selected_alias.?))))
+            return error.SystemOneNotChatModel;
         const raw_current = std.mem.eql(u8, selector, previous.model.name);
         const alias_current = self.selected_alias != null and std.mem.eql(u8, selector, self.selected_alias.?);
         const revision_changed = if (ProviderId.fromUrl(previous.provider.base_url)) |id|
@@ -1261,6 +1265,7 @@ pub const Session = struct {
             };
         } else {
             const resolved = try model_resolver.resolve(owned.arena.allocator(), owned.value, &self.metadata_cache, provider_name, raw_id, false);
+            if (resolved.model.protocol == .systemone) return error.SystemOneNotChatModel;
             model_resolver.apply(&owned.value, resolved);
             context_official = resolved.context_official;
             wanted = reasoning_defaults.preference(owned.value);
@@ -1276,6 +1281,7 @@ pub const Session = struct {
         var owned = parsed;
         var consumed = false;
         defer if (!consumed) cfg.release(&owned);
+        if (owned.value.model.protocol == .systemone) return error.SystemOneNotChatModel;
         const alias = try self.aliasFor(owned.value);
         errdefer if (alias) |value| self.allocator.free(value);
         const pending_selection = if (self.loaded_checkpoint != null) try selections.capture(owned.value) else null;
@@ -1533,19 +1539,18 @@ pub const Session = struct {
                 return error.ThinkingCapabilitiesLoading;
             return error.ThinkingCapabilitiesUnknown;
         };
-        if (next != current_effort.canonical()) try setEffort(raw, next);
+        if (next != current_effort) try setEffort(raw, next);
         return next;
     }
 
     fn setEffort(raw: *anyopaque, effort: presentation.ReasoningEffort) !void {
         const self: *Session = @ptrCast(@alignCast(raw));
         try self.guardSelection();
-        const canonical = effort.canonical();
-        const name = canonical.name() orelse return error.InvalidReasoningEffort;
+        const name = effort.name() orelse return error.InvalidReasoningEffort;
         const config = self.mutableConfig();
         var candidate = self.effortCandidate(config.*);
         const capabilities = self.capabilitiesFor(candidate);
-        if (!capabilities.levels.contains(canonical)) return error.UnsupportedReasoningEffort;
+        if (!capabilities.levels.contains(effort)) return error.UnsupportedReasoningEffort;
         candidate.model.reasoning_effort = name;
         try cfg.validate(candidate);
         // Cache storage is movable and later refreshes can replace it. Own any
@@ -1578,7 +1583,7 @@ pub const Session = struct {
         }
         if (self.pending != null and self.pending_base_model == null) self.pending_base_model = config.model;
         config.model = candidate.model;
-        self.preferred_effort = canonical;
+        self.preferred_effort = effort;
         self.initial_default_pending = false;
         self.settings_error = null;
         self.settings_notice = null;
@@ -1626,7 +1631,7 @@ test "global defaults distinguish machine prefixes from summarized or assistant 
 fn persistedEffortForTest(session: *Session) !presentation.ReasoningEffort {
     var parsed = try session.store.loadExisting();
     defer cfg.release(&parsed);
-    return presentation.ReasoningEffort.fromName(parsed.value.registry.?.reasoning_effort orelse "medium").canonical();
+    return presentation.ReasoningEffort.fromName(parsed.value.registry.?.reasoning_effort orelse "medium");
 }
 
 fn setGlobalEffortForTest(session: *Session, effort: presentation.ReasoningEffort) !void {
@@ -1738,8 +1743,7 @@ test "empty HOME hides placeholder selection but retains initialized defaults" {
     try std.testing.expectEqual(@as(u32, 0), state.context_limit);
     // No active priced model: the UI flag is not the global policy toggle.
     try std.testing.expect(!state.low_price_input);
-    try std.testing.expect(state.model_providers != null);
-    try std.testing.expectEqual(@as(usize, 0), state.model_providers.?.len);
+    try std.testing.expectEqual(@as(usize, 0), state.model_providers.len);
     try std.testing.expectEqualStrings("deepseek-flash", session.pending.?.value.model.name);
     const disk = try session.store.loadExisting();
     defer disk.deinit();
@@ -1758,7 +1762,7 @@ test "provider menu preserves local credential aliases and actual endpoint ident
     var session = try fixture.open(.{ .logging = false });
     defer session.deinit();
     const state = session.connection().current();
-    const providers = state.model_providers.?;
+    const providers = state.model_providers;
     try std.testing.expectEqual(@as(usize, 3), providers.len);
     var seen: u8 = 0;
     for (providers) |provider| {
@@ -1777,7 +1781,7 @@ test "provider menu preserves local credential aliases and actual endpoint ident
     // Fresh publication reflects local environment changes without rebuilding
     // model candidates or treating a kind hint as official identity.
     try fixture.env.put("MENU_KEY", "");
-    try std.testing.expectEqual(@as(usize, 2), session.connection().current().model_providers.?.len);
+    try std.testing.expectEqual(@as(usize, 2), session.connection().current().model_providers.len);
     try std.testing.expectEqual(metadata.bit(.deepseek), session.configuredMask(session.global_config.?.value));
     const proxy = session.global_config.?.value.registry.?.find("proxy-alias").?;
     try std.testing.expect(session.hasLocalCredential(proxy.connection));
@@ -1794,15 +1798,15 @@ test "new llm pending startup and custom login activate without inference" {
     try std.testing.expect(session.app == null);
     try std.testing.expectEqualStrings("", session.connection().current().model);
     try std.testing.expect(session.connection().current().selection_name == null);
-    try std.testing.expectEqual(@as(usize, 0), session.connection().current().model_providers.?.len);
+    try std.testing.expectEqual(@as(usize, 0), session.connection().current().model_providers.len);
     try std.testing.expectEqual(@as(usize, 0), Session.initialHistory(&session).len);
     try std.testing.expect(session.settings_notice != null);
     try session.connection().configure("fake-custom-key");
     try std.testing.expectEqualStrings("Bearer fake-custom-key", session.app.?.client.authorization);
     const logged_in = session.connection().current();
-    try std.testing.expectEqual(@as(usize, 1), logged_in.model_providers.?.len);
-    try std.testing.expectEqualStrings("archive", logged_in.model_providers.?[0].name);
-    try std.testing.expect(logged_in.model_providers.?[0].allow_custom);
+    try std.testing.expectEqual(@as(usize, 1), logged_in.model_providers.len);
+    try std.testing.expectEqualStrings("archive", logged_in.model_providers[0].name);
+    try std.testing.expect(logged_in.model_providers[0].allow_custom);
     try std.testing.expectEqualStrings("archive/saved", logged_in.selection_name.?);
     try std.testing.expectEqualStrings("archive/saved", session.global_config.?.value.registry.?.default);
     try std.testing.expect(!session.app.?.journal.started);
@@ -2315,9 +2319,12 @@ const MetadataFixture = struct {
         _ = calls.fetchAdd(1, .monotonic);
         if (key == null or !std.mem.startsWith(u8, key.?, "fake-")) return error.InvalidFixtureKey;
         var values: metadata.Listing = .{};
-        for (catalog.entries, 0..) |entry, index| if (entry.provider == id) {
-            values.tokens[index] = 1048576;
-            values.available[index] = true;
+        values.directory_mask = metadata.bit(id);
+        for (catalog.entries) |entry| if (entry.provider == id) {
+            const row = try values.directory.upsert(id, entry.model.name);
+            row.tokens = 1048576;
+            row.available = true;
+            row.protocol = entry.model.protocol;
         };
         return values;
     }
@@ -2371,9 +2378,8 @@ const LayeredMetadataFixture = struct {
     fn devFail(_: std.mem.Allocator, _: std.Io) !metadata.Listing {
         return error.FixtureOffline;
     }
-    fn index(selector: []const u8) usize {
-        for (catalog.entries, 0..) |entry, i| if (std.mem.eql(u8, entry.selector, selector)) return i;
-        unreachable;
+    fn row(records: *const directory.Directory, provider: ProviderId, raw_id: []const u8) directory.Record {
+        return records.rows[records.find(provider, raw_id).?];
     }
 };
 
@@ -2717,10 +2723,12 @@ test "manual metadata refresh filters obsolete credentials even with automatic r
     session.metadata_dev_fetch = MetadataFixture.dev;
     MetadataFixture.calls.store(0, .monotonic);
     try session.connection().configureProvider(.deepseek, "fake-stale-first-key");
-    const index = LayeredMetadataFixture.index("deepseek/deepseek-flash");
-    var previous: metadata.Listing = .{};
-    previous.tokens[index] = 65536;
-    previous.reasoning[index] = .{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } };
+    var previous: metadata.Listing = .{ .directory_mask = metadata.bit(.deepseek) };
+    const previous_row = try previous.directory.upsert(.deepseek, "deepseek-flash");
+    previous_row.available = true;
+    previous_row.protocol = .chat;
+    previous_row.tokens = 65536;
+    previous_row.reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } });
     session.metadata_cache = try metadata.commitAt(&session.store.root, metadata.bit(.deepseek), previous, 1000);
     session.metadata_wall_ms = 2000;
     try Session.refreshModels(&session);
@@ -2729,9 +2737,10 @@ test "manual metadata refresh filters obsolete credentials even with automatic r
     try std.testing.expect(session.metadata_login_pending == 0); // No automatic re-query permission.
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expect(session.metadata_job == null);
-    try std.testing.expectEqual(@as(?u32, 65536), session.metadata_cache.tokens[index]);
-    try std.testing.expectEqualStrings("high", session.metadata_cache.reasoning[index].?.map.high.?);
-    try std.testing.expectEqual(@as(?u32, 65536), (try metadata.load(&session.store.root)).tokens[index]);
+    try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&session.metadata_cache.directory, .deepseek, "deepseek-flash").tokens);
+    try std.testing.expectEqualStrings("high", LayeredMetadataFixture.row(&session.metadata_cache.directory, .deepseek, "deepseek-flash").reasoning.?.declaration().map.high.?);
+    const stale_disk = try metadata.load(&session.store.root);
+    try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&stale_disk.directory, .deepseek, "deepseek-flash").tokens);
     try std.testing.expectEqual(@as(?u64, 1000), session.metadata_cache.refresh[0].last_success_ms);
     try std.testing.expect(!session.metadata_cache.refresh[0].successful);
     try std.testing.expectEqual(@as(?u64, 2000), session.metadata_cache.refresh[3].last_success_ms);
@@ -2742,7 +2751,7 @@ test "manual metadata refresh filters obsolete credentials even with automatic r
     try Session.refreshModels(&session);
     MetadataFixture.finish(&session);
     try std.testing.expect(Session.pollModels(&session, true));
-    try std.testing.expectEqual(@as(?u32, 1048576), session.metadata_cache.tokens[index]);
+    try std.testing.expectEqual(@as(?u32, 1048576), LayeredMetadataFixture.row(&session.metadata_cache.directory, .deepseek, "deepseek-flash").tokens);
     try std.testing.expectEqual(@as(?u64, 2000), session.metadata_cache.refresh[0].last_success_ms);
     try std.testing.expect(session.metadata_cache.refresh[0].successful);
 }
@@ -2767,8 +2776,7 @@ test "models.dev completion survives a stalled official source and owner teardow
     try MetadataFixture.waitDone(session.io, &job.dev_done);
     try std.testing.expect(job.dev_future != null); // pollModels owns the actual join.
     try std.testing.expect(Session.pollModels(&session, true));
-    const index = LayeredMetadataFixture.index("opencode-go/claude-haiku-5-5");
-    try std.testing.expectEqualStrings("max", session.metadata_cache.dev_reasoning[index].?.map.max.?);
+    try std.testing.expectEqualStrings("max", LayeredMetadataFixture.row(&session.metadata_cache.directory, .opencode_go, "claude-haiku-5-5").dev_reasoning.?.declaration().map.max.?);
     try std.testing.expect(job.future != null);
     job.started_ms -= official_metadata_timeout_ms + 1;
     try std.testing.expect(Session.pollModels(&session, true));
@@ -2794,7 +2802,6 @@ test "official results publish while models.dev retains an independent longer de
     session.metadata_dev_fetch = LayeredMetadataFixture.devStall;
     LayeredMetadataFixture.official_effort.store(false, .release);
     try session.connection().configureProvider(.opencode_go, "fake-deadline-go");
-    const index = LayeredMetadataFixture.index("opencode-go/claude-haiku-5-5");
     const previous = try metadata.parseDev(a, @embedFile("models_dev_fixture.json"));
     session.metadata_cache = try metadata.commit(&session.store.root, 0, previous);
     try Session.refreshModels(&session);
@@ -2804,7 +2811,7 @@ test "official results publish while models.dev retains an independent longer de
     job.started_ms -= official_metadata_timeout_ms + 1;
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expect(session.metadata_job == job and job.dev_future != null);
-    try std.testing.expectEqual(@as(?u32, 65536), session.metadata_cache.tokens[index]);
+    try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&session.metadata_cache.directory, .opencode_go, "claude-haiku-5-5").tokens);
     for (job.keys) |key| try std.testing.expect(key == null);
     // Passing the old shared deadline does not cancel the public catalog.
     job.dev_started_ms -= official_metadata_timeout_ms + 1;
@@ -2814,15 +2821,15 @@ test "official results publish while models.dev retains an independent longer de
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expect(session.metadata_job == null);
     const saved = try metadata.load(&session.store.root);
-    try std.testing.expectEqual(@as(?u32, 65536), saved.tokens[index]);
-    try std.testing.expectEqualStrings("max", saved.dev_reasoning[index].?.map.max.?);
+    try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&saved.directory, .opencode_go, "claude-haiku-5-5").tokens);
+    try std.testing.expectEqualStrings("max", LayeredMetadataFixture.row(&saved.directory, .opencode_go, "claude-haiku-5-5").dev_reasoning.?.declaration().map.max.?);
     try std.testing.expect(!Session.pollModels(&session, true)); // No tight automatic retry loop.
     // A user retry can still complete after the cancelled catalog attempt.
     session.metadata_dev_fetch = LayeredMetadataFixture.dev;
     try Session.refreshModels(&session);
     MetadataFixture.finish(&session);
     try std.testing.expect(Session.pollModels(&session, true));
-    try std.testing.expectEqualStrings("max", session.metadata_cache.dev_reasoning[index].?.map.max.?);
+    try std.testing.expectEqualStrings("max", LayeredMetadataFixture.row(&session.metadata_cache.directory, .opencode_go, "claude-haiku-5-5").dev_reasoning.?.declaration().map.max.?);
 }
 
 test "login with new credentials refreshes official metadata without waiting for stalled models.dev" {
@@ -2856,8 +2863,7 @@ test "login with new credentials refreshes official metadata without waiting for
     try MetadataFixture.waitDone(session.io, &job.done);
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expect(job.future == null and job.dev_future != null);
-    const index = LayeredMetadataFixture.index("opencode-go/claude-haiku-5-5");
-    try std.testing.expectEqual(@as(?u32, 65536), session.metadata_cache.tokens[index]);
+    try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&session.metadata_cache.directory, .opencode_go, "claude-haiku-5-5").tokens);
     try session.connection().configureProvider(.opencode_go, "fake-rotated-go");
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expect(session.metadata_job == job and job.future != null);
@@ -2865,8 +2871,9 @@ test "login with new credentials refreshes official metadata without waiting for
     try std.testing.expect(job.dev_future != null); // Existing public download not restarted.
     try MetadataFixture.waitDone(session.io, &job.done);
     try std.testing.expect(Session.pollModels(&session, true));
-    try std.testing.expectEqual(@as(?u32, 131072), session.metadata_cache.tokens[index]);
-    try std.testing.expectEqual(@as(?u32, 131072), (try metadata.load(&session.store.root)).tokens[index]);
+    try std.testing.expectEqual(@as(?u32, 131072), LayeredMetadataFixture.row(&session.metadata_cache.directory, .opencode_go, "claude-haiku-5-5").tokens);
+    const rotated_disk = try metadata.load(&session.store.root);
+    try std.testing.expectEqual(@as(?u32, 131072), LayeredMetadataFixture.row(&rotated_disk.directory, .opencode_go, "claude-haiku-5-5").tokens);
     try std.testing.expect(job.dev_future != null and session.metadata_login_pending == 0);
     job.dev_started_ms -= models_dev_timeout_ms + 1;
     try std.testing.expect(Session.pollModels(&session, true));
@@ -3006,7 +3013,7 @@ test "manual refresh asynchronously discovers new IDs and preserves public proto
         picker.clear();
         try std.testing.expect(try picker.insert(selector, false));
         const latest = session.connection().current();
-        const choices = try picker.choicesWithDisabled(a, latest.selection_name orelse latest.model, latest.context_limit, latest.models, latest.model_disabled);
+        const choices = try picker.choicesWithProviders(a, latest.selection_name orelse latest.model, latest.context_limit, latest.models, latest.model_disabled, latest.model_providers);
         defer a.free(choices);
         try std.testing.expectEqual(@as(usize, 1), choices.len);
         try std.testing.expect(!choices[0].disabled);
@@ -3047,7 +3054,6 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     try std.testing.expectEqualStrings(active_before.name, session.app.?.config.value.model.name);
     try std.testing.expectEqual(active_before.context_tokens, session.app.?.config.value.model.context_tokens);
     try std.testing.expectEqual(active_before.output_tokens, session.app.?.config.value.model.output_tokens);
-    const index = LayeredMetadataFixture.index("opencode-go/claude-haiku-5-5");
     for (session.connection().current().models) |model| {
         if (std.mem.eql(u8, model.name, "opencode-go/claude-haiku-5-5")) {
             try std.testing.expectEqual(thinking.Format.anthropic, model.reasoning.?.format);
@@ -3059,7 +3065,7 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
         }
     } else return error.MissingModelPickerRow;
     const disk = try metadata.load(&session.store.root);
-    try std.testing.expectEqualStrings("disabled", disk.dev_reasoning[index].?.map.off.?);
+    try std.testing.expectEqualStrings("disabled", LayeredMetadataFixture.row(&disk.directory, .opencode_go, "claude-haiku-5-5").dev_reasoning.?.declaration().map.off.?);
     {
         var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true, .logging = false });
         defer again.deinit();
@@ -3090,7 +3096,7 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expectEqual(@as(usize, 2), LayeredMetadataFixture.dev_calls.load(.monotonic));
     try std.testing.expectEqualStrings("max", session.app.?.config.value.model.reasoning_effort.?);
-    try std.testing.expect(session.metadata_cache.reasoning[index].?.map.max == null);
+    try std.testing.expect(LayeredMetadataFixture.row(&session.metadata_cache.directory, .opencode_go, "claude-haiku-5-5").reasoning.?.declaration().map.max == null);
     // Credential activation keeps actual options, including output capability.
     // A subsequent deliberate catalog confirmation may use the fresh metadata.
     const output_row = session.metadata_cache.directory.find(.opencode_go, "claude-haiku-5-5").?;
@@ -3117,7 +3123,8 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     try Session.refreshModels(&session);
     MetadataFixture.finish(&session);
     try std.testing.expect(Session.pollModels(&session, true));
-    try std.testing.expectEqualStrings("max", (try metadata.load(&session.store.root)).dev_reasoning[index].?.map.max.?);
+    const failed_refresh_disk = try metadata.load(&session.store.root);
+    try std.testing.expectEqualStrings("max", LayeredMetadataFixture.row(&failed_refresh_disk.directory, .opencode_go, "claude-haiku-5-5").dev_reasoning.?.declaration().map.max.?);
     try std.testing.expect(std.mem.find(u8, session.metadata_notice.?, "models.dev metadata refresh failed") != null);
 }
 
@@ -3202,7 +3209,9 @@ test "login refresh opt out remains offline and explicit profiles survive availa
     try session.connection().configureProvider(.opencode_go, "fake-go-offline");
     try std.testing.expect(!Session.pollModels(&session, true));
     try std.testing.expect(session.metadata_job == null and session.metadata_login_pending == 0);
-    session.metadata_cache.available = @splat(false);
+    for (session.metadata_cache.directory.rows[0..session.metadata_cache.directory.count]) |*row| {
+        if (row.provider == .opencode_go) row.available = false;
+    }
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
     var explicit = try cfg.parse(a,
         \\{"llm":{"default":"opencode-go/kimi-k3","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"kimi-k3":{"context_tokens":65536,"protocol":"chat"}}}}},"limits":{"low_price_input":false}}
@@ -3315,9 +3324,14 @@ test "explicit user reasoning overrides metadata and survives default persistenc
     defer cfg.release(&parsed);
     try model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &source.metadata_cache);
     var config = parsed.value;
-    const index = LayeredMetadataFixture.index("opencode-go/gpt-6-luna");
-    source.metadata_cache.reasoning[index] = .{ .map = .{ .low = "low" } };
-    source.metadata_cache.dev_reasoning[index] = .{ .map = .{ .max = "max" } };
+    source.metadata_cache.directory_mask |= metadata.bit(.opencode_go);
+    const row = try source.metadata_cache.directory.upsert(.opencode_go, "gpt-6-luna");
+    row.available = true;
+    row.protocol = .responses;
+    row.dev_present = true;
+    row.dev_protocol = .responses;
+    row.reasoning = try @import("model_directory.zig").Profile.from(.{ .map = .{ .low = "low" } });
+    row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .map = .{ .max = "max" } });
     source.applyReasoningMetadata(&config);
     try std.testing.expectEqual(cfg.ReasoningSource.explicit, config.model.reasoning_source);
     try std.testing.expectEqualStrings("user-intensive", source.capabilitiesFor(config).wire("high").effort.?);
@@ -3419,19 +3433,24 @@ test "official cached effort metadata overrides the models.dev fallback" {
 
     const entry = catalog.find("opencode-go/gpt-6-luna").?;
     const config: cfg.Config = .{ .provider = catalog.connection(.opencode_go), .model = entry.model };
-    const index = Session.metadataIndex(config).?;
-    session.metadata_cache.reasoning[index] = .{ .format = .standard, .map = .{ .low = "official-low", .high = "official-high" } };
+    session.metadata_cache.directory_mask |= metadata.bit(.opencode_go);
+    const row = try session.metadata_cache.directory.upsert(.opencode_go, "gpt-6-luna");
+    row.available = true;
+    row.protocol = .responses;
+    row.reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .standard, .map = .{ .low = "low", .high = "high" } });
     const official = session.capabilitiesFor(config);
-    try std.testing.expectEqualStrings("official-low", official.map.low.?);
+    try std.testing.expectEqualStrings("low", official.map.low.?);
     try std.testing.expect(official.map.max == null);
-    session.metadata_cache.reasoning[index] = null;
+    row.reasoning = null;
     // Dynamic models.dev profiles are used only when official metadata is absent.
-    session.metadata_cache.dev_reasoning[index] = .{ .format = .standard, .map = .{ .low = "dev-low", .max = "max", .off = "none" } };
+    row.dev_present = true;
+    row.dev_protocol = .responses;
+    row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .standard, .map = .{ .low = "low", .max = "max", .off = "none" } });
     const fallback = session.capabilitiesFor(config);
-    try std.testing.expectEqualStrings("dev-low", fallback.map.low.?);
+    try std.testing.expectEqualStrings("low", fallback.map.low.?);
     try std.testing.expectEqualStrings("max", fallback.map.max.?);
     try std.testing.expectEqualStrings("none", fallback.map.off.?);
-    session.metadata_cache.dev_reasoning[index] = null;
+    row.dev_reasoning = null;
     try std.testing.expect(!session.capabilitiesFor(config).known); // Missing metadata stays unknown.
 }
 
@@ -3507,8 +3526,11 @@ test "pending auth retains trusted derived map while saving only cache backed de
     var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer source.deinit();
     var listing: metadata.Listing = .{};
-    const index = Session.metadataIndex(source.mutableConfig().*).?;
-    listing.reasoning[index] = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } };
+    listing.directory_mask = metadata.bit(.deepseek);
+    const row = try listing.directory.upsert(.deepseek, "deepseek-flash");
+    row.available = true;
+    row.protocol = .chat;
+    row.reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } });
     source.metadata_cache = try metadata.commit(&source.store.root, metadata.bit(.deepseek), listing);
     // Cache publication alone does not rewrite the pending resolved snapshot;
     // confirm the qualified candidate through the real new-selection path.
@@ -3542,8 +3564,10 @@ test "derived metadata protocol or format mismatch clears stale mapping and effo
     var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
     defer source.deinit();
     const entry = catalog.find("opencode-go/gpt-6-luna").?;
-    const index = LayeredMetadataFixture.index(entry.selector);
-    source.metadata_cache.dev_reasoning[index] = .{ .map = .{ .high = "high" } };
+    const row = try source.metadata_cache.directory.upsert(.opencode_go, "gpt-6-luna");
+    row.dev_present = true;
+    row.dev_protocol = .responses;
+    row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .map = .{ .high = "high" } });
     var config: cfg.Config = .{ .provider = catalog.connection(entry.provider), .model = entry.model };
     config.model.reasoning = .{ .map = .{ .max = "max" } };
     config.model.reasoning_effort = "max";
@@ -3553,7 +3577,7 @@ test "derived metadata protocol or format mismatch clears stale mapping and effo
     try std.testing.expect(config.model.reasoning == null and config.model.reasoning_effort == null);
     try std.testing.expect(!source.capabilitiesFor(config).known);
     config.model.protocol = .responses;
-    source.metadata_cache.dev_reasoning[index] = .{ .format = .anthropic, .map = .{ .high = "high" } };
+    row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .anthropic, .map = .{ .high = "high" } });
     source.applyReasoningMetadata(&config);
     try std.testing.expect(!source.capabilitiesFor(config).known);
 }

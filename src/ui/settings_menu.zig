@@ -13,8 +13,6 @@ pub const count = labels.len;
 pub const Snapshot = struct {
     low_price_input_enabled: bool = true,
     decision_enabled: bool = false,
-    decision_configured: bool = false,
-    decision_jev_free: bool = false,
     global_settings_available: bool = true,
     limits: cfg.Limits = .{},
 };
@@ -35,7 +33,7 @@ pub fn label(selected: usize) []const u8 {
 pub fn value(state: Snapshot, selected: usize) []const u8 {
     return switch (selected) {
         0 => if (state.low_price_input_enabled) "on" else "off",
-        1 => if (!state.decision_enabled) "off" else if (state.decision_jev_free) "OpenCode Jev Free" else "Configured",
+        1 => if (!state.decision_enabled) "off" else "Configured",
         2 => if (state.limits.compaction_enabled) "on" else "off",
         3, 4, 6 => "ms",
         5 => if (state.limits.max_output_tokens == null) "Auto" else "tokens",
@@ -45,10 +43,10 @@ pub fn value(state: Snapshot, selected: usize) []const u8 {
 pub fn description(selected: usize) []const u8 {
     return switch (selected) {
         0 => "Protect input from price surcharges; unknown pricing pauses. Flat pricing: no L.",
-        1 => "Review commands, Memory and compaction. Enter selects Off, Jev, or a logged-in model.",
+        1 => "Review commands, Memory and compaction. Enter selects Off or a logged-in model.",
         2 => "Automatic compaction only; manual /compact and hard preflight remain available.",
         3 => "Command timeout in ms; cannot exceed command_max_timeout_ms.",
-        4 => "Main model request timeout in ms; maximum 86400000 ms (24 hours).",
+        4 => "All inference requests, including decisions, in ms; maximum 86400000 ms (24 hours).",
         5 => "Output cap in tokens; Auto uses model policy. Explicit cap must cover summary_tokens.",
         6 => "Whole task timeout in ms; maximum 86400000 ms (24 hours).",
         else => "",
@@ -122,8 +120,8 @@ test "settings preserve old values and expose seven preference rows" {
     try std.testing.expectEqualStrings("on", value(.{}, 0));
     try std.testing.expectEqualStrings("off", value(.{ .low_price_input_enabled = false }, 0));
     try std.testing.expectEqualStrings("off", value(.{}, 1));
-    try std.testing.expectEqualStrings("Configured", value(.{ .decision_configured = true, .decision_enabled = true }, 1));
-    try std.testing.expectEqualStrings("OpenCode Jev Free", value(.{ .decision_enabled = true, .decision_jev_free = true }, 1));
+    try std.testing.expectEqualStrings("Configured", value(.{ .decision_enabled = true }, 1));
+    try std.testing.expect(std.mem.find(u8, description(4), "including decisions") != null);
     try std.testing.expectEqual(@as(?Key, .compaction_enabled), preferenceKey(2));
     try std.testing.expectEqual(@as(?Key, .task_timeout_ms), preferenceKey(6));
     try std.testing.expectEqual(@as(?Key, null), preferenceKey(1));

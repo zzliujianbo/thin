@@ -14,7 +14,7 @@ const COMMAND = "printf 'values-shell-proof\\n'", CALL = 'values-owned-bash';
 const phases = [
   'opened', 'compaction', 'current', 'invalid-empty', 'invalid-zero',
   'invalid-overflow', 'edit-cancel', 'staged-cancel', 'canceled', 'command-staged', 'command',
-  'request', 'output', 'output-auto', 'output-restored', 'task', 'decision', 'closed',
+  'request', 'output', 'output-auto', 'output-restored', 'task', 'decision-menu', 'closed',
 ];
 const changes = {
   compaction:['limits','compaction_enabled',false],
@@ -24,7 +24,6 @@ const changes = {
   'output-auto':['limits','max_output_tokens',null],
   'output-restored':['limits','max_output_tokens',4096],
   task:['limits','task_timeout_ms',900000],
-  decision:['decision','request_timeout_ms',60000],
 };
 
 export async function settingsValuesRegressions({app, pty, execute, send}) {
@@ -127,7 +126,7 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
         shard_bytes:32768,compaction_enabled:true,compaction_trigger_percent:80,
         compaction_target_percent:50,max_response_bytes:8388608,max_event_bytes:1048576,
         max_output_tokens:100,summary_tokens:100},
-      decision:{enabled:true,backend:'model',model:`aux/${AUX}`,request_timeout_ms:30000,
+      decision:{enabled:true,model:`aux/${AUX}`,
         max_input_tokens:8192,max_output_tokens:1024,max_state_bytes:16384},
     };
     previousBytes = JSON.stringify(expected);
@@ -186,7 +185,7 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
     assert.deepEqual(gates,phases); assert.equal(mainPosts,3); assert.equal(auxPosts,1);
     assert.equal(connections,2); await saved();
     assert.deepEqual((await readdir(project)).sort(),phases.map(n=>`settings-values-release-${n}`).sort());
-    console.log('PASS settings/values: six fields; stage/cancel/invalid unchanged; output Auto omitted; zero menu HTTP; warm socket and canonical bash verified');
+    console.log('PASS settings/values: five preferences and shared request timeout; decision menu has no timeout; stage/cancel/invalid unchanged; output Auto omitted; zero menu HTTP; warm socket and canonical bash verified');
   } catch (error) {
     // Never print assertion operands containing config/wire/terminal secrets.
     const safe = new Error('settings values fixture failed');

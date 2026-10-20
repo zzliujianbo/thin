@@ -546,7 +546,7 @@ test "checkpoint runtime restores owned context without replaying tools or autho
     try std.testing.expectError(error.RuntimeNotEmpty, restored.restoreCheckpoint(parsed.value));
 }
 
-test "checkpoint schema provenance preserves matching and legacy native replay but normalizes changed prefixes" {
+test "checkpoint schema provenance preserves matching and explicit null native replay but normalizes changed prefixes" {
     const a = std.testing.allocator;
     const codec = @import("../core/checkpoint.zig");
     var config = configuration();
@@ -585,15 +585,15 @@ test "checkpoint schema provenance preserves matching and legacy native replay b
     const utf8_hash_parsed = try codec.decode(a, utf8_hash_bytes);
     defer utf8_hash_parsed.deinit();
     try std.testing.expectEqualDeep(utf8_hash_state.tool_schema_hash, utf8_hash_parsed.value.tool_schema_hash);
-    // Exercise a genuinely absent version-1 field, not just explicit null.
+    // Missing current DTO fields reject; explicit null remains valid.
     const hash_field = try std.fmt.allocPrint(a, "\"tool_schema_hash\":{f},", .{std.json.fmt(state.tool_schema_hash, .{})});
     defer a.free(hash_field);
     const legacy = try std.mem.replaceOwned(u8, a, bytes, hash_field, "");
     defer a.free(legacy);
     try std.testing.expect(legacy.len < bytes.len);
-    const old = try codec.decode(a, legacy);
-    defer old.deinit();
-    try std.testing.expect(old.value.tool_schema_hash == null);
+    try std.testing.expectError(error.MissingField, codec.decode(a, legacy));
+    var no_hash = parsed.value;
+    no_hash.tool_schema_hash = null;
     for (0..5) |mode| {
         var executor = fake.executor();
         var schemas = tool_schemas;
@@ -606,7 +606,7 @@ test "checkpoint schema provenance preserves matching and legacy native replay b
         executor.schemas = &schemas;
         var restored = try r.Runtime.init(a, std.testing.io, &config, fake.model(), executor, fake.host(), "unused");
         defer restored.deinit();
-        const source = if (mode == 4) old.value else parsed.value;
+        const source = if (mode == 4) no_hash else parsed.value;
         try restored.restoreCheckpoint(source);
         const changed = mode >= 1 and mode <= 3;
         try std.testing.expectEqual(@as(u64, 1731), restored.estimator.per_mille);
@@ -1989,11 +1989,11 @@ test "archived output metadata is displayable without becoming a current budget 
     const cp = @import("../core/checkpoint.zig");
     const t = std.testing;
     var state: cp.State = .{ .system = "", .messages = &.{}, .selector = .{ .configured = .chat, .selected = .chat }, .estimator = .{}, .last_context_tokens = null, .permission_id = 0 };
-    const legacy = try cp.decode(t.allocator,
-        \\{"version":1,"system":"","messages":[],"selector":{"configured":"chat","selected":"chat"},"estimator":{"per_mille":1000},"last_context_tokens":null,"permission_id":0}
-    );
-    defer legacy.deinit();
-    try t.expect(!legacy.value.output_budget_frozen);
+    const initial = try cp.encode(t.allocator, state);
+    defer t.allocator.free(initial);
+    const current = try cp.decode(t.allocator, initial);
+    defer current.deinit();
+    try t.expect(!current.value.output_budget_frozen);
     for ([_]?u32{ null, 131072 }) |tokens| {
         state.output_tokens = tokens;
         state.output_source = .metadata;
@@ -2008,12 +2008,15 @@ test "archived output metadata is displayable without becoming a current budget 
         var config = configuration();
         config.model.output_tokens = tokens;
         config.model.output_source = .metadata;
-        try cp.validate(t.allocator, decoded.value, config, &.{});
+        try cp.validateStructure(decoded.value);
+        try cp.validateRequestHistory(t.allocator, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = decoded.value.system, .messages = decoded.value.messages, .tools = &.{}, .max_output_tokens = 1 });
         config.model.output_source = .explicit;
-        try cp.validate(t.allocator, decoded.value, config, &.{});
+        try cp.validateStructure(decoded.value);
+        try cp.validateRequestHistory(t.allocator, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = decoded.value.system, .messages = decoded.value.messages, .tools = &.{}, .max_output_tokens = 1 });
         config.model.output_source = .metadata;
         config.model.output_tokens = if (tokens == null) 1 else null;
-        try cp.validate(t.allocator, decoded.value, config, &.{});
+        try cp.validateStructure(decoded.value);
+        try cp.validateRequestHistory(t.allocator, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = decoded.value.system, .messages = decoded.value.messages, .tools = &.{}, .max_output_tokens = 1 });
     }
     state.output_tokens = 0;
     const display_only = try cp.encode(t.allocator, state);

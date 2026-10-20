@@ -82,9 +82,11 @@ async function fixture(name, decision, url) {
     }},
     zen:{base_url:'https://opencode.ai/zen/v1', api_key:'zen-fixture-key', models:{}},
     go:{base_url:'https://opencode.ai/zen/go/v1', api_key:'go-fixture-key', models:{}},
-    ...(decision ? {native:{base_url:'https://opencode.ai/inference/systemone/v1', api_key:'native-fixture-key', models:{}}} : {}),
+    native:{base_url:'https://opencode.ai/inference/systemone/v1', api_key:'native-fixture-key', models:{
+      'family/native-review':{protocol:'systemone'},
     }},
-    ...(decision ? {decision:{backend:'systemone', model:'native/jev-1.13-free'}} : {}),
+    }},
+    ...(decision ? {decision:{model:'native/family/native-review'}} : {}),
     limits:{low_price_input:true, max_output_tokens:100, summary_tokens:100, safety_tokens:100, request_timeout_ms:3000, task_timeout_ms:5000},
   }, null, 2) + '\n';
   const configPath = join(home, '.thin/config.json');
@@ -94,12 +96,9 @@ async function fixture(name, decision, url) {
 async function unchanged(f) {
   assert.equal(await readFile(f.configPath, 'utf8'), f.config, 'config declarations changed byte-for-byte');
 }
-async function values(f, low, decision, preset = false) {
+async function values(f, low, decision, newlySelected = false) {
   const expected = JSON.parse(f.config);
-  if (preset) {
-    expected.llm.providers['opencode-jev'] = {base_url:'https://opencode.ai/inference/systemone/v1', api_key_env:'', models:{}};
-    expected.decision = {backend:'systemone', model:'opencode-jev/jev-1.13-free'};
-  }
+  if (newlySelected) expected.decision = {model:'native/family/native-review'};
   // Mirror only known core/config.zig writeDisk canonical defaults, never
   // derive expected fields from the saved file (unknown additions must fail).
   // Provider fields are written individually, including optional nulls;
@@ -122,7 +121,7 @@ async function values(f, low, decision, preset = false) {
     low_price_input:low,
   };
   expected.decision = {
-    enabled:true, backend:'model', request_timeout_ms:30000,
+    enabled:true,
     max_input_tokens:8192, max_output_tokens:1024, max_state_bytes:16384,
     ...expected.decision,
     enabled:decision,
@@ -176,17 +175,17 @@ try {
   await untouched(n.settings, baseline);
   await untouched(n.configPath, unconfigured);
   await unchanged(n);
-  const p = await fixture('preset', false, url);
+  const p = await fixture('native-selection', false, url);
   await writeFile(p.settings, existing, {mode:0o600});
-  const presetLegacy = await snapshot(p.settings);
-  await run('settings-global-preset', p.home, p.project, url);
+  const nativeLegacy = await snapshot(p.settings);
+  await run('settings-global-native', p.home, p.project, url);
   await values(p, true, true, true);
-  await untouched(p.settings, presetLegacy);
-  const presetSaved = await snapshot(p.configPath);
+  await untouched(p.settings, nativeLegacy);
+  const nativeSaved = await snapshot(p.configPath);
   await run('settings-global-verify', p.home, p.project, url);
   await values(p, true, true, true);
-  await untouched(p.configPath, presetSaved);
-  await untouched(p.settings, presetLegacy);
+  await untouched(p.configPath, nativeSaved);
+  await untouched(p.settings, nativeLegacy);
   for (const x of [f, n, p]) assert.deepEqual((await readdir(join(x.home, '.thin'))).sort(), ['config.json','settings.json']);
   console.log(`PASS test-settings: scenarios=${scenarios}, HTTP requests=${requests}, connections=${connections}`);
 } catch (error) {

@@ -16,7 +16,7 @@ const Allocator = std.mem.Allocator;
 
 pub const max_bytes: usize = 16 * 1024 * 1024;
 pub const State = struct {
-    version: u32 = 1,
+    version: u32 = 2,
     /// Tool-prefix provenance only, never configuration or send authority.
     tool_schema_hash: ?[32]u8 = null,
     system: []const u8,
@@ -148,6 +148,9 @@ fn shape(comptime T: type, v: j.Value) !void {
         },
         .@"struct" => |info| {
             if (v != .object) return error.InvalidType;
+            inline for (info.field_names) |name| {
+                if (!v.object.contains(name)) return error.MissingField;
+            }
             var it = v.object.iterator();
             while (it.next()) |kv| {
                 inline for (info.field_names, info.field_types) |name, FT| {
@@ -178,7 +181,6 @@ pub fn decode(a: Allocator, bytes: []const u8) !std.json.Parsed(State) {
     const tree = try strictJson(a, bytes);
     defer tree.deinit();
     try shape(State, tree.value);
-    if (j.get(tree.value, "version") == null) return error.MissingField;
     const parsed = try std.json.parseFromValue(State, a, tree.value, .{});
     errdefer parsed.deinit();
     try basic(parsed.value);
@@ -191,7 +193,7 @@ fn utf8(s: []const u8) !void {
 }
 
 fn basic(state: State) !void {
-    if (state.version != 1) return error.UnsupportedVersion;
+    if (state.version != 2) return error.UnsupportedVersion;
     try utf8(state.system);
     if (state.messages.len > 1024) return error.InputLimit;
     var blocks: usize = 0;
@@ -224,25 +226,12 @@ pub fn validateStructure(state: State) !void {
     _ = try encodedSize(state);
 }
 
-/// Legacy convenience for callers explicitly checking request compatibility.
-/// Never call this to decide whether a checkpoint can be displayed or saved.
-pub fn validate(a: Allocator, state: State, config: cfg.Config, schemas: []const p.ToolSchema) !void {
-    try validateStructure(state);
-    const proto = if (config.model.protocol == .auto) state.selector.effective() else config.model.protocol;
-    try validateRequestHistory(a, .{
-        .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = proto },
-        .system = state.system,
-        .messages = state.messages,
-        .tools = schemas,
-        .max_output_tokens = 1,
-    });
-}
-
 /// Validate the ACTUAL request, independent of persisted selectors, budgets or
 /// poison flags. Used before every model boundary, including fake models.
 pub fn validateRequestHistory(a: Allocator, req: p.Request) !void {
     const proto = req.scope.protocol;
     if (proto == .auto) return error.InvalidSelector;
+    if (proto == .systemone) return error.SystemOneNotChatModel;
     try basic(.{ .system = req.system, .messages = req.messages, .selector = llm.Selector.init(proto), .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
     try common.validateRequest(req, proto);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -273,7 +262,7 @@ pub fn validateRequestHistory(a: Allocator, req: p.Request) !void {
                     if (!r.retain_turn or blocks.len != m.blocks.len) return error.NativeMismatch;
                     for (blocks, m.blocks) |x, y| if (!sameBlock(x, y)) return error.NativeMismatch;
                 },
-                .auto => unreachable,
+                .auto, .systemone => unreachable,
             }
         }
     }
@@ -285,7 +274,7 @@ pub fn validateRequestHistory(a: Allocator, req: p.Request) !void {
         .chat => try chat.encode(t, req),
         .responses => try responses.encode(t, req),
         .anthropic => try anthropic.encode(t, req),
-        .auto => unreachable,
+        .auto, .systemone => unreachable,
     };
     if (wire.len > max_bytes) return error.InputLimit;
 }
@@ -382,6 +371,16 @@ const fixture_config = cfg.Config{
     .provider = .{ .base_url = "https://fixture.invalid/v1", .api_key = "fake-key" },
     .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .auto },
 };
+// Tests construct actual requests explicitly; no production combination wrapper.
+fn fixtureRequest(state: State, config: cfg.Config) p.Request {
+    return .{
+        .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = if (config.model.protocol == .auto) state.selector.effective() else config.model.protocol },
+        .system = state.system,
+        .messages = state.messages,
+        .tools = &.{},
+        .max_output_tokens = 1,
+    };
+}
 const fixture_chat =
     "{\"role\":\"assistant\",\"content\":\"answer\",\"reasoning_content\":\"plan\",\"signature\":{\"opaque\":[1,true]},\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"vendor\":\"keep\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\",\"opaque\":7}}]}";
 const fixture_responses =
@@ -417,7 +416,8 @@ fn allocationRoundtrip(a: Allocator) !void {
     defer a.free(bytes);
     const parsed = try decode(a, bytes);
     defer parsed.deinit();
-    try validate(a, parsed.value, fixture_config, &.{});
+    try validateStructure(parsed.value);
+    try validateRequestHistory(a, fixtureRequest(parsed.value, fixture_config));
     try std.testing.expectEqualDeep(original, parsed.value);
 }
 
@@ -434,7 +434,7 @@ test "checkpoint tagged union exact Chat and Responses roundtrip and opaque repl
         const again = try encode(std.testing.allocator, parsed.value);
         defer std.testing.allocator.free(again);
         try std.testing.expectEqualStrings(bytes, again);
-        try validate(std.testing.allocator, parsed.value, fixture_config, &.{});
+        try validateRequestHistory(std.testing.allocator, fixtureRequest(parsed.value, fixture_config));
     }
 }
 
@@ -451,40 +451,77 @@ test "Anthropic checkpoint exact native canonical pairing and signed opaque roun
     messages[2].blocks = &blocks;
     messages[2].replay.?.scope.protocol = .anthropic;
     messages[2].replay.?.json = "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"plan\",\"signature\":\"signature\"},{\"type\":\"redacted_thinking\",\"data\":\"opaque\"},{\"type\":\"text\",\"text\":\"answer\"},{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"lookup\",\"input\":{}}]}";
-    try validate(a, state, config, &.{});
+    try validateRequestHistory(a, fixtureRequest(state, config));
     const bytes = try encode(a, state);
     defer a.free(bytes);
     const parsed = try decode(a, bytes);
     defer parsed.deinit();
-    try validate(a, parsed.value, config, &.{});
+    try validateRequestHistory(a, fixtureRequest(parsed.value, config));
     try std.testing.expectEqualDeep(state, parsed.value);
     blocks[1] = .{ .text = "changed" };
-    try std.testing.expectError(error.NativeMismatch, validate(a, state, config, &.{}));
+    try std.testing.expectError(error.NativeMismatch, validateRequestHistory(a, fixtureRequest(state, config)));
     blocks[1] = .{ .text = "answer" };
     blocks[2].tool_call.item_id = "foreign-item";
-    try std.testing.expectError(error.InvalidHistory, validate(a, state, config, &.{}));
+    try std.testing.expectError(error.InvalidHistory, validateRequestHistory(a, fixtureRequest(state, config)));
     blocks[2].tool_call.item_id = null;
     messages[2].replay.?.retain_turn = false;
-    try std.testing.expectError(error.NativeMismatch, validate(a, state, config, &.{}));
+    try std.testing.expectError(error.NativeMismatch, validateRequestHistory(a, fixtureRequest(state, config)));
     messages[2].replay.?.retain_turn = true;
     messages[2].replay.?.scope.protocol = .chat;
-    try std.testing.expectError(error.ReplayScopeMismatch, validate(a, state, config, &.{}));
+    try std.testing.expectError(error.ReplayScopeMismatch, validateRequestHistory(a, fixtureRequest(state, config)));
 }
 
-test "checkpoint legacy missing capacity and explicit defaults remain accepted" {
-    const a = std.testing.allocator;
-    const original = fixture(.chat);
-    const bytes = try encode(a, original);
-    defer a.free(bytes);
-    const legacy = try std.mem.replaceOwned(u8, a, bytes, "\"context_tokens\":null,\"context_official\":false,", "");
-    defer a.free(legacy);
-    try std.testing.expect(legacy.len < bytes.len);
-    for ([_][]const u8{ bytes, legacy }) |payload| {
-        const parsed = try decode(a, payload);
-        defer parsed.deinit();
-        try std.testing.expectEqualDeep(original, parsed.value);
-        try validate(a, parsed.value, fixture_config, &.{});
+fn assertRequiredFields(comptime T: type, a: Allocator, value: j.Value) !void {
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| {
+            inline for (info.field_names, info.field_types) |name, FT| {
+                var missing = j.object(a);
+                var it = value.object.iterator();
+                while (it.next()) |entry| {
+                    if (!common.eq(entry.key_ptr.*, name)) try j.put(a, &missing, entry.key_ptr.*, entry.value_ptr.*);
+                }
+                try std.testing.expectError(error.MissingField, shape(T, missing));
+                try assertRequiredFields(FT, a, value.object.get(name).?);
+            }
+        },
+        .optional => |info| if (value != .null) try assertRequiredFields(info.child, a, value),
+        .pointer => |info| if (info.child != u8) {
+            for (value.array.items) |item| try assertRequiredFields(info.child, a, item);
+        },
+        .@"union" => |info| {
+            inline for (info.field_names, info.field_types) |name, FT| {
+                if (value.object.get(name)) |child| try assertRequiredFields(FT, a, child);
+            }
+        },
+        else => {},
     }
+}
+
+test "checkpoint requires every emitted field recursively including nullable defaults" {
+    const a = std.testing.allocator;
+    const bytes = try encode(a, fixture(.chat));
+    defer a.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const tree = try strictJson(arena.allocator(), bytes);
+    defer tree.deinit();
+    try assertRequiredFields(State, arena.allocator(), tree.value);
+    // Each removal starts with the current encoder's complete valid DTO.
+    const removals = [_][]const u8{
+        "\"version\":2,",              "\"context_tokens\":null,", "\"context_official\":false,",
+        ",\"initial_attempted\":true", "\"per_mille\":1234",       ",\"replay\":null",
+        ",\"item_id\":null",           "\"canceled\":true,",       ",\"retain_turn\":true",
+    };
+    for (removals) |field| {
+        const missing = try std.mem.replaceOwned(u8, a, bytes, field, "");
+        defer a.free(missing);
+        try std.testing.expect(missing.len < bytes.len);
+        try std.testing.expectError(error.MissingField, decode(a, missing));
+    }
+    const parsed = try decode(a, bytes);
+    defer parsed.deinit();
+    try validateStructure(parsed.value);
+    try validateRequestHistory(a, fixtureRequest(parsed.value, fixture_config));
 }
 
 test "checkpoint display accepts representable stale budgets and provenance but not wrong types" {
@@ -527,15 +564,15 @@ test "checkpoint exact capacity provenance roundtrip and config match preserve v
                 const parsed = try decode(a, bytes);
                 defer parsed.deinit();
                 try std.testing.expectEqualDeep(state, parsed.value);
-                try validate(a, parsed.value, fixture_config, &.{});
+                try validateRequestHistory(a, fixtureRequest(parsed.value, fixture_config));
                 var config = fixture_config;
                 config.model.context_tokens = tokens;
-                try validate(a, parsed.value, config, &.{});
+                try validateRequestHistory(a, fixtureRequest(parsed.value, config));
                 state.estimator.per_mille = 999;
-                try validate(a, state, config, &.{});
+                try validateRequestHistory(a, fixtureRequest(state, config));
                 state.estimator = parsed.value.estimator;
                 state.messages = state.messages[0..3];
-                try std.testing.expectError(error.IncompleteToolGroup, validate(a, state, config, &.{}));
+                try std.testing.expectError(error.IncompleteToolGroup, validateRequestHistory(a, fixtureRequest(state, config)));
             }
         }
     }
@@ -559,7 +596,7 @@ test "checkpoint strict duplicate unknown type version UTF8 depth and size" {
     const bytes = try encode(a, fixture(.chat));
     defer a.free(bytes);
     for ([_][]const u8{
-        "\"version\":1,", "\"unknown\":true,", "\"permission_id\":\"1\",",
+        "\"version\":2,", "\"unknown\":true,", "\"permission_id\":\"1\",",
     }) |injection| {
         const bad = try std.fmt.allocPrint(a, "{{{s}{s}", .{ injection, bytes[1..] });
         defer a.free(bad);
@@ -567,8 +604,8 @@ test "checkpoint strict duplicate unknown type version UTF8 depth and size" {
     }
     // Replacing the actual field (rather than injecting a duplicate) catches
     // std.json's permissive integer/string, float/integer and enum conversions.
-    for ([_][]const u8{ "\"1\"", "1.0", "true", "2", "null", "-1" }) |v| {
-        const bad = try std.mem.replaceOwned(u8, a, bytes, "\"version\":1", tryVersionPrefix(v));
+    for ([_][]const u8{ "\"1\"", "1.0", "true", "1", "null", "-1" }) |v| {
+        const bad = try std.mem.replaceOwned(u8, a, bytes, "\"version\":2", tryVersionPrefix(v));
         defer a.free(bad);
         try badDecode(bad);
     }
@@ -588,6 +625,9 @@ test "checkpoint strict duplicate unknown type version UTF8 depth and size" {
     @memset(huge, 'x');
     try std.testing.expectError(error.InputLimit, decode(a, huge));
     var state = fixture(.chat);
+    state.version = 1;
+    try std.testing.expectError(error.UnsupportedVersion, encode(a, state));
+    state.version = 2;
     state.system = huge;
     try std.testing.expectError(error.InputLimit, encode(a, state));
     // Escaping expands input beyond the limit: the counting pass, not a late
@@ -601,9 +641,23 @@ fn tryVersionPrefix(v: []const u8) []const u8 {
     if (common.eq(v, "\"1\"")) return "\"version\":\"1\"";
     if (common.eq(v, "1.0")) return "\"version\":1.0";
     if (common.eq(v, "true")) return "\"version\":true";
-    if (common.eq(v, "2")) return "\"version\":2";
+    if (common.eq(v, "1")) return "\"version\":1";
     if (common.eq(v, "null")) return "\"version\":null";
     return "\"version\":-1";
+}
+
+test "SystemOne history remains structural data but cannot authorize chat requests" {
+    const a = std.testing.allocator;
+    var state = fixture(.chat);
+    state.selector = llm.Selector.init(.systemone);
+    const bytes = try encode(a, state);
+    defer a.free(bytes);
+    const parsed = try decode(a, bytes);
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(state, parsed.value);
+    var config = fixture_config;
+    config.model.protocol = .systemone;
+    try std.testing.expectError(error.SystemOneNotChatModel, validateRequestHistory(a, fixtureRequest(parsed.value, config)));
 }
 
 test "checkpoint loads poison estimator selector independently from pre-send scope checks" {
@@ -620,33 +674,33 @@ test "checkpoint loads poison estimator selector independently from pre-send sco
     s = fixture(.chat);
     var config = fixture_config;
     config.provider.base_url = "https://other.invalid";
-    try std.testing.expectError(error.ReplayScopeMismatch, validate(a, s, config, &.{}));
+    try std.testing.expectError(error.ReplayScopeMismatch, validateRequestHistory(a, fixtureRequest(s, config)));
     config = fixture_config;
     config.model.name = "another-model";
-    try std.testing.expectError(error.ReplayScopeMismatch, validate(a, s, config, &.{}));
+    try std.testing.expectError(error.ReplayScopeMismatch, validateRequestHistory(a, fixtureRequest(s, config)));
     s.selector.selected = .responses;
-    try std.testing.expectError(error.ReplayScopeMismatch, validate(a, s, fixture_config, &.{}));
+    try std.testing.expectError(error.ReplayScopeMismatch, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
 }
 
 test "checkpoint roles closure global duplicate ids argument objects and bounds" {
     const a = std.testing.allocator;
     var s = fixture(.chat);
     s.messages = s.messages[0..3];
-    try std.testing.expectError(error.IncompleteToolGroup, validate(a, s, fixture_config, &.{}));
+    try std.testing.expectError(error.IncompleteToolGroup, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
     const good = fixture(.chat);
     var messages = [_]p.Message{ good.messages[2], good.messages[3], good.messages[2], good.messages[3] };
     s.messages = &messages;
-    try std.testing.expectError(error.DuplicateToolId, validate(a, s, fixture_config, &.{}));
+    try std.testing.expectError(error.DuplicateToolId, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
     s.messages = &.{good.messages[3]};
-    try std.testing.expectError(error.OrphanToolResult, validate(a, s, fixture_config, &.{}));
+    try std.testing.expectError(error.OrphanToolResult, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
     for ([_]p.Role{ .user, .context, .tool }) |role| {
         s.messages = &.{.{ .role = role, .blocks = &.{.{ .reasoning = "bad" }} }};
-        try std.testing.expectError(error.InvalidHistory, validate(a, s, fixture_config, &.{}));
+        try std.testing.expectError(error.InvalidHistory, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
     }
     s.messages = &.{.{ .role = .tool, .blocks = &.{.{ .text = "bad" }} }};
-    try std.testing.expectError(error.InvalidHistory, validate(a, s, fixture_config, &.{}));
+    try std.testing.expectError(error.InvalidHistory, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
     s.messages = &.{.{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "c", .name = "lookup", .arguments = "[]" } }} }};
-    try std.testing.expectError(error.InvalidToolArguments, validate(a, s, fixture_config, &.{}));
+    try std.testing.expectError(error.InvalidToolArguments, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
     const many = try a.alloc(p.Message, 1025);
     defer a.free(many);
     @memset(many, .{ .role = .user, .blocks = &.{} });
@@ -690,23 +744,23 @@ test "checkpoint accepts out of order Chat arrival without weakening call identi
     messages[0].blocks = &blocks;
     var state = fixture(.chat);
     state.messages = &messages;
-    try validate(a, state, fixture_config, &.{});
+    try validateRequestHistory(a, fixtureRequest(state, fixture_config));
     const bytes = try encode(a, state);
     defer a.free(bytes);
     const parsed = try decode(a, bytes);
     defer parsed.deinit();
-    try validate(a, parsed.value, fixture_config, &.{});
+    try validateRequestHistory(a, fixtureRequest(parsed.value, fixture_config));
     try std.testing.expectEqualDeep(state, parsed.value);
     blocks[0].tool_call.arguments = "{\"x\":1}";
-    try std.testing.expectError(error.NativeMismatch, validate(a, state, fixture_config, &.{}));
+    try std.testing.expectError(error.NativeMismatch, validateRequestHistory(a, fixtureRequest(state, fixture_config)));
     blocks[0] = message.blocks[0];
     blocks[0].tool_call.name = "different";
-    try std.testing.expectError(error.NativeMismatch, validate(a, state, fixture_config, &.{}));
+    try std.testing.expectError(error.NativeMismatch, validateRequestHistory(a, fixtureRequest(state, fixture_config)));
     blocks[0] = message.blocks[0];
     blocks[0].tool_call.id = "missing";
-    try std.testing.expectError(error.NativeMismatch, validate(a, state, fixture_config, &.{}));
+    try std.testing.expectError(error.NativeMismatch, validateRequestHistory(a, fixtureRequest(state, fixture_config)));
     blocks[0] = message.blocks[1];
-    try std.testing.expectError(error.DuplicateToolId, validate(a, state, fixture_config, &.{}));
+    try std.testing.expectError(error.DuplicateToolId, validateRequestHistory(a, fixtureRequest(state, fixture_config)));
 }
 
 test "checkpoint native mismatches and unsupported native forms fail closed" {
@@ -718,21 +772,21 @@ test "checkpoint native mismatches and unsupported native forms fail closed" {
         var messages = [_]p.Message{ original.messages[2], original.messages[3] };
         messages[0].blocks = &blocks;
         s.messages = &messages;
-        try std.testing.expectError(error.NativeMismatch, validate(a, s, fixture_config, &.{}));
+        try std.testing.expectError(error.NativeMismatch, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
         blocks[1] = original.messages[2].blocks[1];
         blocks[0] = .{ .reasoning = "different" };
-        try std.testing.expectError(error.NativeMismatch, validate(a, s, fixture_config, &.{}));
+        try std.testing.expectError(error.NativeMismatch, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
         blocks[0] = original.messages[2].blocks[0];
         blocks[2].tool_call.arguments = "{\"changed\":true}";
-        try std.testing.expectError(error.NativeMismatch, validate(a, s, fixture_config, &.{}));
+        try std.testing.expectError(error.NativeMismatch, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
         blocks[2] = original.messages[2].blocks[2];
         messages[0].replay.?.retain_turn = false;
-        try std.testing.expectError(error.NativeMismatch, validate(a, s, fixture_config, &.{}));
+        try std.testing.expectError(error.NativeMismatch, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
         messages[0].replay.?.retain_turn = true;
         messages[0].replay.?.json = if (proto == .chat) "[]" else "{}";
-        if (validate(a, s, fixture_config, &.{})) |_| return error.ExpectedValidationFailure else |_| {}
+        if (validateRequestHistory(a, fixtureRequest(s, fixture_config))) |_| return error.ExpectedValidationFailure else |_| {}
     }
     var s = fixture(.responses);
     s.messages = &.{.{ .role = .assistant, .blocks = &.{.{ .reasoning = "native missing" }} }};
-    try std.testing.expectError(error.NativeReplayRequired, validate(a, s, fixture_config, &.{}));
+    try std.testing.expectError(error.NativeReplayRequired, validateRequestHistory(a, fixtureRequest(s, fixture_config)));
 }

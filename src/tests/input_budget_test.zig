@@ -415,7 +415,8 @@ test "input budget checkpoint loads history across changed current policies" {
         defer a.free(bytes);
         var parsed = try checkpoint.decode(a, bytes);
         defer parsed.deinit();
-        try checkpoint.validate(a, parsed.value, config, &.{});
+        try checkpoint.validateStructure(parsed.value);
+        try checkpoint.validateRequestHistory(a, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = parsed.value.system, .messages = parsed.value.messages, .tools = &.{}, .max_output_tokens = 1 });
         for (0..4) |change| {
             var other = config;
             switch (change) {
@@ -424,13 +425,14 @@ test "input budget checkpoint loads history across changed current policies" {
                 2 => other.limits.input_margin_tokens = 1000,
                 else => other.model.input_price_threshold = if (price == null) 100000 else null,
             }
-            try checkpoint.validate(a, parsed.value, other, &.{});
+            try checkpoint.validateRequestHistory(a, .{ .scope = .{ .connection = other.provider.base_url, .model = other.model.name, .protocol = .chat }, .system = parsed.value.system, .messages = parsed.value.messages, .tools = &.{}, .max_output_tokens = 1 });
         }
-        var legacy = state;
-        legacy.input_budget_frozen = false;
-        legacy.input_price_threshold = null;
-        legacy.max_input_tokens = null;
-        legacy.input_margin_tokens = 5000;
-        try checkpoint.validate(a, legacy, config, &.{});
+        var unfrozen = state;
+        unfrozen.input_budget_frozen = false;
+        unfrozen.input_price_threshold = null;
+        unfrozen.max_input_tokens = null;
+        unfrozen.input_margin_tokens = 5000;
+        try checkpoint.validateStructure(unfrozen);
+        try checkpoint.validateRequestHistory(a, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = unfrozen.system, .messages = unfrozen.messages, .tools = &.{}, .max_output_tokens = 1 });
     }
 }

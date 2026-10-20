@@ -38,17 +38,9 @@ fn ownConnection(a: Allocator, value: cfg.Provider) !cfg.Provider {
 fn officialContext(cache: *const metadata.Cache, entry: catalog.Entry, tokens: u32) bool {
     const official = metadata.capacityFor(cache, entry) orelse return false;
     if (official != tokens) return false;
-    if (cache.directory.find(entry.provider, entry.model.name)) |index| {
-        const row = cache.directory.rows[index];
-        if (row.available == true) return row.tokens == tokens;
-        if (row.available != null or metadata.hasDirectory(cache, entry.provider)) return false;
-    }
-    // Old official cache slots belong to the exact original preset route.
-    for (catalog.entries) |preset| {
-        if (preset.provider == entry.provider and std.mem.eql(u8, preset.model.name, entry.model.name))
-            return preset.model.protocol == entry.model.protocol;
-    }
-    return false;
+    const index = cache.directory.find(entry.provider, entry.model.name) orelse return false;
+    const row = cache.directory.rows[index];
+    return row.available == true and row.tokens == tokens;
 }
 
 /// Derived capabilities belong to the exact endpoint, model and concrete wire
@@ -58,7 +50,7 @@ pub fn applyInputThreshold(cache: *const metadata.Cache, config: *cfg.Config) vo
     config.model.input_price_flat_limit = null;
     const service = cfg.providers.Id.fromUrl(config.provider.base_url) orelse return;
     if (config.provider.kind) |hint| if (hint != service) return;
-    if (config.model.protocol == .auto) return;
+    if (config.model.protocol == .auto or config.model.protocol == .systemone) return;
     var entry = metadata.restoreEntry(cache, service, config.model.name) orelse return;
     entry.model.protocol = config.model.protocol;
     config.model.input_price_threshold = metadata.inputPriceThresholdFor(cache, entry);
@@ -67,19 +59,70 @@ pub fn applyInputThreshold(cache: *const metadata.Cache, config: *cfg.Config) vo
     }
 }
 
-const ResolvedModel = struct { model: cfg.Model, official: bool };
+const Protocol = @import("../core/protocol.zig").Protocol;
+
+/// Cache-only protocol authority; no context/output capability is required.
+/// Native SystemOne endpoints never borrow the generative Zen/Go catalog.
+pub fn protocolFor(config: cfg.Config, cache: *const metadata.Cache, provider_name: []const u8, raw_id: []const u8) !Protocol {
+    const registry = config.registry orelse return error.DefaultProviderUnavailable;
+    const provider = registry.find(provider_name) orelse return error.DefaultProviderUnavailable;
+    return protocolForProvider(cache, provider, raw_id);
+}
+
+fn protocolForProvider(cache: *const metadata.Cache, provider: cfg.NamedProvider, raw_id: []const u8) !Protocol {
+    const patch = provider.patchFor(raw_id);
+    const explicit = if (patch) |p| p.protocol else null;
+    if (cfg.providers.Id.fromSystemOneUrl(provider.connection.base_url)) |service| {
+        if (provider.connection.kind) |hint| if (hint != service) return error.ProviderEndpointMismatch;
+        if (explicit) |api| if (api != .systemone) return error.IncompatibleModelProtocol;
+        return .systemone;
+    }
+    var discovered: ?Protocol = null;
+    if (cfg.providers.Id.fromUrl(provider.connection.base_url)) |service| {
+        if (provider.connection.kind) |hint| if (hint != service) return error.ProviderEndpointMismatch;
+        if (metadata.restoreEntry(cache, service, raw_id)) |entry| discovered = entry.model.protocol;
+    }
+    if (explicit) |api| {
+        if (discovered) |known| if (known != .auto and known != api and (known == .systemone or api == .systemone)) return error.IncompatibleModelProtocol;
+        return api;
+    }
+    const api = discovered orelse return error.UnknownModelProtocol;
+    if (api == .auto) return error.UnknownModelProtocol;
+    return api;
+}
+
+const ResolvedModel = struct { connection: cfg.Provider, model: cfg.Model, official: bool };
 fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.NamedProvider, raw_id: []const u8, historical: bool) !ResolvedModel {
     const patch = provider.patchFor(raw_id);
+    if (cfg.providers.Id.fromUrl(provider.connection.base_url)) |service| {
+        if (provider.connection.kind) |hint| if (hint != service) return error.ProviderEndpointMismatch;
+        if (!historical and patch == null and metadata.hasDirectory(cache, service)) {
+            const row = cache.directory.find(service, raw_id) orelse return error.DefaultModelUnavailable;
+            if (cache.directory.rows[row].available != true) return error.DefaultModelUnavailable;
+        }
+        if (patch == null and metadata.restoreEntry(cache, service, raw_id) == null) return error.DefaultModelUnavailable;
+    } else if (patch == null and cfg.providers.Id.fromSystemOneUrl(provider.connection.base_url) == null) return error.DefaultModelUnavailable;
+    const api = try protocolForProvider(cache, provider, raw_id);
+    if (api == .systemone) {
+        // Neither name nor provider kind can manufacture generative capability.
+        var model: cfg.Model = .{ .name = raw_id, .context_tokens = 0, .protocol = .systemone };
+        if (patch) |manual| model = manual.apply(model);
+        var connection = provider.connection;
+        connection.base_url = cfg.providers.systemOneRoute(connection.base_url);
+        var candidate = config;
+        candidate.provider = connection;
+        candidate.model = model;
+        candidate.selection_pending = false;
+        candidate.selected_provider = provider.name;
+        try cfg.validate(candidate);
+        return .{ .connection = connection, .model = model, .official = false };
+    }
     // A service alias and kind are not authority to borrow another endpoint's
     // catalog. Only actual recognized official URLs authorize those records.
     const id = cfg.providers.Id.fromUrl(provider.connection.base_url);
     var entry: ?catalog.Entry = null;
     if (id) |service| {
         if (provider.connection.kind) |hint| if (hint != service) return error.ProviderEndpointMismatch;
-        if (!historical and patch == null and metadata.hasDirectory(cache, service)) {
-            const row = cache.directory.find(service, raw_id) orelse return error.DefaultModelUnavailable;
-            if (cache.directory.rows[row].available != true) return error.DefaultModelUnavailable;
-        }
         entry = metadata.restoreEntry(cache, service, raw_id);
     }
     if (entry == null and patch == null) return error.DefaultModelUnavailable;
@@ -133,7 +176,7 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
     candidate.selection_pending = false;
     candidate.selected_provider = provider.name;
     try cfg.validate(candidate);
-    return .{ .model = model, .official = official };
+    return .{ .connection = provider.connection, .model = model, .official = official };
 }
 
 /// Results borrow no movable config/cache storage; allocate in an owned arena.
@@ -142,7 +185,7 @@ pub fn resolve(a: Allocator, config: cfg.Config, cache: *const metadata.Cache, p
     const provider = registry.find(provider_name) orelse return error.DefaultProviderUnavailable;
     const selected = try resolveOne(config, cache, provider, raw_id, historical);
     return .{
-        .connection = try ownConnection(a, provider.connection),
+        .connection = try ownConnection(a, selected.connection),
         .model = try ownModel(a, selected.model),
         .provider_name = try a.dupe(u8, provider_name),
         .context_official = selected.official,
@@ -168,6 +211,129 @@ pub fn isUnresolved(err: anyerror) bool {
         error.DefaultProviderUnavailable, error.DefaultModelUnavailable, error.UnknownModelProtocol, error.UnknownModelContext => true,
         else => false,
     };
+}
+
+test "official context requires an available exact directory row and compatible route" {
+    var cache: metadata.Cache = .{};
+    const entry = catalog.find("opencode-go/gpt-6-luna").?;
+    // A static preset is a useful local fallback, never official evidence.
+    try std.testing.expect(!officialContext(&cache, entry, entry.model.context_tokens));
+    const row = try cache.directory.upsert(.opencode_go, "gpt-6-luna-alias");
+    row.available = true;
+    row.protocol = .responses;
+    row.tokens = entry.model.context_tokens;
+    cache.directory_mask = metadata.bit(.opencode_go);
+    try std.testing.expect(!officialContext(&cache, entry, entry.model.context_tokens));
+    const exact = try cache.directory.upsert(.opencode_go, "gpt-6-luna");
+    exact.dev_present = true;
+    exact.dev_protocol = .responses;
+    exact.dev_context_tokens = entry.model.context_tokens;
+    try std.testing.expect(!officialContext(&cache, entry, entry.model.context_tokens));
+    exact.available = true;
+    exact.protocol = .responses;
+    exact.tokens = entry.model.context_tokens;
+    try std.testing.expect(officialContext(&cache, entry, entry.model.context_tokens));
+    try std.testing.expect(!officialContext(&cache, entry, entry.model.context_tokens - 1));
+    var incompatible = entry;
+    incompatible.model.protocol = .chat;
+    try std.testing.expect(metadata.contextFor(&cache, incompatible) == null);
+    exact.available = false;
+    try std.testing.expect(!officialContext(&cache, entry, entry.model.context_tokens));
+}
+
+test "native SystemOne endpoint conflicts fail closed during declaration validation" {
+    try std.testing.expectError(error.IncompatibleModelProtocol, cfg.parse(std.testing.allocator,
+        \\{"llm":{"default":"custom/reviewer","providers":{"custom":{"base_url":"http://127.0.0.1:1/v1","models":{"reviewer":{"protocol":"systemone"},"jev-is-only-a-name":{"protocol":"chat","context_tokens":32768},"unknown-jev":{}}},"native":{"base_url":"https://opencode.ai/inference/systemone/v1"},"conflict":{"base_url":"https://opencode.ai/inference/systemone/v1","models":{"reviewer":{"protocol":"responses","context_tokens":32768}}}}}}
+    ));
+}
+
+test "SystemOne cache-only selection needs no capacity and imports no generative metadata" {
+    var parsed = try cfg.parse(std.testing.allocator,
+        \\{"llm":{"default":"custom/reviewer","providers":{"custom":{"base_url":"http://127.0.0.1:1/v1","models":{"reviewer":{"protocol":"systemone"},"jev-is-only-a-name":{"protocol":"chat","context_tokens":32768},"unknown-jev":{}}},"native":{"base_url":"https://opencode.ai/inference/systemone/v1"},"zen":{"base_url":"https://opencode.ai/zen/v1"}}}}
+    );
+    defer cfg.release(&parsed);
+    var cache: metadata.Cache = .{};
+    const row = try cache.directory.upsert(.opencode_zen, "reviewer");
+    row.available = true;
+    row.protocol = .systemone;
+    row.tokens = 200000;
+    row.output_tokens = 32000;
+    row.dev_protocol = .chat;
+    row.dev_context_tokens = 100000;
+    row.dev_input_price_threshold = 10000;
+    cache.directory_mask = metadata.bit(.opencode_zen);
+    for ([_][]const u8{ "custom", "native", "zen" }) |alias| {
+        try std.testing.expectEqual(Protocol.systemone, try protocolFor(parsed.value, &cache, alias, "reviewer"));
+        const selection = try resolve(parsed.arena.allocator(), parsed.value, &cache, alias, "reviewer", false);
+        try std.testing.expectEqual(Protocol.systemone, selection.model.protocol);
+        try std.testing.expectEqual(@as(u32, 0), selection.model.context_tokens);
+        try std.testing.expect(selection.model.output_tokens == null);
+        try std.testing.expect(selection.model.reasoning == null);
+        try std.testing.expect(selection.model.input_price_threshold == null);
+        try std.testing.expect(selection.model.input_price_flat_limit == null);
+        try std.testing.expect(!selection.context_official);
+    }
+    try std.testing.expectEqual(Protocol.chat, try protocolFor(parsed.value, &cache, "custom", "jev-is-only-a-name"));
+    try std.testing.expectError(error.UnknownModelProtocol, protocolFor(parsed.value, &cache, "custom", "unknown-jev"));
+    row.available = false;
+    try std.testing.expectError(error.DefaultModelUnavailable, resolve(parsed.arena.allocator(), parsed.value, &cache, "zen", "reviewer", false));
+    row.available = true;
+    const models = [_]cfg.NamedModel{.{ .name = "reviewer", .patch = .{ .protocol = .chat, .context_tokens = 32768 } }};
+    const providers = [_]cfg.NamedProvider{.{ .name = "zen", .connection = .{ .base_url = "https://opencode.ai/zen/v1" }, .models = &models }};
+    var conflicting = parsed.value;
+    conflicting.registry = .{ .default = "zen/reviewer", .providers = &providers };
+    try std.testing.expectError(error.IncompatibleModelProtocol, protocolFor(conflicting, &cache, "zen", "reviewer"));
+}
+
+test "models.dev SystemOne routes only exact Zen to native retaining alias credentials and proxy scope" {
+    const a = std.testing.allocator;
+    var parsed = try cfg.parse(a,
+        \\{"llm":{"default":"zen/reviewer","providers":{"zen":{"base_url":"https://opencode.ai/zen/v1","kind":"opencode_zen","api_key":"fake-own-key"},"other":{"base_url":"https://opencode.ai/zen/v1","api_key":"fake-other-key"},"custom":{"base_url":"http://127.0.0.1:1/v1","models":{"reviewer":{"protocol":"systemone"}}},"lookalike":{"base_url":"https://opencode.ai.example/zen/v1","kind":"opencode_zen","models":{"reviewer":{"protocol":"systemone"}}},"go":{"base_url":"https://opencode.ai/zen/go/v1"},"native":{"base_url":"https://opencode.ai/inference/systemone/v1/","api_key_env":"OWN_FIXTURE_KEY"}}},"proxy":{"address":"127.0.0.1","port":7890,"models":["zen/reviewer"]}}
+    );
+    defer cfg.release(&parsed);
+    const listing = try metadata.parseDev(a,
+        \\{"opencode":{"models":{"reviewer":{"api":{"url":"https://opencode.ai/inference/systemone/v1"}}}},"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"reviewer":{"limit":{"context":32768}}}}}
+    );
+    const cache: metadata.Cache = .{ .directory = listing.directory };
+    try std.testing.expectEqual(Protocol.systemone, try protocolFor(parsed.value, &cache, "zen", "reviewer"));
+    const selection = try resolve(parsed.arena.allocator(), parsed.value, &cache, "zen", "reviewer", false);
+    try std.testing.expectEqualStrings(cfg.providers.systemone_base_url, selection.connection.base_url);
+    try std.testing.expectEqualStrings("zen", selection.provider_name);
+    try std.testing.expectEqualStrings("fake-own-key", selection.connection.api_key.?);
+    try std.testing.expectEqual(cfg.providers.Id.opencode_zen, selection.connection.kind.?);
+    try std.testing.expectEqual(Protocol.systemone, selection.model.protocol);
+    try std.testing.expectEqual(@as(u32, 0), selection.model.context_tokens);
+    try std.testing.expect(selection.model.output_tokens == null and selection.model.reasoning == null);
+    try std.testing.expect(selection.model.input_price_threshold == null and selection.model.input_price_flat_limit == null);
+    var candidate = parsed.value;
+    apply(&candidate, selection);
+    try cfg.validate(candidate);
+    try std.testing.expect(candidate.proxyFor(candidate.selected_provider, candidate.model.name) != null);
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/v1", parsed.value.registry.?.find("zen").?.connection.base_url);
+    for ([_][]const u8{ "custom", "lookalike", "native" }) |alias| {
+        const own = parsed.value.registry.?.find(alias).?;
+        const route = try resolve(parsed.arena.allocator(), parsed.value, &cache, alias, "reviewer", false);
+        try std.testing.expectEqualStrings(own.connection.base_url, route.connection.base_url);
+        try std.testing.expectEqualStrings(alias, route.provider_name);
+        try std.testing.expectEqualStrings(own.connection.api_key_env, route.connection.api_key_env);
+        try std.testing.expectEqual(Protocol.systemone, route.model.protocol);
+        try std.testing.expectEqual(@as(u32, 0), route.model.context_tokens);
+        try std.testing.expect(parsed.value.proxyFor(route.provider_name, route.model.name) == null);
+    }
+    const other = try resolve(parsed.arena.allocator(), parsed.value, &cache, "other", "reviewer", false);
+    try std.testing.expectEqualStrings("fake-other-key", other.connection.api_key.?);
+    try std.testing.expectEqualStrings(cfg.providers.systemone_base_url, other.connection.base_url);
+    const chat = try resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "reviewer", false);
+    try std.testing.expectEqual(Protocol.chat, chat.model.protocol);
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1", chat.connection.base_url);
+    // Even a SystemOne declaration on Go must not rewrite it into Zen.
+    var go_config = parsed.value;
+    const go_models = [_]cfg.NamedModel{.{ .name = "separate-reviewer", .patch = .{ .protocol = .systemone } }};
+    const go_providers = [_]cfg.NamedProvider{.{ .name = "go", .connection = .{ .base_url = "https://opencode.ai/zen/go/v1" }, .models = &go_models }};
+    go_config.registry = .{ .default = "go/separate-reviewer", .providers = &go_providers };
+    go_config.proxy = null;
+    const go_route = try resolve(parsed.arena.allocator(), go_config, &cache, "go", "separate-reviewer", false);
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1", go_route.connection.base_url);
 }
 
 test "price proof resolves exact direct flat routes and clears on proxy protocol or raw ID changes" {

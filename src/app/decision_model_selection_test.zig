@@ -7,7 +7,7 @@ const profiles = @import("decision_selection.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 const fixture =
-    \\{"llm":{"default":"route/first","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-main-only","models":{"first":{"protocol":"chat","context_tokens":65536},"second":{"protocol":"chat","context_tokens":131072},"tiny":{"protocol":"chat","context_tokens":2048},"auto":{"protocol":"auto","context_tokens":32768}}},"other":{"base_url":"https://other.invalid/v1","api_key_env":"OWN_REVIEW_KEY","models":{"family/judge":{"protocol":"chat","context_tokens":16384}}},"native":{"base_url":"https://opencode.ai/inference/systemone/v1","api_key":"fake-native-only","models":{"jev-1.13-free":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"safety_tokens":100}}
+    \\{"llm":{"default":"route/first","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-main-only","models":{"first":{"protocol":"chat","context_tokens":65536},"second":{"protocol":"chat","context_tokens":131072},"tiny":{"protocol":"chat","context_tokens":2048},"judge/raw":{"protocol":"chat","context_tokens":32768},"auto":{"protocol":"auto","context_tokens":32768}}},"other":{"base_url":"https://other.invalid/v1","api_key_env":"OWN_REVIEW_KEY","models":{"family/judge":{"protocol":"chat","context_tokens":16384}}},"native":{"base_url":"https://native-fixture.invalid/v1","api_key":"fake-native-only","models":{"judge/raw":{"protocol":"systemone"},"jev-1.13-free":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"safety_tokens":100}}
 ;
 fn seed(home: []const u8, bytes: []const u8) !void {
     var store = try Store.open(a, io, home);
@@ -55,7 +55,7 @@ test "Decision generic selection is declaration-only independent and survives re
     defer a.free(before);
     try choose(&session, "other/family/judge");
     const selected = session.connection().current();
-    try std.testing.expect(selected.decision_enabled and !selected.decision_jev_free);
+    try std.testing.expect(selected.decision_enabled);
     try std.testing.expectEqualStrings("other/family/judge", selected.decision_model.?);
     try std.testing.expectEqualStrings("first", app.config.value.model.name);
     try std.testing.expectEqualStrings("route", app.config.value.selected_provider.?);
@@ -69,10 +69,19 @@ test "Decision generic selection is declaration-only independent and survives re
     defer a.free(saved);
     var parsed = try cfg.parse(a, saved);
     defer cfg.release(&parsed);
-    try std.testing.expect(parsed.value.decision.?.backend == .model);
+    try std.testing.expectEqualStrings("other/family/judge", parsed.value.decision.?.model);
     const after = try declarationsWithoutDecision(parsed.value);
     defer a.free(after);
     try std.testing.expectEqualStrings(before, after);
+    // The published picker is not authority after an env credential disappears.
+    try std.testing.expect(contains(session.connection().current().decision_models, "other/family/judge"));
+    try env.put("OWN_REVIEW_KEY", "");
+    try std.testing.expectError(error.ApiKeyNotFound, choose(&session, "other/family/judge"));
+    try std.testing.expect(app.decision_client.? == reviewer);
+    const failed = try disk(home);
+    defer a.free(failed);
+    try std.testing.expectEqualStrings(saved, failed);
+    try env.put("OWN_REVIEW_KEY", "fake-aux-only");
     var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer restarted.deinit();
     try std.testing.expectEqualStrings("other/family/judge", restarted.connection().current().decision_model.?);
@@ -80,7 +89,7 @@ test "Decision generic selection is declaration-only independent and survives re
     try std.testing.expectEqual(@as(usize, 0), restarted.app.?.decision_client.?.calls);
 }
 
-test "Decision generic owner rejects nonmembers unlogged aliases native routes and auto" {
+test "Decision owner rejects nonmembers unlogged aliases and auto but routes by protocol" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
@@ -100,16 +109,48 @@ test "Decision generic owner rejects nonmembers unlogged aliases native routes a
     try std.testing.expectError(error.UnknownProvider, choose(&session, "Route/first"));
     try std.testing.expectError(error.UnknownDecisionModel, choose(&session, "route/FIRST"));
     try std.testing.expectError(error.UnknownDecisionModel, choose(&session, "route/auto"));
-    try std.testing.expectError(error.UnknownDecisionModel, choose(&session, "native/jev-1.13-free"));
+    // A Jev-looking raw ID is ordinary Chat unless its exact patch says otherwise.
+    try std.testing.expect(contains(session.connection().current().decision_models, "native/jev-1.13-free"));
     const state = session.connection().current();
     try std.testing.expect(!contains(state.decision_models, "route/auto"));
-    try std.testing.expect(!contains(state.decision_models, "native/jev-1.13-free"));
-    try std.testing.expect(state.model_providers.?.len == 2); // route/native, never empty-env other.
+    try std.testing.expect(contains(state.decision_models, "native/judge/raw"));
+    try std.testing.expect(state.model_providers.len == 2); // route/native, never empty-env other.
     const after = try disk(home);
     defer a.free(after);
     try std.testing.expectEqualStrings(before, after);
     try std.testing.expect(!session.global_config.?.value.decisionActive());
     try std.testing.expect(session.app.?.decision_client == null);
+}
+
+test "SystemOne without context is auxiliary eligible but cannot become primary Chat" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try seed(home, fixture);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    defer session.deinit();
+    try std.testing.expect(contains(session.connection().current().decision_models, "native/judge/raw"));
+    const connection = session.connection();
+    const before = try disk(home);
+    defer a.free(before);
+    try std.testing.expectError(error.SystemOneNotChatModel, connection.select_model_fn.?(connection.context, "native/judge/raw"));
+    const after = try disk(home);
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    try choose(&session, "native/judge/raw");
+    try std.testing.expect(session.app.?.decision_client.?.native != null);
+    try std.testing.expectEqualStrings("fake-native-only", session.app.?.decision_client.?.key.?);
+    try std.testing.expectEqualStrings("native/judge/raw", session.connection().current().decision_model.?);
+    try choose(&session, "route/judge/raw");
+    try std.testing.expect(session.app.?.decision_client.?.native == null);
+    try std.testing.expectEqualStrings("fake-main-only", session.app.?.decision_client.?.key.?);
+    try choose(&session, "native/jev-1.13-free");
+    try std.testing.expect(session.app.?.decision_client.?.native == null);
+    try std.testing.expectEqualStrings("first", session.app.?.config.value.model.name);
 }
 
 test "Decision generic candidates use auxiliary caps even when primary candidate cannot fit" {
@@ -163,7 +204,7 @@ test "Decision generic candidates use auxiliary caps even when primary candidate
     try std.testing.expectEqual(@as(u32, 65536), session.app.?.config.value.model.context_tokens);
     try std.testing.expect(session.app.?.config.value.limits.low_price_input);
     // Unknown primary price does not exclude a reviewer; its limits are separate.
-    const limits = session.global_config.?.value.decision.?.modelLimits();
+    const limits = session.global_config.?.value.decision.?.modelLimits(session.global_config.?.value.limits.request_timeout_ms);
     try std.testing.expect(!limits.low_price_input and limits.safety_tokens == 256);
 }
 

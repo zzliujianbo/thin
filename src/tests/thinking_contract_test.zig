@@ -29,9 +29,13 @@ test "explicit mapped standard wire off survives normal and summary adapter enco
     const cap = thinking.resolve("https://proxy.invalid", "custom", .{ .map = .{ .off = "off", .low = "off", .high = "provider-high" } });
     for ([_]p.Protocol{ .chat, .responses }) |protocol| {
         for ([_]p.Purpose{ .normal, .summary }) |purpose| {
-            for ([_][]const u8{ "off", "none", "low" }) |logical| {
-                const wire = cap.wire(logical);
-                try std.testing.expectEqualStrings("off", wire.effort.?);
+            for ([_]struct { configured: []const u8, expected: []const u8 }{
+                .{ .configured = "off", .expected = "off" },
+                .{ .configured = "none", .expected = "none" }, // Opaque wire value, not a logical off alias.
+                .{ .configured = "low", .expected = "off" },
+            }) |case| {
+                const wire = cap.wire(case.configured);
+                try std.testing.expectEqualStrings(case.expected, wire.effort.?);
                 var req = support.request(protocol);
                 req.reasoning_effort = wire.effort;
                 req.reasoning_format = cap.format;
@@ -41,7 +45,7 @@ test "explicit mapped standard wire off survives normal and summary adapter enco
                 const parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
                 defer parsed.deinit();
                 const actual = if (protocol == .chat) parsed.value.object.get("reasoning_effort").? else parsed.value.object.get("reasoning").?.object.get("effort").?;
-                try std.testing.expectEqualStrings("off", actual.string);
+                try std.testing.expectEqualStrings(case.expected, actual.string);
                 if (purpose == .summary) try std.testing.expectEqualStrings("none", parsed.value.object.get("tool_choice").?.string);
             }
         }

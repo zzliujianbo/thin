@@ -16,7 +16,6 @@ pub fn rateBand(tenths: ?u64) RateBand {
 /// provider honored the option. Unknown/custom values never guess a level.
 pub const ReasoningEffort = enum {
     unspecified,
-    none, // Legacy source alias; canonical spelling is off.
     off,
     minimal,
     low,
@@ -28,20 +27,16 @@ pub const ReasoningEffort = enum {
 
     pub fn fromName(configured: ?[]const u8) ReasoningEffort {
         const value = configured orelse return .unspecified;
-        if (std.mem.eql(u8, value, "none")) return .off;
         inline for (.{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |known| {
             if (std.mem.eql(u8, value, known)) return @field(ReasoningEffort, known);
         }
         return .unknown;
     }
 
-    pub fn canonical(self: ReasoningEffort) ReasoningEffort {
-        return if (self == .none) .off else self;
-    }
     pub fn name(self: ReasoningEffort) ?[]const u8 {
         return switch (self) {
             .unspecified, .unknown => null,
-            .none, .off => "off",
+            .off => "off",
             .minimal => "minimal",
             .low => "low",
             .medium => "medium",
@@ -59,7 +54,7 @@ pub const EffortSet = struct {
 
     pub fn contains(self: EffortSet, effort: ReasoningEffort) bool {
         for (effort_order, 0..) |level, i| {
-            if (level == effort.canonical()) return self.mask & (@as(u8, 1) << @intCast(i)) != 0;
+            if (level == effort) return self.mask & (@as(u8, 1) << @intCast(i)) != 0;
         }
         return false;
     }
@@ -72,7 +67,7 @@ pub const EffortSet = struct {
     }
     pub fn next(self: EffortSet, current: ReasoningEffort) ?ReasoningEffort {
         for (effort_order, 0..) |level, i| {
-            if (level == current.canonical()) {
+            if (level == current) {
                 for (1..effort_order.len + 1) |delta| {
                     const candidate = effort_order[(i + delta) % effort_order.len];
                     if (self.contains(candidate)) return candidate;
@@ -87,7 +82,7 @@ pub const EffortSet = struct {
     /// Prefer the next stronger supported level, then the nearest weaker one.
     pub fn clamp(self: EffortSet, requested: ReasoningEffort) ?ReasoningEffort {
         for (effort_order, 0..) |level, i| {
-            if (level == requested.canonical()) {
+            if (level == requested) {
                 for (effort_order[i..]) |candidate| if (self.contains(candidate)) return candidate;
                 var n = i;
                 while (n > 0) {
@@ -101,14 +96,15 @@ pub const EffortSet = struct {
     }
 };
 
-test "effort sets canonical aliases bounded cycle and upward first clamp" {
+test "effort sets reject old names bounded cycle and upward first clamp" {
     const t = std.testing;
     const set: EffortSet = .{ .mask = 1 | 4 | 16 | 64 };
-    try t.expectEqual(ReasoningEffort.off, ReasoningEffort.fromName("none"));
-    try t.expectEqualStrings("off", ReasoningEffort.none.name().?);
-    try t.expect(set.contains(.none));
+    try t.expectEqual(ReasoningEffort.unknown, ReasoningEffort.fromName("none"));
+    try t.expect(!@hasField(ReasoningEffort, "none"));
+    try t.expectEqualStrings("off", ReasoningEffort.off.name().?);
+    try t.expect(set.contains(.off));
     try t.expectEqual(@as(usize, 4), set.count());
-    try t.expectEqual(ReasoningEffort.low, set.next(.none).?);
+    try t.expectEqual(ReasoningEffort.low, set.next(.off).?);
     try t.expectEqual(ReasoningEffort.off, set.next(.max).?);
     try t.expectEqual(ReasoningEffort.high, set.clamp(.medium).?);
     try t.expectEqual(ReasoningEffort.max, set.clamp(.xhigh).?);
@@ -354,8 +350,8 @@ test "rate bands and configured effort have explicit unknown and stable mapping"
     try std.testing.expectEqual(ReasoningEffort.unspecified, ReasoningEffort.fromName(null));
     try std.testing.expectEqual(ReasoningEffort.unknown, ReasoningEffort.fromName("provider-custom"));
     try std.testing.expectEqual(ReasoningEffort.unknown, ReasoningEffort.fromName("HIGH"));
-    inline for (.{ "none", "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |name| {
-        try std.testing.expectEqual((@field(ReasoningEffort, name)).canonical(), ReasoningEffort.fromName(name));
+    inline for (.{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |name| {
+        try std.testing.expectEqual(@field(ReasoningEffort, name), ReasoningEffort.fromName(name));
     }
     try std.testing.expect(commandStep(0) != commandStep(120));
     try std.testing.expectEqual(commandStep(0), commandStep(960));

@@ -199,7 +199,7 @@ const Permission = struct { id: u64, description: []const u8, clipped: bool, pas
 /// UI-owned callbacks; the application owns the runtime and configuration lifetime.
 pub const Connection = struct {
     pub const Setting = enum { low_price_input, decision_enabled };
-    pub const DecisionChoice = union(enum) { off, opencode_jev_free, model: []const u8 };
+    pub const DecisionChoice = decision_picker_module.Choice;
     decision_fn: ?*const fn (*anyopaque, DecisionChoice) anyerror!void = null,
     setting_fn: ?*const fn (*anyopaque, Setting, bool) anyerror!void = null,
     preference_fn: ?*const fn (*anyopaque, preference.Key, ?u32) anyerror!void = null,
@@ -231,7 +231,7 @@ pub const Connection = struct {
         models: []const core_config.Model = &.{},
         /// Nonsecret logged-in aliases filter the flat model list. Null is
         /// legacy unfiltered ownership; empty never means all providers.
-        model_providers: ?[]const ModelProvider = null,
+        model_providers: []const ModelProvider = &.{},
         model_context_official: []const bool = &.{},
         model_disabled: []const bool = &.{},
         context_official: bool = false,
@@ -247,14 +247,11 @@ pub const Connection = struct {
         low_price_input: bool = false,
         low_price_input_enabled: bool = true,
         decision_enabled: bool = false,
-        decision_configured: bool = false,
-        decision_jev_free: bool = false,
         /// Owned by the session, resolved with auxiliary rather than chat limits.
         decision_models: []const core_config.Model = &.{},
         decision_model: ?[]const u8 = null,
         global_settings_available: bool = true,
         limits: core_config.Limits = .{},
-        decision_timeout_ms: ?u32 = null,
         /// Immutable configured request option, not inferred from stream time.
         reasoning_effort: shared.ReasoningEffort = .unspecified,
         /// Default preference awaiting an exact capability map; not a wire option.
@@ -354,7 +351,6 @@ const Ui = struct {
     parser: input.Parser = .{},
     editor_pasted: bool = false,
     model_picker: ?picker_module.Picker = null,
-    decision_model_picker: bool = false,
     provider_picker: provider_picker_module.Picker = .{},
     provider_open: bool = false,
     settings_open: bool = false,
@@ -364,6 +360,8 @@ const Ui = struct {
     settings_menu: settings_menu_module.Menu = .{},
     displayed_settings_generation: ?u64 = null,
     frame_settings_generation: ?u64 = null,
+    displayed_decision_fingerprint: ?decision_picker_module.Fingerprint = null,
+    frame_decision_fingerprint: ?decision_picker_module.Fingerprint = null,
     provider_choices: provider_picker_module.Choices = .{},
     displayed_provider_generation: ?u64 = null,
     frame_provider_generation: ?u64 = null,
@@ -679,12 +677,7 @@ const Ui = struct {
         if (self.model_picker) |picker| {
             if (picker.pasted) return "Pasted selection; Esc cancels";
             if (!std.mem.eql(u8, self.notice, "Ready")) return self.notice;
-            if (self.decision_model_picker) {
-                const logged = state.model_providers orelse &.{};
-                if (logged.len == 0 or state.decision_models.len == 0) return "No compatible logged-in models; use /login or refresh model metadata";
-                return "Decision model only; chat model unchanged. Left/Esc back";
-            }
-            if (state.model_providers) |logged| if (logged.len == 0) return "No logged-in providers: /login, then /model";
+            if (state.model_providers.len == 0) return "No logged-in providers: /login, then /model";
             return "";
         }
         if (self.commandMenuVisible()) return "";
@@ -860,7 +853,6 @@ const Ui = struct {
     fn closeModelPicker(self: *Ui) void {
         if (self.model_picker) |*picker| picker.deinit();
         self.model_picker = null;
-        self.decision_model_picker = false;
         self.displayed_model_epoch = null;
         self.displayed_model_generation = null;
     }
@@ -938,6 +930,8 @@ const Ui = struct {
     fn closeSettingsMenu(self: *Ui) void {
         self.settings_open = false;
         self.decision_open = false;
+        self.displayed_decision_fingerprint = null;
+        self.frame_decision_fingerprint = null;
         self.settings_value_picker = null;
         self.settings_menu.clear();
         self.parser.stop_feed = true;
@@ -954,6 +948,8 @@ const Ui = struct {
         self.notice = "Ready";
     }
     fn backToSettings(self: *Ui) void {
+        self.displayed_decision_fingerprint = null;
+        self.frame_decision_fingerprint = null;
         self.settings_value_picker = null;
         self.decision_open = false;
         self.settings_menu.clear();
@@ -967,10 +963,9 @@ const Ui = struct {
         return switch (key_) {
             .compaction_enabled => "Auto compaction",
             .command_timeout_ms => "Command timeout (ms)",
-            .request_timeout_ms => "Main request timeout (ms)",
+            .request_timeout_ms => "All inference request timeout (ms; including decisions)",
             .max_output_tokens => "Output limit (tokens); Auto follows model policy",
             .task_timeout_ms => "Task timeout (ms)",
-            .decision_timeout_ms => "Decision request timeout (ms)",
         };
     }
     fn openSettingsValue(self: *Ui, key_: preference.Key, state: Connection.State) void {
@@ -980,12 +975,7 @@ const Ui = struct {
             .request_timeout_ms => state.limits.request_timeout_ms,
             .max_output_tokens => state.limits.max_output_tokens,
             .task_timeout_ms => state.limits.task_timeout_ms,
-            .decision_timeout_ms => state.decision_timeout_ms,
         };
-        if (key_ == .decision_timeout_ms and current == null) {
-            self.notice = "Select a decision model before setting its timeout";
-            return;
-        }
         self.settings_return_selected = self.settings_menu.selected;
         self.settings_value_picker = settings_value_module.Picker.init(key_, current, state.limits);
         self.settings_menu.clear();
@@ -1108,7 +1098,10 @@ const Ui = struct {
             .text => |value| if (value.pasted) {
                 self.settings_menu.markPaste();
             },
-            .up, .down => self.settings_menu.move(event_ == .down, if (self.decision_open) decision_picker_module.labels.len else settings_menu_module.labels.len),
+            .up, .down => {
+                const state = self.connection.current();
+                self.settings_menu.move(event_ == .down, if (self.decision_open) decision_picker_module.count(state.decision_models, state.model_providers) else settings_menu_module.labels.len);
+            },
             .enter => {
                 if (!self.settingsIdle() or self.editor_pasted or self.frame.len != 0 or self.settings_menu.pasted or
                     self.displayed_settings_generation != self.settings_menu.generation) return;
@@ -1116,8 +1109,16 @@ const Ui = struct {
                 // read batch tail; only a new complete frame can authorize again.
                 self.settings_menu.generation +%= 1;
                 self.displayed_settings_generation = null;
+                const acknowledged = self.displayed_decision_fingerprint;
+                self.displayed_decision_fingerprint = null;
+                self.frame_decision_fingerprint = null;
                 self.parser.stop_feed = true;
                 const state = self.connection.current();
+                if (self.decision_open) {
+                    const previous = acknowledged orelse return;
+                    const current = decision_picker_module.fingerprint(state.decision_models, state.model_providers) orelse return;
+                    if (!std.mem.eql(u8, &previous, &current)) return;
+                }
                 if (!state.global_settings_available) {
                     self.notice = "Global settings unavailable; changes disabled";
                     return;
@@ -1125,17 +1126,9 @@ const Ui = struct {
                 if (!self.decision_open and self.settings_menu.selected == 1) {
                     self.decision_open = true;
                     self.settings_menu.clear();
-                    self.settings_menu.selected = if (!state.decision_enabled) 0 else if (state.decision_jev_free) 1 else 2;
+                    self.settings_menu.selected = decision_picker_module.indexOf(state.decision_models, state.model_providers, if (state.decision_enabled) state.decision_model else null);
                     self.frame_settings_generation = null;
                     self.notice = "Ready";
-                    return;
-                }
-                if (self.decision_open and self.settings_menu.selected == 2) {
-                    self.openDecisionModelPicker();
-                    return;
-                }
-                if (self.decision_open and self.settings_menu.selected == 3) {
-                    self.openSettingsValue(.decision_timeout_ms, state);
                     return;
                 }
                 if (!self.decision_open) {
@@ -1155,7 +1148,8 @@ const Ui = struct {
                         self.notice = "Global settings unavailable; changes disabled";
                         return;
                     };
-                    save(self.connection.context, if (self.settings_menu.selected == 0) .off else .opencode_jev_free) catch {
+                    const selected = decision_picker_module.choice(state.decision_models, state.model_providers, self.settings_menu.selected) orelse return;
+                    save(self.connection.context, selected) catch {
                         self.notice = "Could not save setting; previous value kept";
                         return;
                     };
@@ -1246,62 +1240,11 @@ const Ui = struct {
         self.model_picker.?.provider = state.provider;
         self.notice = "Ready";
     }
-    fn openDecisionModelPicker(self: *Ui) void {
-        self.closeSettingsMenu();
-        self.openModelPicker();
-        self.decision_model_picker = true;
-        self.model_picker.?.allow_custom = false;
-        self.model_picker.?.provider = null;
-        self.parser.stop_feed = true;
-    }
-    fn backToDecision(self: *Ui) void {
-        self.closeModelPicker();
-        self.openSettingsMenu();
-        self.decision_open = true;
-        self.settings_menu.selected = 2;
-        self.notice = "Ready";
-    }
-    /// A separate purpose uses the same exact-identity/ACK machinery, never the
-    /// main selection or legacy null-provider fallback. No ghost current row.
-    fn pickerState(self: *const Ui, state: Connection.State) Connection.State {
-        if (!self.decision_model_picker) return state;
-        var result = state;
-        result.models = state.decision_models;
-        result.model = "";
-        result.selection_name = null;
-        result.context_limit = 0;
-        result.context_official = false;
-        result.model_context_official = &.{};
-        result.model_disabled = &.{}; // Owner publishes eligible profiles only.
-        result.model_providers = state.model_providers orelse &.{};
-        result.allow_custom_models = false;
-        result.provider = null;
-        if (state.decision_model) |current| for (state.decision_models) |model| {
-            if (std.mem.eql(u8, model.name, current)) {
-                result.model = model.name;
-                result.selection_name = model.name;
-                result.context_limit = model.context_tokens;
-                break;
-            }
-        };
-        return result;
-    }
     fn selectModel(self: *Ui, name: []const u8) !void {
         if (!self.settingsIdle()) return error.Busy;
         // Completed producers have joined and complete() drained every event.
         // A reset error occurs BEFORE configuration publication.
         try self.bridge.reset();
-        if (self.decision_model_picker) {
-            const save = self.connection.decision_fn orelse return error.SelectionUnavailable;
-            try save(self.connection.context, .{ .model = name });
-            self.display.context = self.connection.current().initial_context;
-            self.closeModelPicker();
-            self.openSettingsMenu();
-            self.settings_menu.selected = 1;
-            self.notice = "Decision model selected; chat model unchanged";
-            self.dirty = true;
-            return;
-        }
         const before = self.connection.current();
         var inherited = !std.mem.eql(u8, before.model, name);
         for (before.models) |profile| if (std.mem.eql(u8, profile.name, name)) {
@@ -1312,7 +1255,7 @@ const Ui = struct {
         const state = self.connection.current();
         self.display = .{ .context = state.initial_context, .reasoning_effort = state.reasoning_effort };
         self.effort_flash = if (state.effort_levels.contains(state.reasoning_effort))
-            .{ .level = state.reasoning_effort.canonical(), .until_ms = self.clock_ms +| 2000 }
+            .{ .level = state.reasoning_effort, .until_ms = self.clock_ms +| 2000 }
         else
             null;
         self.model_flow = .{};
@@ -1346,13 +1289,13 @@ const Ui = struct {
                 self.notice = "Thinking capabilities unknown: declare model reasoning levels in configuration";
                 return;
             };
-            if (selected != state.reasoning_effort.canonical()) self.connection.setEffort(selected) catch {
+            if (selected != state.reasoning_effort) self.connection.setEffort(selected) catch {
                 self.notice = "Could not save thinking option; previous option kept";
                 return;
             };
             break :blk selected;
         };
-        if (next == state.reasoning_effort.canonical()) {
+        if (next == state.reasoning_effort) {
             self.notice = "This model has no other supported thinking level";
             return;
         }
@@ -1374,10 +1317,8 @@ const Ui = struct {
         const picker = &self.model_picker.?;
         switch (event_) {
             .escape, .cancel => {
-                if (self.decision_model_picker) self.backToDecision() else {
-                    self.closeModelPicker();
-                    self.notice = "Ready";
-                }
+                self.closeModelPicker();
+                self.notice = "Ready";
             },
             .quit => self.requestQuit(),
             .paste_start => {
@@ -1397,7 +1338,7 @@ const Ui = struct {
                 picker.query.delete();
                 picker.changed();
             },
-            .left => if (self.decision_model_picker) self.backToDecision() else try self.backToCommands(.model),
+            .left => try self.backToCommands(.model),
             .right => picker.query.right(),
             .home => picker.query.cursor = 0,
             .end => picker.query.cursor = picker.query.bytes.items.len,
@@ -1407,7 +1348,7 @@ const Ui = struct {
             },
             .up, .down, .enter => {
                 const state = self.connection.current();
-                const model_state = self.pickerState(state);
+                const model_state = state;
                 const choices = try picker.choicesWithProviders(self.allocator, model_state.selection_name orelse model_state.model, model_state.context_limit, model_state.models, model_state.model_disabled, model_state.model_providers);
                 defer self.allocator.free(choices);
                 if (event_ == .enter) {
@@ -1420,17 +1361,8 @@ const Ui = struct {
                     const name = try picker.selectionName(self.allocator, choice);
                     defer self.allocator.free(name);
                     if (!picker.modelShown(name)) return;
-                    if (self.decision_model_picker) {
-                        // Even a failed save consumes this acknowledgement and
-                        // discards the same read batch's remaining input.
-                        picker.generation +%= 1;
-                        picker.drawn_model_len = null;
-                        self.displayed_model_generation = null;
-                        self.displayed_model_epoch = null;
-                        self.parser.stop_feed = true;
-                    }
                     self.selectModel(name) catch {
-                        self.notice = if (self.decision_model_picker) "Could not save decision model; previous value kept" else "Could not switch; selection is unchanged";
+                        self.notice = "Could not switch; selection is unchanged";
                     };
                 } else picker.move(event_ == .down, choices.len);
             },
@@ -1874,7 +1806,7 @@ const Ui = struct {
         const state = self.connection.current();
         if (before.pending_default_effort != null and state.pending_default_effort == null and
             state.effort_levels.contains(state.reasoning_effort))
-            self.effort_flash = .{ .level = state.reasoning_effort.canonical(), .until_ms = self.clock_ms +| 2000 };
+            self.effort_flash = .{ .level = state.reasoning_effort, .until_ms = self.clock_ms +| 2000 };
         if (self.model_picker) |*picker| picker.changed();
         self.displayed_model_generation = null;
         if (state.metadata_notice) |notice| self.notice = notice;
@@ -2015,6 +1947,8 @@ const Ui = struct {
         self.displayed_command_generation = null;
         self.displayed_provider_generation = null;
         self.displayed_settings_generation = null;
+        self.displayed_decision_fingerprint = null;
+        self.frame_decision_fingerprint = null;
         self.frame_fresh = false;
         if (self.tail_snapshot) |*snapshot| snapshot.deinit();
         self.tail_snapshot = null;
@@ -2060,6 +1994,7 @@ const Ui = struct {
         self.displayed_command_generation = if (self.frame_fresh) self.frame_command_generation else null;
         self.displayed_provider_generation = if (self.frame_fresh) self.frame_provider_generation else null;
         self.displayed_settings_generation = if (self.frame_fresh) self.frame_settings_generation else null;
+        self.displayed_decision_fingerprint = if (self.frame_fresh and self.displayed_settings_generation != null) self.frame_decision_fingerprint else null;
         self.tail_height = self.frame_height;
         self.tail_size = self.frame_size;
         for (self.records.items) |*record| {
@@ -2355,16 +2290,14 @@ const Ui = struct {
         const footer_rows: usize = 2 + @as(usize, @intFromBool(hint_line.len != 0));
         const body_limit = self.size.rows -| footer_rows;
         const candidate_limit = body_limit -| 1; // Separate candidates from conversation even in short windows.
-        const model_state = self.pickerState(state);
+        const model_state = state;
         const picker_rows = if (self.model_picker) |*picker| try picker.rowsWithProviders(a, model_state.selection_name orelse model_state.model, model_state.context_limit, model_state.models, cols, candidate_limit, .{ .current = model_state.context_official, .models = model_state.model_context_official }, model_state.model_disabled, model_state.model_providers) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
         if (self.model_picker) |*picker| try picker.captureChoice(a, picker_rows.selected_choice);
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, candidate_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
-        var settings_rows = if (self.settings_open and self.settings_value_picker != null) try settings_value_module.rows(a, self.settings_menu, self.settings_value_picker.?, cols, candidate_limit) else if (self.settings_open and self.decision_open) try decision_picker_module.rowsWithTimeout(a, self.settings_menu, state.decision_timeout_ms, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, .{
+        var settings_rows = if (self.settings_open and self.settings_value_picker != null) try settings_value_module.rows(a, self.settings_menu, self.settings_value_picker.?, cols, candidate_limit) else if (self.settings_open and self.decision_open) try decision_picker_module.rows(a, self.settings_menu, state.decision_models, state.model_providers, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, .{
             .low_price_input_enabled = state.low_price_input_enabled,
             .decision_enabled = state.decision_enabled,
-            .decision_configured = state.decision_configured,
-            .decision_jev_free = state.decision_jev_free,
             .global_settings_available = state.global_settings_available,
             .limits = state.limits,
         }, cols, candidate_limit) else settings_menu_module.Rows{ .lines = &.{} };
@@ -2372,6 +2305,7 @@ const Ui = struct {
             settings_rows.can_confirm = settings_rows.can_confirm and text.width(settingsValueTitle(picker.key)) <= cols;
         }
         self.frame_settings_generation = null;
+        self.frame_decision_fingerprint = null;
         const menu_visible = self.commandMenuVisible();
         const menu_rows = if (menu_visible) try command_menu_module.rows(a, self.command_matches, self.command_menu.selected, cols, candidate_limit) else command_menu_module.Rows{ .lines = &.{} };
         if (menu_visible) self.command_menu.selected = @min(self.command_menu.selected, self.command_matches.len - 1);
@@ -2508,7 +2442,10 @@ const Ui = struct {
                 try putCandidateLine(writer, a, 1 + content_body_rows + @min(popup_gap, body_rows -| popup_span) + line, popup_lines[line], cols, tone, checked_mask & (@as(u16, 1) << @intCast(line)) != 0);
             }
             if (popup_span == popup_lines.len) {
-                if (self.settings_open and settings_rows.can_confirm) self.frame_settings_generation = self.settings_menu.generation;
+                if (self.settings_open and settings_rows.can_confirm) {
+                    self.frame_settings_generation = self.settings_menu.generation;
+                    if (self.decision_open) self.frame_decision_fingerprint = decision_picker_module.fingerprint(state.decision_models, state.model_providers);
+                }
                 if (self.provider_open and provider_rows.can_confirm) self.frame_provider_generation = self.provider_picker.generation;
                 if (self.model_picker) |picker| {
                     if (picker_rows.can_confirm) {
@@ -5023,7 +4960,7 @@ const SelectionFixture = struct {
     limit: u32 = 32768,
     low_price_input: bool = false,
     settings_notice: ?[]const u8 = null,
-    effort: shared.ReasoningEffort = .none,
+    effort: shared.ReasoningEffort = .off,
     levels: shared.activity.EffortSet = .{ .mask = 0x3f },
     selections: usize = 0,
     cycles: usize = 0,
@@ -5032,7 +4969,7 @@ const SelectionFixture = struct {
     provider_hint: ?core_config.providers.Id = null,
     configured_providers: u8 = 0,
     profiles_override: ?[]const core_config.Model = null,
-    model_providers: ?[]const ModelProvider = null,
+    model_providers: []const ModelProvider = &.{.{ .name = "fixture", .allow_custom = true }},
     disabled_models: []const bool = &.{},
     refreshes: usize = 0,
     metadata_changed: bool = false,
@@ -5040,7 +4977,7 @@ const SelectionFixture = struct {
     metadata_effort: ?shared.ReasoningEffort = null,
     key_matched: bool = false,
     fail: bool = false,
-    const profiles = [_]core_config.Model{.{ .name = "fixture-next", .context_tokens = 65536 }};
+    const profiles = [_]core_config.Model{.{ .name = "fixture/fixture-next", .context_tokens = 65536 }};
     fn refreshMetadata(ctx: *anyopaque) !void {
         const self: *SelectionFixture = @ptrCast(@alignCast(ctx));
         self.refreshes += 1;
@@ -5061,7 +4998,7 @@ const SelectionFixture = struct {
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default };
+        return .{ .runtime = null, .model = self.name, .selection_name = if (std.mem.eql(u8, self.name, "fixture-old")) "fixture/fixture-old" else if (std.mem.eql(u8, self.name, "fixture-next")) "fixture/fixture-next" else self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;
@@ -5077,7 +5014,8 @@ const SelectionFixture = struct {
     fn select(raw: *anyopaque, name: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.fail) return error.TestSelectionFailure;
-        const copy = try std.testing.allocator.dupe(u8, name);
+        const local = if (std.mem.startsWith(u8, name, "fixture/")) name["fixture/".len..] else name;
+        const copy = try std.testing.allocator.dupe(u8, local);
         if (self.owned) |old| std.testing.allocator.free(old);
         self.owned = copy;
         self.name = copy;
@@ -5096,6 +5034,9 @@ const SelectionFixture = struct {
 };
 
 test "unselected startup prompts login and model with no placeholder ID or budget" {
+    const owner_default: Connection.State = .{ .runtime = null, .model = "fixture/hidden", .base_url = "" };
+    try std.testing.expect(@TypeOf(owner_default.model_providers) == []const ModelProvider);
+    try std.testing.expectEqual(@as(usize, 0), owner_default.model_providers.len);
     try text.initLocale();
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -5357,14 +5298,13 @@ const DecisionModelFixture = struct {
         self.saved_len = name.len;
         self.state.decision_model = self.saved[0..name.len];
         self.state.decision_enabled = true;
-        self.state.decision_configured = true;
     }
     fn connection(self: *@This()) Connection {
         return .{ .context = self, .current_fn = current, .configure_fn = configure, .select_model_fn = mainSelect, .decision_fn = choose };
     }
 };
 
-test "Decision generic picker isolates purpose and consumes failed save ACK and input batch" {
+test "Decision direct list isolates selection and consumes failed save ACK and input batch" {
     try text.initLocale();
     var fixture: DecisionModelFixture = .{};
     var cancel: p.Cancellation = .{};
@@ -5379,13 +5319,9 @@ test "Decision generic picker isolates purpose and consumes failed save ACK and 
     try ui.draw();
     ui.finishFrame();
     try ui.parser.feed("\r", sink);
-    try ui.parser.feed("\x1b[B\x1b[B", sink);
-    try ui.draw();
-    ui.finishFrame();
-    try ui.parser.feed("\r\r\x1b[B", sink);
-    try std.testing.expect(ui.decision_model_picker and ui.model_picker != null and !ui.settings_open);
-    try std.testing.expectEqual(@as(usize, 0), ui.model_picker.?.selected);
-    try std.testing.expect(!ui.model_picker.?.allow_custom);
+    try ui.parser.feed("\x1b[B", sink);
+    try std.testing.expect(ui.settings_open and ui.decision_open and ui.model_picker == null);
+    try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "login/family/judge") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "unlogged/private-model") == null);
@@ -5394,6 +5330,33 @@ test "Decision generic picker isolates purpose and consumes failed save ACK and 
     ui.frame_offset = 1;
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    ui.finishFrame();
+    // Same-index rename, protocol-only replacement, and logout all revoke ACK.
+    var replacement = DecisionModelFixture.profiles;
+    for (0..3) |scenario| {
+        if (scenario != 0) try ui.draw();
+        replacement = DecisionModelFixture.profiles;
+        switch (scenario) {
+            0 => {
+                replacement[0].name = "login/replaced/Judge";
+                fixture.state.decision_models = &replacement;
+            },
+            1 => {
+                replacement[0].protocol = .responses;
+                fixture.state.decision_models = &replacement;
+            },
+            2 => fixture.state.model_providers = &.{},
+            else => unreachable,
+        }
+        if (scenario != 0) ui.finishFrame(); // Publish only the frame's old identity.
+        try ui.parser.feed("\r\r", sink);
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+        fixture.state.decision_models = &DecisionModelFixture.profiles;
+        fixture.state.model_providers = &DecisionModelFixture.logged;
+        try ui.parser.feed("\r", sink); // Owner ABA cannot restore consumed ACK.
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    }
+    try ui.draw();
     ui.finishFrame();
     // The same raw ID on a different newly visible alias cannot inherit ACK.
     fixture.state.model_providers = &DecisionModelFixture.other;
@@ -5412,7 +5375,7 @@ test "Decision generic picker isolates purpose and consumes failed save ACK and 
     fixture.fail = true;
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(ui.decision_model_picker and !fixture.state.decision_enabled);
+    try std.testing.expect(ui.decision_open and !fixture.state.decision_enabled);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     fixture.fail = false;
@@ -5423,15 +5386,18 @@ test "Decision generic picker isolates purpose and consumes failed save ACK and 
     try std.testing.expectEqualStrings("login/family/judge", fixture.saved[0..fixture.saved_len]);
     try std.testing.expectEqual(@as(usize, 0), fixture.main_calls);
     try std.testing.expectEqualStrings("primary", fixture.state.model);
-    try std.testing.expect(ui.settings_open and !ui.decision_open and !ui.decision_model_picker);
+    try std.testing.expect(ui.settings_open and !ui.decision_open and ui.model_picker == null);
     try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
-    ui.openDecisionModelPicker();
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(ui.decision_open and ui.settings_menu.selected == 1);
     try ui.parser.feed("\x1b[D\r", sink);
-    try std.testing.expect(ui.settings_open and ui.decision_open and ui.settings_menu.selected == 2);
+    try std.testing.expect(ui.settings_open and !ui.decision_open and ui.settings_menu.selected == 1);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }
 
-test "Decision generic picker fails closed for missing providers ghost IDs custom input and paste" {
+test "Decision direct list offers Off without providers and ignores custom input and paste" {
     try text.initLocale();
     var fixture: DecisionModelFixture = .{};
     var cancel: p.Cancellation = .{};
@@ -5442,25 +5408,28 @@ test "Decision generic picker fails closed for missing providers ghost IDs custo
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     fixture.state.decision_model = "login/ghost-current";
-    fixture.state.model_providers = null;
-    ui.openDecisionModelPicker();
+    fixture.state.model_providers = &.{};
+    ui.openSettingsMenu();
+    ui.decision_open = true;
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "login/family/judge") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "ghost-current") == null);
-    try std.testing.expect(ui.frame_model_generation == null);
+    try std.testing.expect(ui.frame_settings_generation != null); // Off remains available.
     ui.finishFrame();
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     fixture.state.model_providers = &DecisionModelFixture.logged;
+    try ui.parser.feed("\r", sink); // Availability changed since ACK, even for Off.
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.parser.feed("arbitrary-raw-id", sink);
+    ui.settings_menu.selected = 1;
     try ui.draw();
-    try std.testing.expect(ui.frame_model_generation == null);
+    try std.testing.expect(ui.model_picker == null);
+    ui.finishFrame();
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(ui.settings_open and !ui.decision_open and ui.settings_menu.selected == 1);
+    try ui.draw();
     ui.finishFrame();
     try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    try Ui.key(&ui, .escape);
-    try std.testing.expect(ui.settings_open and ui.decision_open and ui.settings_menu.selected == 2);
-    ui.openDecisionModelPicker();
+    try std.testing.expect(ui.decision_open);
     try ui.draw();
     ui.finishFrame();
     try ui.parser.feed("\x1b[200~login/family/judge\x1b[201~\r", sink);
@@ -5472,7 +5441,7 @@ test "Decision generic picker fails closed for missing providers ghost IDs custo
 }
 
 const PreferenceFixture = struct {
-    state: Connection.State = .{ .runtime = null, .model = "unchanged-primary", .base_url = "", .decision_configured = true, .decision_timeout_ms = 30000 },
+    state: Connection.State = .{ .runtime = null, .model = "unchanged-primary", .base_url = "" },
     calls: usize = 0,
     fail: bool = false,
     fn current(raw: *anyopaque) Connection.State {
@@ -5489,7 +5458,6 @@ const PreferenceFixture = struct {
             .request_timeout_ms => self.state.limits.request_timeout_ms = value.?,
             .max_output_tokens => self.state.limits.max_output_tokens = value,
             .task_timeout_ms => self.state.limits.task_timeout_ms = value.?,
-            .decision_timeout_ms => self.state.decision_timeout_ms = value,
         }
     }
     fn connection(self: *@This()) Connection {
@@ -5601,11 +5569,9 @@ test "settings custom input stages before a second fresh ACK and output Auto is 
     try std.testing.expect(fixture.state.limits.max_output_tokens == null);
 }
 
-test "settings auxiliary timeout requires declaration and pasted numbers never save" {
+test "settings shared request timeout rejects pasted numbers and preserves parent" {
     try text.initLocale();
     var fixture: PreferenceFixture = .{};
-    fixture.state.decision_configured = false;
-    fixture.state.decision_timeout_ms = null;
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -5614,13 +5580,8 @@ test "settings auxiliary timeout requires declaration and pasted numbers never s
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.decision_open = true;
-    ui.settings_menu.selected = 3;
-    ui.openSettingsValue(.decision_timeout_ms, fixture.state);
-    try std.testing.expect(ui.settings_value_picker == null);
-    fixture.state.decision_configured = true;
-    fixture.state.decision_timeout_ms = 30000;
-    ui.openSettingsValue(.decision_timeout_ms, fixture.state);
+    ui.settings_menu.selected = 4;
+    ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
     ui.finishFrame();
@@ -5634,21 +5595,21 @@ test "settings auxiliary timeout requires declaration and pasted numbers never s
     try ui.parser.feed("\x1b[D\r", sink);
     try std.testing.expect(!ui.settings_value_picker.?.editing);
     try ui.parser.feed("\x1b[D\r", sink);
-    try std.testing.expect(ui.settings_value_picker == null and ui.decision_open and ui.settings_menu.selected == 3);
-    ui.openSettingsValue(.decision_timeout_ms, fixture.state);
+    try std.testing.expect(ui.settings_value_picker == null and !ui.decision_open and ui.settings_menu.selected == 4);
+    ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try preferenceOption(ui.settings_value_picker.?, 60000);
     try ui.draw();
     ui.finishFrame();
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expectEqual(@as(?u32, 60000), fixture.state.decision_timeout_ms);
-    try std.testing.expect(ui.decision_open and !fixture.state.decision_enabled and ui.settings_menu.selected == 3);
+    try std.testing.expectEqual(@as(u32, 60000), fixture.state.limits.request_timeout_ms);
+    try std.testing.expect(!ui.decision_open and !fixture.state.decision_enabled and ui.settings_menu.selected == 4);
 }
 
 test "settings callbacks owner publication ACK paste batch and cursor" {
     try text.initLocale();
     const Fixture = struct {
-        state: Connection.State = .{ .runtime = null, .model = "fixture", .base_url = "", .decision_configured = true },
+        state: Connection.State = .{ .runtime = null, .model = "fixture", .base_url = "", .decision_models = &DecisionModelFixture.profiles, .model_providers = &DecisionModelFixture.logged },
         calls: usize = 0,
         fail: bool = false,
         fn current(raw: *anyopaque) Connection.State {
@@ -5661,8 +5622,10 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
             self.calls += 1;
             if (self.fail) return error.SaveFailed;
             self.state.decision_enabled = choice != .off;
-            self.state.decision_jev_free = choice == .opencode_jev_free;
-            self.state.decision_configured = choice != .off;
+            self.state.decision_model = switch (choice) {
+                .off => null,
+                .model => |name| name,
+            };
             self.state.initial_context = .{ .tokens = 42, .limit = 100 };
         }
         fn save(raw: *anyopaque, setting: Connection.Setting, enabled: bool) !void {
@@ -5713,15 +5676,16 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     try ui.parser.feed("\r", sink); // Partial child output cannot confirm.
     try std.testing.expectEqual(before_choice, fixture.calls);
     ui.finishFrame();
-    fixture.state.decision_configured = false; // Preset may be saved with no declaration/key.
+    // Save the direct identity without changing chat.
     try ui.parser.feed("\r\r\x1b[A", sink);
-    try std.testing.expect(fixture.state.decision_enabled and fixture.state.decision_jev_free);
+    try std.testing.expect(fixture.state.decision_enabled);
+    try std.testing.expectEqualStrings("login/family/judge", fixture.state.decision_model.?);
     try std.testing.expect(!ui.decision_open and ui.settings_menu.selected == 1);
     try std.testing.expectEqual(@as(u32, 42), ui.display.context.?.tokens);
     fixture.fail = true;
     try ui.draw();
     ui.finishFrame();
-    try ui.parser.feed("\r", sink); // Open selected Jev, not toggle.
+    try ui.parser.feed("\r", sink); // Open the selected model, not toggle.
     try std.testing.expect(ui.decision_open);
     try ui.parser.feed("\x1b[A", sink); // Off.
     try ui.draw();
@@ -5778,7 +5742,7 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
 test "decision child requires full fresh unclipped ACK and never saves pasted batch tails" {
     try text.initLocale();
     const Fixture = struct {
-        state: Connection.State = .{ .runtime = null, .model = "", .base_url = "" },
+        state: Connection.State = .{ .runtime = null, .model = "", .base_url = "", .decision_models = &DecisionModelFixture.profiles, .model_providers = &DecisionModelFixture.logged },
         calls: usize = 0,
         fn current(raw: *anyopaque) Connection.State {
             return @as(*@This(), @ptrCast(@alignCast(raw))).state;
@@ -5788,7 +5752,10 @@ test "decision child requires full fresh unclipped ACK and never saves pasted ba
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             self.state.decision_enabled = choice != .off;
-            self.state.decision_jev_free = choice == .opencode_jev_free;
+            self.state.decision_model = switch (choice) {
+                .off => null,
+                .model => |name| name,
+            };
         }
     };
     var fixture: Fixture = .{};
@@ -5821,7 +5788,7 @@ test "decision child requires full fresh unclipped ACK and never saves pasted ba
     ui.resize(.{ .columns = 17, .rows = size.rows });
     try ui.draw();
     ui.finishFrame();
-    try ui.parser.feed("\r", sink); // Jev identifier clipped by one cell.
+    try ui.parser.feed("\r", sink); // Complete provider/raw ID does not fit.
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     ui.resize(size);
     try ui.draw();
@@ -5897,13 +5864,13 @@ test "menus stay above composer share colors and Left returns to acknowledged pa
     ui.finishFrame();
     try ui.parser.feed("\r", sink);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ "✓" ++ theme.accent ++ " fixture-old") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.muted ++ "    fixture-next") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ "✓" ++ theme.accent ++ " fixture/fixture-old") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.muted ++ "    fixture/fixture-next") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "Search> " ++ theme.reset) != null);
     try screen.replay(ui.frame);
     ui.finishFrame();
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[20], "> ~ fixture-old"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], "    fixture-next"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[20], "> ~ fixture/fixture-old"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], "    fixture/fixture-next"));
     try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "Search> "));
     try ui.parser.feed("\t\x1b[5~\x1b[6~", sink);
     try std.testing.expectEqual(@as(usize, 0), ui.model_picker.?.selected);
@@ -5920,7 +5887,7 @@ test "model popup shows at most ten bottom rows and keeps the selected item visi
     defer arena.deinit();
     var profiles: [12]core_config.Model = undefined;
     for (&profiles, 0..) |*profile, index| profile.* = .{
-        .name = try std.fmt.allocPrint(arena.allocator(), "menu-{d:0>2}", .{index}),
+        .name = try std.fmt.allocPrint(arena.allocator(), "fixture/menu-{d:0>2}", .{index}),
         .context_tokens = 32768,
     };
     var cancel: p.Cancellation = .{};
@@ -5934,7 +5901,7 @@ test "model popup shows at most ten bottom rows and keeps the selected item visi
     ui.openModelPicker();
     try ui.modelKey(.up);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ ">   menu-11") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ ">   fixture/menu-11") != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     ui.finishFrame();
@@ -5943,8 +5910,8 @@ test "model popup shows at most ten bottom rows and keeps the selected item visi
         count += 1;
     };
     try std.testing.expectEqual(@as(usize, 10), count);
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[12], "    menu-02"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], ">   menu-11"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[12], "    fixture/menu-02"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], ">   fixture/menu-11"));
     try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "Search> "));
 }
 
@@ -6313,7 +6280,7 @@ test "effort confirmation expires after two seconds and repeated switches restar
     fixture.fail = false;
     ui.cycleEffort();
     try ui.selectModel("fixture-next");
-    try std.testing.expectEqual(fixture.effort.canonical(), ui.effort_flash.?.level);
+    try std.testing.expectEqual(fixture.effort, ui.effort_flash.?.level);
     try std.testing.expectEqual(@as(u64, 6500), ui.effort_flash.?.until_ms);
 }
 
@@ -6884,7 +6851,7 @@ test "effort shortcut waits for queued and borrowed bridge items" {
         const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
         try ui.parser.feed("\x1b[Z", sink);
         try std.testing.expectEqual(@as(usize, 0), fixture.cycles);
-        try std.testing.expectEqual(shared.ReasoningEffort.none, fixture.effort);
+        try std.testing.expectEqual(shared.ReasoningEffort.off, fixture.effort);
         if (held) |*item| {
             item.deinit();
             held = null;

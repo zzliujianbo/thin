@@ -37,7 +37,6 @@ test "preferences pure edits enforce shared validation without partial mutation"
     var parsed = try cfg.parse(a, reviewed);
     defer cfg.release(&parsed);
     for (main_edits) |edit| try preference.apply(&parsed.value, edit.key, edit.value);
-    try preference.apply(&parsed.value, .decision_timeout_ms, 3600000);
     try preference.apply(&parsed.value, .request_timeout_ms, 86400000);
     try preference.apply(&parsed.value, .task_timeout_ms, 86400000);
     try preference.apply(&parsed.value, .max_output_tokens, 1024 * 1024);
@@ -54,9 +53,6 @@ test "preferences pure edits enforce shared validation without partial mutation"
         .{ .key = .task_timeout_ms, .value = null },
         .{ .key = .task_timeout_ms, .value = 0 },
         .{ .key = .task_timeout_ms, .value = 86400001 },
-        .{ .key = .decision_timeout_ms, .value = null },
-        .{ .key = .decision_timeout_ms, .value = 0 },
-        .{ .key = .decision_timeout_ms, .value = 3600001 },
         .{ .key = .max_output_tokens, .value = 0 },
         .{ .key = .max_output_tokens, .value = 1023 },
         .{ .key = .max_output_tokens, .value = 1024 * 1024 + 1 },
@@ -67,7 +63,8 @@ test "preferences pure edits enforce shared validation without partial mutation"
         try std.testing.expectEqualDeep(before, parsed.value);
     }
     parsed.value.decision = null;
-    try std.testing.expectError(error.DecisionNotConfigured, preference.apply(&parsed.value, .decision_timeout_ms, 500));
+    try preference.apply(&parsed.value, .request_timeout_ms, 500);
+    try std.testing.expectEqual(@as(u32, 500), parsed.value.limits.request_timeout_ms);
     try std.testing.expect(parsed.value.decision == null);
 }
 
@@ -93,7 +90,7 @@ test "preferences active clone preserves unrelated frozen limits and rejects inv
     try std.testing.expectEqual(@as(?u32, 4096), candidate.value.limits.summary_tokens);
 }
 
-test "preferences preserve primary client auth session history usage and auxiliary on main edits" {
+test "preferences preserve frozen primary while only shared request timeout refreshes auxiliary" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
@@ -122,6 +119,8 @@ test "preferences preserve primary client auth session history usage and auxilia
     app.runtime.last_context_tokens = 1234;
     const estimator = app.runtime.estimator;
     for (main_edits) |edit| {
+        // Shared request timeout alone rebuilds the independent reviewer below.
+        if (edit.key == .request_timeout_ms) continue;
         try set(&session, edit.key, edit.value);
         try std.testing.expect(&app.client == primary and app.client.authorization.ptr == auth);
         try std.testing.expect(app.decision_client.? == aux and aux.calls == 7);
@@ -140,25 +139,49 @@ test "preferences preserve primary client auth session history usage and auxilia
     defer a.free(saved);
     const active_arena = app.config.arena;
     try session.store.root.writeMode(cfg.file_name, "{}", true, 0o600);
-    try std.testing.expectError(error.AuthVersionConflict, set(&session, .decision_timeout_ms, 45678));
+    try std.testing.expectError(error.AuthVersionConflict, set(&session, .request_timeout_ms, 45678));
     try std.testing.expect(app.config.arena == active_arena and app.decision_client.? == aux);
     try std.testing.expectEqualDeep(aux_usage, aux.last_usage);
-    try std.testing.expectEqual(@as(?u32, 30000), session.connection().current().decision_timeout_ms);
+    try std.testing.expectEqual(frozen.value.limits.request_timeout_ms, session.connection().current().limits.request_timeout_ms);
     try session.store.root.writeMode(cfg.file_name, saved, true, 0o600);
-    try set(&session, .decision_timeout_ms, 45678);
+    try set(&session, .request_timeout_ms, 45678);
     try std.testing.expect(app.decision_client.? != aux);
     try std.testing.expect(app.decision_client.?.calls == 0);
     try std.testing.expect(&app.client == primary and app.client.authorization.ptr == auth);
-    try std.testing.expectEqual(@as(?u32, 45678), session.connection().current().decision_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 45678), session.connection().current().limits.request_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 45678), app.decision_client.?.source.value.limits.request_timeout_ms);
     const connection = session.connection();
     try connection.decision_fn.?(connection.context, .off);
-    try set(&session, .decision_timeout_ms, 56789);
+    try set(&session, .request_timeout_ms, 56789);
     try std.testing.expect(app.decision_client == null and !session.connection().current().decision_enabled);
-    try std.testing.expectEqual(@as(?u32, 56789), session.connection().current().decision_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 56789), session.connection().current().limits.request_timeout_ms);
     var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer restarted.deinit();
     try std.testing.expectEqualDeep(app.config.value.limits, restarted.app.?.config.value.limits);
-    try std.testing.expectEqual(@as(?u32, 56789), restarted.connection().current().decision_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 56789), restarted.connection().current().limits.request_timeout_ms);
+}
+
+test "shared request timeout saves without a decision declaration" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try seed(home, plain);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    defer session.deinit();
+    const auth = session.app.?.client.authorization.ptr;
+    try set(&session, .request_timeout_ms, 54321);
+    try std.testing.expect(session.app.?.decision_client == null);
+    try std.testing.expect(session.global_config.?.value.decision == null);
+    try std.testing.expect(session.app.?.client.authorization.ptr == auth);
+    var saved = try session.store.loadExisting();
+    defer cfg.release(&saved);
+    try std.testing.expect(saved.value.decision == null);
+    try std.testing.expectEqual(@as(u32, 54321), saved.value.limits.request_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 54321), session.connection().current().limits.request_timeout_ms);
 }
 
 test "preferences invalid guards CAS and active validation never publish or save" {
@@ -178,8 +201,7 @@ test "preferences invalid guards CAS and active validation never publish or save
     const auth = app.client.authorization.ptr;
     const initial = try disk(&session);
     defer a.free(initial);
-    try std.testing.expect(session.connection().current().decision_timeout_ms == null);
-    try std.testing.expectError(error.DecisionNotConfigured, set(&session, .decision_timeout_ms, 500));
+    try std.testing.expect(session.global_config.?.value.decision == null);
     try std.testing.expectError(error.InvalidLimit, set(&session, .request_timeout_ms, 0));
     session.read_only = true;
     try std.testing.expectError(error.ResumeReadOnly, set(&session, .compaction_enabled, 0));
@@ -302,7 +324,7 @@ test "preferences restored missing provider preserves pending history while savi
     defer a.free(selection);
     try std.testing.expectEqualStrings("route/first", selection);
     for (main_edits) |edit| try set(&restored, edit.key, edit.value);
-    try set(&restored, .decision_timeout_ms, 60000);
+    try set(&restored, .request_timeout_ms, 60000);
     try connection.decision_fn.?(connection.context, .off);
     try connection.setting_fn.?(connection.context, .low_price_input, true);
     try std.testing.expect(restored.app == null and restored.pending.?.value.selection_pending);
@@ -315,9 +337,9 @@ test "preferences restored missing provider preserves pending history while savi
     defer cfg.release(&saved);
     try std.testing.expectEqualStrings("other/next", saved.value.registry.?.default);
     try std.testing.expectError(error.InvalidConfig, cfg.validatePendingSettings(saved.value));
-    try std.testing.expectEqual(@as(u32, 20000), saved.value.limits.request_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 60000), saved.value.limits.request_timeout_ms);
     try std.testing.expect(saved.value.limits.low_price_input and !saved.value.decision.?.enabled);
-    try std.testing.expectEqual(@as(u32, 60000), saved.value.decision.?.request_timeout_ms);
+    try std.testing.expectEqualStrings("other/judge", saved.value.decision.?.model);
     const before = try disk(&restored);
     defer a.free(before);
     // An unresolved route does not excuse an invalid frozen budget.
@@ -331,6 +353,6 @@ test "preferences restored missing provider preserves pending history while savi
     try restored.store.root.writeMode(cfg.file_name, "{}", true, 0o600);
     try std.testing.expectError(error.AuthVersionConflict, set(&restored, .request_timeout_ms, 30000));
     try std.testing.expect(restored.pending.?.arena == arena and restored.app == null);
-    try std.testing.expectEqual(@as(u32, 20000), restored.pending.?.value.limits.request_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 60000), restored.pending.?.value.limits.request_timeout_ms);
     try std.testing.expect(connection.initial_history_fn.?(connection.context).ptr == history.ptr);
 }

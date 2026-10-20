@@ -27,12 +27,20 @@ test "executor selects decision-aware descriptions without changing tool paramet
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
     var config = configuration;
+    config.registry = .{ .default = "judge/fake", .providers = &.{.{
+        .name = "judge",
+        .connection = .{ .base_url = "https://fixture.invalid/v1", .api_key = "fake-reviewer" },
+        .models = &.{
+            .{ .name = "fake", .patch = .{ .protocol = .chat, .context_tokens = 32768 } },
+            .{ .name = "native/raw", .patch = .{ .protocol = .systemone } },
+        },
+    }} };
     var tools = t.Tools{ .root = &root, .memory = &store, .config = &config, .environment = &environment };
     const plain = tools.executor().schemas;
     try std.testing.expect(std.mem.indexOf(u8, plain[2].description, "decision review disabled") != null);
     for ([_]cfg.DecisionConfig{
         .{ .model = "judge/fake" },
-        .{ .model = "judge/jev-fixture", .backend = .systemone },
+        .{ .model = "judge/native/raw" },
     }) |decision| {
         config.decision = decision;
         const reviewed = tools.executor().schemas;

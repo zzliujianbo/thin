@@ -122,7 +122,6 @@ pub const Picker = struct {
         const maximum: u32 = switch (self.key) {
             .command_timeout_ms => self.limits.command_max_timeout_ms,
             .request_timeout_ms, .task_timeout_ms => 86400000,
-            .decision_timeout_ms => 3600000,
             .max_output_tokens => 1024 * 1024,
             .compaction_enabled => unreachable,
         };
@@ -275,9 +274,9 @@ test "value constraints include auto command maximum summary and timeout bounds"
     try std.testing.expectError(error.InvalidValue, command.validate(1001));
     try command.validate(1000);
     try std.testing.expectEqual(@as(?u32, 123), try command.chosen(command.find(123).?));
-    for ([_]Key{ .request_timeout_ms, .task_timeout_ms, .decision_timeout_ms }) |key| {
+    for ([_]Key{ .request_timeout_ms, .task_timeout_ms }) |key| {
         const picker = Picker.init(key, 300000, .{});
-        const maximum: u32 = if (key == .decision_timeout_ms) 3600000 else 86400000;
+        const maximum: u32 = 86400000;
         try picker.validate(maximum);
         try std.testing.expectError(error.InvalidValue, picker.validate(maximum + 1));
         try std.testing.expectError(error.InvalidValue, picker.validate(null));

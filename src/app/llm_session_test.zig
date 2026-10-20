@@ -633,14 +633,18 @@ test "llm Session manual effort and resolved metadata map stay frozen across sta
         \\{"llm":{"default":"go/gpt-5.6-luna","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key_env":"GO_KEY","models":{"gpt-5.6-luna":{"context_tokens":65536,"reasoning_effort":"high"}}}}}}
     );
     const catalog = @import("provider_catalog.zig");
-    const index = for (catalog.entries, 0..) |entry, i| {
-        if (entry.provider == .opencode_go and std.mem.eql(u8, entry.model.name, "gpt-5.6-luna")) break i;
+    const preset = for (catalog.entries) |entry| {
+        if (entry.provider == .opencode_go and std.mem.eql(u8, entry.model.name, "gpt-5.6-luna")) break entry;
     } else unreachable;
     {
         var store = try Store.openExisting(a, std.testing.io, home);
         defer store.deinit();
         var listing: metadata.Listing = .{};
-        listing.reasoning[index] = .{ .format = .standard, .map = .{ .low = "low", .high = "high" } };
+        listing.directory_mask = metadata.bit(.opencode_go);
+        const row = try listing.directory.upsert(.opencode_go, "gpt-5.6-luna");
+        row.available = true;
+        row.protocol = preset.model.protocol;
+        row.reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .standard, .map = .{ .low = "low", .high = "high" } });
         _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
     }
     var env = std.process.Environ.Map.init(a);
@@ -764,7 +768,8 @@ test "llm Session dynamic history loads after lost window and delisting without 
         parsed.value.selected_provider = "go";
         parsed.value.model = .{ .name = "cached.protochat", .protocol = .chat, .context_tokens = 1000000 };
         const snapshot = try selections.capture(parsed.value);
-        const payload = "{\"version\":1,\"system\":\"hello\",\"messages\":[],\"selector\":{\"configured\":\"auto\",\"selected\":null},\"estimator\":{},\"last_context_tokens\":null,\"permission_id\":0}";
+        const payload = try @import("../core/checkpoint.zig").encode(a, .{ .system = "hello", .messages = &.{}, .selector = .{ .configured = .auto, .selected = null }, .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
+        defer a.free(payload);
         const wire = try codec.encode(a, id, &snapshot, payload);
         defer a.free(wire);
         wire[wire.len - 1] = '!';
@@ -791,7 +796,7 @@ test "llm Session dynamic history loads after lost window and delisting without 
     }
 }
 
-test "llm selection optional provider name remains owned and legacy compatible" {
+test "llm selection v2 provider name remains owned and rejects legacy metadata" {
     var parsed = try cfg.parse(a, custom);
     defer cfg.release(&parsed);
     parsed.value.selected_provider = "alpha";
@@ -800,15 +805,16 @@ test "llm selection optional provider name remains owned and legacy compatible" 
     var encoded: [selections.max_bytes]u8 = undefined;
     var writer = std.Io.Writer.fixed(&encoded);
     const id = "0123456789abcdef0123456789abcdef".*;
-    try selections.encode(&writer, id, &snapshot);
-    const owned = try selections.parse(a, writer.buffered(), id);
+    try selections.encode(&writer, &snapshot);
+    const owned = try selections.parse(a, writer.buffered());
     @memset(&encoded, 0);
     try std.testing.expectEqualStrings("alpha", owned.providerName().?);
-    const framed = try codec.encode(a, id, &snapshot, "{\"version\":1,\"system\":\"\",\"messages\":[],\"selector\":{\"configured\":\"auto\",\"selected\":null},\"estimator\":{},\"last_context_tokens\":null,\"permission_id\":0}");
+    const payload = try @import("../core/checkpoint.zig").encode(a, .{ .system = "", .messages = &.{}, .selector = .{ .configured = .auto, .selected = null }, .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
+    defer a.free(payload);
+    const framed = try codec.encode(a, id, &snapshot, payload);
     defer a.free(framed);
     const envelope = try codec.inspect(a, framed, id);
     try std.testing.expectEqualStrings("alpha", envelope.selection.providerName().?);
     const legacy = "{\"version\":1,\"session\":\"0123456789abcdef0123456789abcdef\",\"provider\":null,\"endpoint\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"model\":\"legacy\",\"protocol\":\"chat\",\"effort\":null,\"effort_hash\":null}";
-    const old = try selections.parse(a, legacy, id);
-    try std.testing.expect(old.providerName() == null);
+    try std.testing.expectError(error.InvalidSelectionVersion, selections.parse(a, legacy));
 }

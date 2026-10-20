@@ -39,6 +39,11 @@ pub const Selector = struct {
     /// unsupported_protocol、尚未输出任何内容、非摘要请求且无模型历史时，改用 Chat 重试一次。
     /// 回退后无论 Chat 成败，协议都固定为 Chat。
     pub fn call(self: *Selector, model: p.Model, allocator: std.mem.Allocator, original: p.Request, sink: p.ModelSink) !Result {
+        // SystemOne is a question/threshold protocol, never a chat probe.
+        if (self.configured == .systemone or self.effective() == .systemone or original.scope.protocol == .systemone) return .{
+            .outcome = .{ .failure = .{ .kind = .unsupported_protocol, .message = "SystemOne does not support chat generation" } },
+            .calls = 0,
+        };
         // 调用前已取消：直接返回，不访问模型（calls = 0）。
         if (original.cancellation) |cancel| {
             if (cancel.isRequested()) return .{
@@ -184,6 +189,23 @@ fn testRequest() p.Request {
         .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "hello" }} }},
         .max_output_tokens = 100,
     };
+}
+
+test "SystemOne is never sent to the generative model or fallback" {
+    var selector = Selector.init(.systemone);
+    var fake = Fake{};
+    const result = try selector.call(fake.model(), std.testing.allocator, testRequest(), .{});
+    try std.testing.expectEqual(@as(u8, 0), result.calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(!result.fallback);
+    try std.testing.expectEqual(p.FailureKind.unsupported_protocol, result.outcome.failure.kind);
+    selector = Selector.init(.auto);
+    var request = testRequest();
+    request.scope.protocol = .systemone;
+    const automatic = try selector.call(fake.model(), std.testing.allocator, request, .{});
+    try std.testing.expectEqual(@as(u8, 0), automatic.calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(!selector.initial_attempted);
 }
 
 // 验证：auto 首次 Responses 失败后回退 Chat 一次，且即使 Chat 失败也保持 Chat。

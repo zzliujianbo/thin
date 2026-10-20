@@ -42,9 +42,6 @@ pub const Picker = struct {
     generation: u64 = 1,
     pasted: bool = false,
     allow_custom: bool = true,
-    /// Internal comparison mode for flat alias/raw-ID identities only.
-    /// Search and display keep their legacy local-name formatting.
-    exact_identity: bool = false,
     /// Resolved from the actual endpoint by the owner, never inferred from a name.
     provider: ?cfg.providers.Id = null,
     drawn_model: [1089]u8 = undefined,
@@ -90,11 +87,9 @@ pub const Picker = struct {
         if (choice.custom_alias) |alias| return std.fmt.allocPrint(a, "{s}/{s}", .{ alias, choice.name });
         return a.dupe(u8, choice.name);
     }
-    pub fn choicesWithProviders(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, disabled: []const bool, providers: ?[]const Provider) ![]Choice {
-        var visible = self.*;
-        visible.exact_identity = providers != null;
-        const all = try visible.choicesWithDisabled(a, current, limit, profiles, disabled);
-        const logged = providers orelse return all; // Legacy owner compatibility only.
+    pub fn choicesWithProviders(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, disabled: []const bool, providers: []const Provider) ![]Choice {
+        const all = try self.candidates(a, current, limit, profiles, disabled);
+        const logged = providers;
         errdefer a.free(all);
         var count: usize = 0;
         for (all) |candidate| {
@@ -109,13 +104,6 @@ pub const Picker = struct {
                     choice.custom_alias = entry.name;
                 } else continue;
             } else if (loggedProvider(logged, choice.name) == null) continue;
-            if (choice.current) if (choice.profile_index) |index| {
-                // Qualified registry rows are a fresh explicit confirmation,
-                // including custom aliases which have no official slug.
-                choice.uses_profile = true;
-                choice.context_tokens = profiles[index].context_tokens;
-                choice.disabled = index < disabled.len and disabled[index];
-            };
             all[count] = choice;
             count += 1;
         }
@@ -143,27 +131,19 @@ pub const Picker = struct {
         self.selected = if (down) (self.selected + 1) % count else if (self.selected == 0) count - 1 else self.selected - 1;
         self.generation +%= 1;
     }
-    pub fn choices(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model) ![]Choice {
-        return self.choicesWithDisabled(a, current, limit, profiles, &.{});
-    }
-    pub fn choicesWithDisabled(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, disabled: []const bool) ![]Choice {
+    fn candidates(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, disabled: []const bool) ![]Choice {
         var result: std.ArrayList(Choice) = .empty;
         errdefer result.deinit(a);
         const query = std.mem.trim(u8, self.query.bytes.items, " \t\r\n");
         var selected: Choice = .{ .name = current, .context_tokens = limit, .current = true };
         for (profiles, 0..) |profile, index| {
             if (!self.sameModel(profile.name, current)) continue;
-            selected.name = profile.name; // Preserve the owner's actual selection key.
             selected.profile_index = index;
-            // Catalog rows describe the next selection, not the frozen Runtime
-            // budget. Explicit raw same-name profiles retain the existing no-op.
-            // Qualified catalog rows describe an explicit fresh confirmation;
-            // raw same-name profiles retain the owner's actual current budget.
-            selected.uses_profile = self.localName(profile.name).len != profile.name.len;
-            if (selected.uses_profile) {
-                selected.context_tokens = profile.context_tokens;
-                selected.disabled = index < disabled.len and disabled[index];
-            }
+            // A registry row is a fresh explicit confirmation, including custom
+            // aliases. It describes the candidate, not the frozen Runtime budget.
+            selected.uses_profile = true;
+            selected.context_tokens = profile.context_tokens;
+            selected.disabled = index < disabled.len and disabled[index];
             break;
         }
         if (current.len != 0 and (self.matchesName(current, query) or self.matchesName(selected.name, query))) try result.append(a, selected);
@@ -188,8 +168,8 @@ pub const Picker = struct {
         return name;
     }
     fn sameModel(self: *const Picker, left: []const u8, right: []const u8) bool {
-        if (self.exact_identity) return std.mem.eql(u8, left, right);
-        return std.mem.eql(u8, self.localName(left), self.localName(right));
+        _ = self;
+        return std.mem.eql(u8, left, right);
     }
     fn matchesName(self: *const Picker, name: []const u8, query: []const u8) bool {
         return matches(name, query) or matches(self.localName(name), query);
@@ -201,16 +181,7 @@ pub const Picker = struct {
         if (self.provider) |id| return std.fmt.allocPrint(a, "{s}/{s}", .{ id.slug(), name });
         return a.dupe(u8, name); // Custom endpoints have no invented provider ID.
     }
-    pub fn rows(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, columns: usize, max_rows: usize) !Rows {
-        return self.rowsWithOrigins(a, current, limit, profiles, columns, max_rows, .{});
-    }
-    pub fn rowsWithOrigins(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, columns: usize, max_rows: usize, origins: Origins) !Rows {
-        return self.rowsWithState(a, current, limit, profiles, columns, max_rows, origins, &.{});
-    }
-    pub fn rowsWithState(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, columns: usize, max_rows: usize, origins: Origins, disabled: []const bool) !Rows {
-        return self.rowsWithProviders(a, current, limit, profiles, columns, max_rows, origins, disabled, null);
-    }
-    pub fn rowsWithProviders(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, columns: usize, max_rows: usize, origins: Origins, disabled: []const bool, providers: ?[]const Provider) !Rows {
+    pub fn rowsWithProviders(self: *const Picker, a: Allocator, current: []const u8, limit: u32, profiles: []const cfg.Model, columns: usize, max_rows: usize, origins: Origins, disabled: []const bool, providers: []const Provider) !Rows {
         const choices_ = try self.choicesWithProviders(a, current, limit, profiles, disabled, providers);
         defer a.free(choices_);
         var lines: std.ArrayList([]const u8) = .empty;
@@ -229,7 +200,7 @@ pub const Picker = struct {
             // must not reserve ellipsis cells at the expense of a complete ID.
             // Provider qualifiers remain visible even for a single-provider
             // list; display formatting never changes the owner's selection key.
-            const qualified = if (providers) |entries| loggedProvider(entries, choice.name) != null else false;
+            const qualified = loggedProvider(providers, choice.name) != null;
             const display_name = if (choice.custom_alias != null) try self.selectionName(a, choice) else if (qualified) try a.dupe(u8, choice.name) else try self.displayName(a, choice.name);
             defer a.free(display_name);
             const name = try presentation.singleLine(a, display_name, columns -| 4);
@@ -343,6 +314,14 @@ test "flat model list includes logged aliases only and preserves disabled indexe
     const empty = try picker.choicesWithProviders(a, "work-go/model-a", 1000000, &profiles, &.{}, &.{});
     defer a.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expect(@typeInfo(@TypeOf(Picker.choicesWithProviders)).@"fn".param_types[6].? == []const Provider);
+    const empty_rows = try picker.rowsWithProviders(a, "work-go/model-a", 1000000, &profiles, 100, 10, .{}, &.{}, &.{});
+    defer a.free(empty_rows.lines);
+    try std.testing.expect(empty_rows.lines.len == 0 and !empty_rows.can_confirm and empty_rows.selected_choice == null);
+    try std.testing.expect(try picker.insert("proxy/new-model", false));
+    const no_custom = try picker.choicesWithProviders(a, "proxy/current", 1000000, &profiles, &.{}, &.{});
+    defer a.free(no_custom);
+    try std.testing.expectEqual(@as(usize, 0), no_custom.len);
 }
 
 test "flat identities preserve slash raw IDs across alias profile order and current selection" {
@@ -448,18 +427,18 @@ test "unknown protocol flags stay aligned through filtering and explicit auto st
     defer picker.deinit();
     picker.allow_custom = false;
     const profiles = [_]cfg.Model{
-        .{ .name = "explicit-auto", .context_tokens = 32768, .protocol = .auto },
+        .{ .name = "opencode-go/explicit-auto", .context_tokens = 32768, .protocol = .auto },
         .{ .name = "opencode-go/new-unknown", .context_tokens = 32768, .protocol = .auto },
         .{ .name = "opencode-zen/known", .context_tokens = 32768, .protocol = .responses },
     };
     const flags = [_]bool{ false, true, false };
     try std.testing.expect(try picker.insert("new-unknown", false));
-    const choices_ = try picker.choicesWithDisabled(a, "current", 32768, &profiles, &flags);
+    const choices_ = try picker.choicesWithProviders(a, "opencode-go/current", 32768, &profiles, &flags, &.{.{ .name = "opencode-go" }});
     defer a.free(choices_);
     try std.testing.expectEqual(@as(usize, 1), choices_.len);
     try std.testing.expect(choices_[0].disabled);
     try std.testing.expectEqual(@as(?usize, 1), choices_[0].profile_index);
-    const rendered = try picker.rowsWithState(a, "current", 32768, &profiles, 120, 10, .{}, &flags);
+    const rendered = try picker.rowsWithProviders(a, "opencode-go/current", 32768, &profiles, 120, 10, .{}, &flags, &.{.{ .name = "opencode-go" }});
     defer {
         for (rendered.lines) |line| a.free(line);
         a.free(rendered.lines);
@@ -468,20 +447,20 @@ test "unknown protocol flags stay aligned through filtering and explicit auto st
     try std.testing.expect(std.mem.find(u8, rendered.lines[0], "Protocol unknown") != null);
     picker.clear();
     try std.testing.expect(try picker.insert("explicit-auto", false));
-    const explicit = try picker.choicesWithDisabled(a, "current", 32768, &profiles, &flags);
+    const explicit = try picker.choicesWithProviders(a, "opencode-go/current", 32768, &profiles, &flags, &.{.{ .name = "opencode-go" }});
     defer a.free(explicit);
     try std.testing.expectEqual(@as(usize, 1), explicit.len);
     try std.testing.expect(!explicit[0].disabled);
     // A checked qualified row is a fresh candidate, including protocol safety.
     picker.provider = .opencode_go;
     picker.clear();
-    const retained = try picker.choicesWithDisabled(a, "opencode-go/new-unknown", 65536, &profiles, &flags);
+    const retained = try picker.choicesWithProviders(a, "opencode-go/new-unknown", 65536, &profiles, &flags, &.{.{ .name = "opencode-go" }});
     defer a.free(retained);
     try std.testing.expect(retained[0].current and retained[0].disabled);
     try std.testing.expectEqual(profiles[1].context_tokens, retained[0].context_tokens);
 }
 
-test "official raw and qualified current IDs merge and show candidate capacity without changing selection key" {
+test "qualified current IDs show candidate capacity without changing selection key" {
     const a = std.testing.allocator;
     try text.initLocale();
     const profiles = [_]cfg.Model{
@@ -491,14 +470,14 @@ test "official raw and qualified current IDs merge and show candidate capacity w
     var picker = Picker.init(a);
     defer picker.deinit();
     picker.provider = .deepseek;
-    for ([_][]const u8{ "deepseek-flash", "deepseek/deepseek-flash" }) |current| {
-        const choices_ = try picker.choices(a, current, 1000000, &profiles);
+    for ([_][]const u8{"deepseek/deepseek-flash"}) |current| {
+        const choices_ = try picker.choicesWithProviders(a, current, 1000000, &profiles, &.{}, &.{.{ .name = "deepseek" }});
         defer a.free(choices_);
         try std.testing.expectEqual(@as(usize, 2), choices_.len);
         try std.testing.expect(choices_[0].current and !choices_[1].current);
         try std.testing.expectEqualStrings("deepseek/deepseek-flash", choices_[0].name);
         try std.testing.expectEqual(@as(u32, 1048576), choices_[0].context_tokens);
-        const rendered = try picker.rowsWithOrigins(a, current, 1000000, &profiles, 80, 10, .{ .models = &.{ true, true } });
+        const rendered = try picker.rowsWithProviders(a, current, 1000000, &profiles, 80, 10, .{ .models = &.{ true, true } }, &.{}, &.{.{ .name = "deepseek" }});
         defer {
             for (rendered.lines) |line| a.free(line);
             a.free(rendered.lines);
@@ -507,7 +486,7 @@ test "official raw and qualified current IDs merge and show candidate capacity w
         try std.testing.expectEqual(@as(u16, 1), rendered.checked_mask);
         try std.testing.expect(rendered.can_confirm);
         // The entire provider/model identifier must fit before confirmation.
-        const narrow = try picker.rows(a, current, 1000000, &profiles, 4 + "deepseek/deepseek-flash".len - 1, 1);
+        const narrow = try picker.rowsWithProviders(a, current, 1000000, &profiles, 4 + "deepseek/deepseek-flash".len - 1, 1, .{}, &.{}, &.{.{ .name = "deepseek" }});
         defer {
             for (narrow.lines) |line| a.free(line);
             a.free(narrow.lines);
@@ -515,7 +494,7 @@ test "official raw and qualified current IDs merge and show candidate capacity w
         try std.testing.expect(!narrow.can_confirm);
     }
     try std.testing.expect(try picker.insert("deepseek-flash", false));
-    const found = try picker.choices(a, "deepseek/deepseek-flash", 1000000, &profiles);
+    const found = try picker.choicesWithProviders(a, "deepseek/deepseek-flash", 1000000, &profiles, &.{}, &.{.{ .name = "deepseek" }});
     defer a.free(found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
     try std.testing.expect(!found[0].inherited);
@@ -526,18 +505,18 @@ test "known provider stays visible even without a qualified catalog entry" {
     var picker = Picker.init(a);
     defer picker.deinit();
     picker.provider = .deepseek;
-    const rendered = try picker.rows(a, "deepseek-flash", 1000000, &.{}, 80, 10);
+    const rendered = try picker.rowsWithProviders(a, "deepseek/deepseek-flash", 1000000, &.{}, 80, 10, .{}, &.{}, &.{.{ .name = "deepseek" }});
     defer {
         for (rendered.lines) |line| a.free(line);
         a.free(rendered.lines);
     }
     try std.testing.expectEqualStrings("> ✓ deepseek/deepseek-flash  (1M tokens; default)", rendered.lines[0]);
-    const choices_ = try picker.choices(a, "deepseek-flash", 1000000, &.{});
+    const choices_ = try picker.choicesWithProviders(a, "deepseek/deepseek-flash", 1000000, &.{}, &.{}, &.{.{ .name = "deepseek" }});
     defer a.free(choices_);
-    try std.testing.expectEqualStrings("deepseek-flash", choices_[0].name);
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", choices_[0].name);
 }
 
-test "model identity keeps providers and custom endpoints distinct and explicit raw profiles first" {
+test "model identity keeps logged providers and custom endpoints distinct" {
     const a = std.testing.allocator;
     var picker = Picker.init(a);
     defer picker.deinit();
@@ -546,32 +525,33 @@ test "model identity keeps providers and custom endpoints distinct and explicit 
         .{ .name = "opencode-go/minimax-m2.7", .context_tokens = 204800 },
     };
     picker.provider = .opencode_zen;
-    const choices_ = try picker.choices(a, "minimax-m2.7", 204800, &mixed);
+    const choices_ = try picker.choicesWithProviders(a, "opencode-zen/minimax-m2.7", 204800, &mixed, &.{}, &.{ .{ .name = "opencode-zen" }, .{ .name = "opencode-go" } });
     defer a.free(choices_);
     try std.testing.expectEqual(@as(usize, 2), choices_.len);
     try std.testing.expect(choices_[0].current and !choices_[1].current);
-    const rendered = try picker.rows(a, "minimax-m2.7", 204800, &mixed, 80, 10);
+    const rendered = try picker.rowsWithProviders(a, "opencode-zen/minimax-m2.7", 204800, &mixed, 80, 10, .{}, &.{}, &.{ .{ .name = "opencode-zen" }, .{ .name = "opencode-go" } });
     defer {
         for (rendered.lines) |line| a.free(line);
         a.free(rendered.lines);
     }
     try std.testing.expect(std.mem.find(u8, rendered.lines[0], "opencode-zen/minimax-m2.7") != null);
     try std.testing.expect(std.mem.find(u8, rendered.lines[1], "opencode-go/minimax-m2.7") != null);
-    picker.provider = null; // A custom/proxy endpoint with the same raw name is not Zen.
-    const custom = try picker.choices(a, "minimax-m2.7", 32768, &mixed);
+    picker.provider = null; // A custom alias with the same raw name is not Zen.
+    const custom = try picker.choicesWithProviders(a, "proxy/minimax-m2.7", 32768, &mixed, &.{}, &.{ .{ .name = "proxy", .allow_custom = true }, .{ .name = "opencode-zen" }, .{ .name = "opencode-go" } });
     defer a.free(custom);
     try std.testing.expectEqual(@as(usize, 3), custom.len);
-    try std.testing.expectEqualStrings("minimax-m2.7", custom[0].name);
+    try std.testing.expectEqualStrings("proxy/minimax-m2.7", custom[0].name);
     picker.provider = .deepseek;
     const explicit = [_]cfg.Model{
         .{ .name = "deepseek-flash", .context_tokens = 262144 },
         .{ .name = "deepseek/deepseek-flash", .context_tokens = 1048576 },
     };
-    const local = try picker.choices(a, "deepseek/deepseek-flash", 1000000, &explicit);
+    const local = try picker.choicesWithProviders(a, "deepseek/deepseek-flash", 1000000, &explicit, &.{}, &.{.{ .name = "deepseek" }});
     defer a.free(local);
     try std.testing.expectEqual(@as(usize, 1), local.len);
-    try std.testing.expectEqualStrings("deepseek-flash", local[0].name);
-    try std.testing.expect(!local[0].uses_profile); // Existing raw same-name no-op is preserved.
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", local[0].name);
+    try std.testing.expect(local[0].uses_profile);
+    try std.testing.expectEqual(@as(?usize, 1), local[0].profile_index);
 }
 
 test "local picker keeps current first searches metadata and labels inherited names" {
@@ -579,23 +559,23 @@ test "local picker keeps current first searches metadata and labels inherited na
     var picker = Picker.init(a);
     defer picker.deinit();
     const profiles = [_]cfg.Model{
-        .{ .name = "current", .context_tokens = 32768 },
-        .{ .name = "fast-code", .context_tokens = 65536 },
-        .{ .name = "deep-code", .context_tokens = 131072 },
+        .{ .name = "proxy/current", .context_tokens = 32768 },
+        .{ .name = "proxy/fast-code", .context_tokens = 65536 },
+        .{ .name = "proxy/deep-code", .context_tokens = 131072 },
     };
-    const all = try picker.choices(a, "current", 32768, &profiles);
+    const all = try picker.choicesWithProviders(a, "proxy/current", 32768, &profiles, &.{}, &.{.{ .name = "proxy", .allow_custom = true }});
     defer a.free(all);
     try std.testing.expectEqual(@as(usize, 3), all.len);
     try std.testing.expect(all[0].current);
-    try std.testing.expectEqualStrings("fast-code", all[1].name);
+    try std.testing.expectEqualStrings("proxy/fast-code", all[1].name);
     try std.testing.expect(try picker.insert("FSC", false));
-    const filtered = try picker.choices(a, "current", 32768, &profiles);
+    const filtered = try picker.choicesWithProviders(a, "proxy/current", 32768, &profiles, &.{}, &.{.{ .name = "proxy", .allow_custom = true }});
     defer a.free(filtered);
-    try std.testing.expectEqualStrings("fast-code", filtered[0].name);
+    try std.testing.expectEqualStrings("proxy/fast-code", filtered[0].name);
     try std.testing.expect(filtered[filtered.len - 1].inherited);
     picker.clear();
-    try std.testing.expect(try picker.insert("FAST-CODE", false));
-    const exact = try picker.choices(a, "current", 32768, &profiles);
+    try std.testing.expect(try picker.insert("PROXY/FAST-CODE", false));
+    const exact = try picker.choicesWithProviders(a, "proxy/current", 32768, &profiles, &.{}, &.{.{ .name = "proxy", .allow_custom = true }});
     defer a.free(exact);
     try std.testing.expectEqual(@as(usize, 1), exact.len);
     picker.move(false, 3);
@@ -610,7 +590,7 @@ test "named provider picker does not guess protocols for unknown custom IDs" {
     defer picker.deinit();
     picker.allow_custom = false;
     try std.testing.expect(try picker.insert("claude-unknown", false));
-    const found = try picker.choices(a, "opencode-go/minimax-m2.7", 204800, &.{});
+    const found = try picker.choicesWithProviders(a, "opencode-go/minimax-m2.7", 204800, &.{}, &.{}, &.{.{ .name = "opencode-go" }});
     defer a.free(found);
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
@@ -622,7 +602,7 @@ test "picker bytes rows and paste confirmation are bounded" {
     const full: [1024]u8 = @splat('a');
     try std.testing.expect(try picker.insert(&full, true));
     try std.testing.expect(!try picker.insert("b", false));
-    const rendered = try picker.rows(a, "current", 32768, &.{}, 20, 3);
+    const rendered = try picker.rowsWithProviders(a, "proxy/current", 32768, &.{}, 20, 3, .{}, &.{}, &.{.{ .name = "proxy", .allow_custom = true }});
     defer {
         for (rendered.lines) |line| a.free(line);
         a.free(rendered.lines);
@@ -640,25 +620,25 @@ test "model candidate window caps at ten and keeps selection visible" {
     var picker = Picker.init(a);
     defer picker.deinit();
     const profiles = [_]cfg.Model{
-        .{ .name = "m01", .context_tokens = 100 },
-        .{ .name = "m02", .context_tokens = 100 },
-        .{ .name = "m03", .context_tokens = 100 },
-        .{ .name = "m04", .context_tokens = 100 },
-        .{ .name = "m05", .context_tokens = 100 },
-        .{ .name = "m06", .context_tokens = 100 },
-        .{ .name = "m07", .context_tokens = 100 },
-        .{ .name = "m08", .context_tokens = 100 },
-        .{ .name = "m09", .context_tokens = 100 },
-        .{ .name = "m10", .context_tokens = 100 },
-        .{ .name = "m11", .context_tokens = 100 },
-        .{ .name = "m12", .context_tokens = 100 },
+        .{ .name = "p/m01", .context_tokens = 100 },
+        .{ .name = "p/m02", .context_tokens = 100 },
+        .{ .name = "p/m03", .context_tokens = 100 },
+        .{ .name = "p/m04", .context_tokens = 100 },
+        .{ .name = "p/m05", .context_tokens = 100 },
+        .{ .name = "p/m06", .context_tokens = 100 },
+        .{ .name = "p/m07", .context_tokens = 100 },
+        .{ .name = "p/m08", .context_tokens = 100 },
+        .{ .name = "p/m09", .context_tokens = 100 },
+        .{ .name = "p/m10", .context_tokens = 100 },
+        .{ .name = "p/m11", .context_tokens = 100 },
+        .{ .name = "p/m12", .context_tokens = 100 },
     };
-    const all = try picker.choices(a, "m00", 100, &profiles);
+    const all = try picker.choicesWithProviders(a, "p/m00", 100, &profiles, &.{}, &.{.{ .name = "p" }});
     defer a.free(all);
     for ([_]usize{ 0, 1, 4, 10, 20 }) |height| {
         for (0..all.len) |selected| {
             picker.selected = selected;
-            const rendered = try picker.rows(a, "m00", 100, &profiles, 7, height);
+            const rendered = try picker.rowsWithProviders(a, "p/m00", 100, &profiles, 9, height, .{}, &.{}, &.{.{ .name = "p" }});
             defer {
                 for (rendered.lines) |line| a.free(line);
                 a.free(rendered.lines);
@@ -688,10 +668,10 @@ test "model confirmation requires complete display cell identifier not metadata"
     try text.initLocale();
     var picker = Picker.init(a);
     defer picker.deinit();
-    for ([_][]const u8{ "long-model", "模型", "e\u{301}" }) |name| {
+    for ([_][]const u8{ "p/long-model", "p/模型", "p/e\u{301}" }) |name| {
         const full_width = 4 + text.width(name);
         for (0..full_width + 1) |columns| {
-            const rendered = try picker.rows(a, name, 100, &.{}, columns, 1);
+            const rendered = try picker.rowsWithProviders(a, name, 100, &.{}, columns, 1, .{}, &.{}, &.{.{ .name = "p" }});
             defer {
                 for (rendered.lines) |line| a.free(line);
                 a.free(rendered.lines);
@@ -704,7 +684,7 @@ test "model confirmation requires complete display cell identifier not metadata"
             if (rendered.can_confirm) try std.testing.expectEqualStrings(name, rendered.lines[0][6..]);
         }
     }
-    const unsafe = try picker.rows(a, "bad\n\x1b[31mname", 100, &.{}, 80, 1);
+    const unsafe = try picker.rowsWithProviders(a, "p/bad\n\x1b[31mname", 100, &.{}, 80, 1, .{}, &.{}, &.{.{ .name = "p" }});
     defer {
         for (unsafe.lines) |line| a.free(line);
         a.free(unsafe.lines);
@@ -717,7 +697,7 @@ test "model confirmation requires complete display cell identifier not metadata"
 fn rowsAllocationProbe(a: Allocator) !void {
     var picker = Picker.init(a);
     defer picker.deinit();
-    const rendered = try picker.rows(a, "current", 100, &.{.{ .name = "other", .context_tokens = 200 }}, 24, 10);
+    const rendered = try picker.rowsWithProviders(a, "p/current", 100, &.{.{ .name = "p/other", .context_tokens = 200 }}, 24, 10, .{}, &.{}, &.{.{ .name = "p" }});
     defer {
         for (rendered.lines) |line| a.free(line);
         a.free(rendered.lines);
@@ -759,40 +739,40 @@ test "model provenance uses current origin and aligned profile names not filtere
     var picker = Picker.init(a);
     defer picker.deinit();
     const profiles = [_]cfg.Model{
-        .{ .name = "other", .context_tokens = 128_000 },
-        .{ .name = "current", .context_tokens = 1_000_000 },
-        .{ .name = "target", .context_tokens = 204_800 },
-        .{ .name = "missing-origin", .context_tokens = 1_000 },
+        .{ .name = "p/other", .context_tokens = 128_000 },
+        .{ .name = "p/current", .context_tokens = 1_000_000 },
+        .{ .name = "p/target", .context_tokens = 204_800 },
+        .{ .name = "p/missing-origin", .context_tokens = 1_000 },
     };
     const origins: Origins = .{ .current = true, .models = &.{ false, false, true } };
-    const rendered = try picker.rowsWithOrigins(a, "current", 1_000_000, &profiles, 100, 10, origins);
+    const rendered = try picker.rowsWithProviders(a, "p/current", 1_000_000, &profiles, 100, 10, origins, &.{}, &.{.{ .name = "p", .allow_custom = true }});
     defer {
         for (rendered.lines) |line| a.free(line);
         a.free(rendered.lines);
     }
     try std.testing.expectEqual(@as(u16, 1), rendered.checked_mask);
-    try std.testing.expectEqualStrings("> ✓ current  (1M tokens; official)", rendered.lines[0]);
-    try std.testing.expectEqualStrings("    other  (128K tokens; default)", rendered.lines[1]);
-    try std.testing.expectEqualStrings("    target  (204.8K tokens; official)", rendered.lines[2]);
-    try std.testing.expectEqualStrings("    missing-origin  (1K tokens; default)", rendered.lines[3]);
+    try std.testing.expectEqualStrings("> ✓ p/current  (1M tokens; default)", rendered.lines[0]);
+    try std.testing.expectEqualStrings("    p/other  (128K tokens; default)", rendered.lines[1]);
+    try std.testing.expectEqualStrings("    p/target  (204.8K tokens; official)", rendered.lines[2]);
+    try std.testing.expectEqualStrings("    p/missing-origin  (1K tokens; default)", rendered.lines[3]);
     try std.testing.expect(try picker.insert("target", false));
-    const filtered = try picker.rowsWithOrigins(a, "current", 1_000_000, &profiles, 100, 10, origins);
+    const filtered = try picker.rowsWithProviders(a, "p/current", 1_000_000, &profiles, 100, 10, origins, &.{}, &.{.{ .name = "p", .allow_custom = true }});
     defer {
         for (filtered.lines) |line| a.free(line);
         a.free(filtered.lines);
     }
     try std.testing.expectEqual(@as(u16, 0), filtered.checked_mask);
-    try std.testing.expectEqualStrings(">   target  (204.8K tokens; official)", filtered.lines[0]);
+    try std.testing.expectEqualStrings(">   p/target  (204.8K tokens; official)", filtered.lines[0]);
     picker.clear();
     try std.testing.expect(try picker.insert("custom", false));
-    const custom = try picker.rowsWithOrigins(a, "current", 1_000_000, &profiles, 100, 10, origins);
+    const custom = try picker.rowsWithProviders(a, "p/current", 1_000_000, &profiles, 100, 10, origins, &.{}, &.{.{ .name = "p", .allow_custom = true }});
     defer {
         for (custom.lines) |line| a.free(line);
         a.free(custom.lines);
     }
-    try std.testing.expectEqualStrings(">   custom  (1M tokens; default; inherited budget)", custom.lines[0]);
+    try std.testing.expectEqualStrings(">   p/custom  (1M tokens; default; inherited budget)", custom.lines[0]);
     picker.clear();
-    const defaults = try picker.rows(a, "current", 1_000_000, &profiles, 100, 10);
+    const defaults = try picker.rowsWithProviders(a, "p/current", 1_000_000, &profiles, 100, 10, .{}, &.{}, &.{.{ .name = "p" }});
     defer {
         for (defaults.lines) |line| a.free(line);
         a.free(defaults.lines);

@@ -39,7 +39,7 @@ fn makeClient(a: std.mem.Allocator, io: Io, scenario: []const u8, timeout_ms: u3
     }
     const origin = try base(if (trust == .direct) "THIN_SYSTEMONE_HTTP" else if (trust == .mismatch_proxy) "THIN_SYSTEMONE_MISMATCH" else "THIN_SYSTEMONE_HTTPS", trust != .direct, trust == .mismatch_proxy);
     const text = try std.fmt.allocPrint(a,
-        \\{{"llm":{{"default":"main/chat","providers":{{"main":{{"base_url":"{s}/primary-never","api_key":"fake-primary-key","models":{{"chat":{{"protocol":"chat","context_tokens":32768}}}}}},"aux":{{"base_url":"{s}/{s}","api_key":"fake-systemone-key"}}}}}},"decision":{{"model":"aux/jev-fixture","backend":"systemone","max_state_bytes":16384,"request_timeout_ms":{d}}}}}
+        \\{{"llm":{{"default":"main/chat","providers":{{"main":{{"base_url":"{s}/primary-never","api_key":"fake-primary-key","models":{{"chat":{{"protocol":"chat","context_tokens":32768}}}}}},"aux":{{"base_url":"{s}/{s}","api_key":"fake-systemone-key","models":{{"jev-fixture":{{"protocol":"systemone"}}}}}}}}}},"decision":{{"model":"aux/jev-fixture","max_state_bytes":16384}},"limits":{{"request_timeout_ms":{d}}}}}
     , .{ try base("THIN_SYSTEMONE_HTTP", false, false), origin, scenario, timeout_ms });
     defer a.free(text);
     var parsed = try cfg.parse(a, text);
@@ -61,7 +61,11 @@ const command: decision.Input = .{ .command = .{ .command = "printf fixture", .p
 const memory: decision.Input = .{ .memory_write = .{ .topic = "style/original-id", .content = "Prefer explicit bounded ownership and concise reports.", .expected_version = "v-original-7" } };
 
 fn independent(client: *Client, calls: u64) !void {
-    try t.expect(client.resolved == null); // No primary resolution or capability borrowing.
+    const resolved = client.resolved orelse return error.MissingNativeResolution;
+    try t.expect(resolved.client == null); // Native resolution never creates a Chat client.
+    try t.expect(resolved.config.value.model.protocol == .systemone);
+    try t.expectEqualStrings("jev-fixture", resolved.config.value.model.name);
+    try t.expectEqual(client.source.value.limits.request_timeout_ms, resolved.config.value.limits.request_timeout_ms);
     try t.expectEqual(calls, client.calls);
     try t.expectEqualStrings("main/chat", client.source.value.registry.?.default);
     try t.expectEqualStrings("fake-systemone-key", client.key.?);

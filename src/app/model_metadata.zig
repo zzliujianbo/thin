@@ -20,61 +20,23 @@ fn boundJson(bytes: []const u8, limit: usize) !void {
     return json_bound.bound(bytes, limit, 32768);
 }
 const max_tokens = 16 * 1024 * 1024;
-const Tokens = [catalog.entries.len]?u32;
 pub const Listing = struct {
     /// Owned byte offsets, not borrowed model IDs; safe across worker publication.
     directory: directory.Directory = .{},
     directory_mask: u8 = 0,
-    tokens: Tokens = @splat(null),
-    /// null means never fetched (including legacy caches); false means absent.
-    available: [catalog.entries.len]?bool = @splat(null),
-    reasoning: [catalog.entries.len]?thinking.Declaration = @splat(null),
-    /// models.dev profiles: a usable value or null (unknown). Only meaningful when dev_done.
-    dev: [catalog.entries.len]?thinking.Declaration = @splat(null),
     dev_done: bool = false,
 };
 pub const Cache = struct {
     directory: directory.Directory = .{},
     /// A successful official listing (even empty) supersedes offline presets.
     directory_mask: u8 = 0,
-    /// Retained for legacy readers; eligibility is now driven by source timing.
-    attempted: u8 = 0,
     refresh: [4]Refresh = @splat(.{}),
-    tokens: Tokens = @splat(null),
-    available: [catalog.entries.len]?bool = @splat(null),
-    /// Official wire capability metadata supersedes models.dev profiles.
-    reasoning: [catalog.entries.len]?thinking.Declaration = @splat(null),
-    /// Dynamic models.dev profile; never bundled, replaced wholesale on success.
-    dev_reasoning: [catalog.entries.len]?thinking.Declaration = @splat(null),
 };
 /// Shared cache-only resolution for interactive and headless entry. No network,
 /// capacity mutation or preset capabilities; explicit user overrides stay local.
-pub fn reasoningIndex(config: cfg.Config) ?usize {
-    const id = providers.Id.fromUrl(config.provider.base_url) orelse return null;
-    if (config.provider.kind) |hint| if (hint != id) return null;
-    for (catalog.entries, 0..) |entry, index| {
-        if (entry.provider != id) continue;
-        if (std.mem.eql(u8, entry.model.name, config.model.name) or std.mem.eql(u8, entry.selector, config.model.name)) return index;
-    }
-    return null;
-}
-
-pub fn reasoningDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinking.Declaration {
-    const actual = providers.Id.fromUrl(config.provider.base_url) orelse return null;
-    if (config.provider.kind) |hint| if (hint != actual) return null;
-    if (index >= catalog.entries.len or catalog.entries[index].provider != actual) return null;
-    if (dynamicIndex(cache, config)) |row| return rowDeclaration(cache, config, row);
-    const entry = catalog.entries[index];
-    const protocol = if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) .chat else config.model.protocol;
-    if (protocol != entry.model.protocol) return null;
-    const format: thinking.Format = if (protocol == .anthropic) .anthropic else if (entry.provider == .deepseek) .deepseek else .standard;
-    for ([_]?thinking.Declaration{ cache.reasoning[index], cache.dev_reasoning[index] }) |source| {
-        const declaration = source orelse continue;
-        if (declaration.format != format) continue;
-        declaration.validate() catch continue;
-        return declaration;
-    }
-    return null;
+pub fn declarationForConfig(cache: *const Cache, config: cfg.Config) ?thinking.Declaration {
+    const index = dynamicIndex(cache, config) orelse return null;
+    return rowDeclaration(cache, config, index);
 }
 
 pub fn applyReasoning(cache: *const Cache, config: *cfg.Config) void {
@@ -83,12 +45,7 @@ pub fn applyReasoning(cache: *const Cache, config: *cfg.Config) void {
         config.model.reasoning = null;
         config.model.reasoning_effort = null;
     }
-    const declaration = if (dynamicIndex(cache, config.*)) |row|
-        rowDeclaration(cache, config.*, row)
-    else if (reasoningIndex(config.*)) |index|
-        reasoningDeclaration(cache, config.*, index)
-    else
-        null;
+    const declaration = declarationForConfig(cache, config.*);
     if (declaration) |value| {
         config.model.reasoning = value;
         config.model.reasoning_source = .metadata;
@@ -98,6 +55,64 @@ pub fn applyReasoning(cache: *const Cache, config: *cfg.Config) void {
 fn preset(id: providers.Id, name: []const u8) ?catalog.Entry {
     for (catalog.entries) |entry| if (entry.provider == id and std.mem.eql(u8, entry.model.name, name)) return entry;
     return null;
+}
+
+test "explicit SystemOne directory identity survives cache without generative capabilities" {
+    const a = std.testing.allocator;
+    const listing = try parseListing(a,
+        \\{"data":[{"id":"reviewer/not-jev","protocol":"systemone"}]}
+    , .opencode_zen);
+    const cache: Cache = .{ .directory = listing.directory, .directory_mask = listing.directory_mask };
+    const entry = dynamicEntry(&cache, .opencode_zen, "reviewer/not-jev").?;
+    try std.testing.expectEqual(Protocol.systemone, entry.model.protocol);
+    try std.testing.expectEqual(@as(u32, 0), entry.model.context_tokens);
+    try std.testing.expect(capacityFor(&cache, entry) == null);
+    try std.testing.expect(contextFor(&cache, entry) == null);
+    try std.testing.expect(outputFor(&cache, entry) == null);
+    try std.testing.expect(entryDeclaration(&cache, entry) == null);
+    try std.testing.expect(inputPriceThresholdFor(&cache, entry) == null);
+    try std.testing.expect(inputPriceFlatLimitFor(&cache, entry) == null);
+    var bytes: std.Io.Writer.Allocating = .init(a);
+    defer bytes.deinit();
+    try std.json.Stringify.value(Document{ .directory_mask = listing.directory_mask, .models = &.{.{ .provider = .opencode_zen, .id = "reviewer/not-jev", .protocol = entry.model.protocol, .available = true }} }, .{}, &bytes.writer);
+    const restored = try parseCache(a, bytes.written());
+    const again = dynamicEntry(&restored, .opencode_zen, "reviewer/not-jev").?;
+    try std.testing.expectEqual(Protocol.systemone, again.model.protocol);
+    try std.testing.expectEqual(@as(u32, 0), again.model.context_tokens);
+}
+
+test "models.dev native API identity survives cache roundtrip without generative metadata" {
+    const a = std.testing.allocator;
+    const source = try parseDev(a,
+        \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"reviewer":{"api":{"url":"https://opencode.ai/inference/systemone/v1"},"limit":{"context":100000,"output":32000},"cost":{"input":1,"output":2}}}}}
+    );
+    var merged: Listing = .{};
+    try mergeDev(&merged, &source);
+    const row = merged.directory.rows[merged.directory.find(.opencode_zen, "reviewer").?];
+    try std.testing.expectEqual(Protocol.systemone, row.dev_protocol);
+    var bytes: std.Io.Writer.Allocating = .init(a);
+    defer bytes.deinit();
+    try std.json.Stringify.value(Document{ .models = &.{.{
+        .provider = .opencode_zen,
+        .id = "reviewer",
+        .dev_protocol = row.dev_protocol,
+        .dev_present = row.dev_present,
+        .dev_context_tokens = row.dev_context_tokens,
+        .dev_output_tokens = row.dev_output_tokens,
+        .dev_input_price_threshold = row.dev_input_price_threshold,
+        .dev_input_price_flat_limit = row.dev_input_price_flat_limit,
+    }} }, .{}, &bytes.writer);
+    const cache = try parseCache(a, bytes.written());
+    const entry = restoreEntry(&cache, .opencode_zen, "reviewer").?;
+    try std.testing.expectEqual(Protocol.systemone, entry.model.protocol);
+    try std.testing.expectEqual(@as(u32, 0), entry.model.context_tokens);
+    try std.testing.expect(entry.model.output_tokens == null);
+    try std.testing.expect(capacityFor(&cache, entry) == null);
+    try std.testing.expect(contextFor(&cache, entry) == null);
+    try std.testing.expect(outputFor(&cache, entry) == null);
+    try std.testing.expect(entryDeclaration(&cache, entry) == null);
+    try std.testing.expect(inputPriceThresholdFor(&cache, entry) == null);
+    try std.testing.expect(inputPriceFlatLimitFor(&cache, entry) == null);
 }
 
 pub fn hasDirectory(cache: *const Cache, id: providers.Id) bool {
@@ -116,6 +131,12 @@ fn resolvedProtocol(cache: *const Cache, index: usize) Protocol {
 
 fn storedEntry(cache: *const Cache, index: usize) catalog.Entry {
     const row = cache.directory.rows[index];
+    const api = resolvedProtocol(cache, index);
+    if (api == .systemone) return .{
+        .provider = row.provider,
+        .selector = cache.directory.selector(index),
+        .model = .{ .name = cache.directory.name(index), .context_tokens = 0, .protocol = .systemone },
+    };
     const known = preset(row.provider, cache.directory.name(index));
     var entry: catalog.Entry = .{
         .provider = row.provider,
@@ -154,14 +175,11 @@ pub fn restoreEntry(cache: *const Cache, id: providers.Id, name: []const u8) ?ca
 }
 
 pub fn capacityFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
+    if (entry.model.protocol == .systemone) return null;
     if (cache.directory.find(entry.provider, entry.model.name)) |index| {
         const row = cache.directory.rows[index];
         if (row.available == true) return row.tokens;
-        // A public-only row is not an official capacity result. Until an
-        // official directory succeeds, retain capacities from legacy caches.
-        if (row.available != null or hasDirectory(cache, entry.provider)) return null;
     }
-    for (catalog.entries, 0..) |known, index| if (known.provider == entry.provider and std.mem.eql(u8, known.model.name, entry.model.name)) return cache.tokens[index];
     return null;
 }
 
@@ -177,26 +195,15 @@ fn validContext(n: ?u32) ?u32 {
 /// Selection-time only: callers own freezing active/resumed model windows.
 pub fn contextFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
     const protocol = entry.model.protocol;
-    if (protocol == .auto) return null;
+    if (protocol == .auto or protocol == .systemone) return null;
     if (cache.directory.find(entry.provider, entry.model.name)) |index| {
         const row = cache.directory.rows[index];
         if (row.protocol != .auto and row.protocol != protocol) return null;
-        // Legacy official capacities remain usable before official discovery,
-        // but only for their original preset protocol, not a public reroute.
         if (row.available == true) {
             if (validContext(row.tokens)) |n| return n;
-        } else if (row.available == null and !hasDirectory(cache, entry.provider)) {
-            if (preset(entry.provider, entry.model.name)) |known| {
-                if (known.model.protocol == protocol) {
-                    if (validContext(capacityFor(cache, entry))) |n| return n;
-                }
-            }
         }
         if (row.dev_protocol == protocol) return validContext(row.dev_context_tokens);
         return null;
-    }
-    if (preset(entry.provider, entry.model.name)) |known| {
-        if (known.model.protocol == protocol) return validContext(capacityFor(cache, entry));
     }
     return null;
 }
@@ -207,7 +214,7 @@ fn validOutput(n: ?u32) ?u32 {
 }
 
 fn compatibleRoute(row: directory.Record, protocol: Protocol) bool {
-    return protocol != .auto and (row.protocol == .auto or row.protocol == protocol);
+    return protocol != .auto and protocol != .systemone and (row.protocol == .auto or row.protocol == protocol);
 }
 
 fn rowOutput(row: directory.Record, protocol: Protocol) ?u32 {
@@ -267,31 +274,14 @@ pub fn applyOutput(cache: *const Cache, config: *cfg.Config) void {
 fn dynamicIndex(cache: *const Cache, config: cfg.Config) ?usize {
     const id = providers.Id.fromUrl(config.provider.base_url) orelse return null;
     if (config.provider.kind) |hint| if (hint != id) return null;
-    if (cache.directory.find(id, config.model.name)) |index| return index;
-    const prefix = id.slug();
-    if (std.mem.startsWith(u8, config.model.name, prefix) and config.model.name.len > prefix.len and config.model.name[prefix.len] == '/')
-        return cache.directory.find(id, config.model.name[prefix.len + 1 ..]);
-    return null;
+    return cache.directory.find(id, config.model.name);
 }
 
 fn rowDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinking.Declaration {
     const row = cache.directory.rows[index];
     const protocol = if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) .chat else config.model.protocol;
-    if (protocol == .auto) return null;
+    if (protocol == .auto or protocol == .systemone) return null;
     const format: thinking.Format = if (protocol == .anthropic) .anthropic else if (row.provider == .deepseek) .deepseek else .standard;
-    if (row.available == null and !hasDirectory(cache, row.provider)) {
-        // Public discovery may arrive before (or without) official discovery.
-        // Its row must not shadow a compatible, last-successful official map,
-        // even when the public SDK disagrees with the verified legacy route.
-        for (catalog.entries, 0..) |entry, legacy| {
-            if (entry.provider != row.provider or entry.model.protocol != protocol or !std.mem.eql(u8, entry.model.name, cache.directory.name(index))) continue;
-            if (cache.reasoning[legacy]) |declaration| {
-                if (declaration.format != format) continue;
-                declaration.validate() catch continue;
-                return declaration;
-            }
-        }
-    }
     if (protocol != resolvedProtocol(cache, index)) return null;
     if (row.reasoning) |profile| {
         var declaration = profile.declaration();
@@ -317,24 +307,13 @@ fn rowDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinki
             return declaration;
         }
     }
-    // Legacy preset resolutions also carry complete-profile fallback when the
-    // exact provider row is absent from the public catalog.
-    for (catalog.entries, 0..) |entry, legacy| {
-        if (entry.provider != row.provider or entry.model.protocol != protocol or !std.mem.eql(u8, entry.model.name, cache.directory.name(index))) continue;
-        if (cache.dev_reasoning[legacy]) |declaration| {
-            if (declaration.format != format) continue;
-            declaration.validate() catch continue;
-            return declaration;
-        }
-    }
     return null;
 }
 
 pub fn entryDeclaration(cache: *const Cache, entry: catalog.Entry) ?thinking.Declaration {
+    if (entry.model.protocol == .systemone) return null;
     const config: cfg.Config = .{ .provider = catalog.connection(entry.provider), .model = entry.model };
-    if (dynamicIndex(cache, config)) |index| return rowDeclaration(cache, config, index);
-    if (reasoningIndex(config)) |index| return reasoningDeclaration(cache, config, index);
-    return null;
+    return declarationForConfig(cache, config);
 }
 
 /// Merge only a joined provider's owned result. Credential filtering still
@@ -359,11 +338,6 @@ pub fn mergeOfficial(target: *Listing, source: *const Listing, id: providers.Id)
         }
     }
     target.directory = merged;
-    for (catalog.entries, 0..) |entry, i| if (entry.provider == id) {
-        target.tokens[i] = source.tokens[i];
-        target.available[i] = source.available[i];
-        target.reasoning[i] = source.reasoning[i];
-    };
     target.directory_mask |= source.directory_mask & bit(id);
 }
 
@@ -391,7 +365,6 @@ pub fn mergeDev(target: *Listing, source: *const Listing) !void {
         row.dev_present = true;
     }
     target.directory = merged;
-    target.dev = source.dev;
     target.dev_done = true;
 }
 
@@ -436,8 +409,9 @@ fn parseEffort(value: std.json.Value, provider: providers.Id, protocol: @import(
         for (seen[0..seen_count]) |previous| if (std.mem.eql(u8, previous, item.string)) return error.InvalidMetadata;
         seen[seen_count] = item.string;
         seen_count += 1;
-        const level = activity.ReasoningEffort.fromName(item.string);
-        switch (level.canonical()) {
+        // Decode the provider's wire spelling at the metadata boundary only.
+        const level: activity.ReasoningEffort = if (std.mem.eql(u8, item.string, "none")) .off else activity.ReasoningEffort.fromName(item.string);
+        switch (level) {
             .off => {
                 map.off = if (format == .anthropic) "disabled" else if (format == .deepseek) "off" else if (std.mem.eql(u8, item.string, "off")) "off" else "none";
                 mapped += 1;
@@ -477,10 +451,6 @@ fn parseEffort(value: std.json.Value, provider: providers.Id, protocol: @import(
 
 /// Only context_window denotes the total context; no input/output heuristic.
 /// Legacy capacity-array view; parseListing also retains all discovered IDs.
-pub fn parseProvider(a: std.mem.Allocator, body: []const u8, id: providers.Id) !Tokens {
-    return (try parseListing(a, body, id)).tokens;
-}
-
 pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !Listing {
     try boundJson(body, max_body_bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_body_bytes });
@@ -494,9 +464,6 @@ pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !L
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(a);
     var result: Listing = .{ .directory_mask = bit(id) };
-    for (catalog.entries, 0..) |model, i| {
-        if (model.provider == id) result.available[i] = false;
-    }
     for (data.array.items) |record| {
         if (record != .object) return error.InvalidMetadata;
         const name = record.object.get("id") orelse return error.InvalidMetadata;
@@ -513,15 +480,14 @@ pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !L
         }
         const known = preset(id, name.string);
         const protocol: Protocol = if (row.protocol != .auto) row.protocol else if (known) |value| value.model.protocol else if (id == .deepseek) .chat else .auto;
+        if (protocol == .systemone) {
+            row.tokens = null;
+            // Non-generative records carry identity/availability, not windows
+            // or thinking borrowed from a same-name generative preset.
+            continue;
+        }
         if (record.object.get("effort")) |effort| {
             if (try parseEffort(effort, id, if (protocol == .auto) .chat else protocol)) |declaration| row.reasoning = try directory.Profile.from(declaration);
-        }
-        for (catalog.entries, 0..) |model, i| {
-            if (model.provider == id and std.mem.eql(u8, model.model.name, name.string)) {
-                result.tokens[i] = n;
-                result.available[i] = true;
-                if (record.object.get("effort")) |effort| result.reasoning[i] = try parseEffort(effort, id, model.model.protocol);
-            }
         }
     }
     return result;
@@ -544,10 +510,7 @@ pub fn fetchDev(a: std.mem.Allocator, io: std.Io) !Listing {
 }
 
 pub fn parseDev(a: std.mem.Allocator, body: []const u8) !Listing {
-    const resolved = try models_dev.parse(a, body);
-    var result: Listing = .{ .dev_done = true, .directory = try models_dev.parseDirectory(a, body) };
-    for (resolved, 0..) |value, index| result.dev[index] = value.declaration;
-    return result;
+    return .{ .dev_done = true, .directory = try models_dev.parseDirectory(a, body) };
 }
 
 fn listingUrl(id: providers.Id) []const u8 {
@@ -599,14 +562,7 @@ fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8,
     return body;
 }
 
-const Record = struct {
-    selector: []const u8,
-    context_window: ?u32,
-    available: ?bool = null,
-    reasoning: ?thinking.Declaration = null,
-    dev_reasoning: ?thinking.Declaration = null,
-};
-const DynamicRecord = struct {
+const ModelRecord = struct {
     provider: providers.Id,
     id: []const u8,
     context_window: ?u32 = null,
@@ -661,12 +617,14 @@ pub fn eligible(cache: *const Cache, requested: u8, now: u64, policy: Policy) u8
     return mask;
 }
 
+/// Single-directory schema only. Older and future documents are rejected,
+/// never migrated or overwritten by a failed load/claim.
+pub const cache_version: u32 = 14;
+
 const Document = struct {
-    version: u32,
-    attempted: u8,
-    records: []const Record,
+    version: u32 = cache_version,
     directory_mask: u8 = 0,
-    models: []const DynamicRecord = &.{},
+    models: []const ModelRecord = &.{},
     refresh: [4]Refresh = @splat(.{}),
 };
 
@@ -694,17 +652,23 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
     var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
     defer parsed.deinit();
     const doc = parsed.value;
+    if (doc.version != cache_version) return error.InvalidMetadata;
     // Typed JSON integer parsing also accepts numeric strings. Cache capability
     // fields deliberately require JSON integer tokens, not that coercion.
-    if (doc.version >= 6) {
+    {
         var raw = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
         defer raw.deinit();
         if (raw.value == .object) {
+            const version = raw.value.object.get("version") orelse return error.InvalidMetadata;
+            if (version != .integer or version.integer != cache_version) return error.InvalidMetadata;
+            if (raw.value.object.get("directory_mask")) |mask| {
+                if (mask != .integer or mask.integer < 0 or mask.integer > all_mask) return error.InvalidMetadata;
+            }
             if (raw.value.object.get("refresh")) |timings| {
                 if (timings != .array or timings.array.items.len != 4) return error.InvalidMetadata;
                 for (timings.array.items) |timing| {
                     if (timing != .object) return error.InvalidMetadata;
-                    if (doc.version >= 9) if (timing.object.get("generation")) |value| switch (value) {
+                    if (timing.object.get("generation")) |value| switch (value) {
                         .integer => |n| if (n < 0 or n > max_generation) return error.InvalidMetadata,
                         else => return error.InvalidMetadata,
                     };
@@ -720,6 +684,13 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
             if (raw.value.object.get("models")) |models| {
                 if (models == .array) for (models.array.items) |model| {
                     if (model != .object) return error.InvalidMetadata;
+                    for ([_][]const u8{ "context_window", "dev_context_tokens", "dev_input_price_threshold", "dev_input_price_flat_limit" }) |key| {
+                        if (model.object.get(key)) |value| switch (value) {
+                            .null => {},
+                            .integer => |n| if (n <= 0 or n > max_tokens) return error.InvalidMetadata,
+                            else => return error.InvalidMetadata,
+                        };
+                    }
                     for ([_][]const u8{ "output_tokens", "dev_output_tokens" }) |key| {
                         if (model.object.get(key)) |value| switch (value) {
                             .null => {},
@@ -727,92 +698,30 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
                             else => return error.InvalidMetadata,
                         };
                     }
-                    if (doc.version >= 11) {
-                        if (model.object.get("dev_input_price_flat_limit")) |value| switch (value) {
-                            .null => {},
-                            .integer => |n| if (n <= 0 or n > max_tokens) return error.InvalidMetadata,
-                            else => return error.InvalidMetadata,
-                        };
-                    }
-                    if (doc.version >= 10) {
-                        if (model.object.get("dev_input_price_threshold")) |value| switch (value) {
-                            .null => {},
-                            .integer => |n| if (n <= 0 or n > max_tokens) return error.InvalidMetadata,
-                            else => return error.InvalidMetadata,
-                        };
-                    }
-                    if (doc.version >= 7) {
-                        if (model.object.get("dev_context_tokens")) |value| switch (value) {
-                            .null => {},
-                            .integer => |n| if (n <= 0 or n > max_tokens) return error.InvalidMetadata,
-                            else => return error.InvalidMetadata,
-                        };
-                    }
                 };
             }
         }
     }
-    if ((doc.version < 1 or doc.version > 12) or doc.attempted & ~(all_mask | dev_bit) != 0 or doc.records.len > catalog.entries.len or doc.models.len > directory.max_models or doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
-    if (doc.version < 5 and (doc.directory_mask != 0 or doc.models.len != 0)) return error.InvalidMetadata;
-    // Legacy caches never attempted dynamic discovery. Retain their successful
-    // metadata, but permit one automatic directory/protocol refresh after upgrade.
-    var result: Cache = .{ .attempted = if (doc.version < 5) 0 else doc.attempted, .directory_mask = doc.directory_mask };
-    if (doc.version >= 8) result.refresh = doc.refresh;
-    if (doc.version < 9) for (&result.refresh) |*timing| {
-        timing.generation = 0;
-    };
-    // v8..v11 lack exact-decimal/strict-descriptor price evidence. Even an old
-    // threshold may have rounded away an earlier surcharge. Permit
-    // one public claim without resetting ANY existing generation: no ABA.
-    if (doc.version >= 8 and doc.version < 12) {
-        result.attempted &= ~dev_bit;
-        result.refresh[3].last_attempt_ms = null;
-    }
-    // v5 lacked output and v6 lacked public context. Grant one public refresh
-    // for either upgrade, preserving successful official and v6 output metadata.
-    // claim persists v12 timing/generations before fetching, so failures observe cooldown.
-    if (doc.version == 5 or doc.version == 6) result.attempted &= ~dev_bit;
+    if (doc.models.len > directory.max_models or doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
+    var result: Cache = .{ .directory_mask = doc.directory_mask, .refresh = doc.refresh };
     for (doc.models) |record| {
         if (record.context_window) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
         if (result.directory.find(record.provider, record.id) != null) return error.InvalidMetadata;
         const row = try result.directory.upsert(record.provider, record.id);
         row.tokens = record.context_window;
-        if (doc.version >= 7) row.dev_context_tokens = record.dev_context_tokens;
-        if (doc.version >= 12) row.dev_input_price_threshold = record.dev_input_price_threshold;
-        if (doc.version >= 12) row.dev_input_price_flat_limit = record.dev_input_price_flat_limit;
-        if (doc.version >= 6) {
-            if (record.output_tokens != null and validOutput(record.output_tokens) == null) return error.InvalidMetadata;
-            if (record.dev_output_tokens != null and validOutput(record.dev_output_tokens) == null) return error.InvalidMetadata;
-            row.output_tokens = record.output_tokens;
-            row.dev_output_tokens = record.dev_output_tokens;
-        }
+        row.dev_context_tokens = record.dev_context_tokens;
+        row.dev_input_price_threshold = record.dev_input_price_threshold;
+        row.dev_input_price_flat_limit = record.dev_input_price_flat_limit;
+        if (record.output_tokens != null and validOutput(record.output_tokens) == null) return error.InvalidMetadata;
+        if (record.dev_output_tokens != null and validOutput(record.dev_output_tokens) == null) return error.InvalidMetadata;
+        row.output_tokens = record.output_tokens;
+        row.dev_output_tokens = record.dev_output_tokens;
         row.available = record.available;
         row.protocol = record.protocol;
         row.dev_protocol = record.dev_protocol;
         row.dev_present = record.dev_present;
         if (record.reasoning) |declaration| row.reasoning = try directory.Profile.from(try canonicalCacheDeclaration(declaration));
         if (record.dev_reasoning) |declaration| row.dev_reasoning = try directory.Profile.from(try canonicalCacheDeclaration(declaration));
-    }
-    var seen: [catalog.entries.len]bool = @splat(false);
-    for (doc.records) |record| {
-        if (record.context_window) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
-        const index = for (catalog.entries, 0..) |entry, i| {
-            if (std.mem.eql(u8, entry.selector, record.selector)) break i;
-        } else return error.InvalidMetadata;
-        if (seen[index]) return error.InvalidMetadata;
-        seen[index] = true;
-        result.tokens[index] = record.context_window;
-        if (doc.version >= 2) result.available[index] = record.available;
-        if (doc.version >= 3) {
-            if (record.reasoning) |declaration| {
-                result.reasoning[index] = try canonicalCacheDeclaration(declaration);
-            }
-        }
-        if (doc.version >= 4) {
-            if (record.dev_reasoning) |declaration| {
-                result.dev_reasoning[index] = try canonicalCacheDeclaration(declaration);
-            }
-        }
     }
     return result;
 }
@@ -850,23 +759,21 @@ fn lock(root: *fs.Root) !c_int {
 }
 
 fn save(root: *fs.Root, cache: Cache) !void {
-    for (cache.refresh) |timing| if (timing.generation > max_generation) return error.InvalidMetadata;
+    if (cache.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
+    for (cache.refresh) |timing| {
+        if (timing.generation > max_generation) return error.InvalidMetadata;
+        if (timing.last_attempt_ms) |n| if (n > max_timestamp_ms) return error.InvalidMetadata;
+        if (timing.last_success_ms) |n| if (n > max_timestamp_ms) return error.InvalidMetadata;
+    }
     for (cache.directory.rows[0..cache.directory.count]) |row| {
+        if (row.tokens != null and validContext(row.tokens) == null) return error.InvalidMetadata;
         if (row.dev_context_tokens != null and validContext(row.dev_context_tokens) == null) return error.InvalidMetadata;
         if (row.dev_input_price_threshold != null and validContext(row.dev_input_price_threshold) == null) return error.InvalidMetadata;
         if (row.dev_input_price_flat_limit != null and validContext(row.dev_input_price_flat_limit) == null) return error.InvalidMetadata;
         if (row.output_tokens != null and validOutput(row.output_tokens) == null) return error.InvalidMetadata;
         if (row.dev_output_tokens != null and validOutput(row.dev_output_tokens) == null) return error.InvalidMetadata;
     }
-    var records: [catalog.entries.len]Record = undefined;
-    for (catalog.entries, 0..) |entry, i| records[i] = .{
-        .selector = entry.selector,
-        .context_window = cache.tokens[i],
-        .available = cache.available[i],
-        .reasoning = cache.reasoning[i],
-        .dev_reasoning = cache.dev_reasoning[i],
-    };
-    const models = try root.allocator.alloc(DynamicRecord, cache.directory.count);
+    const models = try root.allocator.alloc(ModelRecord, cache.directory.count);
     defer root.allocator.free(models);
     for (cache.directory.rows[0..cache.directory.count], 0..) |row, index| models[index] = .{
         .provider = row.provider,
@@ -887,7 +794,7 @@ fn save(root: *fs.Root, cache: Cache) !void {
     const bytes = try root.allocator.alloc(u8, max_cache_bytes);
     defer root.allocator.free(bytes);
     var writer = std.Io.Writer.fixed(bytes);
-    try std.json.Stringify.value(Document{ .version = 12, .attempted = cache.attempted, .records = &records, .directory_mask = cache.directory_mask, .models = models, .refresh = cache.refresh }, .{}, &writer);
+    try std.json.Stringify.value(Document{ .directory_mask = cache.directory_mask, .models = models, .refresh = cache.refresh }, .{}, &writer);
     try writer.writeByte('\n');
     try root.writeMode(file_name, bytes[0..writer.end], true, 0o600);
 }
@@ -905,7 +812,6 @@ pub fn claimAt(root: *fs.Root, requested: u8, manual: bool, now: u64, policy: Po
     var cache = try load(root);
     const mask = if (manual) requested else eligible(&cache, requested, now, policy);
     if (mask != 0) {
-        cache.attempted |= mask;
         for (source_bits, &cache.refresh) |source, *timing| {
             if (mask & source == 0) continue;
             if (timing.last_success_ms) |success| if (success > now) {
@@ -923,7 +829,7 @@ pub fn claimAt(root: *fs.Root, requested: u8, manual: bool, now: u64, policy: Po
     return .{ .cache = cache, .mask = mask, .generations = generations };
 }
 
-/// Reload under lock: unsuccessful providers and attempt flags remain intact.
+/// Reload under lock: unsuccessful provider capabilities and timing stay intact.
 pub fn commit(root: *fs.Root, succeeded: u8, listing: Listing) !Cache {
     return commitAt(root, succeeded, listing, wallNow(root.io));
 }
@@ -954,13 +860,6 @@ pub fn commitClaimedAt(root: *fs.Root, succeeded: u8, listing: Listing, generati
 
 fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing, now: u64) !Cache {
     var cache = previous;
-    for (catalog.entries, 0..) |entry, i| {
-        if (succeeded & bit(entry.provider) == 0) continue;
-        if (listing.tokens[i]) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
-        cache.tokens[i] = listing.tokens[i];
-        cache.available[i] = listing.available[i];
-        cache.reasoning[i] = listing.reasoning[i];
-    }
     const refreshed = succeeded & listing.directory_mask;
     for (cache.directory.rows[0..cache.directory.count]) |*row| {
         if (refreshed & bit(row.provider) != 0) {
@@ -1002,7 +901,6 @@ fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing
         }
     }
     cache.directory_mask |= refreshed;
-    if (listing.dev_done) cache.dev_reasoning = listing.dev;
     for (source_bits, &cache.refresh) |source, *timing| {
         if ((succeeded | (if (listing.dev_done) dev_bit else @as(u8, 0))) & source == 0) continue;
         timing.last_success_ms = now;
@@ -1023,19 +921,19 @@ test "metadata lexical limits precede allocation and respect quoted escapes" {
         for (0..levels) |_| try w.writeByte(']');
         try w.writeByte('}');
         if (levels == 31) {
-            _ = try parseProvider(a, buffer[0..w.end], .deepseek);
+            _ = try parseListing(a, buffer[0..w.end], .deepseek);
         } else {
             // A zero-capacity allocator proves this rejects before JSON allocation.
             var fixed = std.heap.FixedBufferAllocator.init(&.{});
-            try std.testing.expectError(error.MetadataTooDeep, parseProvider(fixed.allocator(), buffer[0..w.end], .deepseek));
+            try std.testing.expectError(error.MetadataTooDeep, parseListing(fixed.allocator(), buffer[0..w.end], .deepseek));
             try std.testing.expectError(error.MetadataTooDeep, parseCache(fixed.allocator(), buffer[0..w.end]));
         }
     }
     const quoted =
         \\{"data":[],"extra":{"text":"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[\\\"{}","next":true}}
     ;
-    _ = try parseProvider(a, quoted, .deepseek);
-    try std.testing.expectError(error.DuplicateField, parseProvider(a, "{\"data\":[],\"extra\":{\"x\":1,\"x\":2}}", .deepseek));
+    _ = try parseListing(a, quoted, .deepseek);
+    try std.testing.expectError(error.DuplicateField, parseListing(a, "{\"data\":[],\"extra\":{\"x\":1,\"x\":2}}", .deepseek));
     try std.testing.expectError(error.DuplicateField, parseCache(a, "{\"version\":1,\"version\":1,\"attempted\":0,\"records\":[]}"));
     try std.testing.expectError(error.InvalidMetadata, boundJson("{\"x\":\"unterminated", max_body_bytes));
     try std.testing.expectError(error.InvalidMetadata, boundJson("{]", max_body_bytes));
@@ -1050,7 +948,7 @@ test "metadata lexical limits precede allocation and respect quoted escapes" {
     try boundJson(many[0 .. many.len - 2], max_body_bytes);
     many[many.len - 3] = ',';
     var fixed = std.heap.FixedBufferAllocator.init(&.{});
-    try std.testing.expectError(error.MetadataTooComplex, parseProvider(fixed.allocator(), many, .deepseek));
+    try std.testing.expectError(error.MetadataTooComplex, parseListing(fixed.allocator(), many, .deepseek));
 }
 
 test "metadata deep oversized and duplicate caches remain untouched" {
@@ -1150,18 +1048,15 @@ test "metadata loopback transport success redirects size short body and cleanup"
         } else {
             const body = try fetchUrl(a, io, url, null, max_body_bytes);
             defer a.free(body);
-            _ = try parseProvider(a, body, .deepseek);
+            _ = try parseListing(a, body, .deepseek);
         }
         try worker.await(io);
         try std.testing.expect(cleaned.load(.acquire));
     }
 }
 
-fn testIndex(selector: []const u8) usize {
-    for (catalog.entries, 0..) |entry, i| {
-        if (std.mem.eql(u8, selector, entry.selector)) return i;
-    }
-    @panic("missing test catalog selector");
+fn testRow(listing: *const Listing, id: providers.Id, name: []const u8) directory.Record {
+    return listing.directory.rows[listing.directory.find(id, name).?];
 }
 
 fn testRoot(dir: std.Io.Dir) !fs.Root {
@@ -1175,16 +1070,17 @@ test "metadata uses only context_window and exact provider raw names" {
     const body =
         \\{"object":"list","data":[{"id":"deepseek-flash","context_window":12345,"max_tokens":2},{"id":"deepseek-v4-pro","max_tokens":8192,"input_tokens":100000,"output_tokens":3}]}
     ;
-    const values = try parseProvider(a, body, .deepseek);
-    try std.testing.expectEqual(@as(?u32, 12345), values[testIndex("deepseek/deepseek-flash")]);
-    try std.testing.expectEqual(@as(?u32, null), values[testIndex("deepseek/deepseek-v4-pro")]);
-    for (try parseProvider(a, body, .opencode_go)) |v| try std.testing.expect(v == null);
-    const absent = try parseProvider(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":null}]}", .deepseek);
-    for (absent) |v| try std.testing.expect(v == null);
+    const values = try parseListing(a, body, .deepseek);
+    try std.testing.expectEqual(@as(?u32, 12345), testRow(&values, .deepseek, "deepseek-flash").tokens);
+    try std.testing.expect(testRow(&values, .deepseek, "deepseek-v4-pro").tokens == null);
+    const other = try parseListing(a, body, .opencode_go);
+    try std.testing.expect(other.directory.find(.deepseek, "deepseek-flash") == null);
+    const absent = try parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":null}]}", .deepseek);
+    try std.testing.expect(testRow(&absent, .deepseek, "deepseek-flash").tokens == null);
     const shared = "{\"data\":[{\"id\":\"minimax-m2.7\",\"context_window\":204800}]}";
-    const zen = try parseProvider(a, shared, .opencode_zen);
-    try std.testing.expectEqual(@as(?u32, 204800), zen[testIndex("opencode-zen/minimax-m2.7")]);
-    try std.testing.expect(zen[testIndex("opencode-go/minimax-m2.7")] == null);
+    const zen = try parseListing(a, shared, .opencode_zen);
+    try std.testing.expectEqual(@as(?u32, 204800), testRow(&zen, .opencode_zen, "minimax-m2.7").tokens);
+    try std.testing.expect(zen.directory.find(.opencode_go, "minimax-m2.7") == null);
 }
 
 test "metadata rejects invalid IDs capacities duplicate IDs and shapes" {
@@ -1193,8 +1089,8 @@ test "metadata rejects invalid IDs capacities duplicate IDs and shapes" {
         "{\"data\":[{\"id\":\"\"}]}",                              "{\"data\":[{\"id\":\"x\"},{\"id\":\"x\"}]}",         "{\"data\":[{\"id\":\"x\",\"context_window\":0}]}",       "{\"data\":[{\"id\":\"x\",\"context_window\":-1}]}",
         "{\"data\":[{\"id\":\"x\",\"context_window\":16777217}]}", "{\"data\":[{\"id\":\"x\",\"context_window\":1.5}]}", "{\"data\":[{\"id\":\"x\",\"context_window\":\"100\"}]}",
     };
-    for (bad) |body| try std.testing.expectError(error.InvalidMetadata, parseProvider(std.testing.allocator, body, .deepseek));
-    try std.testing.expectError(error.DuplicateField, parseProvider(std.testing.allocator, "{\"data\":[],\"data\":[]}", .deepseek));
+    for (bad) |body| try std.testing.expectError(error.InvalidMetadata, parseListing(std.testing.allocator, body, .deepseek));
+    try std.testing.expectError(error.DuplicateField, parseListing(std.testing.allocator, "{\"data\":[],\"data\":[]}", .deepseek));
 }
 
 test "metadata body list and ID bounds are enforced" {
@@ -1202,7 +1098,7 @@ test "metadata body list and ID bounds are enforced" {
     const oversized = try a.alloc(u8, max_body_bytes + 1);
     defer a.free(oversized);
     @memset(oversized, ' ');
-    try std.testing.expectError(error.MetadataTooLarge, parseProvider(a, oversized, .deepseek));
+    try std.testing.expectError(error.MetadataTooLarge, parseListing(a, oversized, .deepseek));
     var buffer: [32768]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try writer.writeAll("{\"data\":[");
@@ -1211,12 +1107,12 @@ test "metadata body list and ID bounds are enforced" {
         try writer.print("{{\"id\":\"model-{d}\"}}", .{i});
     }
     try writer.writeAll("]}");
-    try std.testing.expectError(error.InvalidMetadata, parseProvider(a, buffer[0..writer.end], .deepseek));
+    try std.testing.expectError(error.InvalidMetadata, parseListing(a, buffer[0..writer.end], .deepseek));
     writer = std.Io.Writer.fixed(&buffer);
     try writer.writeAll("{\"data\":[{\"id\":\"");
     for (0..257) |_| try writer.writeByte('a');
     try writer.writeAll("\"}]}");
-    try std.testing.expectError(error.InvalidMetadata, parseProvider(a, buffer[0..writer.end], .deepseek));
+    try std.testing.expectError(error.InvalidMetadata, parseListing(a, buffer[0..writer.end], .deepseek));
 }
 
 test "metadata private roundtrip claims once and merges only successful providers" {
@@ -1226,26 +1122,24 @@ test "metadata private roundtrip claims once and merges only successful provider
     defer first.deinit();
     var second = try testRoot(tmp.dir);
     defer second.deinit();
-    try std.testing.expectEqual(@as(u8, 0), (try load(&first)).attempted);
+    try std.testing.expectEqual(@as(usize, 0), (try load(&first)).directory.count);
     try std.testing.expectEqual(@as(u8, 0), (try claim(&first, 0, false)).mask);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, file_name, .{}));
     try std.testing.expectEqual(all_mask, (try claim(&first, all_mask, false)).mask);
     try std.testing.expectEqual(@as(u8, 0), (try claim(&second, all_mask, false)).mask);
     try std.testing.expectEqual(bit(.deepseek), (try claim(&second, bit(.deepseek), true)).mask);
-    var tokens: Tokens = @splat(1000);
-    _ = try commit(&first, all_mask, .{ .tokens = tokens });
-    tokens = @splat(null);
-    const deepseek_index = testIndex("deepseek/deepseek-flash");
-    tokens[deepseek_index] = 2000;
-    var refreshed: Listing = .{ .tokens = tokens };
-    refreshed.reasoning[deepseek_index] = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } };
+    var original: Listing = .{};
+    for (providers.Id.all) |id| {
+        const source = try parseListing(std.testing.allocator, "{\"data\":[{\"id\":\"raw/id\",\"context_window\":1000}]}", id);
+        try mergeOfficial(&original, &source, id);
+    }
+    _ = try commit(&first, all_mask, original);
+    const refreshed = try parseListing(std.testing.allocator, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":2000,\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", .deepseek);
     const cache = try commit(&second, bit(.deepseek), refreshed);
-    try std.testing.expectEqual(all_mask, cache.attempted);
-    try std.testing.expectEqual(@as(?u32, 2000), cache.tokens[deepseek_index]);
-    try std.testing.expectEqualStrings("max", cache.reasoning[deepseek_index].?.map.max.?);
-    try std.testing.expectEqualStrings("max", (try load(&first)).reasoning[deepseek_index].?.map.max.?);
-    try std.testing.expect(cache.tokens[testIndex("deepseek/deepseek-v4-pro")] == null);
-    try std.testing.expectEqual(@as(?u32, 1000), cache.tokens[testIndex("opencode-zen/minimax-m2.7")]);
+    const row = cache.directory.rows[cache.directory.find(.deepseek, "deepseek-flash").?];
+    try std.testing.expectEqual(@as(?u32, 2000), row.tokens);
+    try std.testing.expectEqualStrings("max", row.reasoning.?.declaration().map.max.?);
+    try std.testing.expectEqual(@as(?u32, 1000), cache.directory.rows[cache.directory.find(.opencode_zen, "raw/id").?].tokens);
     try std.testing.expectEqualDeep(cache, try load(&first));
     const stat = try tmp.dir.statFile(std.testing.io, file_name, .{});
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
@@ -1253,29 +1147,41 @@ test "metadata private roundtrip claims once and merges only successful provider
     try std.testing.expectEqual(stat.inode, (try tmp.dir.statFile(std.testing.io, file_name, .{})).inode);
 }
 
-test "metadata malformed cache is never overwritten and selectors are validated" {
+test "metadata rejects old future unknown and malformed cache without writing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
     defer root.deinit();
-    const bad = [_][]const u8{
-        "{\"version\":13,\"attempted\":0,\"records\":[]}",
-        "{\"version\":1,\"attempted\":64,\"records\":[]}",
-        "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"unknown\",\"context_window\":1}]}",
-        "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":0}]}",
-        "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":1},{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":2}]}",
-    };
-    for (bad) |body| {
-        try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = body });
-        try std.testing.expectError(error.InvalidMetadata, claim(&root, all_mask, true));
-        try std.testing.expectError(error.InvalidMetadata, commit(&root, all_mask, .{}));
-        const result = try root.read(std.testing.allocator, file_name, 0, max_body_bytes);
-        defer std.testing.allocator.free(result.data);
-        try std.testing.expectEqualStrings(body, result.data);
+    const a = std.testing.allocator;
+    for (0..16) |version| {
+        if (version == cache_version) continue;
+        const body = try std.fmt.allocPrint(a, "{{\"version\":{d},\"models\":[]}}", .{version});
+        defer a.free(body);
+        try root.writeMode(file_name, body, true, 0o600);
+        const before = try root.dir.statFile(root.io, file_name, .{});
+        try std.testing.expectError(error.InvalidMetadata, load(&root));
+        try std.testing.expectError(error.InvalidMetadata, claimAt(&root, all_mask | dev_bit, true, 1000, .{}));
+        try std.testing.expectError(error.InvalidMetadata, commitAt(&root, all_mask, .{}, 1000));
+        const bytes = try root.read(a, file_name, 0, max_cache_bytes);
+        defer a.free(bytes.data);
+        try std.testing.expectEqualStrings(body, bytes.data);
+        try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
     }
-    const reordered = try parseCache(std.testing.allocator, "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"opencode-go/minimax-m2.7\",\"context_window\":42},{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":99}]}");
-    try std.testing.expectEqual(@as(?u32, 42), reordered.tokens[testIndex("opencode-go/minimax-m2.7")]);
-    try std.testing.expectEqual(@as(?u32, 99), reordered.tokens[testIndex("deepseek/deepseek-flash")]);
+    for ([_][]const u8{
+        "{\"version\":14,\"attempted\":0}",
+        "{\"version\":14,\"records\":[]}",
+        "{\"version\":14,\"unknown\":false}",
+        "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",\"unknown\":1}]}",
+        "{\"version\":14,\"refresh\":[{\"unknown\":0},{},{},{}]}",
+    }) |body| {
+        try root.writeMode(file_name, body, true, 0o600);
+        const before = try root.dir.statFile(root.io, file_name, .{});
+        try std.testing.expectError(error.UnknownField, claimAt(&root, all_mask, true, 1000, .{}));
+        try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
+        const bytes = try root.read(a, file_name, 0, max_cache_bytes);
+        defer a.free(bytes.data);
+        try std.testing.expectEqualStrings(body, bytes.data);
+    }
 }
 
 test "official effort metadata maps exact model IDs and protocol formats" {
@@ -1287,20 +1193,18 @@ test "official effort metadata maps exact model IDs and protocol formats" {
         "{\"data\":[{\"id\":\"deepseek-flash\",\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"],\"default_level\":\"high\"}}]}",
         .deepseek,
     );
-    const flash = deepseek.reasoning[testIndex("deepseek/deepseek-flash")];
-    try std.testing.expect(flash != null);
-    try std.testing.expectEqual(thinking.Format.deepseek, flash.?.format);
-    try std.testing.expectEqual(@as(usize, 4), flash.?.map.levels().count()); // includes protocol off toggle
-    try std.testing.expectEqualStrings("max", flash.?.map.max.?);
+    const flash = testRow(&deepseek, .deepseek, "deepseek-flash").reasoning.?.declaration();
+    try std.testing.expectEqual(thinking.Format.deepseek, flash.format);
+    try std.testing.expectEqual(@as(usize, 4), flash.map.levels().count()); // includes protocol off toggle
+    try std.testing.expectEqualStrings("max", flash.map.max.?);
     const anthropic = try parseListing(
         a,
         "{\"data\":[{\"id\":\"claude-haiku-5-5\",\"effort\":{\"supported_levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}}]}",
         .opencode_go,
     );
-    const haiku = anthropic.reasoning[testIndex("opencode-go/claude-haiku-5-5")];
-    try std.testing.expect(haiku != null);
-    try std.testing.expectEqual(thinking.Format.anthropic, haiku.?.format);
-    try std.testing.expectEqualStrings("xhigh", haiku.?.map.xhigh.?);
+    const haiku = testRow(&anthropic, .opencode_go, "claude-haiku-5-5").reasoning.?.declaration();
+    try std.testing.expectEqual(thinking.Format.anthropic, haiku.format);
+    try std.testing.expectEqualStrings("xhigh", haiku.map.xhigh.?);
     var unknown = try std.json.parseFromSlice(std.json.Value, a, "{\"supported_levels\":[\"ultra\"]}", .{});
     defer unknown.deinit();
     try std.testing.expectEqual(@as(?thinking.Declaration, null), try parseEffort(unknown.value, .deepseek, .chat));
@@ -1310,69 +1214,46 @@ test "official effort metadata maps exact model IDs and protocol formats" {
 test "metadata listing tracks exact membership independently of capacity and provider" {
     const a = std.testing.allocator;
     const listing = try parseListing(a, "{\"data\":[{\"id\":\"minimax-m2.7\"},{\"id\":\"deepseek-flash\",\"context_window\":42},{\"id\":\"unknown\",\"context_window\":100}]}", .opencode_go);
-    for (catalog.entries, 0..) |entry, i| {
-        const expected: ?bool = if (entry.provider == .opencode_go)
-            std.mem.eql(u8, entry.model.name, "minimax-m2.7") or std.mem.eql(u8, entry.model.name, "deepseek-flash")
-        else
-            null;
-        try std.testing.expectEqual(expected, listing.available[i]);
-        if (entry.provider != .opencode_go) try std.testing.expect(listing.tokens[i] == null);
-    }
-    const go = testIndex("opencode-go/minimax-m2.7");
-    try std.testing.expectEqual(@as(?bool, true), listing.available[go]);
-    try std.testing.expect(listing.tokens[go] == null);
+    try std.testing.expectEqual(@as(usize, 3), listing.directory.count);
+    try std.testing.expectEqual(@as(?bool, true), testRow(&listing, .opencode_go, "minimax-m2.7").available);
+    try std.testing.expect(testRow(&listing, .opencode_go, "minimax-m2.7").tokens == null);
+    try std.testing.expect(listing.directory.find(.deepseek, "deepseek-flash") == null);
     const absent = try parseListing(a, "{\"data\":[{\"id\":\"opencode-go/minimax-m2.7\"},{\"id\":\"MINIMAX-M2.7\"}]}", .opencode_go);
-    try std.testing.expectEqual(@as(?bool, false), absent.available[go]);
+    try std.testing.expect(absent.directory.find(.opencode_go, "minimax-m2.7") == null);
     const explicit_null = try parseListing(a, "{\"data\":[{\"id\":\"minimax-m2.7\",\"context_window\":null}]}", .opencode_go);
-    try std.testing.expectEqual(@as(?bool, true), explicit_null.available[go]);
-    try std.testing.expect(explicit_null.tokens[go] == null);
+    try std.testing.expectEqual(@as(?bool, true), testRow(&explicit_null, .opencode_go, "minimax-m2.7").available);
+    try std.testing.expect(testRow(&explicit_null, .opencode_go, "minimax-m2.7").tokens == null);
 }
 
-test "metadata availability removal and failed refresh preserve other providers" {
+test "metadata empty official listing is authoritative and failed refresh preserves other providers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
     defer root.deinit();
-    const original = try commit(&root, all_mask, .{ .tokens = @splat(4096), .available = @splat(true) });
-    const unchanged = try commit(&root, 0, .{ .tokens = @splat(0), .available = @splat(false) });
-    try std.testing.expectEqualDeep(original, unchanged);
+    var listing: Listing = .{};
+    for (providers.Id.all) |id| {
+        const source = try parseListing(std.testing.allocator, "{\"data\":[{\"id\":\"raw/id\",\"context_window\":4096}]}", id);
+        try mergeOfficial(&listing, &source, id);
+    }
+    const original = try commit(&root, all_mask, listing);
+    try std.testing.expectEqualDeep(original, try commit(&root, 0, .{}));
     const empty = try parseListing(std.testing.allocator, "{\"data\":[]}", .deepseek);
     const removed = try commit(&root, bit(.deepseek), empty);
-    for (catalog.entries, 0..) |entry, i| {
-        try std.testing.expectEqual(@as(?bool, entry.provider != .deepseek), removed.available[i]);
-        try std.testing.expectEqual(if (entry.provider == .deepseek) @as(?u32, null) else @as(?u32, 4096), removed.tokens[i]);
+    for (providers.Id.all) |id| {
+        const row = removed.directory.rows[removed.directory.find(id, "raw/id").?];
+        try std.testing.expectEqual(@as(?bool, id != .deepseek), row.available);
+        try std.testing.expectEqual(if (id == .deepseek) @as(?u32, null) else @as(?u32, 4096), row.tokens);
     }
+    try std.testing.expect(hasDirectory(&removed, .deepseek));
+    try std.testing.expect(findEntry(&removed, "deepseek/deepseek-flash") == null);
     try std.testing.expectEqualDeep(removed, try load(&root));
     const claimed = try claim(&root, all_mask, true);
-    try std.testing.expectEqualDeep(removed.available, claimed.cache.available);
+    try std.testing.expectEqualDeep(removed.directory, claimed.cache.directory);
     const before = try load(&root);
-    try std.testing.expectError(error.InvalidMetadata, commit(&root, bit(.deepseek), .{ .tokens = @splat(0), .available = @splat(true) }));
+    var invalid = listing;
+    invalid.directory.rows[invalid.directory.find(.deepseek, "raw/id").?].tokens = 0;
+    try std.testing.expectError(error.InvalidMetadata, commit(&root, bit(.deepseek), invalid));
     try std.testing.expectEqualDeep(before, try load(&root));
-}
-
-test "metadata legacy cache upgrades to v10 with unknown directory availability and reasoning" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try testRoot(tmp.dir);
-    defer root.deinit();
-    const legacy = "{\"version\":1,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":99}]}";
-    try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = legacy });
-    const old = try load(&root);
-    for (old.available) |v| try std.testing.expect(v == null);
-    try std.testing.expectEqual(@as(?u32, 99), old.tokens[testIndex("deepseek/deepseek-flash")]);
-    const upgraded = try claim(&root, bit(.deepseek), false);
-    try std.testing.expectEqualDeep(old.tokens, upgraded.cache.tokens);
-    try std.testing.expectEqualDeep(old.available, upgraded.cache.available);
-    const bytes = try root.read(std.testing.allocator, file_name, 0, max_cache_bytes);
-    defer std.testing.allocator.free(bytes.data);
-    var parsed = try std.json.parseFromSlice(Document, std.testing.allocator, bytes.data, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 12), parsed.value.version);
-    try std.testing.expectEqualDeep(upgraded.cache, try load(&root));
-    const nullable = try parseCache(std.testing.allocator, "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":null}]}");
-    for (nullable.available) |v| try std.testing.expect(v == null);
-    const omitted = try parseCache(std.testing.allocator, "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":99}]}");
-    try std.testing.expectEqualDeep(old, omitted);
 }
 
 test "metadata rejects malformed availability and duplicate cache records without overwrite" {
@@ -1381,10 +1262,10 @@ test "metadata rejects malformed availability and duplicate cache records withou
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const cases = [_]struct { body: []const u8, err: anyerror }{
-        .{ .body = "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":1}]}", .err = error.UnexpectedToken },
-        .{ .body = "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":\"true\"}]}", .err = error.UnexpectedToken },
-        .{ .body = "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":true,\"available\":false}]}", .err = error.DuplicateField },
-        .{ .body = "{\"version\":2,\"attempted\":0,\"records\":[{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":true},{\"selector\":\"deepseek/deepseek-flash\",\"context_window\":null,\"available\":false}]}", .err = error.InvalidMetadata },
+        .{ .body = "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":1}]}", .err = error.UnexpectedToken },
+        .{ .body = "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":\"true\"}]}", .err = error.UnexpectedToken },
+        .{ .body = "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true,\"available\":false}]}", .err = error.DuplicateField },
+        .{ .body = "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true},{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":false}]}", .err = error.InvalidMetadata },
     };
     for (cases) |case| {
         try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = case.body });
@@ -1410,32 +1291,7 @@ test "metadata official listing routes only DeepSeek credentials" {
     }
 }
 
-test "version 5 upgrades output discovery once while retaining official directory" {
-    const a = std.testing.allocator;
-    const old: Document = .{ .version = 5, .attempted = provider_mask | dev_bit, .records = &.{}, .directory_mask = bit(.deepseek), .models = &.{.{ .provider = .deepseek, .id = "deepseek-flash", .context_window = 131072, .available = true, .protocol = .chat }} };
-    const bytes = try std.json.Stringify.valueAlloc(a, old, .{});
-    defer a.free(bytes);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = bytes });
-    var path: [4096]u8 = undefined;
-    const name = path[0..try tmp.dir.realPath(std.testing.io, &path)];
-    var root = try fs.Root.open(a, std.testing.io, name);
-    defer root.deinit();
-    const migrated = try load(&root);
-    try std.testing.expectEqual(provider_mask, migrated.attempted);
-    try std.testing.expect(hasDirectory(&migrated, .deepseek));
-    try std.testing.expectEqual(@as(?u32, 131072), migrated.directory.rows[0].tokens);
-    try std.testing.expect(migrated.directory.rows[0].dev_output_tokens == null);
-    const first = try claim(&root, dev_bit, false);
-    try std.testing.expectEqual(dev_bit, first.mask);
-    const reloaded = try load(&root);
-    try std.testing.expectEqual(@as(u8, provider_mask | dev_bit), reloaded.attempted);
-    try std.testing.expect(hasDirectory(&reloaded, .deepseek));
-    try std.testing.expectEqual(@as(u8, 0), (try claim(&root, dev_bit, false)).mask);
-}
-
-test "models.dev profiles persist in version 8 cache and automatic claims observe cooldown" {
+test "models.dev profiles persist in current cache and automatic claims observe cooldown" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
@@ -1444,21 +1300,18 @@ test "models.dev profiles persist in version 8 cache and automatic claims observ
         \\{"deepseek":{"id":"deepseek","models":{"deepseek-flash":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high","max"]}],"provider":{"npm":"@ai-sdk/openai-compatible"}}}}}
     ;
     const listing = try parseDev(std.testing.allocator, body);
-    const index = for (catalog.entries, 0..) |entry, i| {
-        if (std.mem.eql(u8, entry.selector, "deepseek/deepseek-flash")) break i;
-    } else unreachable;
     try std.testing.expect(listing.dev_done);
-    try std.testing.expectEqualStrings("off", listing.dev[index].?.map.off.?);
+    try std.testing.expectEqualStrings("off", testRow(&listing, .deepseek, "deepseek-flash").dev_reasoning.?.declaration().map.off.?);
     try std.testing.expectEqual(dev_bit, (try claim(&root, dev_bit, false)).mask);
     _ = try commit(&root, 0, listing);
     const reloaded = try load(&root);
-    try std.testing.expectEqualStrings("off", reloaded.dev_reasoning[index].?.map.off.?);
-    try std.testing.expect(reloaded.reasoning[index] == null);
-    try std.testing.expectEqual(dev_bit, reloaded.attempted & dev_bit);
+    try std.testing.expectEqualStrings("off", reloaded.directory.rows[reloaded.directory.find(.deepseek, "deepseek-flash").?].dev_reasoning.?.declaration().map.off.?);
+    try std.testing.expect(reloaded.directory.rows[reloaded.directory.find(.deepseek, "deepseek-flash").?].reasoning == null);
+    try std.testing.expect(reloaded.refresh[3].last_attempt_ms != null);
     try std.testing.expectEqual(@as(u8, 0), (try claim(&root, dev_bit, false)).mask);
     // A failed later models.dev fetch does not erase the last successful profile.
     _ = try commit(&root, 0, .{});
-    try std.testing.expect((try load(&root)).dev_reasoning[index] != null);
+    try std.testing.expect((try load(&root)).directory.rows[reloaded.directory.find(.deepseek, "deepseek-flash").?].dev_reasoning != null);
 }
 
 test "models.dev loopback transport parses public catalog and enforces its own size limit" {
@@ -1488,8 +1341,7 @@ test "models.dev loopback transport parses public catalog and enforces its own s
     try worker.await(io);
     try std.testing.expect(cleaned.load(.acquire));
     try std.testing.expect(listing.dev_done);
-    const index = testIndex("deepseek/deepseek-flash");
-    try std.testing.expectEqualStrings("off", listing.dev[index].?.map.off.?);
+    try std.testing.expectEqualStrings("off", testRow(&listing, .deepseek, "deepseek-flash").dev_reasoning.?.declaration().map.off.?);
     // The provider limit (512 KiB) is not used for the public catalog, and a
     // smaller explicit limit fails before any parser sees a partial document.
     var tiny = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -1504,6 +1356,39 @@ test "models.dev loopback transport parses public catalog and enforces its own s
     try std.testing.expectError(error.MetadataTooLarge, fetchUrl(a, io, second_url, null, 8));
     try second_worker.await(io);
     try std.testing.expect(second_cleaned.load(.acquire));
+}
+
+fn cacheAllocationCheck(a: std.mem.Allocator) !void {
+    const cache = try parseCache(a,
+        \\{"version":14,"directory_mask":1,"models":[{"provider":"deepseek","id":"deepseek/raw/id","context_window":131072,"available":true,"protocol":"chat","reasoning":{"format":"deepseek","map":{"off":"off","high":"high"}},"dev_protocol":"chat","dev_present":true,"dev_output_tokens":8192,"dev_context_tokens":262144,"dev_input_price_flat_limit":262144}],"refresh":[{"generation":7,"last_attempt_ms":10,"last_success_ms":11,"successful":true},{},{},{}]}
+    );
+    try std.testing.expectEqualStrings("deepseek/raw/id", cache.directory.name(0));
+    try std.testing.expectEqual(@as(u64, 7), cache.refresh[0].generation);
+}
+
+test "metadata current cache allocation failures release all parser scratch" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cacheAllocationCheck, .{});
+}
+
+test "metadata declaration identity never strips a provider prefix inside raw IDs" {
+    var listing = try parseDev(std.testing.allocator,
+        \\{"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"raw/id":{"reasoning_options":[{"type":"effort","values":["low"]}]},"opencode-go/raw/id":{"reasoning_options":[{"type":"effort","values":["high"]}]}}}}
+    );
+    const official = try parseListing(std.testing.allocator, "{\"data\":[{\"id\":\"raw/id\"},{\"id\":\"opencode-go/raw/id\"}]}", .opencode_go);
+    try mergeOfficial(&listing, &official, .opencode_go);
+    const cache: Cache = .{ .directory = listing.directory, .directory_mask = bit(.opencode_go) };
+    var config: cfg.Config = .{ .provider = catalog.connection(.opencode_go), .model = .{ .name = "opencode-go/raw/id", .protocol = .chat, .context_tokens = 32768 } };
+    try std.testing.expectEqualStrings("high", declarationForConfig(&cache, config).?.map.high.?);
+    config.model.name = "raw/id";
+    try std.testing.expectEqualStrings("low", declarationForConfig(&cache, config).?.map.low.?);
+    config.model.name = "opencode-go/opencode-go/raw/id";
+    try std.testing.expect(declarationForConfig(&cache, config) == null);
+    config.provider.kind = .deepseek;
+    config.model.name = "raw/id";
+    try std.testing.expect(declarationForConfig(&cache, config) == null);
+    const exact = restoreEntry(&cache, .opencode_go, "opencode-go/raw/id").?;
+    try std.testing.expectEqualStrings("opencode-go/raw/id", exact.model.name);
+    try std.testing.expectEqualStrings("opencode-go/raw/id", findEntry(&cache, "opencode-go/opencode-go/raw/id").?.model.name);
 }
 
 test {

@@ -177,7 +177,7 @@ test "thinking actual chat standard and deepseek mapping" {
     var req = test_support.request(.chat);
     const cases = [_]struct { model: []const u8, effort: ?[]const u8, expected: ?[]const u8, enabled: ?bool }{
         .{ .model = "deepseek-flash", .effort = null, .expected = null, .enabled = null },
-        .{ .model = "deepseek-flash", .effort = "none", .expected = null, .enabled = false },
+        .{ .model = "deepseek-flash", .effort = "off", .expected = null, .enabled = false },
         .{ .model = "deepseek-flash", .effort = "medium", .expected = "high", .enabled = true },
         .{ .model = "deepseek-v4-pro", .effort = "max", .expected = "max", .enabled = true },
     };

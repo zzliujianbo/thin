@@ -29,7 +29,7 @@ pub const Client = struct {
 
     const Resolved = struct {
         config: std.json.Parsed(cfg.Config),
-        client: http.Client,
+        client: ?http.Client = null,
     };
 
     pub fn create(a: std.mem.Allocator, io: std.Io, config: cfg.Config, env: *const std.process.Environ.Map) !?*Client {
@@ -62,7 +62,11 @@ pub const Client = struct {
         }
         const proxy_url = if (config.proxyFor(reference.provider, reference.model)) |route| try route.url(a) else null;
         defer if (proxy_url) |url| a.free(url);
-        const native: ?native_http.Client = if (declaration.backend == .systemone)
+        const cache = try a.create(metadata.Cache);
+        defer a.destroy(cache);
+        loadCache(a, io, home, cache);
+        const api = resolver.protocolFor(config, cache, reference.provider, reference.model) catch null;
+        const native: ?native_http.Client = if (api == .systemone)
             native_http.Client.initRouted(a, io, env, proxy_url) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => null, // An unusable auxiliary environment cannot block archive viewing.
@@ -77,7 +81,7 @@ pub const Client = struct {
         const a = self.allocator;
         if (self.native) |*native| native.deinit();
         if (self.resolved) |resolved| {
-            resolved.client.deinit();
+            if (resolved.client) |*client| client.deinit();
             cfg.release(&resolved.config);
             a.destroy(resolved);
         }
@@ -95,9 +99,18 @@ pub const Client = struct {
         return .{ .context = self, .decide_fn = decide, .check_fn = checkService };
     }
 
+    fn loadCache(a: std.mem.Allocator, io: std.Io, home: []const u8, cache: *metadata.Cache) void {
+        cache.* = .{};
+        if (home.len == 0) return;
+        if (Store.openExisting(a, io, home)) |opened| {
+            var store = opened;
+            defer store.deinit();
+            cache.* = metadata.load(&store.root) catch .{};
+        } else |_| {}
+    }
+
     fn resolve(self: *Client) !*Resolved {
         if (self.resolved) |ready| return ready;
-        const key = self.key orelse return error.DecisionUnavailable;
         const a = self.allocator;
         const declared = self.source.value.decision.?;
         const reference = try cfg.splitDefault(declared.model);
@@ -107,24 +120,28 @@ pub const Client = struct {
         errdefer cfg.release(&state.config);
         const config = &state.config.value;
         // Picker and actual reviewer resolve with the same independent caps.
-        config.limits = declared.modelLimits();
+        config.limits = declared.modelLimits(self.source.value.limits.request_timeout_ms);
         const cache = try a.create(metadata.Cache);
         defer a.destroy(cache);
-        cache.* = .{};
-        if (self.home.len != 0) {
-            if (Store.openExisting(a, self.io, self.home)) |opened| {
-                var store = opened;
-                defer store.deinit();
-                cache.* = metadata.load(&store.root) catch .{};
-            } else |_| {}
-        }
+        loadCache(a, self.io, self.home, cache);
         const selection = try resolver.resolve(state.config.arena.allocator(), config.*, cache, reference.provider, reference.model, false);
         resolver.apply(config, selection);
         if (config.model.protocol == .auto) return error.UnknownModelProtocol;
         // No applyConfigured/global logical preference: only this model's own
         // explicit declaration/capability can provide wire reasoning settings.
         try cfg.validate(config.*);
-        state.client = try http.Client.initWithEnv(a, self.io, config, key, &self.transport_env);
+        state.client = null;
+        if (config.model.protocol != .systemone) {
+            const key = self.key orelse return error.DecisionUnavailable;
+            state.client = try http.Client.initWithEnv(a, self.io, config, key, &self.transport_env);
+        } else if (self.native == null) {
+            // Metadata can identify the native protocol after creation. Prepare
+            // from the frozen auxiliary scope/environment before publishing;
+            // never replace an existing transport (including sticky poison).
+            const proxy_url = if (self.source.value.proxyFor(reference.provider, reference.model)) |route| try route.url(a) else null;
+            defer if (proxy_url) |url| a.free(url);
+            self.native = try native_http.Client.initRouted(a, self.io, &self.transport_env, proxy_url);
+        }
         self.resolved = state;
         return state;
     }
@@ -136,7 +153,7 @@ pub const Client = struct {
 
     fn checkCleanup(self: *const Client) !void {
         if (self.native) |native| if (native.poisoned) return error.CleanupFailed;
-        if (self.resolved) |ready| if (ready.client.proxy_http) |transport| if (transport.poisoned) return error.CleanupFailed;
+        if (self.resolved) |ready| if (ready.client) |client| if (client.proxy_http) |transport| if (transport.poisoned) return error.CleanupFailed;
     }
 
     fn decide(raw: *anyopaque, a: std.mem.Allocator, input: policy.Input, cancel: *const p.Cancellation) !policy.Output {
@@ -145,16 +162,16 @@ pub const Client = struct {
         self.last_http_status = null;
         try self.checkCleanup();
         if (cancel.isRequested()) return error.Canceled;
-        if (self.source.value.decision.?.backend == .systemone)
-            return self.callNative(a, input, cancel);
         const ready = self.resolve() catch |err| {
             if (err == error.OutOfMemory) return err;
             return error.DecisionUnavailable;
         };
-        return self.call(a, ready.config.value, ready.client.model(), input, cancel);
+        if (ready.config.value.model.protocol == .systemone)
+            return self.callNative(a, ready.config.value, input, cancel);
+        return self.call(a, ready.config.value, ready.client.?.model(), input, cancel);
     }
 
-    fn callNative(self: *Client, output_allocator: std.mem.Allocator, input: policy.Input, cancel: *const p.Cancellation) !policy.Output {
+    fn callNative(self: *Client, output_allocator: std.mem.Allocator, config: cfg.Config, input: policy.Input, cancel: *const p.Cancellation) !policy.Output {
         const transport = if (self.native) |*native| native else return error.DecisionUnavailable;
         if (transport.poisoned) return error.CleanupFailed;
         if (cancel.isRequested()) return error.Canceled;
@@ -162,18 +179,16 @@ pub const Client = struct {
             return .{ .refine_outputs = try output_allocator.alloc(policy.RefineItem, 0) };
         const key = self.key orelse return error.DecisionUnavailable;
         const declared = self.source.value.decision.?;
-        const reference = try cfg.splitDefault(declared.model);
-        const provider = self.source.value.registry.?.find(reference.provider) orelse return error.DecisionUnavailable;
-        // This backend deliberately never resolves a primary Model, metadata
-        // window, reasoning setting or Chat wire route for a SystemOne model.
+        // Native routing comes only from the independently resolved protocol;
+        // SystemOne never borrows generative capabilities or the primary key.
         var scratch = std.heap.ArenaAllocator.init(output_allocator);
         defer scratch.deinit();
         const a = scratch.allocator();
-        const payload = try systemone.encodeRequest(a, reference.model, input, declared.max_state_bytes);
-        const endpoint = try std.fmt.allocPrint(a, "{s}/systemone", .{std.mem.trimEnd(u8, provider.connection.base_url, "/")});
+        const payload = try systemone.encodeRequest(a, config.model.name, input, declared.max_state_bytes);
+        const endpoint = try std.fmt.allocPrint(a, "{s}/systemone", .{std.mem.trimEnd(u8, config.provider.base_url, "/")});
         if (cancel.isRequested()) return error.Canceled;
         self.calls +|= 1;
-        const response = try transport.post(a, endpoint, key, payload, declared.request_timeout_ms, cancel);
+        const response = try transport.post(a, endpoint, key, payload, config.limits.request_timeout_ms, cancel);
         self.last_http_status = response.status;
         if (response.status != 200) return error.DecisionUnavailable;
         const result = try systemone.parseResponse(output_allocator, input, response.body);
@@ -192,7 +207,7 @@ pub const Client = struct {
         const a = scratch.allocator();
         const body = try policy.encodeInput(a, input);
         const messages = [_]p.Message{try p.textMessage(a, .user, body)};
-        const system = policy.instruction();
+        const system = policy.instruction(input);
         const estimated = context.rawTokens(system, &.{}, &messages);
         const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
         const wire = capabilities.wire(config.model.reasoning_effort);
@@ -265,7 +280,7 @@ test "decision client fake wire has own caps no tools and validates output witho
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     var parsed = try cfg.parse(a,
-        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://unused.invalid/v1","api_key":"fake-owned-key","models":{"main":{"context_tokens":32768,"protocol":"chat"},"judge":{"context_tokens":32768,"protocol":"chat"}}}}},"decision":{"model":"p/judge","max_output_tokens":256}}
+        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://unused.invalid/v1","api_key":"fake-owned-key","models":{"main":{"context_tokens":32768,"protocol":"chat"},"judge":{"context_tokens":32768,"protocol":"chat"}}}}},"decision":{"model":"p/judge","max_output_tokens":256},"limits":{"request_timeout_ms":4321}}
     );
     defer cfg.release(&parsed);
     const client = (try Client.create(a, std.testing.io, parsed.value, &env)).?;
@@ -275,6 +290,7 @@ test "decision client fake wire has own caps no tools and validates output witho
     try std.testing.expect(ready.config.value.model.reasoning_effort == null);
     try std.testing.expect(parsed.value.limits.low_price_input);
     try std.testing.expect(!ready.config.value.limits.low_price_input);
+    try std.testing.expectEqual(@as(u32, 4321), ready.config.value.limits.request_timeout_ms);
     const Fake = struct {
         calls: usize = 0,
         bad: bool = false,
@@ -284,6 +300,10 @@ test "decision client fake wire has own caps no tools and validates output witho
             try std.testing.expectEqualStrings("judge", request.scope.model);
             try std.testing.expectEqual(@as(usize, 0), request.tools.len);
             try std.testing.expectEqual(@as(u32, 256), request.max_output_tokens);
+            try std.testing.expectEqualStrings(policy.instruction(.{ .memory_write = .{ .topic = "style", .content = "Prefer concise reports." } }), request.system);
+            try std.testing.expect(std.mem.indexOf(u8, request.system, policy.ReviewRules.memory_value) != null);
+            try std.testing.expect(std.mem.indexOf(u8, request.system, "For command:") == null);
+            try std.testing.expect(std.mem.indexOf(u8, request.system, "For refine_outputs:") == null);
             return .{ .success = .{ .message = try p.textMessage(alloc, .assistant, if (self.bad) "{\"write\":true,\"extra\":false}" else "{\"write\":true}"), .usage = .{ .input_tokens = 100, .output_tokens = 5 }, .finish = .stop } };
         }
     };
@@ -302,12 +322,77 @@ test "decision client fake wire has own caps no tools and validates output witho
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
 
+test "SystemOne metadata refresh prepares frozen auxiliary transport without rebuilding or sending" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const home = home_buffer[0..try tmp.dir.realPath(std.testing.io, &home_buffer)];
+    var store = try Store.open(a, std.testing.io, home);
+    defer store.deinit();
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("AUX_KEY", "fake-aux-frozen-key");
+    try env.put("CURL_CA_BUNDLE", "/owned/fake-ca.pem");
+    var config = try cfg.parse(a,
+        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":32768}}},"Zen":{"base_url":"https://opencode.ai/zen/v1","api_key_env":"AUX_KEY","models":{"reviewer/raw-id":{}}}}},"decision":{"model":"Zen/reviewer/raw-id"},"proxy":{"address":"127.0.0.1","port":18973,"models":["Zen/reviewer/raw-id"]}}
+    );
+    defer cfg.release(&config);
+    const client = (try Client.create(a, std.testing.io, config.value, &env)).?;
+    defer client.deinit();
+    try std.testing.expect(client.native == null and client.resolved == null);
+    try std.testing.expectError(error.UnknownModelProtocol, client.resolve());
+    try std.testing.expect(client.native == null and client.resolved == null);
+    try std.testing.expectEqual(@as(u64, 0), client.calls);
+    // Later external credentials/trust/proxies cannot alter the owned client.
+    try env.put("AUX_KEY", "fake-later-key");
+    try env.put("CURL_CA_BUNDLE", "bad\nca");
+    try env.put("HTTPS_PROXY", "bad\nproxy");
+    const invalid_trust = (try Client.create(a, std.testing.io, config.value, &env)).?;
+    defer invalid_trust.deinit();
+    try std.testing.expect(invalid_trust.native == null);
+    const listing = try a.create(metadata.Listing);
+    defer a.destroy(listing);
+    listing.* = try metadata.parseDev(a,
+        \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"reviewer/raw-id":{"api":{"url":"https://opencode.ai/inference/systemone/v1"}}}}}
+    );
+    const published = try a.create(metadata.Cache);
+    defer a.destroy(published);
+    published.* = try metadata.commit(&store.root, 0, listing.*);
+    // Failed preparation must release the temporary resolved config and remain
+    // unpublished/retryable, not leave a native-null ready state behind.
+    for (0..2) |_| {
+        try std.testing.expectError(error.InvalidProxyEnvironment, invalid_trust.resolve());
+        try std.testing.expect(invalid_trust.native == null and invalid_trust.resolved == null);
+        try std.testing.expectEqual(@as(u64, 0), invalid_trust.calls);
+    }
+    const ready = try client.resolve();
+    try std.testing.expectEqual(p.Protocol.systemone, ready.config.value.model.protocol);
+    try std.testing.expect(client.native != null and ready.client == null);
+    try std.testing.expectEqualStrings("https://opencode.ai/inference/systemone/v1", ready.config.value.provider.base_url);
+    try std.testing.expectEqualStrings("reviewer/raw-id", ready.config.value.model.name);
+    try std.testing.expectEqualStrings("Zen/reviewer/raw-id", client.source.value.decision.?.model);
+    try std.testing.expectEqualStrings("fake-aux-frozen-key", client.key.?);
+    try std.testing.expectEqualStrings("/owned/fake-ca.pem", client.native.?.env.get("CURL_CA_BUNDLE").?);
+    try std.testing.expect(client.native.?.env.get("AUX_KEY") == null);
+    try std.testing.expect(client.native.?.env.get("HTTPS_PROXY") == null);
+    try std.testing.expect(client.native.?.explicit_route);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18973", client.native.?.proxy_url.?);
+    try std.testing.expect(ready == try client.resolve());
+    client.native.?.poisoned = true;
+    try std.testing.expect(ready == try client.resolve());
+    try std.testing.expectError(error.CleanupFailed, client.checkCleanup());
+    try std.testing.expect(client.native.?.poisoned);
+    try std.testing.expectEqual(@as(u64, 0), client.calls);
+}
+
 test "SystemOne creation stays lazy without capabilities or key and never passes credential env to curl" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     var config = try cfg.parse(a,
-        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://inert.invalid/v1"},"aux":{"base_url":"https://opencode.ai/inference/systemone/v1","api_key_env":"SYSTEMONE_KEY"}}},"decision":{"model":"aux/jev-1.13-free","backend":"systemone"}}
+        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://inert.invalid/v1"},"aux":{"base_url":"https://opencode.ai/inference/systemone/v1","api_key_env":"SYSTEMONE_KEY"}}},"decision":{"model":"aux/native-reviewer"}}
     );
     defer cfg.release(&config);
     const missing = (try Client.create(a, std.testing.io, config.value, &env)).?;
@@ -316,6 +401,8 @@ test "SystemOne creation stays lazy without capabilities or key and never passes
     var cancel = p.Cancellation{};
     const input: policy.Input = .{ .memory_write = .{ .topic = "style", .content = "concise" } };
     try std.testing.expectError(error.DecisionUnavailable, missing.service().decide(a, input, &cancel));
+    try std.testing.expectEqual(p.Protocol.systemone, missing.resolved.?.config.value.model.protocol);
+    try std.testing.expect(missing.resolved.?.client == null);
     const empty = try missing.service().decide(a, .{ .refine_outputs = &.{} }, &cancel);
     policy.freeOutput(a, empty);
     try std.testing.expectEqual(@as(u64, 0), missing.calls);

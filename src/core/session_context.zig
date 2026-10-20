@@ -35,9 +35,8 @@ pub const Environment = struct {
     cwd: []const u8,
     shell: []const u8,
     project_root: []const u8,
-    /// Legacy history lacks these fields. Never label it with today's platform.
-    os: ?std.Target.Os.Tag = null,
-    arch: ?std.Target.Cpu.Arch = null,
+    os: std.Target.Os.Tag,
+    arch: std.Target.Cpu.Arch,
 };
 
 /// SHELL is used when it is a single UTF-8 line. Otherwise the session reports bash.
@@ -70,15 +69,13 @@ pub fn formatEnvironment(a: std.mem.Allocator, env: Environment, update: bool) !
     try requireField(env.cwd, true);
     try requireField(env.shell, false);
     try requireField(env.project_root, true);
-    const os = env.os orelse return error.InvalidSessionContext;
-    const arch = env.arch orelse return error.InvalidSessionContext;
     return std.fmt.allocPrint(a, "{s}\ncwd: {s}\nshell: {s}\nproject_root: {s}\nos: {s}\narch: {s}\n", .{
         if (update) "environment update" else "environment",
         env.cwd,
         env.shell,
         env.project_root,
-        @tagName(os),
-        @tagName(arch),
+        @tagName(env.os),
+        @tagName(env.arch),
     });
 }
 
@@ -90,14 +87,19 @@ pub fn parseEnvironment(text: []const u8) ?Environment {
     const cwd = oneField(&rest, "cwd: ") orelse return null;
     const shell = oneField(&rest, "shell: ") orelse return null;
     const project_root = oneField(&rest, "project_root: ") orelse return null;
-    var env: Environment = .{ .cwd = cwd, .shell = shell, .project_root = project_root };
-    if (rest.len == 0) return env; // Archived three-field preface remains readable.
     const os = oneField(&rest, "os: ") orelse return null;
     const arch = oneField(&rest, "arch: ") orelse return null;
     if (rest.len != 0) return null;
-    env.os = std.meta.stringToEnum(std.Target.Os.Tag, os) orelse return null;
-    env.arch = std.meta.stringToEnum(std.Target.Cpu.Arch, arch) orelse return null;
-    return env;
+    requireField(cwd, true) catch return null;
+    requireField(shell, false) catch return null;
+    requireField(project_root, true) catch return null;
+    return .{
+        .cwd = cwd,
+        .shell = shell,
+        .project_root = project_root,
+        .os = std.meta.stringToEnum(std.Target.Os.Tag, os) orelse return null,
+        .arch = std.meta.stringToEnum(std.Target.Cpu.Arch, arch) orelse return null,
+    };
 }
 
 pub fn parseAgentsBody(text: []const u8) ?[]const u8 {

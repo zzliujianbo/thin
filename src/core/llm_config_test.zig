@@ -177,7 +177,9 @@ test "optional global decision owns qualified model and sparsely persists" {
     try t.expect(parsed.value.decisionActive());
     try t.expectEqualStrings("p/chat", parsed.value.registry.?.default);
     try t.expectEqualStrings("vendor/raw/id", (try cfg.splitDefault(parsed.value.decision.?.model)).model);
-    try t.expectEqual(@as(u32, 30000), parsed.value.decision.?.request_timeout_ms);
+    const auxiliary = parsed.value.decision.?.modelLimits(parsed.value.limits.request_timeout_ms);
+    try t.expectEqual(parsed.value.limits.request_timeout_ms, auxiliary.request_timeout_ms);
+    try t.expect(!auxiliary.low_price_input);
     try t.expectEqual(@as(u32, 8192), parsed.value.decision.?.max_input_tokens);
     try t.expectEqual(@as(u32, 1024), parsed.value.decision.?.max_output_tokens);
     var copy = try cfg.clone(a, parsed.value);
@@ -192,11 +194,10 @@ test "optional global decision owns qualified model and sparsely persists" {
     // Reference validation never invents a protocol/window or borrows chat capabilities.
     try t.expect(disk.value.registry.?.find("aux").?.patchFor("vendor/raw/id") == null);
     for ([_][]const u8{
-        "{}",                                               "[]",                                             "false",                                             "1",                                                    "\"aux/m\"",
-        "{\"model\":\"missing/m\"}",                        "{\"model\":\"m\"}",                              "{\"model\":\"p/\"}",                                "{\"model\":1}",                                        "{\"model\":null}",
-        "{\"model\":\"p/m\",\"model\":\"p/n\"}",            "{\"model\":\"p/m\",\"extra\":true}",             "{\"model\":\"p/m\",\"request_timeout_ms\":0}",      "{\"model\":\"p/m\",\"request_timeout_ms\":3600001}",   "{\"model\":\"p/m\",\"request_timeout_ms\":1.0}",
-        "{\"model\":\"p/m\",\"request_timeout_ms\":\"1\"}", "{\"model\":\"p/m\",\"max_input_tokens\":1}",     "{\"model\":\"p/m\",\"max_input_tokens\":16777217}", "{\"model\":\"p/m\",\"max_output_tokens\":0}",          "{\"model\":\"p/m\",\"max_output_tokens\":16777217}",
-        "{\"model\":\"p/m\",\"max_output_tokens\":null}",   "{\"model\":\"p/m\",\"max_output_tokens\":true}", "{\"model\":\"p/m\",\"max_output_tokens\":-1}",      "{\"model\":\"p/m\",\"max_output_tokens\":4294967296}",
+        "{}",                                                 "[]",                                             "false",                                          "1",                                                 "\"aux/m\"",
+        "{\"model\":\"missing/m\"}",                          "{\"model\":\"m\"}",                              "{\"model\":\"p/\"}",                             "{\"model\":1}",                                     "{\"model\":null}",
+        "{\"model\":\"p/m\",\"model\":\"p/n\"}",              "{\"model\":\"p/m\",\"extra\":true}",             "{\"model\":\"p/m\",\"max_input_tokens\":1}",     "{\"model\":\"p/m\",\"max_input_tokens\":16777217}", "{\"model\":\"p/m\",\"max_output_tokens\":0}",
+        "{\"model\":\"p/m\",\"max_output_tokens\":16777217}", "{\"model\":\"p/m\",\"max_output_tokens\":null}", "{\"model\":\"p/m\",\"max_output_tokens\":true}", "{\"model\":\"p/m\",\"max_output_tokens\":-1}",      "{\"model\":\"p/m\",\"max_output_tokens\":4294967296}",
     }) |value| {
         const raw = try std.mem.concat(a, u8, &.{ prefix, ",\"decision\":", value, "}" });
         defer a.free(raw);
@@ -209,7 +210,7 @@ test "optional global decision owns qualified model and sparsely persists" {
     copy.value.decision.?.max_input_tokens = 1;
     try t.expectError(error.InvalidLimit, cfg.clone(a, copy.value));
     copy.value.decision.?.max_input_tokens = 2;
-    copy.value.decision.?.request_timeout_ms = 3600000;
+    copy.value.limits.request_timeout_ms = 3600000;
     copy.value.decision.?.max_output_tokens = 16777216;
     try cfg.validate(copy.value);
     copy.value.registry = null;
@@ -242,10 +243,10 @@ test "decision enabled strict bool rejects null duplicates unknown and root over
     try t.expectError(error.UnknownField, cfg.parse(a, proxy_prefix ++ ",\"decision_enabled\":true,\"decision\":{\"model\":\"p/aux\",\"enabled\":false}}"));
 }
 
-test "disabled decision roundtrip preserves declarations backend credentials limits and proxy" {
+test "disabled decision roundtrip preserves declared protocol credentials shared limits and proxy" {
     const a = t.allocator;
     const input =
-        \\{"llm":{"default":"p/chat","reasoning_effort":"high","providers":{"p":{"base_url":"https://fixture.invalid/v1","api_key":"fixture-key","models":{"chat":{"context_tokens":65536},"aux/raw":{"output_tokens":1234}}},"other":{"base_url":"https://other.invalid","api_key_env":"FIXTURE_KEY"}}},"decision":{"model":"p/aux/raw","enabled":false,"backend":"systemone","request_timeout_ms":1234,"max_input_tokens":4321,"max_output_tokens":321,"max_state_bytes":8192},"limits":{"low_price_input":false,"max_input_tokens":50000},"proxy":{"address":"localhost","port":8080,"models":["p/aux/raw"]}}
+        \\{"llm":{"default":"p/chat","reasoning_effort":"high","providers":{"p":{"base_url":"https://fixture.invalid/v1","api_key":"fixture-key","models":{"chat":{"context_tokens":65536},"aux/raw":{"protocol":"systemone","output_tokens":1234}}},"other":{"base_url":"https://other.invalid","api_key_env":"FIXTURE_KEY"}}},"decision":{"model":"p/aux/raw","enabled":false,"max_input_tokens":4321,"max_output_tokens":321,"max_state_bytes":8192},"limits":{"low_price_input":false,"request_timeout_ms":1234,"max_input_tokens":50000},"proxy":{"address":"localhost","port":8080,"models":["p/aux/raw"]}}
     ;
     var parsed = try cfg.parse(a, input);
     defer cfg.release(&parsed);
@@ -262,6 +263,12 @@ test "disabled decision roundtrip preserves declarations backend credentials lim
     try cfg.writeDisk(copy.value, &out.writer);
     try t.expect(std.mem.find(u8, out.written(), "decision_enabled") == null);
     try t.expect(std.mem.find(u8, out.written(), "runtime-only-model") == null);
+    const encoded = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
+    defer encoded.deinit();
+    const decision_object = encoded.value.object.get("decision").?.object;
+    try t.expectEqual(@as(usize, 5), decision_object.count());
+    try t.expect(decision_object.get("backend") == null);
+    try t.expect(decision_object.get("request_timeout_ms") == null);
     var disk = try cfg.parse(a, out.written());
     defer cfg.release(&disk);
     try t.expect(!disk.value.decisionActive());
@@ -277,13 +284,13 @@ test "disabled decision roundtrip preserves declarations backend credentials lim
     try t.expect(!disk.value.decisionActive());
 }
 
-test "SystemOne backend explicitly owns URL and byte bounds without primary protocol guesses" {
-    const prefix = "{\"llm\":{\"default\":\"main/chat\",\"providers\":{\"main\":{\"base_url\":\"https://api.deepseek.com\"},\"aux\":{\"base_url\":\"https://opencode.ai/inference/systemone/v1\"}}}";
-    var p = try cfg.parse(t.allocator, prefix ++ ",\"decision\":{\"model\":\"aux/jev-1.13-free\",\"backend\":\"systemone\",\"max_state_bytes\":8192}}");
+test "SystemOne exact model declaration owns protocol and byte bounds without primary guesses" {
+    const prefix = "{\"llm\":{\"default\":\"main/chat\",\"providers\":{\"main\":{\"base_url\":\"https://api.deepseek.com\"},\"aux\":{\"base_url\":\"https://native-fixture.invalid/v1\",\"models\":{\"judge/raw\":{\"protocol\":\"systemone\"}}}}}";
+    var p = try cfg.parse(t.allocator, prefix ++ ",\"decision\":{\"model\":\"aux/judge/raw\",\"max_state_bytes\":8192}}");
     defer cfg.release(&p);
-    try t.expect(p.value.decision.?.backend == .systemone);
+    try t.expect(p.value.registry.?.find("aux").?.patchFor("judge/raw").?.protocol == .systemone);
     try t.expectEqual(@as(u32, 8192), p.value.decision.?.max_state_bytes);
-    try t.expect(p.value.registry.?.find("aux").?.patchFor("jev-1.13-free") == null);
+    try t.expect(p.value.registry.?.find("aux").?.patchFor("judge/raw").?.context_tokens == null);
     var copy = try cfg.clone(t.allocator, p.value);
     defer cfg.release(&copy);
     var out: std.Io.Writer.Allocating = .init(t.allocator);
@@ -293,8 +300,6 @@ test "SystemOne backend explicitly owns URL and byte bounds without primary prot
     defer cfg.release(&roundtrip);
     try t.expectEqualDeep(copy.value.decision, roundtrip.value.decision);
     for ([_][]const u8{
-        "{\"model\":\"aux/m\",\"backend\":\"chat\"}",
-        "{\"model\":\"aux/m\",\"backend\":null}",
         "{\"model\":\"aux/m\",\"max_state_bytes\":0}",
         "{\"model\":\"aux/m\",\"max_state_bytes\":65537}",
         "{\"model\":\"aux/m\",\"max_state_bytes\":2.0}",
@@ -309,9 +314,10 @@ test "SystemOne backend explicitly owns URL and byte bounds without primary prot
     }
     const providers = @constCast(copy.value.registry.?.providers);
     providers[1].connection.base_url = "https://opencode.ai/zen/go/v1";
-    try t.expectError(error.InvalidDecisionEndpoint, cfg.validate(copy.value));
+    try cfg.validate(copy.value);
+    try t.expect(copy.value.registry.?.find("aux").?.patchFor("judge/raw").?.protocol == .systemone);
     providers[1].connection.base_url = "https://opencode.ai/zen/v1";
-    try t.expectError(error.InvalidDecisionEndpoint, cfg.validate(copy.value));
+    try cfg.validate(copy.value);
 }
 
 const fixture =
@@ -402,7 +408,7 @@ test "llm registry strict root fields duplicate fields and malformed declaration
 }
 
 test "global reasoning preference roundtrips independently of model capability" {
-    for ([_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max", "none" }) |name| {
+    for ([_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |name| {
         const raw = try std.fmt.allocPrint(
             t.allocator,
             "{{\"llm\":{{\"default\":\"p/m\",\"reasoning_effort\":\"{s}\",\"providers\":{{\"p\":{{\"base_url\":\"https://x\"}}}}}}}}",
@@ -429,7 +435,7 @@ test "global reasoning preference roundtrips independently of model capability" 
 }
 
 test "global reasoning preference rejects unknown duplicate and wrong type" {
-    for ([_][]const u8{ "\"unknown\"", "\"HIGH\"", "\"\"", "\" high\"", "0", "true", "[]", "{}", "\"high\",\"reasoning_effort\":\"low\"" }) |value| {
+    for ([_][]const u8{ "\"none\"", "\"unknown\"", "\"HIGH\"", "\"\"", "\" high\"", "0", "true", "[]", "{}", "\"high\",\"reasoning_effort\":\"low\"" }) |value| {
         const raw = try std.mem.concat(t.allocator, u8, &.{
             "{\"llm\":{\"default\":\"p/m\",\"providers\":{\"p\":{\"base_url\":\"https://x\"}},\"reasoning_effort\":", value, "}}",
         });
@@ -447,7 +453,7 @@ test "global reasoning preference rejects unknown duplicate and wrong type" {
     try t.expectError(error.InvalidReasoningEffort, cfg.clone(t.allocator, parsed.value));
 }
 
-test "global reasoning preference setter owns normalizes and preserves declarations" {
+test "global reasoning preference setter owns rejects aliases and preserves declarations" {
     var parsed = try cfg.parse(t.allocator, fixture);
     defer cfg.release(&parsed);
     try t.expect(parsed.value.registry.?.reasoning_effort == null);
@@ -466,7 +472,9 @@ test "global reasoning preference setter owns normalizes and preserves declarati
     var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
     try t.expectError(error.OutOfMemory, cfg.setRegistryReasoningEffort(failing.allocator(), &copy.value, "low"));
     try t.expect(copy.value.registry.?.reasoning_effort.?.ptr == before.ptr);
-    try cfg.setRegistryReasoningEffort(a, &copy.value, "none");
+    try t.expectError(error.InvalidReasoningEffort, cfg.setRegistryReasoningEffort(a, &copy.value, "none"));
+    try t.expect(copy.value.registry.?.reasoning_effort.?.ptr == before.ptr);
+    try cfg.setRegistryReasoningEffort(a, &copy.value, "off");
     try t.expectEqualStrings("off", copy.value.registry.?.reasoning_effort.?);
     try t.expectEqualStrings(original.default, copy.value.registry.?.default);
     try t.expect(original.providers.ptr == copy.value.registry.?.providers.ptr);
@@ -498,18 +506,18 @@ test "global reasoning preference setter owns normalizes and preserves declarati
 
 test "global preference does not reinterpret manual per model wire effort" {
     var parsed = try cfg.parse(t.allocator,
-        \\{"llm":{"default":"p/m","reasoning_effort":"max","providers":{"p":{"base_url":"https://x","models":{"m":{"reasoning_effort":"custom-wire-value","output_tokens":1234}}}}}}
+        \\{"llm":{"default":"p/m","reasoning_effort":"max","providers":{"p":{"base_url":"https://x","models":{"m":{"reasoning_effort":"none","output_tokens":1234}}}}}}
     );
     defer cfg.release(&parsed);
-    try cfg.setRegistryReasoningEffort(parsed.arena.allocator(), &parsed.value, "none");
-    try t.expectEqualStrings("custom-wire-value", parsed.value.registry.?.find("p").?.patchFor("m").?.reasoning_effort.?);
+    try cfg.setRegistryReasoningEffort(parsed.arena.allocator(), &parsed.value, "off");
+    try t.expectEqualStrings("none", parsed.value.registry.?.find("p").?.patchFor("m").?.reasoning_effort.?);
     var out: std.Io.Writer.Allocating = .init(t.allocator);
     defer out.deinit();
     try cfg.writeDisk(parsed.value, &out.writer);
     var disk = try cfg.parse(t.allocator, out.written());
     defer cfg.release(&disk);
     try t.expectEqualStrings("off", disk.value.registry.?.reasoning_effort.?);
-    try t.expectEqualStrings("custom-wire-value", disk.value.registry.?.find("p").?.patchFor("m").?.reasoning_effort.?);
+    try t.expectEqualStrings("none", disk.value.registry.?.find("p").?.patchFor("m").?.reasoning_effort.?);
     try t.expectEqual(@as(u32, 1234), disk.value.registry.?.find("p").?.patchFor("m").?.output_tokens.?);
 }
 

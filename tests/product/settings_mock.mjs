@@ -87,6 +87,9 @@ export async function settingsRegressions({app,pty,execute,send}) {
         const env = {PATH:'/usr/bin:/bin',HOME:home,LANG:'C.UTF-8',TERM:'xterm-256color',THIN_FIXTURE_KEY:KEY,THIN_APP_BIN:app,THIN_APP_TEST_HOME:home,THIN_APP_TEST_PROJECT:p,THIN_APP_TEST_URL:url,THIN_APP_TEST_MODE:mode};
         const result = await execute(headless?app:pty,headless?['--no-log','--print','settings-task']:[],env,p,undefined,headless?30000:90000);
         if (fixtureError) throw fixtureError;
+        const reason = result.output.match(/^error: ([A-Za-z][A-Za-z0-9_]{0,63})$/m)?.[1] ?? 'unclassified';
+        const lines = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].map(match => match[1]).slice(0,8).join('-') || 'unknown';
+        stage = `owned process code ${result.code} ${reason} at ${lines} requests ${requests}`;
         assert.equal(result.code,0);
         assert.equal(expected.length,0);
         assert(!result.output.includes(KEY));
@@ -156,7 +159,7 @@ export async function settingsRegressions({app,pty,execute,send}) {
   });
 
   for (const protocol of ['chat','responses']) await group(protocol,protocol,async t => {
-    await t.configure({map:custom,effort:'none'});
+    await t.configure({map:custom,effort:'off'}); // Logical off; wire mapping remains "none".
     await t.run('settings-map',['low','high','off'],{map:custom,savedEffort:'low'});
     await t.savedGlobal('low'); // Save the logical level, never the provider alias.
     await t.run('settings-probe-low',['low'],{map:custom});

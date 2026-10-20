@@ -125,6 +125,7 @@ pub const App = struct {
         var owned = parsed;
         errdefer cfg.release(&owned);
         if (owned.value.selection_pending) return error.DefaultModelUnavailable;
+        if (owned.value.model.protocol == .systemone) return error.SystemOneNotChatModel;
         try cfg.validate(owned.value);
         const self = try a.create(App);
         errdefer a.destroy(self);
@@ -216,8 +217,8 @@ pub const App = struct {
             if (service.check_fn) |check| try check(service.context);
         }
         const decision_enabled = declaration.decisionActive();
-        // Low-price-only edits preserve the auxiliary lifecycle. Explicit
-        // reselect forces a fresh independently owned global credential source.
+        // Only decision edits, shared request deadlines or explicit reselect
+        // replace the auxiliary owner. Primary transport/session stay frozen.
         var before: std.Io.Writer.Allocating = .init(self.allocator);
         defer {
             std.crypto.secureZero(u8, before.written());
@@ -231,7 +232,9 @@ pub const App = struct {
         try std.json.Stringify.value(self.config.value.decision, .{}, &before.writer);
         try std.json.Stringify.value(declaration.decision, .{}, &after.writer);
         var result: SettingsReplacement = .{
-            .replace_decision = force_decision_refresh or !std.mem.eql(u8, before.written(), after.written()),
+            .replace_decision = force_decision_refresh or
+                self.config.value.limits.request_timeout_ms != declaration.limits.request_timeout_ms or
+                !std.mem.eql(u8, before.written(), after.written()),
             .changes_tools = self.config.value.decisionActive() != decision_enabled,
         };
         errdefer result.deinit();
@@ -298,6 +301,7 @@ pub const App = struct {
     pub fn prepareConnection(self: *App, parsed: std.json.Parsed(cfg.Config), environ: *const std.process.Environ.Map) !*ConnectionReplacement {
         var owned = parsed;
         errdefer cfg.release(&owned);
+        if (owned.value.model.protocol == .systemone) return error.SystemOneNotChatModel;
         const plan = try self.runtime.planSelection(owned.value, true);
         if (!std.meta.eql(owned.value.limits, self.config.value.limits)) return error.ConnectionLimitsChanged;
         const key = try cfg.resolveApiKey(self.allocator, owned.value, environ);
