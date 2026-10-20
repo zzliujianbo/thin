@@ -497,8 +497,6 @@ fn seed(runtime: *r.Runtime, text: []const u8) !void {
 }
 
 test "compaction policy disabled skips automatic summaries but enforces hard input budget" {
-    const fitting: [10000]u8 = @splat('x');
-    const overfull: [13000]u8 = @splat('x');
     for ([_]bool{ false, true }) |too_large| {
         var config = configuration();
         config.model.context_tokens = 4096;
@@ -508,15 +506,27 @@ test "compaction policy disabled skips automatic summaries but enforces hard inp
         var fake: Fake = .{};
         var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "", true);
         defer runtime.deinit();
-        try seed(&runtime, if (too_large) &overfull else &fitting);
-        try std.testing.expect(runtime.estimatedTokens() > c.threshold(c.inputBudget(config), 80));
+        // Size synthetic history against actual prompt overhead, not fixed bytes.
+        // Keep the real budget and both the >80% and hard-stop assertions intact.
+        try seed(&runtime, "");
+        const budget = c.inputBudget(config);
+        const target = c.threshold(budget, if (too_large) 110 else 90);
+        const overhead = runtime.estimatedTokens();
+        try std.testing.expect(target > overhead);
+        const old = try a.alloc(u8, (target - overhead) * 3); // ASCII: three bytes per estimated token.
+        defer a.free(old);
+        @memset(old, 'x');
+        runtime.history.items[1] = try p.textMessage(runtime.arena.allocator(), .assistant, old);
+        try std.testing.expectEqual(target, runtime.estimatedTokens());
+        try std.testing.expect(runtime.estimatedTokens() > c.threshold(budget, 80));
+        try std.testing.expectEqual(too_large, runtime.estimatedTokens() > budget);
         var cancel: p.Cancellation = .{};
         const result = try runtime.run("new task", &cancel);
         try std.testing.expectEqual(@as(usize, 0), fake.summaries);
         try std.testing.expectEqual(@as(usize, if (too_large) 0 else 1), fake.normal);
         if (too_large) {
             try std.testing.expectEqual(error.ContextTooLarge, result.detail.?);
-            try std.testing.expectEqualStrings(&overfull, runtime.messages()[1].blocks[0].text);
+            try std.testing.expectEqualStrings(old, runtime.messages()[1].blocks[0].text);
         } else try std.testing.expectEqual(r.Status.success, result.status);
     }
 }
