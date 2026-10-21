@@ -3,6 +3,7 @@
 //! 并通过 bridge 与运行时后台任务（Job）通信。绘制采用“整帧生成 + 分段写出”。
 const std = @import("std");
 const r = @import("../core/runtime.zig");
+const inbox_module = @import("../core/inbox.zig");
 const p = @import("../core/protocol.zig");
 const core_config = @import("../core/config.zig");
 const task = @import("../core/task.zig");
@@ -30,6 +31,14 @@ const bridge_module = @import("bridge.zig");
 const Io = std.Io;
 
 pub const ModelProvider = picker_module.Provider;
+
+const StopIdentity = struct {
+    runtime: ?*r.Runtime,
+    session: ?[32]u8,
+    task_epoch: u64,
+    revision: u64,
+    busy: bool,
+};
 
 /// 单条显示记录的字节上限（128 KiB）。超出部分只影响显示，不影响模型历史。
 const record_limit = 128 * 1024;
@@ -201,6 +210,7 @@ pub const Connection = struct {
     pub const Setting = enum { low_price_input, decision_enabled };
     pub const DecisionChoice = decision_picker_module.Choice;
     decision_fn: ?*const fn (*anyopaque, DecisionChoice) anyerror!void = null,
+    image_fn: ?*const fn (*anyopaque, DecisionChoice) anyerror!void = null,
     setting_fn: ?*const fn (*anyopaque, Setting, bool) anyerror!void = null,
     preference_fn: ?*const fn (*anyopaque, preference.Key, ?u32) anyerror!void = null,
     context: *anyopaque,
@@ -246,6 +256,9 @@ pub const Connection = struct {
         /// not the global toggle; never inferred from token usage.
         low_price_input: bool = false,
         low_price_input_enabled: bool = true,
+        image_enabled: bool = false,
+        image_models: []const core_config.Model = &.{},
+        image_model: ?[]const u8 = null,
         decision_enabled: bool = false,
         /// Owned by the session, resolved with auxiliary rather than chat limits.
         decision_models: []const core_config.Model = &.{},
@@ -355,6 +368,7 @@ const Ui = struct {
     provider_open: bool = false,
     settings_open: bool = false,
     decision_open: bool = false,
+    image_open: bool = false,
     settings_value_picker: ?settings_value_module.Picker = null,
     settings_return_selected: usize = 0,
     settings_menu: settings_menu_module.Menu = .{},
@@ -402,6 +416,21 @@ const Ui = struct {
     dropped_display: bool = false,
     /// 后台任务是否正在运行。
     busy: bool = false,
+    // The UI owns the only inbox. Never reach through State.runtime to draw it:
+    // display fixtures intentionally contain undefined Runtime pointers.
+    inbox: r.Inbox = .{},
+    attached_runtime: ?*r.Runtime = null,
+    queue_owner: ?struct { runtime: *r.Runtime, session: ?[32]u8 } = null,
+    task_epoch: u64 = 0,
+    queue_revision: u64 = 0,
+    stop_open: bool = false,
+    stop_danger: bool = false,
+    stop_generation: u64 = 0,
+    stop_identity: ?StopIdentity = null,
+    displayed_stop: ?u64 = null,
+    frame_stop: ?u64 = null,
+    approval_armed: bool = false,
+
     /// 用户请求退出；若任务仍在运行，会等它结束后再退出。
     want_exit: bool = false,
     ctrl_d_exit: bool = false,
@@ -475,6 +504,8 @@ const Ui = struct {
         self.cancel.cancel();
         // 必须等待 worker 结束，否则它可能仍在访问 Ui 的字段。
         if (self.future) |*future| future.await(self.io);
+        self.detachInbox();
+        self.inbox.deinit();
         if (self.prompt) |prompt| self.allocator.free(prompt);
         self.clearPermission();
         self.clearActiveTool();
@@ -500,6 +531,7 @@ const Ui = struct {
     fn clearPermission(self: *Ui) void {
         if (self.permission) |permission| self.allocator.free(permission.description);
         self.permission = null;
+        self.approval_armed = false;
         self.displayed_permission = null;
     }
 
@@ -758,6 +790,14 @@ const Ui = struct {
         self.display.observe(item.event, self.clock_ms);
         switch (item.event) {
             .state => |state| self.mode = state,
+            .user_committed => |v| {
+                self.draft = null;
+                self.discardReasoning();
+                _ = try self.add(.user, v.text);
+            },
+            .permission_cleared => |id| {
+                if (self.permission) |permission| if (permission.id == id) self.clearPermission();
+            },
             .text => |v| {
                 try self.appendDraft(.assistant, v);
                 if (item.display_truncated and self.draft != null) {
@@ -927,9 +967,17 @@ const Ui = struct {
         }
         self.notice = "Ready";
     }
+    fn settingsModelOpen(self: *const Ui) bool {
+        return self.decision_open or self.image_open;
+    }
+    fn settingsModels(self: *const Ui, state: Connection.State) []const core_config.Model {
+        return if (self.image_open) state.image_models else state.decision_models;
+    }
     fn closeSettingsMenu(self: *Ui) void {
+        if (self.settingsModelOpen()) self.wipeEditor();
         self.settings_open = false;
         self.decision_open = false;
+        self.image_open = false;
         self.displayed_decision_fingerprint = null;
         self.frame_decision_fingerprint = null;
         self.settings_value_picker = null;
@@ -948,12 +996,15 @@ const Ui = struct {
         self.notice = "Ready";
     }
     fn backToSettings(self: *Ui) void {
+        const parent: usize = if (self.image_open) 7 else 1;
+        if (self.settingsModelOpen()) self.wipeEditor();
         self.displayed_decision_fingerprint = null;
         self.frame_decision_fingerprint = null;
         self.settings_value_picker = null;
         self.decision_open = false;
+        self.image_open = false;
         self.settings_menu.clear();
-        self.settings_menu.selected = 1;
+        self.settings_menu.selected = parent;
         self.displayed_settings_generation = null;
         self.frame_settings_generation = null;
         self.parser.stop_feed = true;
@@ -962,10 +1013,10 @@ const Ui = struct {
     fn settingsValueTitle(key_: preference.Key) []const u8 {
         return switch (key_) {
             .compaction_enabled => "Auto compaction",
-            .command_timeout_ms => "Command timeout (ms)",
-            .request_timeout_ms => "All inference request timeout (ms; including decisions)",
+            .command_timeout_ms => "Command timeout (s)",
+            .request_timeout_ms => "All inference request timeout (s; including decisions)",
             .max_output_tokens => "Output limit (tokens); Auto follows model policy",
-            .task_timeout_ms => "Task timeout (ms)",
+            .task_timeout_ms => "Task timeout (s)",
         };
     }
     fn openSettingsValue(self: *Ui, key_: preference.Key, state: Connection.State) void {
@@ -1038,7 +1089,7 @@ const Ui = struct {
             .paste_start => self.settings_menu.markPaste(),
             .text => |value| {
                 if (value.pasted) self.settings_menu.markPaste() else if (picker.editing) {
-                    self.notice = if (picker.append(value.value)) settingsValueTitle(picker.key) else "Use bounded positive decimal digits only";
+                    self.notice = if (picker.append(value.value)) settingsValueTitle(picker.key) else if (picker.key == .max_output_tokens) "Use positive integer tokens" else "Use positive seconds with up to three decimal places";
                     self.settings_menu.generation +%= 1;
                 }
             },
@@ -1072,7 +1123,7 @@ const Ui = struct {
                     picker.beginCustom();
                     self.settings_menu.clear();
                     self.frame_settings_generation = null;
-                    self.notice = settingsValueTitle(picker.key);
+                    self.notice = if (picker.key == .max_output_tokens) "Enter positive integer tokens" else "Enter seconds with up to three decimal places";
                     return;
                 }
                 const value = picker.chosen(self.settings_menu.selected) catch {
@@ -1084,9 +1135,19 @@ const Ui = struct {
             else => {},
         }
     }
+    /// The main editor is exclusively a bounded child query while Decision is
+    /// open. Revoke before allocating: an insertion OOM cannot retain old ACK.
+    fn decisionQueryChanged(self: *Ui) void {
+        self.settings_menu.selected = 0;
+        self.settings_menu.generation +%= 1;
+        self.displayed_settings_generation = null;
+        self.frame_settings_generation = null;
+        self.displayed_decision_fingerprint = null;
+        self.frame_decision_fingerprint = null;
+    }
     fn settingsKey(self: *Ui, event_: input.Event) !void {
         if (self.settings_value_picker != null) return self.settingsValueKey(event_);
-        if (self.decision_open and (event_ == .left or event_ == .escape or event_ == .cancel)) {
+        if (self.settingsModelOpen() and (event_ == .left or event_ == .escape or event_ == .cancel)) {
             self.backToSettings();
             return;
         }
@@ -1095,12 +1156,38 @@ const Ui = struct {
             .quit => self.requestQuit(),
             .left => try self.backToCommands(.settings),
             .paste_start => self.settings_menu.markPaste(),
-            .text => |value| if (value.pasted) {
-                self.settings_menu.markPaste();
+            .text => |value| {
+                if (value.pasted) {
+                    self.settings_menu.markPaste();
+                } else if (self.settingsModelOpen()) {
+                    self.decisionQueryChanged();
+                    if (value.value.len <= 256 -| self.editor.bytes.items.len) {
+                        _ = try self.editor.insert(value.value);
+                    } else self.notice = "Search limit: 256 bytes";
+                }
+            },
+            .backspace, .delete, .clear, .kill_end => if (self.settingsModelOpen()) {
+                self.decisionQueryChanged();
+                switch (event_) {
+                    .backspace => self.editor.backspace(),
+                    .delete => self.editor.delete(),
+                    .clear => self.wipeEditor(),
+                    .kill_end => self.editor.bytes.items.len = self.editor.cursor,
+                    else => unreachable,
+                }
+            },
+            .right => if (self.settingsModelOpen()) {
+                self.editor.right();
+            },
+            .home => if (self.settingsModelOpen()) {
+                self.editor.cursor = 0;
+            },
+            .end => if (self.settingsModelOpen()) {
+                self.editor.cursor = self.editor.bytes.items.len;
             },
             .up, .down => {
                 const state = self.connection.current();
-                self.settings_menu.move(event_ == .down, if (self.decision_open) decision_picker_module.count(state.decision_models, state.model_providers) else settings_menu_module.labels.len);
+                self.settings_menu.move(event_ == .down, if (self.settingsModelOpen()) decision_picker_module.count(self.settingsModels(state), state.model_providers, self.editor.bytes.items) else settings_menu_module.labels.len);
             },
             .enter => {
                 if (!self.settingsIdle() or self.editor_pasted or self.frame.len != 0 or self.settings_menu.pasted or
@@ -1114,24 +1201,30 @@ const Ui = struct {
                 self.frame_decision_fingerprint = null;
                 self.parser.stop_feed = true;
                 const state = self.connection.current();
-                if (self.decision_open) {
+                if (self.settingsModelOpen()) {
                     const previous = acknowledged orelse return;
-                    const current = decision_picker_module.fingerprint(state.decision_models, state.model_providers) orelse return;
+                    const current = decision_picker_module.fingerprint(self.settingsModels(state), state.model_providers) orelse return;
                     if (!std.mem.eql(u8, &previous, &current)) return;
                 }
                 if (!state.global_settings_available) {
                     self.notice = "Global settings unavailable; changes disabled";
                     return;
                 }
-                if (!self.decision_open and self.settings_menu.selected == 1) {
-                    self.decision_open = true;
+                if (!self.settingsModelOpen() and (self.settings_menu.selected == 1 or self.settings_menu.selected == 7)) {
+                    self.wipeEditor();
+                    self.image_open = self.settings_menu.selected == 7;
+                    self.decision_open = !self.image_open;
                     self.settings_menu.clear();
-                    self.settings_menu.selected = decision_picker_module.indexOf(state.decision_models, state.model_providers, if (state.decision_enabled) state.decision_model else null);
+                    const selected_ref = if (self.image_open)
+                        (if (state.image_enabled) state.image_model else null)
+                    else
+                        (if (state.decision_enabled) state.decision_model else null);
+                    self.settings_menu.selected = decision_picker_module.indexOf(self.settingsModels(state), state.model_providers, self.editor.bytes.items, selected_ref);
                     self.frame_settings_generation = null;
                     self.notice = "Ready";
                     return;
                 }
-                if (!self.decision_open) {
+                if (!self.settingsModelOpen()) {
                     if (settings_menu_module.preferenceKey(self.settings_menu.selected)) |key_| {
                         if (key_ == .compaction_enabled) {
                             _ = self.savePreference(key_, @intFromBool(!state.limits.compaction_enabled));
@@ -1143,12 +1236,12 @@ const Ui = struct {
                     self.notice = "Settings require a drained session bridge";
                     return;
                 };
-                if (self.decision_open) {
-                    const save = self.connection.decision_fn orelse {
+                if (self.settingsModelOpen()) {
+                    const save = (if (self.image_open) self.connection.image_fn else self.connection.decision_fn) orelse {
                         self.notice = "Global settings unavailable; changes disabled";
                         return;
                     };
-                    const selected = decision_picker_module.choice(state.decision_models, state.model_providers, self.settings_menu.selected) orelse return;
+                    const selected = decision_picker_module.choice(self.settingsModels(state), state.model_providers, self.editor.bytes.items, self.settings_menu.selected) orelse return;
                     save(self.connection.context, selected) catch {
                         self.notice = "Could not save setting; previous value kept";
                         return;
@@ -1374,6 +1467,21 @@ const Ui = struct {
     fn submit(self: *Ui) !void {
         if (self.want_exit) return;
         const command = std.mem.trim(u8, self.editor.bytes.items, " \t\r\n");
+        if (self.busy) return self.enqueueDraft(.steering);
+        if (std.mem.eql(u8, command, "/queue resume")) {
+            if (!self.settingsIdle() or self.editor_pasted or self.parser.escape_len != 0 or self.parser.utf8_len != 0) {
+                self.notice = "Queue resume requires idle, fresh input";
+                return;
+            }
+            if (!self.queueOwnerMatches()) {
+                self.notice = "Queue belongs to another session; Ctrl-C to clear explicitly";
+                return;
+            }
+            self.inbox.@"resume"();
+            self.wipeEditor();
+            self.notice = "Queue resumed";
+            return;
+        }
         if (std.mem.eql(u8, command, "/model --refresh")) {
             const allowed = self.settingsIdle() and !self.editor_pasted;
             self.wipeEditor();
@@ -1417,7 +1525,11 @@ const Ui = struct {
                     self.notice = "No conversation to compact yet";
                     return;
                 }
-                try self.startCompaction(runtime);
+                self.startCompaction(runtime) catch |err| {
+                    if (err != error.QueueOwnerChanged) return err;
+                    self.inbox.pause();
+                    self.notice = "Queue belongs to another session; Ctrl-C to confirm clearing it";
+                };
             } else {
                 self.notice = self.connection.current().settings_notice orelse "Not configured: use /login first";
             }
@@ -1463,10 +1575,6 @@ const Ui = struct {
             }
             return;
         }
-        if (self.busy) {
-            self.notice = "Busy: cancel or wait; submissions are not queued";
-            return;
-        }
         if (self.poisoned) {
             self.notice = "Cleanup unconfirmed: exit and inspect before continuing";
             return;
@@ -1490,23 +1598,52 @@ const Ui = struct {
             return;
         };
 
-        // 重置 bridge 与取消标记，确保新任务不继承上一次的取消状态。
+        self.startPrompt(runtime, self.editor.bytes.items, if (local_command) .command else .prompt) catch |err| {
+            if (err != error.QueueOwnerChanged) return err;
+            self.inbox.pause();
+            self.notice = "Queue belongs to another session; Ctrl-C to confirm clearing it";
+            self.parser.stop_feed = true;
+            return;
+        };
+        self.wipeEditor();
+    }
+
+    // All fallible display/history preparation precedes worker launch. Queued
+    // prompts pass explicit text and never borrow or clear the current draft.
+    fn startPrompt(self: *Ui, runtime: *r.Runtime, value: []const u8, kind: @TypeOf(@as(task.Job, undefined).kind)) !void {
+        if (!self.queueOwnerMatches()) return error.QueueOwnerChanged;
         try self.bridge.reset();
         self.cancel.* = .{};
         self.approval_paste_seen = false;
 
-        const prompt = try self.allocator.dupe(u8, self.editor.bytes.items);
+        const local_command = kind == .command;
+        const prompt = try self.allocator.dupe(u8, value);
 
         // prompt 在任务启动前的错误路径中由 errdefer 释放；启动后由 self.prompt 接管。
         errdefer self.allocator.free(prompt);
         const history_entry = try self.input_history.prepare(self.allocator, prompt);
         errdefer @import("input_history.zig").History.discard(self.allocator, history_entry);
 
-        _ = try self.add(.user, prompt);
-        self.job = .{ .runtime = runtime, .cancel = self.cancel, .prompt = prompt, .kind = if (local_command) .command else .prompt };
-
-        // 在独立线程中运行任务；&self.job 在 future 结束前必须保持有效（Ui 持有）。
+        var record = Record{ .kind = .user };
+        errdefer record.deinit(self.allocator);
+        try record.append(self.allocator, prompt);
+        try self.records.ensureUnusedCapacity(self.allocator, 1);
+        self.job = .{ .runtime = runtime, .cancel = self.cancel, .prompt = prompt, .kind = kind };
+        self.attachInbox(runtime);
+        errdefer self.detachInbox();
         const future = try Io.concurrent(self.io, task.Job.run, .{&self.job});
+        var bytes: usize = record.body.items.len;
+        for (self.records.items) |old| bytes += old.body.items.len;
+        while (self.records.items.len != 0 and (self.records.items.len >= 64 or bytes > 1024 * 1024)) {
+            var removed = self.records.orderedRemove(0);
+            bytes -= removed.body.items.len;
+            removed.deinit(self.allocator);
+            if (self.draft) |i| self.draft = if (i == 0) null else i - 1;
+            if (self.reasoning) |i| self.reasoning = if (i == 0) null else i - 1;
+            self.dropped_display = true;
+        }
+        self.records.appendAssumeCapacity(record);
+        self.task_epoch +%= 1;
         self.input_history.commit(self.allocator, history_entry);
         self.future = future;
         self.prompt = prompt;
@@ -1520,7 +1657,6 @@ const Ui = struct {
         self.clearActiveTool();
         self.clearToolCaptions();
         self.scroll = 0;
-        self.editor.clear();
     }
 
     /// Summary-only worker, sharing the ordinary cancellation/join/terminal path.
@@ -1532,10 +1668,14 @@ const Ui = struct {
         };
         self.cancel.* = .{};
         self.approval_paste_seen = false;
+        if (!self.queueOwnerMatches()) return error.QueueOwnerChanged;
         self.job = .{ .runtime = runtime, .cancel = self.cancel, .prompt = "", .kind = .compact };
+        self.attachInbox(runtime);
+        errdefer self.detachInbox();
         const future = try Io.concurrent(self.io, task.Job.run, .{&self.job});
         self.future = future;
         self.prompt = null;
+        self.task_epoch +%= 1;
         self.has_submitted = true;
         self.busy = true;
         self.mode = .compacting;
@@ -1561,7 +1701,209 @@ const Ui = struct {
         self.editor_pasted = false;
     }
 
+    fn detachInbox(self: *Ui) void {
+        if (self.attached_runtime) |runtime| runtime.inbox = null;
+        self.attached_runtime = null;
+    }
+
+    fn attachInbox(self: *Ui, runtime: *r.Runtime) void {
+        self.queue_owner = .{ .runtime = runtime, .session = self.connection.current().session_id };
+        runtime.inbox = &self.inbox;
+        self.attached_runtime = runtime;
+    }
+
+    fn queueOwnerMatches(self: *Ui) bool {
+        const snapshot = self.inbox.snapshot();
+        if (snapshot.steering + snapshot.follow_up == 0 and !snapshot.active) return true;
+        const owner = self.queue_owner orelse return false;
+        const state = self.connection.current();
+        return state.runtime == owner.runtime and std.meta.eql(state.session_id, owner.session);
+    }
+
+    fn enqueueDraft(self: *Ui, kind: inbox_module.Kind) !void {
+        const value = std.mem.trim(u8, self.editor.bytes.items, " \t\r\n");
+        if (value.len == 0) return;
+        if (value[0] == '/' or value[0] == '!') {
+            self.notice = "Only ordinary conversation text can be queued";
+            return;
+        }
+        if (self.poisoned or self.stop_open or !self.queueOwnerMatches() or self.attached_runtime == null) {
+            self.notice = "Queue unavailable for this task/session";
+            return;
+        }
+        if (kind == .steering and self.job.kind != .prompt) {
+            self.notice = "Local commands/compaction accept Alt-Enter FollowUp only";
+            return;
+        }
+        _ = self.inbox.enqueue(self.allocator, kind, self.editor.bytes.items) catch {
+            self.notice = "Could not queue message; draft kept (queue/input limit)";
+            return;
+        };
+        self.wipeEditor();
+        self.parser.stop_feed = true;
+        self.notice = if (kind == .steering) "Steering pending" else "FollowUp pending";
+    }
+
+    fn dispatchNext(self: *Ui) !void {
+        if (self.busy or self.future != null or self.want_exit or self.poisoned or self.stop_open or
+            self.secret_mode or self.secret_quarantine or self.settings_open or self.provider_open or self.model_picker != null) return;
+        // finishRun's sticky pause is authoritative, including explicit resume.
+        if (!self.queueOwnerMatches()) {
+            self.inbox.pause();
+            return;
+        }
+        const lease = self.inbox.claimNext() orelse return;
+        const runtime = self.connection.current().runtime orelse {
+            self.inbox.restore(lease);
+            self.inbox.pause();
+            return;
+        };
+        self.startPrompt(runtime, lease.text, .prompt) catch {
+            self.inbox.restore(lease);
+            self.inbox.pause();
+            self.notice = "Queued launch failed; message kept; /queue resume retries";
+            self.dirty = true;
+            return;
+        };
+        if (self.inbox.commit(lease)) |value| {
+            var entry = value;
+            entry.deinit();
+        }
+        self.dirty = true;
+    }
+
+    fn stopIdentity(self: *Ui) StopIdentity {
+        const state = self.connection.current();
+        return .{ .runtime = state.runtime, .session = state.session_id, .task_epoch = self.task_epoch, .revision = self.inbox.snapshot().revision, .busy = self.busy };
+    }
+
+    fn invalidateStop(self: *Ui) void {
+        self.stop_generation +%= 1;
+        self.displayed_stop = null;
+        self.frame_stop = null;
+        self.dirty = true;
+    }
+
+    fn refreshStop(self: *Ui) void {
+        const revision = self.inbox.snapshot().revision;
+        if (self.queue_revision != revision) {
+            self.queue_revision = revision;
+            self.dirty = true;
+        }
+        if (!self.stop_open) return;
+        const identity = self.stopIdentity();
+        if (!std.meta.eql(self.stop_identity, @as(?StopIdentity, identity))) {
+            self.stop_identity = identity;
+            self.stop_danger = false;
+            self.invalidateStop();
+        }
+    }
+
+    fn closeStop(self: *Ui) void {
+        self.stop_open = false;
+        self.stop_danger = false;
+        self.inbox.pauseClaims(false);
+        self.stop_identity = null;
+        self.invalidateStop();
+        self.parser.stop_feed = true;
+    }
+
+    fn stopKey(self: *Ui, event_: input.Event) void {
+        self.refreshStop();
+        switch (event_) {
+            .quit => self.requestQuit(),
+            .escape => self.closeStop(),
+            .left, .right, .up, .down, .tab => {
+                self.stop_danger = switch (event_) {
+                    .right, .down => true,
+                    .left, .up => false,
+                    else => !self.stop_danger,
+                };
+                self.invalidateStop();
+                self.parser.stop_feed = true;
+            },
+            .enter => {
+                if (self.displayed_stop != self.stop_generation or self.parser.pasted or
+                    self.parser.utf8_len != 0 or self.parser.escape_len != 0)
+                {
+                    // A held Enter started before ACK cannot become a later
+                    // dangerous authorization merely because output caught up.
+                    self.stop_danger = false;
+                    self.invalidateStop();
+                    self.parser.stop_feed = true;
+                    return;
+                }
+                if (!self.stop_danger) return self.closeStop();
+                const identity = self.stop_identity orelse return;
+                if (!std.meta.eql(identity, self.stopIdentity())) {
+                    self.refreshStop();
+                    return;
+                }
+                if (!self.inbox.cancelClear(identity.revision, self.cancel)) {
+                    self.refreshStop();
+                    return;
+                }
+                self.clearPermission();
+                self.stop_open = false;
+                self.stop_identity = null;
+                self.invalidateStop();
+                self.parser.stop_feed = true;
+                self.notice = "Stop requested; queue cleared; draft kept";
+            },
+            .paste_start => {
+                self.stop_danger = false;
+                self.invalidateStop();
+                // Consume the paste through its terminator; batch_paste keeps
+                // its tail quarantined without stranding Parser.pasted=true.
+            },
+            .cancel => {
+                self.stop_danger = false;
+                self.invalidateStop();
+                self.parser.stop_feed = true;
+            },
+            else => {},
+        }
+    }
+
+    fn openStop(self: *Ui) void {
+        const snapshot = self.inbox.snapshot();
+        if (!self.busy and snapshot.steering + snapshot.follow_up == 0) return;
+        self.inbox.pauseClaims(true);
+        self.stop_open = true;
+        self.stop_danger = false;
+        self.stop_identity = self.stopIdentity();
+        self.invalidateStop();
+        self.parser.stop_feed = true;
+    }
+
+    fn escapeQueue(self: *Ui) !void {
+        self.parser.stop_feed = true;
+        if (self.editor.bytes.items.len != 0) {
+            self.notice = "Draft kept; clear it before withdrawing a pending message";
+            return;
+        }
+        const snapshot = self.inbox.snapshot();
+        if (snapshot.newest_id) |id| {
+            self.editor.bytes.ensureTotalCapacity(self.editor.allocator, snapshot.newest_bytes) catch {
+                self.notice = "Could not prepare editor; pending message kept";
+                return;
+            };
+            if (self.inbox.withdraw(id)) |value| {
+                var entry = value;
+                defer entry.deinit();
+                self.editor.bytes.appendSliceAssumeCapacity(entry.text);
+                self.editor.cursor = entry.text.len;
+                self.editor_pasted = false;
+                self.input_history.index = null;
+                self.notice = "Pending message withdrawn as plain draft";
+            } else self.notice = "Message already consumed; nothing withdrawn";
+            return;
+        }
+        if (self.busy) self.requestCancel();
+    }
+
     fn requestCancel(self: *Ui) void {
+        self.inbox.pause();
         self.cancel.cancel();
         self.notice = "Cancellation requested; cleaning up, not rolling back effects";
         self.clearPermission();
@@ -1657,10 +1999,7 @@ const Ui = struct {
         const self: *Ui = @ptrCast(@alignCast(ctx));
         if (self.want_exit) return;
         self.dirty = true;
-        if (event_ == .escape and self.busy) {
-            self.requestCancel();
-            return; // Cancel the task even while an approval is visible; never exit.
-        }
+        if ((event_ == .enter or event_ == .follow_up) and (self.parser.pasted or self.parser.batch_paste)) return;
         if (self.secret_mode) {
             try self.secretKey(event_);
             return;
@@ -1677,6 +2016,19 @@ const Ui = struct {
             return;
         }
 
+        if (self.stop_open) {
+            if (self.parser.batch_paste and event_ != .quit and event_ != .paste_start) return;
+            self.stopKey(event_);
+            return;
+        }
+        if (event_ == .cancel and (self.busy or self.inbox.snapshot().newest_id != null)) {
+            self.openStop();
+            return;
+        }
+        if (event_ == .escape and (self.busy or self.inbox.snapshot().newest_id != null)) {
+            try self.escapeQueue();
+            return;
+        }
         if (self.settings_open and self.permission == null) return self.settingsKey(event_);
         if (self.provider_open and self.permission == null) return self.providerKey(event_);
         if (self.model_picker != null and self.permission == null) return self.modelKey(event_);
@@ -1726,11 +2078,15 @@ const Ui = struct {
             .text => |v| {
                 self.editor_pasted = self.editor_pasted or v.pasted;
                 if (self.permission) |permission| {
-                    if (v.pasted) {
-                        self.blockPastedApproval();
+                    if (v.pasted) self.blockPastedApproval();
+                    // Ordinary typing always edits the steer draft. Explicit Tab
+                    // arms a separate approval gesture; never approve the 'y'
+                    // beginning a new sentence or consume the rest of that read.
+                    if (!self.approval_armed or v.pasted or self.editor.bytes.items.len != 0) {
+                        self.approval_armed = false;
+                        if (!try self.editor.insert(v.value)) self.notice = "Input limit: 64 KiB";
                         return;
                     }
-                    // 只有用户真正看到的那条审批才能被处理，防止按键落到未显示的请求上。
                     if (self.displayed_permission != permission.id) return;
                     const decision: ?r.Decision = if (std.mem.eql(u8, v.value, "y")) .allow_once else if (std.mem.eql(u8, v.value, "n")) .deny else null;
                     if (decision) |d| {
@@ -1743,27 +2099,32 @@ const Ui = struct {
                         // decide 返回 false 表示请求已过期（运行时已不再等待它）。
                         if (self.bridge.decide(permission.id, d)) self.notice = "Decision sent" else self.notice = "Permission expired";
                         self.clearPermission();
+                        self.parser.stop_feed = true;
+                    } else {
+                        self.approval_armed = false;
+                        if (!try self.editor.insert(v.value)) self.notice = "Input limit: 64 KiB";
                     }
                 } else if (!try self.editor.insert(v.value)) self.notice = "Input limit: 64 KiB";
             },
             .tab => if (self.permission == null) {
                 if (!try self.editor.insert("    ")) self.notice = "Input limit: 64 KiB";
                 self.command_menu.changed();
+            } else if (self.editor.bytes.items.len == 0 and self.displayed_permission != null) {
+                self.approval_armed = true;
+                self.notice = "Approval armed: fresh y allows once, n denies; typing otherwise edits draft";
+                self.parser.stop_feed = true;
             },
-            // 审批可见时回车无效，避免误触发送。
-            .enter => if (self.permission == null) {
+            .enter => {
+                self.approval_armed = false;
                 try self.submit();
             },
-            // 忙碀时取消任务（已产生的副作用不回滚）；空闲时只清空输入。
-            .cancel => {
-                if (self.busy) {
-                    self.requestCancel();
-                } else {
-                    self.editor.clear();
-                    self.input_history.index = null;
-                    self.notice = "Ready";
-                }
+            .follow_up => {
+                self.approval_armed = false;
+                if (self.busy) try self.enqueueDraft(.follow_up) else try self.submit();
             },
+            // Active tasks/queues were handled above; idle modal handlers get
+            // first refusal. Ordinary idle Ctrl-C must not erase the composer.
+            .cancel => {},
             // 退出：若任务仍在运行则先取消，等 loop 中 complete 完成后才真正退出。
             .quit => self.requestQuit(),
             .toggle_reasoning => self.show_reasoning = !self.show_reasoning,
@@ -1817,6 +2178,7 @@ const Ui = struct {
     fn complete(self: *Ui) !void {
         self.future.?.await(self.io);
         self.future = null;
+        self.detachInbox();
 
         // The producer can finish after our per-tick drain limit. Once joined,
         // at most one bounded queue remains; consume it before accepting Submit.
@@ -1838,6 +2200,7 @@ const Ui = struct {
         const result = self.last_terminal.?;
 
         // 清理失败或无法安全继续时进入 poisoned，禁止再次提交。
+        if (result.status != .success) self.inbox.pause();
         self.poisoned = if (result.detail) |detail| detail == error.CleanupFailed or detail == error.UnsafeToContinue else false;
         self.notice = switch (result.status) {
             .success => "Ready",
@@ -1857,6 +2220,17 @@ const Ui = struct {
         self.dirty = true;
     }
 
+    fn animate(self: *Ui) void {
+        const tick = self.clock_ms / 80;
+        if (!self.busy or self.animation_tick == tick) return;
+        self.animation_tick = tick;
+        // An approval owns a full, non-sparse preview. Repainting that unchanged
+        // preview for a composer pulse sends its title/body again every 80 ms.
+        // Keep polling/cancellation alive, but redraw only for actual events,
+        // input or resize until the approval is cleared. Never clear dirty here.
+        if (self.permission == null) self.dirty = true;
+    }
+
     /// 主事件循环：分批消费 bridge 事件、读取按键、分段写出帧、按节流重绘；满足退出条件时返回退出码。
     fn loop(self: *Ui) !u8 {
         var last_draw = Io.Clock.awake.now(self.io);
@@ -1864,10 +2238,7 @@ const Ui = struct {
         defer std.crypto.secureZero(u8, &buffer);
         while (true) {
             self.clock_ms = @intCast(@max(0, Io.Clock.awake.now(self.io).toMilliseconds()));
-            if (self.busy and self.animation_tick != self.clock_ms / 80) {
-                self.animation_tick = self.clock_ms / 80;
-                self.dirty = true;
-            }
+            self.animate();
             // 档位确认到期后自动恢复为上下文百分比，不必等下一次按键。
             // 主循环每轮最多等待 16ms，因此到期后无需额外唤醒。
             self.expireEffortFlash();
@@ -1899,6 +2270,7 @@ const Ui = struct {
                 return if (interrupt.signal() != 0) 128 + interrupt.signal() else 0;
             }
 
+            self.refreshStop();
             self.pollMetadata();
             const dimensions = self.terminal.size();
             self.resize(dimensions);
@@ -1912,6 +2284,11 @@ const Ui = struct {
             } else if (self.clock_ms -| self.last_input_ms >= 150) {
                 try self.parser.expireEscape(.{ .context = self, .emit_fn = key });
             }
+
+            // Join/drain happens above; current input/exit always wins over
+            // dispatch. No await or host emission while holding Inbox locks.
+            if (!self.want_exit) try self.dispatchNext();
+            self.refreshStop();
 
             // 分段写出待输出的帧：终端可能只接受部分字节，剩余部分在下一轮继续。
             if (self.frame_offset < self.frame.len) {
@@ -1949,6 +2326,9 @@ const Ui = struct {
         self.displayed_settings_generation = null;
         self.displayed_decision_fingerprint = null;
         self.frame_decision_fingerprint = null;
+        self.displayed_stop = null;
+        self.frame_stop = null;
+        if (self.stop_open) self.invalidateStop();
         self.frame_fresh = false;
         if (self.tail_snapshot) |*snapshot| snapshot.deinit();
         self.tail_snapshot = null;
@@ -1982,6 +2362,7 @@ const Ui = struct {
 
     fn finishFrame(self: *Ui) void {
         // Resize invalidation is sticky, even if the window returns to its old size.
+        self.displayed_stop = if (self.frame_fresh) self.frame_stop else null;
         self.displayed_permission = if (self.frame_fresh) self.frame_permission else null;
         self.displayed_model_epoch = if (self.frame_fresh) self.frame_model_epoch else null;
         self.displayed_model_generation = if (self.frame_fresh) self.frame_model_generation else null;
@@ -2091,6 +2472,9 @@ const Ui = struct {
 
     /// 构建一整帧输出到帧 arena（不直接写终端），帧由 loop 分段写出。
     fn draw(self: *Ui) !void {
+        self.refreshStop();
+        self.displayed_stop = null;
+        self.frame_stop = null;
         self.refreshCommandMenu();
         self.displayed_command_generation = null;
         self.frame_command_generation = null;
@@ -2146,7 +2530,7 @@ const Ui = struct {
         const preview = self.scroll != 0 or self.menu_history_recovery;
         const flow_allowed = !preview and self.size.rows >= 7 and cols >= 8 and
             self.permission == null and self.model_picker == null and !self.provider_open and !self.settings_open and
-            !self.commandMenuVisible() and !self.secret_mode and !self.secret_quarantine;
+            !self.commandMenuVisible() and !self.stop_open and !self.secret_mode and !self.secret_quarantine;
         const mutable_rows = @max(1, self.size.rows -| 4);
         var flow_continuation = false;
         var canonical_output = false;
@@ -2165,7 +2549,7 @@ const Ui = struct {
             if (record.flow_prefix) |*shown| {
                 if (shown.matches(record.lines, @max(1, cols))) {
                     prefix = shown.rows.len;
-                } else if (!drafting or flow_allowed) {
+                } else if (self.permission == null and (!drafting or flow_allowed)) {
                     // Do not clear/replay native history as Pi's regular renderer
                     // can do. A revised/reflowed preview is explicitly superseded.
                     try putToneLine(writer, a, 1, "Response revised — earlier stream preview above", cols, theme.muted);
@@ -2174,7 +2558,10 @@ const Ui = struct {
                     _ = try record.stageFlow(self.allocator, 0);
                 }
             }
-            const finalized = cols >= 8 and !record.output and !drafting;
+            // An approval is a reversible overlay, not a transcript advance.
+            // Defer unseen canonical rows until it closes; otherwise opening a
+            // full-height preview can scroll away the context it must restore.
+            const finalized = cols >= 8 and !record.output and !drafting and self.permission == null;
             var stop = prefix;
             if (drafting and flow_allowed) {
                 const wanted = @max(prefix, record.lines.len -| mutable_rows);
@@ -2285,7 +2672,13 @@ const Ui = struct {
         // Draw never dereferences Runtime, not even a fixture/idle pointer.
         self.display.seed(state.initial_context);
         self.display.setEffort(state.reasoning_effort);
-        const hint_line = try self.hint(a, state);
+        const queue_snapshot = self.inbox.snapshot();
+        const base_hint = try self.hint(a, state);
+        const queue_pending = queue_snapshot.steering + queue_snapshot.follow_up != 0;
+        const hint_line = if (queue_pending or queue_snapshot.paused)
+            try std.fmt.allocPrint(a, "S:{d} F:{d} {s}{s}{s}", .{ queue_snapshot.steering, queue_snapshot.follow_up, if (queue_snapshot.paused) "paused (/queue resume)" else "pending", if (base_hint.len != 0) " | " else "", base_hint })
+        else
+            base_hint;
         // Always reserve one EMPTY row between conversation and composer.
         const footer_rows: usize = 2 + @as(usize, @intFromBool(hint_line.len != 0));
         const body_limit = self.size.rows -| footer_rows;
@@ -2295,9 +2688,12 @@ const Ui = struct {
         if (self.model_picker) |*picker| try picker.captureChoice(a, picker_rows.selected_choice);
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, candidate_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
-        var settings_rows = if (self.settings_open and self.settings_value_picker != null) try settings_value_module.rows(a, self.settings_menu, self.settings_value_picker.?, cols, candidate_limit) else if (self.settings_open and self.decision_open) try decision_picker_module.rows(a, self.settings_menu, state.decision_models, state.model_providers, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, .{
+        var settings_rows = if (self.settings_open and self.settings_value_picker != null) try settings_value_module.rows(a, self.settings_menu, self.settings_value_picker.?, cols, candidate_limit) else if (self.settings_open and self.settingsModelOpen()) try decision_picker_module.rows(a, self.settings_menu, self.settingsModels(state), state.model_providers, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, .{
             .low_price_input_enabled = state.low_price_input_enabled,
             .decision_enabled = state.decision_enabled,
+            .decision_model = state.decision_model,
+            .image_enabled = state.image_enabled,
+            .image_model = state.image_model,
             .global_settings_available = state.global_settings_available,
             .limits = state.limits,
         }, cols, candidate_limit) else settings_menu_module.Rows{ .lines = &.{} };
@@ -2311,14 +2707,31 @@ const Ui = struct {
         if (menu_visible) self.command_menu.selected = @min(self.command_menu.selected, self.command_matches.len - 1);
         // All candidate menus share one bottom-pinned popup slot. Secondary
         // pickers must not replace the top of the transcript body.
-        const popup_lines = if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else menu_rows.lines;
-        const selected_line = if (self.settings_open) settings_rows.selected_line else if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else menu_rows.selected_line;
-        const checked_mask: u16 = if (self.provider_open) provider_rows.checked_mask else if (self.model_picker != null) picker_rows.checked_mask else 0;
+        var queue_lines: std.ArrayList([]const u8) = .empty;
+        if (self.permission == null and queue_snapshot.preview_count != 0) {
+            const shown = @min(@min(@as(usize, 3), candidate_limit), queue_snapshot.preview_count);
+            for (queue_snapshot.previews[queue_snapshot.preview_count - shown .. queue_snapshot.preview_count]) |entry| {
+                var preview_bytes = entry.bytes;
+                for (preview_bytes[0..entry.len]) |*byte_| {
+                    if (byte_.* == '\n' or byte_.* == '\r' or byte_.* == '\t') byte_.* = ' ';
+                }
+                try queue_lines.append(a, try std.fmt.allocPrint(a, "{s} pending #{d}: {s}", .{
+                    if (entry.kind == .steering) "Steering" else "FollowUp", entry.id, preview_bytes[0..entry.len],
+                }));
+            }
+        }
+        const stop_title = try std.fmt.allocPrint(a, "{s} | Steering {d} FollowUp {d}", .{ if (self.busy) "Task running" else "Task ended", queue_snapshot.steering, queue_snapshot.follow_up });
+        const stop_choices = [_][]const u8{ stop_title, if (self.stop_danger) "  Continue" else "> Continue", if (self.stop_danger) "> Stop and clear" else "  Stop and clear" };
+        const stop_fits = self.stop_open and candidate_limit >= stop_choices.len and
+            cols >= text.width(stop_title) and cols >= text.width(stop_choices[1]) and cols >= text.width(stop_choices[2]);
+        const popup_lines: []const []const u8 = if (self.stop_open) (if (stop_fits) &stop_choices else &.{"Resize to confirm stop (Esc continues)"}) else if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else if (menu_visible) menu_rows.lines else queue_lines.items;
+        const selected_line = if (self.stop_open) @as(?usize, if (self.stop_danger) 2 else 1) else if (self.settings_open) settings_rows.selected_line else if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else menu_rows.selected_line;
+        const checked_mask: u16 = if (self.stop_open) 0 else if (self.provider_open) provider_rows.checked_mask else if (self.model_picker != null) picker_rows.checked_mask else 0;
         const popup_gap: usize = @intFromBool(popup_lines.len != 0);
         const content_body_limit = body_limit -| (popup_lines.len + popup_gap);
         self.frame_model_epoch = null;
         self.frame_model_generation = null;
-        const wanted_body = if (self.permission != null)
+        const wanted_body = if (self.stop_open) 0 else if (self.permission != null)
             @min(body_limit, 1 + @max(1, approval_lines.lines.len))
         else if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (thinking != null) @min(thinking_gap + @min(3, thinking_lines.len), content_body_limit) else @min(lines.items.len, content_body_limit);
         // Initial blank space keeps the first conversation at the top. Each
@@ -2331,7 +2744,7 @@ const Ui = struct {
         // without pushing duplicate content into native scrollback. Keep these
         // restoration rows when returning from preview to the normal live tail.
         // Unknown/reflowed/partially written rows never grant upward ownership.
-        const borrow_count = if ((popup_lines.len != 0 or preview) and transcript_rows == 0)
+        const borrow_count = if ((popup_lines.len != 0 or preview or self.permission != null) and transcript_rows == 0)
             @min(rows -| self.tail_height, above.len)
         else
             0;
@@ -2384,7 +2797,10 @@ const Ui = struct {
             // composer, so the transcript above keeps its own scroll window.
             const popup_span = @min(popup_lines.len, body_rows);
             const content_body_rows = body_rows -| (popup_span + popup_gap);
-            if (self.secret_mode) {
+            if (self.stop_open) {
+                for (0..content_body_rows) |line| try putStyled(writer, 1 + line, "");
+                self.frame_permission = null;
+            } else if (self.secret_mode) {
                 const start = body_rows -| secret_lines.lines.len;
                 for (0..body_rows) |line| try putStyled(writer, 1 + line, if (line >= start and line - start < secret_lines.lines.len) secret_lines.lines[line - start] else "");
                 self.frame_permission = null;
@@ -2401,7 +2817,7 @@ const Ui = struct {
                 else if (clipped)
                     try std.fmt.allocPrint(a, "Approval #{d} [preview clipped; deny only]: n deny", .{permission.id})
                 else
-                    try std.fmt.allocPrint(a, "Approval #{d}: y once / n deny", .{permission.id});
+                    try std.fmt.allocPrint(a, "Approval #{d}: Tab then y once / n deny; type to steer", .{permission.id});
                 try putToneLine(writer, a, 1, title, cols, theme.accent);
 
                 // 滚动位置限制在内容末尾，防止滚出空白区域。
@@ -2442,18 +2858,19 @@ const Ui = struct {
                 try putCandidateLine(writer, a, 1 + content_body_rows + @min(popup_gap, body_rows -| popup_span) + line, popup_lines[line], cols, tone, checked_mask & (@as(u16, 1) << @intCast(line)) != 0);
             }
             if (popup_span == popup_lines.len) {
-                if (self.settings_open and settings_rows.can_confirm) {
+                if (stop_fits) self.frame_stop = self.stop_generation;
+                if (!self.stop_open and self.settings_open and settings_rows.can_confirm) {
                     self.frame_settings_generation = self.settings_menu.generation;
-                    if (self.decision_open) self.frame_decision_fingerprint = decision_picker_module.fingerprint(state.decision_models, state.model_providers);
+                    if (self.settingsModelOpen()) self.frame_decision_fingerprint = decision_picker_module.fingerprint(self.settingsModels(state), state.model_providers);
                 }
-                if (self.provider_open and provider_rows.can_confirm) self.frame_provider_generation = self.provider_picker.generation;
+                if (!self.stop_open and self.provider_open and provider_rows.can_confirm) self.frame_provider_generation = self.provider_picker.generation;
                 if (self.model_picker) |picker| {
-                    if (picker_rows.can_confirm) {
+                    if (!self.stop_open and picker_rows.can_confirm) {
                         self.frame_model_epoch = self.model_epoch;
                         self.frame_model_generation = picker.generation;
                     }
                 }
-                if (menu_visible and menu_rows.can_confirm) self.frame_command_generation = self.command_menu.generation;
+                if (!self.stop_open and menu_visible and menu_rows.can_confirm) self.frame_command_generation = self.command_menu.generation;
             }
 
             if (hint_line.len != 0) try putToneLine(writer, a, rows - 2, hint_line, cols, theme.muted);
@@ -2466,7 +2883,7 @@ const Ui = struct {
                 try putInputLine(writer, a, rows, "API key> ", masks[0..count], cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols, count + 10) - 1});
-            } else if (self.settings_open) {
+            } else if (self.settings_open and !self.settingsModelOpen()) {
                 try putInputLine(writer, a, rows, "Settings> ", "", cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols - 1, 10)});
@@ -2474,9 +2891,10 @@ const Ui = struct {
                 try putInputLine(writer, a, rows, "Provider> ", "", cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols - 1, 10)});
-            } else if (self.model_picker) |picker| {
+            } else if (self.settingsModelOpen() or self.model_picker != null) {
+                const query = if (self.settingsModelOpen()) &self.editor else &self.model_picker.?.query;
                 const decorated: []const u8 = "Search> ";
-                const prefix = try editorDisplay(a, picker.query.bytes.items[0..picker.query.cursor]);
+                const prefix = try editorDisplay(a, query.bytes.items[0..query.cursor]);
                 var start: usize = 0;
                 var width = text.width(prefix);
                 while (width > cols -| (decorated.len + 1) and start < prefix.len) {
@@ -2484,7 +2902,7 @@ const Ui = struct {
                     width -|= cluster.width;
                     start = cluster.end;
                 }
-                const suffix = try editorDisplay(a, picker.query.bytes.items[picker.query.cursor..]);
+                const suffix = try editorDisplay(a, query.bytes.items[query.cursor..]);
                 const end = fittingBytes(suffix, cols -| (decorated.len + width));
                 const value = try std.fmt.allocPrint(a, "{s}{s}", .{ prefix[start..], suffix[0..end] });
                 try putInputLine(writer, a, rows, decorated, value, cols);
@@ -3060,7 +3478,7 @@ test "empty composer arrows browse history while slash arrows only select comman
     try std.testing.expectEqualStrings("second", ui.input_history.target(false).?.text);
 }
 
-test "standalone Escape cancels active task without exit but arrows and pasted escapes cannot" {
+test "Escape protects draft then cancels active task only from empty input" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -3077,8 +3495,12 @@ test "standalone Escape cancels active task without exit but arrows and pasted e
     try ui.parser.feed("\x1b", sink);
     try std.testing.expect(!cancel.isRequested());
     try ui.parser.expireEscape(sink);
-    try std.testing.expect(cancel.isRequested() and !ui.want_exit and !ui.ctrl_d_exit);
+    try std.testing.expect(!cancel.isRequested() and !ui.want_exit and !ui.ctrl_d_exit);
     try std.testing.expectEqualStrings("draft-next", ui.editor.bytes.items);
+    ui.wipeEditor();
+    try ui.parser.feed("\x1b", sink);
+    try ui.parser.expireEscape(sink);
+    try std.testing.expect(cancel.isRequested());
     try std.testing.expect(std.mem.startsWith(u8, ui.notice, "Cancellation requested"));
 }
 
@@ -3976,6 +4398,167 @@ test "one-pass transcript separators erase acknowledged approval preview before 
     try std.testing.expectEqual(@as(usize, 23), screen.row);
 }
 
+test "long approval Escape restores acknowledged conversation without blank screen or replay" {
+    try text.initLocale();
+    for (0..4) |scenario| {
+        const pending_canonical = scenario & 1 != 0;
+        const cancel_during_frame = scenario & 2 != 0;
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        _ = try ui.add(.user, "owned request before long approval");
+        var body: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer body.deinit();
+        for (0..18) |i| try body.writer.print("PRIOR-RESPONSE-{d:0>2}  \n", .{i});
+        _ = try ui.add(.assistant, body.written());
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        try ui.draw();
+        try screen.replay(ui.frame);
+        ui.finishFrame();
+        try std.testing.expect(screen.visible("PRIOR-RESPONSE-17"));
+        const history_before = screen.history_len;
+        const pending_index = ui.records.items.len;
+        if (pending_canonical) {
+            _ = try ui.add(.user, "new short request");
+            _ = try ui.add(.assistant, "PENDING-CANONICAL-RESPONSE");
+        }
+        body.clearRetainingCapacity();
+        for (0..64) |i| try body.writer.print("CANCEL-GHOST-PREVIEW-{d}: synthetic 中文\n", .{i});
+        ui.busy = true;
+        ui.mode = .awaiting_permission;
+        const host = bridge.host();
+        try host.emit_fn(host.context, .{ .permission = .{ .id = 14, .tool_name = "bash", .description = body.written() } }, &cancel);
+        var item = bridge.pop().?;
+        try ui.event(item);
+        item.deinit();
+        // Force old-style repeated full preview draws independently of the
+        // animation fix: closing the preview must still restore its exact rows.
+        for (0..8) |tick| {
+            try ui.draw();
+            if (cancel_during_frame and tick == 7) {
+                const split = std.mem.indexOf(u8, ui.frame, "\r\n").? + 2;
+                try screen.replay(ui.frame[0..split]);
+                ui.requestCancel(); // Cancel while the last preview is in flight.
+                try screen.replay(ui.frame[split..]);
+            } else try screen.replay(ui.frame);
+            ui.finishFrame();
+        }
+        try std.testing.expect(screen.visible("Approval #14"));
+        const record_count = ui.records.items.len;
+        if (pending_canonical) try std.testing.expect(!ui.records.items[pending_index].output);
+        if (!cancel_during_frame) ui.requestCancel(); // Empty-draft/no-queue Esc.
+        try std.testing.expect(cancel.isRequested());
+        try std.testing.expect(ui.permission == null);
+        try ui.draw();
+        try screen.replay(ui.frame);
+        ui.finishFrame();
+        if (!screen.visible("PRIOR-RESPONSE-17")) std.debug.print("APPROVAL_CANCEL pending_canonical={any} history_delta={d} retained_prior={d} prior_visible=false\n", .{ pending_canonical, screen.history_len -| history_before, screen.count("PRIOR-RESPONSE-") });
+        try std.testing.expect(screen.visible("PRIOR-RESPONSE-17"));
+        try std.testing.expectEqual(@as(usize, 18), screen.count("PRIOR-RESPONSE-"));
+        try std.testing.expectEqual(@as(usize, 0), screen.count("Approval #14"));
+        try std.testing.expectEqual(@as(usize, 0), screen.count("CANCEL-GHOST-PREVIEW"));
+        try std.testing.expectEqual(record_count, ui.records.items.len);
+        if (pending_canonical) {
+            try std.testing.expect(ui.records.items[pending_index].output);
+            try std.testing.expect(screen.visible("PENDING-CANONICAL-RESPONSE"));
+            try std.testing.expectEqual(@as(usize, 1), screen.count("PENDING-CANONICAL-RESPONSE"));
+        } else try std.testing.expectEqual(history_before, screen.history_len);
+    }
+}
+
+test "approval restoration borrows only acknowledged same-width rows" {
+    try text.initLocale();
+    for (0..4) |scenario| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        _ = try ui.add(.assistant, "owned-0\nowned-1\nowned-2\nowned-3\nowned-4\nowned-5");
+        try ui.draw();
+        if (scenario == 1) ui.frame_fresh = false;
+        ui.finishFrame();
+        if (scenario == 2) {
+            ui.resize(.{ .columns = 79, .rows = 24 });
+            ui.resize(.{ .columns = 80, .rows = 24 });
+        }
+        if (scenario == 3) ui.size.columns = 70;
+        var description: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer description.deinit();
+        for (0..32) |i| try description.writer.print("owned synthetic approval line {d}\n", .{i});
+        const host = bridge.host();
+        try host.emit_fn(host.context, .{ .permission = .{ .id = 14, .tool_name = "bash", .description = description.written() } }, &cancel);
+        var item = bridge.pop().?;
+        try ui.event(item);
+        item.deinit();
+        try ui.draw();
+        const borrowed = ui.frame_menu_history.?.borrowed.len;
+        if (scenario == 0) try std.testing.expect(borrowed != 0) else try std.testing.expectEqual(@as(usize, 0), borrowed);
+        try std.testing.expect(ui.displayed_permission == null);
+        ui.finishFrame();
+    }
+}
+
+test "approval waiting pulse never adds repeated prompts to native scrollback" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true;
+    ui.clock_ms = 80;
+    ui.dirty = false;
+    ui.animate();
+    try std.testing.expect(ui.dirty); // Ordinary execution still animates.
+    ui.mode = .awaiting_permission;
+    _ = try ui.add(.user, "owned request before approval");
+    _ = try ui.add(.assistant, "owned assistant before approval");
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    var source: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    for (0..125) |i| try source.writer.print("synthetic-step-{d}: Chinese 中文注释 only; abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz\n", .{i});
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .permission = .{ .id = 14, .tool_name = "bash", .description = source.written() } }, &cancel);
+    var item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    const history_before = screen.history_len;
+    try std.testing.expect(screen.visible("Approval #14"));
+    ui.dirty = false;
+    for (2..66) |tick| {
+        ui.clock_ms = tick * 80;
+        ui.animate();
+        try std.testing.expect(!ui.dirty); // No key/event: no repeated preview.
+        // Explicit redraws (input/events) must still preserve tail ownership.
+        try ui.draw();
+        try screen.replay(ui.frame);
+        ui.finishFrame();
+        try std.testing.expectEqual(history_before, screen.history_len);
+        try std.testing.expectEqual(@as(usize, 1), screen.count("Approval #14"));
+        try std.testing.expectEqual(@as(usize, 23), screen.row);
+        try std.testing.expectEqual(@as(?u64, 14), ui.displayed_permission);
+    }
+    ui.dirty = true;
+    ui.clock_ms += 80;
+    ui.animate();
+    try std.testing.expect(ui.dirty); // Do not swallow a real event's repaint.
+    ui.clearPermission();
+    ui.dirty = false;
+    ui.clock_ms += 80;
+    ui.animate();
+    try std.testing.expect(ui.dirty); // Animation resumes once approval ends.
+    try std.testing.expect(!cancel.isRequested());
+}
+
 fn seedShiftDraft(ui: *Ui) !void {
     try ui.appendDraft(.assistant, "```\n");
     for (0..35) |row_index| {
@@ -4732,6 +5315,8 @@ test "permission line clipping is deny-only even when bytes fit bridge budget" {
     try Ui.key(&ui, .{ .text = .{ .value = "y", .pasted = false } });
     try Ui.key(&ui, .{ .text = .{ .value = "t", .pasted = false } });
     try std.testing.expect(bridge.answer == null);
+    ui.wipeEditor();
+    try Ui.key(&ui, .tab);
     try Ui.key(&ui, .{ .text = .{ .value = "n", .pasted = false } });
     try std.testing.expectEqual(@as(?r.Decision, .deny), bridge.answer);
 }
@@ -4759,6 +5344,8 @@ test "permissions require a matching displayed frame and never accept paste" {
     try std.testing.expect(bridge.answer == null);
     try Ui.key(&ui, .{ .text = .{ .value = "y", .pasted = false } });
     try std.testing.expect(bridge.answer == null); // Pasting makes this request deny-only.
+    ui.wipeEditor();
+    try Ui.key(&ui, .tab);
     try Ui.key(&ui, .{ .text = .{ .value = "n", .pasted = false } });
     try std.testing.expectEqual(@as(?r.Decision, .deny), bridge.answer);
 }
@@ -4782,6 +5369,9 @@ test "approval offers only one-shot allow or deny and t grants no authority" {
         try Ui.key(&ui, .{ .text = .{ .value = "t", .pasted = false } });
         try std.testing.expect(bridge.answer == null);
         try std.testing.expectEqual(id, ui.permission.?.id);
+        try std.testing.expectEqualStrings("t", ui.editor.bytes.items);
+        ui.wipeEditor();
+        try Ui.key(&ui, .tab);
         try Ui.key(&ui, .{ .text = .{ .value = if (id == 1) "y" else "n", .pasted = false } });
         try std.testing.expectEqual(@as(?r.Decision, if (id == 1) .allow_once else .deny), bridge.answer);
         try std.testing.expect(ui.permission == null);
@@ -4809,6 +5399,8 @@ test "paste terminator injection cannot authorize the visible permission" {
     try ui.parser.feed("yt\x1b[201~", sink); // Malicious paste body after an embedded terminator.
     try std.testing.expect(bridge.answer == null);
     try std.testing.expect(ui.approval_paste_seen);
+    ui.wipeEditor();
+    try Ui.key(&ui, .tab);
     try ui.parser.feed("n", sink);
     try std.testing.expectEqual(@as(?r.Decision, .deny), bridge.answer);
 }
@@ -4866,6 +5458,8 @@ test "six-row approval cannot authorize and recovers after a complete visible fr
             try ui.parser.feed(key_bytes, sink); // 构建帧不等于整帧已显示。
             try std.testing.expect(bridge.answer == null);
             ui.displayed_permission = ui.frame_permission;
+            ui.wipeEditor();
+            try Ui.key(&ui, .tab);
             try ui.parser.feed(key_bytes, sink);
             try std.testing.expectEqual(@as(?r.Decision, if (key_bytes[0] == 'y') .allow_once else .deny), bridge.answer);
         }
@@ -4906,6 +5500,8 @@ test "approval identity must fit in full before narrow windows can authorize" {
         try ui.parser.feed("y", sink);
         try std.testing.expect(bridge.answer == null);
         ui.displayed_permission = ui.frame_permission;
+        ui.wipeEditor();
+        try Ui.key(&ui, .tab);
         try ui.parser.feed("y", sink);
         try std.testing.expectEqual(@as(?r.Decision, .allow_once), bridge.answer);
     }
@@ -5264,6 +5860,165 @@ test "green checked candidates preserve full multibyte IDs and configured label 
     try std.testing.expect(std.mem.find(u8, ui.frame, "configured locally") == null);
 }
 
+const ImageModelFixture = struct {
+    const profiles = [_]core_config.Model{
+        .{ .name = "login/deepseek-flash", .protocol = .chat, .context_tokens = 16384 },
+        .{ .name = "unlogged/deepseek-flash", .protocol = .chat, .context_tokens = 16384 },
+    };
+    state: Connection.State = .{ .runtime = null, .model = "primary", .base_url = "", .image_models = &profiles, .decision_models = &DecisionModelFixture.profiles, .model_providers = &DecisionModelFixture.logged, .decision_enabled = true, .decision_model = "login/family/judge" },
+    calls: usize = 0,
+    decision_calls: usize = 0,
+    fail: bool = false,
+    fn current(raw: *anyopaque) Connection.State {
+        return @as(*@This(), @ptrCast(@alignCast(raw))).state;
+    }
+    fn configure(_: *anyopaque, _: []const u8) !void {}
+    fn image(raw: *anyopaque, choice: Connection.DecisionChoice) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        if (self.fail) return error.SaveFailed;
+        self.state.image_enabled = choice != .off;
+        self.state.image_model = switch (choice) {
+            .off => null,
+            .model => "login/deepseek-flash",
+        };
+        if (choice == .model) try std.testing.expectEqualStrings("login/deepseek-flash", choice.model);
+    }
+    fn decision(raw: *anyopaque, _: Connection.DecisionChoice) !void {
+        @as(*@This(), @ptrCast(@alignCast(raw))).decision_calls += 1;
+    }
+    fn connection(self: *@This()) Connection {
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .image_fn = image, .decision_fn = decision };
+    }
+};
+
+test "Image settings default Off isolated callbacks search Back and explicit Off" {
+    try text.initLocale();
+    var fixture: ImageModelFixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    try std.testing.expect(!fixture.state.image_enabled);
+    try std.testing.expect((Connection.State{ .runtime = null, .model = "", .base_url = "" }).image_models.len == 0);
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 7;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r\r", sink);
+    try std.testing.expect(ui.image_open and !ui.decision_open and ui.settings_menu.selected == 0);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "login/deepseek-flash") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "unlogged/deepseek-flash") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "family/judge") == null);
+    ui.finishFrame();
+    try ui.parser.feed("no-match", sink);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "No matching models") != null);
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try Ui.key(&ui, .clear);
+    try ui.parser.feed("FLASH login", sink);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expect(fixture.state.image_enabled and !ui.image_open and ui.settings_menu.selected == 7);
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+    try std.testing.expectEqualStrings("login/family/judge", fixture.state.decision_model.?);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(ui.image_open and ui.settings_menu.selected == 1);
+    try ui.parser.feed("\x1b[A", sink);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(!fixture.state.image_enabled and ui.settings_menu.selected == 7);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\rquery\x1b[D\r", sink); // Root open discards the entire tail.
+    try std.testing.expect(ui.image_open and ui.editor.bytes.items.len == 0);
+    try ui.parser.feed("query\x1b[D\r", sink);
+    try std.testing.expect(!ui.image_open and ui.settings_menu.selected == 7 and ui.editor.bytes.items.len == 0);
+    ui.settings_menu.selected = 1;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(ui.decision_open and !ui.image_open);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.decision_calls);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqualStrings("primary", fixture.state.model);
+}
+
+test "Image settings fresh ACK pending partial resize changed candidates paste failed saves" {
+    try text.initLocale();
+    var fixture: ImageModelFixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 7;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try ui.parser.feed("\x1b[B", sink);
+    try ui.draw();
+    try ui.parser.feed("\r", sink);
+    ui.frame_offset = 1;
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    ui.finishFrame();
+    var replaced = ImageModelFixture.profiles;
+    replaced[0].name = "login/replaced";
+    fixture.state.image_models = &replaced;
+    try ui.parser.feed("\r\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    fixture.state.image_models = &ImageModelFixture.profiles;
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try ui.draw();
+    ui.finishFrame();
+    const size = ui.size;
+    ui.resize(.{ .columns = 8, .rows = size.rows });
+    ui.resize(size);
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try ui.draw();
+    ui.finishFrame();
+    fixture.fail = true;
+    try ui.parser.feed("\r\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expect(ui.image_open and !fixture.state.image_enabled);
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    fixture.fail = false;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[200~flash\x1b[201~\r", sink);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    ui.closeSettingsMenu();
+    try std.testing.expect(!ui.image_open and !ui.decision_open and ui.editor.bytes.items.len == 0);
+    try std.testing.expect(ui.displayed_decision_fingerprint == null and ui.frame_decision_fingerprint == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.decision_calls);
+}
+
 const DecisionModelFixture = struct {
     const profiles = [_]core_config.Model{
         .{ .name = "login/family/judge", .protocol = .chat, .context_tokens = 16384 },
@@ -5397,7 +6152,7 @@ test "Decision direct list isolates selection and consumes failed save ACK and i
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }
 
-test "Decision direct list offers Off without providers and ignores custom input and paste" {
+test "Decision list offers Off without providers and never invents search identities or accepts paste" {
     try text.initLocale();
     var fixture: DecisionModelFixture = .{};
     var cancel: p.Cancellation = .{};
@@ -5438,6 +6193,159 @@ test "Decision direct list offers Off without providers and ignores custom input
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expectEqual(@as(usize, 0), fixture.main_calls);
+}
+
+test "Decision search edits revoke query ACK including pending frames and clear on return" {
+    try text.initLocale();
+    var fixture: DecisionModelFixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    ui.openSettingsMenu();
+    ui.decision_open = true;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("LOGIN FAMILY/JUDGE\r", sink);
+    try std.testing.expectEqualStrings("LOGIN FAMILY/JUDGE", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 0), ui.settings_menu.selected);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Search> ") != null);
+    // An edit while the old query frame is in flight must revoke its ACK too.
+    try ui.parser.feed("x", sink);
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "No matching models") != null);
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[A\x1b[B\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try ui.parser.feed("\x7f", sink);
+    try std.testing.expectEqualStrings("LOGIN FAMILY/JUDGE", ui.editor.bytes.items);
+    try ui.draw();
+    ui.finishFrame();
+    // Query changes and changes back cannot resurrect the old identity proof.
+    try ui.parser.feed("x\x7f\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expect(!ui.decision_open and ui.editor.bytes.items.len == 0);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "login/family/judge") != null);
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(ui.decision_open and ui.editor.bytes.items.len == 0);
+    try ui.parser.feed("oFf\x15missing", sink);
+    try std.testing.expectEqualStrings("missing", ui.editor.bytes.items);
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(!ui.decision_open and ui.editor.bytes.items.len == 0);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    const large: [257]u8 = @splat('x');
+    try Ui.key(&ui, .{ .text = .{ .value = &large, .pasted = false } });
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+    try Ui.key(&ui, .{ .text = .{ .value = large[0..256], .pasted = false } });
+    try std.testing.expectEqual(@as(usize, 256), ui.editor.bytes.items.len);
+    try Ui.key(&ui, .clear);
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+    try Ui.key(&ui, .{ .text = .{ .value = "login", .pasted = false } });
+    ui.closeSettingsMenu();
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+    try std.testing.expectEqualStrings("Command timeout (s)", Ui.settingsValueTitle(.command_timeout_ms));
+    try std.testing.expectEqualStrings("Task timeout (s)", Ui.settingsValueTitle(.task_timeout_ms));
+    try std.testing.expect(std.mem.find(u8, Ui.settingsValueTitle(.request_timeout_ms), "(s;") != null);
+}
+
+test "Decision search clips UTF8 controls and tiny windows without granting authority" {
+    try text.initLocale();
+    var fixture: DecisionModelFixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openSettingsMenu();
+    ui.decision_open = true;
+    try ui.settingsKey(.{ .text = .{ .value = "中文中文中文中文中文\x1b[2J", .pasted = false } });
+    for ([_]terminal_module.Size{ .{ .columns = 0, .rows = 0 }, .{ .columns = 8, .rows = 6 }, .{ .columns = 18, .rows = 8 }, .{ .columns = 40, .rows = 12 } }) |size| {
+        ui.resize(size);
+        try ui.draw();
+        try std.testing.expect(std.unicode.utf8ValidateSlice(ui.frame));
+        try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
+        ui.finishFrame();
+        try ui.settingsKey(.enter);
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    }
+    try ui.settingsKey(.home);
+    try ui.settingsKey(.delete);
+    try std.testing.expect(std.mem.startsWith(u8, ui.editor.bytes.items, "文中文"));
+    try ui.settingsKey(.end);
+    try ui.settingsKey(.kill_end);
+    try ui.settingsKey(.cancel);
+    try std.testing.expect(ui.settings_open and !ui.decision_open and ui.editor.bytes.items.len == 0);
+}
+
+test "Decision search OOM preserves bytes but revokes every old ACK" {
+    var fixture: DecisionModelFixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openSettingsMenu();
+    ui.decision_open = true;
+    ui.displayed_settings_generation = ui.settings_menu.generation;
+    ui.frame_settings_generation = ui.settings_menu.generation;
+    ui.displayed_decision_fingerprint = decision_picker_module.fingerprint(fixture.state.decision_models, fixture.state.model_providers);
+    ui.frame_decision_fingerprint = ui.displayed_decision_fingerprint;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    ui.editor.allocator = failing.allocator();
+    defer ui.editor.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, ui.settingsKey(.{ .text = .{ .value = "judge", .pasted = false } }));
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try std.testing.expect(ui.displayed_settings_generation == null and ui.frame_settings_generation == null);
+    try std.testing.expect(ui.displayed_decision_fingerprint == null and ui.frame_decision_fingerprint == null);
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+}
+
+test "settings TUI custom seconds stages equivalent milliseconds" {
+    try text.initLocale();
+    var fixture: PreferenceFixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 3;
+    ui.openSettingsValue(.command_timeout_ms, fixture.state);
+    ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "seconds") != null);
+    try ui.settingsKey(.{ .text = .{ .value = "123.456", .pasted = false } });
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(u32, 123456), fixture.state.limits.command_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
 const PreferenceFixture = struct {
@@ -6781,7 +7689,8 @@ test "selection guards paste secret busy joined future poison and rollback" {
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("\x1b[200~/model pasted-id\x1b[201~\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
-    try ui.parser.feed("/model fixture-next\r", sink);
+    try std.testing.expectEqualStrings("/model pasted-id", ui.editor.bytes.items);
+    try ui.parser.feed("\x15/model fixture-next\r", sink);
     try std.testing.expectEqualStrings("fixture-next", fixture.name);
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expectEqual(shared.ReasoningEffort.minimal, fixture.effort);
@@ -7115,7 +8024,9 @@ test "compact command rejects busy pasted poisoned and unconfigured states witho
         ui.poisoned = case == 2;
         try ui.submit();
         try std.testing.expect(ui.future == null);
-        try std.testing.expectEqualStrings("Compaction requires an idle, non-pasted session", ui.notice);
+        try std.testing.expectEqualStrings(if (case == 0) "Only ordinary conversation text can be queued" else "Compaction requires an idle, non-pasted session", ui.notice);
+        if (case == 0) try std.testing.expectEqualStrings("/compact", ui.editor.bytes.items);
+        ui.wipeEditor();
         ui.busy = false;
         ui.poisoned = false;
     }
@@ -7237,6 +8148,329 @@ test "secret prompt masks keys shows destination and erases cancel error and pas
     try ui.parser.feed("key\x04exit-tail", sink);
     try std.testing.expect(ui.want_exit and !ui.secret_mode and ui.secret.len == 0);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+}
+
+fn pasteTailEscapeRegression(parts: []const []const u8, reset_before_timeout: bool) !void {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const id = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "pending followup");
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    for (parts) |part| try ui.parser.feed(part, sink);
+    try std.testing.expect(!ui.parser.pasted and ui.parser.escape_len == 1);
+    if (reset_before_timeout) try ui.parser.feed("", sink);
+    try ui.parser.expireEscape(sink);
+    try std.testing.expectEqual(@as(?u64, id), ui.inbox.snapshot().newest_id);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), ui.parser.escape_len);
+    // A rejected Escape is consumed, not left to revive on a later read/timer.
+    try ui.parser.feed("", sink);
+    try ui.parser.expireEscape(sink);
+    try std.testing.expectEqual(@as(?u64, id), ui.inbox.snapshot().newest_id);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try ui.parser.feed("\x1b", sink);
+    try ui.parser.expireEscape(sink);
+    try std.testing.expect(ui.inbox.snapshot().newest_id == null);
+    try std.testing.expectEqualStrings("pending followup", ui.editor.bytes.items);
+    try std.testing.expect(!cancel.isRequested());
+}
+
+test "regression paste-tail Escape timeout cannot withdraw queued FollowUp" {
+    try pasteTailEscapeRegression(&.{"\x1b[200~\x1b[201~\x1b"}, false);
+}
+
+test "regression split paste terminator Escape cannot revive after feed resets taint" {
+    try pasteTailEscapeRegression(&.{ "\x1b[200~\x1b[20", "1~\x1b" }, true);
+}
+
+test "regression delayed paste-tail Escape retains provenance across fresh empty reads" {
+    try pasteTailEscapeRegression(&.{"\x1b[200~\x1b[201~\x1b"}, true);
+}
+
+test "regression idle Custom Ctrl-C cancels child before parent via parser" {
+    var fixture: PreferenceFixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 3;
+    ui.openSettingsValue(.command_timeout_ms, fixture.state);
+    ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
+    ui.settings_value_picker.?.beginCustom();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("123.456", sink);
+    try std.testing.expect(ui.settings_value_picker.?.editing);
+    try std.testing.expectEqualStrings("123.456", ui.settings_value_picker.?.input[0..ui.settings_value_picker.?.input_len]);
+    try ui.parser.feed("\x03", sink);
+    try std.testing.expect(!ui.settings_value_picker.?.editing);
+    try std.testing.expect(ui.settings_open and !ui.stop_open);
+    try std.testing.expectEqual(@as(usize, 0), ui.settings_value_picker.?.input_len);
+    try ui.parser.feed("\x03", sink);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_open);
+    try std.testing.expectEqual(@as(usize, 3), ui.settings_menu.selected);
+    try ui.parser.feed("\x03", sink);
+    try std.testing.expect(!ui.settings_open and !ui.stop_open and !cancel.isRequested());
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+}
+
+test "regression idle selectors Ctrl-C reaches child modal via parser" {
+    for (0..4) |kind| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        switch (kind) {
+            0, 1 => {
+                ui.openSettingsMenu();
+                ui.decision_open = kind == 0;
+                ui.image_open = kind == 1;
+            },
+            2 => ui.openModelPicker(),
+            3 => ui.openProviderPicker(),
+            else => unreachable,
+        }
+        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+        if (kind < 3) try ui.parser.feed("query", sink);
+        try ui.parser.feed("\x03", sink);
+        try std.testing.expect(!ui.settingsModelOpen() and ui.model_picker == null and !ui.provider_open);
+        if (kind < 2) {
+            try std.testing.expect(ui.settings_open);
+            try std.testing.expectEqual(@as(usize, if (kind == 0) 1 else 7), ui.settings_menu.selected);
+            try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+        }
+        try std.testing.expect(!ui.stop_open and !cancel.isRequested());
+    }
+}
+
+test "regression Ctrl-C still confirms busy or pending queue and keeps idle composer" {
+    for (0..3) |kind| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.busy = kind == 0;
+        if (kind == 1) {
+            _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "pending");
+            ui.openSettingsMenu(); // Queue confirmation outranks the idle modal.
+        }
+        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+        if (kind != 1) try ui.parser.feed("keep draft", sink);
+        try ui.parser.feed("\x03", sink);
+        try std.testing.expectEqual(kind != 2, ui.stop_open);
+        try std.testing.expect(!ui.stop_danger and !cancel.isRequested());
+        if (kind != 1) try std.testing.expectEqualStrings("keep draft", ui.editor.bytes.items);
+        if (kind == 1) try std.testing.expectEqual(@as(usize, 1), ui.inbox.snapshot().follow_up);
+    }
+}
+
+test "stop clear requires fresh complete ACK and independent dangerous Enter with draft kept" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true; // Undefined fixture Runtime must never be dereferenced.
+    _ = try ui.inbox.enqueue(std.testing.allocator, .steering, "queued steer");
+    _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "queued followup");
+    try std.testing.expect(try ui.editor.insert("keep my draft"));
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x03\x1b[C\r", sink);
+    try std.testing.expect(ui.stop_open and !ui.stop_danger and !cancel.isRequested());
+    try std.testing.expect(ui.inbox.snapshot().confirming);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "> Continue") != null);
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[C\r", sink);
+    try std.testing.expect(ui.stop_danger and !cancel.isRequested());
+    try ui.parser.feed("\r", sink); // No frame yet: no authorization.
+    try std.testing.expect(!cancel.isRequested() and !ui.stop_danger);
+    try ui.parser.feed("\x1b[C", sink); // Reselect after a pre-ACK/held Enter.
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "> Stop and clear") != null);
+    ui.finishFrame();
+    try ui.parser.feed("\r\x03", sink);
+    try std.testing.expect(cancel.isRequested() and !ui.stop_open);
+    try std.testing.expect(ui.inbox.snapshot().newest_id == null);
+    try std.testing.expect(ui.inbox.snapshot().paused);
+    try std.testing.expectEqualStrings("keep my draft", ui.editor.bytes.items);
+}
+
+test "stop modal rejects queue revision resize paste and repeated CtrlC authority" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true;
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x03", sink);
+    try ui.parser.feed("\x1b[B", sink);
+    try ui.draw();
+    ui.finishFrame();
+    _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "raced message");
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(!cancel.isRequested() and !ui.stop_danger);
+    try ui.parser.feed("\x1b[C", sink);
+    try ui.draw();
+    ui.finishFrame();
+    ui.resize(.{ .columns = 18, .rows = 7 });
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(!cancel.isRequested());
+    try ui.draw();
+    ui.finishFrame();
+    try std.testing.expect(ui.displayed_stop == null);
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(!cancel.isRequested());
+    ui.resize(.{ .columns = 80, .rows = 24 });
+    try ui.parser.feed("\x03\r", sink);
+    try std.testing.expect(!ui.stop_danger and !cancel.isRequested());
+    try ui.parser.feed("\x1b[C", sink);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[200~\r\x1b[201~\r", sink);
+    try std.testing.expect(!cancel.isRequested());
+    // The discarded paste tail cannot confirm; fresh Esc solely dismisses.
+    ui.parser.pasted = false;
+    ui.parser.batch_paste = false;
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(!ui.stop_open and !ui.inbox.snapshot().confirming);
+    try std.testing.expectEqual(@as(usize, 1), ui.inbox.snapshot().follow_up);
+}
+
+test "Escape withdraws exact newest plain text once and preserves existing draft" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true;
+    _ = try ui.inbox.enqueue(std.testing.allocator, .steering, "first");
+    _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "newest 中文");
+    try Ui.key(&ui, .escape);
+    try std.testing.expectEqualStrings("newest 中文", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), ui.inbox.snapshot().steering);
+    try Ui.key(&ui, .escape);
+    try std.testing.expectEqualStrings("newest 中文", ui.editor.bytes.items);
+    try std.testing.expect(!cancel.isRequested());
+    ui.wipeEditor();
+    try Ui.key(&ui, .escape);
+    try std.testing.expectEqualStrings("first", ui.editor.bytes.items);
+    try std.testing.expect(!cancel.isRequested());
+    ui.wipeEditor();
+    try Ui.key(&ui, .cancel); // No real worker, but busy confirmation still safe.
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(!cancel.isRequested() and !ui.stop_open);
+    ui.busy = false;
+    try std.testing.expect(try ui.editor.insert("idle draft"));
+    try Ui.key(&ui, .cancel);
+    try std.testing.expectEqualStrings("idle draft", ui.editor.bytes.items);
+}
+
+test "user committed is owned display only and permission cleared matches exact id" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try bridge.host().emit_fn(&bridge, .{ .user_committed = .{ .id = 9, .text = "injected actual text" } }, &cancel);
+    var item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    try std.testing.expectEqualStrings("injected actual text", ui.records.items[0].body.items);
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+    try bridge.host().emit_fn(&bridge, .{ .permission = .{ .id = 10, .tool_name = "bash", .description = "approval" } }, &cancel);
+    item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    try bridge.host().emit_fn(&bridge, .{ .permission_cleared = 9 }, &cancel);
+    item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    try std.testing.expect(ui.permission != null);
+    try bridge.host().emit_fn(&bridge, .{ .permission_cleared = 10 }, &cancel);
+    item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    try std.testing.expect(ui.permission == null);
+}
+
+test "ordinary submission preserves draft and pending queue after owner change" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var old_runtime: r.Runtime = undefined;
+    var new_runtime: r.Runtime = undefined;
+    var fixture = AuthFixture{ .configured = true, .runtime = &new_runtime };
+    var ui = fixtureUi(&bridge, &cancel);
+    ui.connection = fixture.connection();
+    defer ui.deinit();
+    ui.queue_owner = .{ .runtime = &old_runtime, .session = null };
+    _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "old session pending");
+    try std.testing.expect(try ui.editor.insert("new draft"));
+    try Ui.key(&ui, .enter);
+    try std.testing.expectEqualStrings("new draft", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), ui.inbox.snapshot().follow_up);
+    try std.testing.expect(ui.inbox.snapshot().paused);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+    try std.testing.expect(!ui.busy and ui.future == null and !ui.want_exit);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Ctrl-C") != null);
+    ui.inbox.pauseClaims(true);
+    try std.testing.expect(ui.inbox.cancelClear(ui.inbox.snapshot().revision, &cancel));
+    try std.testing.expect(ui.queueOwnerMatches());
+}
+
+test "queued launch waits for joined success preserves draft and restores OOM without duplicate history" {
+    const cfg = @import("../core/config.zig");
+    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = AuthFixture{ .configured = true };
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fixture, .call_fn = AuthFixture.call }, .{ .context = &fixture, .schemas = &.{}, .prepare_fn = AuthFixture.prepare, .execute_fn = AuthFixture.execute }, bridge.host(), "");
+    defer runtime.deinit();
+    fixture.runtime = &runtime;
+    var ui = fixtureUi(&bridge, &cancel);
+    ui.connection = fixture.connection();
+    defer ui.deinit();
+    try std.testing.expect(try ui.editor.insert("first prompt"));
+    try ui.submit();
+    try std.testing.expect(runtime.inbox == &ui.inbox);
+    try std.testing.expect(try ui.editor.insert("followup prompt"));
+    try Ui.key(&ui, .follow_up);
+    try std.testing.expectEqual(@as(usize, 1), ui.inbox.snapshot().follow_up);
+    try std.testing.expect(try ui.editor.insert("unfinished draft"));
+    try ui.dispatchNext();
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    try ui.complete();
+    try std.testing.expect(runtime.inbox == null and ui.attached_runtime == null);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    ui.allocator = failing.allocator();
+    try ui.dispatchNext();
+    ui.allocator = std.testing.allocator;
+    try std.testing.expect(!ui.busy and ui.future == null);
+    try std.testing.expectEqual(@as(usize, 1), ui.inbox.snapshot().follow_up);
+    try std.testing.expect(ui.inbox.snapshot().paused);
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    try std.testing.expectEqualStrings("unfinished draft", ui.editor.bytes.items);
+    // A normal submission must not silently resume the queue. Explicit resume
+    // is tested here at the Inbox seam, without sending /queue to the model.
+    ui.inbox.@"resume"();
+    try ui.dispatchNext();
+    try std.testing.expectEqualStrings("unfinished draft", ui.editor.bytes.items);
+    try std.testing.expectEqualStrings("followup prompt", ui.prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), ui.input_history.entries.items.len);
+    try ui.complete();
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 0), ui.inbox.snapshot().follow_up);
+    try std.testing.expect(runtime.inbox == null);
 }
 
 test "configure enables same-process submit without sending secrets or commands" {

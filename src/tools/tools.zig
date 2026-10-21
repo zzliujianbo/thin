@@ -17,6 +17,8 @@ const j = @import("../util/json.zig");
 const runtime = @import("../core/runtime.zig");
 const command_risk = @import("command_risk.zig");
 const decision = @import("../core/decision.zig");
+const image = @import("../core/image.zig");
+const image_file = @import("image_file.zig");
 
 /// 暴露给模型的工具 schema 列表；顺序是对外契约（测试依赖 read_file 在 0、memory 在 3）。
 pub const schemas = [_]p.ToolSchema{
@@ -65,6 +67,26 @@ fn schemasForDecision(enabled: bool) []const p.ToolSchema {
     return if (enabled) &reviewed_schemas else &schemas;
 }
 
+const image_schema: p.ToolSchema = .{
+    .name = "read_image",
+    .description = "Inspect a local PNG/JPEG/GIF/WebP inside the startup project using the independent image service. Returns bounded text and auxiliary usage only, never image bytes. No URLs. Maximum file size 4 MiB and dimensions 8192. question is optional.",
+    .parameters_json =
+    \\{"type":"object","properties":{"path":{"type":"string"},"question":{"type":"string","minLength":1,"maxLength":4096}},"required":["path"],"additionalProperties":false}
+    ,
+};
+const image_schemas = schemas ++ [_]p.ToolSchema{image_schema};
+const reviewed_image_schemas = reviewed_schemas ++ [_]p.ToolSchema{image_schema};
+fn schemasForServices(review: bool, enabled: bool) []const p.ToolSchema {
+    if (!enabled) return schemasForDecision(review);
+    return if (review) &reviewed_image_schemas else &image_schemas;
+}
+pub const ReadImage = struct { path: []const u8, question: []const u8 = image.default_question };
+fn validateReadImage(r: ReadImage) !void {
+    try validatePath(r.path);
+    if (std.ascii.startsWithIgnoreCase(r.path, "http://") or std.ascii.startsWithIgnoreCase(r.path, "https://")) return error.InvalidImagePath;
+    if (r.question.len == 0 or r.question.len > image.max_question_bytes or !std.unicode.utf8ValidateSlice(r.question) or std.mem.indexOfScalar(u8, r.question, 0) != null) return error.InvalidImageQuestion;
+}
+
 /// read_file 的解析结果；offset 为字节偏移，limit 为空时使用配置的 read_bytes。
 pub const Read = struct { path: []const u8, offset: u64 = 0, limit: ?u32 = null };
 /// write_file 的解析结果；覆盖已有文件必须显式设置 overwrite。
@@ -87,6 +109,7 @@ pub const Memory = struct {
 /// 已解析且通过基本校验的工具动作；内部的切片指向解析时的 arena。
 pub const Action = union(enum) {
     read_file: Read,
+    read_image: ReadImage,
     write_file: Write,
     bash: Bash,
     memory: Memory,
@@ -95,6 +118,7 @@ pub const Action = union(enum) {
     pub fn description(self: Action, a: std.mem.Allocator) ![]const u8 {
         return switch (self) {
             .read_file => |r| try std.fmt.allocPrint(a, "Read {s}", .{r.path}),
+            .read_image => |r| try std.fmt.allocPrint(a, "Inspect image {s}", .{r.path[0..@min(r.path.len, 4096)]}),
             .write_file => |w| try std.fmt.allocPrint(a, "{s} {s} ({d} bytes)", .{
                 if (w.overwrite) "Write/replace" else "Create", w.path, w.content.len,
             }),
@@ -115,6 +139,11 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
     if (arguments.len > limits.max_response_bytes) return error.ArgumentsTooLarge;
     // 严格模式：拒绝未知字段（如伪造的 trust），并让字符串复制进 arena，不借用输入缓冲。
     const opts: std.json.ParseOptions = .{ .allocate = .alloc_always, .ignore_unknown_fields = false };
+    if (std.mem.eql(u8, name, "read_image")) {
+        const args = try std.json.parseFromSliceLeaky(ReadImage, a, arguments, opts);
+        try validateReadImage(args);
+        return .{ .read_image = args };
+    }
     if (std.mem.eql(u8, name, "read_file")) {
         const args = try std.json.parseFromSliceLeaky(Read, a, arguments, opts);
         try validatePath(args.path);
@@ -196,11 +225,22 @@ pub const Tools = struct {
     /// 由应用层传入的认证文件 realPath；与 Root.path 使用同一真实路径空间，
     /// 即使启动目录是 HOME 或 HOME 本身是别名，也不能通过模型文件工具泄露凭证。
     auth_path: ?[]const u8 = null,
+    /// Explicit opt-in; no service means no fifth schema and no file access.
+    image: ?image.Service = null,
+
+    fn checkImageAction(self: *Tools, action: Action) !void {
+        if (action == .read_image) {
+            const service = self.image orelse return error.ImageDisabled;
+            try service.checkReady();
+            try validateReadImage(action.read_image);
+        }
+    }
 
     /// Both preparation and direct execution use the same anchored path policy.
     fn checkFileAction(self: *Tools, a: std.mem.Allocator, action: Action) !void {
         const path = switch (action) {
             .read_file => |read| read.path,
+            .read_image => |read| read.path,
             .write_file => |write| write.path,
             else => return,
         };
@@ -248,7 +288,7 @@ pub const Tools = struct {
 
     /// 把 Tools 包装成 runtime.Executor，供运行时调度 prepare 与 execute。
     pub fn executor(self: *Tools) runtime.Executor {
-        return .{ .context = self, .schemas = schemasForDecision(self.config.decisionActive()), .prepare_fn = prepare, .execute_fn = executePrepared };
+        return .{ .context = self, .schemas = schemasForServices(self.config.decisionActive(), self.image != null), .prepare_fn = prepare, .execute_fn = executePrepared };
     }
 
     /// 解析并做路径校验，生成待授权的 Prepared；此阶段不产生任何副作用。
@@ -256,6 +296,7 @@ pub const Tools = struct {
         const self: *Tools = @ptrCast(@alignCast(context_));
         const action = try a.create(Action);
         action.* = try parse(a, call.name, call.arguments, self.config.limits);
+        try self.checkImageAction(action.*);
         try self.checkFileAction(a, action.*);
         // 危险 bash 在授权前打标。Runtime 看到 explicit_denial 后逐次询问。
         var description = try action.description(a);
@@ -296,6 +337,8 @@ pub const Tools = struct {
     }
 
     fn executeWithTimeout(self: *Tools, a: std.mem.Allocator, action: Action, timeout: ?decision.Timeout, cancel: *const p.Cancellation) !Execution {
+        // Readiness/poison and argument guards are pure and precede all I/O.
+        try self.checkImageAction(action);
         // 执行前已取消则直接返回，不触碰磁盘或子进程。
         if (cancel.isRequested()) return .{ .text = "Canceled before execution", .is_error = true, .canceled = true };
 
@@ -305,6 +348,26 @@ pub const Tools = struct {
 
         var value = j.object(a);
         switch (action) {
+            .read_image => |r| {
+                if (cancel.isRequested()) return error.Canceled;
+                const picture = try image_file.load(a, self.root, r.path);
+                defer a.free(picture.data);
+                if (cancel.isRequested()) return error.Canceled;
+                const output = try self.image.?.inspect(a, .{ .image = picture, .question = r.question }, cancel);
+                defer a.free(output.text);
+                if (cancel.isRequested()) return error.Canceled;
+                try j.put(a, &value, "path", j.str(r.path));
+                try j.put(a, &value, "mime", j.str(picture.format.mime()));
+                try j.put(a, &value, "width", try j.number(picture.width));
+                try j.put(a, &value, "height", try j.number(picture.height));
+                try j.put(a, &value, "description", j.str(output.text));
+                try j.put(a, &value, "usage_scope", j.str("auxiliary_image"));
+                const usage_json = try std.json.Stringify.valueAlloc(a, output.usage, .{});
+                defer a.free(usage_json);
+                const usage = try std.json.parseFromSliceLeaky(std.json.Value, a, usage_json, .{ .allocate = .alloc_always });
+                try j.put(a, &value, "usage", usage);
+                return .{ .text = try j.encode(a, value) };
+            },
             .read_file => |r| {
                 // truncated 时 next_offset 指向下一段起点，模型可据此继续分页读取。
                 const result = try self.root.read(a, r.path, r.offset, r.limit orelse self.config.limits.read_bytes);
@@ -580,6 +643,91 @@ test "dangerous bash is marked for explicit approval and ordinary bash is not" {
     const safe = try Tools.prepare(&tools, a, .{ .id = "s", .name = "bash", .arguments = "{\"command\":\"printf ok\"}" });
     try std.testing.expect(safe.explicit_denial == null);
     try std.testing.expect(std.mem.indexOf(u8, safe.description, "DANGEROUS") == null);
+}
+
+test "image tool strict arguments schemas guards and bounded text output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |review| {
+        const off = schemasForServices(review, false);
+        const on = schemasForServices(review, true);
+        try std.testing.expectEqual(@as(usize, 4), off.len);
+        try std.testing.expectEqual(@as(usize, 5), on.len);
+        for (off, on[0..4]) |old, new| {
+            try std.testing.expectEqualStrings(old.name, new.name);
+            try std.testing.expectEqualStrings(old.description, new.description);
+            try std.testing.expectEqualStrings(old.parameters_json, new.parameters_json);
+        }
+        try std.testing.expectEqualStrings("read_image", on[4].name);
+    }
+    const parsed = try parse(a, "read_image", "{\"path\":\"fixture.bin\"}", .{});
+    try std.testing.expectEqualStrings(image.default_question, parsed.read_image.question);
+    try std.testing.expectError(error.UnknownField, parse(a, "read_image", "{\"path\":\"x\",\"url\":\"x\"}", .{}));
+    try std.testing.expectError(error.InvalidImagePath, parse(a, "read_image", "{\"path\":\"HTTPS://host/x\"}", .{}));
+    try std.testing.expectError(error.PathEscape, parse(a, "read_image", "{\"path\":\"../x\"}", .{}));
+    try std.testing.expectError(error.InvalidImageQuestion, validateReadImage(.{ .path = "x", .question = "\xff" }));
+    try std.testing.expectError(error.InvalidImageQuestion, validateReadImage(.{ .path = "x", .question = "\x00" }));
+    try std.testing.expectError(error.InvalidImageQuestion, parse(a, "read_image", "{\"path\":\"x\",\"question\":\"\"}", .{}));
+    const Fake = struct {
+        calls: usize = 0,
+        poisoned: bool = false,
+        fail: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.poisoned) return error.CleanupFailed;
+        }
+        fn inspect(raw: *anyopaque, alloc: std.mem.Allocator, input: image.Input, _: *const p.Cancellation) !image.Output {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqualStrings(image_file.test_gif, input.image.data);
+            try std.testing.expectEqualStrings(image.default_question, input.question);
+            try std.testing.expectEqual(image.Format.gif, input.image.format);
+            if (self.fail) return error.InvalidImageResponse;
+            return .{ .text = try alloc.dupe(u8, "small fixture"), .usage = .{ .input_tokens = 7, .output_tokens = 2 } };
+        }
+    };
+    var fake: Fake = .{};
+    const service: image.Service = .{ .context = &fake, .inspect_fn = Fake.inspect, .check_fn = Fake.check };
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    // Undefined root proves pure guards never dereference a filesystem object.
+    var tools: Tools = .{ .root = undefined, .memory = undefined, .config = &config, .environment = undefined };
+    var cancel: p.Cancellation = .{};
+    try std.testing.expectError(error.ImageDisabled, tools.execute(a, parsed, &cancel));
+    try std.testing.expectError(error.ImageDisabled, Tools.prepare(&tools, a, .{ .id = "i", .name = "read_image", .arguments = "{\"path\":\"x\"}" }));
+    tools.image = service;
+    cancel.cancel();
+    try std.testing.expect((try tools.execute(a, parsed, &cancel)).canceled);
+    fake.poisoned = true;
+    try std.testing.expectError(error.CleanupFailed, tools.execute(a, parsed, &cancel));
+    try std.testing.expectError(error.CleanupFailed, Tools.prepare(&tools, a, .{ .id = "i", .name = "read_image", .arguments = "{\"path\":\"x\"}" }));
+    fake.poisoned = false;
+    cancel = .{};
+    try std.testing.expectError(error.InvalidImageQuestion, tools.execute(a, .{ .read_image = .{ .path = "x", .question = "" } }, &cancel));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
+    defer root.deinit();
+    tools.root = &root;
+    // prepare on a missing file succeeds without reading it or calling inspect.
+    _ = try Tools.prepare(&tools, a, .{ .id = "i", .name = "read_image", .arguments = "{\"path\":\"fixture.bin\"}" });
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fixture.bin", .data = image_file.test_gif });
+    const result = try tools.execute(a, parsed, &cancel);
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, a, result.text, .{});
+    try std.testing.expectEqualStrings("small fixture", json.object.get("description").?.string);
+    try std.testing.expectEqualStrings("image/gif", json.object.get("mime").?.string);
+    try std.testing.expectEqual(@as(i64, 7), json.object.get("usage").?.object.get("input_tokens").?.integer);
+    try std.testing.expect(json.object.get("data") == null and json.object.get("base64") == null);
+    fake.fail = true;
+    try std.testing.expectError(error.InvalidImageResponse, tools.execute(a, parsed, &cancel));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    tools.auth_path = try std.fs.path.join(a, &.{ root.path, "fixture.bin" });
+    try std.testing.expectError(error.ProtectedAuthFile, tools.execute(a, parsed, &cancel));
+    try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .read_image = .{ .path = ".thin/settings.json" } }, &cancel));
 }
 
 test {

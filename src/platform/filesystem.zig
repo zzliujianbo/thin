@@ -179,6 +179,30 @@ pub const Root = struct {
         return .{ .fd = fd, .name = try self.allocator.dupeSentinel(u8, current, 0), .allocator = self.allocator };
     }
 
+    /// Complete bounded binary snapshot from one anchored regular-file fd.
+    /// Never truncates; metadata checks detect ordinary concurrent mutation (not a lock).
+    pub fn readBinary(self: *Root, allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+        var parent_ = try self.parent(path);
+        defer parent_.deinit();
+        const fd = linux.openat(parent_.fd, parent_.name, linux.nofollow | linux.cloexec | linux.nonblock, 0);
+        if (fd < 0) return osError();
+        defer closeFd(fd);
+        const file = fileFromFd(fd);
+        const before = try file.stat(self.io);
+        if (before.kind != .file) return error.NotRegularFile;
+        if (before.size > limit) return error.FileTooLarge;
+        const data = try allocator.alloc(u8, @intCast(before.size));
+        errdefer allocator.free(data);
+        if (try file.readPositionalAll(self.io, data, 0) != data.len) return error.FileChanged;
+        var extra: [1]u8 = undefined;
+        if (try file.readPositionalAll(self.io, &extra, before.size) != 0) return error.FileChanged;
+        const after = try file.stat(self.io);
+        if (before.size != after.size or before.inode != after.inode or before.kind != after.kind or
+            before.nlink != after.nlink or !std.meta.eql(before.permissions, after.permissions) or
+            !std.meta.eql(before.mtime, after.mtime) or !std.meta.eql(before.ctime, after.ctime)) return error.FileChanged;
+        return data;
+    }
+
     /// 从 offset 附近读取最多 limit 字节的 UTF-8 文本。字符内部的起点最多向前
     /// 对齐 3 字节，返回真实 offset；末尾按完整字符截断，非法文本仍然拒绝。
     pub fn read(self: *Root, allocator: std.mem.Allocator, path: []const u8, offset: u64, limit: usize) !ReadResult {
@@ -391,6 +415,66 @@ test "root reads writes ranges text and failed overwrite" {
     try tmp.dir.writeFile(io, .{ .sub_path = "invalid", .data = "\xff" });
     try std.testing.expectError(error.BinaryFile, root.read(a, "binary", 0, 100));
     try std.testing.expectError(error.InvalidUtf8, root.read(a, "invalid", 0, 100));
+}
+
+test "image binary snapshots detect short reads growth and metadata mutation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(a, std.testing.io, tmp.dir);
+    defer root.deinit();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "file", .data = "abc" });
+    const Fault = struct {
+        var mode: enum { short, growth, metadata } = .short;
+        var calls: usize = 0;
+        fn stat(raw: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+            var result = try std.testing.io.vtable.fileStat(raw, file);
+            calls += 1;
+            if (calls == 1) switch (mode) {
+                .short => result.size += 1,
+                .growth => result.size -= 1,
+                .metadata => {},
+            };
+            if (calls == 2 and mode == .metadata) result.nlink += 1;
+            return result;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileStat = Fault.stat;
+    root.io.vtable = &vtable;
+    for ([_]@TypeOf(Fault.mode){ .short, .growth, .metadata }) |mode| {
+        Fault.mode = mode;
+        Fault.calls = 0;
+        try std.testing.expectError(error.FileChanged, root.readBinary(a, "file", 10));
+    }
+}
+
+test "image binary snapshots are complete bounded anchored and reject special files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(a, io, tmp.dir);
+    defer root.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary", .data = "\xff\x00\x01" });
+    const bytes = try root.readBinary(a, "binary", 3);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("\xff\x00\x01", bytes);
+    try std.testing.expectError(error.FileTooLarge, root.readBinary(a, "binary", 2));
+    try std.testing.expectError(error.InvalidPath, root.readBinary(a, "../binary", 10));
+    try tmp.dir.symLink(io, "binary", "link", .{});
+    try std.testing.expectError(error.SymlinkNotAllowed, root.readBinary(a, "link", 10));
+    try tmp.dir.createDir(io, "dir", .default_dir);
+    try std.testing.expectError(error.NotRegularFile, root.readBinary(a, "dir", 10));
+    try tmp.dir.symLink(io, "dir", "dirlink", .{});
+    try std.testing.expectError(error.NotDir, root.readBinary(a, "dirlink/x", 10));
+    var parent_ = try root.parent("pipe");
+    defer parent_.deinit();
+    const C = struct {
+        extern "c" fn mkfifoat(c_int, [*:0]const u8, c_uint) c_int;
+    };
+    try std.testing.expectEqual(@as(c_int, 0), C.mkfifoat(parent_.fd, parent_.name, 0o600));
+    try std.testing.expectError(error.NotRegularFile, root.readBinary(a, "pipe", 10));
 }
 
 test "root UTF8 ranges align every character byte and paginate without loss" {

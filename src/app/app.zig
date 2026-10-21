@@ -13,6 +13,16 @@ const metadata = @import("model_metadata.zig");
 const session_context = @import("../core/session_context.zig");
 const model_resolver = @import("model_resolver.zig");
 const DecisionClient = @import("decision_client.zig").Client;
+const image = @import("../core/image.zig");
+const ImageClient = @import("image_client.zig").Client;
+const image_setup = @import("image_setup.zig");
+
+/// Idle replacement owners have never sent a request, and used owners have
+/// already joined the worker. An unreapable child is a fail-stop condition,
+/// never permission to discard its owner and continue with another client.
+fn destroyImageClient(client: *ImageClient) void {
+    client.deinit() catch @panic("Image cleanup failed; refusing to discard the owned child");
+}
 
 fn rememberConfiguredKeys(journal: *Journal, config: cfg.Config, environ: *const std.process.Environ.Map) !void {
     if (config.registry) |registry| for (registry.providers) |provider| {
@@ -56,6 +66,7 @@ pub const App = struct {
     /// Optional, independently owned auxiliary route. Never archived or inherited
     /// from a restored selection; initialized lazily without startup requests.
     decision_client: ?*DecisionClient = null,
+    image_client: ?*ImageClient = null,
 
     /// Agent 运行时，最后初始化，依赖前面所有字段。
     runtime: r.Runtime,
@@ -178,6 +189,9 @@ pub const App = struct {
         errdefer self.client.deinit();
         self.decision_client = try DecisionClient.create(a, io, self.config.value, environ);
         errdefer if (self.decision_client) |decision| decision.deinit();
+        self.image_client = try image_setup.create(a, io, self.config.value, environ);
+        errdefer if (self.image_client) |client| destroyImageClient(client);
+        self.executor.image = self.imageService();
 
         const snapshot = try self.memory.snapshot(a);
         defer a.free(snapshot);
@@ -189,15 +203,36 @@ pub const App = struct {
         return self;
     }
 
+    fn imageService(self: *App) ?image.Service {
+        if (!self.config.value.imageActive()) return null;
+        return .{ .context = self, .inspect_fn = inspectImage, .check_fn = checkImage };
+    }
+
+    fn checkImage(raw: *anyopaque) !void {
+        const self: *App = @ptrCast(@alignCast(raw));
+        const client = self.image_client orelse return error.ImageModelUnavailable;
+        try client.service().checkReady();
+    }
+
+    fn inspectImage(raw: *anyopaque, a: std.mem.Allocator, input: image.Input, cancel: *const @import("../core/protocol.zig").Cancellation) !image.Output {
+        const self: *App = @ptrCast(@alignCast(raw));
+        const client = self.image_client orelse return error.ImageModelUnavailable;
+        return client.service().inspect(a, input, cancel);
+    }
+
+    pub const SettingsRefresh = enum { none, decision, image_model };
     pub const SettingsReplacement = struct {
         config: ?std.json.Parsed(cfg.Config) = null,
         replace_decision: bool,
+        replace_image: bool,
         changes_tools: bool,
         decision: ?*DecisionClient = null,
+        image_client: ?*ImageClient = null,
         prefix: ?r.Runtime.ToolPrefix = null,
 
         pub fn deinit(self: *SettingsReplacement) void {
             if (self.decision) |client| client.deinit();
+            if (self.image_client) |client| destroyImageClient(client);
             if (self.prefix) |*prefix| prefix.deinit();
             if (self.config) |*config| cfg.release(config);
         }
@@ -206,16 +241,17 @@ pub const App = struct {
     /// Prepare all fallible work before writing global settings. No requests,
     /// primary reconnect or canonical mutations occur here.
     pub fn prepareSettings(self: *App, declaration: cfg.Config, environ: *const std.process.Environ.Map) !SettingsReplacement {
-        return self.prepareSettingsRefresh(declaration, environ, false);
+        return self.prepareSettingsRefresh(declaration, environ, .none);
     }
 
-    pub fn prepareSettingsRefresh(self: *App, declaration: cfg.Config, environ: *const std.process.Environ.Map, force_decision_refresh: bool) !SettingsReplacement {
+    pub fn prepareSettingsRefresh(self: *App, declaration: cfg.Config, environ: *const std.process.Environ.Map, refresh: SettingsRefresh) !SettingsReplacement {
         if (self.runtime.busy.load(.acquire)) return error.Busy;
         if (self.runtime.poisoned) return error.UnsafeToContinue;
         if (self.decision_client) |client| {
             const service = client.service();
             if (service.check_fn) |check| try check(service.context);
         }
+        if (self.image_client) |client| if (client.isPoisoned()) return error.UnsafeToContinue;
         const decision_enabled = declaration.decisionActive();
         // Only decision edits, shared request deadlines or explicit reselect
         // replace the auxiliary owner. Primary transport/session stay frozen.
@@ -232,10 +268,15 @@ pub const App = struct {
         try std.json.Stringify.value(self.config.value.decision, .{}, &before.writer);
         try std.json.Stringify.value(declaration.decision, .{}, &after.writer);
         var result: SettingsReplacement = .{
-            .replace_decision = force_decision_refresh or
+            .replace_decision = refresh == .decision or
                 self.config.value.limits.request_timeout_ms != declaration.limits.request_timeout_ms or
                 !std.mem.eql(u8, before.written(), after.written()),
-            .changes_tools = self.config.value.decisionActive() != decision_enabled,
+            .replace_image = refresh == .image_model or
+                self.config.value.limits.request_timeout_ms != declaration.limits.request_timeout_ms or
+                self.config.value.image.enabled != declaration.image.enabled or
+                !optionalStringEqual(self.config.value.image.model, declaration.image.model),
+            .changes_tools = self.config.value.decisionActive() != decision_enabled or
+                self.config.value.imageActive() != declaration.imageActive(),
         };
         errdefer result.deinit();
         result.config = try @import("decision_selection.zig").activeClone(self.allocator, self.config.value, declaration);
@@ -246,6 +287,12 @@ pub const App = struct {
             // expand on a failed prepare/save; never publish an unredacted key.
             try rememberConfiguredKeys(&self.journal, declaration, environ);
             result.decision = try DecisionClient.create(self.allocator, self.root.io, declaration, environ);
+        }
+        if (result.replace_image) {
+            try rememberConfiguredKeys(&self.journal, declaration, environ);
+            result.image_client = try image_setup.create(self.allocator, self.root.io, declaration, environ);
+            if (refresh == .image_model and declaration.imageActive() and result.image_client == null)
+                return error.ImageModelUnavailable;
         }
         if (result.changes_tools and self.runtime.selector.effective() == .anthropic)
             result.prefix = try self.runtime.prepareToolPrefix();
@@ -274,6 +321,12 @@ pub const App = struct {
             self.runtime.decision_service = if (self.decision_client) |client| client.service() else null;
             if (previous) |client| client.deinit();
         }
+        if (replacement.replace_image) {
+            if (self.image_client) |client| destroyImageClient(client);
+            self.image_client = replacement.image_client;
+            replacement.image_client = null;
+        }
+        self.executor.image = self.imageService();
         self.runtime.executor = self.executor.executor();
         if (replacement.changes_tools) self.runtime.last_context_tokens = null;
     }
@@ -285,12 +338,14 @@ pub const App = struct {
         config: std.json.Parsed(cfg.Config),
         client: http.Client,
         decision_client: ?*DecisionClient = null,
+        image_client: ?*ImageClient = null,
         plan: r.Runtime.SelectionPlan,
 
         pub fn deinit(self: *ConnectionReplacement) void {
             const a = self.owner.allocator;
             self.client.deinit();
             if (self.decision_client) |decision| decision.deinit();
+            if (self.image_client) |client| destroyImageClient(client);
             cfg.release(&self.config);
             a.destroy(self);
         }
@@ -319,6 +374,8 @@ pub const App = struct {
         replacement.client = try http.Client.initWithEnv(self.allocator, self.root.io, &replacement.config.value, key, environ);
         errdefer replacement.client.deinit();
         replacement.decision_client = try DecisionClient.create(self.allocator, self.root.io, replacement.config.value, environ);
+        errdefer if (replacement.decision_client) |client| client.deinit();
+        replacement.image_client = try image_setup.create(self.allocator, self.root.io, replacement.config.value, environ);
         return replacement;
     }
 
@@ -340,6 +397,10 @@ pub const App = struct {
         self.decision_client = replacement.decision_client;
         self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
         if (previous_decision) |decision| decision.deinit();
+        if (self.image_client) |client| destroyImageClient(client);
+        self.image_client = replacement.image_client;
+        self.executor.image = self.imageService();
+        self.runtime.executor = self.executor.executor();
         self.recordSelection();
         self.allocator.destroy(replacement);
         cfg.release(&previous);
@@ -389,6 +450,7 @@ pub const App = struct {
         const a = self.allocator;
         self.runtime.deinit();
         if (self.decision_client) |decision| decision.deinit();
+        if (self.image_client) |client| destroyImageClient(client);
         self.journal.deinit();
         self.client.deinit();
         self.environment.deinit();
@@ -401,6 +463,11 @@ pub const App = struct {
         a.destroy(self);
     }
 };
+
+fn optionalStringEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a) |left| return if (b) |right| std.mem.eql(u8, left, right) else false;
+    return b == null;
+}
 
 test "headless missing and blank configuration use the same new schema without requests" {
     const a = std.testing.allocator;

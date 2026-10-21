@@ -1,18 +1,23 @@
 //! Local presentation only. The connection owner saves and publishes settings.
 const std = @import("std");
 const text = @import("text.zig");
+const time = @import("settings_time.zig");
 const provider = @import("provider_picker.zig");
 const cfg = @import("../core/config.zig");
 pub const Key = @import("../core/settings.zig").Key;
 pub const Menu = provider.Picker;
 pub const labels = [_][]const u8{
     "Low-price input", "Decision model", "Auto compaction", "Command timeout",
-    "Request timeout", "Output limit",   "Task timeout",
+    "Request timeout", "Output limit",   "Task timeout",    "Image model",
 };
 pub const count = labels.len;
 pub const Snapshot = struct {
     low_price_input_enabled: bool = true,
     decision_enabled: bool = false,
+    image_enabled: bool = false,
+    image_model: ?[]const u8 = null,
+    /// Borrowed provider/rawID reference; rows copies the displayed bytes.
+    decision_model: ?[]const u8 = null,
     global_settings_available: bool = true,
     limits: cfg.Limits = .{},
 };
@@ -29,13 +34,14 @@ pub fn preferenceKey(selected: usize) ?Key {
 pub fn label(selected: usize) []const u8 {
     return if (selected < labels.len) labels[selected] else "";
 }
-/// Static labels only; rows renders exact copied numeric values, with units.
+/// Borrowed display values; rows renders exact copied numeric values, with units.
 pub fn value(state: Snapshot, selected: usize) []const u8 {
     return switch (selected) {
         0 => if (state.low_price_input_enabled) "on" else "off",
-        1 => if (!state.decision_enabled) "off" else "Configured",
+        1 => if (!state.decision_enabled) "Off" else state.decision_model orelse "Not set",
+        7 => if (!state.image_enabled) "Off" else state.image_model orelse "Not set",
         2 => if (state.limits.compaction_enabled) "on" else "off",
-        3, 4, 6 => "ms",
+        3, 4, 6 => "s",
         5 => if (state.limits.max_output_tokens == null) "Auto" else "tokens",
         else => "",
     };
@@ -45,10 +51,11 @@ pub fn description(selected: usize) []const u8 {
         0 => "Protect input from price surcharges; unknown pricing pauses. Flat pricing: no L.",
         1 => "Review commands, Memory and compaction. Enter selects Off or a logged-in model.",
         2 => "Automatic compaction only; manual /compact and hard preflight remain available.",
-        3 => "Command timeout in ms; cannot exceed command_max_timeout_ms.",
-        4 => "All inference requests, including decisions, in ms; maximum 86400000 ms (24 hours).",
+        3 => "Command timeout in s (up to 3 decimals); cannot exceed configured command maximum.",
+        4 => "All inference requests, including decisions, in s (up to 3 decimals); maximum 86400 s (24 hours).",
         5 => "Output cap in tokens; Auto uses model policy. Explicit cap must cover summary_tokens.",
-        6 => "Whole task timeout in ms; maximum 86400000 ms (24 hours).",
+        6 => "Whole task timeout in s (up to 3 decimals); maximum 86400 s (24 hours).",
+        7 => "Read images through a separate helper returning text. Off unless explicitly selected.",
         else => "",
     };
 }
@@ -59,10 +66,10 @@ pub const Rows = struct {
 };
 fn renderedValue(state: Snapshot, selected: usize, buffer: *[32]u8) ![]const u8 {
     return switch (selected) {
-        3 => try std.fmt.bufPrint(buffer, "{d} ms", .{state.limits.command_timeout_ms}),
-        4 => try std.fmt.bufPrint(buffer, "{d} ms", .{state.limits.request_timeout_ms}),
+        3 => try time.format(buffer, state.limits.command_timeout_ms),
+        4 => try time.format(buffer, state.limits.request_timeout_ms),
         5 => if (state.limits.max_output_tokens) |n| try std.fmt.bufPrint(buffer, "{d} tokens", .{n}) else "Auto",
-        6 => try std.fmt.bufPrint(buffer, "{d} ms", .{state.limits.task_timeout_ms}),
+        6 => try time.format(buffer, state.limits.task_timeout_ms),
         else => value(state, selected),
     };
 }
@@ -86,7 +93,12 @@ pub fn rows(a: std.mem.Allocator, menu: Menu, state: Snapshot, columns: usize, m
         const gap = label_width - text.width(label(index));
         const raw = try std.fmt.allocPrint(a, "{s}{s}{s}  {s}", .{ if (index == selected) "> " else "  ", label(index), padding[0..gap], v });
         defer a.free(raw);
-        if (index == selected) complete = text.width(raw) <= columns;
+        // Decision only opens a read-only submenu; its current value is not
+        // being saved. All saving root rows still require the complete value.
+        if (index == selected) complete = if (index == 1 or index == 7)
+            2 + text.width(label(index)) <= columns
+        else
+            text.width(raw) <= columns;
         try append(a, &out, raw, columns);
     }
     if (max_rows > out.items.len) try append(a, &out, description(selected), columns);
@@ -115,12 +127,15 @@ fn freeRows(a: std.mem.Allocator, rendered: Rows) void {
     for (rendered.lines) |line| a.free(line);
     a.free(rendered.lines);
 }
-test "settings preserve old values and expose seven preference rows" {
-    try std.testing.expectEqual(@as(usize, 7), count);
+test "settings preserve old values and expose eight preference rows" {
+    try std.testing.expectEqual(@as(usize, 8), count);
+    try std.testing.expectEqualStrings("Off", value(.{}, 7));
+    try std.testing.expectEqualStrings("login/deepseek-flash", value(.{ .image_enabled = true, .image_model = "login/deepseek-flash" }, 7));
     try std.testing.expectEqualStrings("on", value(.{}, 0));
     try std.testing.expectEqualStrings("off", value(.{ .low_price_input_enabled = false }, 0));
-    try std.testing.expectEqualStrings("off", value(.{}, 1));
-    try std.testing.expectEqualStrings("Configured", value(.{ .decision_enabled = true }, 1));
+    try std.testing.expectEqualStrings("Off", value(.{}, 1));
+    try std.testing.expectEqualStrings("Not set", value(.{ .decision_enabled = true }, 1));
+    try std.testing.expectEqualStrings("provider/rawID", value(.{ .decision_enabled = true, .decision_model = "provider/rawID" }, 1));
     try std.testing.expect(std.mem.find(u8, description(4), "including decisions") != null);
     try std.testing.expectEqual(@as(?Key, .compaction_enabled), preferenceKey(2));
     try std.testing.expectEqual(@as(?Key, .task_timeout_ms), preferenceKey(6));
@@ -144,13 +159,48 @@ test "settings bounded windows keep selection visible and clipping disables conf
     };
     const exact = try rows(a, .{ .selected = 3 }, .{ .limits = .{ .command_timeout_ms = 123456 } }, 80, 1);
     defer freeRows(a, exact);
-    try std.testing.expect(std.mem.find(u8, exact.lines[0], "123456 ms") != null);
+    try std.testing.expect(std.mem.find(u8, exact.lines[0], "123.456 s") != null);
     const unavailable = try rows(a, .{}, .{ .global_settings_available = false }, 80, 1);
     defer freeRows(a, unavailable);
     try std.testing.expect(!unavailable.can_confirm);
     const pasted = try rows(a, .{ .pasted = true }, .{}, 80, 1);
     defer freeRows(a, pasted);
     try std.testing.expect(!pasted.can_confirm);
+}
+test "decision root opens with complete static label even when model is clipped" {
+    const a = std.testing.allocator;
+    var model: [512]u8 = @splat('x');
+    @memcpy(model[0..9], "provider/");
+    const state: Snapshot = .{ .decision_enabled = true, .decision_model = &model };
+    for (0..90) |columns| {
+        const rendered = try rows(a, .{ .selected = 1 }, state, columns, 1);
+        defer freeRows(a, rendered);
+        try std.testing.expectEqual(columns >= 2 + label(1).len, rendered.can_confirm);
+        try std.testing.expect(text.width(rendered.lines[0]) <= columns);
+    }
+    const copied = try rows(a, .{ .selected = 1 }, state, 600, 1);
+    defer freeRows(a, copied);
+    model[9] = 'y';
+    try std.testing.expect(std.mem.find(u8, copied.lines[0], "provider/xxx") != null);
+    for ([_]usize{ 0, 2, 3, 4, 5, 6 }) |selected| {
+        const clipped = try rows(a, .{ .selected = selected }, .{}, 2 + label(selected).len, 1);
+        defer freeRows(a, clipped);
+        try std.testing.expect(!clipped.can_confirm);
+    }
+    const pasted = try rows(a, .{ .selected = 1, .pasted = true }, state, 80, 1);
+    defer freeRows(a, pasted);
+    try std.testing.expect(!pasted.can_confirm);
+}
+test "Image root long value opens independently with static label" {
+    const a = std.testing.allocator;
+    const long: [512]u8 = @splat('x');
+    for (0..90) |columns| {
+        const rendered = try rows(a, .{ .selected = 7 }, .{ .image_enabled = true, .image_model = &long, .decision_enabled = true, .decision_model = "decision/other" }, columns, 1);
+        defer freeRows(a, rendered);
+        try std.testing.expectEqual(columns >= 2 + label(7).len, rendered.can_confirm);
+    }
+    try std.testing.expectEqualStrings("Image model", label(7));
+    try std.testing.expectEqualStrings("Off", value(.{ .image_model = "stale/model" }, 7));
 }
 fn allocationCase(a: std.mem.Allocator) !void {
     const rendered = try rows(a, .{ .selected = 6 }, .{}, 40, 10);

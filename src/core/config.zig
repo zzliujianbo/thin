@@ -265,11 +265,18 @@ pub const DecisionConfig = struct {
     }
 };
 
+/// Independent text-only image helper selection; no credentials or transport policy.
+pub const ImageConfig = struct {
+    enabled: bool = false,
+    model: ?[]const u8 = null,
+};
+
 /// Owned application configuration. Disk input requires llm declarations;
 /// registry may be absent only for a pure in-memory Runtime snapshot.
 pub const Config = struct {
     proxy: ?ProxyConfig = null,
     decision: ?DecisionConfig = null,
+    image: ImageConfig = .{},
     registry: ?Registry = null,
     selected_provider: ?[]const u8 = null,
     selection_pending: bool = false,
@@ -277,6 +284,10 @@ pub const Config = struct {
     model: Model,
     /// 未配置时使用 Limits 中的默认值。
     limits: Limits = .{},
+
+    pub fn imageActive(self: Config) bool {
+        return self.image.enabled;
+    }
 
     pub fn decisionActive(self: Config) bool {
         const decision = self.decision orelse return false;
@@ -303,6 +314,73 @@ pub const max_config_bytes = 64 * 1024;
 /// 中文：解析后的字符串复制到 allocator 中，因此调用方可以擦除 bytes；结果需调用 release 释放。
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Config) {
     return parseBounded(allocator, bytes, max_config_bytes, true, false);
+}
+
+// No secret is needed to select an image helper; provider credentials are
+// resolved separately at use time, never borrowed from decision/primary state.
+const image_test_prefix = "{\"llm\":{\"default\":\"p/main\",\"providers\":{\"p\":{\"base_url\":\"https://fixture.invalid\"}}}";
+
+fn imageAllocationCase(a: std.mem.Allocator) !void {
+    inline for (.{ "", ",\"image\":{}", ",\"image\":{\"enabled\":false,\"model\":null}", ",\"image\":{\"enabled\":true,\"model\":\"p/deepseek-flash\"}", ",\"image\":{\"enabled\":false,\"model\":\"p/deepseek-flash\"}" }, 0..) |suffix, index| {
+        var parsed = try parse(a, image_test_prefix ++ suffix ++ "}");
+        defer release(&parsed);
+        try std.testing.expectEqual(index == 3, parsed.value.imageActive());
+        try std.testing.expect(parsed.value.decision == null);
+        try std.testing.expectEqual(index >= 3, parsed.value.image.model != null);
+        var copied = try clone(a, parsed.value);
+        defer release(&copied);
+        if (parsed.value.image.model) |model| {
+            try std.testing.expectEqualStrings("p/deepseek-flash", copied.value.image.model.?);
+            try std.testing.expect(model.ptr != copied.value.image.model.?.ptr);
+        }
+        var wiping = WipingAllocator{ .backing = a };
+        var out: std.Io.Writer.Allocating = .init(wiping.allocator());
+        defer out.deinit();
+        writeDisk(copied.value, &out.writer) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
+        try std.testing.expectEqual(index >= 3, std.mem.find(u8, out.written(), "\"image\"") != null);
+        var again = try parse(a, out.written());
+        defer release(&again);
+        try std.testing.expectEqualDeep(parsed.value.image, again.value.image);
+        try std.testing.expectEqualDeep(parsed.value.limits, again.value.limits);
+    }
+}
+
+fn rejectedImageAllocationCase(a: std.mem.Allocator) !void {
+    inline for (.{
+        "null",                                   "true",                                 "[]",                                                          "\"Off\"",
+        "{\"enabled\":true}",                     "{\"enabled\":true,\"model\":null}",    "{\"model\":\"deepseek-flash\"}",                              "{\"model\":\"/deepseek-flash\"}",
+        "{\"model\":\"missing/deepseek-flash\"}", "{\"model\":\"p/\"}",                   "{\"model\":\"p/deepseek-chat\"}",                             "{\"model\":\"p/deepseek-flash-preview\"}",
+        "{\"model\":\"p/org/deepseek-flash\"}",   "{\"model\":\"p/DeepSeek-Flash\"}",     "{\"model\":\" p/deepseek-flash\"}",                           "{\"model\":\"p/deepseek-flash \"}",
+        "{\"model\":42}",                         "{\"model\":true}",                     "{\"model\":[]}",                                              "{\"model\":{}}",
+        "{\"enabled\":null}",                     "{\"enabled\":1}",                      "{\"enabled\":\"false\"}",                                     "{\"enabled\":false,\"enabled\":false}",
+        "{\"model\":null,\"model\":null}",        "{\"enabled\":false,\"api_key\":null}", "{\"enabled\":true,\"model\":\"p/deepseek-flash\",\"url\":1}", "{\"request_timeout_ms\":1}",
+        "{\"trust\":false}",                      "{\"unknown\":{}}",
+    }) |bad| {
+        if (parse(a, image_test_prefix ++ ",\"image\":" ++ bad ++ "}")) |value| {
+            var parsed = value;
+            release(&parsed);
+            return error.ExpectedImageRejection;
+        } else |err| if (err == error.OutOfMemory) return err;
+    }
+    if (parse(a, image_test_prefix ++ ",\"image\":{},\"image\":{}}")) |value| {
+        var parsed = value;
+        release(&parsed);
+        return error.ExpectedImageRejection;
+    } else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.DuplicateField, err);
+    }
+}
+
+test "image defaults sparse disk exact selection owned clone and roundtrip" {
+    try imageAllocationCase(std.testing.allocator);
+}
+
+test "image rejects invalid owner model types duplicates and unknown fields" {
+    try rejectedImageAllocationCase(std.testing.allocator);
 }
 
 const decision_fixture =
@@ -494,14 +572,19 @@ fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, d
 const json_options: std.json.ParseOptions = .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" };
 
 fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
-    if (T == ModelPatch or T == Limits or T == DecisionConfig or T == ProxyConfig) {
+    if (T == ModelPatch or T == Limits or T == DecisionConfig or T == ImageConfig or T == ProxyConfig) {
         const fields = try object(value);
         if (T == DecisionConfig) _ = try string(fields.get("model") orelse return error.MissingField);
+        if (T == ImageConfig) {
+            if (fields.get("model")) |model| if (model != .null) {
+                _ = try string(model);
+            };
+        }
         var it = fields.iterator();
         while (it.next()) |entry| {
             // Reject unknown decision keys regardless of the value's type.
             // No removed field is interpreted or imported into declarations.
-            if (T == DecisionConfig) {
+            if (T == DecisionConfig or T == ImageConfig) {
                 const known = inline for (@typeInfo(T).@"struct".field_names) |field| {
                     if (std.mem.eql(u8, entry.key_ptr.*, field)) break true;
                 } else false;
@@ -543,7 +626,7 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
     const root = try object(tree.value);
     var keys = root.iterator();
     while (keys.next()) |entry| {
-        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "decision") and !std.mem.eql(u8, entry.key_ptr.*, "proxy")) return error.UnknownField;
+        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "decision") and !std.mem.eql(u8, entry.key_ptr.*, "proxy") and !std.mem.eql(u8, entry.key_ptr.*, "image")) return error.UnknownField;
     }
     const llm_value = root.get("llm") orelse return error.MissingField;
     const result: Config = blk: {
@@ -593,7 +676,8 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         const context: u32 = @max(32768, limits.safety_tokens + 2);
         const decision = if (root.get("decision")) |v| if (v == .null) null else try decode(DecisionConfig, a, v) else null;
         const proxy = if (root.get("proxy")) |v| if (v == .null) null else try decode(ProxyConfig, a, v) else null;
-        break :blk .{ .proxy = proxy, .decision = decision, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
+        const image = if (root.get("image")) |v| try decode(ImageConfig, a, v) else ImageConfig{};
+        break :blk .{ .proxy = proxy, .decision = decision, .image = image, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
     };
     try validate(result);
     tree.arena.child_allocator = allocator;
@@ -643,6 +727,10 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
         if (config.proxy) |proxy| {
             try s.objectField("proxy");
             try s.write(proxy);
+        }
+        if (config.image.enabled or config.image.model != null) {
+            try s.objectField("image");
+            try s.write(config.image);
         }
         if (config.decision) |decision| {
             try s.objectField("decision");
@@ -697,10 +785,10 @@ pub fn setRegistryCredential(a: std.mem.Allocator, config: *Config, provider_nam
 }
 
 /// 擦除所有释放的分配；禁止缩容与 remap，避免分配器内部释放未擦除的旧缓冲区。
-const WipingAllocator = struct {
+pub const WipingAllocator = struct {
     backing: std.mem.Allocator,
 
-    fn allocator(self: *WipingAllocator) std.mem.Allocator {
+    pub fn allocator(self: *WipingAllocator) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 
@@ -821,6 +909,12 @@ fn validateConfig(config: Config, comptime unresolved: bool) !void {
     }
     if (config.registry) |registry| try validateRegistry(registry, config.limits);
     if (config.proxy) |proxy| try validateProxy(proxy, config.registry);
+    if (config.image.model) |model| {
+        const selection = try splitDefault(model);
+        if (!std.mem.eql(u8, selection.model, "deepseek-flash")) return error.InvalidImageModel;
+        const registry = config.registry orelse return error.MissingRegistry;
+        _ = registry.find(selection.provider) orelse return error.UnknownProvider;
+    } else if (config.image.enabled) return error.InvalidImageModel;
     if (config.decision) |decision| {
         const selection = try splitDefault(decision.model);
         const registry = config.registry orelse return error.MissingRegistry;
@@ -1337,7 +1431,7 @@ test "inline missing ambiguous and invalid API key sources" {
 }
 
 // 包装分配器在语法失败、语义失败、正常 release 三条路径上都负责擦除。
-test "credential parser cleanup and release zero owned allocations" {
+test "credential and image parser cleanup and release zero owned allocations" {
     const Observer = struct {
         backing: std.mem.Allocator,
         dirty_free: bool = false,
@@ -1397,6 +1491,26 @@ test "credential parser cleanup and release zero owned allocations" {
             try std.testing.expect(!watched.dirty_free);
         }
 
+        fn image(a: std.mem.Allocator) !void {
+            var watched = Observer{ .backing = a };
+            imageAllocationCase(watched.allocator()) catch |err| {
+                try std.testing.expect(!watched.dirty_free);
+                return err;
+            };
+            try std.testing.expect(watched.frees > 0);
+            try std.testing.expect(!watched.dirty_free);
+        }
+
+        fn rejectImage(a: std.mem.Allocator) !void {
+            var watched = Observer{ .backing = a };
+            rejectedImageAllocationCase(watched.allocator()) catch |err| {
+                try std.testing.expect(!watched.dirty_free);
+                return err;
+            };
+            try std.testing.expect(watched.frees > 0);
+            try std.testing.expect(!watched.dirty_free);
+        }
+
         fn reject(a: std.mem.Allocator) !void {
             var watched = Observer{ .backing = a };
             // Test-input construction bypasses the observer; only production
@@ -1409,6 +1523,8 @@ test "credential parser cleanup and release zero owned allocations" {
             try std.testing.expect(!watched.dirty_free);
         }
     };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.image, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.rejectImage, .{});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.run, .{});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.reject, .{});
     try std.testing.expect(observer.frees > 0);

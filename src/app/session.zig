@@ -22,6 +22,8 @@ const directory = @import("model_directory.zig");
 const model_resolver = @import("model_resolver.zig");
 const fs = @import("../platform/filesystem.zig");
 const decision_selection = @import("decision_selection.zig");
+const image_selection = @import("image_selection.zig");
+const image = @import("../core/image.zig");
 const settings_preferences = @import("../core/settings.zig");
 
 test {
@@ -29,6 +31,7 @@ test {
     _ = @import("global_preferences_test.zig");
     _ = @import("settings_preferences_test.zig");
     _ = @import("decision_model_selection_test.zig");
+    _ = @import("image_model_selection_test.zig");
 }
 
 const MetadataTokens = [catalog.entries.len]?u32;
@@ -132,6 +135,7 @@ pub const Session = struct {
     display_models: []cfg.Model = &.{},
     /// Independently resolved reviewer candidates; never use primary limits.
     display_decision_models: []cfg.Model = &.{},
+    display_image_models: []cfg.Model = &.{},
     // cfg registry parsing/validation rejects more than 16 providers. Names
     // borrow the global registry arena; current() rebuilds after each save.
     display_providers: [16]tui.ModelProvider = undefined,
@@ -264,6 +268,7 @@ pub const Session = struct {
         const config = &self.pending.?.value;
         self.display_models = try self.buildModels(config.*, self.global_config.?.value);
         self.display_decision_models = try self.buildDecisionModels(self.global_config.?.value);
+        self.display_image_models = try self.buildImageModels(self.global_config.?.value);
         if (self.selected_alias == null) self.selected_alias = try self.aliasFor(config.*);
         if (self.read_only) {
             self.settings_notice = "Session is open elsewhere or not writable; read-only history";
@@ -354,7 +359,9 @@ pub const Session = struct {
         // declaration must not replay old signed thinking under changed tools.
         // Normalize display data before restore, even for a poisoned archive;
         // loading history itself must not require permission to run a task.
-        if (state.tool_schema_hash == null and self.global_config.?.value.decision != null) {
+        if (state.tool_schema_hash == null and
+            (self.global_config.?.value.decision != null or self.global_config.?.value.imageActive()))
+        {
             const messages = try scratch.allocator().alloc(@import("../core/protocol.zig").Message, state.messages.len);
             for (state.messages, 0..) |message, i|
                 messages[i] = try @import("../core/context.zig").cloneAfterPrefixRewrite(scratch.allocator(), message);
@@ -399,6 +406,7 @@ pub const Session = struct {
         if (self.metadata_job) |job| job.destroy();
         self.freeDisplayModels(self.display_models);
         self.freeDisplayModels(self.display_decision_models);
+        self.freeDisplayModels(self.display_image_models);
         if (self.selected_alias) |alias| self.allocator.free(alias);
         if (self.global_config) |*global| cfg.release(global);
         if (self.app) |app| app.deinit();
@@ -418,7 +426,7 @@ pub const Session = struct {
 
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -462,7 +470,7 @@ pub const Session = struct {
                 // Dirty only once a tool can have side effects. Model calls and
                 // compaction keep the previous clean checkpoint resumable.
                 .tool_started => self.markCheckpointDirty(),
-                .assistant_committed, .compacted, .finished => self.persistBestEffort(true),
+                .user_committed, .assistant_committed, .compacted, .finished => self.persistBestEffort(true),
                 else => {},
             },
             .tool_completed => self.persistBestEffort(true),
@@ -622,6 +630,9 @@ pub const Session = struct {
             .decision_enabled = config.decisionActive(),
             .decision_models = self.display_decision_models,
             .decision_model = if (config.decision) |value| (if (value.enabled) value.model else null) else null,
+            .image_enabled = config.imageActive(),
+            .image_models = self.display_image_models,
+            .image_model = if (config.imageActive()) config.image.model else null,
             .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .pending_default_effort = if (self.app != null and self.initial_default_pending and config.model.reasoning_effort == null) self.preferred_effort else null,
@@ -873,10 +884,19 @@ pub const Session = struct {
                 self.metadata_notice = if (job.manual) "Metadata display could not be updated; previous values kept" else null;
                 return true;
             };
+            const image_models = self.buildImageModels(self.global_config.?.value) catch {
+                self.freeDisplayModels(models);
+                self.freeDisplayModels(decision_models);
+                self.metadata_cache = previous;
+                self.metadata_notice = if (job.manual) "Metadata display could not be updated; previous values kept" else null;
+                return true;
+            };
             self.freeDisplayModels(self.display_models);
             self.freeDisplayModels(self.display_decision_models);
+            self.freeDisplayModels(self.display_image_models);
             self.display_models = models;
             self.display_decision_models = decision_models;
+            self.display_image_models = image_models;
             _ = self.completeInitialDefault(idle) catch false;
             const official_requested = job.requested & metadata.provider_mask;
             self.metadata_notice = if (!job.manual) null else if (!finished)
@@ -1026,6 +1046,24 @@ pub const Session = struct {
         return self.allocator.realloc(models, count);
     }
 
+    /// Image has a fixed documented Chat request; it does not borrow the main
+    /// model's generative protocol/window eligibility or low-price budget.
+    fn buildImageModels(self: *Session, global: cfg.Config) ![]cfg.Model {
+        var models: std.ArrayList(cfg.Model) = .empty;
+        errdefer {
+            for (models.items) |model| self.freeDisplayModel(model);
+            models.deinit(self.allocator);
+        }
+        if (global.registry) |registry| for (registry.providers) |provider| {
+            if (!self.hasLocalCredential(provider.connection) or
+                !image_selection.available(global, &self.metadata_cache, provider.name)) continue;
+            const name = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ provider.name, image.model_id });
+            defer self.allocator.free(name);
+            try self.appendDisplayModel(&models, .{ .name = name, .protocol = .chat, .context_tokens = 0 });
+        };
+        return models.toOwnedSlice(self.allocator);
+    }
+
     fn appendRegistryCandidate(self: *Session, models: *std.ArrayList(cfg.Model), global: cfg.Config, provider: []const u8, raw_id: []const u8) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -1130,7 +1168,7 @@ pub const Session = struct {
                 if (declaration.value.decision) |*value| value.enabled = enabled else return error.DecisionNotConfigured;
             },
         }
-        try self.persistSettings(&declaration, false);
+        try self.persistSettings(&declaration, .none);
     }
 
     fn setPreference(raw: *anyopaque, key: settings_preferences.Key, value: ?u32) !void {
@@ -1139,7 +1177,7 @@ pub const Session = struct {
         var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
         defer cfg.release(&declaration);
         try settings_preferences.apply(&declaration.value, key, value);
-        try self.persistSettings(&declaration, false);
+        try self.persistSettings(&declaration, .none);
     }
 
     fn setDecision(raw: *anyopaque, choice: tui.Connection.DecisionChoice) !void {
@@ -1174,12 +1212,37 @@ pub const Session = struct {
             .off => .off,
             .model => |name| .{ .model = name },
         })) return;
-        try self.persistSettings(&declaration, true);
+        try self.persistSettings(&declaration, .decision);
+    }
+
+    fn setImage(raw: *anyopaque, choice: tui.Connection.DecisionChoice) !void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        try self.guardSelection();
+        switch (choice) {
+            .model => |name| {
+                const candidates = try self.buildImageModels(self.global_config.?.value);
+                defer self.freeDisplayModels(candidates);
+                var found = false;
+                for (candidates) |model| if (std.mem.eql(u8, name, model.name)) {
+                    found = true;
+                    break;
+                };
+                if (!found) return error.UnknownImageModel;
+            },
+            .off => {},
+        }
+        var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
+        defer cfg.release(&declaration);
+        if (!try image_selection.apply(declaration.arena.allocator(), &declaration.value, switch (choice) {
+            .off => .off,
+            .model => |name| .{ .model = name },
+        })) return;
+        try self.persistSettings(&declaration, .image_model);
     }
 
     /// Save is the final fallible operation. Swapping with the caller keeps its
     /// deferred release responsible for wiping the previous global declaration.
-    fn persistSettings(self: *Session, declaration: *std.json.Parsed(cfg.Config), refresh: bool) !void {
+    fn persistSettings(self: *Session, declaration: *std.json.Parsed(cfg.Config), refresh: App.SettingsRefresh) !void {
         try cfg.validate(declaration.value);
         var prepared: ?App.SettingsReplacement = if (self.app) |app| try app.prepareSettingsRefresh(declaration.value, self.environ, refresh) else null;
         defer if (prepared) |*value| value.deinit();
@@ -1291,6 +1354,8 @@ pub const Session = struct {
         errdefer self.freeDisplayModels(models);
         const decision_models = try self.buildDecisionModels(if (defaults) |value| value.value else self.global_config.?.value);
         errdefer self.freeDisplayModels(decision_models);
+        const image_models = try self.buildImageModels(if (defaults) |value| value.value else self.global_config.?.value);
+        errdefer self.freeDisplayModels(image_models);
         var replacement: ?*App.ConnectionReplacement = null;
         var initial: ?*App = null;
         errdefer if (replacement) |value| value.deinit();
@@ -1338,6 +1403,8 @@ pub const Session = struct {
         self.display_models = models;
         self.freeDisplayModels(self.display_decision_models);
         self.display_decision_models = decision_models;
+        self.freeDisplayModels(self.display_image_models);
+        self.display_image_models = image_models;
         self.active_context_official = context_official;
         self.preferred_effort = wanted;
         // A replacement is also a new model selection: metadata may arrive
@@ -1413,6 +1480,8 @@ pub const Session = struct {
         errdefer self.freeDisplayModels(models);
         const decision_models = try self.buildDecisionModels(baseline.value);
         errdefer self.freeDisplayModels(decision_models);
+        const image_models = try self.buildImageModels(baseline.value);
+        errdefer self.freeDisplayModels(image_models);
         if (self.app) |app| try app.journal.rememberKey(key);
         try self.store.save(baseline.value);
         if (self.global_config) |*old| cfg.release(old);
@@ -1435,6 +1504,8 @@ pub const Session = struct {
         self.display_models = models;
         self.freeDisplayModels(self.display_decision_models);
         self.display_decision_models = decision_models;
+        self.freeDisplayModels(self.display_image_models);
+        self.display_image_models = image_models;
         if (self.metadata_login_auto) if (id) |service| {
             self.metadata_login_pending |= metadata.bit(service);
         };

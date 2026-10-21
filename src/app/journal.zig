@@ -418,6 +418,13 @@ pub const Journal = struct {
                     if (v == .calling_model or v == .compacting) self.first = false;
                     try self.record(a, "state", .{ .state = v });
                 },
+                .user_committed => |value| {
+                    // Steering belongs to the accepted task, not a new submitted
+                    // turn. Use the same bounded known-key redaction as prompts.
+                    const t = try self.jsonText(a, value.text);
+                    try self.record(a, "user", .{ .text = t.text, .source_bytes = t.source_bytes, .truncated = t.truncated, .omitted = t.omitted, .delivery = "steering", .input_id = value.id });
+                },
+                .permission_cleared => |id| try self.record(a, "permission_cleared", .{ .id = id }),
                 .assistant_committed => |blocks| {
                     self.message_index = try std.math.add(u64, self.message_index, 1);
                     for (blocks, 0..) |block, index| switch (block) {
@@ -879,6 +886,53 @@ test "journal idle writer failure is visible and never accepts stranded records"
     journal.flush();
     try std.testing.expect(journal.worker == null);
     try std.testing.expectEqual(@as(usize, 0), journal.outstanding);
+}
+
+test "steering is a redacted user record in the accepted turn, not a new submission" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-steering-key");
+    defer journal.deinit();
+    const observer = journal.observer();
+    observer.notify(.{ .submitted = "original task" });
+    observer.notify(.{ .event = .{ .user_committed = .{ .id = 77, .text = "adjust fake-steering-key" } } });
+    observer.notify(.{ .event = .{ .permission_cleared = 9 } });
+    observer.notify(.{ .event = .{ .finished = .{ .status = .success } } });
+    journal.flush();
+    try std.testing.expectEqual(null, journal.failure());
+    const content = try root.read(std.testing.allocator, journal.store.path(), 0, record_limit);
+    defer std.testing.allocator.free(content.data);
+    try std.testing.expect(std.mem.indexOf(u8, content.data, "fake-steering-key") == null);
+    var users: usize = 0;
+    var steered = false;
+    var cleared = false;
+    var lines = std.mem.splitScalar(u8, content.data, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        try std.testing.expectEqual(@as(i64, 1), obj.get("turn").?.integer);
+        const event = obj.get("event").?.string;
+        const data = obj.get("data").?.object;
+        if (std.mem.eql(u8, event, "user")) {
+            users += 1;
+            if (data.get("delivery")) |delivery| {
+                try std.testing.expectEqualStrings("steering", delivery.string);
+                try std.testing.expectEqual(@as(i64, 77), data.get("input_id").?.integer);
+                try std.testing.expectEqualStrings("adjust [redacted]", data.get("text").?.string);
+                steered = true;
+            }
+        }
+        if (std.mem.eql(u8, event, "permission_cleared")) {
+            try std.testing.expectEqual(@as(i64, 9), data.get("id").?.integer);
+            cleared = true;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), users);
+    try std.testing.expect(steered and cleared);
 }
 
 test "journal structured records redaction turns and first response" {

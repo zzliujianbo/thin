@@ -10,7 +10,7 @@
 //! - 远程执行：curl/wget/fetch 管道进 shell 或解释器，bash <(curl)、bash/sh/eval 的 -c "$(curl)"
 //! - fork bomb：name() { name | name & }
 //!
-//! 换行会分开扫描，因此 heredoc 正文里的高风险命令也会命中（写脚本仍会询问，用户可单次放行）。
+//! 仅独立 cat/tee 的严格 quoted-data heredoc 可忽略正文；其它 heredoc 保守地完整扫描。
 //! bash -c / eval / $(...) / `...` 会递归再分类，因为 shell 会执行它们。
 //! 分类只决定是否强制审批，不代替用户的明确允许。
 
@@ -38,9 +38,77 @@ pub fn classify(command: []const u8) ?Finding {
 
 fn classifyAt(command: []const u8, depth: u8) ?Finding {
     if (depth > 8) return .{ .kind = .remote_exec, .label = "nested shell execution" };
-    if (forkBomb(command)) return .{ .kind = .fork_bomb, .label = "fork bomb" };
-    if (scanSubstitutions(command, depth)) |found| return found;
-    return scanList(command, depth);
+    // A recursively inspected cat/tee can feed an OUTER execution sink, e.g.
+    // bash <(cat <<'EOF' ...) or bash -c "$(cat <<'EOF' ...)". Without data-flow
+    // context only the top-level standalone operation is proven to be data.
+    const scanned = if (depth == 0) standaloneQuotedDataHeader(command) orelse command else command;
+    if (forkBomb(scanned)) return .{ .kind = .fork_bomb, .label = "fork bomb" };
+    if (scanSubstitutions(scanned, depth)) |found| return found;
+    return scanList(scanned, depth);
+}
+
+/// A deliberately small data-only grammar, not a general shell heredoc parser.
+/// No allocation; one header pass and one exact-line body pass. Anything ambiguous
+/// falls back to the original scanners, including execution sinks and command tails.
+fn standaloneQuotedDataHeader(command: []const u8) ?[]const u8 {
+    const newline = std.mem.indexOfScalar(u8, command, '\n') orelse return null;
+    const header = command[0..newline];
+    var i: usize = 0;
+    while (i < header.len and (header[i] == ' ' or header[i] == '\t')) i += 1;
+    const start = i;
+    while (i < header.len and header[i] != ' ' and header[i] != '\t') i += 1;
+    const cmd = header[start..i];
+    if (!eql(cmd, "cat") and !eql(cmd, "tee") and
+        !eql(cmd, "/bin/cat") and !eql(cmd, "/usr/bin/cat") and
+        !eql(cmd, "/bin/tee") and !eql(cmd, "/usr/bin/tee")) return null;
+
+    var delimiter: ?[]const u8 = null;
+    var quote: u8 = 0;
+    while (i < header.len) : (i += 1) {
+        const c = header[i];
+        // Reject expansions, escapes, comments and shell grammar even inside quotes:
+        // this is intentionally narrower than what the shell can safely accept.
+        if (std.mem.indexOfScalar(u8, "\\$`;|&(){}#\r", c) != null) return null;
+        if (quote != 0) {
+            if (c == quote) {
+                quote = 0;
+                if (i + 1 < header.len and header[i + 1] != ' ' and header[i + 1] != '\t' and header[i + 1] != '>') return null;
+            }
+            continue;
+        }
+        if (c == '\'' or c == '"') {
+            if (i > 0 and header[i - 1] != ' ' and header[i - 1] != '\t' and header[i - 1] != '>') return null;
+            quote = c;
+            continue;
+        }
+        if (c != '<') continue;
+        if (delimiter != null or i + 2 >= header.len or header[i + 1] != '<') return null;
+        if (i > 0 and header[i - 1] != ' ' and header[i - 1] != '\t') return null;
+        i += 2;
+        while (i < header.len and (header[i] == ' ' or header[i] == '\t')) i += 1;
+        if (i == header.len or (header[i] != '\'' and header[i] != '"')) return null;
+        const q = header[i];
+        i += 1;
+        const delim_start = i;
+        while (i < header.len and (std.ascii.isAlphanumeric(header[i]) or header[i] == '_')) i += 1;
+        if (i == delim_start or i - delim_start > 64 or i == header.len or header[i] != q) return null;
+        delimiter = header[delim_start..i];
+        if (i + 1 < header.len and header[i + 1] != ' ' and header[i + 1] != '\t') return null;
+    }
+    if (quote != 0) return null;
+    const delim = delimiter orelse return null;
+    i = newline + 1;
+    while (i < command.len) {
+        const end = std.mem.indexOfScalarPos(u8, command, i, '\n') orelse command.len;
+        // Do not trim: indentation or CR is data, never the terminator.
+        if (eql(command[i..end], delim)) {
+            const tail = if (end < command.len) command[end + 1 ..] else command[end..];
+            for (tail) |c| if (c != ' ' and c != '\t' and c != '\r' and c != '\n') return null;
+            return header;
+        }
+        i = if (end < command.len) end + 1 else command.len;
+    }
+    return null;
 }
 
 fn remote() Finding {
@@ -855,22 +923,69 @@ fn gitFlagTakesArg(flag: []const u8) bool {
     return false;
 }
 
+/// Git parse-options accepts unambiguous long-option abbreviations. In
+/// particular --no-d cancels -n, and --exc -n consumes -n as a pattern.
+fn gitLongFlag(word: []const u8, full: []const u8) bool {
+    return word.len >= 3 and std.mem.startsWith(u8, word, "--") and std.mem.startsWith(u8, full, word);
+}
+
+/// A dry-run suppresses deletion, not an explicitly configured executable hook.
+/// Do not inspect environment values or files to pretend those hooks are safe.
+fn gitConfigMayExecute(argument: []const u8, from_environment: bool) bool {
+    const eq = std.mem.indexOfScalar(u8, argument, '=') orelse return false;
+    if (!std.ascii.eqlIgnoreCase(argument[0..eq], "core.fsmonitor")) return false;
+    if (from_environment) return true;
+    const value = argument[eq + 1 ..];
+    if (value.len == 0) return false;
+    for ([_][]const u8{ "true", "false", "yes", "no", "on", "off", "0", "1" }) |boolean|
+        if (std.ascii.eqlIgnoreCase(value, boolean)) return false;
+    return true;
+}
+
 fn classifyGit(it: *Items) ?Finding {
     var end_opts = false;
     var sub: []const u8 = "";
     var force = false;
+    var dry_run = false;
+    var configured_execution = false;
+    var config_arg: enum { none, literal, environment } = .none;
     var pending_arg = false;
     while (it.next()) |item| switch (item) {
         .redirect => |path| if (writeTargetFinding(path)) |found| return found,
         .word => |word| {
             if (pending_arg) {
                 pending_arg = false;
+                if (config_arg != .none and gitConfigMayExecute(word, config_arg == .environment)) configured_execution = true;
+                config_arg = .none;
                 continue;
             }
             switch (classifyWord(word, &end_opts)) {
                 .flag => {
-                    if (eql(word, "--force") or shortHas(word, 'f')) force = true;
-                    if (gitFlagTakesArg(word) and std.mem.indexOfScalar(u8, word, '=') == null) pending_arg = true;
+                    if (sub.len == 0) {
+                        // Global options and their arguments are not clean flags.
+                        if (gitFlagTakesArg(word)) pending_arg = true;
+                        if (eql(word, "-c")) config_arg = .literal;
+                        if (eql(word, "--config-env")) config_arg = .environment;
+                        if (word.len > 2 and std.mem.startsWith(u8, word, "-c") and gitConfigMayExecute(word[2..], false)) configured_execution = true;
+                        if (std.mem.startsWith(u8, word, "--config-env=") and gitConfigMayExecute(word["--config-env=".len..], true)) configured_execution = true;
+                    } else if (eql(sub, "clean")) {
+                        const option = word[0 .. std.mem.indexOfScalar(u8, word, '=') orelse word.len];
+                        if (gitLongFlag(option, "--force")) force = true;
+                        if (gitLongFlag(option, "--dry-run")) dry_run = true;
+                        if (gitLongFlag(option, "--no-dry-run")) dry_run = false;
+                        if (gitLongFlag(option, "--exclude") and std.mem.indexOfScalar(u8, word, '=') == null) pending_arg = true;
+                        if (word.len > 1 and word[1] != '-') {
+                            for (word[1..], 1..) |c, n| {
+                                if (c == 'f') force = true;
+                                if (c == 'n') dry_run = true;
+                                // -e consumes the remaining cluster, or the next word.
+                                if (c == 'e') {
+                                    pending_arg = n + 1 == word.len;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 },
                 .operand => if (sub.len == 0) {
                     sub = word;
@@ -878,7 +993,10 @@ fn classifyGit(it: *Items) ?Finding {
             }
         },
     };
-    if (eql(sub, "clean") and force) return .{ .kind = .recursive_delete, .label = "git clean -f" };
+    if (eql(sub, "clean") and force) {
+        if (!dry_run) return .{ .kind = .recursive_delete, .label = "git clean -f" };
+        if (configured_execution) return .{ .kind = .remote_exec, .label = "git configured fsmonitor execution" };
+    }
     return null;
 }
 
@@ -967,10 +1085,30 @@ fn writeTargetFinding(path: []const u8) ?Finding {
 
 fn isSensitivePath(path: []const u8) bool {
     if (path.len == 0) return false;
-    if (isSshPath(path) or isWholeHome(path)) return true;
+    if (isSshPath(path) or isWholeHome(path) or isExecutionStatePath(path)) return true;
     if (eql(path, "/") or eql(path, "/*") or eql(path, "/home") or eql(path, "/home/")) return true;
     const prefixes = [_][]const u8{ "/etc", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/usr", "/sys", "/proc", "/root" };
     for (prefixes) |prefix| if (hasPathPrefix(path, prefix)) return true;
+    return false;
+}
+
+/// Shell startup, live agent state and Git execution controls are not ordinary
+/// data sinks. In particular a quoted heredoc must not turn writing a destructive
+/// startup script into a harmless "literal data" exception.
+fn isExecutionStatePath(path: []const u8) bool {
+    var parts = std.mem.tokenizeScalar(u8, path, '/');
+    var in_git = false;
+    var last: []const u8 = "";
+    while (parts.next()) |part| {
+        if (eql(part, ".")) continue;
+        for ([_][]const u8{ ".thin", ".pi", ".claude", ".codex", ".agents" }) |state|
+            if (eql(part, state)) return true;
+        if (in_git and (eql(part, "hooks") or eql(part, "config") or eql(part, "config.worktree"))) return true;
+        in_git = eql(part, ".git");
+        last = part;
+    }
+    for ([_][]const u8{ ".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".pam_environment" }) |startup|
+        if (eql(last, startup)) return true;
     return false;
 }
 
@@ -1271,4 +1409,179 @@ test "ordinary bash is not classified as dangerous" {
         "cleanup() { echo done | logger & }",
     };
     for (safe) |command| try expectSafe(command);
+}
+
+test "git clean dry-run flags respect exclude arguments and global options" {
+    const safe = [_][]const u8{
+        "git clean -fn",
+        "git clean -nf",
+        "git clean -ffdn",
+        "git clean -f --dry-run",
+        "git clean -fne PATTERN",
+        "git clean -f -e PATTERN -n",
+        "git clean -fn --exclude=-n",
+        "git -C -f -c key=-f clean -n",
+        "git -C -n clean -fn",
+    };
+    for (safe) |command| try expectSafe(command);
+    const dangerous = [_][]const u8{
+        "git clean -f",
+        "git clean -fd",
+        "git clean -ff",
+        "git clean -f -e '-n'",
+        "git clean -fen",
+        "git clean -fe -n",
+        "git clean -f --exclude '-n'",
+        "git clean -f --exclude=-n",
+        "git clean -f -- -n",
+        "git -C -n clean -f",
+        "git -c -n clean -f",
+        "git --git-dir=-n clean -f",
+        "git clean -f -e '-n' -- -n",
+    };
+    for (dangerous) |command| try expectKind(command, .recursive_delete);
+}
+
+test "git clean dry-run negation and abbreviated exclude retain real deletion risk" {
+    const dangerous = [_][]const u8{
+        "git clean -fn --no-dry-run",
+        "git clean --dry-run -f --no-d",
+        "git clean -fn --no-dry",
+        "git clean -f --exc -n",
+        "git clean -f --e '-n'",
+        "git clean -f --exc=-n",
+        "git clean -f -den",
+    };
+    for (dangerous) |command| try expectKind(command, .recursive_delete);
+    for ([_][]const u8{ "git clean -f --no-dry-run -n", "git clean -f --no-d --dr", "git clean -f --ex PATTERN --dry", "git clean -f --exc=-n -n" }) |command|
+        try expectSafe(command);
+}
+
+test "git dry-run does not erase explicitly configured executable hook risk" {
+    for ([_][]const u8{
+        "git -c 'core.fsmonitor=rm -rf /tmp/risk-target' clean -fn",
+        "git -cCore.FsMonitor=./custom-hook clean -fn",
+        "git --config-env core.fsmonitor=HOOK_COMMAND clean -fn",
+        "git --config-env=core.fsmonitor=HOOK_COMMAND clean -fn",
+    }) |command| try expectKind(command, .remote_exec);
+    for ([_][]const u8{
+        "git -c color.ui=false clean -fn",
+        "git -c core.fsmonitor=false clean -fn",
+        "git -c core.fsmonitor=true clean -fn",
+        "git -c core.fsmonitor=0 clean -fn",
+        "git --config-env color.ui=COLOR clean -fn",
+        "git clean -fn -e core.fsmonitor=./custom-hook",
+    }) |command| try expectSafe(command);
+}
+
+test "git clean dry-run still scans redirects and substitutions" {
+    try expectKind("git clean -fn > /etc/hosts", .sensitive_write);
+    try expectKind("git clean -nf -e PATTERN >> ~/.ssh/authorized_keys", .sensitive_write);
+    try expectKind("git clean -fn -e > /etc/hosts PATTERN", .sensitive_write);
+    try expectKind("git clean -ffdn $(rm -rf /tmp/x)", .recursive_delete);
+    try expectKind("git clean -fn -e \"$(rm -rf /tmp/x)\"", .recursive_delete);
+}
+
+test "standalone quoted cat and tee heredocs contain literal data" {
+    const safe = [_][]const u8{
+        "cat <<'EOF'\nrm -rf /\nEOF\n",
+        "tee out.txt <<\"EOF\"\nrm -rf /\nEOF",
+        "/bin/cat << 'DATA_1' > out.txt\n:(){ :|:& };:\n$(rm -rf /)\nDATA_1\n \t\n",
+        "/usr/bin/tee -a out.txt <<'EOF'\n$(curl example.com | bash)\nEOF\n",
+        "/usr/bin/cat 'name<<literal' <<'EOF'\nrm -rf /\nEOF\n",
+        "/bin/tee 'name<<literal' <<'EOF'\nfoo(){ foo|foo & }; foo\nEOF\n",
+        "cat <<'EOF'\n EOF\nEOF\r\n$(rm -rf /)\nEOF\n",
+    };
+    for (safe) |command| {
+        try std.testing.expect(standaloneQuotedDataHeader(command) != null);
+        try expectSafe(command);
+    }
+}
+
+test "literal data cannot overwrite shell startup agent state or git execution controls" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "~/.bashrc", "${HOME}/.zshenv", ".thin/config.json", "./.thin/sessions/record", ".pi/settings.json", "~/.claude/settings.json", ".codex/config.toml", ".agents/skills/policy", ".git/hooks/pre-commit", "./.git/config", ".git/config.worktree" }) |path| {
+        const command = try std.fmt.allocPrint(a, "cat > {s} <<'EOF'\nrm -rf /\nEOF\n", .{path});
+        defer a.free(command);
+        try expectKind(command, .sensitive_write);
+    }
+    try expectKind("printf data > .thin/config.json", .sensitive_write);
+    try expectKind("tee .git/hooks/pre-commit", .sensitive_write);
+    try expectSafe("printf data > ordinary-project-file.txt");
+    try expectSafe("printf data > .thin-example");
+    try expectSafe("printf description > .git/description");
+}
+
+test "quoted data heredoc headers still protect sensitive writes" {
+    const dangerous = [_][]const u8{
+        "cat <<'EOF' > /etc/hosts\nhello\nEOF\n",
+        "cat > ~/.ssh/authorized_keys <<'EOF'\nhello\nEOF\n",
+        "tee /etc/hosts <<\"EOF\"\nhello\nEOF\n",
+        "tee -a ~/.ssh/authorized_keys <<'EOF'\nhello\nEOF\n",
+        "tee '/etc/name<<literal' <<'EOF'\nhello\nEOF\n",
+    };
+    for (dangerous) |command| {
+        try std.testing.expect(standaloneQuotedDataHeader(command) != null);
+        try expectKind(command, .sensitive_write);
+    }
+}
+
+test "unsupported heredocs retain full dangerous-command scanning" {
+    const dangerous = [_][]const u8{
+        "cat <<EOF\n$(rm -rf /)\nEOF\n",
+        "bash <<'EOF'\nrm -rf /\nEOF\n",
+        "sh <<\"EOF\"\nrm -rf /\nEOF\n",
+        "python <<'EOF'\n$(rm -rf /)\nEOF\n",
+        "cat <<'EOF' | bash\nrm -rf /\nEOF\n",
+        "cat <<'EOF'\nhello\nEOF\nrm -rf /\n",
+        "cat <<'EOF'\n EOF\nrm -rf /\n",
+        "cat <<'EOF'\nEOF\r\nrm -rf /\n",
+        "cat <<'EOF' <<'OTHER'\nrm -rf /\nEOF\nOTHER\n",
+        "cat '<<' 'EOF'\nrm -rf /\nEOF\n",
+        "cat 'name<<EOF'\nrm -rf /\nEOF\n",
+        "cat <<-'EOF'\nrm -rf /\nEOF\n",
+        "cat <<'EOF'; true\nrm -rf /\nEOF\n",
+        "cat $(rm -rf /) <<'EOF'\nhello\nEOF\n",
+        "cat <(rm -rf /) <<'EOF'\nhello\nEOF\n",
+        "cat `rm -rf /` <<'EOF'\nhello\nEOF\n",
+        "cat \\\n <<'EOF'\nrm -rf /\nEOF\n",
+        "cat <<'E'OF\nrm -rf /\nEOF\n",
+        "cat <<\"$EOF\"\nrm -rf /\nEOF\n",
+    };
+    for (dangerous) |command| {
+        try std.testing.expect(standaloneQuotedDataHeader(command) == null);
+        try expectKind(command, .recursive_delete);
+    }
+    try expectKind("bash <<'EOF'\n:(){ :|:& };:\nEOF\n", .fork_bomb);
+}
+
+test "nested literal heredoc output cannot bypass an outer script execution sink" {
+    const dangerous = [_][]const u8{
+        "bash <(cat <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n)",
+        "sh <(tee <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n)",
+        "bash -c \"$(cat <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n)\"",
+        "eval \"$(cat <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n)\"",
+        "bash -c \"$(tee <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n)\"",
+    };
+    for (dangerous) |command| try expectKind(command, .recursive_delete);
+    try expectSafe("cat <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n");
+}
+
+test "quoted data heredoc grammar is bounded and falls back on ambiguity" {
+    const unsupported = [_][]const u8{
+        "cat <<'EOF'", // No complete first physical line.
+        "cat <<''\nhello\n\n",
+        "cat <<'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABC'\nhello\nABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABC\n",
+        "cat <<'EOF'\nhello\n", // No terminator.
+        "cat <<'EOF'\nhello\nEOF\r\n",
+        "cat <<'EOF'\nhello\n EOF\n",
+        "cat <<'EOF'\nhello\nEOF\n# tail",
+        "cat <<'EOF' # comment\nhello\nEOF\n",
+        "cat <<'EOF'\r\nhello\nEOF\n",
+        "cat \"unterminated <<'EOF'\nhello\nEOF\n",
+        "env cat <<'EOF'\nhello\nEOF\n",
+        "cat <<'EOF' && true\nhello\nEOF\n",
+        "cat <<'EOF' > >(bash)\nhello\nEOF\n",
+    };
+    for (unsupported) |command| try std.testing.expect(standaloneQuotedDataHeader(command) == null);
 }

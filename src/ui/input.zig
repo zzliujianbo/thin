@@ -9,6 +9,7 @@ pub const Event = union(enum) {
     /// 文本内容（合法 UTF-8）；pasted 表示来自 bracketed paste。
     text: struct { value: []const u8, pasted: bool },
     enter,
+    follow_up,
     paste_start,
     backspace,
     delete,
@@ -49,6 +50,9 @@ pub const Parser = struct {
     escape: [32]u8 = undefined,
     /// 0 表示不在 ESC 序列中；非 0 表示已收集的字节数。
     escape_len: usize = 0,
+    /// Provenance belongs to the sequence, not the current read. A paste-tail
+    /// Escape must not become a fresh key when feed resets batch_paste.
+    escape_paste: bool = false,
     /// 多字节 UTF-8 字符的临时缓冲。
     utf8: [4]u8 = undefined,
     /// 已收集的字节数；0 表示没有未完成的字符。
@@ -65,18 +69,22 @@ pub const Parser = struct {
     stop_feed: bool = false,
     secret_paste: bool = false,
     secret_batch_paste: bool = false,
+    /// A terminator cannot smuggle a submit in the remainder of the same read.
+    batch_paste: bool = false,
 
     /// Wipe scratch and discard the remainder of the current read on a mode change.
     pub fn secretMode(self: *Parser, enabled: bool) void {
         std.crypto.secureZero(u8, &self.escape);
         std.crypto.secureZero(u8, &self.utf8);
         self.escape_len = 0;
+        self.escape_paste = false;
         self.utf8_len = 0;
         self.utf8_need = 0;
         self.pasted = false;
         self.pasted_cr = false;
         self.secret_paste = false;
         self.secret_batch_paste = false;
+        self.batch_paste = false;
         self.secret = enabled;
         self.stop_feed = true;
     }
@@ -88,16 +96,21 @@ pub const Parser = struct {
     /// UI-owned ambiguity timeout for a standalone Escape, including canceling
     /// secret entry. Partial CSI and pasted/batch-tail escapes never navigate.
     pub fn expireEscape(self: *Parser, sink: Sink) !void {
-        if (self.escape_len != 1 or self.pasted or (self.secret and self.secret_batch_paste)) return;
+        // Inside a paste this may still be a delayed/split framing marker.
+        if (self.escape_len != 1 or self.pasted) return;
+        const tainted = self.escape_paste or (self.secret and self.secret_batch_paste);
         self.escape_len = 0;
+        self.escape_paste = false;
         std.crypto.secureZero(u8, &self.escape);
-        try sink.emit(.escape);
+        // Consume rejected escapes, rather than letting a later read revive one.
+        if (!tainted) try sink.emit(.escape);
     }
 
     /// 逐字节解析输入。
     pub fn feed(self: *Parser, bytes: []const u8, sink: Sink) !void {
         self.stop_feed = false;
         self.secret_batch_paste = self.secret and self.pasted;
+        self.batch_paste = self.pasted;
         for (bytes) |value| {
             try self.byte(value, sink);
             if (self.stop_feed) break;
@@ -114,12 +127,14 @@ pub const Parser = struct {
             // 中文：序列中途的 Ctrl-C / Ctrl-D 仍视为取消 / 退出；粘贴中则忽略。
             if (!self.pasted and (b == 3 or b == 4)) {
                 self.escape_len = 0;
+                self.escape_paste = false;
                 return sink.emit(if (b == 3) .cancel else .quit);
             }
 
             // 中文：序列超长则丢弃，防止缓冲区溢出。
             if (self.escape_len == self.escape.len) {
                 self.escape_len = 0;
+                self.escape_paste = false;
                 return self.invalid(sink);
             }
             self.escape[self.escape_len] = b;
@@ -133,13 +148,17 @@ pub const Parser = struct {
             if (self.escape_len > 2 and b >= 0x30 and b <= 0x3f) return;
 
             // 中文：遇到终结字节后，无论是否匹配，返回前都重置为非序列状态。
-            defer self.escape_len = 0;
+            defer {
+                self.escape_len = 0;
+                self.escape_paste = false;
+            }
 
             // 中文：bracketed paste 的开始 / 结束标记。
             // 中文：粘贴结束时同时清除 pasted_cr，避免跨粘贴影响 CRLF 判断。
             if (std.mem.eql(u8, seq, "\x1b[200~")) {
                 if (self.secret and self.pasted) try self.invalid(sink);
                 self.pasted = true;
+                self.batch_paste = true;
                 if (self.secret) {
                     self.secret_paste = true;
                     self.secret_batch_paste = true;
@@ -153,7 +172,9 @@ pub const Parser = struct {
                 return;
             }
 
-            if (self.pasted) return self.invalid(sink); // Pasted escape sequences never become keys/approvals.
+            // Recognize framing above even when split across reads. All other
+            // paste-origin sequences remain data, never navigation or approvals.
+            if (self.pasted or self.escape_paste) return self.invalid(sink);
 
             // 中文：常见光标与编辑键映射，同时兼容 SS3 与 CSI 两种编码。
             const keys = .{
@@ -174,9 +195,11 @@ pub const Parser = struct {
                 return;
             };
 
-            // 中文：Alt+Enter（ESC CR）视为插入换行。
-            if (std.mem.eql(u8, seq, "\x1b\r")) {
-                try sink.emit(.{ .text = .{ .value = "\n", .pasted = false } });
+            // Alt+Enter is a distinct intent, never text or a secret submission.
+            if (std.mem.eql(u8, seq, "\x1b\r") or std.mem.eql(u8, seq, "\x1b\n") or
+                std.mem.eql(u8, seq, "\x1b[13;3u"))
+            {
+                if (!self.secret) try sink.emit(.follow_up);
             } else try self.invalid(sink);
             return;
         }
@@ -186,6 +209,7 @@ pub const Parser = struct {
             if (self.utf8_len != 0) try self.invalid(sink);
             self.escape[0] = b;
             self.escape_len = 1;
+            self.escape_paste = self.pasted or self.batch_paste or (self.secret and self.secret_batch_paste);
             self.utf8_len = 0;
             return;
         }
@@ -371,6 +395,7 @@ const Record = struct {
     data: [256]u8 = undefined,
     len: usize = 0,
     enters: usize = 0,
+    follow_ups: usize = 0,
     cancels: usize = 0,
     pasted: usize = 0,
     cycles: usize = 0,
@@ -386,6 +411,7 @@ const Record = struct {
                 if (v.pasted) self.pasted += 1;
             },
             .enter => self.enters += 1,
+            .follow_up => self.follow_ups += 1,
             .cancel => self.cancels += 1,
             .cycle_effort => self.cycles += 1,
             .escape => self.escapes += 1,
@@ -395,6 +421,23 @@ const Record = struct {
 };
 
 // 验证被拆分的 UTF-8、粘贴中的 CR / Ctrl-C / 方向键都不会触发提交、取消或授权。
+test "AltEnter is distinct across split sequences and suppressed in paste and secret modes" {
+    var record = Record{};
+    var parser = Parser{};
+    const sink = Sink{ .context = &record, .emit_fn = Record.event };
+    for ("\x1b\r\x1b\n\x1b[13;3u") |byte_| try parser.feed(&.{byte_}, sink);
+    try std.testing.expectEqual(@as(usize, 3), record.follow_ups);
+    try std.testing.expectEqual(@as(usize, 0), record.enters);
+    try parser.feed("\x1b[200~\x1b\r\x1b[13;3u\x1b[201~", sink);
+    try std.testing.expectEqual(@as(usize, 3), record.follow_ups);
+    try parser.feed("\x1b[13;", sink);
+    try parser.expireEscape(sink);
+    try std.testing.expectEqual(@as(usize, 3), record.follow_ups);
+    parser.secretMode(true);
+    try parser.feed("\x1b\r\x1b\n\x1b[13;3u", sink);
+    try std.testing.expectEqual(@as(usize, 3), record.follow_ups);
+}
+
 test "split UTF8 and bracketed paste cannot submit, cancel or authorize" {
     var record = Record{};
     var parser = Parser{};
@@ -466,6 +509,50 @@ test "split ShiftTab cannot change secret settings and only fresh Escape cancels
     try parser.feed("\x1b[", sink);
     try parser.expireEscape(sink);
     try std.testing.expectEqual(@as(usize, 2), record.escapes);
+}
+
+test "paste-tail escape provenance survives split CSI and AltEnter without blocking fresh keys" {
+    for ([_]bool{ false, true }) |secret| {
+        var record: Record = .{};
+        var parser: Parser = .{};
+        if (secret) parser.secretMode(true);
+        const sink: Sink = .{ .context = &record, .emit_fn = Record.event };
+        try parser.feed("\x1b[200~\x1b[201~\x1b[", sink);
+        try parser.feed("Z", sink);
+        try std.testing.expectEqual(@as(usize, 0), record.cycles);
+        try parser.feed("\x1b[200~\x1b[201~\x1b", sink);
+        try parser.feed("\r", sink);
+        try std.testing.expectEqual(@as(usize, 0), record.follow_ups);
+        try parser.feed("\x1b[Z", sink);
+        try std.testing.expectEqual(@as(usize, if (secret) 0 else 1), record.cycles);
+        try parser.feed("\x1b\r", sink);
+        try std.testing.expectEqual(@as(usize, if (secret) 0 else 1), record.follow_ups);
+    }
+}
+
+test "delayed paste framing escapes still parse and tainted timeout is consumed" {
+    for ([_]bool{ false, true }) |secret| {
+        var record: Record = .{};
+        var parser: Parser = .{};
+        if (secret) parser.secretMode(true);
+        const sink: Sink = .{ .context = &record, .emit_fn = Record.event };
+        try parser.feed("\x1b[200~\x1b", sink);
+        try parser.expireEscape(sink); // Could still be a split paste terminator.
+        try std.testing.expect(parser.pasted and parser.escape_len == 1);
+        for ("[201~") |byte_| try parser.feed(&.{byte_}, sink);
+        try std.testing.expect(!parser.pasted and parser.escape_len == 0);
+        try parser.feed("\x1b[200~\x1b[201~\x1b", sink);
+        try parser.feed("", sink); // Reset per-read flags, not escape provenance.
+        try parser.expireEscape(sink);
+        try std.testing.expectEqual(@as(usize, 0), record.escapes);
+        try std.testing.expectEqual(@as(usize, 0), parser.escape_len);
+        try parser.feed("", sink);
+        try parser.expireEscape(sink);
+        try std.testing.expectEqual(@as(usize, 0), record.escapes);
+        try parser.feed("\x1b", sink);
+        try parser.expireEscape(sink);
+        try std.testing.expectEqual(@as(usize, 1), record.escapes);
+    }
 }
 
 // 验证 Editor 的字形簇边界与输入长度上限。

@@ -20,6 +20,7 @@ import {reviewRegressions} from './review_mock.mjs';
 import {logRegressions} from './log_mock.mjs';
 import {settingsRegressions} from './settings_mock.mjs';
 import {decisionModelRegressions} from './decision_model_mock.mjs';
+import {imageModelRegressions} from './image_model_mock.mjs';
 import {settingsValuesRegressions} from './settings_values_mock.mjs';
 import {selectionRestoreRegressions} from './selection_restore_mock.mjs';
 import {fullResumeRegressions} from './full_resume_mock.mjs';
@@ -256,6 +257,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       // 挂起场景：返回 SSE 响应头后不再发送数据；非 PTY 时发送 SIGINT 以测试取消。
       if (kind === 'stall' || kind === 'exit-busy' || (isPty && (kind === 'cancel' || kind === 'term') && rounds === 1)) {
         stalled = true;
+        if (kind === 'exit-busy') await writeFile(join(project, 'exit-busy-arrived'), 'ready', {mode:0o600});
         res.writeHead(200, {'content-type':'text/event-stream'}); res.flushHeaders();
         if (!isPty && ownsChild()) signalChild.kill('SIGINT');
         return;
@@ -803,6 +805,8 @@ try {
     await scenario('PTY model/effort selection responses','responses','model-select',true);
   } else if (process.argv.includes('--settings-values-only')) {
     await settingsValuesRegressions({app,pty,execute,send});
+  } else if (process.argv.includes('--image-model-only')) {
+    await imageModelRegressions({app,pty,execute,send});
   } else if (process.argv.includes('--decision-model-only')) {
     await decisionModelRegressions({app,pty,execute,send});
   } else if (process.argv.includes('--settings-only')) {
@@ -836,6 +840,7 @@ try {
   await logRegressions(app,pty);
   await settingsRegressions({app,pty,execute,send});
   await decisionModelRegressions({app,pty,execute,send});
+  await imageModelRegressions({app,pty,execute,send});
   await settingsValuesRegressions({app,pty,execute,send});
   await selectionRestoreRegressions({app,pty,execute});
   await fullResumeRegressions({app,pty,execute});

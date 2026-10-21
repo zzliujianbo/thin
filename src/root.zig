@@ -17,6 +17,8 @@ pub const context = @import("core/context.zig");
 pub const session_context = @import("core/session_context.zig");
 /// Agent 运行时：驱动模型调用、工具执行与事件分发。
 pub const runtime = @import("core/runtime.zig");
+/// Optional independent local-image service; canonical messages remain text.
+pub const image = @import("core/image.zig");
 
 /// HTTP 客户端。
 pub const http = @import("llm/http.zig");
@@ -51,6 +53,7 @@ test {
     _ = context;
     _ = session_context;
     _ = runtime;
+    _ = image;
     _ = http;
     _ = chat;
     _ = responses;
@@ -105,6 +108,8 @@ test {
     _ = @import("ui/tui.zig");
 
     _ = @import("tests/local_command_test.zig");
+    _ = @import("core/inbox.zig");
+    _ = @import("tests/steering_runtime_test.zig");
     _ = @import("tests/runtime_test.zig");
     _ = @import("tests/tool_lifecycle_test.zig");
     _ = @import("tests/session_context_test.zig");

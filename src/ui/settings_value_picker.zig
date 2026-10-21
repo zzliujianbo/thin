@@ -5,10 +5,12 @@
 const std = @import("std");
 const cfg = @import("../core/config.zig");
 const text = @import("text.zig");
+const time = @import("settings_time.zig");
 const provider = @import("provider_picker.zig");
 pub const Key = @import("../core/settings.zig").Key;
 pub const Rows = @import("settings_menu.zig").Rows;
-pub const max_digits = 10;
+pub const max_digits = 10; // Token integers retain their existing bound.
+pub const max_input_len = 14; // Bounded seconds text, including decimal point.
 
 pub const Picker = struct {
     key: Key,
@@ -19,7 +21,7 @@ pub const Picker = struct {
     values: [8]?u32 = @splat(null),
     values_len: usize = 0,
     staged_index: ?usize = null,
-    input: [max_digits]u8 = @splat(0),
+    input: [max_input_len]u8 = @splat(0),
     input_len: usize = 0,
 
     pub fn init(key: Key, current: ?u32, limits: cfg.Limits) Picker {
@@ -55,12 +57,18 @@ pub const Picker = struct {
         self.clear();
     }
     /// All-or-nothing ASCII decimal append. The owner must reject paste events;
-    /// digit-only text cannot itself prove whether bytes came from a paste.
+    /// text alone cannot prove whether bytes came from a paste.
     pub fn append(self: *Picker, bytes: []const u8) bool {
-        if (!self.editing or bytes.len == 0 or bytes.len > max_digits - self.input_len) return false;
-        for (bytes) |byte| if (byte < '0' or byte > '9') return false;
-        @memcpy(self.input[self.input_len..][0..bytes.len], bytes);
-        self.input_len += bytes.len;
+        const capacity: usize = if (self.key == .max_output_tokens) max_digits else max_input_len;
+        if (!self.editing or bytes.len == 0 or self.input_len > capacity or bytes.len > capacity - self.input_len) return false;
+        var next = self.input;
+        @memcpy(next[self.input_len..][0..bytes.len], bytes);
+        const length = self.input_len + bytes.len;
+        if (self.key == .max_output_tokens) {
+            for (next[0..length]) |byte| if (byte < '0' or byte > '9') return false;
+        } else if (!time.validPrefix(next[0..length])) return false;
+        self.input = next;
+        self.input_len = length;
         return true;
     }
     pub fn backspace(self: *Picker) void {
@@ -110,8 +118,13 @@ pub const Picker = struct {
         return null;
     }
     fn parsedInput(self: Picker) !u32 {
-        if (self.input_len == 0) return error.InvalidValue;
-        const n = std.fmt.parseInt(u32, self.input[0..self.input_len], 10) catch return error.InvalidValue;
+        const capacity: usize = if (self.key == .max_output_tokens) max_digits else max_input_len;
+        if (self.input_len == 0 or self.input_len > capacity) return error.InvalidValue;
+        const input = self.input[0..self.input_len];
+        const n = if (self.key == .max_output_tokens)
+            std.fmt.parseInt(u32, input, 10) catch return error.InvalidValue
+        else
+            try time.parse(input);
         try self.validate(n);
         return n;
     }
@@ -133,7 +146,7 @@ pub const Picker = struct {
 };
 
 fn unit(key: Key) []const u8 {
-    return if (key == .max_output_tokens) "tokens" else "ms";
+    return if (key == .max_output_tokens) "tokens" else "s";
 }
 fn candidate(buffer: *[96]u8, picker: Picker, index: usize) ![]const u8 {
     if (picker.isCustom(index)) {
@@ -142,7 +155,11 @@ fn candidate(buffer: *[96]u8, picker: Picker, index: usize) ![]const u8 {
     }
     const n = picker.values[index];
     const marker = if (n == picker.current) " (current)" else if (picker.staged_index == index) " (staged)" else "";
-    if (n) |v| return std.fmt.bufPrint(buffer, "{d} {s}{s}", .{ v, unit(picker.key), marker });
+    if (n) |v| {
+        if (picker.key == .max_output_tokens) return std.fmt.bufPrint(buffer, "{d} tokens{s}", .{ v, marker });
+        var seconds: [32]u8 = undefined;
+        return std.fmt.bufPrint(buffer, "{s}{s}", .{ try time.format(&seconds, v), marker });
+    }
     return std.fmt.bufPrint(buffer, "{s}{s}", .{ if (picker.key == .max_output_tokens) "Auto" else "Unset (invalid)", marker });
 }
 pub fn rows(a: std.mem.Allocator, menu: provider.Picker, self: Picker, columns: usize, max_rows: usize) !Rows {
@@ -172,7 +189,10 @@ pub fn rows(a: std.mem.Allocator, menu: provider.Picker, self: Picker, columns: 
         break :blk true;
     };
     if (max_rows > out.items.len) try appendLine(a, &out, if (self.editing)
-        "Positive decimal only, at most 10 digits. Enter stages; next Enter saves."
+        (if (self.key == .max_output_tokens)
+            "Positive integer tokens, at most 10 digits. Enter stages; next Enter saves."
+        else
+            "Positive seconds (s), up to 3 decimals. Enter stages; next Enter saves.")
     else
         "Up/Down select  Enter choose  Left/Esc back", columns);
     if (self.editing and !valid and max_rows > out.items.len) try appendLine(a, &out, "Empty, overflow or outside configured bounds; cannot stage.", columns);
@@ -207,7 +227,7 @@ test "value picker preserves exact current custom values and stable stages" {
     try std.testing.expectEqual(@as(?u32, 123456), try picker.chosen(current_index));
     const count_before = picker.count();
     picker.beginCustom();
-    try std.testing.expect(picker.append("234567"));
+    try std.testing.expect(picker.append("234.567"));
     try std.testing.expectError(error.Editing, picker.chosen(current_index));
     const staged_index = try picker.submitCustom();
     try std.testing.expect(!picker.editing);
@@ -216,15 +236,15 @@ test "value picker preserves exact current custom values and stable stages" {
     try std.testing.expectEqual(@as(?u32, 123456), try picker.chosen(current_index));
     try std.testing.expectEqual(count_before + 1, picker.count());
     picker.beginCustom();
-    try std.testing.expect(picker.append("345678"));
+    try std.testing.expect(picker.append("345.678"));
     try std.testing.expectEqual(staged_index, try picker.submitCustom());
     try std.testing.expectEqual(@as(?u32, 345678), try picker.chosen(staged_index));
     try std.testing.expectEqual(@as(?u32, 123456), try picker.chosen(current_index));
     try std.testing.expectError(error.CustomChoice, picker.chosen(picker.count() - 1));
     try std.testing.expectError(error.InvalidIndex, picker.chosen(picker.count()));
 }
-test "custom input is atomic bounded decimal and checked positive u32" {
-    var picker = Picker.init(.request_timeout_ms, 300000, .{});
+test "token input is atomic bounded integer and checked positive u32" {
+    var picker = Picker.init(.max_output_tokens, null, .{});
     try std.testing.expect(!picker.append("12"));
     picker.beginCustom();
     try std.testing.expectError(error.InvalidValue, picker.submitCustom());
@@ -310,7 +330,7 @@ test "editing custom can only stage valid complete input then confirm staged row
     const invalid = try rows(a, .{ .selected = picker.count() - 1 }, picker, 80, 1);
     defer freeRows(a, invalid);
     try std.testing.expect(!invalid.can_confirm);
-    try std.testing.expect(picker.append("234567"));
+    try std.testing.expect(picker.append("234.567"));
     const valid = try rows(a, .{ .selected = picker.count() - 1 }, picker, 80, 1);
     defer freeRows(a, valid);
     try std.testing.expect(valid.can_confirm);
@@ -321,7 +341,99 @@ test "editing custom can only stage valid complete input then confirm staged row
     const staged = try rows(a, .{ .selected = index }, picker, 80, 1);
     defer freeRows(a, staged);
     try std.testing.expect(staged.can_confirm);
-    try std.testing.expect(std.mem.find(u8, staged.lines[0], "234567 ms (staged)") != null);
+    try std.testing.expect(std.mem.find(u8, staged.lines[0], "234.567 s (staged)") != null);
+}
+test "seconds custom input is exact atomic and strictly bounded" {
+    for ([_]Key{ .command_timeout_ms, .request_timeout_ms, .task_timeout_ms }) |key| {
+        var picker = Picker.init(key, 123456, .{ .command_max_timeout_ms = 86400000 });
+        picker.beginCustom();
+        for ([_][]const u8{ ".", ".1", "-1", "1..2", "1.0001", "1e3", "1\n" }) |bad| {
+            try std.testing.expect(!picker.append(bad));
+            try std.testing.expectEqual(@as(usize, 0), picker.input_len);
+        }
+        try std.testing.expect(picker.append("1."));
+        try std.testing.expectError(error.InvalidValue, picker.submitCustom());
+        try std.testing.expect(!picker.append(".2"));
+        try std.testing.expectEqualStrings("1.", picker.input[0..picker.input_len]);
+        try std.testing.expect(picker.append("001"));
+        try std.testing.expect(!picker.append("0"));
+        try std.testing.expectEqualStrings("1.001", picker.input[0..picker.input_len]);
+        picker.backspace();
+        try std.testing.expectEqualStrings("1.00", picker.input[0..picker.input_len]);
+        for ([_][]const u8{ "0", "0.000", "86400.001", "4294967.296", "99999999999999" }) |bad| {
+            picker.clear();
+            try std.testing.expect(picker.append(bad));
+            try std.testing.expectError(error.InvalidValue, picker.submitCustom());
+            try std.testing.expect(picker.editing);
+        }
+        picker.clear();
+        try std.testing.expect(!picker.append("123456789012345"));
+        try std.testing.expect(picker.append("0.001"));
+        const index = try picker.submitCustom();
+        try std.testing.expectEqual(@as(?u32, 1), try picker.chosen(index));
+        try std.testing.expectEqual(@as(?u32, 123456), try picker.chosen(picker.currentIndex()));
+        picker.beginCustom();
+        try std.testing.expect(picker.append("86400"));
+        const maximum = try picker.submitCustom();
+        try std.testing.expectEqual(@as(?u32, 86400000), try picker.chosen(maximum));
+    }
+    var command = Picker.init(.command_timeout_ms, 1, .{ .command_max_timeout_ms = 1500 });
+    command.beginCustom();
+    try std.testing.expect(command.append("1.501"));
+    try std.testing.expectError(error.InvalidValue, command.submitCustom());
+    command.clear();
+    try std.testing.expect(command.append("1.5"));
+    const index = try command.submitCustom();
+    try std.testing.expectEqual(@as(?u32, 1500), try command.chosen(index));
+    var output = Picker.init(.max_output_tokens, null, .{});
+    output.beginCustom();
+    try std.testing.expect(!output.append("1.5"));
+}
+test "seconds append rejection preserves all bytes and preset staging stays exact" {
+    var picker = Picker.init(.request_timeout_ms, 123456, .{});
+    picker.beginCustom();
+    try std.testing.expect(picker.append("0000000000.001"));
+    const before = picker.input;
+    const length = picker.input_len;
+    for ([_][]const u8{ "0", ".", "x", "\n", "12.3", "123456789012345" }) |bad| {
+        try std.testing.expect(!picker.append(bad));
+        try std.testing.expectEqual(length, picker.input_len);
+        try std.testing.expectEqualSlices(u8, &before, &picker.input);
+    }
+    const staged = try picker.submitCustom();
+    try std.testing.expectEqual(@as(?u32, 1), try picker.chosen(staged));
+    const count_before = picker.count();
+    picker.beginCustom();
+    try std.testing.expect(picker.append("30.000"));
+    const preset = try picker.submitCustom();
+    try std.testing.expectEqual(@as(?u32, 30000), try picker.chosen(preset));
+    try std.testing.expectEqual(count_before, picker.count());
+    try std.testing.expectEqual(@as(?u32, 1), try picker.chosen(staged));
+    try std.testing.expectEqual(@as(?u32, 123456), try picker.chosen(picker.currentIndex()));
+}
+
+test "seconds current and staged identities require complete rows and reject paste" {
+    const a = std.testing.allocator;
+    var picker = Picker.init(.request_timeout_ms, 123456, .{});
+    var buffer: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("123.456 s (current)", try candidate(&buffer, picker, picker.currentIndex()));
+    picker.beginCustom();
+    try std.testing.expect(picker.append("0.001"));
+    const editing = try rows(a, .{ .selected = picker.count() - 1 }, picker, 100, 12);
+    defer freeRows(a, editing);
+    try std.testing.expect(editing.can_confirm);
+    try std.testing.expect(std.mem.find(u8, editing.lines[editing.lines.len - 1], "up to 3 decimals") != null);
+    const index = try picker.submitCustom();
+    try std.testing.expectEqualStrings("0.001 s (staged)", try candidate(&buffer, picker, index));
+    const clipped = try rows(a, .{ .selected = index }, picker, 16, 1);
+    defer freeRows(a, clipped);
+    try std.testing.expect(!clipped.can_confirm);
+    const pasted = try rows(a, .{ .selected = index, .pasted = true }, picker, 100, 1);
+    defer freeRows(a, pasted);
+    try std.testing.expect(!pasted.can_confirm);
+    const short = try rows(a, .{ .selected = index }, picker, 100, 0);
+    defer freeRows(a, short);
+    try std.testing.expect(!short.can_confirm);
 }
 fn allocationCase(a: std.mem.Allocator) !void {
     var picker = Picker.init(.max_output_tokens, 12345, .{});

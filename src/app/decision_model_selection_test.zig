@@ -36,6 +36,150 @@ fn contains(models: []const cfg.Model, name: []const u8) bool {
     return false;
 }
 
+const metadata = @import("model_metadata.zig");
+const resolver = @import("model_resolver.zig");
+const zen_fixture =
+    \\{"llm":{"default":"route/first","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-main-only","models":{"first":{"protocol":"chat","context_tokens":65536}}},"zen":{"base_url":"https://opencode.ai/zen/v1","api_key_env":"ZEN_OWN_KEY","models":{}},"zen-unlogged":{"base_url":"https://opencode.ai/zen/v1","api_key_env":"ZEN_MISSING_KEY","models":{}},"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key":"fake-go-only","models":{}},"lookalike":{"base_url":"https://opencode.ai.example/zen/v1","api_key":"fake-lookalike-only","models":{"jev-1.13-free":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"safety_tokens":100}}
+;
+const zen_listing =
+    \\{"object":"list","data":[{"id":"jev-1.13","object":"model","created":1,"owned_by":"opencode"},{"id":"jev-1.13-free","object":"model","created":1,"owned_by":"opencode"},{"id":"jev-1.13-free-lookalike"},{"id":"JEV-1.13"}]}
+;
+
+/// Exercise the actual bounded parser, generation claim and persisted cache,
+/// not a guessed disk DTO or an in-memory candidate injected after startup.
+fn publishListing(home: []const u8, provider: cfg.providers.Id, body: []const u8, now: u64) !void {
+    var store = try Store.openExisting(a, io, home);
+    defer store.deinit();
+    const mask = metadata.bit(provider);
+    const claim = try metadata.claimAt(&store.root, mask, true, now, .{});
+    const listing = try metadata.parseListing(a, body, provider);
+    const result = try metadata.commitClaimedAt(&store.root, mask, listing, claim.generations, now + 1);
+    try std.testing.expectEqual(mask, result.accepted);
+}
+
+fn expectNativeCandidate(session: *Session, name: []const u8) !void {
+    for (session.connection().current().decision_models) |model| {
+        if (!std.mem.eql(u8, model.name, name)) continue;
+        try std.testing.expectEqual(@import("../core/protocol.zig").Protocol.systemone, model.protocol);
+        try std.testing.expectEqual(@as(u32, 0), model.context_tokens);
+        try std.testing.expect(model.output_tokens == null and model.reasoning == null);
+        try std.testing.expect(model.input_price_threshold == null and model.input_price_flat_limit == null);
+        return;
+    }
+    return error.ExpectedNativeCandidate;
+}
+
+test "Jev official refresh publishes native Decision candidates with only their own alias credentials" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try seed(home, zen_fixture);
+    try publishListing(home, .opencode_zen, zen_listing, 100);
+    try publishListing(home, .opencode_go, zen_listing, 200);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("ZEN_OWN_KEY", "fake-zen-own-only");
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    defer session.deinit();
+    const app = session.app.?;
+    const primary_auth = app.client.authorization.ptr;
+    const before = try declarationsWithoutDecision(session.global_config.?.value);
+    defer a.free(before);
+    try expectNativeCandidate(&session, "zen/jev-1.13");
+    try expectNativeCandidate(&session, "zen/jev-1.13-free");
+    const state = session.connection().current();
+    for ([_][]const u8{ "zen/jev-1.13-free-lookalike", "zen/JEV-1.13", "zen-unlogged/jev-1.13-free", "go/jev-1.13-free" }) |name|
+        try std.testing.expect(!contains(state.decision_models, name));
+    try std.testing.expect(contains(state.decision_models, "lookalike/jev-1.13-free"));
+    try std.testing.expectError(error.ApiKeyNotFound, choose(&session, "zen-unlogged/jev-1.13-free"));
+    const connection = session.connection();
+    try std.testing.expectError(error.SystemOneNotChatModel, connection.select_model_fn.?(connection.context, "zen/jev-1.13-free"));
+    try std.testing.expect(app.decision_client == null);
+    for ([_][]const u8{ "zen/jev-1.13-free", "zen/jev-1.13" }) |name| {
+        const ref = try cfg.splitDefault(name);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const selected = try resolver.resolve(arena.allocator(), session.global_config.?.value, &session.metadata_cache, ref.provider, ref.model, false);
+        try std.testing.expectEqualStrings(cfg.providers.systemone_base_url, selected.connection.base_url);
+        try std.testing.expectEqualStrings("zen", selected.provider_name);
+        try choose(&session, name);
+        try std.testing.expectEqualStrings(name, session.connection().current().decision_model.?);
+        try std.testing.expect(app.decision_client.?.native != null);
+        try std.testing.expect(app.decision_client.?.resolved == null and app.decision_client.?.calls == 0);
+        try std.testing.expectEqualStrings("fake-zen-own-only", app.decision_client.?.key.?);
+        try std.testing.expect(app.client.authorization.ptr == primary_auth);
+        try std.testing.expectEqualStrings("route", app.config.value.selected_provider.?);
+        try std.testing.expectEqualStrings("first", app.config.value.model.name);
+        try std.testing.expectEqualStrings("fake-main-only", app.config.value.provider.api_key.?);
+    }
+    try std.testing.expectError(error.UnknownModelProtocol, resolver.protocolFor(session.global_config.?.value, &session.metadata_cache, "go", "jev-1.13-free"));
+    try std.testing.expectEqual(@import("../core/protocol.zig").Protocol.chat, try resolver.protocolFor(session.global_config.?.value, &session.metadata_cache, "lookalike", "jev-1.13-free"));
+    const after = try declarationsWithoutDecision(session.global_config.?.value);
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expectEqual(@as(usize, 0), session.global_config.?.value.registry.?.find("zen").?.models.len);
+    // The protocol is derived, not forged into official wire evidence.
+    const row = session.metadata_cache.directory.rows[session.metadata_cache.directory.find(.opencode_zen, "jev-1.13-free").?];
+    try std.testing.expect(row.available == true and row.protocol == .auto and row.tokens == null);
+}
+
+test "Jev missing own key never borrows main Go or another official Zen alias key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try seed(home, zen_fixture);
+    try publishListing(home, .opencode_zen, zen_listing, 100);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("ZEN_MISSING_KEY", "fake-other-zen-only");
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    defer session.deinit();
+    try expectNativeCandidate(&session, "zen-unlogged/jev-1.13-free");
+    try std.testing.expect(!contains(session.connection().current().decision_models, "zen/jev-1.13-free"));
+    const before = try disk(home);
+    defer a.free(before);
+    try std.testing.expectError(error.ApiKeyNotFound, choose(&session, "zen/jev-1.13-free"));
+    try std.testing.expect(session.app.?.decision_client == null);
+    const after = try disk(home);
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "Jev documented protocol cannot create absent delisted or empty-list Decision availability" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try seed(home, zen_fixture);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("ZEN_OWN_KEY", "fake-zen-own-only");
+    for ([_]?[]const u8{ null, zen_listing, "{\"data\":[{\"id\":\"jev-1.13\"}]}", "{\"data\":[]}" }, 0..) |listing, index| {
+        if (listing) |body| try publishListing(home, .opencode_zen, body, 100 * index);
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+        defer session.deinit();
+        const models = session.connection().current().decision_models;
+        try std.testing.expectEqual(index == 1 or index == 2, contains(models, "zen/jev-1.13"));
+        try std.testing.expectEqual(index == 1, contains(models, "zen/jev-1.13-free"));
+        if (index != 1) {
+            const before = try disk(home);
+            defer a.free(before);
+            try std.testing.expectError(error.UnknownDecisionModel, choose(&session, "zen/jev-1.13-free"));
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            try std.testing.expectError(error.DefaultModelUnavailable, resolver.resolve(arena.allocator(), session.global_config.?.value, &session.metadata_cache, "zen", "jev-1.13-free", false));
+            const after = try disk(home);
+            defer a.free(after);
+            try std.testing.expectEqualStrings(before, after);
+        }
+    }
+}
+
 test "Decision generic selection is declaration-only independent and survives restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -183,7 +327,6 @@ test "Decision generic candidates use auxiliary caps even when primary candidate
     try env.put("HOME", home);
     var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
     defer session.deinit();
-    const metadata = @import("model_metadata.zig");
     const row = try session.metadata_cache.directory.upsert(.deepseek, "tiny");
     row.available = true;
     row.protocol = .chat;

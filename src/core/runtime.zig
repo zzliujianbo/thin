@@ -12,6 +12,7 @@ const session_context = @import("session_context.zig");
 const Io = std.Io;
 const tool_stream = @import("tool_stream.zig");
 pub const ToolView = tool_stream.View;
+pub const Inbox = @import("inbox.zig").Inbox;
 
 /// 单次工具执行的结果，由 Executor.execute_fn 返回或由 executeBatch 合成。
 pub const Execution = struct {
@@ -93,7 +94,7 @@ pub const Executor = struct {
 };
 
 /// 权限询问。id 由 Runtime 递增分配，与 tool_started / tool_result 事件关联。
-pub const Permission = struct { id: u64, tool_name: []const u8, description: []const u8 };
+pub const Permission = struct { id: u64, tool_name: []const u8, description: []const u8, interrupt: ?*Inbox = null };
 
 /// 用户对本次权限询问的答复，不授予后续调用权限。
 pub const Decision = enum { allow_once, deny };
@@ -174,6 +175,8 @@ pub const Event = union(enum) {
     /// Canonical visible blocks replace the current draft. Native replay is
     /// intentionally absent, including on final-only Responses streams.
     assistant_committed: []const p.Block,
+    user_committed: struct { id: u64, text: []const u8 },
+    permission_cleared: u64,
     /// 工具参数的流式预览，尚未校验，不能用于执行。
     tool_preview: struct { index: usize, arguments: []const u8, write_file: bool = false, argument_bytes: ?usize = null },
     tool_views: struct { generation: u64, phase: enum { begin, commit, discard } },
@@ -721,6 +724,9 @@ pub const Runtime = struct {
     host: Host,
     /// 可选只读观察者，由应用层在首次 run 前设置；不参与授权和错误传播。
     observer: Observer = .{},
+    inbox: ?*Inbox = null,
+    /// Worker-only reservation; kept until the committed batch is paired.
+    steering_lease: ?@import("inbox.zig").Lease = null,
     /// 系统提示词：启动时生成后固定不变，以便利用提示词缓存。
     system: []u8,
     /// 持有对话历史及其内容；压缩时整体替换，旧 arena 在提交后释放。
@@ -1137,6 +1143,15 @@ pub const Runtime = struct {
         // 占用运行权；defer 保证任何退出路径都会释放，防止永久 Busy。
         if (self.busy.swap(true, .acq_rel)) return error.Busy;
         defer self.busy.store(false, .release);
+        if (self.inbox) |box| box.beginRun();
+        var inbox_success = false;
+        defer if (self.inbox) |box| {
+            if (self.steering_lease) |lease| {
+                box.restore(lease);
+                self.steering_lease = null;
+            }
+            box.finishRun(inbox_success);
+        };
         self.observer.notify(.{ .submitted = switch (operation) {
             .prompt, .command => |text| text,
             .compact => "/compact",
@@ -1180,7 +1195,10 @@ pub const Runtime = struct {
         // Exactly one terminal result per accepted run, including failures. A
         // disconnected host need not receive it, but the caller still gets it.
         task.terminal.context_snapshot = self.contextSnapshot();
-        self.emit(.{ .finished = task.terminal }, cancel) catch {};
+        inbox_success = task.terminal.status == .success;
+        self.emit(.{ .finished = task.terminal }, cancel) catch {
+            inbox_success = false;
+        };
         return task.terminal;
     }
 
@@ -1467,6 +1485,45 @@ pub const Runtime = struct {
         retained.* = true;
     }
 
+    fn reserveSteering(self: *Runtime) bool {
+        if (self.steering_lease != null) return true;
+        const box = self.inbox orelse return false;
+        self.steering_lease = box.claimSteering();
+        return self.steering_lease != null;
+    }
+
+    /// Reserve first: OOM cannot let a concurrent enqueue steal restoration room.
+    /// protected_index continues to protect the ORIGINAL input across compaction.
+    fn consumeSteering(self: *Runtime, retained: *bool, cancel: *p.Cancellation) !bool {
+        const box = self.inbox orelse return false;
+        var consumed = false;
+        while (true) {
+            try checkCanceled(cancel);
+            if (self.poisoned) return error.CleanupFailed;
+            const lease = self.steering_lease orelse box.claimSteering() orelse return consumed;
+            self.steering_lease = null;
+            var resolved = false;
+            defer if (!resolved) box.restore(lease);
+            if (lease.text.len > self.config.limits.max_response_bytes) return error.InputTooLarge;
+            try self.retainCurrentInput(retained);
+            const a = self.arena.allocator();
+            const message = try p.cloneMessage(a, .{ .role = .user, .blocks = &.{.{ .text = lease.text }} });
+            try self.history.ensureUnusedCapacity(a, 1);
+            try checkCanceled(cancel);
+            var entry = box.commit(lease) orelse {
+                resolved = true;
+                continue;
+            };
+            resolved = true;
+            defer entry.deinit();
+            self.history.appendAssumeCapacity(message);
+            self.last_context_tokens = null;
+            consumed = true;
+            try self.emit(.{ .user_committed = .{ .id = entry.id, .text = message.blocks[0].text } }, cancel);
+            try self.emitContext(cancel);
+        }
+    }
+
     /// 主循环：预检（必要时压缩）→ 调用模型 → stop 则提交返回，否则执行工具批次。
     /// 不变量：模型输出的每个 tool_call 在返回前都会有对应 tool_result（见 executeBatch 的 errdefer）。
     fn runInner(self: *Runtime, text: []const u8, cancel: *p.Cancellation, task: *Task) !void {
@@ -1493,8 +1550,9 @@ pub const Runtime = struct {
         const input_blocks = [_]p.Block{.{ .text = text }};
         try self.history.append(self.arena.allocator(), .{ .role = .user, .blocks = &input_blocks });
 
-        while (true) {
+        model_loop: while (true) {
             try checkCanceled(cancel);
+            _ = try self.consumeSteering(&input_retained, cancel);
             // 预检：超过压缩阈值则先压缩。
             self.preflight(cancel, task) catch |err| {
                 // A bounded pause retains the accepted goal, including a paid
@@ -1509,7 +1567,9 @@ pub const Runtime = struct {
                 try self.retainCurrentInput(&input_retained);
                 return error.RoundLimit;
             }
-            task.countRound();
+            // A summary/host callback may have received steering. Re-plan with
+            // its committed input rather than sending an obsolete request.
+            if (try self.consumeSteering(&input_retained, cancel)) continue;
             try self.emitContext(cancel);
             try self.emit(.{ .state = .calling_model }, cancel);
 
@@ -1525,6 +1585,10 @@ pub const Runtime = struct {
             // only once, not on every model/tool round. Any failure still rolls
             // back the staged input before its stack block can escape runInner.
             try self.retainCurrentInput(&input_retained);
+            // Host callbacks above may enqueue too. Do not spend a model round
+            // or send until this final pre-request safe point is resolved.
+            if (try self.consumeSteering(&input_retained, cancel)) continue;
+            task.countRound();
             // 调用模型；协议选择与降级由 selector 处理。
             const result = self.selector.call(self.checkedModel(), result_arena.allocator(), try self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
                 self.last_context_tokens = null;
@@ -1561,6 +1625,17 @@ pub const Runtime = struct {
                 try self.emitContext(cancel);
                 try self.emit(.{ .assistant_committed = message.blocks }, cancel);
                 self.discardToolViews(cancel);
+                try checkCanceled(cancel);
+                if (self.inbox) |box| {
+                    // enqueue and sealing share one linearization lock. Late
+                    // steering stays pending for idle host dispatch.
+                    while (!box.sealTask()) {
+                        if (try self.consumeSteering(&input_retained, cancel)) continue :model_loop;
+                        // Withdrawal can win between seal and claim. Retry
+                        // sealing, not a new paid model round with no new user.
+                        try checkCanceled(cancel);
+                    }
+                }
                 return;
             }
 
@@ -1966,6 +2041,32 @@ pub const Runtime = struct {
     /// 不变量：批次一旦提交（emit assistant_committed），每个 tool_call 都必须获得结果，即使中途失败。
     const BatchKind = enum { normal, local };
 
+    /// The confirmation modal gates only NEW launches, not an in-flight model
+    /// or tool. Never mistake its beginTool refusal for a steering skip: wait
+    /// cancelably without holding the inbox lock, then linearize again.
+    fn confirmationBarrier(self: *Runtime, cancel: *p.Cancellation, kind: BatchKind) !bool {
+        const box = self.inbox orelse return true;
+        while (true) {
+            if (self.poisoned) return error.CleanupFailed;
+            try checkCanceled(cancel);
+            // An old pending Steering entry must not block or get consumed by
+            // an explicit local command. Confirmation still gates its launch.
+            if (kind == .local) {
+                if (!box.snapshot().confirming) return true;
+                try Io.sleep(self.io, .fromMilliseconds(2), .awake);
+                continue;
+            }
+            if (box.beginTool()) return true;
+            if (box.snapshot().confirming) {
+                try Io.sleep(self.io, .fromMilliseconds(2), .awake);
+                continue;
+            }
+            if (self.reserveSteering()) return false;
+            // Confirmation/withdrawal changed between snapshots. Retry the
+            // actual beginTool lock instead of granting a speculative launch.
+        }
+    }
+
     fn executeBatch(self: *Runtime, blocks: []const p.Block, cancel: *p.Cancellation, task: *Task, kind: BatchKind) !void {
         // 已处理到的块下标；errdefer 只为之后未处理的 call 补写结果。
         var next_block: usize = 0;
@@ -2017,18 +2118,18 @@ pub const Runtime = struct {
         try self.emit(.{ .tool_views = .{ .generation = self.display_generation, .phase = .commit } }, cancel);
         var display_ordinal: usize = 0;
 
-        while (next_block < blocks.len) {
+        calls: while (next_block < blocks.len) {
             const block = blocks[next_block];
             if (block != .tool_call) {
                 next_block += 1;
                 continue;
             }
             try checkCanceled(cancel);
+            if (kind == .normal and self.reserveSteering()) break :calls;
 
             // 模型给出的 call.id 只用于回填结果；事件使用 Runtime 分配的 host_id。
             const call = block.tool_call;
             const display_key: ?p.ToolDisplayKey = if (display_ordinal < display_count) display_keys[display_ordinal] else null;
-            display_ordinal += 1;
 
             // Monotonic for this Bridge. Wrapping to 0 would be <= last_id and
             // surface as InvalidPermission; overflow rebases or refuses first.
@@ -2040,14 +2141,21 @@ pub const Runtime = struct {
 
             // prepare 失败：不执行工具，但仍回填错误结果，保持 call 与 result 一一对应。
             var prepared = self.executor.prepare_fn(self.executor.context, a, call) catch |err| {
-                const result = Execution{ .text = @errorName(err), .is_error = true };
+                const result = Execution{ .text = @errorName(err), .is_error = true, .cleanup_failed = err == error.CleanupFailed };
+                // Readiness may expose an already-poisoned helper. Preserve this
+                // safety failure before any fallible history/host publication.
+                if (result.cleanup_failed) self.poisoned = true;
                 try self.appendResult(call.id, result);
                 next_block += 1;
+                display_ordinal += 1;
                 try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result, .display_key = display_key } }, cancel);
                 try self.emitContext(cancel);
+                if (result.cleanup_failed) return error.CleanupFailed;
                 continue;
             };
 
+            try checkCanceled(cancel);
+            if (kind == .normal and self.reserveSteering()) break :calls;
             if (self.decision_service) |service| if (prepared.decision_input) |input| {
                 const output = service.decide(a, input, cancel) catch |err| {
                     if (err == error.Canceled) return err;
@@ -2055,9 +2163,11 @@ pub const Runtime = struct {
                         self.poisoned = true;
                         return err;
                     }
+                    if (kind == .normal and self.reserveSteering()) break :calls;
                     return error.DecisionUnavailable;
                 };
                 try checkCanceled(cancel);
+                if (kind == .normal and self.reserveSteering()) break :calls;
                 validateDecisionOutput(input, output) catch return error.DecisionUnavailable;
                 switch (input) {
                     .command => {
@@ -2071,6 +2181,7 @@ pub const Runtime = struct {
                         const skipped: Execution = .{ .text = "Skipped: decision review found this memory write unnecessary; nothing was written." };
                         try self.appendResult(call.id, skipped);
                         next_block += 1;
+                        display_ordinal += 1;
                         try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = skipped, .display_key = display_key } }, cancel);
                         try self.emitContext(cancel);
                         continue;
@@ -2083,22 +2194,38 @@ pub const Runtime = struct {
 
             // 仅本次明确要求批准的调用询问；普通操作直接执行。
             if (prepared.explicit_denial != null) {
-                const permission = Permission{ .id = host_id, .tool_name = call.name, .description = prepared.description };
+                const permission = Permission{ .id = host_id, .tool_name = call.name, .description = prepared.description, .interrupt = if (kind == .normal) self.inbox else null };
                 try self.emit(.{ .state = .awaiting_permission }, cancel);
                 try self.emit(.{ .permission = permission }, cancel);
 
                 // 授权回调返回后再检查取消，避免取消后仍执行工具。
                 // Canceled is not a deny: the tool is not run, and observers do not
                 // record a user denial. Disconnect or a replaced request still returns deny.
-                const approval = try self.host.authorize_fn(self.host.context, permission, cancel);
+                const approval = self.host.authorize_fn(self.host.context, permission, cancel) catch |err| {
+                    if (err == error.Steered and kind == .normal and self.inbox != null) {
+                        try self.emit(.{ .permission_cleared = permission.id }, cancel);
+                        try checkCanceled(cancel);
+                        if (self.reserveSteering()) break :calls;
+                        // A withdrawal won after Bridge's interrupt check.
+                        // Retry preparation/approval with a fresh permission id.
+                        continue :calls;
+                    }
+                    return err;
+                };
                 self.observer.notify(.{ .decision = .{ .id = permission.id, .value = approval } });
                 try checkCanceled(cancel);
+                if (kind == .normal and self.reserveSteering()) {
+                    try self.emit(.{ .permission_cleared = permission.id }, cancel);
+                    break :calls;
+                }
                 switch (approval) {
                     .allow_once => {},
                     .deny => allowed = false,
                 }
             }
 
+            try checkCanceled(cancel);
+            if (kind == .normal and self.reserveSteering()) break :calls;
             // 默认结果为拒绝，只有通过授权时才真正执行。
             // 危险命令被拒绝时回传分类原因，而不是笼统的 denied。
             var result: Execution = .{ .text = prepared.explicit_denial orelse "User denied this action; it was not executed", .is_error = true };
@@ -2106,6 +2233,8 @@ pub const Runtime = struct {
                 // 工具调用次数限制在执行前检查。
                 if (task.tool_calls >= self.config.limits.max_tool_calls) return error.ToolCallLimit;
                 try self.emit(.{ .state = .executing_tool }, cancel);
+                try checkCanceled(cancel);
+                if (!try self.confirmationBarrier(cancel, kind)) break :calls;
                 const began = Io.Clock.awake.now(self.io);
                 // Dirty-marker failure returns before started_call, so this call
                 // is recorded as not executed and later calls in the batch are too.
@@ -2118,6 +2247,7 @@ pub const Runtime = struct {
                     .text = @errorName(err),
                     .is_error = true,
                     .canceled = err == error.Canceled,
+                    .cleanup_failed = err == error.CleanupFailed,
                 };
                 result.duration_ms = @intCast(@max(0, began.untilNow(self.io, .awake).toMilliseconds()));
             }
@@ -2142,6 +2272,7 @@ pub const Runtime = struct {
             try self.appendResult(call.id, result);
             started_call = null;
             next_block += 1;
+            display_ordinal += 1;
             try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result, .display_key = display_key } }, cancel);
             try self.emitContext(cancel);
 
@@ -2153,6 +2284,24 @@ pub const Runtime = struct {
 
             // 取消后不再执行后续 call；剩余 call 由 errdefer 补写 canceled 结果。
             if (result.canceled) return error.Canceled;
+        }
+        // Steering supersedes only calls that have not started. Complete the
+        // committed batch BEFORE the new user message can enter history.
+        while (next_block < blocks.len) {
+            const block = blocks[next_block];
+            if (block != .tool_call) {
+                next_block += 1;
+                continue;
+            }
+            try checkCanceled(cancel);
+            const skipped: Execution = .{ .text = "Skipped: superseded by steering before this call started; not executed.", .is_error = true };
+            const id = try self.allocatePermissionId();
+            const key: ?p.ToolDisplayKey = if (display_ordinal < display_count) display_keys[display_ordinal] else null;
+            try self.appendResult(block.tool_call.id, skipped);
+            next_block += 1;
+            display_ordinal += 1;
+            try self.emit(.{ .tool_result = .{ .id = id, .name = block.tool_call.name, .result = skipped, .display_key = key } }, cancel);
+            try self.emitContext(cancel);
         }
     }
 

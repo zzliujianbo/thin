@@ -123,10 +123,41 @@ fn resolvedProtocol(cache: *const Cache, index: usize) Protocol {
     const row = cache.directory.rows[index];
     if (row.protocol != .auto) return row.protocol;
     if (row.dev_protocol != .auto) return row.dev_protocol;
+    if (catalog.documentedProtocol(row.provider, cache.directory.name(index))) |api| return api;
     if (preset(row.provider, cache.directory.name(index))) |entry| return entry.model.protocol;
     // This exact service exposes Chat Completions, not a model-name heuristic.
     if (row.provider == .deepseek) return .chat;
     return .auto;
+}
+
+test "documented SystemOne fallback resolves listed Jev without inventing availability or capabilities" {
+    var cache: Cache = .{};
+    cache.directory_mask = bit(.opencode_zen);
+    const name = "jev-1.13-free";
+    try std.testing.expect(dynamicEntry(&cache, .opencode_zen, name) == null);
+    const row = try cache.directory.upsert(.opencode_zen, name);
+    row.available = true;
+    row.tokens = 65536;
+    row.dev_context_tokens = 65536;
+    row.dev_output_tokens = 4096;
+    var entry = dynamicEntry(&cache, .opencode_zen, name).?;
+    try std.testing.expectEqual(Protocol.systemone, entry.model.protocol);
+    try std.testing.expectEqual(@as(u32, 0), entry.model.context_tokens);
+    try std.testing.expect(entry.model.output_tokens == null);
+    try std.testing.expect(capacityFor(&cache, entry) == null);
+    try std.testing.expect(outputFor(&cache, entry) == null);
+    try std.testing.expect(entryDeclaration(&cache, entry) == null);
+    try std.testing.expect(inputPriceThresholdFor(&cache, entry) == null);
+    row.protocol = .responses;
+    try std.testing.expectEqual(Protocol.responses, dynamicEntry(&cache, .opencode_zen, name).?.model.protocol);
+    row.protocol = .auto;
+    row.dev_protocol = .chat;
+    entry = dynamicEntry(&cache, .opencode_zen, name).?;
+    try std.testing.expectEqual(Protocol.chat, entry.model.protocol);
+    row.dev_protocol = .auto;
+    row.available = false;
+    try std.testing.expect(dynamicEntry(&cache, .opencode_zen, name) == null);
+    try std.testing.expect(dynamicEntry(&cache, .opencode_go, name) == null);
 }
 
 fn storedEntry(cache: *const Cache, index: usize) catalog.Entry {

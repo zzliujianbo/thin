@@ -175,12 +175,28 @@ pub fn build(b: *std.Build) void {
     run_settings.setCwd(b.path("."));
     b.step("test-settings", "Run isolated global settings PTY acceptance without inference").dependOn(&run_settings.step);
 
+    // Focused image group; normal test-app also includes it exactly once.
+    const run_image = b.addSystemCommand(&.{"node"});
+    run_image.addFileArg(b.path("tests/product/app_mock.mjs"));
+    run_image.addArtifactArg(exe);
+    run_image.addArtifactArg(pty_driver);
+    run_image.addArg("--image-model-only");
+    run_image.setCwd(b.path("."));
+    b.step("test-image", "Run owned local-image HTTP and Settings PTY acceptance").dependOn(&run_image.step);
+
     const run_command = b.addSystemCommand(&.{"node"});
     run_command.addFileArg(b.path("tests/product/local_command_mock.mjs"));
     run_command.addArtifactArg(exe);
     run_command.addArtifactArg(pty_driver);
     run_command.setCwd(b.path("."));
     b.step("test-command", "Run owned local-command approval, denial, cancellation and timeout PTYs").dependOn(&run_command.step);
+
+    const run_approval_cancel = b.addSystemCommand(&.{"node"});
+    run_approval_cancel.addFileArg(b.path("tests/product/approval_cancel_mock.mjs"));
+    run_approval_cancel.addArtifactArg(exe);
+    run_approval_cancel.addArtifactArg(pty_driver);
+    run_approval_cancel.setCwd(b.path("."));
+    b.step("test-approval-cancel", "Run owned long-approval Escape context-restoration PTY").dependOn(&run_approval_cancel.step);
 
     const run_tool_preview = b.addSystemCommand(&.{"node"});
     run_tool_preview.addFileArg(b.path("tests/product/tool_preview_mock.mjs"));
@@ -197,6 +213,13 @@ pub fn build(b: *std.Build) void {
     run_tool_presentation.setCwd(b.path("."));
     b.step("test-tool-presentation", "Run owned tool animation, result rows, file counts and Memory captions").dependOn(&run_tool_presentation.step);
 
+    const run_queued = b.addSystemCommand(&.{"node"});
+    run_queued.addFileArg(b.path("tests/product/steering_followup_mock.mjs"));
+    run_queued.addArtifactArg(exe);
+    run_queued.addArtifactArg(pty_driver);
+    run_queued.setCwd(b.path("."));
+    b.step("test-queued", "Run owned steering, follow-up, withdrawal and stop-clear confirmation PTYs").dependOn(&run_queued.step);
+
     // 聚合步骤 `zig build test`：依次挂载所有离线测试（不含需要真实 API 的内容）。
     const test_all = b.step("test", "Run all offline unit, transport, application and foundation tests");
     test_all.dependOn(&run_unit.step);
@@ -208,7 +231,9 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_app.step);
     test_all.dependOn(&run_settings.step);
     test_all.dependOn(&run_command.step);
+    test_all.dependOn(&run_approval_cancel.step);
     test_all.dependOn(&run_tool_preview.step);
+    test_all.dependOn(&run_queued.step);
     test_all.dependOn(&run.step);
 }
 

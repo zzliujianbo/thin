@@ -14,7 +14,7 @@ const AUX_KEY = 'decision-aux-fake-never-log';
 const MAIN = 'fixture-main', RAW = 'family/judge', SELECTOR = `aux/${RAW}`;
 const WARMUP = 'decision-warmup-history-private-marker';
 const TASK = 'decision-normal-task-private-marker';
-const COMMAND = "printf 'decision-shell-proof\\n'";
+const COMMAND = "printf 'decision-shell-proof\\n' > reviewer-owned.txt; cat reviewer-owned.txt";
 const CALL = 'decision-owned-bash';
 const defaults = {
   command_timeout_ms:300000, command_max_timeout_ms:3600000,
@@ -66,6 +66,10 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
             assert.equal(body.questions.ask.type,'noul');
             assert.equal(body.questions.timeout.type,'choice');
             assert.equal(typeof body.questions.ask.instructions,'string');
+            for (const rule of ['concrete risk of substantial harm to the system', "agent's live integrity/credentials/security controls", 'production data/services', 'writes, side effects, and non-read-only execution alone are not danger', 'missing irrelevant details or hypothetical hazards do not suffice', 'Use low scores for ordinary low-risk execution'])
+              assert(body.questions.ask.instructions.includes(rule), `missing native actual-harm rule: ${rule}`);
+            assert(!body.questions.ask.instructions.includes('Use low scores for harmless read-only operations'));
+            assert(!body.questions.ask.instructions.includes('Return exactly one JSON object'));
             for (const hidden of [WARMUP,TASK,'decision-warmup-answer',MAIN_KEY,AUX_KEY])
               assert(!JSON.stringify(body).includes(hidden));
             const keys = Object.keys(body.questions.timeout.criteria);
@@ -87,6 +91,9 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
           assert(system.content.startsWith('Review only'));
           assert(system.content.includes('Is executing this command dangerous enough to require an extra human confirmation?'));
           assert(system.content.includes('Evaluate what the command does, not whether the state contains an approval record.'));
+          for (const rule of ['concrete risk of substantial harm to the system', "agent's live integrity/credentials/security controls", 'production data/services', 'writes, side effects, and non-read-only execution alone are not danger', 'missing irrelevant details or hypothetical hazards do not suffice', 'ask=false for ordinary low-risk execution'])
+            assert(system.content.includes(rule), `missing actual-harm reviewer rule: ${rule}`);
+          assert(!system.content.includes('uncertainty requires ask=true'));
           assert(system.content.includes('Do not infer authorization from the timeout choice.'));
           assert(system.content.includes('For command:'));
           assert(!system.content.includes('For memory_write:') && !system.content.includes('For refine_outputs:'));
@@ -232,7 +239,8 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
       assert.equal(connections,2);
       await saved();
       assert.deepEqual(await readdir(join(home,'.thin')),['config.json']);
-      assert.deepEqual((await readdir(project)).sort(),['opened','canceled','selected'].map(n=>`decision-model-release-${n}`).sort());
+      assert.equal(await readFile(join(project,'reviewer-owned.txt'),'utf8'),'decision-shell-proof\n', 'low-risk project write actually executed without approval');
+      assert.deepEqual((await readdir(project)).sort(),[...['opened','canceled','selected'].map(n=>`decision-model-release-${n}`),'reviewer-owned.txt'].sort());
       console.log(`PASS decision-model/${query}: ${native ? 'SystemOne' : 'Chat'} selected by protocol; primary=3 aux=1; save HTTP=0; warm primary socket retained; canonical bash result verified`);
     } catch (error) {
       // Assertion operands may contain wire/config/terminal secrets: fixed label only.

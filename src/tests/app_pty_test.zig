@@ -417,8 +417,8 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     try settingsKey(d, "/settings\r");
     const before = if (on) "off" else "on";
     const after = if (off) "off" else "on";
-    const decision_before = if (absent or native or on) "off" else "Configured";
-    const decision_after = if (absent or off) "off" else "Configured";
+    const decision_before = if (absent or native or on) "Off" else "native/family/native-review";
+    const decision_after = if (absent or off) "Off" else "native/family/native-review";
     try settingsValues(d, before, decision_before, 0);
     if (off or on) {
         try settingsKey(d, "\r");
@@ -511,7 +511,7 @@ fn decisionModel(d: *Driver, init: std.process.Init, mode: []const u8, project: 
     try settingsKey(d, "\x1b[B");
     try decisionModelScreen(d, a, &.{"> Decision model"}, &.{});
     try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{ "> Off", "aux/family/judge", "primary/fixture-main" }, &.{ "locked/secret-model", "OpenCode Jev Free", "Logged-in model", "Search> ", "Request timeout" });
+    try decisionModelScreen(d, a, &.{ "> Off", "aux/family/judge", "primary/fixture-main", "Search> " }, &.{ "locked/secret-model", "OpenCode Jev Free", "Logged-in model", "Request timeout" });
     try decisionModelGate(d, a, project, "opened");
     try settingsDecisionChoose(d, "aux/family/judge", backwards);
     // A pasted identity plus Enter cannot save or fabricate a candidate.
@@ -524,17 +524,26 @@ fn decisionModel(d: *Driver, init: std.process.Init, mode: []const u8, project: 
 
     try settingsKey(d, "\r");
     try settingsDecisionChoose(d, "aux/family/judge", backwards);
-    try decisionModelScreen(d, a, &.{"> aux/family/judge"}, &.{ "locked/secret-model", "Search> " });
+    try decisionModelScreen(d, a, &.{ "> aux/family/judge", "Search> " }, &.{"locked/secret-model"});
+    // Search intersects provider and raw-ID tokens, case-insensitively. A query
+    // with no candidates cannot invent a choice or save on Enter.
+    try settingsKey(d, "missing-decision-query");
+    try decisionModelScreen(d, a, &.{ "Search> missing-decision-query", "No matching models" }, &.{ "> Off", "aux/family/judge", "primary/fixture-main" });
+    try d.send("\r");
+    try d.quiet(30);
+    try decisionModelScreen(d, a, &.{"No matching models"}, &.{"Decision model   aux/family/judge"});
+    try settingsKey(d, "\x15AUX /JUDGE");
+    try decisionModelScreen(d, a, &.{ "Search> AUX /JUDGE", "> aux/family/judge" }, &.{ "> Off", "primary/fixture-main", "locked/secret-model", "No matching models" });
     // Settings now returns a generic Ready notice. Authorize success from the
     // completed owner-published frame and the following whole-JSON gate, not a
     // removed selection-specific caption.
     try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{ "> Decision model", "Decision model   Configured" }, &.{ "Search> ", "Logged-in model" });
+    try decisionModelScreen(d, a, &.{ "> Decision model", "Decision model   aux/family/judge" }, &.{ "Search> ", "Logged-in model", "AUX /JUDGE", "missing-decision-query" });
     try decisionModelGate(d, a, project, "selected");
     start = d.used;
     try d.send("\x1b");
     try d.waitIdle(start);
-    try decisionModelScreen(d, a, &.{"fixture-main"}, &.{"family/judge"});
+    try decisionModelScreen(d, a, &.{"fixture-main"}, &.{ "family/judge", "AUX /JUDGE", "missing-decision-query" });
     start = d.used;
     try d.send("decision-normal-task-private-marker\r");
     // The server only emits this AFTER inspecting the canonical bash result,
@@ -543,6 +552,72 @@ fn decisionModel(d: *Driver, init: std.process.Init, mode: []const u8, project: 
     try d.waitIdle(start);
     try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
     try decisionModelScreen(d, a, &.{"fixture-main"}, &.{});
+}
+
+// Image selection owns separate ACKed gates; no timer stands in for a save.
+fn imageModelGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
+    const path = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "{s}/image-model-release-{s}", .{ project, name }), 0);
+    try check(access(path, 0) == -1 and c._errno().* == 2);
+    std.debug.print("IMAGE_MODEL_GATE={s}\n", .{name});
+    const until = now() + 10000;
+    while (now() < until) {
+        if (access(path, 0) == 0) return;
+        try check(c._errno().* == 2);
+        try d.drain(20);
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.ImageModelGateTimeout;
+}
+
+fn imageModel(d: *Driver, init: std.process.Init, project: []const u8) !void {
+    const a = init.arena.allocator();
+    try d.waitIdle(0);
+    var start = d.used;
+    try d.send("image-warmup-history-private-marker\r");
+    try d.waitText(start, "image-warmup-answer");
+    try d.waitIdle(start);
+    try settingsKey(d, "/settings\r");
+    // Preserve the seven original positions; Image is appended at index 7.
+    for (0..7) |_| try settingsKey(d, "\x1b[B");
+    try decisionModelScreen(d, a, &.{ "> Image model", "Image model      Off" }, &.{});
+    try settingsKey(d, "\r");
+    try decisionModelScreen(d, a, &.{ "> Off", "aux/deepseek-flash", "Search> " }, &.{ "primary/fixture-main", "locked/deepseek-flash", "aux/not-image" });
+    try imageModelGate(d, a, project, "opened");
+    try settingsKey(d, "aux/deepseek-flash");
+    try decisionModelScreen(d, a, &.{"> aux/deepseek-flash"}, &.{});
+    try settingsKey(d, "\x1b");
+    try decisionModelScreen(d, a, &.{"> Image model"}, &.{"Search> "});
+    try imageModelGate(d, a, project, "canceled");
+    try settingsKey(d, "\r");
+    try settingsKey(d, "aux/deepseek-flash");
+    try decisionModelScreen(d, a, &.{"> aux/deepseek-flash"}, &.{});
+    try settingsKey(d, "\r");
+    try decisionModelScreen(d, a, &.{ "> Image model", "aux/deepseek-flash" }, &.{"Search> "});
+    try imageModelGate(d, a, project, "selected");
+    start = d.used;
+    try d.send("\x1b");
+    try d.waitIdle(start);
+    start = d.used;
+    try d.send("image-normal-task-private-marker\r");
+    try d.waitFrame(start, "image-tool-result-verified");
+    try d.waitIdle(start);
+    try settingsKey(d, "/settings\r");
+    for (0..7) |_| try settingsKey(d, "\x1b[B");
+    try decisionModelScreen(d, a, &.{"> Image model"}, &.{});
+    try settingsKey(d, "\r");
+    try settingsKey(d, "\x15Off");
+    try decisionModelScreen(d, a, &.{"> Off"}, &.{"aux/deepseek-flash"});
+    try settingsKey(d, "\r");
+    try decisionModelScreen(d, a, &.{ "> Image model", "Image model      Off" }, &.{"Search> "});
+    try imageModelGate(d, a, project, "off");
+    start = d.used;
+    try d.send("\x1b");
+    try d.waitIdle(start);
+    // A subsequent explicit request proves Off actually removes the tool.
+    start = d.used;
+    try d.send("image-off-proof\r");
+    try d.waitFrame(start, "image-off-verified");
+    try d.waitIdle(start);
 }
 
 // Shared request-timeout and main-preference journey, with direct Decision choices.
@@ -616,57 +691,57 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try settingsValueGate(d, a, project, "compaction");
 
     try settingsValueOpen(d, a, "Command timeout");
-    try decisionModelScreen(d, a, &.{ "> 123456 ms (current)", "Custom (ms)..." }, &.{});
+    try decisionModelScreen(d, a, &.{ "> 123.456 s (current)", "Custom (s)..." }, &.{});
     try settingsValueGate(d, a, project, "current");
-    try settingsValueOpen(d, a, "Custom (ms)...");
-    try decisionModelScreen(d, a, &.{ "Custom: _ ms", "Enter stages" }, &.{});
+    try settingsValueOpen(d, a, "Custom (s)...");
+    try decisionModelScreen(d, a, &.{ "Custom: _ s", "up to 3 decimals", "Enter stages" }, &.{});
     // Invalid candidates may intentionally have no confirmable ACK and emit
     // no new frame on Enter. Observe the existing screen, not waitFrame.
     try d.send("\r");
     try d.quiet(30);
-    try decisionModelScreen(d, a, &.{"Custom: _ ms"}, &.{"(staged)"});
+    try decisionModelScreen(d, a, &.{"Custom: _ s"}, &.{"(staged)"});
     try settingsValueGate(d, a, project, "invalid-empty");
     try settingsKey(d, "0");
     try d.send("\r");
     try d.quiet(30);
-    try decisionModelScreen(d, a, &.{"Custom: 0_ ms"}, &.{"(staged)"});
+    try decisionModelScreen(d, a, &.{"Custom: 0_ s"}, &.{"(staged)"});
     try settingsValueGate(d, a, project, "invalid-zero");
     try settingsKey(d, "\x15"); // Ctrl-U must clear all digits, not edit the composer.
-    try decisionModelScreen(d, a, &.{"Custom: _ ms"}, &.{});
-    try settingsKey(d, "4294967296");
+    try decisionModelScreen(d, a, &.{"Custom: _ s"}, &.{});
+    try settingsKey(d, "4294967.296"); // Same u32-ms overflow, expressed in seconds.
     try d.send("\r");
     try d.quiet(30);
-    try decisionModelScreen(d, a, &.{"Custom: 4294967296_ ms"}, &.{"(staged)"});
+    try decisionModelScreen(d, a, &.{"Custom: 4294967.296_ s"}, &.{"(staged)"});
     try settingsValueGate(d, a, project, "invalid-overflow");
     try settingsKey(d, "\x1b[D"); // edit -> candidate list, not parent Settings.
-    try decisionModelScreen(d, a, &.{"> Custom (ms)..."}, &.{"Custom:"});
+    try decisionModelScreen(d, a, &.{"> Custom (s)..."}, &.{"Custom:"});
     try settingsValueGate(d, a, project, "edit-cancel");
     try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{"Custom: _ ms"}, &.{});
-    try settingsKey(d, "120001");
+    try decisionModelScreen(d, a, &.{"Custom: _ s"}, &.{});
+    try settingsKey(d, "120.001");
     // Two Enters in ONE input batch must only stage. The owner drops remaining
     // batch input, publishes a fresh generation, and waits for its frame ACK.
     try settingsKey(d, "\r\r");
-    try decisionModelScreen(d, a, &.{"> 120001 ms (staged)"}, &.{"Custom:"});
+    try decisionModelScreen(d, a, &.{"> 120.001 s (staged)"}, &.{"Custom:"});
     try settingsValueGate(d, a, project, "staged-cancel");
     try settingsKey(d, "\x1b"); // staged candidate -> parent, no save.
     try decisionModelScreen(d, a, &.{"> Command timeout"}, &.{"Custom ("});
     try settingsValueGate(d, a, project, "canceled");
 
     try settingsValueOpen(d, a, "Command timeout");
-    try decisionModelScreen(d, a, &.{"> 123456 ms (current)"}, &.{"120001 ms"});
-    try settingsValueOpen(d, a, "Custom (ms)...");
-    try settingsKey(d, "120000");
+    try decisionModelScreen(d, a, &.{"> 123.456 s (current)"}, &.{"120.001 s"});
+    try settingsValueOpen(d, a, "Custom (s)...");
+    try settingsKey(d, "120");
     try settingsKey(d, "\r\r");
-    try decisionModelScreen(d, a, &.{"> 120000 ms (staged)"}, &.{"Custom:"});
+    try decisionModelScreen(d, a, &.{"> 120 s (staged)"}, &.{"Custom:"});
     try settingsValueGate(d, a, project, "command-staged");
     try settingsKey(d, "\r"); // Separate Enter only after fresh ACK and disk gate.
-    try decisionModelScreen(d, a, &.{ "> Command timeout", "120000 ms" }, &.{"Custom ("});
+    try decisionModelScreen(d, a, &.{ "> Command timeout", "120 s" }, &.{"Custom ("});
     try settingsValueGate(d, a, project, "command");
 
     try settingsValueOpen(d, a, "Request timeout");
-    try decisionModelScreen(d, a, &.{"> 10000 ms (current)"}, &.{});
-    try settingsValueChoose(d, a, "60000 ms", "Request timeout");
+    try decisionModelScreen(d, a, &.{"> 10 s (current)"}, &.{});
+    try settingsValueChoose(d, a, "60 s", "Request timeout");
     try settingsValueGate(d, a, project, "request");
     try settingsValueOpen(d, a, "Output limit");
     try decisionModelScreen(d, a, &.{"> 100 tokens (current)"}, &.{});
@@ -680,7 +755,7 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try settingsValueChoose(d, a, "4096 tokens", "Output limit");
     try settingsValueGate(d, a, project, "output-restored");
     try settingsValueOpen(d, a, "Task timeout");
-    try settingsValueChoose(d, a, "900000 ms", "Task timeout");
+    try settingsValueChoose(d, a, "900 s", "Task timeout");
     try settingsValueGate(d, a, project, "task");
 
     try settingsValueOpen(d, a, "Decision model");
@@ -706,6 +781,102 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try decisionModelScreen(d, a, &.{"fixture-main"}, &.{});
 }
 
+// Whole-capture replay through the last ACK, not a suffix that loses native
+// scrollback or an in-flight frame. Keep this large fixture off the stack.
+fn approvalCancelScreen(d: *Driver, view: *regular.Screen) !void {
+    const raw = d.output[0..d.used];
+    const ack = std.mem.lastIndexOf(u8, raw, "\x1b[?25h") orelse return error.MissingApprovalCancelAck;
+    view.* = .{};
+    try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
+}
+
+fn checkApprovalCancelRestored(view: *const regular.Screen) !void {
+    std.debug.print("APPROVAL_CANCEL_SCREEN last_visible={any} prior_total={d} history={d}\n", .{ view.visible("PRIOR-CANCEL-17"), view.count("PRIOR-CANCEL-"), view.history_len });
+    try check(view.visible("PRIOR-CANCEL-17"));
+    var marker: [32]u8 = undefined;
+    var visible_prior: usize = 0;
+    for (0..18) |i| {
+        const text = try std.fmt.bufPrint(&marker, "PRIOR-CANCEL-{d:0>2}", .{i});
+        // count includes history AND grid: restore must not reprint old rows.
+        try check(view.count(text) == 1);
+        if (view.visible(text)) visible_prior += 1;
+    }
+    try check(view.count("Approval #") == 0 and view.count("GHOST-CANCEL-ONLY") == 0);
+    try check(view.row == 23);
+    const composer = &view.grid[23];
+    try check(std.mem.indexOf(u8, composer, ") > ") != null);
+    const tail = std.mem.trimEnd(u8, composer, " ");
+    try check(view.col == tail.len + @as(usize, if (std.mem.endsWith(u8, tail, ") >")) 1 else 0));
+    // Catch the original screenful of erased body, not just a surviving tail
+    // marker. This compact fixture leaves many prior lines in the viewport.
+    try check(visible_prior >= 8);
+    var occupied: usize = 0;
+    var blanks: usize = 0;
+    var longest_blank: usize = 0;
+    for (view.grid[0..23]) |row| {
+        if (std.mem.trim(u8, &row, " ").len == 0) {
+            blanks += 1;
+            longest_blank = @max(longest_blank, blanks);
+        } else {
+            occupied += 1;
+            blanks = 0;
+        }
+    }
+    try check(occupied >= 10 and longest_blank <= 5);
+}
+
+fn approvalCancel(d: *Driver) !void {
+    const a = std.heap.page_allocator;
+    const view = try a.create(regular.Screen);
+    defer a.destroy(view);
+    try d.waitIdle(0);
+    var start = d.used;
+    try d.send("approval-cancel-seed\r");
+    try queuedScreen(d, a, start, &.{"PRIOR-CANCEL-17"});
+    try queuedIdle(d, a, start);
+    try approvalCancelScreen(d, view);
+    try check(view.visible("PRIOR-CANCEL-17"));
+    for (0..18) |i| {
+        var marker: [32]u8 = undefined;
+        try check(view.count(try std.fmt.bufPrint(&marker, "PRIOR-CANCEL-{d:0>2}", .{i})) == 1);
+    }
+
+    start = d.used;
+    try d.send("approval-cancel-long\r");
+    try queuedScreen(d, a, start, &.{ "Approval #", "GHOST-CANCEL-ONLY" });
+    try approvalCancelScreen(d, view);
+    const history_before = view.history_len;
+    const waiting = d.used;
+    try d.quiet(2400);
+    try check(d.owned);
+    const titles = std.mem.count(u8, d.output[waiting..d.used], "Approval #");
+    try approvalCancelScreen(d, view);
+    try check(titles == 0 and view.history_len == history_before);
+    try check(view.count("Approval #") == 1 and view.visible("GHOST-CANCEL-ONLY"));
+    std.debug.print("APPROVAL_CANCEL_WAIT repeated_titles={d}\n", .{titles});
+
+    // Standalone ESC: no following byte may mask the parser's 150ms expiry.
+    start = d.used;
+    try d.send("\x1b");
+    try queuedScreen(d, a, start, &.{"Canceled"});
+    try queuedIdle(d, a, start);
+    try approvalCancelScreen(d, view);
+    try checkApprovalCancelRestored(view);
+    start = d.used;
+    try d.send("cancel-live-draft");
+    try queuedScreen(d, a, start, &.{"cancel-live-draft"});
+    try approvalCancelScreen(d, view);
+    try checkApprovalCancelRestored(view);
+    try check(std.mem.endsWith(u8, std.mem.trimEnd(u8, &view.grid[23], " "), "cancel-live-draft"));
+    start = d.used;
+    try d.send("\x15");
+    try queuedIdle(d, a, start);
+    try approvalCancelScreen(d, view);
+    try checkApprovalCancelRestored(view);
+    try check(std.mem.endsWith(u8, std.mem.trimEnd(u8, &view.grid[23], " "), ") >"));
+    std.debug.print("APPROVAL_CANCEL_GATE=verified\n", .{});
+}
+
 fn localCommand(d: *Driver, mode: []const u8) !void {
     // Do not materialize another large Screen on this history driver's stack.
     errdefer std.debug.print("command PTY tail: {s}\n", .{d.output[d.used -| 3000..d.used]});
@@ -714,7 +885,46 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
     const deny = std.mem.eql(u8, mode, "settings-command-deny");
     const cancel = std.mem.eql(u8, mode, "settings-command-cancel");
     const timeout = std.mem.eql(u8, mode, "settings-command-timeout");
-    try check(accept or deny or cancel or timeout);
+    const stable = std.mem.eql(u8, mode, "settings-command-stable");
+    try check(accept or deny or cancel or timeout or stable);
+    if (stable) {
+        var source: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        defer source.deinit();
+        try source.writer.writeAll("  !rm -rf absent; touch stable-executed; #");
+        for (0..125) |i| try source.writer.print(" synthetic-step-{d}: 中文注释 abcdefghijklmnopqrstuvwxyz", .{i});
+        try source.writer.writeByte('\r');
+        const submitted = d.used;
+        try d.send(source.written());
+        try d.waitFrame(submitted, "Approval #");
+        const view = try std.heap.page_allocator.create(regular.Screen);
+        defer std.heap.page_allocator.destroy(view);
+        const ack_before = std.mem.lastIndexOf(u8, d.output[0..d.used], "\x1b[?25h").? + "\x1b[?25h".len;
+        view.* = .{};
+        try view.replay(d.output[0..ack_before]);
+        const history_before = view.history_len;
+        try check(view.visible("Approval #"));
+        const waiting = d.used;
+        try d.quiet(2400);
+        try check(d.owned);
+        const titles = std.mem.count(u8, d.output[waiting..d.used], "Approval #");
+        const ack_after = std.mem.lastIndexOf(u8, d.output[0..d.used], "\x1b[?25h").? + "\x1b[?25h".len;
+        view.* = .{};
+        try view.replay(d.output[0..ack_after]);
+        std.debug.print("APPROVAL_WAIT repeated_titles={d} history_delta={d} visible_titles={d}\n", .{ titles, view.history_len -| history_before, view.count("Approval #") });
+        try check(titles == 0 and view.history_len == history_before and view.count("Approval #") == 1);
+        // An actual scroll still redraws and needs a fresh completed frame;
+        // freezing idle animation must not freeze input or approval controls.
+        const scrolled = d.used;
+        try d.send("\x1b[B");
+        try d.waitFrame(scrolled, "Approval #");
+        const armed = d.used;
+        try d.send("\t");
+        try d.waitFrame(armed, "Approval #");
+        const denied = d.used;
+        try d.send("n");
+        try d.waitIdle(denied);
+        return;
+    }
     // Empty command, bracketed paste and submit batch tail must not execute.
     if (deny) {
         var start = d.used;
@@ -737,6 +947,11 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
     // Both command preview and approval must belong to a completed new frame.
     try d.waitFrame(start, command);
     try d.waitFrame(start, "Approval #");
+    // Ordinary text (including y/n) belongs to the queue composer. Tab arms
+    // the separate one-shot approval controls, then await their fresh frame.
+    const armed = d.used;
+    try d.send("\t");
+    try d.waitFrame(armed, "Approval #");
     const answered = d.used;
     try d.send(if (deny) "n" else "y");
     if (cancel) {
@@ -777,6 +992,9 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         const batch = d.used;
         try d.send("!rm -rf absent; touch batch-first\r!touch batch-tail\r");
         try d.waitFrame(batch, "Approval #");
+        const deny_armed = d.used;
+        try d.send("\t");
+        try d.waitFrame(deny_armed, "Approval #");
         const rejected = d.used;
         try d.send("n");
         try d.waitIdle(rejected);
@@ -898,6 +1116,208 @@ fn toolPreview(d: *Driver, init: std.process.Init, mode: []const u8, project: []
     std.debug.print("PREVIEW_GATE=verified\n", .{});
 }
 
+// Queued product scenarios deliberately reuse the real fork/PTY/ACK helpers.
+// Stage markers contain only fixed fixture names; captured terminal bytes stay
+// in the owned project on failure, never in the parent console.
+fn queuedFile(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
+    const path = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "{s}/{s}", .{ project, name }), 0);
+    const until = now() + 15000;
+    while (now() < until) {
+        if (access(path, 0) == 0) return;
+        try check(c._errno().* == 2);
+        try d.drain(20);
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.QueuedFileDeadline;
+}
+
+fn queuedGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
+    std.debug.print("QUEUED_GATE={s}\n", .{name});
+    try queuedFile(d, a, project, try std.fmt.allocPrint(a, "release-{s}", .{name}));
+}
+
+// Replay only through the LAST complete cursor ACK, never an in-flight diff.
+fn queuedScreen(d: *Driver, a: std.mem.Allocator, since: usize, needles: []const []const u8) !void {
+    const view = try a.create(regular.Screen);
+    defer a.destroy(view);
+    const until = now() + 15000;
+    while (now() < until) {
+        try d.drain(20);
+        const raw = d.output[0..d.used];
+        if (std.mem.lastIndexOf(u8, raw, "\x1b[?25h")) |ack| {
+            if (ack >= since) {
+                view.* = .{};
+                try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
+                var found = true;
+                for (needles) |needle| found = found and view.visible(needle);
+                if (found) return;
+            }
+        }
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.QueuedScreenDeadline;
+}
+
+fn queuedKey(d: *Driver, a: std.mem.Allocator, bytes: []const u8, needles: []const []const u8) !void {
+    const start = d.used;
+    try d.send(bytes);
+    try queuedScreen(d, a, start, needles);
+}
+
+fn queuedIdle(d: *Driver, a: std.mem.Allocator, since: usize) !void {
+    const view = try a.create(regular.Screen);
+    defer a.destroy(view);
+    const until = now() + 15000;
+    while (now() < until) {
+        try d.drain(20);
+        const raw = d.output[0..d.used];
+        if (std.mem.lastIndexOf(u8, raw, "\x1b[?25h")) |ack| {
+            if (ack >= since) {
+                view.* = .{};
+                try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
+                const row = &view.grid[view.row];
+                if (std.mem.indexOf(u8, row, ") > ") != null or std.mem.startsWith(u8, row, "> ")) return;
+            }
+        }
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.QueuedIdleDeadline;
+}
+
+fn queuedDraft(d: *Driver, a: std.mem.Allocator, text: []const u8) !void {
+    const view = try a.create(regular.Screen);
+    defer a.destroy(view);
+    const until = now() + 15000;
+    while (now() < until) {
+        try d.drain(20);
+        const raw = d.output[0..d.used];
+        if (std.mem.lastIndexOf(u8, raw, "\x1b[?25h")) |ack| {
+            view.* = .{};
+            try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
+            const row = &view.grid[view.row];
+            // Require the ENTIRE acknowledged editor tail, not recalled text
+            // still visible in a pending row or an unrelated animation ACK.
+            if (std.mem.lastIndexOf(u8, row, ") ")) |prefix| {
+                if (prefix + 4 <= row.len and
+                    std.mem.eql(u8, std.mem.trimEnd(u8, row[prefix + 4 ..], " "), text)) return;
+            }
+        }
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.QueuedComposerDeadline;
+}
+
+fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project: []const u8) !void {
+    const a = init.arena.allocator();
+    errdefer {
+        const path = std.fmt.allocPrint(a, "{s}/queued-pty.log", .{project}) catch unreachable;
+        std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = d.output[0..d.used] }) catch {};
+    }
+    const steer = std.mem.eql(u8, mode, "test-queued-steer");
+    const withdraw = std.mem.eql(u8, mode, "test-queued-withdraw");
+    const cancel = std.mem.eql(u8, mode, "test-queued-cancel");
+    const natural = std.mem.eql(u8, mode, "test-queued-natural");
+    try check(steer or withdraw or cancel or natural);
+    try d.waitIdle(0);
+    const start = d.used;
+    try d.send("queued-start\r");
+    if (withdraw) {
+        try queuedScreen(d, a, start, &.{"queued-held"});
+    } else {
+        // A tool caption/argument preview is NOT execution evidence.
+        try queuedFile(d, a, project, "started");
+        if (natural) try queuedFile(d, a, project, "natural-awaiting");
+        try d.waitBusy(start);
+    }
+    try queuedKey(d, a, "keep-steer\r", &.{"Steering pending #1: keep-steer"});
+    try queuedDraft(d, a, "");
+    try queuedKey(d, a, if (withdraw) "old-follow\x1b\r" else "keep-follow\x1b\r", &.{if (withdraw) "FollowUp pending #2: old-follow" else "FollowUp pending #2: keep-follow"});
+    try queuedDraft(d, a, "");
+    if (withdraw) {
+        try queuedKey(d, a, "\x1b", &.{"old-follow"});
+        try queuedDraft(d, a, "old-follow");
+        try queuedGate(d, a, project, "withdrawn-follow");
+        // Retyping after Ctrl-U and Enter creates a NEW Steering message.
+        try queuedKey(d, a, "\x15new-steer\r", &.{"Steering pending #3: new-steer"});
+        try queuedDraft(d, a, "");
+        try queuedKey(d, a, "\x1b", &.{"new-steer"});
+        try queuedDraft(d, a, "new-steer");
+        // And a second recall can freely switch back to FollowUp.
+        try queuedKey(d, a, "\x15new-follow\x1b\r", &.{"FollowUp pending #4: new-follow"});
+        try queuedDraft(d, a, "");
+    }
+    if (steer or withdraw) {
+        try queuedGate(d, a, project, "queued");
+        try queuedScreen(d, a, start, &.{"queued-follow-answer"});
+        try queuedIdle(d, a, start);
+        try queuedGate(d, a, project, "done");
+    } else {
+        try queuedKey(d, a, "preserved-draft", &.{"preserved-draft"});
+        // Opening drops the whole read tail: neither repetition nor Enter can
+        // approve. The fresh replay must still show the safe default.
+        try queuedKey(d, a, "\x03\x03\r", &.{"> Continue"});
+        try queuedGate(d, a, project, "modal-default");
+        // Each probe must cause an observable safe-selection transition.
+        // Consecutive writes are NOT application read boundaries: without
+        // these semantic ACKs a stop_feed tail could discard the later Esc.
+        try queuedKey(d, a, "\x1b[B", &.{"> Stop and clear"});
+        try queuedKey(d, a, "\x03\x03\r", &.{"> Continue"});
+        try queuedKey(d, a, "\x1b[B", &.{"> Stop and clear"});
+        try queuedKey(d, a, "\x1b[200~\r\x03\x1b[201~", &.{"> Continue"});
+        try queuedKey(d, a, "\x1b", &.{ "Steering pending #1: keep-steer", "FollowUp pending #2: keep-follow", "preserved-draft" });
+        try queuedDraft(d, a, "preserved-draft");
+        try queuedGate(d, a, project, "modal-dismissed");
+        try queuedKey(d, a, "\x03", &.{"> Continue"});
+        if (natural) {
+            const natural_start = d.used;
+            // Node releases the already-in-flight final response after this ACK.
+            try queuedGate(d, a, project, "natural-release");
+            try queuedScreen(d, a, natural_start, &.{ "queued-natural-answer", "> Continue" });
+            try queuedIdle(d, a, natural_start);
+            try queuedGate(d, a, project, "natural-finished");
+        }
+        // Selection and Enter in one read must NOT approve. Only the next,
+        // independent Enter after this complete dangerous-option ACK may act.
+        try queuedKey(d, a, "\x1b[B\r", &.{"> Stop and clear"});
+        try queuedGate(d, a, project, "selected-not-approved");
+        const stop_start = d.used;
+        try d.send("\r");
+        try queuedIdle(d, a, stop_start);
+        try queuedDraft(d, a, "preserved-draft");
+        const cleared_view = try a.create(regular.Screen);
+        defer a.destroy(cleared_view);
+        cleared_view.* = .{};
+        const cleared_raw = d.output[0..d.used];
+        const cleared_ack = std.mem.lastIndexOf(u8, cleared_raw, "\x1b[?25h").?;
+        try cleared_view.replay(cleared_raw[0 .. cleared_ack + "\x1b[?25h".len]);
+        for ([_][]const u8{ "keep-steer", "keep-follow", "> Continue", "> Stop and clear" }) |text| try check(!cleared_view.visible(text));
+        try queuedGate(d, a, project, "cleared");
+        // A fresh explicit task proves stale confirmation cannot cancel a new
+        // epoch. No queued message is allowed to sneak ahead of this probe.
+        const probe_start = d.used;
+        try d.send("\x15after-clear\r");
+        try queuedScreen(d, a, probe_start, &.{"queued-probe-answer"});
+        try queuedIdle(d, a, probe_start);
+        try queuedGate(d, a, project, "done");
+    }
+    try d.send("\x04");
+    try d.finish(0);
+}
+
+// Concrete entrypoints exported to the standalone dispatcher/build root.
+pub fn testQueuedSteer(init: std.process.Init) !void {
+    try main(init);
+}
+pub fn testQueuedWithdraw(init: std.process.Init) !void {
+    try main(init);
+}
+pub fn testQueuedCancel(init: std.process.Init) !void {
+    try main(init);
+}
+pub fn testQueuedNatural(init: std.process.Init) !void {
+    try main(init);
+}
+
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const bin = try a.dupeSentinel(u8, try required(init, "THIN_APP_BIN"), 0);
@@ -941,13 +1361,13 @@ pub fn main(init: std.process.Init) !void {
     const resume_argv = [_:null]?[*:0]const u8{ bin, "--resume", restore_id };
     const resume_no_log_argv = [_:null]?[*:0]const u8{ bin, "--resume", restore_id, "--no-log" };
     // output 模式直接执行 --print 大输出；其余模式启动交互式界面。
-    const argv: [*:null]const ?[*:0]const u8 = if (full_resume) (if (std.mem.eql(u8, mode, "resume-readonly")) &resume_no_log_argv else &resume_argv) else if (restore_mode) &restore_argv else if (std.mem.eql(u8, mode, "output")) &print_argv else if (std.mem.eql(u8, mode, "exit-no-log") or std.mem.startsWith(u8, mode, "settings-") or std.mem.startsWith(u8, mode, "tool-preview-")) &no_log_argv else &interactive_argv;
+    const argv: [*:null]const ?[*:0]const u8 = if (full_resume) (if (std.mem.eql(u8, mode, "resume-readonly")) &resume_no_log_argv else &resume_argv) else if (restore_mode) &restore_argv else if (std.mem.eql(u8, mode, "output")) &print_argv else if (std.mem.eql(u8, mode, "exit-no-log") or (std.mem.startsWith(u8, mode, "settings-") and !std.mem.eql(u8, mode, "settings-image-model")) or std.mem.startsWith(u8, mode, "tool-preview-") or std.mem.startsWith(u8, mode, "test-queued-")) &no_log_argv else &interactive_argv;
 
     var master: c_int = undefined;
     var slave: c_int = undefined;
 
     var size = std.mem.zeroes(c.winsize);
-    size.col = if (std.mem.startsWith(u8, mode, "settings-command-")) 160 else 80;
+    size.col = if (std.mem.startsWith(u8, mode, "settings-command-") and !std.mem.eql(u8, mode, "settings-command-stable")) 160 else 80;
     size.row = 24;
 
     // 创建 PTY 对，初始窗口尺寸为 80x24。
@@ -1046,6 +1466,10 @@ pub fn main(init: std.process.Init) !void {
     try check(std.mem.indexOf(u8, d.output[0..d.used], "Time:") == null);
     try check(std.mem.indexOf(u8, d.output[0..d.used], if (std.mem.eql(u8, timezone, "UTC-8")) " +0800" else " +0000") != null);
     try check(std.mem.indexOf(u8, d.output[0..d.used], "Zig ") == null);
+    if (std.mem.startsWith(u8, mode, "test-queued-")) {
+        try queuedScenario(&d, init, mode, project);
+        return;
+    }
     if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
         // A generated disk default is not an activated selection. Do not enter
         // a key or submit a prompt: no public endpoint may be contacted.
@@ -1327,7 +1751,14 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, mode, "exit-busy") or std.mem.eql(u8, mode, "exit-busy-tool")) {
         const start = d.used;
         try d.send("exit-busy-task\r");
-        if (std.mem.eql(u8, mode, "exit-busy-tool")) try d.waitRunningFrame(start, "sleep 30") else try d.waitBusy(start);
+        if (std.mem.eql(u8, mode, "exit-busy-tool")) {
+            try d.waitRunningFrame(start, "sleep 30");
+        } else {
+            // A busy composer alone is not evidence that Runtime accepted its
+            // user or sent HTTP. Test an IN-FLIGHT request, not pre-start cancel.
+            try queuedFile(&d, a, project, "exit-busy-arrived");
+            try d.waitBusy(start);
+        }
         // Ctrl+D at the shared tail below cancels and joins before restoration.
     } else if (std.mem.eql(u8, mode, "auth-activate")) {
         // 待激活配置指向本地 fixture。/login 使用独立的掩码输入，取消不能保存或污染聊天输入。
@@ -1646,8 +2077,12 @@ pub fn main(init: std.process.Init) !void {
         try toolPreview(&d, init, mode, project);
     } else if (std.mem.eql(u8, mode, "settings-values")) {
         try settingsValuesJourney(&d, init, project);
+    } else if (std.mem.eql(u8, mode, "settings-image-model")) {
+        try imageModel(&d, init, project);
     } else if (std.mem.startsWith(u8, mode, "settings-decision-model-")) {
         try decisionModel(&d, init, mode, project);
+    } else if (std.mem.eql(u8, mode, "settings-approval-cancel")) {
+        try approvalCancel(&d);
     } else if (std.mem.startsWith(u8, mode, "settings-command-")) {
         try localCommand(&d, mode);
     } else if (std.mem.startsWith(u8, mode, "settings-global")) {
@@ -1749,8 +2184,12 @@ pub fn main(init: std.process.Init) !void {
         try d.send("\x1b[Z/model rejected-busy\r");
         try d.waitText(start, "selection-answer-one");
         try d.waitIdle(start);
+        // Busy special commands are rejected without destroying their draft.
+        // The user explicitly clears it before opening a new local menu; it
+        // must not silently become Steering or a second inference request.
+        try queuedDraft(&d, a, "/model rejected-busy");
         start = d.used;
-        try d.send("/");
+        try d.send("\x15/");
         try d.waitFrame(start, "/login");
         const commands = try d.screen();
         try check(commands.visible("/model") and commands.visible("/login"));
@@ -1888,8 +2327,11 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
 
-        // cancel 模式：发送 Ctrl-C（0x03），由应用取消当前任务。
-        try d.send("\x03");
+        // Ctrl-C only opens the safe-default confirmation. Selection must
+        // receive a complete owned frame before an independent Enter acts.
+        try queuedKey(&d, a, "\x03", &.{"> Continue"});
+        try queuedKey(&d, a, "\x1b[C", &.{"> Stop and clear"});
+        try d.send("\r");
         try d.waitText(start, "Canceled");
         try d.waitIdle(start);
 

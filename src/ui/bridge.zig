@@ -106,6 +106,9 @@ const Copy = struct {
     fn event(self: *Copy, e: r.Event) r.Event {
         return switch (e) {
             .text => |s| .{ .text = self.text(s) },
+            // Inbox bounds this at item_budget. Unlike display previews, this
+            // is the canonical user message and must be copied in its entirety.
+            .user_committed => |v| .{ .user_committed = .{ .id = v.id, .text = self.text(v.text) } },
             .reasoning => |s| .{ .reasoning = self.text(s) },
             .tool_preview => |v| .{ .tool_preview = .{ .index = v.index, .arguments = self.text(v.arguments), .write_file = v.write_file, .argument_bytes = v.argument_bytes } },
             .tool_view => |v| blk: {
@@ -237,6 +240,8 @@ pub const Bridge = struct {
     /// 运行时的事件入口（工作线程调用）。流程：处理终态 -> 检查取消 -> 校验权限 ID -> 两阶段预留预算并拷贝 -> 入队。
     fn emit(ctx: ?*anyopaque, event: r.Event, cancel: *const p.Cancellation) anyerror!void {
         const self = from(ctx);
+        // Canonical injected user text is never a clipped display preview.
+        if (event == .user_committed and event.user_committed.text.len > item_budget) return error.InputTooLarge;
         self.lock();
         // 中文：finished 不进入队列，只保存终态，也不占用预算。
         if (event == .finished) {
@@ -330,6 +335,14 @@ pub const Bridge = struct {
         }
 
         while (true) {
+            // Never acquire Inbox while holding Bridge: Core may emit after
+            // resolving a lease. A pending steer revokes even a raced answer.
+            if (permission.interrupt) |inbox| if (inbox.hasSteering()) {
+                self.lock();
+                if (self.pending == permission.id) self.clearPermission();
+                self.unlock();
+                return error.Steered;
+            };
             self.lock();
             // Only this request's decision counts. A leftover answer for another
             // id must not be reused, and cancel is not a user deny.
@@ -444,3 +457,41 @@ pub const Bridge = struct {
         self.* = undefined;
     }
 };
+
+test "user committed copy owns the entire bounded text including the last byte" {
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var original: [item_budget]u8 = @splat('x');
+    original[item_budget - 1] = 'Z';
+    const host_ = bridge.host();
+    try host_.emit_fn(host_.context, .{ .user_committed = .{ .id = 7, .text = &original } }, &cancel);
+    @memset(&original, 'q');
+    var item = bridge.pop().?;
+    defer item.deinit();
+    try std.testing.expectEqual(@as(usize, item_budget), item.event.user_committed.text.len);
+    try std.testing.expectEqual(@as(u8, 'x'), item.event.user_committed.text[0]);
+    try std.testing.expectEqual(@as(u8, 'Z'), item.event.user_committed.text[item_budget - 1]);
+    try std.testing.expect(!item.display_truncated);
+}
+
+test "steering interrupts matching pending permission outside bridge lock without denying" {
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var inbox: r.Inbox = .{};
+    defer inbox.deinit();
+    inbox.beginRun();
+    _ = try inbox.enqueue(std.testing.allocator, .steering, "new instruction");
+    const host_ = bridge.host();
+    try host_.emit_fn(host_.context, .{ .permission = .{ .id = 8, .tool_name = "bash", .description = "not started" } }, &cancel);
+    try std.testing.expectError(error.Steered, host_.authorize_fn(host_.context, .{
+        .id = 8,
+        .tool_name = "bash",
+        .description = "not started",
+        .interrupt = &inbox,
+    }, &cancel));
+    try std.testing.expect(bridge.pending == null and bridge.answer == null);
+    try std.testing.expect(!cancel.isRequested());
+    try std.testing.expectEqual(@as(usize, 1), inbox.snapshot().steering);
+}

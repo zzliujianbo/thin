@@ -85,6 +85,7 @@ const Fake = struct {
     last_summary_total: ?u64 = null,
     nonzero_usage: bool = false,
     fail_prepare: bool = false,
+    preparation_error: ?anyerror = null,
     disconnect_snapshot: ?usize = null,
     file_stats: ?@import("../util/line_stats.zig").File = null,
     last_file_stats: ?@import("../util/line_stats.zig").File = null,
@@ -219,6 +220,7 @@ const Fake = struct {
     fn prepare(ctx: *anyopaque, _: std.mem.Allocator, call_: p.ToolCall) !r.Prepared {
         const self: *Fake = @ptrCast(@alignCast(ctx));
         if (!std.mem.eql(u8, call_.name, "write_file")) return error.UnexpectedTool;
+        if (self.preparation_error) |err| return err;
         if (self.fail_prepare) return error.InvalidFixtureArguments;
         return .{ .payload = ctx, .description = "write fixture", .explicit_denial = self.explicit_denial, .decision_input = self.decision_input };
     }
@@ -1425,6 +1427,49 @@ test "cleanup failure poisons the Runtime rather than reporting cancellation suc
     try std.testing.expectEqual(r.Status.failed, later.status);
     // 第二次运行不应再执行工具。
     try std.testing.expectEqual(@as(u32, 1), fake.executions);
+}
+
+fn throwingCleanupFailure(prepare_failure: bool) !void {
+    var fake: Fake = .{
+        .calls_per_response = 2,
+        .explicit_denial = null,
+        .preparation_error = if (prepare_failure) error.CleanupFailed else null,
+        .execution_error = if (prepare_failure) null else error.CleanupFailed,
+    };
+    const config = configuration();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
+    defer runtime.deinit();
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run("Do the task", &cancel);
+    try std.testing.expectEqual(r.Status.failed, terminal.status);
+    try std.testing.expectEqual(error.CleanupFailed, terminal.detail.?);
+    try std.testing.expect(runtime.poisoned);
+    try std.testing.expectEqual(@as(u32, 1), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, if (prepare_failure) 0 else 1), fake.executions);
+    const messages = runtime.messages();
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
+    try std.testing.expectEqualStrings("call-1-0", messages[2].blocks[0].tool_result.call_id);
+    try std.testing.expect(messages[2].blocks[0].tool_result.is_error);
+    try std.testing.expectEqualStrings("CleanupFailed", messages[2].blocks[0].tool_result.text);
+    try std.testing.expectEqualStrings("call-1-1", messages[3].blocks[0].tool_result.call_id);
+    try std.testing.expect(messages[3].blocks[0].tool_result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, messages[3].blocks[0].tool_result.text, "Not executed") != null);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = try context.boundaries(arena.allocator(), messages);
+    const later = try runtime.run("must not start", &cancel);
+    try std.testing.expectEqual(r.Status.failed, later.status);
+    try std.testing.expectEqual(error.CleanupFailed, later.detail.?);
+    try std.testing.expectEqual(@as(u32, 1), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, if (prepare_failure) 0 else 1), fake.executions);
+}
+
+test "throwing cleanup failure during preparation blocks remaining calls and future tasks" {
+    try throwingCleanupFailure(true);
+}
+
+test "throwing cleanup failure during execution blocks remaining calls and future tasks" {
+    try throwingCleanupFailure(false);
 }
 
 // 长工具任务中触发一次摘要压缩后仍能继续运行，并保留原始任务消息。

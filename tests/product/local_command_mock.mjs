@@ -6,8 +6,10 @@ import {mkdtemp, mkdir, writeFile, readFile, stat, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 
-const [appArg, ptyArg] = process.argv.slice(2);
+const [appArg, ptyArg, onlyMode] = process.argv.slice(2);
 assert(appArg && ptyArg);
+const modes = ['accept','deny','cancel','timeout','stable'];
+assert(onlyMode === undefined || modes.includes(onlyMode));
 const app = resolve(appArg), pty = resolve(ptyArg);
 const base = await mkdtemp(join(tmpdir(), 'thin-local-command-'));
 let active, failure, requests = 0, connections = 0, scenarios = 0;
@@ -95,7 +97,7 @@ async function run(mode, url) {
     assert.equal(requests-before, normal); assert.equal(active.normalRequests, normal);
     if (!normal) assert.equal(connections-beforeConnections, 0);
     if (mode === 'accept') await stat(join(project,'marker'));
-    for (const name of ['denied','pasted','batch-first','batch-tail']) await missing(join(project,name));
+    for (const name of ['denied','pasted','batch-first','batch-tail','stable-executed']) await missing(join(project,name));
     if (mode === 'cancel' || mode === 'timeout') {
       await stat(join(project,'started'));
       const pid = Number((await readFile(join(project,'child'),'utf8')).trim());
@@ -114,7 +116,7 @@ async function run(mode, url) {
 try {
   await new Promise((res,rej) => {server.once('error',rej);server.listen(0,'127.0.0.1',res);});
   const url = `http://127.0.0.1:${server.address().port}/v1`;
-  for (const mode of ['accept','deny','cancel','timeout']) await run(mode,url);
+  for (const mode of onlyMode === undefined ? modes : [onlyMode]) await run(mode,url);
   console.log(`PASS test-command: scenarios=${scenarios}, command HTTP=0, explicit normal HTTP=${requests}`);
 } catch (error) {
   console.error(`FAIL test-command: completed=${scenarios}, HTTP=${requests}, TCP=${connections}, explicit normal HTTP=${active?.normalRequests ?? 0}`);
