@@ -54,6 +54,30 @@ test "anthropic prefix rewrite does not emit empty assistant after thinking only
     try std.testing.expect(std.mem.find(u8, encoded, "stale-fixture") == null);
 }
 
+test "anthropic refusal metadata preserves valid JSON text as normal displayable response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "{\"items\":[]}";
+    for ([_][]const u8{ "refusal", "end_turn", "stop_sequence" }) |reason| {
+        var stream = adapter.Stream.init(a, scope, .{});
+        try stream.feed("", start);
+        try block(&stream, 0, "{\"type\":\"text\",\"text\":\"\"}");
+        const native = try std.fmt.allocPrint(a, "{{\"type\":\"text_delta\",\"text\":{s}}}", .{try j.encode(a, j.str(body))});
+        try delta(&stream, 0, native);
+        try stop(&stream, 0);
+        try end(&stream, reason);
+        const response = (try stream.finish()).success;
+        try std.testing.expectEqual(c.eq(reason, "refusal"), response.refused);
+        try std.testing.expectEqual(p.Finish.stop, response.finish);
+        try std.testing.expectEqualStrings(body, response.message.blocks[0].text);
+        try std.testing.expectEqual(@as(?u64, 15), response.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 4), response.usage.output_tokens);
+        // Refusal metadata is deliberately not persisted into message replay.
+        try std.testing.expect(std.mem.find(u8, response.message.replay.?.json, "refused") == null);
+    }
+}
+
 test "anthropic output limit requires complete message stop and preserves reasoning usage" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -72,7 +96,10 @@ test "anthropic output limit requires complete message stop and preserves reason
             try std.testing.expectEqual(expected, f.kind);
             try std.testing.expect(f.observed_content and f.raw_usage_json != null);
             try std.testing.expectEqual(@as(?u64, 4096), f.usage.output_tokens);
-        } else try std.testing.expect(out == .success);
+        } else {
+            try std.testing.expect(out == .success);
+            try std.testing.expectEqual(c.eq(reason, "refusal"), out.success.refused);
+        }
         try std.testing.expectError(error.InvalidStreamState, s.finish());
     }
     var s = adapter.Stream.init(a, scope, .{});

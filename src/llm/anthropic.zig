@@ -387,7 +387,7 @@ pub const Stream = struct {
         for (self.content.items) |b| try j.append(&content, b);
         const native = try message(self.a, "assistant", content);
         const blocks = try nativeBlocks(self.a, native);
-        return .{ .success = .{ .message = .{ .role = .assistant, .blocks = blocks, .replay = .{ .scope = try c.scopeCopy(self.a, self.scope), .json = try j.encode(self.a, native), .retain_turn = true } }, .finish = if (calls) .tool_calls else .stop, .usage = self.token_usage, .raw_usage_json = raw } };
+        return .{ .success = .{ .message = .{ .role = .assistant, .blocks = blocks, .replay = .{ .scope = try c.scopeCopy(self.a, self.scope), .json = try j.encode(self.a, native), .retain_turn = true } }, .refused = c.eq(reason, "refusal"), .finish = if (calls) .tool_calls else .stop, .usage = self.token_usage, .raw_usage_json = raw } };
     }
 };
 fn knownReason(s: []const u8) bool {

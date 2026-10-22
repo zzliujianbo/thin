@@ -9,12 +9,14 @@ pub const Menu = provider.Picker;
 pub const labels = [_][]const u8{
     "Low-price input", "Decision model", "Auto compaction", "Command timeout",
     "Request timeout", "Output limit",   "Task timeout",    "Image model",
+    "Auto memory",
 };
 pub const count = labels.len;
 pub const Snapshot = struct {
     low_price_input_enabled: bool = true,
     decision_enabled: bool = false,
     image_enabled: bool = false,
+    memory_auto: bool = true,
     image_model: ?[]const u8 = null,
     /// Borrowed provider/rawID reference; rows copies the displayed bytes.
     decision_model: ?[]const u8 = null,
@@ -28,6 +30,7 @@ pub fn preferenceKey(selected: usize) ?Key {
         4 => .request_timeout_ms,
         5 => .max_output_tokens,
         6 => .task_timeout_ms,
+        8 => .memory_auto,
         else => null,
     };
 }
@@ -41,6 +44,7 @@ pub fn value(state: Snapshot, selected: usize) []const u8 {
         1 => if (!state.decision_enabled) "Off" else state.decision_model orelse "Not set",
         7 => if (!state.image_enabled) "Off" else state.image_model orelse "Not set",
         2 => if (state.limits.compaction_enabled) "on" else "off",
+        8 => if (state.memory_auto) "on" else "off",
         3, 4, 6 => "s",
         5 => if (state.limits.max_output_tokens == null) "Auto" else "tokens",
         else => "",
@@ -56,6 +60,7 @@ pub fn description(selected: usize) []const u8 {
         5 => "Output cap in tokens; Auto uses model policy. Explicit cap must cover summary_tokens.",
         6 => "Whole task timeout in s (up to 3 decimals); maximum 86400 s (24 hours).",
         7 => "Read images through a separate helper returning text. Off unless explicitly selected.",
+        8 => "Automatically extract and maintain useful memory. On by default.",
         else => "",
     };
 }
@@ -127,8 +132,12 @@ fn freeRows(a: std.mem.Allocator, rendered: Rows) void {
     for (rendered.lines) |line| a.free(line);
     a.free(rendered.lines);
 }
-test "settings preserve old values and expose eight preference rows" {
-    try std.testing.expectEqual(@as(usize, 8), count);
+test "settings preserve old values and expose nine preference rows" {
+    try std.testing.expectEqual(@as(usize, 9), count);
+    try std.testing.expectEqualStrings("Auto memory", label(8));
+    try std.testing.expectEqualStrings("on", value(.{}, 8));
+    try std.testing.expectEqualStrings("off", value(.{ .memory_auto = false }, 8));
+    try std.testing.expectEqual(@as(?Key, .memory_auto), preferenceKey(8));
     try std.testing.expectEqualStrings("Off", value(.{}, 7));
     try std.testing.expectEqualStrings("login/deepseek-flash", value(.{ .image_enabled = true, .image_model = "login/deepseek-flash" }, 7));
     try std.testing.expectEqualStrings("on", value(.{}, 0));
@@ -182,7 +191,7 @@ test "decision root opens with complete static label even when model is clipped"
     defer freeRows(a, copied);
     model[9] = 'y';
     try std.testing.expect(std.mem.find(u8, copied.lines[0], "provider/xxx") != null);
-    for ([_]usize{ 0, 2, 3, 4, 5, 6 }) |selected| {
+    for ([_]usize{ 0, 2, 3, 4, 5, 6, 8 }) |selected| {
         const clipped = try rows(a, .{ .selected = selected }, .{}, 2 + label(selected).len, 1);
         defer freeRows(a, clipped);
         try std.testing.expect(!clipped.can_confirm);

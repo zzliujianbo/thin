@@ -259,6 +259,8 @@ pub const Connection = struct {
         image_enabled: bool = false,
         image_models: []const core_config.Model = &.{},
         image_model: ?[]const u8 = null,
+        memory_auto: bool = true,
+        memory_notice: ?[]const u8 = null,
         decision_enabled: bool = false,
         /// Owned by the session, resolved with auxiliary rather than chat limits.
         decision_models: []const core_config.Model = &.{},
@@ -480,6 +482,18 @@ const Ui = struct {
     /// in the same frame arena for CAN/bottom recovery after any resize.
     frame_full_tail: []const u8 = "",
     frame_sparse: bool = false,
+    /// Display requests, not messages. Only a complete frame consumes them.
+    idle_breaks: u16 = 0,
+    frame_idle_breaks: u16 = 0,
+    frame_idle_prefix_end: usize = 0,
+    idle_resize_bytes: [600]u8 = undefined,
+    compact_composer: bool = false,
+    compact_hint_hash: u64 = 0,
+    frame_hint_hash: u64 = 0,
+    /// A normal Enter behind display-only breaks waits for their ACK, never
+    /// until the next task completes. Move the editor (no allocation) so typing
+    /// in the following read batch belongs to the next draft, not this submit.
+    deferred_submit: ?struct { editor: input.Editor, pasted: bool } = null,
     /// 待输出的完整帧；可能分多次 write，由 frame_offset 记录进度。
     frame: []const u8 = "",
     frame_offset: usize = 0,
@@ -524,6 +538,10 @@ const Ui = struct {
         self.parser.secretMode(false);
         self.wipeEditor();
         self.editor.deinit();
+        if (self.deferred_submit) |*pending| {
+            std.crypto.secureZero(u8, pending.editor.bytes.items);
+            pending.editor.deinit();
+        }
         self.input_history.deinit(self.allocator);
     }
 
@@ -738,6 +756,10 @@ const Ui = struct {
         }
         if (state.log_error) |err| return std.fmt.allocPrint(a, "{s}{s}REC FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
         if (!state.logging_enabled) return std.fmt.allocPrint(a, "{s}{s}recording off", .{ notice, if (notice.len != 0) " | " else "" });
+        // Advisory worker state never replaces failures, approvals or queued input.
+        if (notice.len == 0 and self.permission == null and !self.stop_open and self.inbox.snapshot().newest_id == null and !self.inbox.snapshot().paused) {
+            if (state.memory_notice) |memory_notice| return memory_notice;
+        }
         return notice;
     }
 
@@ -890,6 +912,23 @@ const Ui = struct {
     fn settingsIdle(self: *const Ui) bool {
         return !self.busy and self.future == null and self.permission == null and !self.poisoned and !self.want_exit and !self.secret_mode and !self.secret_quarantine and !self.parser.pasted;
     }
+    /// No worker can still publish after its Future was joined. Check borrowed
+    /// Bridge items as well as the queue, without reset's cancellation side effects.
+    fn idleEnter(self: *Ui) bool {
+        if (self.deferred_submit != null or !self.settingsIdle() or self.editor_pasted or self.parser.batch_paste or
+            self.parser.escape_len != 0 or self.parser.utf8_len != 0 or self.stop_open or
+            self.settings_open or self.provider_open or self.model_picker != null or
+            self.mode != null or self.active_tool != null or self.draft != null or self.scroll != 0 or
+            self.size.columns < 9 or self.size.rows < 7 or
+            std.mem.trim(u8, self.editor.bytes.items, " \t\r\n").len != 0) return false;
+        const queue = self.inbox.snapshot();
+        if (queue.steering != 0 or queue.follow_up != 0) return false;
+        std.debug.assert(std.c.pthread_mutex_lock(&self.bridge.mutex) == .SUCCESS);
+        defer std.debug.assert(std.c.pthread_mutex_unlock(&self.bridge.mutex) == .SUCCESS);
+        return self.bridge.active == 0 and self.bridge.len == 0 and self.bridge.outstanding == 0 and
+            self.bridge.bytes == 0 and self.bridge.pending == null and self.bridge.terminal == null;
+    }
+
     fn closeModelPicker(self: *Ui) void {
         if (self.model_picker) |*picker| picker.deinit();
         self.model_picker = null;
@@ -1013,6 +1052,7 @@ const Ui = struct {
     fn settingsValueTitle(key_: preference.Key) []const u8 {
         return switch (key_) {
             .compaction_enabled => "Auto compaction",
+            .memory_auto => "Auto memory",
             .command_timeout_ms => "Command timeout (s)",
             .request_timeout_ms => "All inference request timeout (s; including decisions)",
             .max_output_tokens => "Output limit (tokens); Auto follows model policy",
@@ -1022,6 +1062,7 @@ const Ui = struct {
     fn openSettingsValue(self: *Ui, key_: preference.Key, state: Connection.State) void {
         const current: ?u32 = switch (key_) {
             .compaction_enabled => @intFromBool(state.limits.compaction_enabled),
+            .memory_auto => @intFromBool(state.memory_auto),
             .command_timeout_ms => state.limits.command_timeout_ms,
             .request_timeout_ms => state.limits.request_timeout_ms,
             .max_output_tokens => state.limits.max_output_tokens,
@@ -1228,6 +1269,8 @@ const Ui = struct {
                     if (settings_menu_module.preferenceKey(self.settings_menu.selected)) |key_| {
                         if (key_ == .compaction_enabled) {
                             _ = self.savePreference(key_, @intFromBool(!state.limits.compaction_enabled));
+                        } else if (key_ == .memory_auto) {
+                            _ = self.savePreference(key_, @intFromBool(!state.memory_auto));
                         } else self.openSettingsValue(key_, state);
                         return;
                     }
@@ -1468,6 +1511,18 @@ const Ui = struct {
         if (self.want_exit) return;
         const command = std.mem.trim(u8, self.editor.bytes.items, " \t\r\n");
         if (self.busy) return self.enqueueDraft(.steering);
+        // Slash commands keep their original modal/secret and stop-feed
+        // boundary. Inference/local execution alone needs the display barrier.
+        if (self.idle_breaks != 0 and command.len != 0 and (command[0] != '/' or compactCommand(command))) {
+            if (self.deferred_submit == null) {
+                self.deferred_submit = .{ .editor = self.editor, .pasted = self.editor_pasted };
+                self.editor = .{ .allocator = self.allocator };
+                self.editor_pasted = false;
+                self.input_history.index = null;
+                self.dirty = true;
+            }
+            return;
+        }
         if (std.mem.eql(u8, command, "/queue resume")) {
             if (!self.settingsIdle() or self.editor_pasted or self.parser.escape_len != 0 or self.parser.utf8_len != 0) {
                 self.notice = "Queue resume requires idle, fresh input";
@@ -1649,6 +1704,7 @@ const Ui = struct {
         self.prompt = prompt;
         self.has_submitted = true;
         self.busy = true;
+        self.compact_composer = false;
         self.mode = if (local_command) .executing_tool else .calling_model;
         self.last_terminal = null;
         self.notice = if (local_command) "Running command" else "Running";
@@ -1678,6 +1734,7 @@ const Ui = struct {
         self.task_epoch +%= 1;
         self.has_submitted = true;
         self.busy = true;
+        self.compact_composer = false;
         self.mode = .compacting;
         self.last_terminal = null;
         self.notice = "Compacting context...";
@@ -2116,7 +2173,11 @@ const Ui = struct {
             },
             .enter => {
                 self.approval_armed = false;
-                try self.submit();
+                if (self.idleEnter()) {
+                    // Saturation bounds memory/work even with an unresponsive TTY.
+                    self.idle_breaks +|= 1;
+                    self.wipeEditor();
+                } else try self.submit();
             },
             .follow_up => {
                 self.approval_armed = false;
@@ -2220,6 +2281,24 @@ const Ui = struct {
         self.dirty = true;
     }
 
+    fn flushDeferredSubmit(self: *Ui) !void {
+        if (self.idle_breaks != 0 or self.frame.len != 0 or self.want_exit or self.busy) return;
+        const pending = self.deferred_submit orelse return;
+        const draft = self.editor;
+        const pasted = self.editor_pasted;
+        self.deferred_submit = null;
+        self.editor = pending.editor;
+        self.editor_pasted = pending.pasted;
+        defer {
+            self.wipeEditor();
+            self.editor.deinit();
+            self.editor = draft;
+            self.editor_pasted = pasted;
+        }
+        try self.submit();
+        self.dirty = true;
+    }
+
     fn animate(self: *Ui) void {
         const tick = self.clock_ms / 80;
         if (!self.busy or self.animation_tick == tick) return;
@@ -2287,7 +2366,8 @@ const Ui = struct {
 
             // Join/drain happens above; current input/exit always wins over
             // dispatch. No await or host emission while holding Inbox locks.
-            if (!self.want_exit) try self.dispatchNext();
+            try self.flushDeferredSubmit();
+            if (!self.want_exit and self.idle_breaks == 0 and self.deferred_submit == null) try self.dispatchNext();
             self.refreshStop();
 
             // 分段写出待输出的帧：终端可能只接受部分字节，剩余部分在下一轮继续。
@@ -2332,7 +2412,28 @@ const Ui = struct {
         self.frame_fresh = false;
         if (self.tail_snapshot) |*snapshot| snapshot.deinit();
         self.tail_snapshot = null;
-        if (self.frame.len != 0 and self.frame_sparse) {
+        if (self.frame.len != 0 and self.frame_idle_breaks != 0) {
+            // A narrower terminal must not finish old-width prompt payloads:
+            // they could autowrap. Count only LF bytes actually sent (a lone CR
+            // has not advanced), cancel a partial escape, then finish exactly the
+            // remaining append operations at bottom. Never replay sent CRLF.
+            if (self.frame_idle_prefix_end != 0) {
+                const sent = std.mem.count(u8, self.frame[0..@min(self.frame_offset, self.frame_idle_prefix_end)], "\n");
+                const prefix = "\x18" ++ terminal_module.sync_end ++ "\x1b[999B";
+                @memcpy(self.idle_resize_bytes[0..prefix.len], prefix);
+                var used = prefix.len;
+                for (sent..self.frame_idle_breaks) |_| {
+                    self.idle_resize_bytes[used..][0..2].* = "\r\n".*;
+                    used += 2;
+                }
+                self.resize_rescue = self.idle_resize_bytes[0..used];
+                self.frame = "\x1b[?25h";
+                self.frame_offset = 0;
+                self.frame_clear_end = 0;
+                self.frame_idle_prefix_end = 0;
+                self.frame_height = 1;
+            }
+        } else if (self.frame.len != 0 and self.frame_sparse) {
             // Every sparse CUU/CUD after reflow is uncertain, even beyond the
             // initial reclaim prefix. Skip them ALL and replace at a fresh bottom.
             self.frame = self.frame_full_tail;
@@ -2402,6 +2503,16 @@ const Ui = struct {
         self.frame_menu_history = null;
         if (self.frame_arena) |*arena| arena.deinit();
         self.frame_arena = null;
+        self.idle_breaks -= self.frame_idle_breaks;
+        if (self.frame_idle_breaks != 0) {
+            self.compact_composer = self.frame_fresh and self.frame_height == 1;
+            self.compact_hint_hash = self.frame_hint_hash;
+            // Edits/menu state may have arrived after this frame was staged.
+            self.dirty = true;
+        }
+        self.frame_idle_breaks = 0;
+        self.frame_idle_prefix_end = 0;
+        if (self.idle_breaks != 0) self.dirty = true;
         self.frame_full_tail = "";
         self.frame_sparse = false;
         self.frame = "";
@@ -2492,12 +2603,44 @@ const Ui = struct {
         self.displayed_permission = null;
         self.frame_permission = null;
 
+        const pending_transcript = for (self.records.items) |record| {
+            if (record.kind != .reasoning and !record.output) break true;
+        } else false;
+        const release_idle = self.idle_breaks != 0 and !pending_transcript and !self.abandon_tail and
+            self.size.columns >= 9 and self.size.rows >= 7 and
+            self.tail_snapshot != null and self.tail_height != 0 and
+            self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows and
+            self.permission == null and !self.stop_open and !self.settings_open and !self.provider_open and
+            self.model_picker == null and !self.secret_mode and !self.secret_quarantine and
+            !self.busy and self.mode == null and self.active_tool == null;
+        const break_count: u16 = if (release_idle) @min(256, self.idle_breaks) else 0;
+
         // Reclaim only our last complete live tail, never the user's earlier rows.
         // Batch visible presentation as well as writes: large canonical commits
         // must scroll, and row-by-row correctness alone still exposes mid-frame
         // footer/body states. Unsupported terminals retain the same safe diffs.
         try writer.writeAll(terminal_module.sync_begin ++ "\x1b[?25l\r");
-        if (self.abandon_tail or (self.tail_height != 0 and
+        var idle_prompt: []const u8 = "";
+        if (release_idle) {
+            // Repair the old composer before releasing it: Ctrl-U/backspace and
+            // Enter may share a read batch after a nonempty draft was ACKed.
+            // Only the prompt, never that now-deleted draft, becomes history.
+            const state = self.connection.current();
+            self.display.seed(state.initial_context);
+            self.display.setEffort(state.reasoning_effort);
+            const view = self.display.view(self.clock_ms);
+            const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
+            const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .now_ms = self.clock_ms, .phase = self.model_flow.step(), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input });
+            idle_prompt = try std.fmt.allocPrint(a, "{s}{s}\x1b[K", .{ decoration.styled, theme.reset });
+            try writer.writeAll(idle_prompt);
+            // Entry is the ACKed composer's bottom row, not the tail's top.
+            // Each LF advances exactly one native row; the final composer uses
+            // today's draft, including text received after the empty Enter.
+            for (0..break_count) |i| {
+                if (i != 0) try writer.writeAll(idle_prompt);
+                try writer.writeAll("\r\n");
+            }
+        } else if (self.abandon_tail or (self.tail_height != 0 and
             (self.tail_size.columns != self.size.columns or self.tail_size.rows != self.size.rows)))
         {
             try writer.writeAll("\x1b[999B\r\n");
@@ -2512,7 +2655,7 @@ const Ui = struct {
         const history_valid = !self.abandon_tail and self.tail_size.columns == self.size.columns and
             self.tail_size.rows == self.size.rows and self.menu_history != null;
         var above: []const []const u8 = if (history_valid) self.menu_history.?.above else &.{};
-        var borrowed: []const []const u8 = if (history_valid) self.menu_history.?.borrowed else &.{};
+        var borrowed: []const []const u8 = if (history_valid and !release_idle) self.menu_history.?.borrowed else &.{};
 
         // Native scrollback is an appendable document, not a sliding window.
         // Streamed body prefixes may leave the mutable tail as DISPLAY previews;
@@ -2679,8 +2822,15 @@ const Ui = struct {
             try std.fmt.allocPrint(a, "S:{d} F:{d} {s}{s}{s}", .{ queue_snapshot.steering, queue_snapshot.follow_up, if (queue_snapshot.paused) "paused (/queue resume)" else "pending", if (base_hint.len != 0) " | " else "", base_hint })
         else
             base_hint;
-        // Always reserve one EMPTY row between conversation and composer.
-        const footer_rows: usize = 2 + @as(usize, @intFromBool(hint_line.len != 0));
+        // Normal output keeps its empty gap; acknowledged shell-like idle
+        // lines instead keep a single-row composer without extra redraw scroll.
+        const hint_hash = std.hash.Wyhash.hash(0, hint_line);
+        const compact = ((release_idle and self.frame_hint_hash == hint_hash) or
+            (self.compact_composer and self.compact_hint_hash == hint_hash)) and
+            !self.busy and self.permission == null and !self.stop_open and !self.settings_open and
+            !self.provider_open and self.model_picker == null and (release_idle or !self.commandMenuVisible()) and
+            !self.secret_mode and !self.secret_quarantine and thinking == null;
+        const footer_rows: usize = if (compact) 1 else 2 + @as(usize, @intFromBool(hint_line.len != 0));
         const body_limit = self.size.rows -| footer_rows;
         const candidate_limit = body_limit -| 1; // Separate candidates from conversation even in short windows.
         const model_state = state;
@@ -2694,6 +2844,7 @@ const Ui = struct {
             .decision_model = state.decision_model,
             .image_enabled = state.image_enabled,
             .image_model = state.image_model,
+            .memory_auto = state.memory_auto,
             .global_settings_available = state.global_settings_available,
             .limits = state.limits,
         }, cols, candidate_limit) else settings_menu_module.Rows{ .lines = &.{} };
@@ -2702,7 +2853,7 @@ const Ui = struct {
         }
         self.frame_settings_generation = null;
         self.frame_decision_fingerprint = null;
-        const menu_visible = self.commandMenuVisible();
+        const menu_visible = !release_idle and self.commandMenuVisible();
         const menu_rows = if (menu_visible) try command_menu_module.rows(a, self.command_matches, self.command_menu.selected, cols, candidate_limit) else command_menu_module.Rows{ .lines = &.{} };
         if (menu_visible) self.command_menu.selected = @min(self.command_menu.selected, self.command_matches.len - 1);
         // All candidate menus share one bottom-pinned popup slot. Secondary
@@ -2738,7 +2889,7 @@ const Ui = struct {
         // immutable row consumes it; expanding drafts scroll old content upward.
         // Never shrink a tail without replacing it by committed rows: the editor
         // therefore stays on the physical bottom row, without absolute positioning.
-        const available = if (self.tail_height == 0 or self.abandon_tail) self.size.rows else self.tail_height;
+        const available = if (release_idle) @as(usize, 1) else if (self.tail_height == 0 or self.abandon_tail) self.size.rows else self.tail_height;
         const rows = @min(self.size.rows, @max(footer_rows + popup_lines.len + popup_gap + wanted_body, available -| transcript_rows));
         // Popups and history preview grow UP into exact ACKed transcript rows,
         // without pushing duplicate content into native scrollback. Keep these
@@ -2771,6 +2922,11 @@ const Ui = struct {
         }
         var next_above: std.ArrayList([]const u8) = .empty;
         try next_above.appendSlice(a, above);
+        if (release_idle) {
+            const old_rows = self.tail_snapshot.?.rows;
+            try next_above.appendSlice(a, old_rows[0 .. old_rows.len - 1]);
+            for (0..break_count) |_| try next_above.append(a, idle_prompt);
+        }
         if (transcript_rows != 0) {
             var split = std.mem.splitSequence(u8, out.written()[self.frame_clear_end..], "\r\n");
             for (0..transcript_rows) |_| try next_above.append(a, split.next() orelse return error.InvalidTailFrame);
@@ -2873,8 +3029,8 @@ const Ui = struct {
                 if (!self.stop_open and menu_visible and menu_rows.can_confirm) self.frame_command_generation = self.command_menu.generation;
             }
 
-            if (hint_line.len != 0) try putToneLine(writer, a, rows - 2, hint_line, cols, theme.muted);
-            try putLine(writer, a, rows - 1, "", cols);
+            if (!compact and hint_line.len != 0) try putToneLine(writer, a, rows - 2, hint_line, cols, theme.muted);
+            if (!compact) try putLine(writer, a, rows - 1, "", cols);
 
             if (self.secret_mode or self.secret_quarantine) {
                 // Only a bounded mask is copied to the frame; never format secret bytes.
@@ -2964,7 +3120,7 @@ const Ui = struct {
         const snapshot_allowed = self.permission == null and self.model_picker == null and !self.provider_open and !self.settings_open and !menu_visible and !self.secret_mode and !self.secret_quarantine;
         var candidate = if (snapshot_allowed) try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset) else null;
         errdefer if (candidate) |*snapshot| snapshot.deinit();
-        const can_diff = !self.abandon_tail and snapshot_allowed and
+        const can_diff = !release_idle and !self.abandon_tail and snapshot_allowed and
             self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows and
             self.tail_snapshot != null and candidate != null;
         const growing = can_diff and !canonical_output and transcript_rows != 0 and
@@ -2994,6 +3150,9 @@ const Ui = struct {
 
         // frame 指向 arena 内存，arena 所有权交给 frame_arena，直到这帧写完。
         self.frame_full_tail = tail_out.written();
+        self.frame_idle_breaks = break_count;
+        self.frame_idle_prefix_end = if (release_idle) self.frame_clear_end else 0;
+        self.frame_hint_hash = hint_hash;
         self.frame_sparse = sparse or growing;
         self.frame_tail_snapshot = candidate;
         self.frame_menu_history = next_history;
@@ -3109,6 +3268,391 @@ const FixtureConnection = struct {
 /// 测试用 Ui 构造器：使用 testing allocator，运行时与终端字段为 undefined（测试中不会访问）。
 fn fixtureUi(bridge: *bridge_module.Bridge, cancel: *p.Cancellation) Ui {
     return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = undefined, .editor = .{ .allocator = std.testing.allocator }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" }, .size = .{ .columns = 80, .rows = 24 } };
+}
+
+test "idle Enter releases exactly one native row and redraw keeps the live draft" {
+    for ([_]usize{ 80, 16 }) |columns| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.size.columns = columns;
+        var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = columns };
+        try ui.draw();
+        try screen.replay(ui.frame);
+        ui.finishFrame();
+        const history_start = screen.history_len;
+        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+        // A read batch can contain several blank lines and then a new draft.
+        try ui.parser.feed(" \t\r\r\rtyped", sink);
+        try std.testing.expectEqual(@as(u16, 3), ui.idle_breaks);
+        try std.testing.expectEqualStrings("typed", ui.editor.bytes.items);
+        try ui.draw();
+        try std.testing.expectEqual(@as(u16, 3), ui.frame_idle_breaks);
+        try std.testing.expectEqual(@as(usize, 1), ui.frame_height);
+        try screen.replay(ui.frame);
+        try std.testing.expectEqual(history_start + 3, screen.history_len);
+        try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
+        ui.finishFrame();
+        try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
+        try std.testing.expect(ui.future == null and !ui.busy and !ui.has_submitted and ui.prompt == null);
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+        try std.testing.expect(ui.menu_history != null and ui.menu_history.?.above.len != 0);
+        for (0..3) |_| {
+            try ui.draw();
+            try screen.replay(ui.frame);
+            ui.finishFrame();
+            try std.testing.expectEqual(history_start + 3, screen.history_len);
+            try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
+        }
+        try std.testing.expectEqualStrings("typed", ui.editor.bytes.items);
+        // A subsequent ordinary nonempty Enter still follows submit, not the
+        // display-only path (this intentionally unconfigured fixture has no API).
+        try Ui.key(&ui, .enter);
+        try std.testing.expectEqualStrings("Not configured: use /login first", ui.notice);
+        try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+        try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
+    }
+}
+
+test "idle Enter bounded stages retain more than one frame of line requests" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    const old_history = screen.history_len;
+    for (0..300) |_| try Ui.key(&ui, .enter);
+    try ui.draw();
+    try std.testing.expectEqual(@as(u16, 256), ui.frame_idle_breaks);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u16, 44), ui.idle_breaks);
+    try ui.draw();
+    try std.testing.expectEqual(@as(u16, 44), ui.frame_idle_breaks);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
+    try std.testing.expectEqual(old_history + 300, screen.history_len);
+    try std.testing.expectEqual(@as(usize, 301), screen.count("?%>"));
+}
+
+test "idle Enter rejects paste queue permission and undrained bridge provenance" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b[200~ \r\x1b[201~\r", sink);
+    try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
+    ui.wipeEditor();
+    bridge.outstanding = 1;
+    try std.testing.expect(!ui.idleEnter());
+    bridge.outstanding = 0;
+    bridge.active = 1;
+    try std.testing.expect(!ui.idleEnter());
+    bridge.active = 0;
+    bridge.pending = 1;
+    try std.testing.expect(!ui.idleEnter());
+    bridge.pending = null;
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .text = "not yet drained" }, &cancel);
+    try Ui.key(&ui, .enter);
+    try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
+    var item = bridge.pop().?;
+    try std.testing.expect(!ui.idleEnter());
+    item.deinit();
+    ui.parser.batch_paste = false;
+    ui.parser.pasted = false;
+    ui.editor_pasted = false;
+    try std.testing.expect(ui.idleEnter());
+    ui.busy = true;
+    try Ui.key(&ui, .enter);
+    try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
+    ui.busy = false;
+    ui.stop_open = true;
+    try std.testing.expect(!ui.idleEnter());
+    ui.stop_open = false;
+    ui.future = @as(Io.Future(void), undefined);
+    try std.testing.expect(!ui.idleEnter());
+    ui.future = null;
+    ui.settings_open = true;
+    try std.testing.expect(!ui.idleEnter());
+    ui.settings_open = false;
+    ui.size.columns = 8;
+    try std.testing.expect(!ui.idleEnter());
+    ui.size.columns = 80;
+    ui.size.rows = 6;
+    try std.testing.expect(!ui.idleEnter());
+    ui.size.rows = 24;
+    _ = try ui.inbox.enqueue(std.testing.allocator, .steering, "pending");
+    try std.testing.expect(!ui.idleEnter());
+}
+
+test "idle Enter precedes rapid nonempty submit and preserves following draft" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.draw();
+    ui.finishFrame();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\r\rquestion\rnext draft", sink);
+    try std.testing.expect(ui.deferred_submit != null);
+    try std.testing.expectEqualStrings("question", ui.deferred_submit.?.editor.bytes.items);
+    try std.testing.expectEqualStrings("next draft", ui.editor.bytes.items);
+    try std.testing.expect(ui.future == null and !ui.has_submitted);
+    try ui.draw();
+    try std.testing.expectEqual(@as(u16, 2), ui.frame_idle_breaks);
+    try ui.flushDeferredSubmit();
+    try std.testing.expect(ui.deferred_submit != null and !ui.has_submitted);
+    ui.finishFrame();
+    try ui.flushDeferredSubmit();
+    try std.testing.expect(ui.deferred_submit == null and !ui.has_submitted);
+    try std.testing.expectEqualStrings("Not configured: use /login first", ui.notice);
+    try std.testing.expectEqualStrings("next draft", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+}
+
+test "idle Enter does not release an acknowledged draft erased in the same read batch" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("deleted-draft", sink);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 1), screen.count("deleted-draft"));
+    try ui.parser.feed("\x15\r", sink);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), screen.count("deleted-draft"));
+    try std.testing.expectEqual(@as(usize, 2), screen.count("?%>"));
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try ui.parser.feed("/", sink);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try Ui.key(&ui, .escape);
+    try Ui.key(&ui, .clear);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), screen.count("deleted-draft"));
+}
+
+test "idle Enter waits for pending transcript output before releasing prompt rows" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.draw();
+    ui.finishFrame();
+    var record = Record{ .kind = .user };
+    try record.append(std.testing.allocator, "pending-output");
+    try ui.records.append(std.testing.allocator, record);
+    try Ui.key(&ui, .enter);
+    try ui.draw();
+    try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
+    try std.testing.expect(ui.records.items[0].pending_output);
+    ui.finishFrame();
+    try ui.draw();
+    try std.testing.expectEqual(@as(u16, 1), ui.frame_idle_breaks);
+    ui.finishFrame();
+}
+
+test "idle Enter display barrier also precedes a rapid compact command" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r/compact\r", .{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expect(ui.deferred_submit != null);
+    try std.testing.expectEqualStrings("/compact", ui.deferred_submit.?.editor.bytes.items);
+    try ui.draw();
+    try std.testing.expectEqual(@as(u16, 1), ui.frame_idle_breaks);
+    try ui.flushDeferredSubmit();
+    try std.testing.expect(ui.deferred_submit != null);
+    ui.finishFrame();
+    try ui.flushDeferredSubmit();
+    try std.testing.expect(ui.deferred_submit == null and ui.future == null);
+    try std.testing.expectEqualStrings("Not configured: use /login first", ui.notice);
+}
+
+test "idle Enter acknowledged prompts survive a command popup without duplication" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    for (0..3) |_| try Ui.key(&ui, .enter);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    const old_history = screen.history_len;
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("/", sink);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expect(ui.menu_history.?.borrowed.len != 0);
+    try Ui.key(&ui, .escape);
+    try Ui.key(&ui, .clear);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(old_history, screen.history_len);
+    try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
+    // Releasing this restored tail transfers borrowed rows to native history;
+    // another popup must not retain a second copy of those same coordinates.
+    try Ui.key(&ui, .enter);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(old_history + 1, screen.history_len);
+    try std.testing.expectEqual(@as(usize, 5), screen.count("?%>"));
+    try ui.parser.feed("/", sink);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try Ui.key(&ui, .escape);
+    try Ui.key(&ui, .clear);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 5), screen.count("?%>"));
+}
+
+test "idle Enter keeps a newly published diagnostic visible across redraws" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    try Ui.key(&ui, .enter);
+    ui.notice = "new-safety-diagnostic";
+    for (0..3) |_| {
+        try ui.draw();
+        try screen.replay(ui.frame);
+        ui.finishFrame();
+        try std.testing.expect(screen.visible("new-safety-diagnostic"));
+    }
+    try std.testing.expect(!ui.compact_composer);
+}
+
+test "idle Enter resize at every frame byte never replays or drops CRLF" {
+    for (0..160) |offset| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        try ui.draw();
+        ui.finishFrame();
+        try Ui.key(&ui, .enter);
+        try Ui.key(&ui, .enter);
+        try ui.draw();
+        if (offset >= ui.frame.len) break;
+        const frame = ui.frame;
+        const prefix_end = ui.frame_idle_prefix_end;
+        ui.frame_offset = offset;
+        ui.resize(.{ .columns = 40, .rows = 24 });
+        const sent = std.mem.count(u8, frame[0..@min(offset, prefix_end)], "\n");
+        try std.testing.expectEqual(@as(usize, 2) - sent, std.mem.count(u8, ui.resize_rescue, "\n"));
+        const rescue = ui.resize_rescue;
+        ui.resize(.{ .columns = 16, .rows = 24 });
+        try std.testing.expectEqualStrings(rescue, ui.resize_rescue);
+        try std.testing.expectEqual(@as(usize, 0), ui.frame_offset);
+        try std.testing.expectEqualStrings("\x1b[?25h", ui.frame);
+        try std.testing.expect(std.mem.startsWith(u8, ui.resize_rescue, "\x18" ++ terminal_module.sync_end ++ "\x1b[999B"));
+        try std.testing.expectEqual(@as(u16, 2), ui.idle_breaks);
+        try std.testing.expect(!ui.frame_fresh);
+        ui.finishFrame();
+        try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
+        try std.testing.expect(ui.tail_snapshot == null);
+        try ui.draw();
+        try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
+    }
+}
+
+fn idleEnterAllocationScenario(a: std.mem.Allocator) !void {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.draw();
+    ui.finishFrame();
+    try Ui.key(&ui, .enter);
+    _ = try ui.editor.insert("draft survives OOM");
+    ui.allocator = a;
+    ui.draw() catch |err| {
+        try std.testing.expectEqual(@as(u16, 1), ui.idle_breaks);
+        try std.testing.expectEqualStrings("draft survives OOM", ui.editor.bytes.items);
+        try std.testing.expect(ui.frame.len == 0 and ui.frame_idle_breaks == 0);
+        return if (err == error.WriteFailed) error.OutOfMemory else err;
+    };
+    ui.finishFrame();
+}
+
+test "idle Enter captured before resize waits until a supported composer is acknowledged" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.draw();
+    ui.finishFrame();
+    try Ui.key(&ui, .enter);
+    ui.resize(.{ .columns = 1, .rows = 24 });
+    for (0..2) |_| {
+        try ui.draw();
+        try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
+        ui.finishFrame();
+        try std.testing.expectEqual(@as(u16, 1), ui.idle_breaks);
+    }
+    ui.resize(.{ .columns = 80, .rows = 24 });
+    try ui.draw();
+    try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
+    ui.finishFrame();
+    try ui.draw();
+    try std.testing.expectEqual(@as(u16, 1), ui.frame_idle_breaks);
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
+}
+
+test "idle Enter staging OOM keeps request draft and acknowledged ownership" {
+    // Optional arena resize/remap can change allocation counts after an injected
+    // failure. As in tailAllocationScenario, deny backing growth deterministically
+    // while still exercising every required fresh allocation and leak check.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), idleEnterAllocationScenario, .{});
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
 }
 
 test "local command bridge clipping preserves outer truncation provenance" {
@@ -4157,7 +4701,7 @@ test "file captions are contiguous but separated from final prose and percent co
     try std.testing.expect(std.mem.find(u8, ui.frame, "w" ++ theme.muted ++ " src/main.zig  ~1 " ++ theme.diff_added ++ "+2" ++ theme.muted ++ " " ++ theme.diff_removed ++ "-3" ++ theme.muted ++ " lines") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "raw-json-must-stay-hidden") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "do-not-show-body") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ theme.reset ++ "fixture" ++ theme.reset ++ " " ++ theme.failure ++ "50.0%" ++ theme.reset ++ ") > ") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ theme.reset ++ "fixture" ++ theme.reset ++ ") " ++ theme.failure ++ "50.0%" ++ theme.reset ++ "> ") != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expect(!screen.visible("Final answer") and screen.visible("final-body-marker"));
@@ -4829,17 +5373,17 @@ test "composer displays startup zero and latest actual usage or unknown without 
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     ui.display.seed(.{ .tokens = 0, .limit = 1000000 });
-    const green_prompt = "(" ++ theme.reset ++ "fixture" ++ theme.reset ++ " " ++ theme.success;
+    const green_prompt = "(" ++ theme.reset ++ "fixture" ++ theme.reset ++ ") " ++ theme.success;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, green_prompt ++ "0.0%" ++ theme.reset ++ ") > ") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, green_prompt ++ "0.0%" ++ theme.reset ++ "> ") != null);
     ui.finishFrame();
     const Case = struct { purpose: p.Purpose, usage: p.Usage, prefix: []const u8 };
     const host = bridge.host();
     for ([_]Case{
-        .{ .purpose = .normal, .usage = .{ .input_tokens = 12000, .output_tokens = 1000, .cached_input_tokens = 10000, .reasoning_tokens = 300 }, .prefix = green_prompt ++ "1.3%" ++ theme.reset ++ ") > " },
-        .{ .purpose = .summary, .usage = .{ .total_tokens = 1000 }, .prefix = green_prompt ++ "0.1%" ++ theme.reset ++ ") > " },
-        .{ .purpose = .normal, .usage = .{ .input_tokens = 12 }, .prefix = "(fixture ?%) > " },
-        .{ .purpose = .normal, .usage = .{ .total_tokens = 0 }, .prefix = green_prompt ++ "0.0%" ++ theme.reset ++ ") > " },
+        .{ .purpose = .normal, .usage = .{ .input_tokens = 12000, .output_tokens = 1000, .cached_input_tokens = 10000, .reasoning_tokens = 300 }, .prefix = green_prompt ++ "1.3%" ++ theme.reset ++ "> " },
+        .{ .purpose = .summary, .usage = .{ .total_tokens = 1000 }, .prefix = green_prompt ++ "0.1%" ++ theme.reset ++ "> " },
+        .{ .purpose = .normal, .usage = .{ .input_tokens = 12 }, .prefix = "(fixture) ?%> " },
+        .{ .purpose = .normal, .usage = .{ .total_tokens = 0 }, .prefix = green_prompt ++ "0.0%" ++ theme.reset ++ "> " },
     }) |case| {
         try host.emit_fn(host.context, .{ .usage = .{ .purpose = case.purpose, .protocol = .chat, .value = case.usage } }, &cancel);
         var item = bridge.pop().?;
@@ -4960,7 +5504,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     _ = try ui.editor.insert("input-default");
     // Idle startup, without any delta or mutable Runtime reads.
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.high)) ++ "fixture" ++ theme.reset ++ " " ++ theme.reset ++ "?%" ++ theme.reset ++ ") > input-default") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.high)) ++ "fixture" ++ theme.reset ++ ") " ++ theme.reset ++ "?%" ++ theme.reset ++ "> input-default") != null);
     ui.finishFrame();
     ui.mode = .calling_model;
     ui.display.reset(0);
@@ -4968,7 +5512,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     for ([_]u64{ 1100, 3100, 9100 }) |now| {
         ui.clock_ms = now;
         try ui.draw();
-        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}) {s}{s}{s} input-default", .{ theme.reset, theme.command_pulse[shared.activity.commandStep(now)], activity.spinner(now), theme.reset });
+        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}{s} input-default", .{ theme.reset, theme.command_pulse[shared.activity.commandStep(now)], activity.spinner(now), theme.reset });
         defer std.testing.allocator.free(marker);
         try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, theme.effortColor(.high)) == null);
@@ -4980,11 +5524,11 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     ui.mode = null;
     owner.effort = .low;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.low)) ++ "fixture" ++ theme.reset ++ " " ++ theme.reset ++ "?%" ++ theme.reset ++ ") > input-default") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.low)) ++ "fixture" ++ theme.reset ++ ") " ++ theme.reset ++ "?%" ++ theme.reset ++ "> input-default") != null);
     ui.finishFrame();
     owner.effort = .unspecified;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture ?%) > input-default") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture) ?%> input-default") != null);
     ui.finishFrame();
 }
 
@@ -5001,7 +5545,7 @@ test "composer frame keeps context occupancy colors static while model and spinn
             ui.clock_ms = 80;
             _ = try ui.editor.insert("default-input");
             try ui.draw();
-            const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}.0%{s}) {s}{s}{s} default-input", .{ if (tokens == 0) theme.success else if (tokens == 25) "\x1b[38;5;220m" else theme.failure, tokens, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
+            const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}.0%{s}{s}{s}{s} default-input", .{ if (tokens == 0) theme.success else if (tokens == 25) "\x1b[38;5;220m" else theme.failure, tokens, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
             defer std.testing.allocator.free(expected);
             try std.testing.expect(std.mem.find(u8, ui.frame, expected) != null);
             ui.finishFrame();
@@ -5060,7 +5604,7 @@ test "composer reflects owner low price policy without reading runtime configura
         try std.testing.expectEqual(@as(usize, 5), ui.editor.cursor);
         var screen: @import("../tests/regular_screen.zig").Screen = .{};
         try screen.replay(ui.frame);
-        try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], ") > typed") != null);
+        try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], if (enabled) ") L3.1%> typed" else ") 3.1%> typed") != null);
     }
 }
 
@@ -5078,10 +5622,10 @@ test "model only default color prompt has no headers cache or status and preserv
     try std.testing.expect(std.mem.find(u8, ui.frame, "thin |") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "tools trusted") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, ".thin/sessions") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture ?%) > hello    你") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture) ?%> hello    你") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "90.0%") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "(fixture)") == null);
-    const decoration = "(fixture ?%) > ";
+    const decoration = "(fixture) ?%> ";
     const position = try std.fmt.allocPrint(std.testing.allocator, "\r\x1b[{d}C" ++ terminal_module.sync_end ++ "\x1b[?25h", .{text.width(decoration) + text.width("hello    你")});
     defer std.testing.allocator.free(position);
     try std.testing.expect(std.mem.endsWith(u8, ui.frame, position));
@@ -5105,13 +5649,13 @@ test "single composer hides statistics and completion and uses flow and exact br
     _ = try ui.editor.insert("typed-default-color");
     try ui.draw();
     for ([_][]const u8{ "TPS:", "TTFT:", "tokens in:", "summary in:", "cost:", "loading", "Completed", "calling_model" }) |removed| try std.testing.expect(std.mem.find(u8, ui.frame, removed) == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ ") " ++ theme.command_pulse[5] ++ "⠧" ++ theme.reset ++ " typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ theme.command_pulse[5] ++ "⠧" ++ theme.reset ++ " typed-default-color") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.model_flow[ui.model_flow.step()]) != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("visible-body"));
     for (screen.grid[22]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
-    try std.testing.expect(std.mem.find(u8, &screen.grid[23], "(fixture ?%) ~ typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[23], "(fixture) ?%~ typed-default-color") != null);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     ui.finishFrame();
     ui.clock_ms = 680;
@@ -5123,7 +5667,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     ui.notice = "Completed"; // Even old application success notices cannot add a row.
     ui.last_terminal = .{ .status = .success, .usage = .{ .normal_calls = 1, .normal = .{ .input_tokens = 10562, .output_tokens = 873, .cached_input_tokens = 9600 } } };
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture ?%) > typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(fixture) ?%> typed-default-color") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Completed") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "tokens in:") == null);
     ui.finishFrame();
@@ -5144,8 +5688,8 @@ test "flow model prefix clips long editor suffix without wrap or changing raw cu
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "(fixture ?%) ~ x"));
-    try std.testing.expect(std.mem.endsWith(u8, ui.frame, "\r\x1b[16C" ++ terminal_module.sync_end ++ "\x1b[?25h"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "(fixture) ?%~ x"));
+    try std.testing.expect(std.mem.endsWith(u8, ui.frame, "\r\x1b[15C" ++ terminal_module.sync_end ++ "\x1b[?25h"));
     for (screen.grid[22]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
     try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
     ui.finishFrame();
@@ -5674,7 +6218,7 @@ test "model selection and late default completion flash the actual logical level
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
-    try std.testing.expect(screen.visible("fixture-next medium"));
+    try std.testing.expect(screen.visible("fixture-next) medium"));
     ui.finishFrame();
     fixture.effort = .unspecified;
     fixture.levels = .{};
@@ -5689,7 +6233,7 @@ test "model selection and late default completion flash the actual logical level
     try ui.draw();
     try std.testing.expectEqual(shared.ReasoningEffort.high, ui.display.reasoning_effort);
     try screen.replay(ui.frame);
-    try std.testing.expect(screen.visible("fixture-late high"));
+    try std.testing.expect(screen.visible("fixture-late) high"));
 }
 
 test "pending default thinking is explicit and never claims an effective wire option" {
@@ -6362,6 +6906,7 @@ const PreferenceFixture = struct {
         if (self.fail) return error.SaveFailed;
         switch (key_) {
             .compaction_enabled => self.state.limits.compaction_enabled = value.? == 1,
+            .memory_auto => self.state.memory_auto = value.? == 1,
             .command_timeout_ms => self.state.limits.command_timeout_ms = value.?,
             .request_timeout_ms => self.state.limits.request_timeout_ms = value.?,
             .max_output_tokens => self.state.limits.max_output_tokens = value,
@@ -6383,6 +6928,44 @@ fn preferenceOption(picker: settings_value_module.Picker, value: ?u32) !usize {
 fn customPreferenceOption(picker: settings_value_module.Picker) !usize {
     for (0..picker.count()) |index| if (picker.isCustom(index)) return index;
     return error.MissingCustomOption;
+}
+
+test "Auto memory root toggles only after fresh ACK without overlays and preserves failed save" {
+    try text.initLocale();
+    var fixture: PreferenceFixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 8;
+    try ui.draw();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    ui.finishFrame();
+    try ui.parser.feed("\r\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expect(!fixture.state.memory_auto);
+    try std.testing.expect(ui.settings_value_picker == null and !ui.settingsModelOpen());
+    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 8);
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try ui.draw();
+    ui.finishFrame();
+    fixture.fail = true;
+    try ui.parser.feed("\r\r", sink);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expect(!fixture.state.memory_auto);
+    try std.testing.expect(ui.settings_value_picker == null and !ui.settingsModelOpen());
+    fixture.fail = false;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(fixture.state.memory_auto);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
 }
 
 test "settings numeric child consumes ACK before failed save and preserves parent" {
@@ -6864,6 +7447,82 @@ test "secret Escape cancels and Left returns to provider without leaking paste t
     for (ui.secret.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
+test "memory notice owner poll dirties UI without replacing foreground notice" {
+    const Fixture = struct {
+        notice: ?[]const u8 = null,
+        changed: bool = false,
+        fn current(raw: *anyopaque) Connection.State {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .runtime = null, .model = "fixture", .base_url = "", .memory_notice = self.notice };
+        }
+        fn poll(raw: *anyopaque, _: bool) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const changed = self.changed;
+            self.changed = false;
+            return changed;
+        }
+    };
+    var fixture: Fixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.context = &fixture;
+    ui.connection.current_fn = Fixture.current;
+    ui.connection.poll_models_fn = Fixture.poll;
+    ui.notice = "Foreground error";
+    inline for (.{ @as(?[]const u8, "Memory: updating"), @as(?[]const u8, null) }) |notice| {
+        fixture.notice = notice;
+        fixture.changed = true;
+        ui.dirty = false;
+        ui.pollMetadata();
+        try std.testing.expect(ui.dirty);
+        try std.testing.expectEqualStrings("Foreground error", ui.notice);
+        ui.dirty = false;
+        ui.pollMetadata();
+        try std.testing.expect(!ui.dirty);
+    }
+}
+
+test "memory notice is advisory and never replaces errors queue or settings" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime: r.Runtime = undefined;
+    var state = ui.connection.current();
+    state.runtime = &runtime;
+    state.memory_notice = "Memory: updating";
+    try std.testing.expectEqualStrings("Memory: updating", try ui.hint(arena.allocator(), state));
+    ui.notice = "Approval required";
+    try std.testing.expectEqualStrings("Approval required", try ui.hint(arena.allocator(), state));
+    ui.notice = "Ready";
+    state.settings_error = error.TestSettingsFailure;
+    try std.testing.expect(std.mem.find(u8, try ui.hint(arena.allocator(), state), "Memory:") == null);
+    state.settings_error = null;
+    state.settings_notice = "Settings warning";
+    try std.testing.expectEqualStrings("Settings warning", try ui.hint(arena.allocator(), state));
+    state.settings_notice = null;
+    state.log_error = error.TestLogFailure;
+    try std.testing.expect(std.mem.find(u8, try ui.hint(arena.allocator(), state), "REC FAILED") != null);
+    state.log_error = null;
+    ui.permission = .{ .id = 17, .description = try std.testing.allocator.dupe(u8, "owned approval"), .clipped = false };
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    std.testing.allocator.free(ui.permission.?.description);
+    ui.permission = null;
+    ui.stop_open = true;
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    ui.stop_open = false;
+    _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "queued input");
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    ui.openSettingsMenu();
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+}
+
 test "authentication failure hint preserves HTTP status and separates thinking notice" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -7140,7 +7799,7 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try ui.draw();
     try screen.replay(ui.frame);
     ui.finishFrame();
-    try std.testing.expect(screen.visible("fixture-old 3.1%"));
+    try std.testing.expect(screen.visible("fixture-old) 3.1%"));
     try std.testing.expect(ui.effort_flash == null);
 
     ui.clock_ms = 1000;
@@ -7150,10 +7809,10 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try ui.draw();
     try screen.replay(ui.frame);
     ui.finishFrame();
-    try std.testing.expect(screen.visible("fixture-old high"));
+    try std.testing.expect(screen.visible("fixture-old) high"));
     try std.testing.expectEqualDeep(context, ui.display.context);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
-    try std.testing.expectEqual(text.width("(fixture-old high) > "), screen.col);
+    try std.testing.expectEqual(text.width("(fixture-old) high> "), screen.col);
 
     ui.clock_ms = 2500;
     ui.cycleEffort(); // high -> max, now expires at 4500 instead.
@@ -7172,7 +7831,7 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try ui.draw();
     try screen.replay(ui.frame);
     ui.finishFrame();
-    try std.testing.expect(screen.visible("fixture-old max"));
+    try std.testing.expect(screen.visible("fixture-old) max"));
 
     ui.display.context = .{ .tokens = 2000, .limit = fixture.limit };
     ui.clock_ms = 4500;
@@ -7181,7 +7840,7 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try ui.draw();
     try screen.replay(ui.frame);
     ui.finishFrame();
-    try std.testing.expect(screen.visible("fixture-old 6.1%"));
+    try std.testing.expect(screen.visible("fixture-old) 6.1%"));
     try std.testing.expectEqual(@as(usize, 23), screen.row);
     ui.cycleEffort();
     try std.testing.expect(ui.effort_flash == null);
@@ -7696,13 +8355,13 @@ test "selection guards paste secret busy joined future poison and rollback" {
     try std.testing.expectEqual(shared.ReasoningEffort.minimal, fixture.effort);
     // 切换档位后，输入框百分比位置短暂显示新档位名。
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.minimal)) ++ "fixture-next" ++ theme.reset ++ " " ++ (comptime theme.effortColor(.minimal)) ++ "minimal" ++ theme.reset ++ ") > ") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.minimal)) ++ "fixture-next" ++ theme.reset ++ ") " ++ (comptime theme.effortColor(.minimal)) ++ "minimal" ++ theme.reset ++ "> ") != null);
     ui.finishFrame();
     // 2 秒后自动恢复为上下文百分比。
     ui.clock_ms = 2001;
     ui.expireEffortFlash();
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.minimal)) ++ "fixture-next" ++ theme.reset ++ " " ++ theme.success ++ "1.5%" ++ theme.reset ++ ") > ") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.minimal)) ++ "fixture-next" ++ theme.reset ++ ") " ++ theme.success ++ "1.5%" ++ theme.reset ++ "> ") != null);
     ui.finishFrame();
     ui.busy = true;
     try ui.parser.feed("\x1b[Z/model busy-id\r", sink);

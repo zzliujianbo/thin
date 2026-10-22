@@ -16,6 +16,8 @@ const DecisionClient = @import("decision_client.zig").Client;
 const image = @import("../core/image.zig");
 const ImageClient = @import("image_client.zig").Client;
 const image_setup = @import("image_setup.zig");
+const knowledge = @import("../core/knowledge.zig");
+const MemoryCoordinator = @import("memory_service.zig").Coordinator;
 
 /// Idle replacement owners have never sent a request, and used owners have
 /// already joined the worker. An unreapable child is a fail-stop condition,
@@ -67,6 +69,7 @@ pub const App = struct {
     /// from a restored selection; initialized lazily without startup requests.
     decision_client: ?*DecisionClient = null,
     image_client: ?*ImageClient = null,
+    memory_coordinator: *MemoryCoordinator,
 
     /// Agent 运行时，最后初始化，依赖前面所有字段。
     runtime: r.Runtime,
@@ -193,14 +196,62 @@ pub const App = struct {
         errdefer if (self.image_client) |client| destroyImageClient(client);
         self.executor.image = self.imageService();
 
-        const snapshot = try self.memory.snapshot(a);
-        defer a.free(snapshot);
-        self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, snapshot);
+        self.memory_coordinator = try MemoryCoordinator.create(a, io, &self.root, self.config.value, environ);
+        errdefer self.memory_coordinator.deinit();
+        // Only small core is frozen into the initial prefix. Task-local memory
+        // is read afresh through bounded hooks, never an ever-growing index.
+        var snapshot_wiping: cfg.WipingAllocator = .{ .backing = a };
+        var reader = self.memory;
+        reader.wait_for_lock = false;
+        const snapshot = reader.coreSnapshot(snapshot_wiping.allocator()) catch |err| blk: {
+            if (err != error.Busy) return err;
+            self.memory_coordinator.reportFailure(err);
+            break :blk try snapshot_wiping.allocator().dupe(u8, "");
+        };
+        defer snapshot_wiping.allocator().free(snapshot);
+        // Explicit/local legacy core is untrusted too. Never freeze a known
+        // credential into the primary prefix before task retrieval can screen it.
+        const safe_snapshot = if (self.journal.containsSecret(snapshot)) blk: {
+            self.memory_coordinator.reportFailure(error.SensitiveMemoryMaterial);
+            break :blk "";
+        } else snapshot;
+        self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, safe_snapshot);
         self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
         self.runtime.session_loader = .{ .context = self, .load_fn = loadSessionPolicy };
         self.runtime.observer = self.journal.observer();
+        self.runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieveMemory, .complete_fn = completeMemory };
         self.recordSelection();
         return self;
+    }
+
+    pub fn memoryNotice(self: *const App) ?[]const u8 {
+        return self.memory_coordinator.notice();
+    }
+
+    fn retrieveMemory(raw: *anyopaque, a: std.mem.Allocator, query: []const u8, max_bytes: usize) ![]const u8 {
+        const self: *App = @ptrCast(@alignCast(raw));
+        return self.memory_coordinator.retrieve(a, query, max_bytes) catch |err| {
+            self.memory_coordinator.reportFailure(err);
+            return err;
+        };
+    }
+
+    fn completeMemory(raw: *anyopaque, capture: *const knowledge.Capture) void {
+        const self: *App = @ptrCast(@alignCast(raw));
+        if (!self.config.value.memory.auto or capture.incomplete) return;
+        self.memory_coordinator.confirmProtocol(self.runtime.selector.effective());
+        var wiping: cfg.WipingAllocator = .{ .backing = self.allocator };
+        var arena = std.heap.ArenaAllocator.init(wiping.allocator());
+        defer arena.deinit();
+        var filtered: knowledge.Capture = .{ .allocator = arena.allocator(), .omitted_sources = capture.omitted_sources };
+        for (capture.sources.items) |source| {
+            if (self.journal.containsSecret(source.text)) {
+                filtered.omitted_sources += 1;
+                continue;
+            }
+            filtered.add(source.kind, source.text);
+        }
+        self.memory_coordinator.enqueue(&filtered) catch |err| self.memory_coordinator.reportFailure(err);
     }
 
     fn imageService(self: *App) ?image.Service {
@@ -225,12 +276,15 @@ pub const App = struct {
         config: ?std.json.Parsed(cfg.Config) = null,
         replace_decision: bool,
         replace_image: bool,
+        replace_memory: bool = false,
+        memory_coordinator: ?*MemoryCoordinator = null,
         changes_tools: bool,
         decision: ?*DecisionClient = null,
         image_client: ?*ImageClient = null,
         prefix: ?r.Runtime.ToolPrefix = null,
 
         pub fn deinit(self: *SettingsReplacement) void {
+            if (self.memory_coordinator) |owner| owner.deinit();
             if (self.decision) |client| client.deinit();
             if (self.image_client) |client| destroyImageClient(client);
             if (self.prefix) |*prefix| prefix.deinit();
@@ -246,7 +300,7 @@ pub const App = struct {
 
     pub fn prepareSettingsRefresh(self: *App, declaration: cfg.Config, environ: *const std.process.Environ.Map, refresh: SettingsRefresh) !SettingsReplacement {
         if (self.runtime.busy.load(.acquire)) return error.Busy;
-        if (self.runtime.poisoned) return error.UnsafeToContinue;
+        if (self.runtime.poisoned or self.memory_coordinator.isPoisoned()) return error.UnsafeToContinue;
         if (self.decision_client) |client| {
             const service = client.service();
             if (service.check_fn) |check| try check(service.context);
@@ -273,13 +327,17 @@ pub const App = struct {
                 !std.mem.eql(u8, before.written(), after.written()),
             .replace_image = refresh == .image_model or
                 self.config.value.limits.request_timeout_ms != declaration.limits.request_timeout_ms or
-                self.config.value.image.enabled != declaration.image.enabled or
                 !optionalStringEqual(self.config.value.image.model, declaration.image.model),
             .changes_tools = self.config.value.decisionActive() != decision_enabled or
                 self.config.value.imageActive() != declaration.imageActive(),
         };
         errdefer result.deinit();
         result.config = try @import("decision_selection.zig").activeClone(self.allocator, self.config.value, declaration);
+        result.replace_memory = result.replace_decision or self.config.value.memory.auto != declaration.memory.auto or
+            !std.meta.eql(self.config.value.limits, declaration.limits);
+        if (result.replace_memory) {
+            result.memory_coordinator = try MemoryCoordinator.create(self.allocator, self.root.io, &self.root, result.config.?.value, environ);
+        }
         if (result.replace_decision) {
             // Login may have replaced the global declaration since this chat's
             // frozen config was installed. Own the latest auxiliary credentials
@@ -326,9 +384,15 @@ pub const App = struct {
             self.image_client = replacement.image_client;
             replacement.image_client = null;
         }
+        if (replacement.replace_memory) {
+            self.memory_coordinator.deinit();
+            self.memory_coordinator = replacement.memory_coordinator.?;
+            replacement.memory_coordinator = null;
+        }
         self.executor.image = self.imageService();
         self.runtime.executor = self.executor.executor();
-        if (replacement.changes_tools) self.runtime.last_context_tokens = null;
+        // Schema edits affect future estimates, not the latest server-reported
+        // primary usage (including fresh-session zero or genuinely unknown).
     }
 
     /// Heap-placed until publication: the unused client borrows this config.
@@ -339,11 +403,13 @@ pub const App = struct {
         client: http.Client,
         decision_client: ?*DecisionClient = null,
         image_client: ?*ImageClient = null,
+        memory_coordinator: *MemoryCoordinator,
         plan: r.Runtime.SelectionPlan,
 
         pub fn deinit(self: *ConnectionReplacement) void {
             const a = self.owner.allocator;
             self.client.deinit();
+            self.memory_coordinator.deinit();
             if (self.decision_client) |decision| decision.deinit();
             if (self.image_client) |client| destroyImageClient(client);
             cfg.release(&self.config);
@@ -376,6 +442,8 @@ pub const App = struct {
         replacement.decision_client = try DecisionClient.create(self.allocator, self.root.io, replacement.config.value, environ);
         errdefer if (replacement.decision_client) |client| client.deinit();
         replacement.image_client = try image_setup.create(self.allocator, self.root.io, replacement.config.value, environ);
+        errdefer if (replacement.image_client) |client| destroyImageClient(client);
+        replacement.memory_coordinator = try MemoryCoordinator.create(self.allocator, self.root.io, &self.root, replacement.config.value, environ);
         return replacement;
     }
 
@@ -393,6 +461,8 @@ pub const App = struct {
         self.runtime.config = &self.config.value;
         self.executor.config = &self.config.value;
         self.runtime.model = self.client.model();
+        self.memory_coordinator.deinit();
+        self.memory_coordinator = replacement.memory_coordinator;
         const previous_decision = self.decision_client;
         self.decision_client = replacement.decision_client;
         self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
@@ -449,6 +519,9 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         const a = self.allocator;
         self.runtime.deinit();
+        // Interactive exit/model replacement cancels immediately. Headless
+        // success explicitly drains with signal handling before destruction.
+        self.memory_coordinator.deinit();
         if (self.decision_client) |decision| decision.deinit();
         if (self.image_client) |client| destroyImageClient(client);
         self.journal.deinit();

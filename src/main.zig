@@ -138,6 +138,17 @@ fn run(init: std.process.Init) !u8 {
             try output(init.io, .stdout(), safe);
             if (console.clipped) try output(init.io, .stdout(), "\n[display clipped; model history unchanged]");
             try output(init.io, .stdout(), "\n");
+            const stopped = struct {
+                fn check() bool {
+                    return interrupt.signal() != 0;
+                }
+            };
+            app.memory_coordinator.finishCancellable(stopped.check);
+            if (app.memory_coordinator.failure.load(.acquire) != 0 or
+                app.memory_coordinator.settled_version.load(.acquire) < app.memory_coordinator.work_version.load(.acquire))
+            {
+                try output(init.io, .stderr(), "thin: auxiliary Memory did not settle successfully; queued work is preserved, uncertain requests are not automatically replayed.\n");
+            }
             return 0;
         }
 

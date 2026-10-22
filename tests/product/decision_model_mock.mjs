@@ -174,6 +174,7 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
         base_url:`${origin}/${path}/v1`,api_key:key,api_key_env:'',kind:null,chat_max_tokens:false,models,
       });
       baseline = {
+        memory:{auto:false},
         llm:{default:`primary/${MAIN}`,reasoning_effort:'high',providers:{
           primary:provider('primary',MAIN_KEY,{[MAIN]:{protocol:'chat',context_tokens:32768,
             reasoning:{format:'standard',map:{off:'none',high:'high'}}}}),

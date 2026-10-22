@@ -124,6 +124,9 @@ pub const Finish = enum { stop, tool_calls };
 /// 一次成功的模型响应（已完整提交，可写入历史）。
 pub const Response = struct {
     message: Message,
+    /// Explicit provider refusal metadata for helper consumers. Still a normal
+    /// displayable response; deliberately not part of Message/history/replay.
+    refused: bool = false,
     usage: Usage = .{},
     /// 提供方原始用量 JSON，仅用于诊断保留。
     raw_usage_json: ?[]const u8 = null,

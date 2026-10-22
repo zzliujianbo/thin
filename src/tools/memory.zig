@@ -1,4 +1,5 @@
-//! Explicit user-authorized project memory only. No automatic conversation log.
+//! Shared explicit and evidence-grounded automatic project memory. Never a
+//! conversation log; automatic candidates use generation-guarded CAS.
 //! Linux flock on a fresh root-directory open description serializes cooperating
 //! Stores across threads and processes, without creating a lock file. Locks are
 //! held only for disk transactions. Caller frees Entry.content and Entry.version.
@@ -10,6 +11,7 @@ const fs = @import("../platform/filesystem.zig");
 const config = @import("../core/config.zig");
 
 const Root = fs.Root;
+extern "c" fn fsync(c_int) c_int;
 /// 一次读取的结果：content 为正文，version 为正文的 sha256 十六进制串（用作 CAS 比较依据）。
 pub const Entry = struct { content: []const u8, version: []const u8 };
 
@@ -19,6 +21,8 @@ pub const Store = struct {
     root: *Root,
     /// core 与分片的大小、索引总预算等上限。
     limits: config.Limits,
+    /// Optional reference reads may decline contention; manual operations wait.
+    wait_for_lock: bool = true,
 
     /// 创建 Store；本身不做任何磁盘操作。
     pub fn init(root: *Root, limits: config.Limits) Store {
@@ -34,6 +38,7 @@ pub const Store = struct {
         // 2 = LOCK_EX，4 = LOCK_NB：非阻塞尝试；EINTR 直接重试，EWOULDBLOCK(11) 时 sleep 2ms 后再试。
         while (fs.linux.flock(fd, 2 | 4) != 0) {
             const e = std.c._errno().*;
+            if (!self.wait_for_lock and (e == 4 or e == 11)) return error.Busy;
             if (e == 4) continue;
             if (e != 11) return fs.osError();
             try std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake);
@@ -91,6 +96,14 @@ pub const Store = struct {
     /// 带 CAS 的写入。expected_version 为 null 表示只允许创建；非空则必须与当前版本一致。
     /// 成功时返回新内容与其版本，均由 allocator 分配。
     pub fn write(self: *Store, allocator: std.mem.Allocator, topic: []const u8, content: []const u8, expected_version: ?[]const u8) !Entry {
+        return self.writeImpl(allocator, topic, content, expected_version, null);
+    }
+
+    pub fn writeGuarded(self: *Store, allocator: std.mem.Allocator, topic: []const u8, content: []const u8, expected_version: ?[]const u8, expected_generation: u64) !Entry {
+        return self.writeImpl(allocator, topic, content, expected_version, expected_generation);
+    }
+
+    fn writeImpl(self: *Store, allocator: std.mem.Allocator, topic: []const u8, content: []const u8, expected_version: ?[]const u8, guard: ?u64) !Entry {
         try validTopic(topic);
         try self.bound(topic, content.len);
         try fs.validateText(content);
@@ -104,6 +117,8 @@ pub const Store = struct {
         // 从加锁开始到落盘结束是一个临界区，保证 CAS 检查与写入之间没有其他写者插入。
         const fd = try self.lock();
         defer fs.closeFd(fd);
+
+        if (guard) |g| if (try self.generationUnlocked() != g) return error.GenerationConflict;
 
         // 只有创建时才允许建立目录；更新时若目录不存在，等价于版本冲突。
         var mem = self.directory(expected_version == null) catch |err| {
@@ -131,7 +146,12 @@ pub const Store = struct {
         _ = try self.index(&mem, a, topic, content);
         const name = try filename(a, topic);
         // 最后一步才落盘；仅更新时允许覆盖已有文件，权限固定 0600 以保护私有记忆。
+        if (guard == null) try self.advanceGeneration(&mem);
         try mem.writeMode(name, content, expected_version != null, 0o600);
+        const written = fs.linux.openat(mem.dir.handle, name, fs.linux.nofollow | fs.linux.cloexec, 0);
+        if (written < 0) return fs.osError();
+        defer fs.closeFd(written);
+        if (fsync(written) != 0 or fsync(mem.dir.handle) != 0) return fs.osError();
         return result;
     }
 
@@ -157,10 +177,138 @@ pub const Store = struct {
         if (!std.mem.eql(u8, current.version, expected_version)) return error.VersionConflict;
         const name = try filename(a, topic);
 
+        try self.advanceGeneration(&mem);
         // 通过父目录句柄加文件名删除，而不是重新解析完整路径，减少路径竞争面。
         var p = try mem.parent(name);
         defer p.deinit();
         if (std.c.unlinkat(p.fd, p.name, 0) != 0) return fs.osError();
+        if (fsync(p.fd) != 0) return fs.osError();
+    }
+
+    pub fn generation(self: *Store) !u64 {
+        const fd = try self.lock();
+        defer fs.closeFd(fd);
+        return self.generationUnlocked();
+    }
+
+    /// Shared outbox transaction boundary. Caller MUST already hold the fresh
+    /// project-root flock (the same lock as write/delete); never re-enter lock().
+    pub fn generationLocked(self: *Store) !u64 {
+        return self.generationUnlocked();
+    }
+
+    fn generationUnlocked(self: *Store) !u64 {
+        var dir = self.directory(false) catch |err| {
+            if (err == error.FileNotFound) return 0;
+            return err;
+        };
+        defer dir.deinit();
+        const bytes = dir.readBinary(self.root.allocator, ".generation", 20) catch |err| {
+            if (err == error.FileNotFound) return 0;
+            return err;
+        };
+        defer self.root.allocator.free(bytes);
+        if (bytes.len == 0) return error.InvalidGeneration;
+        for (bytes) |c| if (c < '0' or c > '9') return error.InvalidGeneration;
+        return std.fmt.parseInt(u64, bytes, 10) catch error.InvalidGeneration;
+    }
+
+    fn advanceGeneration(self: *Store, dir: *Root) !void {
+        const previous = try self.generationUnlocked();
+        const next = std.math.add(u64, previous, 1) catch return error.GenerationOverflow;
+        var buffer: [20]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "{d}", .{next});
+        try dir.writeMode(".generation", text, true, 0o600);
+        const fd = fs.linux.openat(dir.dir.handle, ".generation", fs.linux.nofollow | fs.linux.cloexec, 0);
+        if (fd < 0) return fs.osError();
+        defer fs.closeFd(fd);
+        if (fsync(fd) != 0 or fsync(dir.dir.handle) != 0) return fs.osError();
+        // Manual mutation invalidates every old-generation extraction. Forget
+        // its queued/failed/uncertain plaintext too, even while Auto is Off.
+        // The project flock is ALREADY held; do not re-enter Queue's lock.
+        try self.clearOutboxSources();
+    }
+
+    fn clearOutboxSources(self: *Store) !void {
+        const thin = try fs.openDirectory(self.root.dir.handle, ".thin");
+        defer fs.closeFd(thin);
+        const jobs = fs.openDirectory(thin, "mem-jobs") catch |err| {
+            if (err == error.FileNotFound) return;
+            return err;
+        };
+        defer fs.closeFd(jobs);
+        var iterator = (std.Io.Dir{ .handle = jobs }).iterate();
+        var count: usize = 0;
+        while (try iterator.next(self.root.io)) |item| {
+            count += 1;
+            if (count > 128) return error.InvalidJobStorage;
+            var owned_job = item.name.len == 69 and std.mem.endsWith(u8, item.name, ".json");
+            if (owned_job) for (item.name[0..64]) |byte| {
+                if (!(byte >= '0' and byte <= '9') and !(byte >= 'a' and byte <= 'f')) {
+                    owned_job = false;
+                    break;
+                }
+            };
+            if (!owned_job and !std.mem.startsWith(u8, item.name, ".thin-tmp-")) return error.InvalidJobStorage;
+            if (item.name.len > 255) return error.InvalidJobStorage;
+            var name: [256:0]u8 = undefined;
+            @memcpy(name[0..item.name.len], item.name);
+            name[item.name.len] = 0;
+            if (std.c.unlinkat(jobs, @ptrCast(&name), 0) != 0) return fs.osError();
+        }
+        if (fsync(jobs) != 0) return fs.osError();
+    }
+
+    pub fn coreSnapshot(self: *Store, a: std.mem.Allocator) ![]u8 {
+        const entry = self.read(a, "core") catch |err| {
+            if (err == error.FileNotFound) return a.dupe(u8, "");
+            return err;
+        };
+        a.free(entry.version);
+        return @constCast(entry.content);
+    }
+
+    pub fn topics(self: *Store, a: std.mem.Allocator) ![]const []const u8 {
+        const fd = try self.lock();
+        defer fs.closeFd(fd);
+        var dir = self.directory(false) catch |err| {
+            if (err == error.FileNotFound) return a.alloc([]const u8, 0);
+            return err;
+        };
+        defer dir.deinit();
+        var rows: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (rows.items) |row| a.free(row);
+            rows.deinit(a);
+        }
+        var bytes: usize = 0;
+        var it = dir.dir.iterate();
+        while (try it.next(dir.io)) |item| {
+            if (!std.mem.endsWith(u8, item.name, ".md")) continue;
+            const topic = item.name[0 .. item.name.len - 3];
+            try validTopic(topic);
+            bytes += topic.len + 6;
+            if (bytes > self.limits.index_bytes) return error.IndexTooLarge;
+            try rows.append(a, try a.dupe(u8, topic));
+        }
+        std.mem.sort([]const u8, rows.items, {}, struct {
+            fn less(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.order(u8, x, y) == .lt;
+            }
+        }.less);
+        return rows.toOwnedSlice(a);
+    }
+
+    /// Bounded titles only, for per-turn candidate selection (not permanent injection).
+    pub fn topicIndex(self: *Store, a: std.mem.Allocator) ![]const u8 {
+        const fd = try self.lock();
+        defer fs.closeFd(fd);
+        var dir = self.directory(false) catch |err| {
+            if (err == error.FileNotFound) return a.dupe(u8, "");
+            return err;
+        };
+        defer dir.deinit();
+        return self.index(&dir, a, null, null);
     }
 
     /// Frozen by Runtime at startup. Missing storage creates no paths.
@@ -285,6 +433,7 @@ fn child(parent: c_int, name: [*:0]const u8, create: bool) !c_int {
         if (err != error.FileNotFound or !create) return err;
         // 17 = EEXIST：并发创建时目录已存在，视为成功。
         if (std.c.mkdirat(parent, name, 0o700) != 0 and std.c._errno().* != 17) return fs.osError();
+        if (fsync(parent) != 0) return fs.osError();
         return fs.openDirectory(parent, name);
     };
 }

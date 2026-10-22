@@ -43,8 +43,8 @@ pub fn available(config: cfg.Config, cache: *const metadata.Cache, provider_name
 pub fn apply(a: std.mem.Allocator, config: *cfg.Config, choice: Choice) !bool {
     switch (choice) {
         .off => {
-            if (!config.image.enabled) return false;
-            config.image.enabled = false;
+            if (config.image.model == null) return false;
+            config.image.model = null;
             return true;
         },
         .model => |name| {
@@ -52,7 +52,6 @@ pub fn apply(a: std.mem.Allocator, config: *cfg.Config, choice: Choice) !bool {
             if (!std.mem.eql(u8, ref.model, image.model_id)) return error.InvalidImageModel;
             const provider = (config.registry orelse return error.MissingRegistry).find(ref.provider) orelse return error.UnknownProvider;
             _ = try baseUrl(provider);
-            config.image.enabled = true;
             config.image.model = try a.dupe(u8, name);
             return true;
         },
@@ -78,5 +77,6 @@ test "image selector accepts only exact Flash declarations and never changes pri
     try std.testing.expectError(error.InvalidImageModel, apply(parsed.arena.allocator(), &parsed.value, .{ .model = "vision/deepseek-v4-flash" }));
     try std.testing.expect(try apply(parsed.arena.allocator(), &parsed.value, .off));
     try std.testing.expect(!parsed.value.imageActive());
-    try std.testing.expectEqualStrings("vision/deepseek-flash", parsed.value.image.model.?);
+    try std.testing.expect(parsed.value.image.model == null);
+    try std.testing.expect(!try apply(parsed.arena.allocator(), &parsed.value, .off));
 }

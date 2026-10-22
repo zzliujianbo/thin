@@ -26,7 +26,7 @@ pub const Picker = struct {
 
     pub fn init(key: Key, current: ?u32, limits: cfg.Limits) Picker {
         var result: Picker = .{ .key = key, .current = current, .limits = limits };
-        if (key == .compaction_enabled) return result; // Boolean stays in the parent.
+        if (key == .compaction_enabled or key == .memory_auto) return result; // Boolean stays in the parent.
         if (key == .max_output_tokens) result.add(null);
         const presets: []const u32 = switch (key) {
             .max_output_tokens => &.{ 4096, 8192, 16384, 32768, 65536 },
@@ -129,14 +129,14 @@ pub const Picker = struct {
         return n;
     }
     fn validate(self: Picker, n: ?u32) !void {
-        if (self.key == .compaction_enabled) return error.InvalidKey;
+        if (self.key == .compaction_enabled or self.key == .memory_auto) return error.InvalidKey;
         const value = n orelse return if (self.key == .max_output_tokens) {} else error.InvalidValue;
         if (value == 0) return error.InvalidValue;
         const maximum: u32 = switch (self.key) {
             .command_timeout_ms => self.limits.command_max_timeout_ms,
             .request_timeout_ms, .task_timeout_ms => 86400000,
             .max_output_tokens => 1024 * 1024,
-            .compaction_enabled => unreachable,
+            .compaction_enabled, .memory_auto => unreachable,
         };
         if (value > maximum) return error.InvalidValue;
         if (self.key == .max_output_tokens) if (self.limits.summary_tokens) |summary| {
@@ -144,6 +144,23 @@ pub const Picker = struct {
         };
     }
 };
+
+test "boolean preferences never offer confirmable numeric values" {
+    const a = std.testing.allocator;
+    for ([_]Key{ .compaction_enabled, .memory_auto }) |key| {
+        var picker = Picker.init(key, 1, .{});
+        try std.testing.expectEqual(@as(usize, 0), picker.values_len);
+        const rendered = try rows(a, .{}, picker, 80, 3);
+        defer {
+            for (rendered.lines) |line| a.free(line);
+            a.free(rendered.lines);
+        }
+        try std.testing.expect(!rendered.can_confirm);
+        picker.beginCustom();
+        try std.testing.expect(picker.append("1"));
+        try std.testing.expectError(error.InvalidKey, picker.submitCustom());
+    }
+}
 
 fn unit(key: Key) []const u8 {
     return if (key == .max_output_tokens) "tokens" else "s";
@@ -184,7 +201,7 @@ pub fn rows(a: std.mem.Allocator, menu: provider.Picker, self: Picker, columns: 
     const valid = if (self.editing) blk: {
         _ = self.parsedInput() catch break :blk false;
         break :blk self.isCustom(selected);
-    } else if (self.isCustom(selected)) self.key != .compaction_enabled else blk: {
+    } else if (self.isCustom(selected)) self.key != .compaction_enabled and self.key != .memory_auto else blk: {
         _ = self.chosen(selected) catch break :blk false;
         break :blk true;
     };

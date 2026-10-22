@@ -19,6 +19,19 @@ fn disk(home: []const u8) ![]const u8 {
     defer store.deinit();
     return (try store.root.read(a, cfg.file_name, 0, cfg.max_config_bytes)).data;
 }
+fn expectPersistedImage(home: []const u8, model: ?[]const u8) !void {
+    const bytes = try disk(home);
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer parsed.deinit();
+    if (model) |name| {
+        const image = parsed.value.object.get("image").?.object;
+        try std.testing.expectEqual(@as(usize, 1), image.count());
+        try std.testing.expectEqualStrings(name, image.get("model").?.string);
+    } else {
+        try std.testing.expect(!parsed.value.object.contains("image"));
+    }
+}
 fn choose(session: *Session, model: []const u8) !void {
     const connection = session.connection();
     try connection.image_fn.?(connection.context, .{ .model = model });
@@ -67,18 +80,105 @@ test "image Settings default Off exact logged candidates and independent transac
     try std.testing.expect(app.image_client.? != selected);
     try std.testing.expectEqualStrings("fake-refreshed-vision", app.image_client.?.key);
     try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
+    try expectPersistedImage(home, "vision/deepseek-flash");
     const connection = session.connection();
     try connection.image_fn.?(connection.context, .off);
     try std.testing.expect(app.image_client == null and !app.config.value.imageActive());
+    try std.testing.expect(app.config.value.image.model == null);
+    try std.testing.expect(!session.connection().current().image_enabled and session.connection().current().image_model == null);
+    try expectPersistedImage(home, null);
     try std.testing.expectEqual(@as(usize, 4), app.runtime.executor.schemas.len);
     try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
     const bytes = try disk(home);
     defer a.free(bytes);
     var saved = try cfg.parse(a, bytes);
     defer cfg.release(&saved);
-    try std.testing.expect(!saved.value.image.enabled);
-    try std.testing.expectEqualStrings("vision/deepseek-flash", saved.value.image.model.?);
+    try std.testing.expect(!saved.value.imageActive() and saved.value.image.model == null);
     try std.testing.expectEqualStrings("main/chat", saved.value.registry.?.default);
+    try connection.image_fn.?(connection.context, .off);
+    try std.testing.expect(app.image_client == null and app.config.value.image.model == null);
+    try std.testing.expectEqual(@as(usize, 4), app.runtime.executor.schemas.len);
+    try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
+    const twice = try disk(home);
+    defer a.free(twice);
+    try std.testing.expectEqualStrings(bytes, twice);
+    try expectPersistedImage(home, null);
+}
+
+fn contextSurvivesImageSettings(protocol: @import("../core/protocol.zig").Protocol) !void {
+    const p = @import("../core/protocol.zig");
+    const r = @import("../core/runtime.zig");
+    const display = @import("../presentation/state.zig");
+    const Reply = struct {
+        calls: usize = 0,
+        usage: p.Usage,
+        fn call(raw: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .{ .success = .{
+                .message = .{ .role = .assistant, .blocks = &.{.{ .text = "owned context answer" }} },
+                .finish = .stop,
+                .usage = self.usage,
+            } };
+        }
+    };
+    const source =
+        \\{"memory":{"auto":false},"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"PRIMARY_PROTOCOL","context_tokens":65536}}},"one":{"base_url":"https://one.invalid/v1","api_key":"fake-image-one","models":{"deepseek-flash":{}}},"two":{"base_url":"https://two.invalid/v1","api_key":"fake-image-two","models":{"deepseek-flash":{}}}}},"limits":{"low_price_input":false,"safety_tokens":100}}
+    ;
+    const document = try std.mem.replaceOwned(u8, a, source, "PRIMARY_PROTOCOL", @tagName(protocol));
+    defer a.free(document);
+    for ([_]enum { reported, missing, fresh }{ .reported, .missing, .fresh }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buf: [4096]u8 = undefined;
+        const home = buf[0..try tmp.dir.realPath(io, &buf)];
+        try seed(home, document);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = false });
+        defer session.deinit();
+        const app = session.app.?;
+        var reply: Reply = .{ .usage = if (mode == .reported) .{ .total_tokens = 1234 } else .{} };
+        app.runtime.model = .{ .context = &reply, .call_fn = Reply.call };
+        if (mode != .fresh) {
+            var cancel: p.Cancellation = .{};
+            try std.testing.expectEqual(r.Status.success, (try app.runtime.run("owned offline context", &cancel)).status);
+        }
+        const before = app.runtime.contextSnapshot();
+        try std.testing.expectEqual(mode != .missing, before.known);
+        try std.testing.expectEqual(@as(u64, if (mode == .reported) 1234 else 0), before.tokens);
+        const primary = app.client.authorization.ptr;
+        const estimator = app.runtime.estimator;
+        for ([_]?[]const u8{ "one/deepseek-flash", "one/deepseek-flash", "two/deepseek-flash", null }) |selection| {
+            if (selection) |name| try choose(&session, name) else {
+                const connection = session.connection();
+                try connection.image_fn.?(connection.context, .off);
+            }
+            const state = session.connection().current();
+            try std.testing.expectEqualDeep(before, app.runtime.contextSnapshot());
+            try std.testing.expectEqualDeep(before, state.initial_context.?);
+            try std.testing.expectEqual(display.contextRatio(before), display.contextRatio(state.initial_context.?));
+            try std.testing.expect(app.client.authorization.ptr == primary);
+            try std.testing.expectEqualDeep(estimator, app.runtime.estimator);
+            try std.testing.expectEqual(@as(usize, if (mode == .fresh) 0 else 1), reply.calls);
+            try std.testing.expectEqual(@as(usize, if (selection != null) 5 else 4), app.runtime.executor.schemas.len);
+            const checkpoint = try app.runtime.checkpoint();
+            try std.testing.expectEqual(if (mode == .missing) @as(?u64, null) else before.tokens, checkpoint.last_context_tokens);
+        }
+    }
+}
+
+test "image Settings context chat preserves actual usage missing usage and fresh zero" {
+    try contextSurvivesImageSettings(.chat);
+}
+
+test "image Settings context responses preserves actual usage missing usage and fresh zero" {
+    try contextSurvivesImageSettings(.responses);
+}
+
+test "image Settings context anthropic preserves actual usage missing usage and fresh zero" {
+    try contextSurvivesImageSettings(.anthropic);
 }
 
 test "image Settings stale credential OOM and CAS failure publish nothing" {
@@ -104,7 +204,12 @@ test "image Settings stale credential OOM and CAS failure publish nothing" {
     const failed = choose(&session, "vision/deepseek-flash");
     session.allocator = a;
     try std.testing.expectError(error.OutOfMemory, failed);
-    const changed = try std.fmt.allocPrint(a, "{s}\n", .{fixture});
+    try choose(&session, "vision/deepseek-flash");
+    const selected = app.image_client.?;
+    try expectPersistedImage(home, "vision/deepseek-flash");
+    const prior = try disk(home);
+    defer a.free(prior);
+    const changed = try std.fmt.allocPrint(a, "{s}\n", .{prior});
     defer a.free(changed);
     {
         var external = try Store.openExisting(a, io, home);
@@ -112,9 +217,13 @@ test "image Settings stale credential OOM and CAS failure publish nothing" {
         try external.root.writeMode(cfg.file_name, changed, true, 0o600);
     }
     try std.testing.expectError(error.AuthVersionConflict, choose(&session, "vision/deepseek-flash"));
-    try std.testing.expect(app.image_client == null and !app.config.value.imageActive());
+    const connection = session.connection();
+    try std.testing.expectError(error.AuthVersionConflict, connection.image_fn.?(connection.context, .off));
+    try std.testing.expect(app.image_client.? == selected and app.config.value.imageActive());
+    try std.testing.expectEqualStrings("vision/deepseek-flash", app.config.value.image.model.?);
+    try std.testing.expectEqualStrings("vision/deepseek-flash", session.connection().current().image_model.?);
     try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
-    try std.testing.expectEqual(@as(usize, 4), app.runtime.executor.schemas.len);
+    try std.testing.expectEqual(@as(usize, 5), app.runtime.executor.schemas.len);
     const after = try disk(home);
     defer a.free(after);
     try std.testing.expectEqualStrings(changed, after);
@@ -206,7 +315,7 @@ test "image unavailable own key preserves main startup and fails before file acc
     const home = buf[0..try tmp.dir.realPath(io, &buf)];
     var parsed = try cfg.parse(a, fixture);
     defer cfg.release(&parsed);
-    parsed.value.image = .{ .enabled = true, .model = "vision/deepseek-flash" };
+    parsed.value.image = .{ .model = "vision/deepseek-flash" };
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     try cfg.writeDisk(parsed.value, &out.writer);

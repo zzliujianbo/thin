@@ -256,6 +256,12 @@ pub const Journal = struct {
         self.known_key_count += 1;
     }
 
+    /// Read-only while Runtime owns an accepted task. Reject entire memory
+    /// evidence rather than persisting a partly redacted credential-bearing log.
+    pub fn containsSecret(self: *const Journal, value: []const u8) bool {
+        return self.nextSecret(value) != null;
+    }
+
     fn isKey(self: *const Journal, value: []const u8) bool {
         if (self.key.len != 0 and std.mem.eql(u8, self.key, value)) return true;
         for (self.known_keys[0..self.known_key_count]) |key| if (std.mem.eql(u8, key, value)) return true;

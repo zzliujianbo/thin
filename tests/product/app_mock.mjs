@@ -514,7 +514,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       const filename = kind === 'legacy-config' ? 'auth.json' : 'config.json';
       // 空白文件走交互初始化；待激活配置始终使用回环服务，绝不向公共端点发送密钥或消息。
       const provider = ['auth-activate','exit-unconfigured','exit-secret'].includes(kind) ? {base_url:url, api_key_env:'', api_key:null, chat_max_tokens:true} : {base_url:url, api_key_env:'THIN_FIXTURE_KEY'};
-      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({llm:{default:'local/fixture-model',providers:{local:{...provider,models:{'fixture-model':{protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined},...(['model-select','model-select-empty'].includes(kind)?{'fixture-next':{protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}},'fixture-custom':{protocol,context_tokens:32768,reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}}:{})}}}}, limits:{low_price_input:false,max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',providers:{local:{...provider,models:{'fixture-model':{protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined},...(['model-select','model-select-empty'].includes(kind)?{'fixture-next':{protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}},'fixture-custom':{protocol,context_tokens:32768,reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}}:{})}}}}, limits:{low_price_input:false,max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
       await writeFile(join(home,'.thin',filename), content);
     }
 
@@ -811,6 +811,8 @@ try {
     await decisionModelRegressions({app,pty,execute,send});
   } else if (process.argv.includes('--settings-only')) {
     await settingsRegressions({app,pty,execute,send});
+  } else if (process.argv.includes('--resume-only')) {
+    await fullResumeRegressions({app,pty,execute});
   } else if (process.argv.includes('--tool-presentation-only')) {
     for (const kind of ['tool-icons','file-stats','memory-summary']) await scenario(`PTY/${kind}`,'chat',kind,true);
   } else if (!watchdogOnly) {

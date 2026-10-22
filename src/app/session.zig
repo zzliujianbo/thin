@@ -155,6 +155,9 @@ pub const Session = struct {
     metadata_fetch: MetadataFetch = metadata.fetch,
     metadata_dev_fetch: DevFetch = metadata.fetchDev,
     metadata_notice: ?[]const u8 = null,
+    /// Identity snapshot only: App publishes process-lifetime static notices.
+    /// Never retain or inspect worker-owned mutable Runtime state here.
+    last_memory_notice: ?[]const u8 = null,
     active_context_official: bool = false,
     display_origins: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
     display_disabled: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
@@ -633,6 +636,8 @@ pub const Session = struct {
             .image_enabled = config.imageActive(),
             .image_models = self.display_image_models,
             .image_model = if (config.imageActive()) config.image.model else null,
+            .memory_auto = config.memory.auto,
+            .memory_notice = if (self.app) |app| app.memoryNotice() else null,
             .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .pending_default_effort = if (self.app != null and self.initial_default_pending and config.model.reasoning_effort == null) self.preferred_effort else null,
@@ -796,11 +801,54 @@ pub const Session = struct {
         self.metadata_login_pending &= ~claim.mask;
     }
 
-    /// Owner polling never waits for network. Completion may change only the
-    /// candidate catalog; the active Runtime budget is frozen until selection.
+    test "memory notice static identity changes and clears only once" {
+        // Only this field is touched; no App, Runtime, filesystem or network.
+        var session: Session = undefined;
+        session.last_memory_notice = null;
+        try std.testing.expect(!session.memoryNoticeChanged(null));
+        try std.testing.expect(session.memoryNoticeChanged("Memory: updating"));
+        try std.testing.expect(!session.memoryNoticeChanged("Memory: updating"));
+        try std.testing.expect(session.memoryNoticeChanged("Memory: update failed"));
+        try std.testing.expect(!session.memoryNoticeChanged("Memory: update failed"));
+        try std.testing.expect(session.memoryNoticeChanged(null));
+        try std.testing.expect(!session.memoryNoticeChanged(null));
+    }
+
+    test "memory notice dirty survives busy metadata and cadence early returns" {
+        // Minimal owner fixture: these paths must not touch App/Runtime or I/O.
+        var session: Session = undefined;
+        session.app = null;
+        session.initial_default_pending = false;
+        var job: MetadataJob = undefined;
+        job.future = null;
+        job.dev_future = null;
+        session.metadata_job = &job;
+        session.last_memory_notice = "Memory: updating";
+        try std.testing.expect(pollModels(&session, false));
+        try std.testing.expect(!pollModels(&session, false));
+        session.metadata_job = null;
+        session.metadata_login_pending = 0;
+        session.metadata_auto = true;
+        session.metadata_blocked = false;
+        session.metadata_awake_ms = 1;
+        session.metadata_next_check_ms = 100;
+        session.last_memory_notice = "Memory: update failed";
+        try std.testing.expect(pollModels(&session, true));
+        try std.testing.expect(!pollModels(&session, true));
+    }
+
+    fn memoryNoticeChanged(self: *Session, notice: ?[]const u8) bool {
+        const changed = !std.meta.eql(self.last_memory_notice, notice);
+        self.last_memory_notice = notice;
+        return changed;
+    }
+
+    /// Owner polling never waits for network. Notice publication only dirties
+    /// presentation; the active Runtime budget stays frozen until selection.
     fn pollModels(raw: *anyopaque, idle: bool) bool {
         const self: *Session = @ptrCast(@alignCast(raw));
-        const default_changed = self.completeInitialDefault(idle) catch false;
+        const memory_changed = self.memoryNoticeChanged(if (self.app) |app| app.memoryNotice() else null);
+        const default_changed = (self.completeInitialDefault(idle) catch false) or memory_changed;
         if (self.metadata_job) |job| {
             official_pending: {
                 if (job.future) |*future| {
@@ -823,7 +871,7 @@ pub const Session = struct {
                     job.dev_future = null;
                 }
             }
-            if (!idle) return false;
+            if (!idle) return default_changed;
             if (job.future == null and job.official_published and job.dev_future != null and self.metadata_login_pending != 0) {
                 const requested = self.metadata_login_pending;
                 self.restartOfficialMetadata(job, requested) catch {
@@ -926,7 +974,7 @@ pub const Session = struct {
         }
         if (!idle or !self.metadata_auto or self.metadata_blocked) return default_changed;
         const tick = self.metadataTick();
-        if (tick < self.metadata_next_check_ms) return false;
+        if (tick < self.metadata_next_check_ms) return default_changed;
         self.metadata_next_check_ms = tick + 60000;
         const configured = self.configuredMask(self.global_config.?.value);
         if (configured != 0 and metadata.eligible(&self.metadata_cache, configured | metadata.dev_bit, self.metadataNow(), self.refreshPolicy()) != 0) {

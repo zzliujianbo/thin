@@ -14,7 +14,7 @@ const io = std.testing.io;
 // No catalog/name-based capability fallback. The second model deliberately has
 // a different supported set and different wire strings from the first.
 const document =
-    \\{"llm":{"default":"local/first","providers":{"local":{"base_url":"https://fixture.invalid/v1","api_key_env":"OWNED_SETTINGS_KEY","models":{"first":{"protocol":"chat","context_tokens":65536,"reasoning":{"map":{"off":"none","low":"light","high":"intensive","max":"maximum"}}},"second":{"protocol":"chat","context_tokens":65536,"reasoning_effort":"low","reasoning":{"map":{"low":"second-light","medium":"balanced","high":"second-intensive"}}},"unknown":{"protocol":"chat","context_tokens":65536,"reasoning_effort":"high"}}}}},"limits":{"low_price_input":false}}
+    \\{"memory":{"auto":false},"llm":{"default":"local/first","providers":{"local":{"base_url":"https://fixture.invalid/v1","api_key_env":"OWNED_SETTINGS_KEY","models":{"first":{"protocol":"chat","context_tokens":65536,"reasoning":{"map":{"off":"none","low":"light","high":"intensive","max":"maximum"}}},"second":{"protocol":"chat","context_tokens":65536,"reasoning_effort":"low","reasoning":{"map":{"low":"second-light","medium":"balanced","high":"second-intensive"}}},"unknown":{"protocol":"chat","context_tokens":65536,"reasoning_effort":"high"}}}}},"limits":{"low_price_input":false}}
 ;
 
 const Fixture = struct {

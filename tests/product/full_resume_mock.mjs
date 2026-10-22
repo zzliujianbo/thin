@@ -86,7 +86,7 @@ export async function fullResumeRegressions({app, pty, execute}) {
       await mkdir(join(home, '.thin'), {recursive:true,mode:0o700});
       await mkdir(join(project, '.thin'), {recursive:true,mode:0o700});
       const configPath = join(home, '.thin', 'config.json');
-      const configObject = {limits:{low_price_input:false},llm:{default:'local/fixture-model',providers:{local:{kind:'opencode_zen',base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol,context_tokens:32768}}}}}};
+      const configObject = {memory:{auto:false},limits:{low_price_input:false},llm:{default:'local/fixture-model',providers:{local:{kind:'opencode_zen',base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol,context_tokens:32768}}}}}};
       const config = JSON.stringify(configObject);
       const settingsPath = join(project, '.thin', 'settings.json');
       const settings = '{"version":1,"reasoning_effort":"low"}\n';

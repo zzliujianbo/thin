@@ -63,6 +63,18 @@ pub fn build(b: *std.Build) void {
     const run_unit = b.addRunArtifact(unit);
     b.step("test-unit", "Run product unit tests without network or credentials").dependOn(&run_unit.step);
 
+    const memory_tests = b.addTest(.{
+        .use_llvm = false,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/memory_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_memory = b.addRunArtifact(memory_tests);
+    b.step("test-memory", "Run bounded automatic-memory offline regressions").dependOn(&run_memory.step);
+
     const http_tests = b.addTest(.{
         .use_llvm = false,
         .root_module = b.createModule(.{
@@ -166,6 +178,18 @@ pub fn build(b: *std.Build) void {
     run_app.setCwd(b.path("."));
     b.step("test-app", "Run isolated CLI and PTY application acceptance (requires Node)").dependOn(&run_app.step);
 
+    const run_memory_app = b.addSystemCommand(&.{"node"});
+    run_memory_app.addFileArg(b.path("tests/product/memory_auto_mock.mjs"));
+    run_memory_app.addArtifactArg(exe);
+    run_memory_app.setCwd(b.path("."));
+    b.step("test-memory-app", "Run owned loopback automatic-memory CLI lifecycle acceptance").dependOn(&run_memory_app.step);
+
+    const run_idle_enter = b.addSystemCommand(&.{"python3"});
+    run_idle_enter.addFileArg(b.path("tests/product/idle_enter_mock.py"));
+    run_idle_enter.addArtifactArg(exe);
+    run_idle_enter.setCwd(b.path("."));
+    b.step("test-idle-enter", "Run owned idle prompt newline PTYs (requires Python 3)").dependOn(&run_idle_enter.step);
+
     // Global settings acceptance reuses both application artifacts; the Node
     // fixture owns its loopback server and serial PTY launches.
     const run_settings = b.addSystemCommand(&.{"node"});
@@ -223,12 +247,15 @@ pub fn build(b: *std.Build) void {
     // 聚合步骤 `zig build test`：依次挂载所有离线测试（不含需要真实 API 的内容）。
     const test_all = b.step("test", "Run all offline unit, transport, application and foundation tests");
     test_all.dependOn(&run_unit.step);
+    test_all.dependOn(&run_memory.step);
+    test_all.dependOn(&run_memory_app.step);
     test_all.dependOn(&run_presentation.step);
     test_all.dependOn(&run_http.step);
     test_all.dependOn(&run_anthropic.step);
     test_all.dependOn(&run_systemone.step);
     test_all.dependOn(&run_proxy.step);
     test_all.dependOn(&run_app.step);
+    test_all.dependOn(&run_idle_enter.step);
     test_all.dependOn(&run_settings.step);
     test_all.dependOn(&run_command.step);
     test_all.dependOn(&run_approval_cancel.step);

@@ -267,8 +267,12 @@ pub const DecisionConfig = struct {
 
 /// Independent text-only image helper selection; no credentials or transport policy.
 pub const ImageConfig = struct {
-    enabled: bool = false,
+    /// Presence is the only activation state. Off clears the selection.
     model: ?[]const u8 = null,
+};
+
+pub const MemoryConfig = struct {
+    auto: bool = true,
 };
 
 /// Owned application configuration. Disk input requires llm declarations;
@@ -277,6 +281,7 @@ pub const Config = struct {
     proxy: ?ProxyConfig = null,
     decision: ?DecisionConfig = null,
     image: ImageConfig = .{},
+    memory: MemoryConfig = .{},
     registry: ?Registry = null,
     selected_provider: ?[]const u8 = null,
     selection_pending: bool = false,
@@ -286,7 +291,7 @@ pub const Config = struct {
     limits: Limits = .{},
 
     pub fn imageActive(self: Config) bool {
-        return self.image.enabled;
+        return self.image.model != null;
     }
 
     pub fn decisionActive(self: Config) bool {
@@ -321,7 +326,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
 const image_test_prefix = "{\"llm\":{\"default\":\"p/main\",\"providers\":{\"p\":{\"base_url\":\"https://fixture.invalid\"}}}";
 
 fn imageAllocationCase(a: std.mem.Allocator) !void {
-    inline for (.{ "", ",\"image\":{}", ",\"image\":{\"enabled\":false,\"model\":null}", ",\"image\":{\"enabled\":true,\"model\":\"p/deepseek-flash\"}", ",\"image\":{\"enabled\":false,\"model\":\"p/deepseek-flash\"}" }, 0..) |suffix, index| {
+    inline for (.{ "", ",\"image\":{}", ",\"image\":{\"model\":null}", ",\"image\":{\"model\":\"p/deepseek-flash\"}" }, 0..) |suffix, index| {
         var parsed = try parse(a, image_test_prefix ++ suffix ++ "}");
         defer release(&parsed);
         try std.testing.expectEqual(index == 3, parsed.value.imageActive());
@@ -340,7 +345,13 @@ fn imageAllocationCase(a: std.mem.Allocator) !void {
             error.WriteFailed => return error.OutOfMemory,
             else => return err,
         };
-        try std.testing.expectEqual(index >= 3, std.mem.find(u8, out.written(), "\"image\"") != null);
+        try std.testing.expectEqual(index == 3, std.mem.find(u8, out.written(), "\"image\"") != null);
+        var tree = try std.json.parseFromSlice(std.json.Value, wiping.allocator(), out.written(), .{});
+        defer tree.deinit();
+        if (tree.value.object.get("image")) |value| {
+            try std.testing.expectEqual(@as(usize, 1), value.object.count());
+            try std.testing.expect(value.object.contains("model"));
+        }
         var again = try parse(a, out.written());
         defer release(&again);
         try std.testing.expectEqualDeep(parsed.value.image, again.value.image);
@@ -377,6 +388,18 @@ fn rejectedImageAllocationCase(a: std.mem.Allocator) !void {
 
 test "image defaults sparse disk exact selection owned clone and roundtrip" {
     try imageAllocationCase(std.testing.allocator);
+}
+
+test "image retired enabled is rejected regardless of value" {
+    inline for (.{ "true", "false", "null", "0", "\"false\"" }) |value| {
+        if (parse(std.testing.allocator, image_test_prefix ++
+            ",\"image\":{\"model\":\"p/deepseek-flash\",\"enabled\":" ++ value ++ "}}")) |parsed_value|
+        {
+            var parsed = parsed_value;
+            release(&parsed);
+            return error.ExpectedEnabledRejection;
+        } else |err| try std.testing.expectEqual(error.UnknownField, err);
+    }
 }
 
 test "image rejects invalid owner model types duplicates and unknown fields" {
@@ -626,7 +649,7 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
     const root = try object(tree.value);
     var keys = root.iterator();
     while (keys.next()) |entry| {
-        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "decision") and !std.mem.eql(u8, entry.key_ptr.*, "proxy") and !std.mem.eql(u8, entry.key_ptr.*, "image")) return error.UnknownField;
+        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "decision") and !std.mem.eql(u8, entry.key_ptr.*, "proxy") and !std.mem.eql(u8, entry.key_ptr.*, "image") and !std.mem.eql(u8, entry.key_ptr.*, "memory")) return error.UnknownField;
     }
     const llm_value = root.get("llm") orelse return error.MissingField;
     const result: Config = blk: {
@@ -677,7 +700,8 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         const decision = if (root.get("decision")) |v| if (v == .null) null else try decode(DecisionConfig, a, v) else null;
         const proxy = if (root.get("proxy")) |v| if (v == .null) null else try decode(ProxyConfig, a, v) else null;
         const image = if (root.get("image")) |v| try decode(ImageConfig, a, v) else ImageConfig{};
-        break :blk .{ .proxy = proxy, .decision = decision, .image = image, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
+        const memory = if (root.get("memory")) |v| try decode(MemoryConfig, a, v) else MemoryConfig{};
+        break :blk .{ .proxy = proxy, .decision = decision, .image = image, .memory = memory, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
     };
     try validate(result);
     tree.arena.child_allocator = allocator;
@@ -728,9 +752,13 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
             try s.objectField("proxy");
             try s.write(proxy);
         }
-        if (config.image.enabled or config.image.model != null) {
+        if (config.imageActive()) {
             try s.objectField("image");
             try s.write(config.image);
+        }
+        if (!config.memory.auto) {
+            try s.objectField("memory");
+            try s.write(config.memory);
         }
         if (config.decision) |decision| {
             try s.objectField("decision");
@@ -738,6 +766,62 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
         }
         try s.endObject();
     }
+}
+
+test "memory auto strict defaults sparse disk and roundtrip" {
+    const a = std.testing.allocator;
+    inline for (.{ "", ",\"memory\":{}", ",\"memory\":{\"auto\":true}", ",\"memory\":{\"auto\":false}" }, 0..) |suffix, index| {
+        var parsed = try parse(a, image_test_prefix ++ suffix ++ "}");
+        defer release(&parsed);
+        try std.testing.expectEqual(index != 3, parsed.value.memory.auto);
+        var copied = try clone(a, parsed.value);
+        defer release(&copied);
+        try std.testing.expectEqualDeep(parsed.value.memory, copied.value.memory);
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try writeDisk(copied.value, &out.writer);
+        var tree = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
+        defer tree.deinit();
+        try std.testing.expectEqual(index == 3, tree.value.object.contains("memory"));
+        if (tree.value.object.get("memory")) |memory| {
+            try std.testing.expectEqual(@as(usize, 1), memory.object.count());
+            try std.testing.expect(!memory.object.get("auto").?.bool);
+        }
+        var again = try parse(a, out.written());
+        defer release(&again);
+        try std.testing.expectEqualDeep(parsed.value.memory, again.value.memory);
+    }
+    inline for (.{ "null", "true", "0", "\"auto\"", "[]", "{\"auto\":null}", "{\"auto\":0}", "{\"auto\":\"true\"}", "{\"auto\":[]}", "{\"auto\":{}}" }) |bad| {
+        try std.testing.expectError(error.UnexpectedToken, parse(a, image_test_prefix ++ ",\"memory\":" ++ bad ++ "}"));
+    }
+    inline for (.{ "enabled", "reviewer", "model", "Auto" }) |field| {
+        try std.testing.expectError(error.UnknownField, parse(a, image_test_prefix ++ ",\"memory\":{\"" ++ field ++ "\":true}}"));
+    }
+    try std.testing.expectError(error.DuplicateField, parse(a, image_test_prefix ++ ",\"memory\":{\"auto\":true,\"auto\":false}}"));
+    try std.testing.expectError(error.DuplicateField, parse(a, image_test_prefix ++ ",\"memory\":{},\"memory\":{}}"));
+}
+
+fn memoryAllocationCase(a: std.mem.Allocator) !void {
+    inline for (.{ "{}", "{\"auto\":false}" }) |memory| {
+        var parsed = try parse(a, image_test_prefix ++ ",\"memory\":" ++ memory ++ "}");
+        defer release(&parsed);
+        var copied = try clone(a, parsed.value);
+        defer release(&copied);
+        try std.testing.expectEqualDeep(parsed.value.memory, copied.value.memory);
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        writeDisk(copied.value, &out.writer) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
+        var again = try parse(a, out.written());
+        defer release(&again);
+        try std.testing.expectEqualDeep(copied.value.memory, again.value.memory);
+    }
+}
+
+test "memory config allocation failures release parse clone and disk candidates" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, memoryAllocationCase, .{});
 }
 
 /// Candidate-only edits. Allocate replacement slices; never mutate shared registry memory.
@@ -914,7 +998,7 @@ fn validateConfig(config: Config, comptime unresolved: bool) !void {
         if (!std.mem.eql(u8, selection.model, "deepseek-flash")) return error.InvalidImageModel;
         const registry = config.registry orelse return error.MissingRegistry;
         _ = registry.find(selection.provider) orelse return error.UnknownProvider;
-    } else if (config.image.enabled) return error.InvalidImageModel;
+    }
     if (config.decision) |decision| {
         const selection = try splitDefault(decision.model);
         const registry = config.registry orelse return error.MissingRegistry;

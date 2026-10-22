@@ -1,8 +1,9 @@
-//! Pure, transactional edits of the five user-facing preferences.
+//! Pure, transactional edits of user-facing preferences.
 const cfg = @import("config.zig");
 
 pub const Key = enum {
     compaction_enabled,
+    memory_auto,
     command_timeout_ms,
     request_timeout_ms,
     max_output_tokens,
@@ -18,6 +19,11 @@ pub fn apply(config: *cfg.Config, key: Key, value: ?u32) !void {
             const enabled = value orelse return error.InvalidLimit;
             if (enabled > 1) return error.InvalidLimit;
             candidate.limits.compaction_enabled = enabled == 1;
+        },
+        .memory_auto => {
+            const auto = value orelse return error.InvalidLimit;
+            if (auto > 1) return error.InvalidLimit;
+            candidate.memory.auto = auto == 1;
         },
         .max_output_tokens => candidate.limits.max_output_tokens = value,
         .command_timeout_ms => candidate.limits.command_timeout_ms = value orelse return error.InvalidLimit,

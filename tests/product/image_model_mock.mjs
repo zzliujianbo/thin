@@ -60,7 +60,19 @@ async function scan(directory) {
   return files;
 }
 
-export async function imageModelRegressions({app,pty,execute,send}) {
+// The primary reports 1024 / 32768 = 3.1% to the footer. Auxiliary usage
+// deliberately differs, so helper output must not replace that observation.
+function sendPrimary(res,text,calls = []) {
+  res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});
+  const event = value=>res.write(`data: ${JSON.stringify(value)}\n\n`);
+  const delta = calls.length ? {tool_calls:calls.map((call,index)=>({index,id:call.id,type:'function',function:{name:call.name,arguments:call.arguments}}))} : {content:text};
+  event({id:'image-context-fixture',choices:[{index:0,delta,finish_reason:null}]});
+  event({id:'image-context-fixture',choices:[{index:0,delta:{},finish_reason:calls.length ? 'tool_calls':'stop'}],usage:{prompt_tokens:1000,completion_tokens:24,total_tokens:1024}});
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+export async function imageModelRegressions({app,pty,execute}) {
   for (const kind of ['pty','success','malformed','timeout']) {
     const isPty = kind === 'pty';
     const root = await mkdtemp(join(tmpdir(),'thin-image-model-'));
@@ -124,7 +136,7 @@ export async function imageModelRegressions({app,pty,execute,send}) {
         assert.deepEqual(body.tools.slice(0,4),primaryTools,'Image changed an existing tool schema');
         if (isPty && mainPosts === 1) {
           assert.equal(auxPosts,0); assert.equal(body.messages.at(-1).content,WARMUP);
-          send(res,'chat','image-warmup-answer'); return;
+          sendPrimary(res,'image-warmup-answer'); return;
         }
         if (isPty) {
           assert(body.messages.some(m=>m.role==='user' && m.content===WARMUP));
@@ -132,7 +144,7 @@ export async function imageModelRegressions({app,pty,execute,send}) {
         }
         if (mainPosts === (isPty ? 2 : 1)) {
           assert.equal(auxPosts,0); assert.equal(body.messages.at(-1).content,TASK);
-          send(res,'chat','',[{id:CALL,name:'read_image',arguments:JSON.stringify({path:FILE,question:QUESTION})}]);
+          sendPrimary(res,'',[{id:CALL,name:'read_image',arguments:JSON.stringify({path:FILE,question:QUESTION})}]);
         } else {
           assert.equal(auxPosts,1);
           const calls = body.messages.flatMap(m=>m.tool_calls ?? []);
@@ -154,7 +166,7 @@ export async function imageModelRegressions({app,pty,execute,send}) {
             assert.equal(value.usage.total_tokens,333); assert.equal(value.usage.cached_input_tokens,7);
           }
           if (off) assert.equal(body.messages.at(-1).content,'image-off-proof');
-          send(res,'chat',off ? 'image-off-verified' : 'image-tool-result-verified');
+          sendPrimary(res,off ? 'image-off-verified' : 'image-tool-result-verified');
         }
       } catch (error) { fail(error); res.writeHead(500); res.end(); }
     });
@@ -166,19 +178,25 @@ export async function imageModelRegressions({app,pty,execute,send}) {
       await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
       const origin = `http://127.0.0.1:${server.address().port}`;
       const provider = (path,key,models)=>({base_url:`${origin}/${path}/v1`,api_key:key,api_key_env:'',kind:null,chat_max_tokens:false,models});
-      baseline = {llm:{default:`primary/${MAIN}`,reasoning_effort:'high',providers:{
+      baseline = {memory:{auto:false},llm:{default:`primary/${MAIN}`,reasoning_effort:'high',providers:{
         primary:provider('primary',MAIN_KEY,{[MAIN]:{protocol:'chat',context_tokens:32768,reasoning:{format:'standard',map:{off:'none',high:'high'}}}}),
         aux:provider('aux',AUX_KEY,{'deepseek-flash':{},'not-image':{protocol:'chat',context_tokens:32768}}),
         locked:provider('locked',null,{'deepseek-flash':{}}),
       }},limits:{...defaults,request_timeout_ms:kind === 'timeout' ? 300 : 10000}};
-      if (!isPty) baseline.image = {enabled:true,model:SELECTOR};
+      if (!isPty) baseline.image = {model:SELECTOR};
       original = JSON.stringify(baseline);
       await writeFile(configPath,original,{mode:0o600});
       const expected = structuredClone(baseline);
       async function saved(enabled) {
-        // Off disables the helper but deliberately retains the chosen identity.
-        expected.image = {enabled,model:SELECTOR};
-        assert.deepEqual(JSON.parse(await readFile(configPath,'utf8')),expected);
+        // A selected helper persists only its identity; Off removes it entirely.
+        if (enabled) expected.image = {model:SELECTOR};
+        else delete expected.image;
+        const actual = JSON.parse(await readFile(configPath,'utf8'));
+        assert.deepEqual(actual,expected);
+        if (enabled) {
+          assert.deepEqual(Object.keys(actual.image),['model']);
+          assert.equal(actual.image.model,SELECTOR);
+        } else assert(!Object.hasOwn(actual,'image'),'Off retained an image declaration');
         assert.equal((await stat(configPath)).mode & 0o777,0o600);
       }
       async function gate(name) {

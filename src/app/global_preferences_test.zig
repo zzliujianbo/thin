@@ -247,7 +247,8 @@ test "config CAS save failure is atomic and decision toggles normalize Anthropic
     try std.testing.expectEqual(@as(usize, 1), app.runtime.history.items[1].blocks.len);
     try std.testing.expectEqualStrings("keep-id", app.runtime.history.items[1].blocks[0].tool_call.id);
     try std.testing.expectEqualStrings("completed fixture", app.runtime.history.items[2].blocks[0].tool_result.text);
-    try std.testing.expect(!session.connection().current().initial_context.?.known);
+    try std.testing.expect(session.connection().current().initial_context.?.known);
+    try std.testing.expectEqual(@as(u64, 1234), session.connection().current().initial_context.?.tokens);
     var description_changed = false;
     for (schemas, app.runtime.executor.schemas) |old, next| {
         try std.testing.expectEqualStrings(old.name, next.name);
@@ -372,10 +373,9 @@ test "settings auxiliary credentials follow login addition rotation and failed s
     try std.testing.expectEqualStrings("Bearer fake-frozen-primary", app.client.authorization);
     try std.testing.expectEqualStrings("PRIMARY_FIXTURE_KEY", app.config.value.provider.api_key_env);
     try std.testing.expect(app.config.value.provider.api_key == null);
-    // Tool schema changes invalidate the last request's context count, not the
-    // frozen primary window or calibration. Failed save above keeps all of it.
-    try std.testing.expect(!app.runtime.contextSnapshot().known);
-    try std.testing.expectEqual(snapshot.limit, app.runtime.contextSnapshot().limit);
+    // Tool schema changes do not rewrite the latest server observation (or
+    // fresh-session zero). Failed saves and successful edits both retain it.
+    try std.testing.expectEqualDeep(snapshot, app.runtime.contextSnapshot());
     try std.testing.expectEqualDeep(estimator, app.runtime.estimator);
     const disk = try read(home, cfg.file_name);
     defer a.free(disk);

@@ -14,6 +14,7 @@ const plain =
 const reviewed = plain[0 .. plain.len - 1] ++ ",\"decision\":{\"model\":\"route/judge\"}}";
 const Edit = struct { key: preference.Key, value: ?u32 };
 const main_edits = [_]Edit{
+    .{ .key = .memory_auto, .value = 0 },
     .{ .key = .compaction_enabled, .value = 0 },
     .{ .key = .command_timeout_ms, .value = 10000 },
     .{ .key = .request_timeout_ms, .value = 20000 },
@@ -33,6 +34,49 @@ fn seed(home: []const u8, bytes: []const u8) !void {
     try store.root.writeMode(cfg.file_name, bytes, false, 0o600);
 }
 
+test "memory settings current publishes active pending and global defaults without network" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    // Missing configuration initializes owned defaults, without activating App.
+    var pending = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = false });
+    defer pending.deinit();
+    const connection = pending.connection();
+    try std.testing.expect(pending.app == null);
+    try std.testing.expect(connection.current().memory_auto);
+    try std.testing.expect(connection.current().memory_notice == null);
+    try std.testing.expect(!connection.poll_models_fn.?(connection.context, false));
+    try set(&pending, .memory_auto, 0);
+    try std.testing.expect(!pending.pending.?.value.memory.auto);
+    try std.testing.expect(!pending.global_config.?.value.memory.auto);
+    // Pending presentation must not silently borrow a different global value.
+    pending.global_config.?.value.memory.auto = true;
+    try std.testing.expect(!connection.current().memory_auto);
+    pending.global_config.?.value.memory.auto = false;
+    try set(&pending, .memory_auto, 1);
+    const bytes = try disk(&pending);
+    defer a.free(bytes);
+    var tree = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer tree.deinit();
+    try std.testing.expect(!tree.value.object.contains("memory"));
+
+    try pending.store.root.writeMode(cfg.file_name, plain, true, 0o600);
+    var active = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = false });
+    defer active.deinit();
+    const app = active.app.?;
+    try std.testing.expect(active.connection().current().memory_auto);
+    try set(&active, .memory_auto, 0);
+    active.global_config.?.value.memory.auto = true;
+    try std.testing.expect(!active.connection().current().memory_auto);
+    active.global_config.?.value.memory.auto = false;
+    try std.testing.expectEqual(app.memoryNotice(), active.connection().current().memory_notice);
+    try std.testing.expect(active.metadata_job == null and pending.metadata_job == null);
+}
+
 test "preferences pure edits enforce shared validation without partial mutation" {
     var parsed = try cfg.parse(a, reviewed);
     defer cfg.release(&parsed);
@@ -42,6 +86,8 @@ test "preferences pure edits enforce shared validation without partial mutation"
     try preference.apply(&parsed.value, .max_output_tokens, 1024 * 1024);
     try preference.apply(&parsed.value, .max_output_tokens, null);
     const invalid = [_]Edit{
+        .{ .key = .memory_auto, .value = null },
+        .{ .key = .memory_auto, .value = 2 },
         .{ .key = .compaction_enabled, .value = null },
         .{ .key = .compaction_enabled, .value = 2 },
         .{ .key = .command_timeout_ms, .value = null },
@@ -88,6 +134,13 @@ test "preferences active clone preserves unrelated frozen limits and rejects inv
     try std.testing.expectEqual(@as(u32, 777), candidate.value.limits.input_margin_tokens);
     try std.testing.expectEqual(@as(u32, 20000), candidate.value.limits.command_max_timeout_ms);
     try std.testing.expectEqual(@as(?u32, 4096), candidate.value.limits.summary_tokens);
+    try std.testing.expect(candidate.value.memory.auto);
+    try preference.apply(&declaration.value, .memory_auto, 0);
+    var memory_candidate = try profiles.activeClone(a, active, declaration.value);
+    defer cfg.release(&memory_candidate);
+    try std.testing.expect(!memory_candidate.value.memory.auto);
+    try std.testing.expectEqualDeep(active.provider, memory_candidate.value.provider);
+    try std.testing.expectEqualDeep(active.model, memory_candidate.value.model);
 }
 
 test "preferences preserve frozen primary while only shared request timeout refreshes auxiliary" {
@@ -134,11 +187,15 @@ test "preferences preserve frozen primary while only shared request timeout refr
         try std.testing.expectEqualDeep(estimator, app.runtime.estimator);
         try std.testing.expectEqualDeep(id, session.session_id);
         try std.testing.expectEqualDeep(session.global_config.?.value.limits, session.connection().current().limits);
+        try std.testing.expectEqual(session.global_config.?.value.memory.auto, session.connection().current().memory_auto);
     }
     const saved = try disk(&session);
     defer a.free(saved);
     const active_arena = app.config.arena;
     try session.store.root.writeMode(cfg.file_name, "{}", true, 0o600);
+    try std.testing.expectError(error.AuthVersionConflict, set(&session, .memory_auto, 1));
+    try std.testing.expect(!app.config.value.memory.auto and !session.global_config.?.value.memory.auto);
+    try std.testing.expect(!session.connection().current().memory_auto);
     try std.testing.expectError(error.AuthVersionConflict, set(&session, .request_timeout_ms, 45678));
     try std.testing.expect(app.config.arena == active_arena and app.decision_client.? == aux);
     try std.testing.expectEqualDeep(aux_usage, aux.last_usage);
@@ -339,6 +396,7 @@ test "preferences restored missing provider preserves pending history while savi
     try std.testing.expectError(error.InvalidConfig, cfg.validatePendingSettings(saved.value));
     try std.testing.expectEqual(@as(u32, 60000), saved.value.limits.request_timeout_ms);
     try std.testing.expect(saved.value.limits.low_price_input and !saved.value.decision.?.enabled);
+    try std.testing.expect(!saved.value.memory.auto and !connection.current().memory_auto);
     try std.testing.expectEqualStrings("other/judge", saved.value.decision.?.model);
     const before = try disk(&restored);
     defer a.free(before);
