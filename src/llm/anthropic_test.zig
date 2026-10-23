@@ -6,7 +6,29 @@ const c = @import("common.zig");
 const scope: p.ReplayScope = .{ .connection = "offline", .model = "fixture", .protocol = .anthropic };
 const start = "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":7,\"output_tokens\":0}}}";
 fn request() p.Request {
-    return .{ .scope = scope, .system = "system", .tools = &.{}, .messages = &.{}, .max_output_tokens = 100 };
+    // Synthetic verified capacity for this fixture model, not a request cap.
+    return .{ .scope = scope, .system = "system", .tools = &.{}, .messages = &.{}, .model_output_tokens = 100 };
+}
+
+test "anthropic requires known positive frozen model output capacity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var req = request();
+    for ([_]p.Purpose{ .normal, .summary }) |purpose| {
+        req.purpose = purpose;
+        req.model_output_tokens = null;
+        try std.testing.expectError(error.UnknownModelOutputCapacity, adapter.encode(a, req));
+        req.model_output_tokens = 0;
+        try std.testing.expectError(error.InvalidModelOutputCapacity, adapter.encode(a, req));
+        for ([_]u32{ 1, 100, std.math.maxInt(u32) }) |capacity| {
+            req.model_output_tokens = capacity;
+            const wire = try j.parse(a, try adapter.encode(a, req));
+            try std.testing.expectEqual(@as(?u64, capacity), j.uint(j.get(wire, "max_tokens")));
+            try std.testing.expect(j.get(wire, "max_completion_tokens") == null);
+            try std.testing.expect(j.get(wire, "max_output_tokens") == null);
+        }
+    }
 }
 fn end(s: *adapter.Stream, reason: []const u8) !void {
     const data = try std.fmt.allocPrint(s.a, "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":4}}}}", .{reason});

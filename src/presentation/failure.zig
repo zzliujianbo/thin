@@ -14,6 +14,7 @@ pub fn write(writer: *std.Io.Writer, label: []const u8, detail: ?anyerror, kind:
         if (err == error.InputBudgetSummaryFailed) try writer.writeAll("; summary failed; history kept, no further inference sent");
         if (err == error.DecisionUnavailable) try writer.writeAll("; decision review unavailable; operation not executed, no further inference sent");
         if (err == error.UnknownInputPriceThreshold) try writer.writeAll("; low-price threshold unavailable; refresh metadata and reselect, or explicitly disable limits.low_price_input");
+        if (err == error.UnknownModelOutputCapacity) try writer.writeAll("; Anthropic requires a verified model output capacity; refresh metadata and reselect the model");
     }
     if (kind) |failure| {
         try writer.print(" / {s}", .{@tagName(failure)});
@@ -22,7 +23,7 @@ pub fn write(writer: *std.Io.Writer, label: []const u8, detail: ?anyerror, kind:
             403 => "; access denied; check workspace/model permissions",
             else => "; check credentials and access permissions",
         });
-        if (failure == .output_limit) try writer.writeAll("; output token limit reached; raise limits.max_output_tokens or lower reasoning effort");
+        if (failure == .output_limit) try writer.writeAll("; provider output limit reached; split the response or lower reasoning effort");
     }
 }
 
@@ -30,7 +31,7 @@ test "output limit pause explains shared output budget without implying network 
     var buffer: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try write(&writer, "Paused", error.OutputLimitReached, .output_limit, null);
-    try std.testing.expectEqualStrings("Paused: OutputLimitReached / output_limit; output token limit reached; raise limits.max_output_tokens or lower reasoning effort", writer.buffered());
+    try std.testing.expectEqualStrings("Paused: OutputLimitReached / output_limit; provider output limit reached; split the response or lower reasoning effort", writer.buffered());
     try std.testing.expect(std.mem.find(u8, writer.buffered(), "HTTP") == null);
     try std.testing.expect(std.mem.find(u8, writer.buffered(), "ModelRequestFailed") == null);
 }

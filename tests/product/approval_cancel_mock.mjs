@@ -81,7 +81,7 @@ async function run(url) {
   const config = JSON.stringify({
     memory:{auto:false},
     llm:{default:'local/fixture-model', providers:{local:{base_url:url, api_key_env:'THIN_FIXTURE_KEY', models:{'fixture-model':{protocol:'chat', context_tokens:32768}}}}},
-    limits:{low_price_input:false, max_output_tokens:4096, summary_tokens:100, safety_tokens:100, request_timeout_ms:5000, task_timeout_ms:20000, command_timeout_ms:5000, cleanup_grace_ms:100, cleanup_timeout_ms:2000},
+    limits:{low_price_input:false, safety_tokens:100, request_timeout_ms:5000, task_timeout_ms:20000, command_timeout_ms:5000, cleanup_grace_ms:100, cleanup_timeout_ms:2000},
   }, null, 2) + '\n';
   const path = join(home, '.thin/config.json');
   await writeFile(path, config, {mode:0o600});

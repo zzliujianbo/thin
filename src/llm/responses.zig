@@ -7,6 +7,22 @@ const j = @import("../util/json.zig");
 const c = @import("common.zig");
 const test_support = @import("../tests/adapter_test_support.zig");
 
+test "responses omits all output caps regardless of model capacity and purpose" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var req = test_support.request(.responses);
+    for ([_]?u32{ null, 0, 123 }) |capacity| {
+        req.model_output_tokens = capacity;
+        for ([_]p.Purpose{ .normal, .summary }) |purpose| {
+            req.purpose = purpose;
+            const wire = try j.parse(a, try encode(a, req));
+            inline for (.{ "max_tokens", "max_completion_tokens", "max_output_tokens" }) |key|
+                try std.testing.expect(j.get(wire, key) == null);
+        }
+    }
+}
+
 // 测试：usage 累计快照在 in_progress/incomplete 中仍被记录，但不会因此锁定内容（observedContent 为 false），失败结果也携带用量。
 test "responses output limit explicit cap with reasoning or partial tool never commits" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

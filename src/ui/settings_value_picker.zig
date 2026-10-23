@@ -9,7 +9,6 @@ const time = @import("settings_time.zig");
 const provider = @import("provider_picker.zig");
 pub const Key = @import("../core/settings.zig").Key;
 pub const Rows = @import("settings_menu.zig").Rows;
-pub const max_digits = 10; // Token integers retain their existing bound.
 pub const max_input_len = 14; // Bounded seconds text, including decimal point.
 
 pub const Picker = struct {
@@ -17,8 +16,8 @@ pub const Picker = struct {
     current: ?u32,
     editing: bool = false,
     limits: cfg.Limits,
-    // Six presets (including Auto), a preserved current value and one stage.
-    values: [8]?u32 = @splat(null),
+    // Five time presets, a preserved current value and one stage.
+    values: [7]?u32 = @splat(null),
     values_len: usize = 0,
     staged_index: ?usize = null,
     input: [max_input_len]u8 = @splat(0),
@@ -27,9 +26,7 @@ pub const Picker = struct {
     pub fn init(key: Key, current: ?u32, limits: cfg.Limits) Picker {
         var result: Picker = .{ .key = key, .current = current, .limits = limits };
         if (key == .compaction_enabled or key == .memory_auto) return result; // Boolean stays in the parent.
-        if (key == .max_output_tokens) result.add(null);
         const presets: []const u32 = switch (key) {
-            .max_output_tokens => &.{ 4096, 8192, 16384, 32768, 65536 },
             .task_timeout_ms => &.{ 300000, 900000, 1800000, 3600000, 86400000 },
             else => &.{ 30000, 60000, 300000, 900000, 3600000 },
         };
@@ -59,14 +56,12 @@ pub const Picker = struct {
     /// All-or-nothing ASCII decimal append. The owner must reject paste events;
     /// text alone cannot prove whether bytes came from a paste.
     pub fn append(self: *Picker, bytes: []const u8) bool {
-        const capacity: usize = if (self.key == .max_output_tokens) max_digits else max_input_len;
+        const capacity: usize = max_input_len;
         if (!self.editing or bytes.len == 0 or self.input_len > capacity or bytes.len > capacity - self.input_len) return false;
         var next = self.input;
         @memcpy(next[self.input_len..][0..bytes.len], bytes);
         const length = self.input_len + bytes.len;
-        if (self.key == .max_output_tokens) {
-            for (next[0..length]) |byte| if (byte < '0' or byte > '9') return false;
-        } else if (!time.validPrefix(next[0..length])) return false;
+        if (!time.validPrefix(next[0..length])) return false;
         self.input = next;
         self.input_len = length;
         return true;
@@ -118,30 +113,21 @@ pub const Picker = struct {
         return null;
     }
     fn parsedInput(self: Picker) !u32 {
-        const capacity: usize = if (self.key == .max_output_tokens) max_digits else max_input_len;
-        if (self.input_len == 0 or self.input_len > capacity) return error.InvalidValue;
-        const input = self.input[0..self.input_len];
-        const n = if (self.key == .max_output_tokens)
-            std.fmt.parseInt(u32, input, 10) catch return error.InvalidValue
-        else
-            try time.parse(input);
+        if (self.input_len == 0 or self.input_len > max_input_len) return error.InvalidValue;
+        const n = try time.parse(self.input[0..self.input_len]);
         try self.validate(n);
         return n;
     }
     fn validate(self: Picker, n: ?u32) !void {
         if (self.key == .compaction_enabled or self.key == .memory_auto) return error.InvalidKey;
-        const value = n orelse return if (self.key == .max_output_tokens) {} else error.InvalidValue;
+        const value = n orelse return error.InvalidValue;
         if (value == 0) return error.InvalidValue;
         const maximum: u32 = switch (self.key) {
             .command_timeout_ms => self.limits.command_max_timeout_ms,
             .request_timeout_ms, .task_timeout_ms => 86400000,
-            .max_output_tokens => 1024 * 1024,
             .compaction_enabled, .memory_auto => unreachable,
         };
         if (value > maximum) return error.InvalidValue;
-        if (self.key == .max_output_tokens) if (self.limits.summary_tokens) |summary| {
-            if (value < summary) return error.InvalidValue;
-        };
     }
 };
 
@@ -162,22 +148,18 @@ test "boolean preferences never offer confirmable numeric values" {
     }
 }
 
-fn unit(key: Key) []const u8 {
-    return if (key == .max_output_tokens) "tokens" else "s";
-}
 fn candidate(buffer: *[96]u8, picker: Picker, index: usize) ![]const u8 {
     if (picker.isCustom(index)) {
-        if (picker.editing) return std.fmt.bufPrint(buffer, "Custom: {s}_ {s}", .{ picker.input[0..picker.input_len], unit(picker.key) });
-        return std.fmt.bufPrint(buffer, "Custom ({s})...", .{unit(picker.key)});
+        if (picker.editing) return std.fmt.bufPrint(buffer, "Custom: {s}_ s", .{picker.input[0..picker.input_len]});
+        return "Custom (s)...";
     }
     const n = picker.values[index];
     const marker = if (n == picker.current) " (current)" else if (picker.staged_index == index) " (staged)" else "";
     if (n) |v| {
-        if (picker.key == .max_output_tokens) return std.fmt.bufPrint(buffer, "{d} tokens{s}", .{ v, marker });
         var seconds: [32]u8 = undefined;
         return std.fmt.bufPrint(buffer, "{s}{s}", .{ try time.format(&seconds, v), marker });
     }
-    return std.fmt.bufPrint(buffer, "{s}{s}", .{ if (picker.key == .max_output_tokens) "Auto" else "Unset (invalid)", marker });
+    return std.fmt.bufPrint(buffer, "Unset (invalid){s}", .{marker});
 }
 pub fn rows(a: std.mem.Allocator, menu: provider.Picker, self: Picker, columns: usize, max_rows: usize) !Rows {
     var out: std.ArrayList([]const u8) = .empty;
@@ -206,10 +188,7 @@ pub fn rows(a: std.mem.Allocator, menu: provider.Picker, self: Picker, columns: 
         break :blk true;
     };
     if (max_rows > out.items.len) try appendLine(a, &out, if (self.editing)
-        (if (self.key == .max_output_tokens)
-            "Positive integer tokens, at most 10 digits. Enter stages; next Enter saves."
-        else
-            "Positive seconds (s), up to 3 decimals. Enter stages; next Enter saves.")
+        "Positive seconds (s), up to 3 decimals. Enter stages; next Enter saves."
     else
         "Up/Down select  Enter choose  Left/Esc back", columns);
     if (self.editing and !valid and max_rows > out.items.len) try appendLine(a, &out, "Empty, overflow or outside configured bounds; cannot stage.", columns);
@@ -243,13 +222,16 @@ test "value picker preserves exact current custom values and stable stages" {
     try std.testing.expectEqual(picker.find(123456).?, current_index);
     try std.testing.expectEqual(@as(?u32, 123456), try picker.chosen(current_index));
     const count_before = picker.count();
+    try std.testing.expect(!picker.append("12"));
     picker.beginCustom();
+    try std.testing.expectError(error.InvalidValue, picker.submitCustom());
     try std.testing.expect(picker.append("234.567"));
     try std.testing.expectError(error.Editing, picker.chosen(current_index));
     const staged_index = try picker.submitCustom();
     try std.testing.expect(!picker.editing);
     try std.testing.expectEqual(@as(?u32, 123456), picker.current);
     try std.testing.expectEqual(@as(?u32, 234567), try picker.chosen(staged_index));
+    try std.testing.expectError(error.NotEditing, picker.submitCustom());
     try std.testing.expectEqual(@as(?u32, 123456), try picker.chosen(current_index));
     try std.testing.expectEqual(count_before + 1, picker.count());
     picker.beginCustom();
@@ -260,52 +242,9 @@ test "value picker preserves exact current custom values and stable stages" {
     try std.testing.expectError(error.CustomChoice, picker.chosen(picker.count() - 1));
     try std.testing.expectError(error.InvalidIndex, picker.chosen(picker.count()));
 }
-test "token input is atomic bounded integer and checked positive u32" {
-    var picker = Picker.init(.max_output_tokens, null, .{});
-    try std.testing.expect(!picker.append("12"));
-    picker.beginCustom();
-    try std.testing.expectError(error.InvalidValue, picker.submitCustom());
-    for ([_][]const u8{ "auto", "-1", "1\n", "12x", "\x1b[200~12", "１２" }) |bad| {
-        try std.testing.expect(!picker.append(bad));
-        try std.testing.expectEqual(@as(usize, 0), picker.input_len);
-    }
-    try std.testing.expect(!picker.append("12345678901"));
-    try std.testing.expect(picker.append("4294967296"));
-    try std.testing.expect(!picker.append("1"));
-    try std.testing.expectEqualStrings("4294967296", picker.input[0..picker.input_len]);
-    try std.testing.expectError(error.InvalidValue, picker.submitCustom());
-    try std.testing.expect(picker.editing);
-    picker.backspace();
-    try std.testing.expectEqualStrings("429496729", picker.input[0..picker.input_len]);
-    picker.clear();
-    try std.testing.expect(picker.append("0"));
-    try std.testing.expectError(error.InvalidValue, picker.submitCustom());
-    picker.clear();
-    try std.testing.expect(picker.append("0000000001"));
-    const one_index = try picker.submitCustom();
-    try std.testing.expectEqual(@as(?u32, 1), try picker.chosen(one_index));
-    try std.testing.expectError(error.NotEditing, picker.submitCustom());
-}
-test "value constraints include auto command maximum summary and timeout bounds" {
-    var output = Picker.init(.max_output_tokens, null, .{ .summary_tokens = 8192 });
-    try std.testing.expectEqual(@as(?u32, null), try output.chosen(output.find(null).?));
-    try std.testing.expect(output.find(4096) == null);
-    output.beginCustom();
-    try std.testing.expect(output.append("8191"));
-    try std.testing.expectError(error.InvalidValue, output.submitCustom());
-    output.clear();
-    try std.testing.expect(output.append("8192"));
-    const summary_index = try output.submitCustom();
-    try std.testing.expectEqual(@as(?u32, 8192), try output.chosen(summary_index));
-    output.beginCustom();
-    try std.testing.expect(output.append("1048577"));
-    try std.testing.expectError(error.InvalidValue, output.submitCustom());
-    output.clear();
-    try std.testing.expect(output.append("1048576"));
-    const maximum_index = try output.submitCustom();
-    try std.testing.expectEqual(@as(?u32, 1048576), try output.chosen(maximum_index));
-    const legacy = Picker.init(.max_output_tokens, 4096, .{ .summary_tokens = 8192 });
-    try std.testing.expectEqual(@as(?u32, 4096), legacy.values[legacy.currentIndex()]);
+test "value constraints include command maximum and timeout bounds" {
+    const legacy = Picker.init(.request_timeout_ms, 86400001, .{});
+    try std.testing.expectEqual(@as(?u32, 86400001), legacy.values[legacy.currentIndex()]);
     try std.testing.expectError(error.InvalidValue, legacy.chosen(legacy.currentIndex()));
     const command = Picker.init(.command_timeout_ms, 123, .{ .command_max_timeout_ms = 1000 });
     try std.testing.expectError(error.InvalidValue, command.validate(1001));
@@ -364,7 +303,7 @@ test "seconds custom input is exact atomic and strictly bounded" {
     for ([_]Key{ .command_timeout_ms, .request_timeout_ms, .task_timeout_ms }) |key| {
         var picker = Picker.init(key, 123456, .{ .command_max_timeout_ms = 86400000 });
         picker.beginCustom();
-        for ([_][]const u8{ ".", ".1", "-1", "1..2", "1.0001", "1e3", "1\n" }) |bad| {
+        for ([_][]const u8{ ".", ".1", "-1", "1..2", "1.0001", "1e3", "1\n", "auto", "12x", "\x1b[200~12", "１２" }) |bad| {
             try std.testing.expect(!picker.append(bad));
             try std.testing.expectEqual(@as(usize, 0), picker.input_len);
         }
@@ -402,9 +341,6 @@ test "seconds custom input is exact atomic and strictly bounded" {
     try std.testing.expect(command.append("1.5"));
     const index = try command.submitCustom();
     try std.testing.expectEqual(@as(?u32, 1500), try command.chosen(index));
-    var output = Picker.init(.max_output_tokens, null, .{});
-    output.beginCustom();
-    try std.testing.expect(!output.append("1.5"));
 }
 test "seconds append rejection preserves all bytes and preset staging stays exact" {
     var picker = Picker.init(.request_timeout_ms, 123456, .{});
@@ -453,9 +389,9 @@ test "seconds current and staged identities require complete rows and reject pas
     try std.testing.expect(!short.can_confirm);
 }
 fn allocationCase(a: std.mem.Allocator) !void {
-    var picker = Picker.init(.max_output_tokens, 12345, .{});
+    var picker = Picker.init(.request_timeout_ms, 12345, .{});
     picker.beginCustom();
-    try std.testing.expect(picker.append("67890"));
+    try std.testing.expect(picker.append("67.890"));
     const rendered = try rows(a, .{ .selected = picker.count() - 1 }, picker, 40, 12);
     defer freeRows(a, rendered);
 }

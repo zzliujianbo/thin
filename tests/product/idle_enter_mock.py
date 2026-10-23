@@ -132,7 +132,7 @@ def run(app, width, batched):
         home, project = Path(base) / 'home', Path(base) / 'project'
         (home / '.thin').mkdir(parents=True)
         project.mkdir()
-        config = {'memory': {'auto': False}, 'llm': {'default': 'local/fixture-model', 'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'max_output_tokens': 100, 'summary_tokens': 100, 'safety_tokens': 100, 'request_timeout_ms': 10000, 'task_timeout_ms': 15000}}
+        config = {'memory': {'auto': False}, 'llm': {'default': 'local/fixture-model', 'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'safety_tokens': 100, 'request_timeout_ms': 10000, 'task_timeout_ms': 15000}}
         config_path = home / '.thin/config.json'
         config_bytes = json.dumps(config).encode()
         config_path.write_bytes(config_bytes)
@@ -215,12 +215,20 @@ def run(app, width, batched):
             send(b'\x1b[200~ \r\x1b[201~\r')
             pump_until(lambda: len(capture) > mark and capture.endswith(ACK))
             assert len(screen.history) == before + 3
+            mark = len(capture)
             send(b'\x15')
-            # Actual owned-PTY resize after releasing rows. The VT subset above
-            # deliberately makes no reflow assertions; require a fresh complete
-            # frame and continued usability, with no task/network side effect.
+            pump_until(lambda: len(capture) > mark and capture.endswith(ACK))
+            # Resize alone leaves reflow to the terminal. A genuine later edit
+            # resumes the active region; this VT subset does not emulate reflow.
             mark = len(capture)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 40, 0, 0))
+            until = time.monotonic() + .25
+            pump_until(lambda: time.monotonic() >= until)
+            assert len(capture) == mark, 'idle resize repainted without input/content'
+            send(b'z')
+            pump_until(lambda: len(capture) > mark and capture.endswith(ACK))
+            mark = len(capture)
+            send(b'\x15')
             pump_until(lambda: len(capture) > mark and capture.endswith(ACK))
             assert not Service.requests
             # Nonempty submit is exactly one request; Enter while busy is still

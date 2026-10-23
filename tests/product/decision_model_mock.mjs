@@ -26,11 +26,10 @@ const defaults = {
   core_bytes:2048, index_bytes:8192, shard_bytes:32768,
   compaction_enabled:true, compaction_trigger_percent:80, compaction_target_percent:50,
   max_response_bytes:8388608, max_event_bytes:1048576,
-  max_output_tokens:100, summary_tokens:100,
 };
 const decisionDefaults = {
   enabled:true,
-  max_input_tokens:8192, max_output_tokens:1024, max_state_bytes:16384,
+  max_input_tokens:8192, max_state_bytes:16384,
 };
 
 export async function decisionModelRegressions({app, pty, execute, send}) {

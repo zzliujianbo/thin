@@ -152,13 +152,17 @@ const Driver = struct {
             for ([_][]const u8{
                 "%> ",
                 "%\x1b[0m> ",
+                "%>\x1b[0m ",
+                "%\x1b[0m\x1b[1m>\x1b[0m ",
             }) |idle| if (std.mem.indexOf(u8, bytes, idle)) |marker| {
                 if (std.mem.indexOf(u8, bytes[marker + idle.len ..], "\x1b[?25h") != null) return;
             };
-            if (std.mem.indexOf(u8, bytes, "\x1b[0m> \x1b[0m\x1b[K")) |marker| {
-                if (std.mem.indexOf(u8, bytes[marker..], "\x1b[?25h") != null) {
-                    const visible = try self.screen();
-                    if (std.mem.startsWith(u8, &visible.grid[visible.row], "> ")) return;
+            for ([_][]const u8{ "\x1b[0m> \x1b[0m\x1b[K", "\x1b[1m>\x1b[0m " }) |idle| {
+                if (std.mem.indexOf(u8, bytes, idle)) |marker| {
+                    if (std.mem.indexOf(u8, bytes[marker + idle.len ..], "\x1b[?25h") != null) {
+                        const visible = try self.screen();
+                        if (std.mem.startsWith(u8, &visible.grid[visible.row], "> ")) return;
+                    }
                 }
             }
             if (!self.owned) return error.EarlyExit;
@@ -177,6 +181,8 @@ const Driver = struct {
             const busy_prefix = "%\x1b[0m"; // Static occupancy resets immediately before the busy marker.
             while (std.mem.indexOfPos(u8, bytes, from, busy_prefix)) |prefix| {
                 from = prefix + busy_prefix.len;
+                // Bold prefix rendering restores weight after the occupancy reset.
+                if (std.mem.startsWith(u8, bytes[from..], "\x1b[1m")) from += "\x1b[1m".len;
                 // Accept only the running-tool palette, with a reset before
                 // the editor's space. Neither TPS nor effort colors qualify.
                 for (spinner_theme.command_pulse) |tone| {
@@ -358,18 +364,18 @@ fn settingsColor(d: *const Driver, start: usize, level: []const u8) !void {
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, bytes, from, color)) |at| {
         from = at + color.len;
-        const model_end = "fixture-model\x1b[0m) ";
+        const model_end = "fixture-model\x1b[0m\x1b[1m) ";
         if (!std.mem.startsWith(u8, bytes[from..], model_end)) continue;
         const slot = bytes[from + model_end.len ..];
         // A level confirmation keeps effort color; an actual percentage uses
         // occupancy, independent of the model's configured effort.
-        if (std.mem.startsWith(u8, slot, color) and std.mem.startsWith(u8, slot[color.len..], level) and std.mem.startsWith(u8, slot[color.len + level.len ..], "\x1b[0m> ")) return;
-        if (std.mem.startsWith(u8, slot, "\x1b[0m?%\x1b[0m> ")) return;
+        if (std.mem.startsWith(u8, slot, color) and std.mem.startsWith(u8, slot[color.len..], level) and std.mem.startsWith(u8, slot[color.len + level.len ..], "\x1b[0m\x1b[1m>\x1b[0m ")) return;
+        if (std.mem.startsWith(u8, slot, "\x1b[0m\x1b[1m?%\x1b[0m\x1b[1m>\x1b[0m ")) return;
         const green = "\x1b[38;5;114m";
         if (!std.mem.startsWith(u8, slot, green)) continue;
         var end = green.len;
         while (end < slot.len and (std.ascii.isDigit(slot[end]) or slot[end] == '.')) : (end += 1) {}
-        if (!std.mem.startsWith(u8, slot[end..], "%\x1b[0m> ")) continue;
+        if (!std.mem.startsWith(u8, slot[end..], "%\x1b[0m\x1b[1m>\x1b[0m ")) continue;
         const percent = std.fmt.parseFloat(f64, slot[green.len..end]) catch continue;
         if (percent >= 0 and percent < 25) return;
     }
@@ -591,8 +597,8 @@ fn imageModel(d: *Driver, init: std.process.Init, project: []const u8) !void {
     try d.waitIdle(start);
     try decisionModelScreen(d, a, &.{"3.1%"}, &.{"?%"});
     try settingsKey(d, "/settings\r");
-    // Preserve the seven original positions; Image is appended at index 7.
-    for (0..7) |_| try settingsKey(d, "\x1b[B");
+    // Resolve the eight-row root by label and wait for every navigation ACK.
+    try settingsValueSelect(d, a, "Image model");
     try decisionModelScreen(d, a, &.{ "> Image model", "Image model      Off" }, &.{});
     try settingsKey(d, "\r");
     try decisionModelScreen(d, a, &.{ "> Off", "aux/deepseek-flash", "Search> " }, &.{ "primary/fixture-main", "locked/deepseek-flash", "aux/not-image" });
@@ -619,7 +625,7 @@ fn imageModel(d: *Driver, init: std.process.Init, project: []const u8) !void {
     try d.waitFrame(start, "image-tool-result-verified");
     try d.waitIdle(start);
     try settingsKey(d, "/settings\r");
-    for (0..7) |_| try settingsKey(d, "\x1b[B");
+    try settingsValueSelect(d, a, "Image model");
     try decisionModelScreen(d, a, &.{"> Image model"}, &.{});
     try settingsKey(d, "\r");
     try settingsKey(d, "\x15Off");
@@ -701,8 +707,8 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try d.waitText(start, "values-warmup-answer");
     try d.waitIdle(start);
     try settingsKey(d, "/settings\r");
-    try decisionModelScreen(d, a, &.{ "> Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Output limit", "Task timeout" }, &.{});
-    try settingsValueMenuOrder(d, a, &.{ "Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Output limit", "Task timeout" });
+    try decisionModelScreen(d, a, &.{ "> Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Task timeout", "Image model" }, &.{"Output limit"});
+    try settingsValueMenuOrder(d, a, &.{ "Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Task timeout", "Image model", "Auto memory" });
     try settingsValueGate(d, a, project, "opened");
     try settingsValueOpen(d, a, "Auto compaction"); // Boolean toggle, no numeric picker.
     try decisionModelScreen(d, a, &.{ "> Auto compaction", "Auto compaction  off" }, &.{});
@@ -761,17 +767,6 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try decisionModelScreen(d, a, &.{"> 10 s (current)"}, &.{});
     try settingsValueChoose(d, a, "60 s", "Request timeout");
     try settingsValueGate(d, a, project, "request");
-    try settingsValueOpen(d, a, "Output limit");
-    try decisionModelScreen(d, a, &.{"> 100 tokens (current)"}, &.{});
-    try settingsValueChoose(d, a, "4096 tokens", "Output limit");
-    try settingsValueGate(d, a, project, "output");
-    try settingsValueOpen(d, a, "Output limit");
-    try settingsValueChoose(d, a, "Auto", "Output limit");
-    try settingsValueGate(d, a, project, "output-auto");
-    try settingsValueOpen(d, a, "Output limit");
-    try decisionModelScreen(d, a, &.{"> Auto (current)"}, &.{});
-    try settingsValueChoose(d, a, "4096 tokens", "Output limit");
-    try settingsValueGate(d, a, project, "output-restored");
     try settingsValueOpen(d, a, "Task timeout");
     try settingsValueChoose(d, a, "900 s", "Task timeout");
     try settingsValueGate(d, a, project, "task");
@@ -1966,7 +1961,7 @@ pub fn main(init: std.process.Init) !void {
             defer a.free(expected);
             try check(std.mem.indexOf(u8, markdown_output, expected) != null);
         }
-        try check(std.mem.indexOf(u8, markdown_output, "(\x1b[38;5;75mfixture-model\x1b[0m) \x1b[38;5;114m0.3%\x1b[0m> ") != null); // High model, static green occupancy.
+        try check(std.mem.indexOf(u8, markdown_output, "(\x1b[38;5;75mfixture-model\x1b[0m\x1b[1m) \x1b[38;5;114m0.3%\x1b[0m\x1b[1m>\x1b[0m ") != null); // High model, static green occupancy.
         try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;75m>\x1b[0m") == null);
         for (stage.grid[22]) |byte| try check(byte == ' ');
         try check(stage.row == 23);
@@ -1985,8 +1980,8 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, mode, "tool-icons")) {
         const start = d.used;
         // Startup already shows configured high on idle text, not the marker.
-        try check(std.mem.indexOf(u8, d.output[0..start], "(\x1b[38;5;75mfixture-model\x1b[0m) \x1b[38;5;114m0.0%\x1b[0m> ") != null);
-        try check(std.mem.indexOf(u8, d.output[0..start], "%\x1b[0m> ") != null);
+        try check(std.mem.indexOf(u8, d.output[0..start], "(\x1b[38;5;75mfixture-model\x1b[0m\x1b[1m) \x1b[38;5;114m0.0%\x1b[0m\x1b[1m>\x1b[0m ") != null);
+        try check(std.mem.indexOf(u8, d.output[0..start], "%\x1b[0m\x1b[1m>\x1b[0m ") != null);
         try check(std.mem.indexOf(u8, d.output[0..start], "\x1b[38;5;75m>\x1b[0m") == null);
         try d.send("tool-icon-task\r");
         try d.waitRunningFrame(start, "sleep 1; cat r.json");
@@ -2265,7 +2260,7 @@ pub fn main(init: std.process.Init) !void {
         start = d.used;
         try d.send("\x1b[Z");
         try d.waitIdle(start);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;75mfixture-custom\x1b[0m) \x1b[38;5;75m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;75mfixture-custom\x1b[0m\x1b[1m) \x1b[38;5;75m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;75m>\x1b[0m") == null);
         start = d.used;
         try d.send("selection-third\r");

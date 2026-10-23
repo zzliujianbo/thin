@@ -25,7 +25,7 @@ const image_file = @import("image_file.zig");
 pub const schemas = [_]p.ToolSchema{
     .{
         .name = "read_file",
-        .description = "Read UTF-8 inside the startup project. offset is a zero-based BYTE offset; limit is a BYTE count, not lines. Mid-character starts round back at most 3 bytes; returned offset is the actual start. When truncated, use returned next_offset as the next call's offset.",
+        .description = "Read a local UTF-8 file. Relative paths start in the startup project; absolute paths and ../ may read outside it. Protected credentials and symlinks remain denied. offset is a zero-based BYTE offset; limit is a BYTE count, not lines. Mid-character starts round back at most 3 bytes; returned offset is the actual start. When truncated, use returned next_offset as the next call's offset.",
         .parameters_json =
         \\{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}
         ,
@@ -147,7 +147,7 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
     }
     if (std.mem.eql(u8, name, "read_file")) {
         const args = try std.json.parseFromSliceLeaky(Read, a, arguments, opts);
-        try validatePath(args.path);
+        try validateReadPath(args.path);
         // 未指定 limit 时用配置上限；0 或超过上限都拒绝，避免单次读取撑爆上下文。
         const limit = args.limit orelse limits.read_bytes;
         if (limit == 0 or limit > limits.read_bytes) return error.InvalidReadLimit;
@@ -205,11 +205,15 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
     return error.UnknownTool;
 }
 
-/// 做词法层面的路径校验：拒绝空路径、超长路径、NUL 以及 ".." 段，防止明显越界访问。
-/// 真正的根目录包含检查由 fs.Root.relative 完成。
-fn validatePath(path: []const u8) !void {
+/// Text reads may leave the project; syntax and resource limits still apply.
+fn validateReadPath(path: []const u8) !void {
     if (path.len == 0 or path.len > 4096 or std.mem.findScalar(u8, path, 0) != null)
         return error.InvalidPath;
+}
+
+/// Writes and image reads retain their rooted path policy.
+fn validatePath(path: []const u8) !void {
+    try validateReadPath(path);
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return error.PathEscape;
 }
@@ -249,9 +253,19 @@ pub const Tools = struct {
             .write_file => |write| write.path,
             else => return,
         };
+        if (action == .read_file) {
+            try validateReadPath(path);
+            const limit = action.read_file.limit orelse self.config.limits.read_bytes;
+            if (limit == 0 or limit > self.config.limits.read_bytes) return error.InvalidReadLimit;
+            // Text policy is applied to actual descriptors below, not a resolve
+            // against root.path, which can name a different parent after rename.
+            return;
+        }
+        const absolute = try std.fs.path.resolve(a, &.{ self.root.path, path });
+        defer a.free(absolute);
         const relative = try self.root.relative(path);
         // 会话记录可作为普通只读输入，但不允许文件工具篡改自己的留档。
-        // 只放开路径策略；实际读取仍走 Root.read 的 OS 权限、NOFOLLOW、UTF-8 与大小限制。
+        // 文本读取允许项目外路径；仍保留 OS 权限、NOFOLLOW、UTF-8 与大小限制。
         // 跳过点段和重复分隔符，保证绝对/相对路径别名使用同一规则。
         var parts = std.mem.tokenizeScalar(u8, relative, '/');
         var in_thin = false;
@@ -286,9 +300,46 @@ pub const Tools = struct {
         // Writing the .thin parent itself must not replace the Memory namespace.
         if (in_thin and action == .write_file) return error.UseMemoryTool;
         const protected = self.auth_path orelse return;
-        const absolute = try std.fs.path.resolve(a, &.{ self.root.path, path });
-        defer a.free(absolute);
         if (std.mem.eql(u8, absolute, protected)) return error.ProtectedAuthFile;
+    }
+
+    fn textReadGuard(self: *Tools) fs.Root.ReadGuard {
+        return .{ .context = self, .check_fn = checkTextReadTarget };
+    }
+
+    /// Parent/name covers absent protected leaves; dev+inode also covers an
+    /// already-open leaf (including aliases). Never reads protected contents.
+    fn matchesReadTarget(target: fs.Root.Parent, fd: ?c_int, protected: fs.Root.Parent) !bool {
+        if (std.mem.eql(u8, target.name, protected.name) and try fs.sameObject(target.fd, protected.fd)) return true;
+        const opened = fd orelse return false;
+        const protected_fd = fs.openPath(protected.fd, protected.name) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer fs.closeFd(protected_fd);
+        return fs.sameObject(opened, protected_fd);
+    }
+
+    fn checkTextReadTarget(raw: *anyopaque, target: fs.Root.Parent, fd: ?c_int) !void {
+        const self: *Tools = @ptrCast(@alignCast(raw));
+        // Project settings follow the launch inode even when its pathname was
+        // replaced. Auth uses the same component/dirfd semantics as the reader.
+        var project_settings: ?fs.Root.Parent = self.root.parent(".thin/" ++ settings.file_name) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (project_settings) |*parent_| parent_.deinit();
+        if (project_settings) |parent_| {
+            if (try matchesReadTarget(target, fd, parent_)) return error.ProtectedSettingsFile;
+        }
+        if (self.auth_path) |path| {
+            var auth = self.root.readParent(path) catch |err| switch (err) {
+                error.FileNotFound => return,
+                else => return err,
+            };
+            defer auth.deinit();
+            if (try matchesReadTarget(target, fd, auth)) return error.ProtectedAuthFile;
+        }
     }
 
     /// 把 Tools 包装成 runtime.Executor，供运行时调度 prepare 与 execute。
@@ -303,6 +354,14 @@ pub const Tools = struct {
         action.* = try parse(a, call.name, call.arguments, self.config.limits);
         try self.checkImageAction(action.*);
         try self.checkFileAction(a, action.*);
+        if (action.* == .read_file) {
+            self.root.probeExternalRead(action.read_file.path, self.textReadGuard()) catch |err| switch (err) {
+                // Another call in this batch may create the file or its parent.
+                // Execution resolves afresh and guards the descriptor it reads.
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
         // 危险 bash 在授权前打标。Runtime 看到 explicit_denial 后逐次询问。
         var description = try action.description(a);
         const denial: ?[]const u8 = if (action.* == .bash) blk: {
@@ -378,7 +437,7 @@ pub const Tools = struct {
             },
             .read_file => |r| {
                 // truncated 时 next_offset 指向下一段起点，模型可据此继续分页读取。
-                const result = try self.root.read(a, r.path, r.offset, r.limit orelse self.config.limits.read_bytes);
+                const result = try self.root.readExternalGuarded(a, r.path, r.offset, r.limit orelse self.config.limits.read_bytes, self.textReadGuard());
                 try j.put(a, &value, "path", j.str(r.path));
                 try j.put(a, &value, "offset", try j.number(result.offset));
                 try j.put(a, &value, "bytes_read", try j.number(result.data.len));
@@ -590,7 +649,9 @@ test "tool arguments remain strict" {
     try std.testing.expect(read == .read_file);
     const write = try parse(a, "write_file", "{\"path\":\"a.zig\",\"content\":\"hello\"}", .{});
     try std.testing.expect(write == .write_file);
-    try std.testing.expectError(error.PathEscape, parse(a, "read_file", "{\"path\":\"../secret\"}", .{}));
+    const external = try parse(a, "read_file", "{\"path\":\"../outside.txt\"}", .{});
+    try std.testing.expectEqualStrings("../outside.txt", external.read_file.path);
+    try std.testing.expectError(error.PathEscape, parse(a, "write_file", "{\"path\":\"../outside.txt\",\"content\":\"x\"}", .{}));
     try std.testing.expectError(error.InvalidReadLimit, parse(a, "read_file", "{\"path\":\"a\",\"limit\":99999999}", .{}));
     try std.testing.expectError(error.MissingMemoryVersion, parse(a, "memory", "{\"action\":\"delete\",\"topic\":\"core\"}", .{}));
     try std.testing.expectError(error.UnknownField, parse(a, "bash", "{\"command\":\"true\",\"trust\":true}", .{}));

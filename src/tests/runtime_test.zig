@@ -320,12 +320,10 @@ fn configuration() cfg.Config {
         .limits = .{ .low_price_input = false },
     };
 }
-/// 小上下文配置：窗口仅 3000 tokens，输出、摘要与安全余量都缩小，使长任务很快触发压缩。
+/// 小上下文配置：窗口仅 3000 tokens，安全余量缩小，使长任务很快触发压缩。
 fn smallConfiguration() cfg.Config {
     var config = configuration();
     config.model.context_tokens = 3000;
-    config.limits.max_output_tokens = 100;
-    config.limits.summary_tokens = 100;
     config.limits.safety_tokens = 100;
     return config;
 }
@@ -1646,7 +1644,8 @@ const OutputLimitFixture = struct {
     fn call(raw: *anyopaque, _: std.mem.Allocator, request: p.Request, sink: p.ModelSink) !p.Outcome {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (request.purpose == .summary) self.summaries += 1 else self.normal += 1;
-        try std.testing.expectEqual(@as(u32, 4096), request.max_output_tokens);
+        // Upstream output-limit reports remain meaningful with no local cap.
+        try std.testing.expectEqual(@as(?u32, null), request.model_output_tokens);
         try std.testing.expectEqualStrings("max", request.reasoning_effort.?);
         if (!self.limited) return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .text = "continued" }} }, .finish = .stop } };
         try sink.emit(.{ .reasoning_delta = "reasoning-only preview" });
@@ -1671,8 +1670,6 @@ const OutputLimitFixture = struct {
         result.model.context_tokens = 131072;
         result.model.reasoning_effort = "max";
         result.model.reasoning = .{ .format = .standard, .map = .{ .max = "max" } };
-        result.limits.max_output_tokens = 4096;
-        result.limits.summary_tokens = 4096;
         return result;
     }
 };
@@ -1901,80 +1898,67 @@ test "manual compaction empty or no candidate is zero-request and Busy is not ac
     }
 }
 
-test "output budget automatic config explicit caps and metadata provenance" {
+test "frozen output metadata provenance never changes physical input checks" {
     const t = std.testing;
-    for ([_][]const u8{
-        \\{"llm":{"default":"local/fake","providers":{"local":{"base_url":"http://localhost","models":{"fake":{"context_tokens":131072,"protocol":"chat"}}}}},"limits":{"low_price_input":false}}
-        ,
-        \\{"llm":{"default":"local/fake","providers":{"local":{"base_url":"http://localhost","models":{"fake":{"context_tokens":131072,"protocol":"chat"}}}}},"limits":{"low_price_input":false,"max_output_tokens":null}}
-        ,
-    }) |json| {
-        var parsed = try cfg.parse(t.allocator, json);
-        defer cfg.release(&parsed);
-        try t.expectEqual(@as(?u32, null), parsed.value.limits.max_output_tokens);
-        try t.expectEqual(@as(u32, 4096), parsed.value.limits.safety_tokens);
+    const prefix = "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\",\"models\":{\"fake\":{\"context_tokens\":131072,\"protocol\":\"chat\"}}}}},\"limits\":";
+    var parsed = try cfg.parse(t.allocator, prefix ++ "{\"low_price_input\":false}}");
+    defer cfg.release(&parsed);
+    try t.expectEqual(@as(u32, 4096), parsed.value.limits.safety_tokens);
+    for ([_][]const u8{ "{\"max_output_tokens\":null}", "{\"max_output_tokens\":4096}", "{\"summary_tokens\":100}" }) |limits| {
+        const json = try std.mem.concat(t.allocator, u8, &.{ prefix, limits, "}" });
+        defer t.allocator.free(json);
+        try t.expectError(error.UnknownField, cfg.parse(t.allocator, json));
     }
     var config = configuration();
     config.model.context_tokens = 131072;
-    config.model.output_tokens = 131072;
     config.model.output_source = .metadata;
-    try cfg.validate(config);
-    try t.expectEqual(@as(usize, 126975), context.inputBudget(config));
-    try t.expectEqual(@as(u32, 125976), try context.outputBudget(config, .normal, 1000));
-    try t.expectEqual(@as(u32, 125976), try context.outputBudget(config, .summary, 1000));
-    try t.expectEqual(@as(u32, 976), try context.outputBudget(config, .summary, 126000));
-    config.model.output_tokens = 512;
-    try t.expectEqual(@as(u32, 512), try context.outputBudget(config, .summary, 1000));
-    config.model.output_tokens = 131072;
-    config.limits.max_output_tokens = 131072;
-    try cfg.validate(config);
-    try t.expectEqual(@as(usize, 126975), context.inputBudget(config));
-    try t.expectEqual(@as(u32, 125976), try context.outputBudget(config, .normal, 1000));
-    config.limits.max_output_tokens = 4096;
-    try t.expectEqual(@as(u32, 4096), try context.outputBudget(config, .normal, 1000));
-    try t.expectEqual(@as(u32, 976), try context.outputBudget(config, .normal, 126000));
+    for ([_]?u32{ null, 512, 131072 }) |capacity| {
+        config.model.output_tokens = capacity;
+        try cfg.validate(config);
+        try t.expectEqual(@as(usize, 126975), context.inputBudget(config));
+        for ([_]p.Purpose{ .normal, .summary }) |purpose| {
+            try context.checkInputFor(config, purpose, 126975);
+            try t.expectError(error.ContextTooLarge, context.checkInputFor(config, purpose, 126976));
+        }
+        try t.expectEqual(capacity, config.model.output_tokens);
+    }
     try t.expectEqual(@as(?u32, null), config.model.persisted().output_tokens);
     var clone = try cfg.clone(t.allocator, config);
     defer cfg.release(&clone);
     try t.expectEqual(@as(?u32, 131072), clone.value.model.output_tokens);
-    config.limits.max_output_tokens = 0;
-    try t.expectError(error.InvalidLimit, cfg.validate(config));
-    config.limits.max_output_tokens = null;
     config.model.output_tokens = 0;
     try t.expectError(error.InvalidBudget, cfg.validate(config));
     config.model.output_tokens = 1048577;
     try t.expectError(error.InvalidBudget, cfg.validate(config));
     config.model.output_tokens = null;
-    try t.expectEqual(@as(u32, 4096), try context.outputBudget(config, .normal, 1000));
-    try t.expectError(error.ContextTooLarge, context.outputBudget(config, .normal, std.math.maxInt(usize)));
+    try t.expectError(error.ContextTooLarge, context.checkInput(config, std.math.maxInt(usize)));
     const estimator: context.Estimator = .{ .per_mille = std.math.maxInt(u64) };
-    try t.expectError(error.ContextTooLarge, context.outputBudget(config, .normal, estimator.tokens(std.math.maxInt(usize))));
+    try t.expectError(error.ContextTooLarge, context.checkInput(config, estimator.tokens(std.math.maxInt(usize))));
     config.model.context_tokens = 1;
     try t.expectEqual(@as(usize, 0), context.inputBudget(config));
-    try t.expectError(error.ContextTooLarge, context.outputBudget(config, .summary, 0));
+    try t.expectError(error.ContextTooLarge, context.checkInputFor(config, .summary, 0));
 }
 
-test "output budget requests shrink across rounds without changing effort" {
+test "model output capacity stays frozen across rounds without changing effort" {
     const Fixture = struct {
         calls: usize = 0,
-        previous: u32 = std.math.maxInt(u32),
+        previous_input: usize = 0,
         fn call(raw: *anyopaque, _: std.mem.Allocator, req: p.Request, _: p.ModelSink) !p.Outcome {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqualStrings("high", req.reasoning_effort.?);
-            try std.testing.expect(req.max_output_tokens > 0 and req.max_output_tokens < self.previous);
-            self.previous = req.max_output_tokens;
+            try std.testing.expectEqual(@as(?u32, 32768), req.model_output_tokens);
+            const input = context.rawTokens(req.system, req.tools, req.messages);
+            try std.testing.expect(input > self.previous_input);
+            self.previous_input = input;
             self.calls += 1;
             if (self.calls == 1) return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "budget-call", .name = "write_file", .arguments = "{}" } }} }, .finish = .tool_calls } };
             return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} }, .finish = .stop } };
         }
     };
-    const Case = struct { protocol: p.Protocol, cap: ?u32 = null };
-    for ([_]Case{ .{ .protocol = .chat }, .{ .protocol = .responses }, .{ .protocol = .anthropic }, .{ .protocol = .chat, .cap = 131072 }, .{ .protocol = .responses, .cap = 131072 }, .{ .protocol = .anthropic, .cap = 131072 } }) |case| {
-        const protocol = case.protocol;
+    for ([_]p.Protocol{ .chat, .responses, .anthropic }) |protocol| {
         var fixture: Fixture = .{};
         var fake: Fake = .{ .explicit_denial = null };
         var config = configuration();
-        config.limits.max_output_tokens = case.cap;
         config.model.protocol = protocol;
         config.model.output_tokens = 32768;
         config.model.reasoning_effort = "high";
@@ -1991,7 +1975,7 @@ test "output budget requests shrink across rounds without changing effort" {
     }
 }
 
-test "output budget clipped summary validates its actual sent cap atomically" {
+test "summary text is not rejected by a former local output token ceiling" {
     var fake: Fake = .{};
     var config = configuration();
     config.model.output_tokens = 1;
@@ -1999,21 +1983,21 @@ test "output budget clipped summary validates its actual sent cap atomically" {
     defer runtime.deinit();
     fake.current_runtime = &runtime;
     try seedManualHistory(&runtime);
-    const before = runtime.messages();
-    const protected = runtime.protected_index;
+    const before_tokens = runtime.estimatedTokens();
     var cancel: p.Cancellation = .{};
     const terminal = try runtime.compactContext(&cancel);
-    try std.testing.expectEqual(r.Status.failed, terminal.status);
-    try std.testing.expectEqual(error.InvalidSummary, terminal.detail.?);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
+    try std.testing.expect(terminal.detail == null);
     try std.testing.expectEqual(@as(u32, 1), fake.summary_calls);
     try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
     try std.testing.expectEqual(@as(u32, 0), fake.executions);
-    try std.testing.expectEqual(before.ptr, runtime.messages().ptr);
-    try std.testing.expectEqual(before.len, runtime.messages().len);
-    try std.testing.expectEqual(protected, runtime.protected_index);
+    try std.testing.expect(context.hasSummaryPrefix(runtime.messages()));
+    try std.testing.expect(runtime.estimatedTokens() < before_tokens);
+    try context.checkInput(config, runtime.estimatedTokens());
+    try std.testing.expectEqualStrings("Do the task", runtime.messages()[runtime.protected_index].blocks[0].text);
 }
 
-test "output budget automatic context exhaustion sends no request" {
+test "physical context exhaustion sends no request" {
     var fake: Fake = .{};
     var config = configuration();
     config.model.context_tokens = 5000;
@@ -2054,14 +2038,14 @@ test "archived output metadata is displayable without becoming a current budget 
         config.model.output_tokens = tokens;
         config.model.output_source = .metadata;
         try cp.validateStructure(decoded.value);
-        try cp.validateRequestHistory(t.allocator, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = decoded.value.system, .messages = decoded.value.messages, .tools = &.{}, .max_output_tokens = 1 });
+        try cp.validateRequestHistory(t.allocator, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = decoded.value.system, .messages = decoded.value.messages, .tools = &.{} });
         config.model.output_source = .explicit;
         try cp.validateStructure(decoded.value);
-        try cp.validateRequestHistory(t.allocator, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = decoded.value.system, .messages = decoded.value.messages, .tools = &.{}, .max_output_tokens = 1 });
+        try cp.validateRequestHistory(t.allocator, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = decoded.value.system, .messages = decoded.value.messages, .tools = &.{} });
         config.model.output_source = .metadata;
         config.model.output_tokens = if (tokens == null) 1 else null;
         try cp.validateStructure(decoded.value);
-        try cp.validateRequestHistory(t.allocator, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = decoded.value.system, .messages = decoded.value.messages, .tools = &.{}, .max_output_tokens = 1 });
+        try cp.validateRequestHistory(t.allocator, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = decoded.value.system, .messages = decoded.value.messages, .tools = &.{} });
     }
     state.output_tokens = 0;
     const display_only = try cp.encode(t.allocator, state);
@@ -2069,6 +2053,108 @@ test "archived output metadata is displayable without becoming a current budget 
     const decoded_display = try cp.decode(t.allocator, display_only);
     defer decoded_display.deinit();
     try t.expectEqual(@as(?u32, 0), decoded_display.value.output_tokens);
+}
+
+test "Anthropic restored output metadata is displayable but only current capacity authorizes sending" {
+    const cp = @import("../core/checkpoint.zig");
+    const anthropic = @import("../llm/anthropic.zig");
+    const json = @import("../util/json.zig");
+    const Gate = struct {
+        calls: usize = 0,
+        capacity: ?u32 = null,
+        wire_capacity: ?u64 = null,
+        purpose: ?p.Purpose = null,
+        protocol: ?p.Protocol = null,
+        history_count: usize = 0,
+
+        fn call(raw: *anyopaque, alloc: std.mem.Allocator, req: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.capacity = req.model_output_tokens;
+            self.purpose = req.purpose;
+            self.protocol = req.scope.protocol;
+            self.history_count = req.messages.len;
+            const wire = try json.parse(alloc, try anthropic.encode(alloc, req));
+            self.wire_capacity = json.uint(json.get(wire, "max_tokens"));
+            // Reaching this fake proves Runtime's actual pre-send gate passed.
+            // Deliberately stop here: no native replay response or I/O is needed.
+            return .{ .failure = .{ .kind = .server, .message = "Controlled fixture failure after send gate" } };
+        }
+    };
+    const t = std.testing;
+    const current_capacity: u32 = 65536;
+    for ([_]?u32{ 8192, 0, null }) |archived_capacity| {
+        var config = configuration();
+        config.model.protocol = .anthropic;
+        config.model.output_tokens = if (archived_capacity == 8192) null else current_capacity;
+        config.limits.compaction_enabled = false;
+        // Current capacity deliberately exceeds remaining context room. It is
+        // still sent verbatim, never clamped or replaced by archived metadata.
+        try t.expect(current_capacity > config.model.context_tokens);
+        const current = config.model.output_tokens;
+        var gate: Gate = .{};
+        var tools: Fake = .{};
+        var runtime = try r.Runtime.init(t.allocator, std.testing.io, &config, .{ .context = &gate, .call_fn = Gate.call }, tools.executor(), .{}, "unused startup system");
+        defer runtime.deinit();
+        const state: cp.State = .{
+            .system = "restored fixture system",
+            .messages = &.{
+                .{ .role = .user, .blocks = &.{.{ .text = "archived goal" }} },
+                .{ .role = .assistant, .blocks = &.{.{ .text = "archived answer" }} },
+            },
+            .selector = .init(.anthropic),
+            .estimator = .{},
+            .last_context_tokens = 77,
+            .permission_id = 0,
+            .output_tokens = archived_capacity,
+            .output_source = .metadata,
+            .output_budget_frozen = true,
+        };
+        const bytes = try cp.encode(t.allocator, state);
+        defer t.allocator.free(bytes);
+        const decoded = try cp.decode(t.allocator, bytes);
+        defer decoded.deinit();
+        try t.expectEqual(archived_capacity, decoded.value.output_tokens);
+        try t.expect(decoded.value.output_budget_frozen);
+        try runtime.restoreCheckpoint(decoded.value);
+        // Display restoration is independent of current output capability and
+        // does not silently import the archive's value into the current model.
+        try t.expectEqual(@as(usize, 0), gate.calls);
+        try t.expectEqualDeep(state.messages, runtime.messages());
+        try t.expectEqualStrings(state.system, runtime.system);
+        try t.expectEqual(current, config.model.output_tokens);
+        const goal = "explicit new goal after restore";
+        var cancel: p.Cancellation = .{};
+        const terminal = try runtime.run(goal, &cancel);
+        try t.expectEqual(r.Status.failed, terminal.status);
+        try t.expectEqual(@as(usize, 0), tools.executions + tools.permissions);
+        try t.expectEqual(@as(u32, 0), terminal.usage.summary_calls);
+        // Compare the accepted pre-send history, including the NEW user input,
+        // rather than mistaking the two-message loaded history for a rollback.
+        try t.expectEqual(@as(usize, 3), runtime.messages().len);
+        try t.expectEqualDeep(state.messages, runtime.messages()[0..state.messages.len]);
+        try t.expectEqual(p.Role.user, runtime.messages()[2].role);
+        try t.expectEqualStrings(goal, runtime.messages()[2].blocks[0].text);
+        try t.expectEqual(@as(usize, 2), runtime.protected_index);
+        try t.expectEqual(current, config.model.output_tokens);
+        if (current == null) {
+            try t.expectEqual(error.UnknownModelOutputCapacity, terminal.detail.?);
+            try t.expectEqual(@as(usize, 0), gate.calls);
+            try t.expect(gate.capacity == null and gate.wire_capacity == null);
+            try t.expect(terminal.model_failure == null and terminal.http_status == null);
+            try t.expectEqualDeep(r.UsageTotals{}, terminal.usage);
+        } else {
+            try t.expectEqual(error.ModelRequestFailed, terminal.detail.?);
+            try t.expectEqual(p.FailureKind.server, terminal.model_failure.?);
+            try t.expectEqual(@as(usize, 1), gate.calls);
+            try t.expectEqual(@as(?u32, current_capacity), gate.capacity);
+            try t.expectEqual(@as(?u64, current_capacity), gate.wire_capacity);
+            try t.expectEqual(@as(?p.Purpose, .normal), gate.purpose);
+            try t.expectEqual(@as(?p.Protocol, .anthropic), gate.protocol);
+            try t.expectEqual(@as(usize, 3), gate.history_count);
+            try t.expectEqual(@as(u32, 1), terminal.usage.normal_calls);
+        }
+    }
 }
 
 // Runtime 忙时拒绝新的提交；宿主断开时停止执行，并报告 HostDisconnected。

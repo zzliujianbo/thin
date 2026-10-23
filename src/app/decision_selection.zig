@@ -46,7 +46,6 @@ pub fn activeClone(a: std.mem.Allocator, active: cfg.Config, declaration: cfg.Co
     candidate.limits.compaction_enabled = declaration.limits.compaction_enabled;
     candidate.limits.command_timeout_ms = declaration.limits.command_timeout_ms;
     candidate.limits.request_timeout_ms = declaration.limits.request_timeout_ms;
-    candidate.limits.max_output_tokens = declaration.limits.max_output_tokens;
     candidate.limits.task_timeout_ms = declaration.limits.task_timeout_ms;
     // A frozen active/pending selection may have different budget constraints
     // from the declaration. Reject before the caller's CAS save, not afterward.

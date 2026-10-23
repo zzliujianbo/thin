@@ -17,10 +17,11 @@ fn config(a: std.mem.Allocator, scenario: []const u8) !cfg.Config {
         .raw, .percent_encoded => |s| s,
     };
     if (!std.mem.eql(u8, uri.scheme, "http") or !std.mem.eql(u8, host_text, "127.0.0.1") or uri.port == null or uri.port == 0 or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null or !uri.path.isEmpty()) return error.UnsafeFixtureUrl;
-    return .{ .provider = .{ .base_url = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, scenario }), .api_key_env = "THIN_FAKE_KEY" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .anthropic }, .limits = .{ .low_price_input = false, .request_timeout_ms = 10000 } };
+    return .{ .provider = .{ .base_url = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, scenario }), .api_key_env = "THIN_FAKE_KEY" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .anthropic, .output_tokens = 128 }, .limits = .{ .low_price_input = false, .request_timeout_ms = 10000 } };
 }
 fn request(c: cfg.Config) p.Request {
-    return .{ .scope = .{ .connection = c.provider.base_url, .model = c.model.name, .protocol = .anthropic }, .system = "fixed fixture system", .tools = &tools, .messages = &initial, .max_output_tokens = 128 };
+    // The fixture model has a synthetic verified output capacity, not a cap setting.
+    return .{ .scope = .{ .connection = c.provider.base_url, .model = c.model.name, .protocol = .anthropic }, .system = "fixed fixture system", .tools = &tools, .messages = &initial, .model_output_tokens = c.model.output_tokens };
 }
 fn success(out: p.Outcome) !p.Response {
     // Never print failure messages, native replay, assertion operands, or response bodies.
@@ -60,6 +61,16 @@ fn usage(u: p.Usage, output: u64) !void {
     try t.expect(u.cache_write_tokens == 2);
     try t.expect(u.output_tokens == output);
     try t.expect(u.total() == 15 + output);
+}
+
+test "anthropic fixture unknown or invalid model capacity rejects locally before HTTP" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const c: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid" }, .model = .{ .name = "unknown-fixture", .context_tokens = 32768, .protocol = .anthropic } };
+    var req = request(c);
+    try t.expectError(error.UnknownModelOutputCapacity, @import("../llm/anthropic.zig").encode(arena.allocator(), req));
+    req.model_output_tokens = 0;
+    try t.expectError(error.InvalidModelOutputCapacity, @import("../llm/anthropic.zig").encode(arena.allocator(), req));
 }
 
 test "anthropic HTTP: fragmented signed native replay and adjacent multiple tool results" {

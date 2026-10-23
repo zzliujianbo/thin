@@ -54,6 +54,10 @@ pub fn nativeBlocks(a: std.mem.Allocator, native: j.Value) ![]const p.Block {
 
 pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
     try c.validateRequest(req, .anthropic);
+    // Messages requires max_tokens. Use only frozen, verified capacity: no
+    // guessed default, configurable cap or remaining-context clamp.
+    const model_output_tokens = req.model_output_tokens orelse return error.UnknownModelOutputCapacity;
+    if (model_output_tokens == 0) return error.InvalidModelOutputCapacity;
     switch (req.reasoning_format) {
         .standard => if (req.thinking != null or req.reasoning_effort != null) return error.IncompatibleReasoningProtocol,
         .deepseek => return error.IncompatibleReasoningProtocol,
@@ -69,7 +73,7 @@ pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
     var root = j.object(t);
     try j.put(t, &root, "model", j.str(req.scope.model));
     try j.put(t, &root, "system", j.str(req.system));
-    try j.put(t, &root, "max_tokens", try j.number(req.max_output_tokens));
+    try j.put(t, &root, "max_tokens", try j.number(model_output_tokens));
     try j.put(t, &root, "stream", .{ .bool = true });
     if (req.reasoning_format == .anthropic and req.thinking != null) {
         const thinking = try typed(t, if (req.thinking.?) "adaptive" else "disabled");

@@ -8,7 +8,6 @@ pub const max_image_bytes = 4 * 1024 * 1024;
 pub const max_dimension = 8192;
 pub const max_question_bytes = 4096;
 pub const max_result_bytes = 16 * 1024;
-pub const max_output_tokens: u32 = 2048;
 /// Current Flash vision documentation: each image consumes at most 1024 tokens.
 /// A transport byte limit is separate; base64 bytes are not text-token usage.
 pub const image_token_bound: u32 = 1024;

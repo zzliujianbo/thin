@@ -204,9 +204,9 @@ async function scenario(name, protocol, kind, isPty = false) {
       }
       if (kind === 'stream-markdown' || kind === 'tool-icons') assert.equal(body.reasoning_effort, 'high');
       if (kind === 'auth-activate') {
-        // DeepSeek 兼容选项必须真实影响线路参数，避免后端忽略输出上限。
-        assert.equal(body.max_tokens, 100);
-        assert(!('max_completion_tokens' in body));
+        // Successful activation must not reintroduce retired output caps.
+        for (const key of ['max_tokens','max_completion_tokens','max_output_tokens'])
+          assert(!Object.hasOwn(body,key));
       }
 
       // 校验历史中的工具配对，并记录本次请求携带的工具结果。
@@ -514,7 +514,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       const filename = kind === 'legacy-config' ? 'auth.json' : 'config.json';
       // 空白文件走交互初始化；待激活配置始终使用回环服务，绝不向公共端点发送密钥或消息。
       const provider = ['auth-activate','exit-unconfigured','exit-secret'].includes(kind) ? {base_url:url, api_key_env:'', api_key:null, chat_max_tokens:true} : {base_url:url, api_key_env:'THIN_FIXTURE_KEY'};
-      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',providers:{local:{...provider,models:{'fixture-model':{protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined},...(['model-select','model-select-empty'].includes(kind)?{'fixture-next':{protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}},'fixture-custom':{protocol,context_tokens:32768,reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}}:{})}}}}, limits:{low_price_input:false,max_output_tokens:100,summary_tokens:100,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',providers:{local:{...provider,models:{'fixture-model':{protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined},...(['model-select','model-select-empty'].includes(kind)?{'fixture-next':{protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}},'fixture-custom':{protocol,context_tokens:32768,reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}}:{})}}}}, limits:{low_price_input:false,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
       await writeFile(join(home,'.thin',filename), content);
     }
 

@@ -190,6 +190,12 @@ pub fn build(b: *std.Build) void {
     run_idle_enter.setCwd(b.path("."));
     b.step("test-idle-enter", "Run owned idle prompt newline PTYs (requires Python 3)").dependOn(&run_idle_enter.step);
 
+    const run_resize = b.addSystemCommand(&.{"python3"});
+    run_resize.addFileArg(b.path("tests/product/resize_deferred_mock.py"));
+    run_resize.addArtifactArg(exe);
+    run_resize.setCwd(b.path("."));
+    b.step("test-resize-deferred", "Run owned deferred resize, animation and fresh-ACK PTY checks").dependOn(&run_resize.step);
+
     // Global settings acceptance reuses both application artifacts; the Node
     // fixture owns its loopback server and serial PTY launches.
     const run_settings = b.addSystemCommand(&.{"node"});
@@ -256,6 +262,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_proxy.step);
     test_all.dependOn(&run_app.step);
     test_all.dependOn(&run_idle_enter.step);
+    test_all.dependOn(&run_resize.step);
     test_all.dependOn(&run_settings.step);
     test_all.dependOn(&run_command.step);
     test_all.dependOn(&run_approval_cancel.step);

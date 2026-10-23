@@ -41,18 +41,15 @@ pub fn create(a: std.mem.Allocator, io: std.Io, config: cfg.Config, env: *const 
     };
     defer secure.free(key);
     var context_tokens: ?u64 = null;
-    var output_tokens: ?u32 = null;
     if (cfg.providers.Id.fromUrl(base)) |id| {
         if (metadata.restoreEntry(cache, id, image.model_id)) |record| {
             var route = record;
             route.model.protocol = .chat;
             if (metadata.contextFor(cache, route)) |n| context_tokens = n;
-            output_tokens = metadata.outputFor(cache, route);
         }
     }
     if (provider.patchFor(image.model_id)) |patch| {
         if (patch.context_tokens) |n| context_tokens = n;
-        if (patch.output_tokens) |n| output_tokens = n;
     }
     const proxy = if (config.proxyFor(ref.provider, ref.model)) |route| try route.url(a) else null;
     defer if (proxy) |url| a.free(url);
@@ -62,7 +59,6 @@ pub fn create(a: std.mem.Allocator, io: std.Io, config: cfg.Config, env: *const 
         .request_timeout_ms = config.limits.request_timeout_ms,
         .proxy_url = proxy,
         .context_tokens = context_tokens,
-        .output_tokens = output_tokens,
     }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return null,

@@ -14,15 +14,12 @@ const COMMAND = "printf 'values-shell-proof\\n'", CALL = 'values-owned-bash';
 const phases = [
   'opened', 'compaction', 'current', 'invalid-empty', 'invalid-zero',
   'invalid-overflow', 'edit-cancel', 'staged-cancel', 'canceled', 'command-staged', 'command',
-  'request', 'output', 'output-auto', 'output-restored', 'task', 'decision-menu', 'closed',
+  'request', 'task', 'decision-menu', 'closed',
 ];
 const changes = {
   compaction:['limits','compaction_enabled',false],
   command:['limits','command_timeout_ms',120000],
   request:['limits','request_timeout_ms',60000],
-  output:['limits','max_output_tokens',4096],
-  'output-auto':['limits','max_output_tokens',null],
-  'output-restored':['limits','max_output_tokens',4096],
   task:['limits','task_timeout_ms',900000],
 };
 
@@ -50,7 +47,8 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
         assert.equal(req.headers.authorization,`Bearer ${AUX_KEY}`);
         assert.equal(body.model,AUX);
         assert(!body.tools || body.tools.length === 0);
-        assert.equal(body.max_tokens ?? body.max_completion_tokens,1024);
+        for (const key of ['max_tokens','max_completion_tokens','max_output_tokens'])
+          assert(!Object.hasOwn(body,key));
         assert.equal(body.messages.length,2);
         const [system,input] = body.messages;
         assert.equal(system.role,'system'); assert(system.content.startsWith('Review only'));
@@ -70,7 +68,8 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
       assert.equal(req.headers.authorization,`Bearer ${MAIN_KEY}`);
       assert.equal(body.model,MAIN); assert.equal(body.reasoning_effort,'high');
       const system = body.messages.filter(m=>m.role==='system'); assert(system.length > 0);
-      assert.equal(body.max_tokens ?? body.max_completion_tokens,mainPosts === 1 ? 100 : 4096);
+      for (const key of ['max_tokens','max_completion_tokens','max_output_tokens'])
+        assert(!Object.hasOwn(body,key));
       if (mainPosts === 1) {
         primarySystem = system; primarySocket = req.socket; warmAt = performance.now();
         assert.equal(auxPosts,0);
@@ -125,10 +124,9 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
         model_refresh_ttl_ms:14400000,model_refresh_cooldown_ms:300000,
         cleanup_grace_ms:1000,cleanup_timeout_ms:5000,core_bytes:2048,index_bytes:8192,
         shard_bytes:32768,compaction_enabled:true,compaction_trigger_percent:80,
-        compaction_target_percent:50,max_response_bytes:8388608,max_event_bytes:1048576,
-        max_output_tokens:100,summary_tokens:100},
+        compaction_target_percent:50,max_response_bytes:8388608,max_event_bytes:1048576},
       decision:{enabled:true,model:`aux/${AUX}`,
-        max_input_tokens:8192,max_output_tokens:1024,max_state_bytes:16384},
+        max_input_tokens:8192,max_state_bytes:16384},
     };
     previousBytes = JSON.stringify(expected);
     await writeFile(configPath,previousBytes,{mode:0o600});
@@ -146,12 +144,10 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
       assert(primarySocket && !primarySocket.destroyed,'primary warm socket lost in menu');
       if (changes[name]) {
         const [section,key,value] = changes[name];
-        if (value === null) delete expected[section][key]; // writeDisk omits null optionals.
-        else expected[section][key] = value;
+        expected[section][key] = value;
       }
       const bytes = await saved();
       if (!changes[name]) assert.equal(bytes,previousBytes,'cancel/stage/invalid rewrote config');
-      if (name === 'output-auto') assert(!Object.hasOwn(JSON.parse(bytes).limits,'max_output_tokens'));
       previousBytes = bytes;
       if (name === 'closed') closed = true;
       await writeFile(join(project,`settings-values-release-${name}`),'release',{flag:'wx',mode:0o600});
@@ -186,7 +182,7 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
     assert.deepEqual(gates,phases); assert.equal(mainPosts,3); assert.equal(auxPosts,1);
     assert.equal(connections,2); await saved();
     assert.deepEqual((await readdir(project)).sort(),phases.map(n=>`settings-values-release-${n}`).sort());
-    console.log('PASS settings/values: five preferences and shared request timeout; decision menu has no timeout; stage/cancel/invalid unchanged; output Auto omitted; zero menu HTTP; warm socket and canonical bash verified');
+    console.log('PASS settings/values: four preferences and shared request timeout; eight-row root; decision menu has no timeout; stage/cancel/invalid unchanged; output caps absent; zero menu HTTP; warm socket and canonical bash verified');
   } catch (error) {
     // Never print assertion operands containing config/wire/terminal secrets.
     const safe = new Error('settings values fixture failed');

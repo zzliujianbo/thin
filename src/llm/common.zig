@@ -256,7 +256,7 @@ pub fn tools(a: std.mem.Allocator, schemas: []const p.ToolSchema, chat: bool) !V
     return out;
 }
 
-/// 构造 Chat 或 Responses 请求体的公共部分（模型、流式开关、输出上限、工具与推理强度）。
+/// 构造 Chat 或 Responses 请求体的公共部分（模型、流式开关、工具与推理强度；不发送输出上限）。
 pub fn base(a: std.mem.Allocator, req: p.Request, chat: bool) !V {
     if (!chat and (req.thinking != null or req.reasoning_format == .deepseek)) return error.IncompatibleReasoningProtocol;
     var v = object(a);
@@ -267,7 +267,6 @@ pub fn base(a: std.mem.Allocator, req: p.Request, chat: bool) !V {
     }
     try put(a, &v, "model", j.str(req.scope.model));
     try put(a, &v, "stream", .{ .bool = true });
-    try put(a, &v, if (chat) "max_completion_tokens" else "max_output_tokens", try j.number(req.max_output_tokens));
     try put(a, &v, "tools", try tools(a, req.tools, chat));
 
     // 摘要请求不允许模型调用工具。

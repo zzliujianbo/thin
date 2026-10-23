@@ -378,7 +378,7 @@ fn fixtureRequest(state: State, config: cfg.Config) p.Request {
         .system = state.system,
         .messages = state.messages,
         .tools = &.{},
-        .max_output_tokens = 1,
+        .model_output_tokens = 8192, // Synthetic capability for wire-only fixtures.
     };
 }
 const fixture_chat =

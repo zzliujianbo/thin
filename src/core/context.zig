@@ -68,9 +68,8 @@ pub fn rawTokens(system: []const u8, tools: []const p.ToolSchema, messages: []co
     return n;
 }
 
-/// Reserve one output token for hard input preflight. Neither a model maximum
-/// nor an explicit request ceiling is a permanent context reservation: both are
-/// clamped to the actual room when constructing each request.
+/// Reserve minimal response room for hard input preflight. This does not set
+/// a model output allowance; output length belongs to the provider.
 fn windowInputBudget(config: cfg.Config) usize {
     return @as(usize, config.model.context_tokens) -| config.limits.safety_tokens -| 1;
 }
@@ -114,35 +113,6 @@ pub fn checkInputFor(config: cfg.Config, purpose: p.Purpose, estimated_input: us
     if (purpose == .normal) try validateInputPolicy(config);
     if (inputBudgetFor(config, purpose) == 0 or estimated_input > inputBudgetFor(config, purpose))
         return inputBudgetError(config);
-}
-
-/// Summary defaults follow the normal output policy, not a window ratio.
-/// An explicit summary ceiling remains independent; model capability, global
-/// ceiling and per-request headroom can still reduce the actual sent allowance.
-fn desiredOutput(config: cfg.Config) u32 {
-    return config.limits.max_output_tokens orelse config.model.output_tokens orelse 4096;
-}
-
-pub fn summaryBudget(config: cfg.Config) u32 {
-    const desired = config.limits.summary_tokens orelse desiredOutput(config);
-    return @min(desired, @min(config.model.output_tokens orelse desired, config.limits.max_output_tokens orelse desired));
-}
-
-/// Per-request budget, based on this purpose's complete serialized-message
-/// estimate (including summary instructions), never cumulative provider usage.
-/// Saturating arithmetic also handles a saturated calibrated input estimate.
-pub fn outputBudget(config: cfg.Config, purpose: p.Purpose, estimated_input: usize) !u32 {
-    // Guard the COMPLETE request for both purposes, including summary instructions.
-    // Output room is still calculated from the real window, not a price step.
-    try checkInputFor(config, purpose, estimated_input);
-    const available = @as(usize, config.model.context_tokens) -| estimated_input -| config.limits.safety_tokens;
-    const desired = if (purpose == .summary)
-        summaryBudget(config)
-    else
-        desiredOutput(config);
-    const budget = @min(@as(usize, desired), available);
-    if (budget == 0) return error.ContextTooLarge;
-    return @intCast(budget);
 }
 
 /// 按百分比计算阈值（向下取整）。
@@ -287,8 +257,9 @@ fn planWithMode(a: std.mem.Allocator, config: cfg.Config, estimator: Estimator, 
         if (!older_content) continue;
         best = cut;
 
-        // 一旦压缩后（加上摘要预算）已低于目标阈值就提前停止，尽量少压缩。
-        if (mode == .automatic and estimator.tokens(retained) +| summaryBudget(config) <= target) break;
+        // Plan from retained input only: output length belongs to the provider.
+        // Runtime validates the actual summary and resulting input before commit.
+        if (mode == .automatic and estimator.tokens(retained) <= target) break;
     }
     return .{ .cut = best orelse return error.NoCompactionCandidate, .protected_index = protected_index, .before_tokens = before };
 }

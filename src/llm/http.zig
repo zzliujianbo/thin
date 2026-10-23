@@ -346,7 +346,7 @@ pub const Client = struct {
 
         // 按协议选择编码器：Chat Completions 或 Responses。
         const payload = switch (protocol) {
-            .chat => try chat.encodeWithOptions(a, job.request, self.config.provider.chat_max_tokens),
+            .chat => try chat.encode(a, job.request),
             .responses => try responses.encode(a, job.request),
             .anthropic => try anthropic.encode(a, job.request),
             .systemone => return error.UnsupportedProtocol,
@@ -574,7 +574,6 @@ test "SystemOne cannot enter chat HTTP via protocol endpoint or stale client" {
         .system = "",
         .tools = &.{},
         .messages = &.{},
-        .max_output_tokens = 1,
     };
     const result = try client.model().call(a, request, .{});
     try std.testing.expectEqual(p.FailureKind.unsupported_protocol, result.failure.kind);
@@ -592,7 +591,7 @@ test "completed worker cannot publish late tools or hide usage at the final dead
     var job: Client.Job = .{
         .client = &client,
         .allocator = std.testing.allocator,
-        .request = .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = "fixed", .tools = &.{}, .messages = &.{}, .max_output_tokens = 1, .cancellation = &cancel },
+        .request = .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = "fixed", .tools = &.{}, .messages = &.{}, .cancellation = &cancel },
         .sink = .{},
         .start = Io.Clock.awake.now(std.testing.io),
         .last_usage = .{ .output_tokens = 2 },

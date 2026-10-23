@@ -95,6 +95,9 @@ function checkWire(req, body, chat) {
   assert.equal(req.headers.authorization, 'Bearer fake-local-key');
   assert.equal(body.model, 'fixture-model');
   assert.equal(body.stream, true);
+  for (const key of ['max_tokens', 'max_completion_tokens', 'max_output_tokens']) {
+    assert(!Object.hasOwn(body, key), 'Chat/Responses output caps must be absent');
+  }
   assert.equal(body.tools.length, 1);
 
   if (chat) {
@@ -254,7 +257,6 @@ try {
         }
 
         if (scenario.startsWith('output-limit') || scenario.startsWith('limit-tools')) {
-          assert.equal(body.max_completion_tokens ?? body.max_tokens ?? body.max_output_tokens, 4096);
           const partialTool = scenario.startsWith('limit-tools');
           const silent = scenario.endsWith('-auto');
           const usage = chat

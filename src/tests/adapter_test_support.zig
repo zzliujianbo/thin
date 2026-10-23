@@ -47,7 +47,7 @@ pub const schemas = [_]p.ToolSchema{.{ .name = "lookup", .description = "Look up
 
 /// 构造测试请求：按协议选择 scope，system 中包含 memory 快照片段，消息列表初始为空。
 pub fn request(proto: p.Protocol) p.Request {
-    return .{ .scope = if (proto == .chat) chat_scope else response_scope, .system = "fixed system\nMemory snapshot", .tools = &schemas, .messages = &.{}, .max_output_tokens = 512 };
+    return .{ .scope = if (proto == .chat) chat_scope else response_scope, .system = "fixed system\nMemory snapshot", .tools = &schemas, .messages = &.{} };
 }
 
 /// 断言 haystack 中包含 needle，否则测试失败。

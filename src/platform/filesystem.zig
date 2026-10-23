@@ -1,6 +1,6 @@
-//! Linux project-rooted text files. All traversal is relative to owned dirfds;
-//! symlinks are rejected, including in the root path. No terminal interaction.
-//! 中文：本模块只处理项目根目录内的 UTF-8 文本文件。所有访问都从已打开的目录 fd 出发，逐段 openat 解析路径，不依赖可被替换的绝对路径。
+//! Linux dirfd-anchored files. Normal operations stay project-rooted; the
+//! explicit readExternal text path also permits absolute/parent paths.
+//! Symlinks remain rejected. No terminal interaction.
 
 const std = @import("std");
 const line_stats = @import("../util/line_stats.zig");
@@ -24,6 +24,8 @@ pub const linux = struct {
     pub const cloexec = 0x80000;
     /// O_NONBLOCK：open 不因 FIFO 等特殊文件而阻塞。
     pub const nonblock = 0x800;
+    /// O_PATH: metadata handle only, never opens a device for I/O.
+    pub const path_only = 0x200000;
     /// O_CREAT：文件不存在时创建。
     pub const create = 0x40;
     /// O_EXCL：与 O_CREAT 同用，目标已存在则失败。
@@ -61,6 +63,28 @@ pub fn openDirectory(parent: c_int, name: [*:0]const u8) !c_int {
 pub fn fileFromFd(fd: c_int) std.Io.File {
     // 与 openat 的 O_NONBLOCK 保持一致，读取 FIFO 等特殊文件时不会阻塞。
     return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+}
+
+/// Descriptor identity includes the device: inode numbers alone are not global.
+pub fn sameObject(left: c_int, right: c_int) !bool {
+    const l = try objectIdentity(left);
+    const r = try objectIdentity(right);
+    return l.ino == r.ino and l.dev_major == r.dev_major and l.dev_minor == r.dev_minor;
+}
+
+fn objectIdentity(fd: c_int) !std.os.linux.Statx {
+    var result: std.os.linux.Statx = undefined;
+    if (std.c.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .INO = true }, &result) != 0) return osError();
+    if (!result.mask.INO) return error.FileIdentityUnavailable;
+    return result;
+}
+
+/// Metadata-only handle, including for unreadable files. Never follows the leaf.
+/// O_PATH may open the symlink itself; it does not authorize a text read.
+pub fn openPath(parent: c_int, name: [*:0]const u8) !c_int {
+    const fd = linux.openat(parent, name, linux.path_only | linux.nofollow | linux.cloexec, 0);
+    if (fd < 0) return osError();
+    return fd;
 }
 
 /// 校验文本：必须是合法 UTF-8，且不含 \n \r \t 以外的控制字符和 DEL(127)；否则视为二进制或非法文本。
@@ -159,7 +183,62 @@ pub const Root = struct {
     pub fn parent(self: *Root, path: []const u8) !Parent {
         const rel = try self.relative(path);
         // 用 "." 重新打开根目录得到独立 fd，之后逐段替换也不会关闭 self.dir。
-        var fd = try openDirectory(self.dir.handle, ".");
+        return self.walkParent(try openDirectory(self.dir.handle, "."), rel);
+    }
+
+    /// Read-only traversal may leave the project, but still follows no symlinks.
+    /// In-project absolute paths retain the original project inode anchor.
+    pub fn readParent(self: *Root, path: []const u8) !Parent {
+        if (path.len == 0 or path.len > 4096 or std.mem.findScalar(u8, path, 0) != null or path[path.len - 1] == '/') return error.InvalidPath;
+        if (std.fs.path.isAbsolute(path)) {
+            if (self.projectReadSuffix(path)) |rel|
+                return self.walkParent(try openDirectory(self.dir.handle, "."), rel);
+            return self.walkParent(try openDirectory(-100, "/"), path[1..]);
+        }
+        return self.walkParent(try openDirectory(self.dir.handle, "."), path);
+    }
+
+    /// Ignore only separators and dots in the launch-path prefix. Never cancel
+    /// '..': link/../file must still visit link and fail NOFOLLOW.
+    fn projectReadSuffix(self: *const Root, path: []const u8) ?[]const u8 {
+        var root_parts = std.mem.tokenizeScalar(u8, self.path, '/');
+        var parts = std.mem.tokenizeScalar(u8, path, '/');
+        while (root_parts.next()) |wanted| {
+            var part = parts.next() orelse return null;
+            while (std.mem.eql(u8, part, ".")) part = parts.next() orelse return null;
+            if (!std.mem.eql(u8, wanted, part)) return null;
+        }
+        return parts.rest(); // Preserve every remaining component for openat.
+    }
+
+    /// Policy belongs to the caller. The second check receives the exact open
+    /// file subsequently read, not a path which will be traversed again.
+    pub const ReadGuard = struct {
+        context: *anyopaque,
+        check_fn: *const fn (*anyopaque, Parent, ?c_int) anyerror!void,
+
+        fn check(self: ReadGuard, parent_: Parent, fd: ?c_int) !void {
+            try self.check_fn(self.context, parent_, fd);
+        }
+    };
+
+    /// Preparation probes metadata only, not contents or special-device I/O.
+    /// A missing leaf is allowed; callers may also defer missing parents.
+    pub fn probeExternalRead(self: *Root, path: []const u8, guard: ReadGuard) !void {
+        var parent_ = try self.readParent(path);
+        defer parent_.deinit();
+        try guard.check(parent_, null);
+        const fd = openPath(parent_.fd, parent_.name) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer closeFd(fd);
+        try guard.check(parent_, fd);
+    }
+
+    /// Consumes an independent directory fd, closing it on every failure.
+    fn walkParent(self: *Root, owned_fd: c_int, rel: []const u8) !Parent {
+        var fd = owned_fd;
         errdefer closeFd(fd);
         var parts = std.mem.tokenizeScalar(u8, rel, '/');
         var current = parts.next() orelse return error.InvalidPath;
@@ -175,7 +254,7 @@ pub const Root = struct {
             current = next;
         }
         // 最终文件名不能是 "."，否则无法指向一个普通文件。
-        if (std.mem.eql(u8, current, ".")) return error.InvalidPath;
+        if (std.mem.eql(u8, current, ".") or std.mem.eql(u8, current, "..")) return error.InvalidPath;
         return .{ .fd = fd, .name = try self.allocator.dupeSentinel(u8, current, 0), .allocator = self.allocator };
     }
 
@@ -208,11 +287,27 @@ pub const Root = struct {
     pub fn read(self: *Root, allocator: std.mem.Allocator, path: []const u8, offset: u64, limit: usize) !ReadResult {
         var p = try self.parent(path);
         defer p.deinit();
+        return self.readParentText(allocator, p, offset, limit, null);
+    }
 
+    /// Explicit text-tool read, not a policy change for Memory, images or writes.
+    pub fn readExternal(self: *Root, allocator: std.mem.Allocator, path: []const u8, offset: u64, limit: usize) !ReadResult {
+        return self.readExternalGuarded(allocator, path, offset, limit, null);
+    }
+
+    pub fn readExternalGuarded(self: *Root, allocator: std.mem.Allocator, path: []const u8, offset: u64, limit: usize, guard: ?ReadGuard) !ReadResult {
+        var p = try self.readParent(path);
+        defer p.deinit();
+        return self.readParentText(allocator, p, offset, limit, guard);
+    }
+
+    fn readParentText(self: *Root, allocator: std.mem.Allocator, p: Parent, offset: u64, limit: usize, guard: ?ReadGuard) !ReadResult {
+        if (guard) |policy| try policy.check(p, null);
         // NOFOLLOW 拒绝符号链接；NONBLOCK 保证 FIFO 等特殊文件不会让 open 挂起。
         const fd = linux.openat(p.fd, p.name, linux.nofollow | linux.cloexec | linux.nonblock, 0);
         if (fd < 0) return osError();
         defer closeFd(fd);
+        if (guard) |policy| try policy.check(p, fd);
         const file = fileFromFd(fd);
         // 基于已打开的 fd 做 stat，而不是按路径重新查找，避免读取前后被替换（TOCTOU）。
         const stat = try file.stat(self.io);
@@ -360,6 +455,69 @@ fn testRoot(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Root {
 }
 
 // 测试：读写、范围读取、UTF-8 边界、覆盖失败与权限保留。
+test "guarded read keeps checked fd" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    var root = try Root.open(a, io, buffer[0..try tmp.dir.realPath(io, &buffer)]);
+    defer root.deinit();
+    try root.write("payload.txt", "checked original", false);
+    const Guard = struct {
+        root: *Root,
+        checked_open: bool = false,
+        fn check(raw: *anyopaque, _: Root.Parent, fd: ?c_int) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (fd == null) return;
+            self.checked_open = true;
+            // A deterministic namespace race exactly after the final check.
+            try self.root.write("payload.txt", "unchecked replacement", true);
+        }
+    };
+    var guard: Guard = .{ .root = &root };
+    const result = try root.readExternalGuarded(a, "payload.txt", 0, 100, .{ .context = &guard, .check_fn = Guard.check });
+    defer a.free(result.data);
+    try std.testing.expect(guard.checked_open);
+    try std.testing.expectEqualStrings("checked original", result.data);
+    const replacement = try root.read(a, "payload.txt", 0, 100);
+    defer a.free(replacement.data);
+    try std.testing.expectEqualStrings("unchecked replacement", replacement.data);
+}
+
+test "guarded read checks post-open identity" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    var root = try Root.open(a, io, buffer[0..try tmp.dir.realPath(io, &buffer)]);
+    defer root.deinit();
+    try root.write("payload.txt", "public", false);
+    try root.write("private.txt", "synthetic private", false);
+    const private_fd = try openPath(root.dir.handle, "private.txt");
+    defer closeFd(private_fd);
+    const Guard = struct {
+        root: *Root,
+        private_fd: c_int,
+        checks: usize = 0,
+        fn check(raw: *anyopaque, parent_: Root.Parent, fd: ?c_int) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (fd) |opened| {
+                if (try sameObject(opened, self.private_fd)) return error.GuardDenied;
+            } else {
+                // Substitute the leaf between the parent check and openat.
+                if (std.c.unlinkat(parent_.fd, parent_.name, 0) != 0) return osError();
+                if (std.c.linkat(self.root.dir.handle, "private.txt", parent_.fd, parent_.name, 0) != 0) return osError();
+            }
+        }
+    };
+    var guard: Guard = .{ .root = &root, .private_fd = private_fd };
+    try std.testing.expectError(error.GuardDenied, root.readExternalGuarded(a, "payload.txt", 0, 100, .{ .context = &guard, .check_fn = Guard.check }));
+    try std.testing.expectEqual(@as(usize, 2), guard.checks);
+}
+
 test "root reads writes ranges text and failed overwrite" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});

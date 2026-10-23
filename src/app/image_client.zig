@@ -13,7 +13,6 @@ pub const Options = struct {
     request_timeout_ms: u32,
     proxy_url: ?[]const u8 = null,
     context_tokens: ?u64 = null,
-    output_tokens: ?u32 = null,
 };
 
 pub const Client = struct {
@@ -24,7 +23,6 @@ pub const Client = struct {
     key: []u8,
     timeout_ms: u32,
     context_tokens: ?u64,
-    output_tokens: ?u32,
     transport: http.Client,
 
     pub fn create(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, options: Options) !*Client {
@@ -33,7 +31,6 @@ pub const Client = struct {
         if (options.proxy_url) |url| try validateUrl(url);
         if (!validText(options.api_key, 16384)) return error.InvalidApiKey;
         if (options.request_timeout_ms == 0) return error.InvalidTimeout;
-        _ = try codec.outputBudget(options.output_tokens);
         if (options.context_tokens == 0) return error.ImageContextTooLarge;
         const self = try a.create(Client);
         self.backing = a;
@@ -51,7 +48,6 @@ pub const Client = struct {
         self.io = io;
         self.timeout_ms = options.request_timeout_ms;
         self.context_tokens = options.context_tokens;
-        self.output_tokens = options.output_tokens;
         return self;
     }
 
@@ -91,7 +87,7 @@ pub const Client = struct {
         var sink: Sink = .{ .a = a, .io = self.io, .start = start, .timeout_ms = self.timeout_ms, .cancel = cancel };
         defer sink.body.deinit(a);
         try sink.checkNow();
-        const payload = try codec.encode(a, input, self.context_tokens, self.output_tokens);
+        const payload = try codec.encode(a, input, self.context_tokens);
         defer a.free(payload);
         try sink.checkNow();
         const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{self.key});

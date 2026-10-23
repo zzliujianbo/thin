@@ -181,7 +181,8 @@ test "optional global decision owns qualified model and sparsely persists" {
     try t.expectEqual(parsed.value.limits.request_timeout_ms, auxiliary.request_timeout_ms);
     try t.expect(!auxiliary.low_price_input);
     try t.expectEqual(@as(u32, 8192), parsed.value.decision.?.max_input_tokens);
-    try t.expectEqual(@as(u32, 1024), parsed.value.decision.?.max_output_tokens);
+    // Auxiliary limits retain input protection, not a local output ceiling.
+    try t.expectEqual(@as(?u32, 8192), auxiliary.max_input_tokens);
     var copy = try cfg.clone(a, parsed.value);
     defer cfg.release(&copy);
     try t.expect(copy.value.decision.?.model.ptr != parsed.value.decision.?.model.ptr);
@@ -194,10 +195,11 @@ test "optional global decision owns qualified model and sparsely persists" {
     // Reference validation never invents a protocol/window or borrows chat capabilities.
     try t.expect(disk.value.registry.?.find("aux").?.patchFor("vendor/raw/id") == null);
     for ([_][]const u8{
-        "{}",                                                 "[]",                                             "false",                                          "1",                                                 "\"aux/m\"",
-        "{\"model\":\"missing/m\"}",                          "{\"model\":\"m\"}",                              "{\"model\":\"p/\"}",                             "{\"model\":1}",                                     "{\"model\":null}",
-        "{\"model\":\"p/m\",\"model\":\"p/n\"}",              "{\"model\":\"p/m\",\"extra\":true}",             "{\"model\":\"p/m\",\"max_input_tokens\":1}",     "{\"model\":\"p/m\",\"max_input_tokens\":16777217}", "{\"model\":\"p/m\",\"max_output_tokens\":0}",
-        "{\"model\":\"p/m\",\"max_output_tokens\":16777217}", "{\"model\":\"p/m\",\"max_output_tokens\":null}", "{\"model\":\"p/m\",\"max_output_tokens\":true}", "{\"model\":\"p/m\",\"max_output_tokens\":-1}",      "{\"model\":\"p/m\",\"max_output_tokens\":4294967296}",
+        "{}",                                                   "[]",                                                 "false",                                          "1",                                                 "\"aux/m\"",
+        "{\"model\":\"missing/m\"}",                            "{\"model\":\"m\"}",                                  "{\"model\":\"p/\"}",                             "{\"model\":1}",                                     "{\"model\":null}",
+        "{\"model\":\"p/m\",\"model\":\"p/n\"}",                "{\"model\":\"p/m\",\"extra\":true}",                 "{\"model\":\"p/m\",\"max_input_tokens\":1}",     "{\"model\":\"p/m\",\"max_input_tokens\":16777217}", "{\"model\":\"p/m\",\"max_output_tokens\":0}",
+        "{\"model\":\"p/m\",\"max_output_tokens\":1024}",       "{\"model\":\"p/m\",\"max_output_tokens\":16777217}", "{\"model\":\"p/m\",\"max_output_tokens\":null}", "{\"model\":\"p/m\",\"max_output_tokens\":true}",    "{\"model\":\"p/m\",\"max_output_tokens\":-1}",
+        "{\"model\":\"p/m\",\"max_output_tokens\":4294967296}",
     }) |value| {
         const raw = try std.mem.concat(a, u8, &.{ prefix, ",\"decision\":", value, "}" });
         defer a.free(raw);
@@ -211,7 +213,6 @@ test "optional global decision owns qualified model and sparsely persists" {
     try t.expectError(error.InvalidLimit, cfg.clone(a, copy.value));
     copy.value.decision.?.max_input_tokens = 2;
     copy.value.limits.request_timeout_ms = 3600000;
-    copy.value.decision.?.max_output_tokens = 16777216;
     try cfg.validate(copy.value);
     copy.value.registry = null;
     try t.expectError(error.MissingRegistry, cfg.validate(copy.value));
@@ -246,7 +247,7 @@ test "decision enabled strict bool rejects null duplicates unknown and root over
 test "disabled decision roundtrip preserves declared protocol credentials shared limits and proxy" {
     const a = t.allocator;
     const input =
-        \\{"llm":{"default":"p/chat","reasoning_effort":"high","providers":{"p":{"base_url":"https://fixture.invalid/v1","api_key":"fixture-key","models":{"chat":{"context_tokens":65536},"aux/raw":{"protocol":"systemone","output_tokens":1234}}},"other":{"base_url":"https://other.invalid","api_key_env":"FIXTURE_KEY"}}},"decision":{"model":"p/aux/raw","enabled":false,"max_input_tokens":4321,"max_output_tokens":321,"max_state_bytes":8192},"limits":{"low_price_input":false,"request_timeout_ms":1234,"max_input_tokens":50000},"proxy":{"address":"localhost","port":8080,"models":["p/aux/raw"]}}
+        \\{"llm":{"default":"p/chat","reasoning_effort":"high","providers":{"p":{"base_url":"https://fixture.invalid/v1","api_key":"fixture-key","models":{"chat":{"context_tokens":65536},"aux/raw":{"protocol":"systemone","output_tokens":1234}}},"other":{"base_url":"https://other.invalid","api_key_env":"FIXTURE_KEY"}}},"decision":{"model":"p/aux/raw","enabled":false,"max_input_tokens":4321,"max_state_bytes":8192},"limits":{"low_price_input":false,"request_timeout_ms":1234,"max_input_tokens":50000},"proxy":{"address":"localhost","port":8080,"models":["p/aux/raw"]}}
     ;
     var parsed = try cfg.parse(a, input);
     defer cfg.release(&parsed);
@@ -266,7 +267,8 @@ test "disabled decision roundtrip preserves declared protocol credentials shared
     const encoded = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
     defer encoded.deinit();
     const decision_object = encoded.value.object.get("decision").?.object;
-    try t.expectEqual(@as(usize, 5), decision_object.count());
+    try t.expectEqual(@as(usize, 4), decision_object.count());
+    try t.expect(decision_object.get("max_output_tokens") == null);
     try t.expect(decision_object.get("backend") == null);
     try t.expect(decision_object.get("request_timeout_ms") == null);
     var disk = try cfg.parse(a, out.written());

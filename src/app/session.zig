@@ -39,6 +39,21 @@ const MetadataFetch = *const fn (std.mem.Allocator, std.Io, ProviderId, ?[]const
 const DevFetch = *const fn (std.mem.Allocator, std.Io) anyerror!metadata.Listing;
 const official_metadata_timeout_ms = 8000;
 const models_dev_timeout_ms = 30000;
+const official_refresh_success = "Official model list refreshed";
+const public_refresh_success = "models.dev metadata refreshed";
+
+fn metadataNoticeTtl(notice: ?[]const u8) u16 {
+    const value = notice orelse return 0;
+    return if (std.mem.eql(u8, value, official_refresh_success) or std.mem.eql(u8, value, public_refresh_success)) 3000 else 0;
+}
+
+test "metadata notice TTL only expires complete refresh successes" {
+    try std.testing.expectEqual(@as(u16, 3000), metadataNoticeTtl(official_refresh_success));
+    try std.testing.expectEqual(@as(u16, 3000), metadataNoticeTtl(public_refresh_success));
+    for ([_]?[]const u8{ null, "Official metadata partly refreshed; failed sources kept cached/default values", "Official model list refreshed; models.dev metadata refresh failed", "Metadata cache could not be saved; previous values kept", "Official metadata updated; models.dev refresh still running" }) |notice| {
+        try std.testing.expectEqual(@as(u16, 0), metadataNoticeTtl(notice));
+    }
+}
 
 /// A prepared actual model is not a fresh catalog choice. Credential swaps
 /// preserve its budget, mapping, effective effort and context provenance.
@@ -64,6 +79,14 @@ const MetadataJob = struct {
     dev_started_ms: i64 = 0,
     official_published: bool = false,
     dev_published: bool = false,
+    // Owner-only, first publication/display failure for this whole job. Worker
+    // success and later stages (including a login restart) cannot erase it.
+    failure_notice: ?[]const u8 = null,
+
+    fn publicationFailed(self: *MetadataJob, notice: []const u8) ?[]const u8 {
+        if (self.failure_notice == null) self.failure_notice = notice;
+        return if (self.manual) self.failure_notice else null;
+    }
 
     fn run(self: *MetadataJob) void {
         defer self.done.store(true, .release);
@@ -616,6 +639,7 @@ pub const Session = struct {
             .model_disabled = self.display_disabled[0..self.display_models.len],
             .context_official = self.active_context_official,
             .metadata_notice = self.metadata_notice,
+            .metadata_notice_ttl_ms = metadataNoticeTtl(self.metadata_notice),
             .selection_name = if (unselected) null else self.selected_alias,
             // Login identity must agree with credential/metadata routing. A kind
             // hint on a proxy does not turn that endpoint into an official host.
@@ -876,7 +900,7 @@ pub const Session = struct {
                 const requested = self.metadata_login_pending;
                 self.restartOfficialMetadata(job, requested) catch {
                     self.metadata_login_pending &= ~requested; // One attempt per login, never a tight retry loop.
-                    self.metadata_notice = "Login saved; official model refresh failed, previous list kept";
+                    self.metadata_notice = job.failure_notice orelse "Login saved; official model refresh failed, previous list kept";
                 };
                 return true;
             }
@@ -905,12 +929,12 @@ pub const Session = struct {
             if (dev_ready) {
                 job.dev_published = true;
                 metadata.mergeDev(&listing, &job.dev_listing) catch {
-                    self.metadata_notice = if (job.manual) "Metadata cache could not be saved; previous values kept" else null;
+                    self.metadata_notice = job.publicationFailed("Metadata cache could not be saved; previous values kept");
                     return true;
                 };
             }
             const publication = metadata.commitClaimedAt(&self.store.root, succeeded, listing, job.generations, self.metadataNow()) catch {
-                self.metadata_notice = if (job.manual) "Metadata cache could not be saved; previous values kept" else null;
+                self.metadata_notice = job.publicationFailed("Metadata cache could not be saved; previous values kept");
                 return true;
             };
             if (official_ready) job.succeeded = publication.accepted & metadata.provider_mask;
@@ -923,20 +947,20 @@ pub const Session = struct {
             self.metadata_cache = publication.cache;
             const models = self.buildModels(self.mutableConfig().*, self.global_config.?.value) catch {
                 self.metadata_cache = previous;
-                self.metadata_notice = if (job.manual) "Metadata display could not be updated; previous values kept" else null;
+                self.metadata_notice = job.publicationFailed("Metadata display could not be updated; previous values kept");
                 return true;
             };
             const decision_models = self.buildDecisionModels(self.global_config.?.value) catch {
                 self.freeDisplayModels(models);
                 self.metadata_cache = previous;
-                self.metadata_notice = if (job.manual) "Metadata display could not be updated; previous values kept" else null;
+                self.metadata_notice = job.publicationFailed("Metadata display could not be updated; previous values kept");
                 return true;
             };
             const image_models = self.buildImageModels(self.global_config.?.value) catch {
                 self.freeDisplayModels(models);
                 self.freeDisplayModels(decision_models);
                 self.metadata_cache = previous;
-                self.metadata_notice = if (job.manual) "Metadata display could not be updated; previous values kept" else null;
+                self.metadata_notice = job.publicationFailed("Metadata display could not be updated; previous values kept");
                 return true;
             };
             self.freeDisplayModels(self.display_models);
@@ -947,13 +971,13 @@ pub const Session = struct {
             self.display_image_models = image_models;
             _ = self.completeInitialDefault(idle) catch false;
             const official_requested = job.requested & metadata.provider_mask;
-            self.metadata_notice = if (!job.manual) null else if (!finished)
+            self.metadata_notice = if (!job.manual) null else if (job.failure_notice) |notice| notice else if (!finished)
                 (if (job.dev_future != null)
                     (if (succeeded != 0) "Official metadata updated; models.dev refresh still running" else "Official metadata failed or became stale; models.dev refresh still running")
                 else
                     (if (listing.dev_done) "models.dev updated; official metadata refresh still running" else "models.dev refresh failed; official metadata refresh still running"))
             else if (official_requested == 0)
-                (if (job.dev_listing.dev_done) "models.dev metadata refreshed" else "models.dev metadata refresh failed; cached/default values kept")
+                (if (job.dev_listing.dev_done) public_refresh_success else "models.dev metadata refresh failed; cached/default values kept")
             else if (job.succeeded == 0)
                 "Official metadata refresh failed; cached/default values kept"
             else if (job.succeeded != official_requested)
@@ -961,7 +985,7 @@ pub const Session = struct {
             else if (job.requested & metadata.dev_bit != 0 and !job.dev_listing.dev_done)
                 "Official model list refreshed; models.dev metadata refresh failed"
             else
-                "Official model list refreshed; /model shows official or default capacity";
+                official_refresh_success;
             return true;
         }
         if (idle and self.metadata_login_pending != 0) {
@@ -2290,15 +2314,13 @@ test "Anthropic displayable session resume preserves signed replay and never exe
     const Wire = struct {
         fn encode(allocator: std.mem.Allocator, session: *Session) ![]u8 {
             const app = session.app.?;
-            // Wire-only replay fixture has no price directory and never sends.
-            var config = app.config.value;
-            config.limits.low_price_input = false;
+            // Wire-only replay fixture never sends; provide synthetic required capacity.
             return adapter.encode(allocator, .{
                 .scope = .{ .connection = app.config.value.provider.base_url, .model = app.config.value.model.name, .protocol = .anthropic },
                 .system = app.runtime.system,
                 .messages = app.runtime.messages(),
                 .tools = &.{},
-                .max_output_tokens = try @import("../core/context.zig").outputBudget(config, .normal, app.runtime.estimator.tokens(@import("../core/context.zig").rawTokens(app.runtime.system, &.{}, app.runtime.messages()))),
+                .model_output_tokens = app.config.value.model.output_tokens orelse 8192,
             });
         }
     };
@@ -2474,6 +2496,141 @@ const MetadataFixture = struct {
         job.dev_future = null;
     }
 };
+
+// Controlled publication stages: both fetches are local and complete before
+// polling. A cancellable, data-free future holds the second stage pending; no
+// test mutates storage that a fetch worker could still be using.
+const MetadataPublicationFixture = struct {
+    const Fault = enum { none, cache, display };
+
+    fn official(a: std.mem.Allocator, _: std.Io, id: ProviderId, _: ?[]const u8) !metadata.Listing {
+        return metadata.parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":65536,\"protocol\":\"chat\"}]}", id);
+    }
+    fn public(_: std.mem.Allocator, _: std.Io) !metadata.Listing {
+        return .{ .dev_done = true };
+    }
+    fn hold(io: std.Io) void {
+        while (true) std.Io.sleep(io, .fromSeconds(60), .awake) catch return;
+    }
+
+    fn check(official_first: bool, fault: Fault, manual: bool) !void {
+        const a = std.testing.allocator;
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeSessionTestConfig(tmp.dir,
+            \\{"memory":{"auto":false},"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","api_key":"fake-owned-publication","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+        );
+        var path: [4096]u8 = undefined;
+        const home = path[0..try tmp.dir.realPath(io, &path)];
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = false });
+        defer session.deinit();
+        session.initial_default_pending = false;
+        session.metadata_wall_ms = 1000;
+        const mask = metadata.bit(.deepseek) | metadata.dev_bit;
+        const claim = try metadata.claimAt(&session.store.root, mask, manual, 1000, .{});
+        try std.testing.expectEqual(mask, claim.mask);
+        const job = try a.create(MetadataJob);
+        job.* = .{
+            .allocator = a,
+            .io = io,
+            .fetch = official,
+            .dev_fetch = public,
+            .manual = manual,
+            .requested = mask,
+            .generations = claim.generations,
+            .credential_revisions = session.credential_revisions,
+            .started_ms = @intCast(std.Io.Clock.awake.now(io).toMilliseconds()),
+        };
+        session.metadata_job = job; // Session owns every subsequent failure path.
+        job.keys[@intCast(@backingInt(ProviderId.deepseek))] = try a.dupe(u8, "fake-local-fetch");
+        job.run();
+        job.runDev();
+        try std.testing.expectEqual(metadata.bit(.deepseek), job.succeeded);
+        try std.testing.expect(job.dev_listing.dev_done);
+        if (official_first) {
+            job.dev_done.store(false, .release);
+            job.dev_started_ms = @intCast(std.Io.Clock.awake.now(io).toMilliseconds());
+            job.dev_future = try std.Io.concurrent(io, hold, .{io});
+        } else {
+            job.done.store(false, .release);
+            job.future = try std.Io.concurrent(io, hold, .{io});
+        }
+        const previous_models = session.display_models;
+        const previous_cache = session.metadata_cache;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        {
+            const session_allocator = session.allocator;
+            const root_allocator = session.store.root.allocator;
+            defer session.allocator = session_allocator;
+            defer session.store.root.allocator = root_allocator;
+            // Cache fault hits real commitClaimedAt -> load allocation, after
+            // published is marked. Display fault hits the real buildModels,
+            // after a successful on-disk commit. Neither needs a production seam.
+            switch (fault) {
+                .cache => session.store.root.allocator = failing.allocator(),
+                .display => session.allocator = failing.allocator(),
+                .none => {},
+            }
+            try std.testing.expect(Session.pollModels(&session, true));
+        }
+        try std.testing.expect(session.metadata_job == job);
+        try std.testing.expectEqual(official_first, job.official_published);
+        try std.testing.expectEqual(!official_first, job.dev_published);
+        const expected: ?[]const u8 = switch (fault) {
+            .cache => "Metadata cache could not be saved; previous values kept",
+            .display => "Metadata display could not be updated; previous values kept",
+            .none => null,
+        };
+        if (expected) |notice| {
+            if (manual) {
+                try std.testing.expectEqualStrings(notice, session.metadata_notice orelse return error.MissingFailureNotice);
+            } else try std.testing.expect(session.metadata_notice == null);
+            try std.testing.expect(session.display_models.ptr == previous_models.ptr);
+            try std.testing.expectEqualDeep(previous_cache, session.metadata_cache);
+        }
+        const first_saved = try metadata.load(&session.store.root);
+        const first_index: usize = if (official_first) @intCast(@backingInt(ProviderId.deepseek)) else 3;
+        try std.testing.expectEqual(fault != .cache, first_saved.refresh[first_index].successful);
+        try std.testing.expectEqual(@as(u16, 0), metadataNoticeTtl(session.metadata_notice));
+        if (official_first) {
+            job.dev_future.?.cancel(io);
+            job.dev_future = null;
+        } else {
+            job.future.?.cancel(io);
+            job.future = null;
+        }
+        try std.testing.expect(Session.pollModels(&session, true));
+        try std.testing.expect(session.metadata_job == null);
+        // The second stage really committed successfully, not another failure.
+        const saved = try metadata.load(&session.store.root);
+        if (official_first) {
+            try std.testing.expect(saved.refresh[3].successful);
+        } else {
+            const index: usize = @intCast(@backingInt(ProviderId.deepseek));
+            try std.testing.expect(saved.refresh[index].successful);
+        }
+        if (!manual) {
+            try std.testing.expect(session.metadata_notice == null);
+        } else if (expected) |notice| {
+            try std.testing.expectEqualStrings(notice, session.metadata_notice.?);
+        } else {
+            try std.testing.expectEqualStrings(official_refresh_success, session.metadata_notice.?);
+        }
+        try std.testing.expectEqual(@as(u16, if (manual and fault == .none) 3000 else 0), metadataNoticeTtl(session.metadata_notice));
+    }
+};
+
+test "metadata publication failures survive both stage orders while clean successes alone expire" {
+    for ([_]bool{ true, false }) |official_first| {
+        for ([_]MetadataPublicationFixture.Fault{ .cache, .display, .none }) |fault| {
+            for ([_]bool{ true, false }) |manual| try MetadataPublicationFixture.check(official_first, fault, manual);
+        }
+    }
+}
 
 const LayeredMetadataFixture = struct {
     var official_effort: std.atomic.Value(bool) = .init(false);
@@ -3236,7 +3393,6 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     var persisted_defaults = try session.store.loadExisting();
     defer cfg.release(&persisted_defaults);
     try std.testing.expect(persisted_defaults.value.model.output_tokens == null);
-    try std.testing.expect(persisted_defaults.value.limits.max_output_tokens == null);
     try std.testing.expectEqual(presentation.ReasoningEffort.max, session.preferred_effort.?);
     session.metadata_dev_fetch = LayeredMetadataFixture.devFail;
     try Session.refreshModels(&session);

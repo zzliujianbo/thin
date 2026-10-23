@@ -187,7 +187,6 @@ fn testRequest() p.Request {
         .system = "fixed",
         .tools = &.{},
         .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "hello" }} }},
-        .max_output_tokens = 100,
     };
 }
 

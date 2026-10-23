@@ -34,13 +34,10 @@ pub const Client = struct {
         }
         self.source = if (config.selection_pending) try cfg.clonePendingSettings(owned, config) else try cfg.clone(owned, config);
         errdefer cfg.release(&self.source);
-        // Bound helper tokens/decoded JSON without confusing that payload with
-        // SSE wire bytes. Framing, reasoning and signatures can legitimately
-        // exceed 32KiB even for tiny JSON; retain the frozen, validated transport
-        // response/event limits (including an explicitly smaller user policy).
-        // codec.parse and extract below independently enforce max_output_bytes.
+        // Decoded JSON bounds are independent of provider output length and SSE
+        // framing. Retain validated wire/event limits and codec payload bounds,
+        // without imposing a separate helper token allowance.
         const frozen = &self.source.value;
-        frozen.limits.max_output_tokens = @min(frozen.limits.max_output_tokens orelse 4096, @min(frozen.model.output_tokens orelse 4096, 4096));
         self.key = cfg.resolveApiKey(owned, frozen.*, env) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
@@ -122,6 +119,7 @@ pub const Client = struct {
         try self.check(cancel);
         const messages = [_]p.Message{try p.textMessage(a, .user, body)};
         const estimated = context.rawTokens(codec.instruction, &.{}, &messages);
+        try context.checkInput(config, estimated);
         const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
         const wire = capabilities.wire(config.model.reasoning_effort);
         const request: p.Request = .{
@@ -129,13 +127,15 @@ pub const Client = struct {
             .system = codec.instruction,
             .tools = &.{},
             .messages = &messages,
-            .max_output_tokens = try context.outputBudget(config, .normal, estimated),
+            .model_output_tokens = config.model.output_tokens,
             .reasoning_effort = wire.effort,
             .thinking = wire.thinking,
             .reasoning_format = capabilities.format,
             .purpose = .normal,
             .cancellation = cancel,
         };
+        // Validate the actual frozen request before counting an inference attempt.
+        try @import("../core/checkpoint.zig").validateRequestHistory(a, request);
         try self.check(cancel);
         self.calls +|= 1;
         // Streamed usage survives even a thrown cancellation/cleanup failure.
@@ -318,9 +318,7 @@ const Fake = struct {
         try std.testing.expectEqualStrings("http://primary.invalid/v1", request.scope.connection);
         try std.testing.expectEqual(@as(usize, 1), request.messages.len);
         const client = self.client.?;
-        const expected = try context.outputBudget(client.source.value, .normal, context.rawTokens(codec.instruction, &.{}, request.messages));
-        try std.testing.expectEqual(expected, request.max_output_tokens);
-        try std.testing.expect(request.max_output_tokens <= 4096);
+        try std.testing.expectEqual(client.source.value.model.output_tokens, request.model_output_tokens);
         try std.testing.expect(client.source.value.limits.low_price_input);
         try std.testing.expectEqual(@as(u32, 1234), client.source.value.limits.request_timeout_ms);
         const usage: p.Usage = .{ .input_tokens = 17, .output_tokens = 3 };
@@ -354,7 +352,7 @@ fn creationCase(a: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("own-key", client.key.?);
     try env.put("SYNTHETIC_MEMORY_KEY", "replaced");
     try std.testing.expectEqualStrings("Bearer own-key", client.transport.?.authorization);
-    try std.testing.expectEqual(@as(u32, 4096), client.source.value.limits.max_output_tokens.?);
+    try std.testing.expectEqual(testConfig().model.output_tokens, client.source.value.model.output_tokens);
     try std.testing.expectEqual(testConfig().limits.max_response_bytes, client.source.value.limits.max_response_bytes);
     try std.testing.expectEqual(testConfig().limits.max_event_bytes, client.source.value.limits.max_event_bytes);
 }
@@ -372,7 +370,7 @@ test "memory client frozen wire limits are independent of decoded JSON and prese
     try std.testing.expectEqual(config.limits.max_event_bytes, client.source.value.limits.max_event_bytes);
     try std.testing.expectEqual(config.limits.max_response_bytes, client.transport.?.config.limits.max_response_bytes);
     try std.testing.expectEqual(config.limits.max_event_bytes, client.transport.?.config.limits.max_event_bytes);
-    try std.testing.expectEqual(@as(u32, 4096), client.source.value.limits.max_output_tokens.?);
+    try std.testing.expectEqual(config.model.output_tokens, client.source.value.model.output_tokens);
     try std.testing.expectEqual(@as(u64, 0), client.calls);
 }
 test "memory client zero startup owns frozen config key and independent route OOM" {
@@ -422,6 +420,48 @@ test "memory client fake normal request preserves usage cancellation no tools no
     try std.testing.expectError(error.Canceled, client.service().extract(a, fixture, &cancel));
     try std.testing.expectEqual(prior, client.calls);
 }
+test "memory client rejects unknown or zero Anthropic capacity before counting calls" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    for ([_]?u32{ null, 0, 8192 }) |capacity| {
+        const client = try Client.create(a, std.testing.io, testConfig(), &env);
+        defer client.deinit();
+        client.source.value.model.protocol = .anthropic;
+        client.source.value.model.output_tokens = capacity;
+        const FakeCapacity = struct {
+            calls: usize = 0,
+            fn invoke(raw: *anyopaque, alloc: std.mem.Allocator, request: p.Request, _: p.ModelSink) !p.Outcome {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                try std.testing.expectEqual(@as(?u32, 8192), request.model_output_tokens);
+                const wire = try @import("../llm/anthropic.zig").encode(alloc, request);
+                const json = try std.json.parseFromSlice(std.json.Value, alloc, wire, .{});
+                defer json.deinit();
+                try std.testing.expectEqual(@as(i64, 8192), json.value.object.get("max_tokens").?.integer);
+                return .{ .success = .{ .message = try p.textMessage(alloc, .assistant, "{\"items\":[]}"), .finish = .stop, .usage = .{ .input_tokens = 7, .output_tokens = 1 } } };
+            }
+        };
+        var fake: FakeCapacity = .{};
+        client.model_override = .{ .context = &fake, .call_fn = FakeCapacity.invoke };
+        var cancel: p.Cancellation = .{};
+        const outcome = client.service().extract(a, fixture, &cancel);
+        if (capacity == null or capacity.? == 0) {
+            try std.testing.expectError(if (capacity == null) error.UnknownModelOutputCapacity else error.InvalidModelOutputCapacity, outcome);
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            try std.testing.expectEqual(@as(u64, 0), client.calls);
+            try std.testing.expect(client.last_usage.input_tokens == null and client.last_http_status == null);
+        } else {
+            const items = try outcome;
+            defer codec.freeCandidates(a, items);
+            try std.testing.expectEqual(@as(usize, 0), items.len);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            try std.testing.expectEqual(@as(u64, 1), client.calls);
+            try std.testing.expectEqual(@as(?u64, 7), client.last_usage.input_tokens);
+        }
+    }
+}
+
 test "memory client refuses unresolved native absent credentials and input policy before calls" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
@@ -444,7 +484,7 @@ test "memory client refuses unresolved native absent credentials and input polic
     try std.testing.expectEqual(@as(u64, 0), client.calls);
 }
 
-test "memory client complete request exact input and physical output boundaries" {
+test "memory client complete request exact input boundary without output clamp" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -462,7 +502,8 @@ test "memory client complete request exact input and physical output boundaries"
     var cancel: p.Cancellation = .{};
     const empty = try client.service().extract(a, fixture, &cancel);
     defer codec.freeCandidates(a, empty);
-    try std.testing.expectEqual(@as(u32, 1), try context.outputBudget(client.source.value, .normal, estimated));
+    try context.checkInput(client.source.value, estimated);
+    try std.testing.expectEqual(testConfig().model.output_tokens, client.source.value.model.output_tokens);
     client.source.value.limits.max_input_tokens.? -= 1;
     try std.testing.expectError(error.InputBudgetExceeded, client.service().extract(a, fixture, &cancel));
     try std.testing.expectEqual(@as(u64, 1), client.calls);
@@ -477,7 +518,8 @@ const WireFake = struct {
     fn invoke(raw: *anyopaque, a: std.mem.Allocator, req: p.Request, sink: p.ModelSink) !p.Outcome {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.calls += 1;
-        try std.testing.expect(req.max_output_tokens <= 4096 and req.tools.len == 0);
+        try std.testing.expectEqual(@as(usize, 0), req.tools.len);
+        try std.testing.expectEqual(testConfig().model.output_tokens, req.model_output_tokens);
         const body = self.body_override orelse "{\"items\":[{\"category\":\"preferences\",\"topic\":\"language\",\"content\":\"Prefer Zig.\",\"source_id\":0,\"quote\":\"Prefer Zig.\"}]}";
         const quoted = try std.json.Stringify.valueAlloc(a, body, .{});
         switch (req.scope.protocol) {

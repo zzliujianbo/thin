@@ -159,7 +159,7 @@ try {
   const declaration = {llm: {default: 'owned/memory-fixture', providers: {owned: {
     base_url: `http://127.0.0.1:${server.address().port}/v1`, api_key: KEY,
     models: {'memory-fixture': {protocol: 'chat', context_tokens: 32768}},
-  }}}, limits: {low_price_input: false, max_output_tokens: 512, summary_tokens: 80,
+  }}}, limits: {low_price_input: false,
     request_timeout_ms: 5000, task_timeout_ms: 15000}};
   const config = join(home, '.thin/config.json');
   const original = JSON.stringify(declaration);

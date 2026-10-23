@@ -50,7 +50,9 @@ fn run(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 2) return error.ExplicitProbeModeRequired;
-    const live = std.mem.eql(u8, args[1], "--allow-live-requests");
+    // Old authorization assumed a 512-token cap. Do not reuse it after the
+    // product stops sending optional output limits; require fresh explicit consent.
+    const live = std.mem.eql(u8, args[1], "--allow-provider-output-defaults");
     if (!live and !std.mem.eql(u8, args[1], "--preflight")) return error.ExplicitProbeModeRequired;
 
     // 沿用产品加载路径；不展示文件内容、连接地址、模型名、环境变量名或密钥。
@@ -61,11 +63,10 @@ fn run(init: std.process.Init) !u8 {
     defer thin.config.release(&parsed);
     var config = parsed.value;
 
-    // 只在内存中收紧成本和等待上限，不修改用户文件或更换模型/协议/推理档位。
+    // 只在内存中收紧等待及字节上限，不修改用户文件或更换模型/协议/推理档位。
     config.limits.request_timeout_ms = @min(config.limits.request_timeout_ms, 60000);
     config.limits.max_response_bytes = @min(config.limits.max_response_bytes, 2 * 1024 * 1024);
     config.limits.max_event_bytes = @min(config.limits.max_event_bytes, config.limits.max_response_bytes);
-    const output_cap = @min(config.limits.max_output_tokens, 512);
 
     const key = try thin.config.resolveApiKey(a, config, init.environ_map);
     defer {
@@ -97,7 +98,8 @@ fn run(init: std.process.Init) !u8 {
         .live_requests_enabled = live,
         .input_bytes = prompt.len,
         .input_tokens_estimate = thin.context.rawTokens(system, schemas, &messages),
-        .output_token_cap = output_cap,
+        .output_policy = "provider_default_or_required_model_capacity",
+        .local_output_token_cap = false,
         .max_calls = max_calls,
         .tools_executable = false,
     });
@@ -110,7 +112,6 @@ fn run(init: std.process.Init) !u8 {
         .system = system,
         .tools = schemas,
         .messages = &messages,
-        .max_output_tokens = output_cap,
     });
 
     for (0..3) |index| {

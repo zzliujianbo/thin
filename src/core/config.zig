@@ -81,8 +81,6 @@ pub const Limits = struct {
     read_bytes: u32 = 65536,
     /// 单次工具输出的字节上限。
     output_bytes: u32 = 32768,
-    /// Explicit response cap; missing/null uses model capability or conservative fallback.
-    max_output_tokens: ?u32 = null,
     /// Optional estimated-input ceiling, independent of the real model window.
     max_input_tokens: ?u32 = null,
     /// Enabled by default; explicit false opts out of the first known price step.
@@ -123,9 +121,6 @@ pub const Limits = struct {
     compaction_trigger_percent: u8 = 80,
     /// 压缩后希望达到的上下文占用百分比（必须小于触发阈值）。
     compaction_target_percent: u8 = 50,
-    /// Missing/null follows max_output_tokens (or the same model/fallback policy
-    /// when automatic). Explicit values cannot exceed explicit max_output_tokens.
-    summary_tokens: ?u32 = null,
     /// 单次模型响应的最大字节数。
     max_response_bytes: u32 = 8388608,
     /// 单个流式事件的最大字节数（不能超过 max_response_bytes）。
@@ -245,7 +240,6 @@ pub const DecisionConfig = struct {
     enabled: bool = true,
     /// Generative protocols only; SystemOne has no max_tokens/message context API.
     max_input_tokens: u32 = 8192,
-    max_output_tokens: u32 = 1024,
     /// Local SystemOne state bound, not a claim about supplier context capacity.
     max_state_bytes: u32 = 16384,
 
@@ -257,7 +251,6 @@ pub const DecisionConfig = struct {
             .input_margin_tokens = 1,
             .safety_tokens = 256,
             .max_input_tokens = self.max_input_tokens,
-            .max_output_tokens = self.max_output_tokens,
             .request_timeout_ms = shared_request_timeout_ms,
             .max_response_bytes = 128 * 1024,
             .max_event_bytes = 64 * 1024,
@@ -407,7 +400,7 @@ test "image rejects invalid owner model types duplicates and unknown fields" {
 }
 
 const decision_fixture =
-    \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://127.0.0.1:1/v1","api_key":"fake-inline","models":{"main":{"protocol":"chat","context_tokens":32768},"org/reviewer":{"protocol":"systemone"}}}}},"limits":{"request_timeout_ms":123456},"decision":{"model":"p/org/reviewer","enabled":true,"max_input_tokens":8192,"max_output_tokens":1024,"max_state_bytes":16384}}
+    \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://127.0.0.1:1/v1","api_key":"fake-inline","models":{"main":{"protocol":"chat","context_tokens":32768},"org/reviewer":{"protocol":"systemone"}}}}},"limits":{"request_timeout_ms":123456},"decision":{"model":"p/org/reviewer","enabled":true,"max_input_tokens":8192,"max_state_bytes":16384}}
 ;
 
 fn decisionAllocationCase(a: std.mem.Allocator) !void {
@@ -452,7 +445,7 @@ test "explicit decision protocol round trips with shared timeout" {
     const decision = tree.value.object.get("decision").?.object;
     try std.testing.expect(decision.get("backend") == null);
     try std.testing.expect(decision.get("request_timeout_ms") == null);
-    try std.testing.expectEqual(@as(usize, 5), decision.count());
+    try std.testing.expectEqual(@as(usize, 4), decision.count());
     var again = try parse(std.testing.allocator, out.written());
     defer release(&again);
     try std.testing.expectEqual(protocol.Protocol.systemone, again.value.registry.?.find("p").?.patchFor("org/reviewer").?.protocol.?);
@@ -519,8 +512,9 @@ test "SystemOne has no required generative window but retains field and budget s
     model.reasoning = .{ .map = .{ .high = "high" } };
     try std.testing.expectError(error.IncompatibleReasoningProtocol, validateModel(model, .{}));
     model.reasoning = null;
-    try std.testing.expectError(error.InvalidBudget, validateModel(model, .{ .max_output_tokens = 0 }));
-    try std.testing.expectError(error.InvalidBudget, validateModel(model, .{ .max_output_tokens = 100, .summary_tokens = 101 }));
+    model.output_tokens = 0;
+    try std.testing.expectError(error.InvalidBudget, validateModel(model, .{}));
+    model.output_tokens = null;
     model.context_tokens = 16 * 1024 * 1024 + 1;
     try std.testing.expectError(error.InvalidBudget, validateModel(model, .{}));
     model.context_tokens = 0;
@@ -1004,12 +998,11 @@ fn validateConfig(config: Config, comptime unresolved: bool) !void {
         const registry = config.registry orelse return error.MissingRegistry;
         _ = registry.find(selection.provider) orelse return error.UnknownProvider;
         if (decision.max_state_bytes < 2 or decision.max_state_bytes > 65536) return error.InvalidLimit;
-        if (decision.max_input_tokens < 2 or decision.max_input_tokens > 16 * 1024 * 1024 or
-            decision.max_output_tokens == 0 or decision.max_output_tokens > 16 * 1024 * 1024) return error.InvalidLimit;
+        if (decision.max_input_tokens < 2 or decision.max_input_tokens > 16 * 1024 * 1024) return error.InvalidLimit;
     }
 
     const l = config.limits;
-    // Null means unlimited rounds / automatic output; explicit limits are positive.
+    // Null means unlimited rounds; explicit limits are positive.
     inline for (@typeInfo(Limits).@"struct".field_names) |field| {
         if (comptime std.mem.eql(u8, field, "max_rounds")) {
             if (l.max_rounds) |rounds| {
@@ -1195,13 +1188,6 @@ pub fn validateModel(model: Model, l: Limits) !void {
         (model.context_tokens == 0 or @as(u64, l.safety_tokens) + 1 >= model.context_tokens)) return error.InvalidBudget;
     if (model.input_price_threshold) |tokens| if (tokens == 0 or tokens > 16 * mib) return error.InvalidBudget;
     if (model.input_price_flat_limit) |tokens| if (tokens == 0 or tokens > 16 * mib) return error.InvalidBudget;
-    if (l.summary_tokens) |tokens| if (tokens == 0 or tokens > mib) return error.InvalidBudget;
-    if (l.max_output_tokens) |cap| {
-        // An explicit ceiling is preserved, but may shrink to available room
-        // per request. It must not invalidate an otherwise usable model window.
-        if (cap == 0 or cap > mib) return error.InvalidBudget;
-        if (l.summary_tokens) |tokens| if (tokens > cap) return error.InvalidBudget;
-    }
 }
 
 /// Reads only the explicit file; never consults environment variables.
@@ -1372,17 +1358,15 @@ test "reject invalid URL and header injection" {
 // 验证：预算、压缩比例与各项限额的边界都会被检查。
 test "budget ratios and bounded limits" {
     var c = testConfig();
-    // A ceiling is not a reservation; requests shrink to available context.
-    c.limits.max_output_tokens = 4096;
+    // Input preflight retains physical context safety without an output policy.
     c.model.context_tokens = 6144;
     try validate(c);
     c.model.context_tokens = c.limits.safety_tokens + 1;
     try std.testing.expectError(error.InvalidBudget, validate(c));
 
     c = testConfig();
-    // 摘要预算超过显式输出上限（自动模式的摘要独立）。
-    c.limits.max_output_tokens = 4096;
-    c.limits.summary_tokens = 4097;
+    // A declared model output capability remains positive, independently of context.
+    c.model.output_tokens = 0;
     try std.testing.expectError(error.InvalidBudget, validate(c));
     c = testConfig();
 

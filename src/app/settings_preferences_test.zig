@@ -9,7 +9,7 @@ const p = @import("../core/protocol.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 const plain =
-    \\{"llm":{"default":"route/first","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-owned-only","models":{"first":{"protocol":"chat","context_tokens":65536},"judge":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false,"summary_tokens":1024}}
+    \\{"llm":{"default":"route/first","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-owned-only","models":{"first":{"protocol":"chat","context_tokens":65536},"judge":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
 ;
 const reviewed = plain[0 .. plain.len - 1] ++ ",\"decision\":{\"model\":\"route/judge\"}}";
 const Edit = struct { key: preference.Key, value: ?u32 };
@@ -18,7 +18,6 @@ const main_edits = [_]Edit{
     .{ .key = .compaction_enabled, .value = 0 },
     .{ .key = .command_timeout_ms, .value = 10000 },
     .{ .key = .request_timeout_ms, .value = 20000 },
-    .{ .key = .max_output_tokens, .value = 2048 },
     .{ .key = .task_timeout_ms, .value = 40000 },
 };
 fn set(session: *Session, key: preference.Key, value: ?u32) !void {
@@ -83,8 +82,6 @@ test "preferences pure edits enforce shared validation without partial mutation"
     for (main_edits) |edit| try preference.apply(&parsed.value, edit.key, edit.value);
     try preference.apply(&parsed.value, .request_timeout_ms, 86400000);
     try preference.apply(&parsed.value, .task_timeout_ms, 86400000);
-    try preference.apply(&parsed.value, .max_output_tokens, 1024 * 1024);
-    try preference.apply(&parsed.value, .max_output_tokens, null);
     const invalid = [_]Edit{
         .{ .key = .memory_auto, .value = null },
         .{ .key = .memory_auto, .value = 2 },
@@ -99,9 +96,6 @@ test "preferences pure edits enforce shared validation without partial mutation"
         .{ .key = .task_timeout_ms, .value = null },
         .{ .key = .task_timeout_ms, .value = 0 },
         .{ .key = .task_timeout_ms, .value = 86400001 },
-        .{ .key = .max_output_tokens, .value = 0 },
-        .{ .key = .max_output_tokens, .value = 1023 },
-        .{ .key = .max_output_tokens, .value = 1024 * 1024 + 1 },
     };
     for (invalid) |edit| {
         const before = parsed.value;
@@ -121,19 +115,20 @@ test "preferences active clone preserves unrelated frozen limits and rejects inv
     active.limits.max_input_tokens = 12000;
     active.limits.input_margin_tokens = 777;
     active.limits.command_max_timeout_ms = 20000;
-    active.limits.summary_tokens = 4096;
     try preference.apply(&declaration.value, .command_timeout_ms, 30000);
     try std.testing.expectError(error.InvalidLimit, profiles.activeClone(a, active, declaration.value));
     try preference.apply(&declaration.value, .command_timeout_ms, 10000);
-    try preference.apply(&declaration.value, .max_output_tokens, 2048);
+    // A valid timeout edit must still reject invalid frozen input constraints.
+    active.limits.max_input_tokens = active.limits.input_margin_tokens;
+    try preference.apply(&declaration.value, .request_timeout_ms, 12345);
     try std.testing.expectError(error.InvalidBudget, profiles.activeClone(a, active, declaration.value));
-    try preference.apply(&declaration.value, .max_output_tokens, null);
+    active.limits.max_input_tokens = 12000;
     var candidate = try profiles.activeClone(a, active, declaration.value);
     defer cfg.release(&candidate);
     try std.testing.expectEqual(@as(?u32, 12000), candidate.value.limits.max_input_tokens);
     try std.testing.expectEqual(@as(u32, 777), candidate.value.limits.input_margin_tokens);
     try std.testing.expectEqual(@as(u32, 20000), candidate.value.limits.command_max_timeout_ms);
-    try std.testing.expectEqual(@as(?u32, 4096), candidate.value.limits.summary_tokens);
+    try std.testing.expectEqual(@as(u32, 12345), candidate.value.limits.request_timeout_ms);
     try std.testing.expect(candidate.value.memory.auto);
     try preference.apply(&declaration.value, .memory_auto, 0);
     var memory_candidate = try profiles.activeClone(a, active, declaration.value);
@@ -269,9 +264,12 @@ test "preferences invalid guards CAS and active validation never publish or save
     app.runtime.poisoned = true;
     try std.testing.expectError(error.UnsafeToContinue, set(&session, .compaction_enabled, 0));
     app.runtime.poisoned = false;
-    // Declaration passes; the frozen active summary budget must reject pre-save.
-    app.config.value.limits.summary_tokens = 4096;
-    try std.testing.expectError(error.InvalidBudget, set(&session, .max_output_tokens, 2048));
+    // Declaration passes; invalid frozen input constraints must reject pre-save.
+    const input_limit = app.config.value.limits.max_input_tokens;
+    app.config.value.limits.max_input_tokens = app.config.value.limits.input_margin_tokens;
+    try std.testing.expectError(error.InvalidBudget, set(&session, .request_timeout_ms, 20000));
+    try std.testing.expectEqual(@as(u32, 300000), app.config.value.limits.request_timeout_ms);
+    app.config.value.limits.max_input_tokens = input_limit;
     const unchanged = try disk(&session);
     defer a.free(unchanged);
     try std.testing.expectEqualStrings(initial, unchanged);
@@ -306,7 +304,7 @@ test "preferences no App pending ownership validation and CAS" {
     defer session.deinit();
     try std.testing.expect(session.app == null);
     for (main_edits) |edit| try set(&session, edit.key, edit.value);
-    try set(&session, .max_output_tokens, null);
+    try set(&session, .request_timeout_ms, 60000);
     try std.testing.expect(session.app == null and session.pending.?.arena != session.global_config.?.arena);
     try std.testing.expectEqualDeep(session.global_config.?.value.limits, session.connection().current().limits);
     const initial = try disk(&session);
@@ -362,7 +360,7 @@ test "preferences restored missing provider preserves pending history while savi
         try std.testing.expect(try source.saveOnExit());
     }
     const replacement =
-        \\{"llm":{"default":"other/next","providers":{"other":{"base_url":"https://replacement.invalid/v1","api_key":"fake-replacement-only","models":{"next":{"protocol":"chat","context_tokens":65536},"judge":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false,"summary_tokens":1024},"decision":{"model":"other/judge"}}
+        \\{"llm":{"default":"other/next","providers":{"other":{"base_url":"https://replacement.invalid/v1","api_key":"fake-replacement-only","models":{"next":{"protocol":"chat","context_tokens":65536},"judge":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false},"decision":{"model":"other/judge"}}
     ;
     {
         var store = try Store.open(a, io, home);
@@ -400,13 +398,16 @@ test "preferences restored missing provider preserves pending history while savi
     try std.testing.expectEqualStrings("other/judge", saved.value.decision.?.model);
     const before = try disk(&restored);
     defer a.free(before);
-    // An unresolved route does not excuse an invalid frozen budget.
-    restored.pending.?.value.limits.summary_tokens = 4096;
-    try std.testing.expectError(error.InvalidBudget, set(&restored, .max_output_tokens, 2048));
+    // An unresolved route does not excuse invalid frozen input constraints.
+    const input_limit = restored.pending.?.value.limits.max_input_tokens;
+    restored.pending.?.value.limits.max_input_tokens = restored.pending.?.value.limits.input_margin_tokens;
+    try std.testing.expectError(error.InvalidBudget, set(&restored, .request_timeout_ms, 20000));
+    try std.testing.expectEqual(@as(u32, 60000), restored.pending.?.value.limits.request_timeout_ms);
+    try std.testing.expect(connection.initial_history_fn.?(connection.context).ptr == history.ptr);
     const unchanged = try disk(&restored);
     defer a.free(unchanged);
     try std.testing.expectEqualStrings(before, unchanged);
-    restored.pending.?.value.limits.summary_tokens = 1024;
+    restored.pending.?.value.limits.max_input_tokens = input_limit;
     const arena = restored.pending.?.arena;
     try restored.store.root.writeMode(cfg.file_name, "{}", true, 0o600);
     try std.testing.expectError(error.AuthVersionConflict, set(&restored, .request_timeout_ms, 30000));

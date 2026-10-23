@@ -250,12 +250,75 @@ pub const Prompt = struct {
     }
 };
 
+// Preserve exact palette/layout goldens independently of the added weight.
+fn promptColors(styled: []const u8) ![]u8 {
+    const a = std.testing.allocator;
+    const colors = try std.mem.replaceOwned(u8, a, styled, "\x1b[1m", "");
+    errdefer a.free(colors);
+    try std.testing.expect(std.mem.endsWith(u8, colors, theme.reset ++ " "));
+    return colors;
+}
+
+fn promptDefaultEnd(expected: []const u8) ![]u8 {
+    const a = std.testing.allocator;
+    if (std.mem.endsWith(u8, expected, theme.reset ++ " ")) return a.dupe(u8, expected);
+    return std.mem.concat(a, u8, &.{ expected[0 .. expected.len - 1], theme.reset ++ " " });
+}
+
+fn expectPromptStyle(expected: []const u8, actual: []const u8) !void {
+    const colors = try promptColors(actual);
+    defer std.testing.allocator.free(colors);
+    const ended = try promptDefaultEnd(expected);
+    defer std.testing.allocator.free(ended);
+    try std.testing.expectEqualStrings(ended, colors);
+}
+
+fn expectPromptSuffix(actual: []const u8, suffix: []const u8) !void {
+    const colors = try promptColors(actual);
+    defer std.testing.allocator.free(colors);
+    const ended = try promptDefaultEnd(suffix);
+    defer std.testing.allocator.free(ended);
+    try std.testing.expect(std.mem.endsWith(u8, colors, ended));
+}
+
+test "bold prompt preserves every color and resets before the editor at every width" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "模型-name" }) |model| for ([_]usize{ 1, 7, 12, 80 }) |columns| for ([_]bool{ false, true }) |busy| for ([_]?shared.ReasoningEffort{ null, .high }) |flash| {
+        const motion: PromptActivity = .{ .busy = busy, .now_ms = 120, .phase = 7, .reasoning_effort = .high, .low_price_input = true, .effort_flash = flash };
+        const rendered = try prompt(a, model, .{ .tokens = 25, .limit = 100 }, columns, motion);
+        defer rendered.deinit(a);
+        const layout = try promptLayout(a, model, .{ .tokens = 25, .limit = 100 }, columns, motion);
+        defer layout.deinit(a);
+        try expectPromptStyle(layout.styled, rendered.styled);
+        try std.testing.expectEqualStrings(layout.plain, rendered.plain);
+        var at: usize = 0;
+        var glyph: usize = 0;
+        var bold = false;
+        while (at < rendered.styled.len) {
+            if (rendered.styled[at] == '\x1b') {
+                const end = std.mem.findScalarPos(u8, rendered.styled, at, 'm') orelse return error.TestUnexpectedResult;
+                const parameters = rendered.styled[at + 2 .. end];
+                if (std.mem.eql(u8, parameters, "0")) bold = false;
+                if (std.mem.eql(u8, parameters, "1")) bold = true;
+                at = end + 1;
+            } else {
+                try std.testing.expectEqual(glyph + 1 < rendered.plain.len, bold);
+                try std.testing.expectEqual(rendered.plain[glyph], rendered.styled[at]);
+                glyph += 1;
+                at += 1;
+            }
+        }
+        try std.testing.expectEqual(rendered.plain.len, glyph);
+        try std.testing.expect(!bold);
+    };
+}
+
 test "unselected model prompt shows no preset ID policy marker or percentage" {
     for ([_]usize{ 1, 12, 80 }) |columns| {
         const rendered = try prompt(std.testing.allocator, "", .{ .tokens = 0, .limit = 1000000 }, columns, .{ .low_price_input = true });
         defer rendered.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("> ", rendered.plain);
-        try std.testing.expectEqualStrings("> ", rendered.styled);
+        try expectPromptStyle("> ", rendered.styled);
     }
 }
 
@@ -278,6 +341,27 @@ pub const PromptActivity = struct {
 /// previous styling. Only the busy marker shares the tool indicator pulse;
 /// parentheses, spaces, idle marker and editor stay default.
 pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, motion: PromptActivity) !Prompt {
+    const base = try promptLayout(a, model, snapshot, columns, motion);
+    defer a.free(base.styled);
+    errdefer a.free(base.plain);
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    const bold = "\x1b[1m";
+    try out.writer.writeAll(bold);
+    // Keep all existing colors and restore weight after their full SGR resets.
+    // The final separator/editor must start in the terminal's default style.
+    var spans = std.mem.splitSequence(u8, base.styled[0 .. base.styled.len - 1], theme.reset);
+    try out.writer.writeAll(spans.first());
+    while (spans.next()) |span| {
+        try out.writer.writeAll(theme.reset);
+        if (span.len != 0) try out.writer.print("{s}{s}", .{ bold, span });
+    }
+    if (!std.mem.endsWith(u8, base.styled[0 .. base.styled.len - 1], theme.reset)) try out.writer.writeAll(theme.reset);
+    try out.writer.writeAll(" ");
+    return .{ .plain = base.plain, .styled = try a.dupe(u8, out.written()) };
+}
+
+fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, motion: PromptActivity) !Prompt {
     if (model.len == 0) {
         const plain = try a.dupe(u8, "> ");
         errdefer a.free(plain);
@@ -408,11 +492,11 @@ test "percent prompt has default input colors and real spinner not loading text"
     const idle = try prompt(a, "deepseek-flash", null, 79, .{});
     defer idle.deinit(a);
     try std.testing.expectEqualStrings("(deepseek-flash) ?%> ", idle.plain);
-    try std.testing.expectEqualStrings(idle.plain, idle.styled);
+    try expectPromptStyle(idle.plain, idle.styled);
     const active = try prompt(a, "deepseek-flash", null, 79, .{ .busy = true, .now_ms = 80, .phase = 2 });
     defer active.deinit(a);
     try std.testing.expectEqualStrings("(deepseek-flash) ?%⠙ ", active.plain);
-    try std.testing.expect(std.mem.endsWith(u8, active.styled, theme.reset ++ theme.command_pulse[0] ++ "⠙" ++ theme.reset ++ " "));
+    try expectPromptSuffix(active.styled, theme.reset ++ theme.command_pulse[0] ++ "⠙" ++ theme.reset ++ " ");
     try std.testing.expect(std.mem.find(u8, active.styled, "loading") == null);
     const narrow = try prompt(a, "long model name", null, 7, .{});
     defer narrow.deinit(a);
@@ -474,7 +558,7 @@ test "context prompt is retained occupancy not cache billing and remains bounded
     const value = try prompt(a, "fixture", .{ .tokens = 16384, .limit = 32768 }, 79, .{});
     defer value.deinit(a);
     try std.testing.expectEqualStrings("(fixture) 50.0%> ", value.plain);
-    try std.testing.expectEqualStrings("(" ++ theme.reset ++ "fixture" ++ theme.reset ++ ") " ++ theme.failure ++ "50.0%" ++ theme.reset ++ "> ", value.styled);
+    try expectPromptStyle("(" ++ theme.reset ++ "fixture" ++ theme.reset ++ ") " ++ theme.failure ++ "50.0%" ++ theme.reset ++ "> ", value.styled);
     for ([_]usize{ 1, 7, 24, 40, 79, 119 }) |width| {
         const small = try prompt(a, "long-model-name", .{ .tokens = std.math.maxInt(u64), .limit = 1 }, width, .{ .busy = true, .now_ms = 80, .phase = 1 });
         defer small.deinit(a);
@@ -509,7 +593,7 @@ test "context percent thresholds follow displayed rounding without animation or 
                 defer value.deinit(a);
                 const suffix = try std.fmt.allocPrint(a, ") {s}{s}{s}{s}{s}{s} ", .{ case.color, case.label, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
                 defer a.free(suffix);
-                try std.testing.expect(std.mem.endsWith(u8, value.styled, suffix));
+                try expectPromptSuffix(value.styled, suffix);
                 try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
             }
         }
@@ -533,7 +617,7 @@ test "low price marker shares the full static context color and optout removes i
         defer value.deinit(a);
         const suffix = try std.fmt.allocPrint(a, ") {s}{s}{s}{s}{s}{s}{s} ", .{ case.color, if (enabled) "L" else "", case.label, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
         defer a.free(suffix);
-        try std.testing.expect(std.mem.endsWith(u8, value.styled, suffix));
+        try expectPromptSuffix(value.styled, suffix);
         const label = try std.mem.concat(a, u8, &.{ "L", case.label });
         defer a.free(label);
         try std.testing.expectEqual(enabled, std.mem.find(u8, value.plain, label) != null);
@@ -555,14 +639,14 @@ test "model closes before adjacent policy and percentage while punctuation stays
     defer value.deinit(a);
     try std.testing.expectEqualStrings("(deepseek-flash) L1.6%> ", value.plain);
     const model_color = comptime theme.effortColor(.high);
-    try std.testing.expectEqualStrings("(" ++ model_color ++ "deepseek-flash" ++ theme.reset ++ ") " ++ theme.success ++ "L1.6%" ++ theme.reset ++ "> ", value.styled);
+    try expectPromptStyle("(" ++ model_color ++ "deepseek-flash" ++ theme.reset ++ ") " ++ theme.success ++ "L1.6%" ++ theme.reset ++ "> ", value.styled);
     const optout = try prompt(a, "deepseek-flash", .{ .tokens = 16, .limit = 1000 }, 79, .{ .low_price_input = false });
     defer optout.deinit(a);
     try std.testing.expectEqualStrings("(deepseek-flash) 1.6%> ", optout.plain);
     const compact = try prompt(a, "x", .{ .tokens = 16, .limit = 1000 }, 12, .{ .low_price_input = true });
     defer compact.deinit(a);
     try std.testing.expectEqualStrings("L1.6%> ", compact.plain);
-    try std.testing.expectEqualStrings(theme.success ++ "L1.6%" ++ theme.reset ++ "> ", compact.styled);
+    try expectPromptStyle(theme.success ++ "L1.6%" ++ theme.reset ++ "> ", compact.styled);
 }
 
 test "low price marker stays context colored during effort flashes" {
@@ -583,7 +667,7 @@ test "effort confirmation replaces only the context slot and medium stays defaul
     const flash = try prompt(a, "fixture", context, 79, .{ .reasoning_effort = .medium, .effort_flash = .medium });
     defer flash.deinit(a);
     try std.testing.expectEqualStrings("(fixture) medium> ", flash.plain);
-    try std.testing.expectEqualStrings(flash.plain, flash.styled);
+    try expectPromptStyle(flash.plain, flash.styled);
     const restored = try prompt(a, "fixture", context, 79, .{ .reasoning_effort = .medium });
     defer restored.deinit(a);
     try std.testing.expectEqualStrings("(fixture) 25.0%> ", restored.plain);
@@ -616,7 +700,7 @@ test "model keeps effort and TPS waves while context percent has static occupanc
                 for (efforts) |effort| {
                     const value = try prompt(a, "model", .{ .tokens = 22807, .limit = 1000000 }, 79, .{ .busy = true, .now_ms = now, .phase = phase, .rate_band = band, .reasoning_effort = effort });
                     defer value.deinit(a);
-                    try std.testing.expectEqualStrings(expected.written(), value.styled);
+                    try expectPromptStyle(expected.written(), value.styled);
                     const plain = try std.fmt.allocPrint(a, "(model) 2.3%{s} ", .{activity.spinner(now)});
                     defer a.free(plain);
                     try std.testing.expectEqualStrings(plain, value.plain);
@@ -631,22 +715,22 @@ test "model keeps effort and TPS waves while context percent has static occupanc
         defer idle.deinit(a);
         const expected = try std.fmt.allocPrint(a, "({s}model{s}) {s}0.1%{s}> ", .{ color, theme.reset, theme.success, theme.reset });
         defer a.free(expected);
-        try std.testing.expectEqualStrings(expected, idle.styled);
+        try expectPromptStyle(expected, idle.styled);
         try std.testing.expectEqualStrings("(model) 0.1%> ", idle.plain);
         const percent = try prompt(a, "", null, 79, .{ .reasoning_effort = effort });
         defer percent.deinit(a);
         const percent_expected = try a.dupe(u8, percent.plain);
         defer a.free(percent_expected);
         try std.testing.expectEqualStrings("> ", percent.plain);
-        try std.testing.expectEqualStrings(percent_expected, percent.styled);
+        try expectPromptStyle(percent_expected, percent.styled);
         for (0..12) |columns| {
             for ([_]bool{ false, true }) |busy| {
                 const narrow = try prompt(a, "model", null, columns, .{ .busy = busy, .now_ms = 80, .reasoning_effort = effort });
                 defer narrow.deinit(a);
                 try std.testing.expectEqualStrings(if (busy) "⠙ " else "> ", narrow.plain);
                 if (busy) {
-                    try std.testing.expectEqualStrings(theme.command_pulse[0] ++ "⠙" ++ theme.reset ++ " ", narrow.styled);
-                } else try std.testing.expectEqualStrings(narrow.plain, narrow.styled);
+                    try expectPromptStyle(theme.command_pulse[0] ++ "⠙" ++ theme.reset ++ " ", narrow.styled);
+                } else try expectPromptStyle(narrow.plain, narrow.styled);
             }
         }
     }
@@ -668,7 +752,7 @@ test "composer busy indicator shares tool pulse including narrow widths without 
         for ([_]usize{ 0, 7, 12, 15, 80 }) |columns| for ([_]shared.activity.RateBand{ .slow, .fast, .unknown }) |band| {
             const rendered = try prompt(a, "model", .{ .tokens = 10, .limit = 100 }, columns, .{ .busy = true, .now_ms = now, .phase = 7, .rate_band = band, .reasoning_effort = .high });
             defer rendered.deinit(a);
-            try std.testing.expect(std.mem.endsWith(u8, rendered.styled, ending));
+            try expectPromptSuffix(rendered.styled, ending);
             try std.testing.expectEqual(text.width(rendered.plain), @import("markdown_writer.zig").displayWidth(rendered.styled));
             try std.testing.expect(text.width(rendered.plain) <= @max(columns, 2));
         };

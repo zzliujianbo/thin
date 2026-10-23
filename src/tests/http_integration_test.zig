@@ -39,7 +39,7 @@ fn configBase(a: std.mem.Allocator, scenario: []const u8, protocol: p.Protocol, 
 
 /// 构造固定内容的请求，使每次调用的 scope 与 system 保持一致，便于对比。
 fn request(c: cfg.Config, protocol: p.Protocol) p.Request {
-    return .{ .scope = .{ .connection = c.provider.base_url, .model = c.model.name, .protocol = protocol }, .system = "fixed fixture system", .tools = &tools, .messages = &initial, .max_output_tokens = 128 };
+    return .{ .scope = .{ .connection = c.provider.base_url, .model = c.model.name, .protocol = protocol }, .system = "fixed fixture system", .tools = &tools, .messages = &initial };
 }
 
 /// 记录流式事件：文本写入固定 128 字节缓冲（超出则报错），并累计推理与工具参数的字节数及 usage。
@@ -225,8 +225,7 @@ test "integration: explicit output limits preserve reasoning usage and never rep
             var client = try Client.init(t.allocator, backend.io(), &c, "fake-local-key");
             defer client.deinit();
             var selector = Selector.init(protocol);
-            var req = request(c, protocol);
-            req.max_output_tokens = 4096;
+            const req = request(c, protocol);
             var recorder: Recorder = .{};
             const result = try selector.call(client.model(), a, req, recorder.sink());
             try t.expect(!result.fallback and result.calls == 1);

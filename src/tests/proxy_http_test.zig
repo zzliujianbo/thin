@@ -44,13 +44,13 @@ fn config(a: std.mem.Allocator, scenario: []const u8, protocol: p.Protocol, dire
     return .{
         .provider = .{ .base_url = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, scenario }), .api_key_env = "UNUSED_FAKE_KEY" },
         .selected_provider = if (direct) "other" else "listed",
-        .model = .{ .name = "raw/id", .protocol = protocol, .context_tokens = 32768 },
+        .model = .{ .name = "raw/id", .protocol = protocol, .context_tokens = 32768, .output_tokens = if (protocol == .anthropic) 128 else null },
         .proxy = .{ .address = "127.0.0.1", .port = try proxyPort(false), .models = &.{"listed/raw/id"} },
         .limits = .{ .low_price_input = false, .request_timeout_ms = 4000 },
     };
 }
 fn request(c: cfg.Config, protocol: p.Protocol) p.Request {
-    return .{ .scope = .{ .connection = c.provider.base_url, .model = c.model.name, .protocol = protocol }, .system = "fixed proxy fixture system", .messages = &messages, .tools = &tools, .max_output_tokens = 128 };
+    return .{ .scope = .{ .connection = c.provider.base_url, .model = c.model.name, .protocol = protocol }, .system = "fixed proxy fixture system", .messages = &messages, .tools = &tools, .model_output_tokens = c.model.output_tokens };
 }
 const Recorder = struct {
     io: Io,

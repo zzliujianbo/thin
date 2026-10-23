@@ -25,7 +25,6 @@ const defaults = {
   core_bytes:2048, index_bytes:8192, shard_bytes:32768,
   compaction_enabled:true, compaction_trigger_percent:80, compaction_target_percent:50,
   max_response_bytes:8388608, max_event_bytes:1048576,
-  max_output_tokens:100, summary_tokens:100,
 };
 // Same 1x1 PNG container as tools/image_file.zig, independently repair/verify
 // chunk CRCs. Exact bytes are compared after decoding the received data URL.
@@ -94,10 +93,11 @@ export async function imageModelRegressions({app,pty,execute}) {
           assert.equal(mainPosts,isPty ? 2 : 1);
           assert.notEqual(req.socket,primarySocket);
           assert.equal(req.headers.authorization,`Bearer ${AUX_KEY}`);
-          assert.deepEqual(Object.keys(body).sort(),['max_tokens','messages','model','stream','thinking']);
+          assert.deepEqual(Object.keys(body).sort(),['messages','model','stream','thinking']);
+          for (const key of ['max_tokens','max_completion_tokens','max_output_tokens'])
+            assert(!Object.hasOwn(body,key));
           assert.equal(body.model,'deepseek-flash'); assert.equal(body.stream,false);
           assert.deepEqual(body.thinking,{type:'disabled'});
-          assert(Number.isInteger(body.max_tokens) && body.max_tokens > 0 && body.max_tokens <= 2048);
           assert.equal(body.messages.length,2);
           const [system,user] = body.messages;
           assert.deepEqual(Object.keys(system).sort(),['content','role']);

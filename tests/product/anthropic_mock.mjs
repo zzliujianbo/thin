@@ -77,7 +77,10 @@ function checkWire(req, body, scenario, count) {
   check(req.headers.authorization === undefined, 'authorization-forbidden');
   check(req.headers['anthropic-version'] === '2023-06-01', 'version');
   check(req.headers['user-agent'] === 'thin', 'user-agent');
-  check(body.model === 'fixture-model' && body.stream === true && body.max_tokens === 128, 'model-stream-budget');
+  // Messages requires max_tokens: 128 is the owned fixture model capability,
+  // not a user-configurable output quota. Chat/Responses use no output cap.
+  check(body.model === 'fixture-model' && body.stream === true && body.max_tokens === 128, 'model-stream-capability');
+  check(!Object.hasOwn(body, 'max_completion_tokens') && !Object.hasOwn(body, 'max_output_tokens'), 'foreign-output-caps');
   check(body.system === 'fixed fixture system', 'separate-system');
   check(Array.isArray(body.messages) && !body.messages.some(m => m.role === 'system'), 'messages');
   same(body.tools, [{ name: 'lookup', description: 'Local fixture only', input_schema: {

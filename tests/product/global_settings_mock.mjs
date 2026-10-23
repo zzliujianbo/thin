@@ -88,7 +88,7 @@ async function fixture(name, decision, url) {
     }},
     }},
     ...(decision ? {decision:{model:'native/family/native-review'}} : {}),
-    limits:{low_price_input:true, max_output_tokens:100, summary_tokens:100, safety_tokens:100, request_timeout_ms:3000, task_timeout_ms:5000},
+    limits:{low_price_input:true, safety_tokens:100, request_timeout_ms:3000, task_timeout_ms:5000},
   }, null, 2) + '\n';
   const configPath = join(home, '.thin/config.json');
   await writeFile(configPath, config, {mode:0o600});
@@ -123,7 +123,7 @@ async function values(f, low, decision, newlySelected = false) {
   };
   expected.decision = {
     enabled:true,
-    max_input_tokens:8192, max_output_tokens:1024, max_state_bytes:16384,
+    max_input_tokens:8192, max_state_bytes:16384,
     ...expected.decision,
     enabled:decision,
   };

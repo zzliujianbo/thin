@@ -189,7 +189,9 @@ pub const Request = struct {
     system: []const u8,
     tools: []const ToolSchema,
     messages: []const Message,
-    max_output_tokens: u32,
+    /// Frozen, verified model output capacity, not a configurable request cap.
+    /// Chat/Responses omit output limits; Anthropic requires a known positive value.
+    model_output_tokens: ?u32 = null,
     /// Already mapped wire string, not the logical UI effort.
     reasoning_effort: ?[]const u8 = null,
     thinking: ?bool = null,

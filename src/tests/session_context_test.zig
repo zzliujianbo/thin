@@ -276,7 +276,8 @@ fn encodeWire(a: std.mem.Allocator, runtime: *r.Runtime, protocol: p.Protocol) !
         .system = runtime.system,
         .messages = runtime.messages(),
         .tools = &.{},
-        .max_output_tokens = 32,
+        // Synthetic verified capacity for the Anthropic wire-only fixture.
+        .model_output_tokens = if (protocol == .anthropic) 32 else null,
     };
     return switch (protocol) {
         .chat => chat.encode(a, req),
@@ -729,8 +730,6 @@ test "compaction reinstalls the policy after the retained prefix" {
     try runtime.history.append(arena, try p.textMessage(arena, .assistant, "retained-tail"));
 
     config.model.context_tokens = 20000;
-    config.limits.max_output_tokens = 400;
-    config.limits.summary_tokens = 200;
     config.limits.safety_tokens = 200;
     config.limits.compaction_trigger_percent = 40;
     config.limits.compaction_target_percent = 20;

@@ -136,8 +136,12 @@ test "local command unknown price keeps output, pairs checkpoint and next normal
     try std.testing.expectEqual(error.UnknownInputPriceThreshold, next.detail.?);
     try std.testing.expectEqual(@as(usize, 0), fake.primary);
     // Independently encode the canonical next-normal history without sending it.
-    const encoded = try chat.encode(a, .{ .scope = .{ .connection = "https://offline.invalid", .model = "offline", .protocol = .chat }, .system = restored.system, .messages = restored.messages(), .tools = &schemas, .purpose = .normal, .max_output_tokens = 128 });
+    const encoded = try chat.encode(a, .{ .scope = .{ .connection = "https://offline.invalid", .model = "offline", .protocol = .chat }, .system = restored.system, .messages = restored.messages(), .tools = &schemas, .purpose = .normal });
     defer a.free(encoded);
+    const wire = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+    defer wire.deinit();
+    inline for (.{ "max_tokens", "max_completion_tokens", "max_output_tokens" }) |key|
+        try std.testing.expect(wire.value.object.get(key) == null);
     try std.testing.expectEqual(@as(usize, 3), fake.finished);
     try std.testing.expectEqual(fake.finished, fake.submitted);
 }

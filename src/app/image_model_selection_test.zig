@@ -123,7 +123,7 @@ fn contextSurvivesImageSettings(protocol: @import("../core/protocol.zig").Protoc
         }
     };
     const source =
-        \\{"memory":{"auto":false},"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"PRIMARY_PROTOCOL","context_tokens":65536}}},"one":{"base_url":"https://one.invalid/v1","api_key":"fake-image-one","models":{"deepseek-flash":{}}},"two":{"base_url":"https://two.invalid/v1","api_key":"fake-image-two","models":{"deepseek-flash":{}}}}},"limits":{"low_price_input":false,"safety_tokens":100}}
+        \\{"memory":{"auto":false},"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"PRIMARY_PROTOCOL","context_tokens":65536,"output_tokens":8192}}},"one":{"base_url":"https://one.invalid/v1","api_key":"fake-image-one","models":{"deepseek-flash":{}}},"two":{"base_url":"https://two.invalid/v1","api_key":"fake-image-two","models":{"deepseek-flash":{}}}}},"limits":{"low_price_input":false,"safety_tokens":100}}
     ;
     const document = try std.mem.replaceOwned(u8, a, source, "PRIMARY_PROTOCOL", @tagName(protocol));
     defer a.free(document);
@@ -262,7 +262,7 @@ test "image official id-only listing authorizes exact availability not invented 
         if (index == 0) {
             try choose(&session, "official/deepseek-flash");
             const client = session.app.?.image_client.?;
-            try std.testing.expect(client.context_tokens == null and client.output_tokens == null);
+            try std.testing.expect(client.context_tokens == null);
             try std.testing.expectEqualStrings("fake-official-own", client.key);
             const connection = session.connection();
             try connection.image_fn.?(connection.context, .off);
@@ -303,7 +303,7 @@ test "image official Anthropic base uses the same availability and cached limits
         try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", client.endpoint);
         try std.testing.expectEqualStrings("fake-anthropic-own", client.key);
         try std.testing.expectEqual(@as(?u64, 8192), client.context_tokens);
-        try std.testing.expectEqual(@as(?u32, 512), client.output_tokens);
+        // Chat image requests do not consume the cached output capability as a cap.
         try std.testing.expectEqualStrings("chat", session.app.?.config.value.model.name);
     }
 }

@@ -45,6 +45,10 @@ const Server = struct {
         var body: [4096]u8 = undefined;
         const reader = req.readerExpectNone(&.{});
         try reader.readSliceAll(body[0..@intCast(size)]);
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body[0..@intCast(size)], .{});
+        defer parsed.deinit();
+        inline for (.{ "max_tokens", "max_completion_tokens", "max_output_tokens" }) |key|
+            try t.expect(parsed.value.object.get(key) == null);
         // Count fully received POSTs, not TCP connections or partial headers.
         _ = self.posts.fetchAdd(1, .release);
         switch (self.mode) {
@@ -71,7 +75,6 @@ fn request(config: *const cfg.Config, cancel: ?*const p.Cancellation) p.Request 
         .system = "offline fixture",
         .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "hello" }} }},
         .tools = &.{},
-        .max_output_tokens = 16,
         .cancellation = cancel,
     };
 }

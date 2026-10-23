@@ -96,7 +96,7 @@ async function run(mode, url) {
     memory:{auto:false},
     llm:{default:'local/fixture-model',providers:{local:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:32768}}}}},
     // Explicit opt-out: fixture has no external metadata/known input price.
-    limits:{low_price_input:false,max_output_tokens:16000,summary_tokens:100,safety_tokens:100,request_timeout_ms:20000,task_timeout_ms:30000,command_timeout_ms:3000,cleanup_grace_ms:100,cleanup_timeout_ms:2000},
+    limits:{low_price_input:false,safety_tokens:100,request_timeout_ms:20000,task_timeout_ms:30000,command_timeout_ms:3000,cleanup_grace_ms:100,cleanup_timeout_ms:2000},
   },null,2)+'\n';
   const configPath = join(home,'.thin/config.json');
   await writeFile(configPath,config,{mode:0o600});

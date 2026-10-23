@@ -295,21 +295,22 @@ test "chat refuses truncation length malformed arguments duplicate IDs and unkno
     try std.testing.expect(std.mem.indexOf(u8, failure.message, "secret-key") == null);
 }
 
-// 两种输出预算字段互斥，正常请求与摘要都保持同一个明确上限。
-test "explicit legacy token limit applies to normal and summary requests only" {
+// 正常请求与摘要均省略输出上限，旧兼容选项也不能重新引入。
+test "chat omits all output caps even with legacy option and known model capacity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var req = test_support.request(.chat);
-    req.max_output_tokens = 123;
-    for ([_]p.Purpose{ .normal, .summary }) |purpose| {
-        req.purpose = purpose;
-        const modern = try j.parse(a, try encode(a, req));
-        const legacy = try j.parse(a, try encodeWithOptions(a, req, true));
-        try std.testing.expect(j.get(modern, "max_tokens") == null);
-        try std.testing.expect(j.get(legacy, "max_completion_tokens") == null);
-        try std.testing.expectEqualStrings("123", try j.encode(a, j.get(modern, "max_completion_tokens").?));
-        try std.testing.expectEqualStrings("123", try j.encode(a, j.get(legacy, "max_tokens").?));
+    for ([_]?u32{ null, 0, 123 }) |capacity| {
+        req.model_output_tokens = capacity;
+        for ([_]p.Purpose{ .normal, .summary }) |purpose| {
+            req.purpose = purpose;
+            for ([_]bool{ false, true }) |legacy| {
+                const wire = try j.parse(a, try encodeWithOptions(a, req, legacy));
+                inline for (.{ "max_tokens", "max_completion_tokens", "max_output_tokens" }) |key|
+                    try std.testing.expect(j.get(wire, key) == null);
+            }
+        }
     }
 }
 
@@ -318,9 +319,10 @@ pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
     return encodeWithOptions(a, req, false);
 }
 
-/// 某些兼容服务（如 DeepSeek）使用 max_tokens；由 Provider 显式选择，不猜测域名或模型。
-/// 默认仍使用现代 OpenAI 的 max_completion_tokens，两个字段绝不同时发送。
+/// Compatibility entry point only: the legacy option is ignored.
+/// Chat never emits max_tokens, max_completion_tokens or max_output_tokens.
 pub fn encodeWithOptions(a: std.mem.Allocator, req: p.Request, use_max_tokens: bool) ![]u8 {
+    _ = use_max_tokens;
     try c.validateRequest(req, .chat);
 
     // 中间 JSON 树放在临时 arena 中；最终结果通过 j.encode 复制到调用方的 a 中。
@@ -328,10 +330,6 @@ pub fn encodeWithOptions(a: std.mem.Allocator, req: p.Request, use_max_tokens: b
     defer temp.deinit();
     const t = temp.allocator();
     var root = try c.base(t, req, true);
-    if (use_max_tokens) {
-        _ = root.object.orderedRemove("max_completion_tokens");
-        try c.put(t, &root, "max_tokens", try j.number(req.max_output_tokens));
-    }
 
     // 流式请求必须显式开启 include_usage，否则服务端不会返回 token 统计。
     var options = c.object(t);

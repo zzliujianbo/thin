@@ -209,6 +209,7 @@ pub const Client = struct {
         const messages = [_]p.Message{try p.textMessage(a, .user, body)};
         const system = policy.instruction(input);
         const estimated = context.rawTokens(system, &.{}, &messages);
+        try context.checkInput(config, estimated);
         const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
         const wire = capabilities.wire(config.model.reasoning_effort);
         const request: p.Request = .{
@@ -216,12 +217,14 @@ pub const Client = struct {
             .system = system,
             .tools = &.{},
             .messages = &messages,
-            .max_output_tokens = try context.outputBudget(config, .normal, estimated),
+            .model_output_tokens = config.model.output_tokens,
             .reasoning_effort = wire.effort,
             .thinking = wire.thinking,
             .reasoning_format = capabilities.format,
             .cancellation = cancel,
         };
+        // Local wire/capability failures are not attempted inference calls.
+        try @import("../core/checkpoint.zig").validateRequestHistory(a, request);
         if (cancel.isRequested()) return error.Canceled;
         self.calls +|= 1;
         const result = try model.call(a, request, .{});
@@ -280,7 +283,7 @@ test "decision client fake wire has own caps no tools and validates output witho
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     var parsed = try cfg.parse(a,
-        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://unused.invalid/v1","api_key":"fake-owned-key","models":{"main":{"context_tokens":32768,"protocol":"chat"},"judge":{"context_tokens":32768,"protocol":"chat"}}}}},"decision":{"model":"p/judge","max_output_tokens":256},"limits":{"request_timeout_ms":4321}}
+        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://unused.invalid/v1","api_key":"fake-owned-key","models":{"main":{"context_tokens":32768,"protocol":"chat"},"judge":{"context_tokens":32768,"protocol":"chat"}}}}},"decision":{"model":"p/judge"},"limits":{"request_timeout_ms":4321}}
     );
     defer cfg.release(&parsed);
     const client = (try Client.create(a, std.testing.io, parsed.value, &env)).?;
@@ -299,7 +302,7 @@ test "decision client fake wire has own caps no tools and validates output witho
             self.calls += 1;
             try std.testing.expectEqualStrings("judge", request.scope.model);
             try std.testing.expectEqual(@as(usize, 0), request.tools.len);
-            try std.testing.expectEqual(@as(u32, 256), request.max_output_tokens);
+            try std.testing.expect(request.model_output_tokens == null);
             try std.testing.expectEqualStrings(policy.instruction(.{ .memory_write = .{ .topic = "style", .content = "Prefer concise reports." } }), request.system);
             try std.testing.expect(std.mem.indexOf(u8, request.system, policy.ReviewRules.memory_value) != null);
             try std.testing.expect(std.mem.indexOf(u8, request.system, "For command:") == null);
@@ -320,6 +323,51 @@ test "decision client fake wire has own caps no tools and validates output witho
     const bad = client.call(arena.allocator(), ready.config.value, .{ .context = &fake, .call_fn = Fake.call }, input, &cancel);
     if (bad) |_| return error.ExpectedInvalidDecision else |_| {}
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "decision client rejects unknown or zero Anthropic capacity before counting calls" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var parsed = try cfg.parse(a,
+        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://unused.invalid/v1","api_key":"fake-owned-key","models":{"main":{"context_tokens":32768,"protocol":"chat"},"judge":{"context_tokens":32768,"protocol":"anthropic"}}}}},"decision":{"model":"p/judge"}}
+    );
+    defer cfg.release(&parsed);
+    for ([_]?u32{ null, 0, 8192 }) |capacity| {
+        const client = (try Client.create(a, std.testing.io, parsed.value, &env)).?;
+        defer client.deinit();
+        var config = (try client.resolve()).config.value;
+        config.model.output_tokens = capacity;
+        const FakeCapacity = struct {
+            calls: usize = 0,
+            fn invoke(raw: *anyopaque, alloc: std.mem.Allocator, request: p.Request, _: p.ModelSink) !p.Outcome {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                try std.testing.expectEqual(@as(?u32, 8192), request.model_output_tokens);
+                const wire = try @import("../llm/anthropic.zig").encode(alloc, request);
+                const json = try std.json.parseFromSlice(std.json.Value, alloc, wire, .{});
+                defer json.deinit();
+                try std.testing.expectEqual(@as(i64, 8192), json.value.object.get("max_tokens").?.integer);
+                return .{ .success = .{ .message = try p.textMessage(alloc, .assistant, "{\"write\":true}"), .finish = .stop, .usage = .{ .input_tokens = 7, .output_tokens = 1 } } };
+            }
+        };
+        var fake: FakeCapacity = .{};
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var cancel: p.Cancellation = .{};
+        const outcome = client.call(arena.allocator(), config, .{ .context = &fake, .call_fn = FakeCapacity.invoke }, .{ .memory_write = .{ .topic = "style", .content = "Keep concise." } }, &cancel);
+        if (capacity == null or capacity.? == 0) {
+            try std.testing.expectError(if (capacity == null) error.UnknownModelOutputCapacity else error.InvalidModelOutputCapacity, outcome);
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            try std.testing.expectEqual(@as(u64, 0), client.calls);
+            try std.testing.expect(client.last_usage.input_tokens == null and client.last_http_status == null);
+        } else {
+            try std.testing.expect((try outcome).memory_write);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            try std.testing.expectEqual(@as(u64, 1), client.calls);
+            try std.testing.expectEqual(@as(?u64, 7), client.last_usage.input_tokens);
+        }
+    }
 }
 
 test "SystemOne metadata refresh prepares frozen auxiliary transport without rebuilding or sending" {
