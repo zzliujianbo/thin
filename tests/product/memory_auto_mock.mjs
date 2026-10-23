@@ -139,7 +139,7 @@ async function run(cwd, prompt, {expectFact = false, bad = false, args} = {}) {
   }
 }
 async function jobs(cwd) {
-  const directory = join(cwd, '.thin/mem-jobs');
+  const directory = join(cwd, '.thin/memory/jobs');
   assert.equal((await stat(directory)).mode & 0o777, 0o700);
   const result = [];
   for (const name of await readdir(directory)) {
@@ -169,7 +169,7 @@ try {
   assert(!await exists(join(project, '.thin')), 'startup-only command touched project memory');
   await run(project, FIRST);
   assert.deepEqual(requests, {primary: 1, helper: 1});
-  const saved = await readFile(join(project, '.thin/mem/preferences-review-style.md'), 'utf8');
+  const saved = await readFile(join(project, '.thin/memory/preferences-review-style.md'), 'utf8');
   assert(saved.includes(FACT) && !saved.includes(KEY));
   assert((await jobs(project)).every(job => job.state === 'done' && job.material === null));
   assert.equal(await readFile(config, 'utf8'), original, 'active snapshot rewrote declaration');

@@ -133,7 +133,7 @@ test "lifecycle local batch starts independent generation without inference" {
     try t.expectEqual(@as(u32, 0), result.usage.normal_calls);
 }
 
-test "lifecycle binds same-name calls by id and canonical full arguments before execute" {
+test "lifecycle refuses streamed key reuse when canonical arguments differ" {
     var f: Fixture = .{};
     var config = configuration();
     var runtime = try f.runtime(&config);
@@ -142,9 +142,9 @@ test "lifecycle binds same-name calls by id and canonical full arguments before 
     const result = try runtime.run("fixture", &cancel);
     try t.expectEqual(r.Status.success, result.status);
     try t.expectEqual(@as(usize, 2), f.executions);
-    try t.expect(f.keys[1].eql(f.streamed_key.?));
+    try t.expect(!f.keys[1].eql(f.streamed_key.?));
     try t.expect(!f.keys[0].eql(f.keys[1]));
-    try t.expectEqual(@as(usize, 37), f.keys[1].index);
+    try t.expectEqual(@as(usize, 1), f.keys[1].index);
     try t.expectEqual(@as(usize, 2), f.begins);
 }
 test "lifecycle final-only prepare failure and deny keep keys without starts" {

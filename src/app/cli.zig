@@ -111,7 +111,7 @@ pub const help =
     \\High-risk bash is classified before it runs and requires explicit approval each time.
     \\Patterns: recursive rm, find -delete, git clean -f, mkfs and dd onto devices,
     \\writes or chmod/chown of /etc, /usr, /bin, /root or ~/.ssh, curl|bash and wget|sh, and fork bombs.
-    \\y runs that command once. n denies it. The next dangerous command asks again.
+    \\The confirmation popup uses arrows, Enter and Esc; the next dangerous command asks again.
     \\On denial the model gets an error and nothing runs.
     \\--print cannot approve dangerous bash, so those calls are denied.
     \\--print returns the final committed visible answer with the same tool policy.
@@ -120,7 +120,7 @@ pub const help =
     \\Legacy project settings.json is ignored, never created or rewritten.
     \\Restoring history/selection alone does not rewrite global defaults.
     \\An unsupported saved level is adjusted effectively without rewriting the preference.
-    \\Project Memory: <startup directory>/.thin/mem/*.md, changed through memory tools.
+    \\Project Memory: <startup directory>/.thin/memory/*.md, changed through memory tools.
     \\Session records: <startup directory>/.thin/sessions/*.jsonl (local plaintext, 0600).
     \\Recording starts on the first submitted message; --no-log disables it for this run.
     \\Records include messages, tools, stages, usage and errors, not /login input,

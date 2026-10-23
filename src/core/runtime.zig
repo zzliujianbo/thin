@@ -20,6 +20,7 @@ pub const MemoryHooks = struct {
 const session_context = @import("session_context.zig");
 const Io = std.Io;
 const tool_stream = @import("tool_stream.zig");
+const write_preview = @import("write_preview.zig");
 pub const ToolView = tool_stream.View;
 pub const Inbox = @import("inbox.zig").Inbox;
 
@@ -100,6 +101,9 @@ pub const Executor = struct {
     prepare_fn: *const fn (*anyopaque, std.mem.Allocator, p.ToolCall) anyerror!Prepared,
     /// 第二阶段：实际执行，必须响应传入的 cancellation。
     execute_fn: *const fn (*anyopaque, std.mem.Allocator, Prepared, *const p.Cancellation) anyerror!Execution,
+    /// Optional display-only pre-write snapshot. It must never create or alter
+    /// the target and any failure degrades only the provisional UI.
+    preview_write_fn: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, *const p.Cancellation) anyerror!?write_preview.Baseline = null,
 };
 
 /// 权限询问。id 由 Runtime 递增分配，与 tool_started / tool_result 事件关联。
@@ -1813,8 +1817,11 @@ pub const Runtime = struct {
         const cancel = req.cancellation orelse &uncanceled;
         self.beginToolViews(cancel);
         const controller = self.allocator.create(tool_stream.Controller) catch null;
-        defer if (controller) |value| self.allocator.destroy(value);
-        if (controller) |value| value.* = .{ .generation = self.display_generation, .schemas = req.tools };
+        defer if (controller) |value| {
+            value.deinit();
+            self.allocator.destroy(value);
+        };
+        if (controller) |value| value.* = .{ .allocator = self.allocator, .generation = self.display_generation, .schemas = req.tools };
         var forward = PreviewForward{ .runtime = self, .controller = controller, .original = sink, .cancel = cancel };
         const outcome = self.callModel(a, req, .{ .context = &forward, .emit_fn = PreviewForward.emit }) catch |err| {
             self.discardToolViews(cancel);
@@ -1855,7 +1862,19 @@ pub const Runtime = struct {
                 if (controller.observe(event.tool_delta)) |view|
                     self.runtime.emit(.{ .tool_view = view }, self.cancel) catch {};
             };
+            // Forward canonical model bytes before optional filesystem
+            // observation; preview latency must not become transport backpressure.
             try self.original.emit(event);
+            if (event == .tool_delta) if (self.controller) |controller| {
+                if (controller.takeBaselineRequest(event.tool_delta.index)) |baseline_request| {
+                    const baseline = if (self.runtime.executor.preview_write_fn) |callback|
+                        callback(self.runtime.executor.context, self.runtime.allocator, baseline_request.path, self.cancel) catch null
+                    else
+                        null;
+                    if (controller.resolveBaseline(baseline_request.index, baseline)) |view|
+                        self.runtime.emit(.{ .tool_view = view }, self.cancel) catch {};
+                }
+            };
         }
     };
 
@@ -2256,7 +2275,8 @@ pub const Runtime = struct {
         var display_count: usize = 0;
         for (blocks) |block| if (block == .tool_call and display_count < display_keys.len) {
             const call = block.tool_call;
-            var key = self.display_links.lookup(call.id) orelse self.display_links.fresh(display_keys[0..display_count]);
+            const linked = self.display_links.lookup(call.id, call.arguments);
+            var key = if (linked) |value| value.key else self.display_links.fresh(display_keys[0..display_count]);
             for (display_keys[0..display_count]) |previous| if (previous.eql(key)) {
                 key = self.display_links.fresh(display_keys[0..display_count]);
                 break;
@@ -2266,7 +2286,7 @@ pub const Runtime = struct {
             var extractor: @import("tool_preview.zig").Extractor = .{};
             extractor.feed(call.arguments);
             const valid = extractor.finish();
-            try self.emit(.{ .tool_view = .{ .key = key, .name = call.name, .fields = if (valid) extractor.snapshot() else .{}, .ready = true } }, cancel);
+            try self.emit(.{ .tool_view = .{ .key = key, .name = call.name, .fields = if (valid) extractor.snapshot() else .{}, .write_progress = if (std.mem.eql(u8, call.name, "write_file")) if (linked) |value| value.write_progress orelse write_preview.Progress.unknown() else write_preview.Progress.unknown() else null, .ready = true } }, cancel);
         };
         try self.emit(.{ .tool_views = .{ .generation = self.display_generation, .phase = .commit } }, cancel);
         var display_ordinal: usize = 0;

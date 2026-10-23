@@ -129,9 +129,9 @@ test "tools validate containment and Memory namespace before approval" {
     const executor = tools.executor();
 
     var cancel = p.Cancellation{};
-    const memory_path = try std.fs.path.join(temp, &.{ root.path, ".thin/mem/core.md" });
+    const memory_path = try std.fs.path.join(temp, &.{ root.path, ".thin/memory/core.md" });
     // Both entrypoints protect Memory aliases; direct calls cannot bypass CAS.
-    for ([_][]const u8{ ".thin", ".thin/mem/core.md", ".thin//./mem/a.md", memory_path }) |path| {
+    for ([_][]const u8{ ".thin", ".thin/memory/core.md", ".thin//./memory/a.md", memory_path }) |path| {
         const args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
         try std.testing.expectError(error.UseMemoryTool, executor.prepare_fn(executor.context, temp, .{ .id = "c", .name = "write_file", .arguments = args }));
         try std.testing.expectError(error.UseMemoryTool, tools.execute(temp, .{ .write_file = .{ .path = path, .content = "x" } }, &cancel));

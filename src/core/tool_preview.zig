@@ -7,7 +7,7 @@ pub const Snapshot = struct { path: ?Field = null, command: ?Field = null, actio
 
 const capacity = 1024;
 const max_depth = 32;
-const names = [_][]const u8{ "path", "command", "action", "topic" };
+const names = [_][]const u8{ "path", "command", "action", "topic", "content" };
 const Phase = enum { object_first, object_key, colon, value, object_after, array_first, array_value, array_after };
 const Mode = enum { syntax, string, number, literal };
 const Escape = enum { normal, escaped, unicode, low_slash, low_u };
@@ -18,7 +18,7 @@ pub const Extractor = struct {
     lengths: [4]usize = @splat(0),
     truncated: [4]bool = @splat(false),
     present: [4]bool = @splat(false),
-    seen: [4]bool = @splat(false),
+    seen: [5]bool = @splat(false),
     stack: [max_depth]Phase = undefined,
     depth: usize = 0,
     started: bool = false,
@@ -40,12 +40,28 @@ pub const Extractor = struct {
     number: Number = .zero,
     literal: []const u8 = "",
     literal_pos: usize = 0,
+    content_context: ?*anyopaque = null,
+    content_scalar_fn: ?*const fn (*anyopaque, u21) void = null,
+    content_end_fn: ?*const fn (*anyopaque) void = null,
+    content_revoke_fn: ?*const fn (*anyopaque) void = null,
+    content_revoked: bool = false,
+
+    pub fn attachContent(self: *Extractor, context: *anyopaque, scalar_fn: *const fn (*anyopaque, u21) void, end_fn: *const fn (*anyopaque) void, revoke_fn: *const fn (*anyopaque) void) void {
+        self.content_context = context;
+        self.content_scalar_fn = scalar_fn;
+        self.content_end_fn = end_fn;
+        self.content_revoke_fn = revoke_fn;
+    }
 
     pub fn feed(self: *Extractor, chunk: []const u8) void {
         for (chunk) |byte| {
-            if (self.invalid) return;
+            if (self.invalid) {
+                self.revokeContent();
+                return;
+            }
             self.consume(byte);
         }
+        if (self.invalid) self.revokeContent();
     }
 
     pub fn snapshot(self: *const Extractor) Snapshot {
@@ -59,7 +75,14 @@ pub const Extractor = struct {
 
     pub fn finish(self: *Extractor) bool {
         if (!self.done or self.mode != .syntax or self.depth != 0) self.invalid = true;
+        if (self.invalid) self.revokeContent();
         return !self.invalid;
+    }
+
+    fn revokeContent(self: *Extractor) void {
+        if (self.content_revoked) return;
+        self.content_revoked = true;
+        if (self.content_context) |context| if (self.content_revoke_fn) |callback| callback(context);
     }
 
     fn whitespace(b: u8) bool {
@@ -202,6 +225,10 @@ pub const Extractor = struct {
             self.key_len += len;
         } else if (self.depth == 1) {
             if (self.selected) |i| {
+                if (i == 4) {
+                    if (self.content_context) |context| if (self.content_scalar_fn) |callback| callback(context, cp);
+                    return;
+                }
                 if (self.truncated[i]) return;
                 if (self.lengths[i] + len > capacity) {
                     self.truncated[i] = true;
@@ -323,7 +350,11 @@ pub const Extractor = struct {
             }
         } else {
             if (self.depth == 1) {
-                if (self.selected) |i| self.present[i] = true;
+                if (self.selected) |i| {
+                    if (i == 4) {
+                        if (self.content_context) |context| if (self.content_end_fn) |callback| callback(context);
+                    } else self.present[i] = true;
+                }
             }
             self.valueDone();
         }
@@ -385,6 +416,45 @@ test "all two-chunk splits and byte-by-byte decoded keys scalars nested values" 
     for (json) |b| e.feed(&.{b});
     try std.testing.expect(e.finish());
     try checkGolden(&e);
+}
+
+test "content hook receives decoded scalars close and revocation without storing content" {
+    const Hook = struct {
+        scalars: usize = 0,
+        newlines: usize = 0,
+        ended: bool = false,
+        revoked: bool = false,
+        fn scalar(ctx: *anyopaque, cp: u21) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.scalars += 1;
+            self.newlines += @intFromBool(cp == '\n');
+        }
+        fn end(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ended = true;
+        }
+        fn revoke(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.revoked = true;
+        }
+    };
+    var hook: Hook = .{};
+    var e: Extractor = .{};
+    e.attachContent(&hook, Hook.scalar, Hook.end, Hook.revoke);
+    const json = "{\"path\":\"x\",\"content\":\"中\\n\\uD83D\\uDE00\"}";
+    for (json) |byte| e.feed(&.{byte});
+    try std.testing.expect(e.finish());
+    try std.testing.expectEqual(@as(usize, 3), hook.scalars);
+    try std.testing.expectEqual(@as(usize, 1), hook.newlines);
+    try std.testing.expect(hook.ended and !hook.revoked);
+    try std.testing.expect(e.snapshot().path != null);
+
+    hook = .{};
+    var bad: Extractor = .{};
+    bad.attachContent(&hook, Hook.scalar, Hook.end, Hook.revoke);
+    bad.feed("{\"content\":\"a\",\"content\":\"b\"}");
+    try std.testing.expect(!bad.finish());
+    try std.testing.expect(hook.revoked);
 }
 
 test "unknown content and nested names never publish and long keys do not alias" {

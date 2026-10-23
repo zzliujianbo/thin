@@ -196,6 +196,27 @@ pub fn build(b: *std.Build) void {
     run_resize.setCwd(b.path("."));
     b.step("test-resize-deferred", "Run owned deferred resize, animation and fresh-ACK PTY checks").dependOn(&run_resize.step);
 
+    const viewport_step = b.step("test-resize-viewport", "Run owned tmux viewport, multiline composer and local-command lifecycle checks");
+    const run_viewport = b.addSystemCommand(&.{"python3"});
+    run_viewport.addFileArg(b.path("tests/product/resize_viewport_mock.py"));
+    run_viewport.addArtifactArg(exe);
+    run_viewport.setCwd(b.path("."));
+    viewport_step.dependOn(&run_viewport.step);
+
+    const run_viewport_wrap = b.addSystemCommand(&.{"python3"});
+    run_viewport_wrap.addFileArg(b.path("tests/product/resize_viewport_mock.py"));
+    run_viewport_wrap.addArtifactArg(exe);
+    run_viewport_wrap.addArg("--wrap");
+    run_viewport_wrap.setCwd(b.path("."));
+    viewport_step.dependOn(&run_viewport_wrap.step);
+
+    const run_viewport_command = b.addSystemCommand(&.{"python3"});
+    run_viewport_command.addFileArg(b.path("tests/product/resize_viewport_mock.py"));
+    run_viewport_command.addArtifactArg(exe);
+    run_viewport_command.addArg("--local-command");
+    run_viewport_command.setCwd(b.path("."));
+    viewport_step.dependOn(&run_viewport_command.step);
+
     // Global settings acceptance reuses both application artifacts; the Node
     // fixture owns its loopback server and serial PTY launches.
     const run_settings = b.addSystemCommand(&.{"node"});
@@ -263,6 +284,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_app.step);
     test_all.dependOn(&run_idle_enter.step);
     test_all.dependOn(&run_resize.step);
+    test_all.dependOn(viewport_step);
     test_all.dependOn(&run_settings.step);
     test_all.dependOn(&run_command.step);
     test_all.dependOn(&run_approval_cancel.step);

@@ -43,8 +43,16 @@ const Buffer = struct {
         try self.bytes.appendSlice(self.a, s[0..n]);
         self.clipped = self.clipped or n != s.len;
     }
-    fn field(self: *Buffer, label: []const u8, s: []const u8) !void {
-        try self.put(label);
+    fn lineBreak(self: *Buffer) !void {
+        if (self.bytes.items.len != 0 and self.bytes.items[self.bytes.items.len - 1] != '\n') try self.put("\n");
+    }
+    fn stream(self: *Buffer, s: []const u8) !void {
+        if (s.len == 0) return;
+        try self.lineBreak();
+        try self.put(s);
+    }
+    fn status(self: *Buffer, s: []const u8) !void {
+        try self.lineBreak();
         try self.put(s);
         try self.put("\n");
     }
@@ -67,16 +75,18 @@ pub fn format(a: std.mem.Allocator, input: []const u8) !Output {
     if (v.stdout == null and v.stderr == null and v.exit_code == null and v.signal == null and v.timed_out == null and v.canceled == null and v.cleanup_failed == null and v.truncated == null and v.output_encoding == null) return literal(a, input);
     var b = Buffer{ .a = a };
     defer b.bytes.deinit(a);
-    if (v.stdout) |s| try b.field("stdout:\n", s);
-    if (v.stderr) |s| try b.field("stderr:\n", s);
-    var number: [32]u8 = undefined;
-    if (v.exit_code) |code| try b.field("exit: ", try std.fmt.bufPrint(&number, "{d}", .{code})) else try b.put("exit: unknown\n");
-    if (v.signal) |signal| try b.field("signal: ", try std.fmt.bufPrint(&number, "{d}", .{signal}));
-    if (v.timed_out == true) try b.put("timed out\n");
-    if (v.canceled == true) try b.put("canceled\n");
-    if (v.cleanup_failed == true) try b.put("cleanup failed\n");
-    if (v.truncated == true) try b.put("output truncated\n");
-    if (v.output_encoding) |s| try b.field("output encoding: ", s);
+    // Preserve the canonical JSON envelope for history/replay, but project
+    // ordinary terminal output literally: no stdout/stderr headings, success
+    // status, byte counts, or encoding implementation details.
+    if (v.stdout) |s| try b.stream(s);
+    if (v.stderr) |s| try b.stream(s);
+    var status_buffer: [64]u8 = undefined;
+    if (v.timed_out == true) try b.status("Command timed out");
+    if (v.canceled == true) try b.status("Command canceled");
+    if (v.signal) |signal| try b.status(try std.fmt.bufPrint(&status_buffer, "Command terminated by signal {d}", .{signal}));
+    if (v.exit_code) |code| if (code != 0) try b.status(try std.fmt.bufPrint(&status_buffer, "Command exited with status {d}", .{code}));
+    if (v.cleanup_failed == true) try b.status("Command cleanup failed");
+    if (v.truncated == true) try b.status("[output truncated]");
     const safe = try clean.sanitizePrefix(a, b.bytes.items, limit);
     return .{ .text = safe.text, .clipped = b.clipped or safe.truncated };
 }
@@ -88,11 +98,12 @@ fn literal(a: std.mem.Allocator, input: []const u8) !Output {
     return .{ .text = safe.text, .clipped = safe.truncated or input.len > limit };
 }
 
-test "local output streams statuses and unsafe text are literal" {
+test "local output is literal without stream success or encoding labels" {
     const a = std.testing.allocator;
     const out = try format(a, "{\"stdout\":\"**literal**\\n\\u001b[2J\\\\x1b\",\"stderr\":\"bad\",\"exit_code\":7,\"signal\":9,\"timed_out\":true,\"canceled\":true,\"cleanup_failed\":true,\"truncated\":true,\"output_encoding\":\"utf8\"}");
     defer a.free(out.text);
-    for ([_][]const u8{ "stdout:\n**literal**", "stderr:\nbad", "exit: 7", "signal: 9", "timed out", "canceled", "cleanup failed", "output truncated", "output encoding: utf8", "\\x1b" }) |s| try std.testing.expect(std.mem.indexOf(u8, out.text, s) != null);
+    for ([_][]const u8{ "**literal**", "bad", "Command exited with status 7", "Command terminated by signal 9", "Command timed out", "Command canceled", "Command cleanup failed", "[output truncated]", "\\x1b" }) |s| try std.testing.expect(std.mem.indexOf(u8, out.text, s) != null);
+    for ([_][]const u8{ "stdout:", "stderr:", "exit:", "output encoding:" }) |s| try std.testing.expect(std.mem.indexOf(u8, out.text, s) == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, out.text, 0x1b) == null);
 }
 
@@ -103,9 +114,12 @@ test "local output fallback empty unknown and bounded" {
         defer a.free(out.text);
         try std.testing.expectEqualStrings(s, out.text);
     }
+    const success = try format(a, "{\"stdout\":\"moved\\n\",\"stderr\":\"\",\"exit_code\":0,\"output_encoding\":\"utf8\"}");
+    defer a.free(success.text);
+    try std.testing.expectEqualStrings("moved\n", success.text);
     const empty = try format(a, "{\"stdout\":\"\",\"truncated\":true}");
     defer a.free(empty.text);
-    try std.testing.expectEqualStrings("stdout:\n\nexit: unknown\noutput truncated\n", empty.text);
+    try std.testing.expectEqualStrings("[output truncated]\n", empty.text);
     const large = try a.alloc(u8, limit + 1);
     defer a.free(large);
     @memset(large, 'x');

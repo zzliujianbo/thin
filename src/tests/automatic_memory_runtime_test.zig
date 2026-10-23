@@ -327,6 +327,7 @@ test "automatic Memory survives compaction arena replacement and reinserts refer
     var fake = Fake{};
     var config = configValue();
     config.model.protocol = .anthropic;
+    config.model.output_tokens = 8192;
     var runtime = try fake.init(&config);
     defer runtime.deinit();
     var cancel: p.Cancellation = .{};

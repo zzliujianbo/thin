@@ -212,7 +212,7 @@ async function scenario(app, pty, kind) {
         assert(events('tool_started').length === 1, 'default execution did not start');
         if (writeAuto) assert(await readFile(join(project,'automatic.txt'),'utf8') === 'automatic', 'shell write did not execute');
         if (memoryAuto) {
-          assert(JSON.parse(await readFile(join(project,'.thin/mem/core.md'),'utf8')).secret === key, 'memory write did not execute');
+          assert(JSON.parse(await readFile(join(project,'.thin/memory/core.md'),'utf8')).secret === key, 'memory write did not execute');
           assert(calls[0].arguments.content.includes('[redacted]'), 'encoded memory content leaked in archive');
         }
       }

@@ -17,6 +17,11 @@ fn forbidden(c: u21) bool {
         (c >= 0x2066 and c <= 0x206f) or c == 0x2028 or c == 0x2029;
 }
 
+/// Shared scalar policy for display copies and raw-input cursor mapping.
+pub fn displayCodepoint(cp: u21) u21 {
+    return if (forbidden(cp)) 0xfffd else cp;
+}
+
 pub const Prefix = struct { text: []u8, truncated: bool };
 
 /// Owned bounded safe prefix, without a text marker. The flag is metadata so
@@ -32,7 +37,7 @@ pub fn sanitizePrefix(a: std.mem.Allocator, input: []const u8, max_bytes: usize)
             continue;
         }
         var buf: [4]u8 = undefined;
-        const n = try std.unicode.utf8Encode(if (forbidden(r.cp)) 0xfffd else r.cp, &buf);
+        const n = try std.unicode.utf8Encode(displayCodepoint(r.cp), &buf);
         if (out.items.len > max_bytes or n > max_bytes - out.items.len) break;
         try out.appendSlice(a, buf[0..n]);
         i = r.end;
@@ -88,7 +93,7 @@ pub fn exceedsSanitizedLimit(input: []const u8, max_bytes: usize) bool {
             continue;
         }
         var buf: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(if (forbidden(r.cp)) 0xfffd else r.cp, &buf) catch unreachable;
+        const n = std.unicode.utf8Encode(displayCodepoint(r.cp), &buf) catch unreachable;
         if (n > max_bytes - bytes) return true;
         bytes += n;
         i = r.end;

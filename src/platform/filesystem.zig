@@ -261,11 +261,17 @@ pub const Root = struct {
     /// Complete bounded binary snapshot from one anchored regular-file fd.
     /// Never truncates; metadata checks detect ordinary concurrent mutation (not a lock).
     pub fn readBinary(self: *Root, allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+        return self.readBinaryGuarded(allocator, path, limit, null);
+    }
+
+    pub fn readBinaryGuarded(self: *Root, allocator: std.mem.Allocator, path: []const u8, limit: usize, guard: ?ReadGuard) ![]u8 {
         var parent_ = try self.parent(path);
         defer parent_.deinit();
+        if (guard) |policy| try policy.check(parent_, null);
         const fd = linux.openat(parent_.fd, parent_.name, linux.nofollow | linux.cloexec | linux.nonblock, 0);
         if (fd < 0) return osError();
         defer closeFd(fd);
+        if (guard) |policy| try policy.check(parent_, fd);
         const file = fileFromFd(fd);
         const before = try file.stat(self.io);
         if (before.kind != .file) return error.NotRegularFile;

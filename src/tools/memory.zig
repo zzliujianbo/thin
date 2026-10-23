@@ -3,7 +3,7 @@
 //! Linux flock on a fresh root-directory open description serializes cooperating
 //! Stores across threads and processes, without creating a lock file. Locks are
 //! held only for disk transactions. Caller frees Entry.content and Entry.version.
-//! 中文：项目内 memory 存储于 .thin/mem。写入采用基于内容哈希版本的 CAS：版本不符返回 VersionConflict，
+//! 中文：项目内 memory 存储于 .thin/memory。写入采用基于内容哈希版本的 CAS：版本不符返回 VersionConflict，
 //! 调用方必须重新读取后再决定，不得盲目覆盖。文件权限固定为 0600，目录为 0700。
 
 const std = @import("std");
@@ -12,12 +12,126 @@ const config = @import("../core/config.zig");
 
 const Root = fs.Root;
 extern "c" fn fsync(c_int) c_int;
+pub const directory_name = "memory";
+pub const jobs_name = "jobs";
+pub const owner_name = "jobs-owner";
+
+fn exists(parent: c_int, name: [*:0]const u8) !bool {
+    const fd = fs.linux.openat(parent, name, fs.linux.path_only | fs.linux.nofollow | fs.linux.cloexec, 0);
+    if (fd >= 0) {
+        fs.closeFd(fd);
+        return true;
+    }
+    if (std.c._errno().* == 2) return false;
+    return fs.osError();
+}
+
+fn lockOwner(parent: c_int, name: [*:0]const u8, io: std.Io) !c_int {
+    const fd = fs.linux.openat(parent, name, 2 | fs.linux.create | fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0o600);
+    if (fd < 0) return fs.osError();
+    errdefer fs.closeFd(fd);
+    if ((try fs.fileFromFd(fd).stat(io)).kind != .file) return error.NotRegularFile;
+    while (fs.linux.flock(fd, 2 | 4) != 0) {
+        const e = std.c._errno().*;
+        if (e == 4) continue;
+        if (e == 11) return error.Busy;
+        return fs.osError();
+    }
+    return fd;
+}
+
+fn legacyOwnerNeedsMigration(thin: c_int, io: std.Io) !bool {
+    const fd = fs.linux.openat(thin, "mem-jobs-owner", fs.linux.path_only | fs.linux.nofollow | fs.linux.cloexec, 0);
+    if (fd < 0) {
+        if (std.c._errno().* == 2) return false;
+        return fs.osError();
+    }
+    defer fs.closeFd(fd);
+    // A completed migration leaves a symlink tombstone. Old binaries use
+    // O_NOFOLLOW and therefore cannot recreate a second lease/queue namespace.
+    return (try fs.fileFromFd(fd).stat(io)).kind != .sym_link;
+}
+
+fn hasLegacyLayout(thin: c_int, io: std.Io) !bool {
+    return try exists(thin, "mem") or try exists(thin, "mem-jobs") or try legacyOwnerNeedsMigration(thin, io);
+}
+
+/// One-time, no-merge migration from the original public layout. The durable
+/// outbox is moved, never discarded: queued work and failed/uncertain replay
+/// decisions remain authoritative. Both old and new worker lease inodes are
+/// locked before any rename, so a live worker or mixed destination fails closed.
+pub fn migrateLayout(root: *Root) !void {
+    // Normal startup has no legacy artifacts and must not contend on the
+    // optional Memory root lock merely to prove that migration is unnecessary.
+    const probe = fs.openDirectory(root.dir.handle, ".thin") catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer fs.closeFd(probe);
+    const migration_needed = try hasLegacyLayout(probe, root.io);
+    if (!migration_needed) return;
+
+    const locked = try fs.openDirectory(root.dir.handle, ".");
+    defer fs.closeFd(locked);
+    while (fs.linux.flock(locked, 2 | 4) != 0) {
+        const e = std.c._errno().*;
+        if (e == 4) continue;
+        if (e == 11) return error.Busy;
+        return fs.osError();
+    }
+    const thin = try fs.openDirectory(root.dir.handle, ".thin");
+    defer fs.closeFd(thin);
+    if (!try hasLegacyLayout(thin, root.io)) return;
+
+    const old_memory = try exists(thin, "mem");
+    const new_memory = try exists(thin, directory_name);
+    if (old_memory and new_memory) return error.MemoryLayoutConflict;
+    const old_jobs = try exists(thin, "mem-jobs");
+
+    // Creating and locking the legacy owner closes the check/create race with
+    // an old worker. Its inode has no durable payload; the queue directory is
+    // the durable state that must be renamed intact.
+    const legacy_owner = try lockOwner(thin, "mem-jobs-owner", root.io);
+    defer fs.closeFd(legacy_owner);
+
+    // If the store itself is legacy, establish the future destination lease
+    // inside it before the directory becomes visible under the new name.
+    const memory = if (old_memory)
+        try child(thin, "mem", false)
+    else
+        try child(thin, directory_name, true);
+    defer fs.closeFd(memory);
+    const destination_owner = try lockOwner(memory, owner_name, root.io);
+    defer fs.closeFd(destination_owner);
+
+    if (old_jobs and try exists(memory, jobs_name)) return error.MemoryLayoutConflict;
+    if (old_memory) {
+        if (std.c.renameat(thin, "mem", thin, directory_name) != 0) return fs.osError();
+        if (fsync(thin) != 0) return fs.osError();
+    }
+    if (old_jobs) {
+        if (std.c.renameat(thin, "mem-jobs", memory, jobs_name) != 0) return fs.osError();
+        if (fsync(memory) != 0 or fsync(thin) != 0) return fs.osError();
+    }
+    // Atomically replace the old lease pathname with an O_NOFOLLOW tombstone.
+    // There is no unlink window in which a retrying legacy worker can create a
+    // fresh inode and run alongside the new worker.
+    const tombstone = ".mem-jobs-owner-tombstone";
+    if (std.c.symlinkat("memory/jobs-owner", thin, tombstone) != 0) {
+        if (std.c._errno().* != 17) return fs.osError();
+        if (std.c.unlinkat(thin, tombstone, 0) != 0) return fs.osError();
+        if (std.c.symlinkat("memory/jobs-owner", thin, tombstone) != 0) return fs.osError();
+    }
+    errdefer _ = std.c.unlinkat(thin, tombstone, 0);
+    if (std.c.renameat(thin, tombstone, thin, "mem-jobs-owner") != 0) return fs.osError();
+    if (fsync(memory) != 0 or fsync(thin) != 0) return fs.osError();
+}
 /// 一次读取的结果：content 为正文，version 为正文的 sha256 十六进制串（用作 CAS 比较依据）。
 pub const Entry = struct { content: []const u8, version: []const u8 };
 
 /// 项目 memory 的存储句柄；多个 Store 可共享同一 Root，互斥由 flock 保证。
 pub const Store = struct {
-    /// 项目根目录（不是 .thin/mem 本身）。
+    /// 项目根目录（不是 .thin/memory 本身）。
     root: *Root,
     /// core 与分片的大小、索引总预算等上限。
     limits: config.Limits,
@@ -46,19 +160,19 @@ pub const Store = struct {
         return fd;
     }
 
-    /// 打开 .thin/mem 并返回新的 Root（调用方负责 deinit）。create 为 true 时才创建缺失目录；读路径从不创建路径。
+    /// 打开 .thin/memory 并返回新的 Root（调用方负责 deinit）。create 为 true 时才创建缺失目录；读路径从不创建路径。
     fn directory(self: *Store, create: bool) !Root {
         const thin = try child(self.root.dir.handle, ".thin", create);
         defer fs.closeFd(thin);
 
-        const mem = try child(thin, "mem", create);
-        // mem 句柄由返回的 Root 持有；只有在后续失败时才由 errdefer 关闭。
-        errdefer fs.closeFd(mem);
+        const memory = try child(thin, directory_name, create);
+        // memory 句柄由返回的 Root 持有；只有在后续失败时才由 errdefer 关闭。
+        errdefer fs.closeFd(memory);
         return .{
-            .dir = .{ .handle = mem },
+            .dir = .{ .handle = memory },
             .io = self.root.io,
             .allocator = self.root.allocator,
-            .path = try std.fs.path.join(self.root.allocator, &.{ self.root.path, ".thin", "mem" }),
+            .path = try std.fs.path.join(self.root.allocator, &.{ self.root.path, ".thin", directory_name }),
         };
     }
 
@@ -232,7 +346,12 @@ pub const Store = struct {
     fn clearOutboxSources(self: *Store) !void {
         const thin = try fs.openDirectory(self.root.dir.handle, ".thin");
         defer fs.closeFd(thin);
-        const jobs = fs.openDirectory(thin, "mem-jobs") catch |err| {
+        const memory = fs.openDirectory(thin, directory_name) catch |err| {
+            if (err == error.FileNotFound) return;
+            return err;
+        };
+        defer fs.closeFd(memory);
+        const jobs = fs.openDirectory(memory, jobs_name) catch |err| {
             if (err == error.FileNotFound) return;
             return err;
         };
@@ -473,6 +592,72 @@ fn testRoot(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Root {
     return Root.open(a, io, buffer[0..n]);
 }
 
+test "memory layout migration preserves shards jobs and owner without merging" {
+    const a = std.testing.allocator;
+    var backend = std.Io.Threaded.init(a, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(a, io, tmp.dir);
+    defer root.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(root.dir.handle, ".thin", 0o700));
+    const thin = try fs.openDirectory(root.dir.handle, ".thin");
+    defer fs.closeFd(thin);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(thin, "mem", 0o700));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(thin, "mem-jobs", 0o700));
+    try root.writeMode(".thin/mem/core.md", "legacy core", false, 0o600);
+    try root.writeMode(".thin/mem-jobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", "legacy job", false, 0o600);
+    const owner = fs.linux.openat(thin, "mem-jobs-owner", 2 | fs.linux.create | fs.linux.exclusive | fs.linux.nofollow | fs.linux.cloexec, 0o600);
+    try std.testing.expect(owner >= 0);
+    fs.closeFd(owner);
+
+    try migrateLayout(&root);
+    try migrateLayout(&root); // completed migrations are idempotent.
+    try std.testing.expectError(error.FileNotFound, fs.openDirectory(thin, "mem"));
+    try std.testing.expectError(error.FileNotFound, fs.openDirectory(thin, "mem-jobs"));
+    const core = try root.readBinary(a, ".thin/memory/core.md", 1024);
+    defer a.free(core);
+    try std.testing.expectEqualStrings("legacy core", core);
+    const job = try root.readBinary(a, ".thin/memory/jobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", 1024);
+    defer a.free(job);
+    try std.testing.expectEqualStrings("legacy job", job);
+    const migrated_owner = fs.linux.openat(thin, "memory/jobs-owner", fs.linux.nofollow | fs.linux.cloexec, 0);
+    try std.testing.expect(migrated_owner >= 0);
+    fs.closeFd(migrated_owner);
+    const legacy_tombstone = try fs.openPath(thin, "mem-jobs-owner");
+    defer fs.closeFd(legacy_tombstone);
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, (try fs.fileFromFd(legacy_tombstone).stat(io)).kind);
+
+    var conflict_tmp = std.testing.tmpDir(.{});
+    defer conflict_tmp.cleanup();
+    var conflict_root = try testRoot(a, io, conflict_tmp.dir);
+    defer conflict_root.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(conflict_root.dir.handle, ".thin", 0o700));
+    const conflict_thin = try fs.openDirectory(conflict_root.dir.handle, ".thin");
+    defer fs.closeFd(conflict_thin);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(conflict_thin, "mem", 0o700));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(conflict_thin, directory_name, 0o700));
+    try std.testing.expectError(error.MemoryLayoutConflict, migrateLayout(&conflict_root));
+
+    var busy_tmp = std.testing.tmpDir(.{});
+    defer busy_tmp.cleanup();
+    var busy_root = try testRoot(a, io, busy_tmp.dir);
+    defer busy_root.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(busy_root.dir.handle, ".thin", 0o700));
+    const busy_thin = try fs.openDirectory(busy_root.dir.handle, ".thin");
+    defer fs.closeFd(busy_thin);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(busy_thin, directory_name, 0o700));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(busy_thin, "mem-jobs", 0o700));
+    const busy_memory = try fs.openDirectory(busy_thin, directory_name);
+    defer fs.closeFd(busy_memory);
+    const busy_owner = try lockOwner(busy_memory, owner_name, io);
+    defer fs.closeFd(busy_owner);
+    try std.testing.expectError(error.Busy, migrateLayout(&busy_root));
+    const unmoved = try fs.openDirectory(busy_thin, "mem-jobs");
+    fs.closeFd(unmoved);
+}
+
 // 空存储的 snapshot 不产生任何副作用；两个 Store 之间的 CAS 语义正确。
 test "memory empty snapshot has no side effects and CAS updates across Stores" {
     const a = std.testing.allocator;
@@ -506,7 +691,7 @@ test "memory empty snapshot has no side effects and CAS updates across Stores" {
     try std.testing.expectError(error.FileNotFound, two.read(a, "topic"));
     try std.testing.expectError(error.InvalidTopic, one.read(a, "../x"));
 
-    const stat = try root.dir.statFile(io, ".thin/mem", .{});
+    const stat = try root.dir.statFile(io, ".thin/memory", .{});
     try std.testing.expectEqual(@as(u32, 0o700), stat.permissions.toMode() & 0o777);
 }
 
@@ -620,7 +805,7 @@ test "index reads bounded titles, not full shard bodies" {
     // A separately edited body is checked by read, not secretly loaded into
     // startup context merely to obtain its first line.
     const binary_body: [20000]u8 = @splat(0);
-    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/mem/topic.md", .data = "Title\n" ++ binary_body });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".thin/memory/topic.md", .data = "Title\n" ++ binary_body });
 
     const snapshot = try store.snapshot(a);
     defer a.free(snapshot);
@@ -670,7 +855,7 @@ test "memory sorted index independent limits and project isolation" {
     try std.testing.expectError(error.IndexTooLarge, store.write(a, "extra", "123456789", null));
     try std.testing.expectError(error.FileNotFound, store.read(a, "extra"));
 
-    const stat = try root.dir.statFile(io, ".thin/mem/core.md", .{});
+    const stat = try root.dir.statFile(io, ".thin/memory/core.md", .{});
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
 
     store.limits.index_bytes = 1;

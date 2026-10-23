@@ -206,7 +206,7 @@ fn status(root: *fs.Root, id: []const u8, state: []const u8) !void {
 }
 fn receipt(root: *fs.Root, id: []const u8) !void {
     try status(root, id, "done");
-    const path = try std.fmt.allocPrint(a, ".thin/mem-jobs/{s}.json", .{id});
+    const path = try std.fmt.allocPrint(a, ".thin/memory/jobs/{s}.json", .{id});
     defer a.free(path);
     const body = try root.readBinary(a, path, 65536);
     defer a.free(body);

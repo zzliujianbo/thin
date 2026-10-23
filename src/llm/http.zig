@@ -436,10 +436,10 @@ pub const Client = struct {
         var buffer: [8192]u8 = undefined;
         var total: usize = 0;
         while (true) {
-            // readSliceShort would fill the whole buffer and hide small streaming
-            // updates. readVec returns currently available bytes instead.
-            var vectors = [_][]u8{&buffer};
-            const n = reader.readVec(&vectors) catch |err| switch (err) {
+            // readVec copies an existing buffered prefix, then can block in
+            // another socket read before returning it. Deliver that prefix
+            // first, notably for EOF-delimited SSE coalesced with the headers.
+            const n = readAvailable(reader, &buffer) catch |err| switch (err) {
                 error.EndOfStream => break,
                 error.ReadFailed => return failure(.transport, "Model stream was interrupted", status, stream.observed()),
             };
@@ -472,6 +472,42 @@ pub const Client = struct {
         };
     }
 };
+
+/// Never hold already-buffered SSE bytes hostage to the next socket read.
+fn readAvailable(reader: *Io.Reader, destination: []u8) Io.Reader.Error!usize {
+    std.debug.assert(destination.len != 0);
+    const pending = reader.buffered();
+    if (pending.len != 0) {
+        const n = @min(pending.len, destination.len);
+        @memcpy(destination[0..n], pending[0..n]);
+        reader.toss(n);
+        return n;
+    }
+    var vectors = [_][]u8{destination};
+    return reader.readVec(&vectors);
+}
+
+test "SSE buffered prefix returns before a subsequent failing transport read" {
+    var payload = "data: owned-first-event\n\n".*;
+    var reader = Io.Reader.failing;
+    reader.buffer = &payload;
+    reader.end = payload.len;
+    var buffer: [8192]u8 = undefined;
+    const n = try readAvailable(&reader, &buffer);
+    try std.testing.expectEqualStrings(&payload, buffer[0..n]);
+    try std.testing.expectEqual(@as(usize, 0), reader.bufferedLen());
+    try std.testing.expectError(error.ReadFailed, readAvailable(&reader, &buffer));
+}
+
+test "SSE buffered prefix respects destination bounds and logical consumption" {
+    var reader: Io.Reader = .fixed("owned");
+    var buffer: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try readAvailable(&reader, &buffer));
+    try std.testing.expectEqualStrings("own", &buffer);
+    const n = try readAvailable(&reader, &buffer);
+    try std.testing.expectEqualStrings("ed", buffer[0..n]);
+    try std.testing.expectError(error.EndOfStream, readAvailable(&reader, &buffer));
+}
 
 /// Deliberate allowlist from Zig 0.17 HostName.ConnectError. DNS
 /// NameServerFailure is ambiguous (no temporary/permanent distinction), and

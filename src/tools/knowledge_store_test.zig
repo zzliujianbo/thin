@@ -105,7 +105,7 @@ test "outbox sending crash recovery explicit retry receipt and strict storage" {
     try recovered.retry(a, id);
     try recovered.mark(a, id, .sending);
     try recovered.mark(a, id, .done);
-    const name = try std.fmt.allocPrint(a, ".thin/mem-jobs/{s}.json", .{id});
+    const name = try std.fmt.allocPrint(a, ".thin/memory/jobs/{s}.json", .{id});
     const receipt = try root.readBinary(a, name, queue.max_file_bytes);
     try std.testing.expect(std.mem.find(u8, receipt, "PRIVATE") == null);
     try recovered.enqueue(a, material);

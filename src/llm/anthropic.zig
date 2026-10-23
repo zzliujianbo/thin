@@ -18,7 +18,7 @@ fn message(a: std.mem.Allocator, role: []const u8, content: j.Value) !j.Value {
 
 /// Derive canonical display/execution blocks without losing native opaque fields.
 /// All returned strings and JSON arguments belong to a, never to native.
-pub fn nativeBlocks(a: std.mem.Allocator, native: j.Value) ![]const p.Block {
+pub fn nativeBlocks(a: std.mem.Allocator, native: j.Value) ![]p.Block {
     if (!c.onlyKeys(native, &.{ "role", "content" }) or !c.eq(try c.text(native, "role"), "assistant")) return error.InvalidReplay;
     const content = try c.list(j.get(native, "content") orelse return error.InvalidReplay);
     if (content.len > c.max_items) return error.InputLimit;
@@ -357,8 +357,10 @@ pub const Stream = struct {
             if (c.eq(kind, "thinking")) try j.put(self.a, &item.native, "signature", j.str(try item.signature.join(self.a)));
             // nativeBlocks validates replay signatures only on a successful
             // completed message; cap-truncated reasoning is never replayed.
-        } else if (c.eq(kind, "tool_use") and item.args.len > 0) {
-            try self.arguments.append(self.a, .{ .index = self.content.items.len, .json = try item.args.join(self.a) });
+        } else if (c.eq(kind, "tool_use")) {
+            const raw_args = if (item.args.len > 0) try item.args.join(self.a) else try self.a.dupe(u8, "{}");
+            try self.arguments.append(self.a, .{ .index = self.content.items.len, .json = raw_args });
+            if (item.args.len == 0) try self.sink.emit(.{ .tool_delta = .{ .index = item.tool_index, .arguments = raw_args, .name = try c.text(item.native, "name"), .call_id = try c.text(item.native, "id"), .write_file = c.eq(try c.text(item.native, "name"), "write_file"), .argument_bytes = raw_args.len } });
         }
         try self.content.append(self.a, item.native);
         self.open = null;
@@ -391,6 +393,13 @@ pub const Stream = struct {
         for (self.content.items) |b| try j.append(&content, b);
         const native = try message(self.a, "assistant", content);
         const blocks = try nativeBlocks(self.a, native);
+        var argument_index: usize = 0;
+        for (blocks) |*block| if (block.* == .tool_call) {
+            if (argument_index >= self.arguments.items.len) return error.InvalidToolArguments;
+            block.tool_call.arguments = self.arguments.items[argument_index].json;
+            argument_index += 1;
+        };
+        if (argument_index != self.arguments.items.len) return error.InvalidToolArguments;
         return .{ .success = .{ .message = .{ .role = .assistant, .blocks = blocks, .replay = .{ .scope = try c.scopeCopy(self.a, self.scope), .json = try j.encode(self.a, native), .retain_turn = true } }, .refused = c.eq(reason, "refusal"), .finish = if (calls) .tool_calls else .stop, .usage = self.token_usage, .raw_usage_json = raw } };
     }
 };

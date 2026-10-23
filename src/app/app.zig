@@ -167,6 +167,7 @@ pub const App = struct {
 
         self.root = if (anchored) |root| try root.duplicate() else try fs.Root.open(a, io, project);
         errdefer self.root.deinit();
+        try mem.migrateLayout(&self.root);
         self.home_path = if (environ.get("HOME")) |home| try a.dupe(u8, home) else try a.dupe(u8, "");
         errdefer a.free(self.home_path);
         self.shell_name = try a.dupe(u8, session_context.shellName(environ.get("SHELL")));

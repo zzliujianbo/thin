@@ -34,7 +34,7 @@ test "manual memory correction and deletion purge queued failed and uncertain so
         const status = try queue.status(a);
         defer a.free(status);
         try std.testing.expectEqualStrings("", status);
-        try std.testing.expectError(error.FileNotFound, root.read(a, ".thin/mem-jobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", 0, 65536));
+        try std.testing.expectError(error.FileNotFound, root.read(a, ".thin/memory/jobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", 0, 65536));
         try std.testing.expectError(error.GenerationConflict, store.writeGuarded(a, "resurrect", "forgotten fact", null, generation));
     }
 }

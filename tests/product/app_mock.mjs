@@ -479,7 +479,7 @@ async function scenario(name, protocol, kind, isPty = false) {
         assert(outputs.get('shell').includes('child-key-omitted'), 'shell saw key or did not run');
         assert.equal(await readFile(join(project,'written.txt'),'utf8'),'actual-write');
         assert.equal(await readFile(join(project,'shell.txt'),'utf8'),'actual-shell');
-        assert((await readFile(join(project,'.thin/mem/acceptance.md'),'utf8')).includes('actual-memory'));
+        assert((await readFile(join(project,'.thin/memory/acceptance.md'),'utf8')).includes('actual-memory'));
       }
 
       // 默认回复：包含 Unicode、Markdown 与 OSC 52 注入，用于验证渲染与净化。
@@ -707,7 +707,7 @@ async function scenario(name, protocol, kind, isPty = false) {
 
     // 畸形与截断的工具调用仍不得执行，与普通操作默认放行无关。
     if (kind==='malformed' || kind==='truncated') {
-      for (const path of ['written.txt','shell.txt','forbidden.txt','.thin/mem/acceptance.md']) assert(!await exists(join(project,path)), `unexpected effect: ${path}`);
+      for (const path of ['written.txt','shell.txt','forbidden.txt','.thin/memory/acceptance.md']) assert(!await exists(join(project,path)), `unexpected effect: ${path}`);
     }
 
     // 默认执行不进入审批；文件、shell 与 Memory 的真实结果仍正确回填。

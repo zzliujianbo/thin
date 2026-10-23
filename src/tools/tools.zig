@@ -225,7 +225,7 @@ pub const Execution = runtime.Execution;
 pub const Tools = struct {
     /// 启动项目根目录；所有文件路径都相对它解析。
     root: *fs.Root,
-    /// 项目内 memory 存储（.thin/mem）。
+    /// 项目内 memory 存储（.thin/memory）。
     memory: *mem.Store,
     /// 运行时配置，包含各类上限与超时。
     config: *const cfg.Config,
@@ -276,7 +276,7 @@ pub const Tools = struct {
                 in_thin = true;
             } else {
                 in_thin = false; // A second non-dot component exists.
-                if (action == .write_file and std.mem.eql(u8, part, "mem")) return error.UseMemoryTool;
+                if (action == .write_file and (std.mem.eql(u8, part, mem.directory_name) or std.mem.eql(u8, part, "mem"))) return error.UseMemoryTool;
                 // Exact project settings path only; ignore dot/slash aliases.
                 if (std.mem.eql(u8, part, settings.file_name)) {
                     var exact = true;
@@ -344,7 +344,23 @@ pub const Tools = struct {
 
     /// 把 Tools 包装成 runtime.Executor，供运行时调度 prepare 与 execute。
     pub fn executor(self: *Tools) runtime.Executor {
-        return .{ .context = self, .schemas = schemasForServices(self.config.decisionActive(), self.image != null), .prepare_fn = prepare, .execute_fn = executePrepared };
+        return .{ .context = self, .schemas = schemasForServices(self.config.decisionActive(), self.image != null), .prepare_fn = prepare, .execute_fn = executePrepared, .preview_write_fn = previewWrite };
+    }
+
+    fn previewWrite(context_: *anyopaque, a: std.mem.Allocator, path: []const u8, cancel: *const p.Cancellation) !?@import("../core/write_preview.zig").Baseline {
+        const self: *Tools = @ptrCast(@alignCast(context_));
+        if (cancel.isRequested()) return null;
+        try self.checkFileAction(a, .{ .write_file = .{ .path = path, .content = "", .overwrite = true } });
+        const bytes = self.root.readBinaryGuarded(a, path, @import("../util/line_stats.zig").max_bytes, self.textReadGuard()) catch |err| switch (err) {
+            error.FileNotFound => return @import("../core/write_preview.zig").Baseline.fromBytes(a, ""),
+            else => return null,
+        };
+        defer {
+            std.crypto.secureZero(u8, bytes);
+            a.free(bytes);
+        }
+        if (cancel.isRequested()) return null;
+        return @import("../core/write_preview.zig").Baseline.fromBytes(a, bytes);
     }
 
     /// 解析并做路径校验，生成待授权的 Prepared；此阶段不产生任何副作用。
@@ -366,7 +382,7 @@ pub const Tools = struct {
         var description = try action.description(a);
         const denial: ?[]const u8 = if (action.* == .bash) blk: {
             const finding = command_risk.classify(action.bash.command) orelse break :blk null;
-            description = try std.fmt.allocPrint(a, "DANGEROUS bash ({s}). Explicit approval is required each time; y runs it once, n denies it.\n{s}", .{ finding.label, description });
+            description = try std.fmt.allocPrint(a, "DANGEROUS bash ({s}). Explicit approval is required each time; choose Allow once or Deny in the confirmation popup.\n{s}", .{ finding.label, description });
             break :blk try std.fmt.allocPrint(a, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow each time.", .{finding.label});
         } else if (action.* == .memory and action.memory.action == .retry)
             "Memory retry was not executed. Explicit approval is required: an uncertain inference may already have been billed; retry can incur another charge."
@@ -682,18 +698,26 @@ test "project settings exact aliases protected at prepare and direct execute" {
     defer root.deinit();
     const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
     var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = undefined };
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(root.dir.handle, ".thin", 0o700));
+    try root.writeMode(settings.relative_path, "private", false, 0o600);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const absolute = try std.fs.path.join(a, &.{ root.path, ".thin/./settings.json" });
     var cancel: p.Cancellation = .{};
     for ([_][]const u8{ settings.relative_path, "./.thin//./settings.json", ".thin/./settings.json/.", absolute }) |path| {
-        try std.testing.expectError(error.ProtectedSettingsFile, tools.checkFileAction(a, .{ .read_file = .{ .path = path } }));
-        try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .read_file = .{ .path = path } }, &cancel));
+        // Read authorization is descriptor-based so aliases and hard links are
+        // rejected against the same opened inode, not guessed during prepare.
+        try tools.checkFileAction(a, .{ .read_file = .{ .path = path } });
+        if (tools.execute(a, .{ .read_file = .{ .path = path } }, &cancel)) |_| return error.ExpectedProtectedRead else |err| {
+            try std.testing.expect(err == error.ProtectedSettingsFile or err == error.NotDir or err == error.FileNotFound);
+        }
         try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .write_file = .{ .path = path, .content = "x" } }, &cancel));
         const read_args = try std.fmt.allocPrint(a, "{{\"path\":\"{s}\"}}", .{path});
         const write_args = try std.fmt.allocPrint(a, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
-        try std.testing.expectError(error.ProtectedSettingsFile, Tools.prepare(&tools, a, .{ .id = "r", .name = "read_file", .arguments = read_args }));
+        if (Tools.prepare(&tools, a, .{ .id = "r", .name = "read_file", .arguments = read_args })) |_| return error.ExpectedProtectedRead else |err| {
+            try std.testing.expect(err == error.ProtectedSettingsFile or err == error.NotDir or err == error.FileNotFound);
+        }
         try std.testing.expectError(error.ProtectedSettingsFile, Tools.prepare(&tools, a, .{ .id = "w", .name = "write_file", .arguments = write_args }));
     }
     for ([_][]const u8{ ".thin/settings.jsonfoo", ".thin/sub/settings.json", "settings.json", ".thin/settings.json/child" }) |path| {
@@ -703,6 +727,43 @@ test "project settings exact aliases protected at prepare and direct execute" {
         try tools.checkFileAction(a, .{ .read_file = .{ .path = path } });
         try std.testing.expectError(error.ProtectedSessionFile, tools.checkFileAction(a, .{ .write_file = .{ .path = path, .content = "x", .overwrite = true } }));
     }
+}
+
+test "write preview baseline is one-shot read only missing-safe and protected" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, io, buffer[0..n]);
+    defer root.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = undefined };
+    var cancel: p.Cancellation = .{};
+
+    var missing = (try Tools.previewWrite(&tools, std.testing.allocator, "missing.txt", &cancel)).?;
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing.lines.len);
+    try std.testing.expectError(error.FileNotFound, root.readBinary(std.testing.allocator, "missing.txt", 1));
+
+    try root.writeMode("existing.txt", "old\ncontent", false, 0o600);
+    const before = try root.dir.statFile(io, "existing.txt", .{});
+    var baseline = (try Tools.previewWrite(&tools, std.testing.allocator, "existing.txt", &cancel)).?;
+    defer baseline.deinit();
+    try std.testing.expectEqual(@as(usize, 2), baseline.lines.len);
+    const after = try root.dir.statFile(io, "existing.txt", .{});
+    try std.testing.expectEqual(before.size, after.size);
+    try std.testing.expectEqualDeep(before.mtime, after.mtime);
+
+    cancel.cancel();
+    try std.testing.expect((try Tools.previewWrite(&tools, std.testing.allocator, "existing.txt", &cancel)) == null);
+    var active: p.Cancellation = .{};
+    try std.testing.expectError(error.ProtectedSettingsFile, Tools.previewWrite(&tools, std.testing.allocator, settings.relative_path, &active));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(root.dir.handle, ".thin", 0o700));
+    try root.writeMode(settings.relative_path, "private", false, 0o600);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.linkat(root.dir.handle, ".thin/settings.json", root.dir.handle, "settings-alias.txt", 0));
+    try std.testing.expectError(error.ProtectedSettingsFile, root.readBinaryGuarded(std.testing.allocator, "settings-alias.txt", 1024, tools.textReadGuard()));
+    try std.testing.expect((try Tools.previewWrite(&tools, std.testing.allocator, "settings-alias.txt", &active)) == null);
 }
 
 test "dangerous bash is marked for explicit approval and ordinary bash is not" {

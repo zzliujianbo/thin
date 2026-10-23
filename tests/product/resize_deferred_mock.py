@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Owned PTY/loopback resize hold + fresh-ACK acceptance; no real API/config.
-This checks emitted bytes, not physical-terminal reflow or visual cleanliness.
+"""Owned PTY/loopback coalesced resize recovery + fresh-ACK acceptance.
+No real API/config. Byte-level checks complement emulator viewport acceptance.
 """
 import errno
 import fcntl
@@ -48,15 +48,17 @@ class Service(http.server.BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n))
             assert not any(k in body for k in ('max_tokens', 'max_completion_tokens', 'max_output_tokens'))
             assert any(m.get('role') == 'user' and m.get('content') == 'resize-stream-proof' for m in body['messages'])
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/event-stream')
-            self.end_headers()
+            def event(text):
+                return ('data: ' + json.dumps({'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]}) + '\n\n').encode()
 
             def chunk(text):
-                self.wfile.write(('data: ' + json.dumps({'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]}) + '\n\n').encode())
+                self.wfile.write(event(text))
                 self.wfile.flush()
 
-            chunk('before-resize-proof ')
+            # Unframed HTTP/1.0 SSE is valid. Coalesce header + first event to
+            # exercise a buffered body prefix, then withhold the next event.
+            self.wfile.write(b'HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\n\r\n' + event('before-resize-proof '))
+            self.wfile.flush()
             assert cls.more.wait(12), 'stream middle gate timeout'
             chunk('after-resize-proof ')
             assert cls.finish_gate.wait(12), 'stream finish gate timeout'
@@ -118,63 +120,87 @@ def run(app):
                         assert len(capture) < 2 * 1024 * 1024, 'capture bound'
                     assert Service.failed is None, Service.failed
 
-            def wait(predicate, timeout=6):
+            def wait(predicate, timeout=6, label='frame'):
                 deadline = time.monotonic() + timeout
                 while not predicate():
-                    assert time.monotonic() < deadline, 'bounded PTY predicate timeout'
+                    assert time.monotonic() < deadline, f'bounded PTY predicate timeout: {label}'
                     assert child.poll() is None, f'early child exit ({child.returncode})'
                     pump()
 
             def key(data):
                 before = capture.count(ACK)
                 os.write(master, data)
-                wait(lambda: capture.count(ACK) > before)
+                wait(lambda: capture.count(ACK) > before, label=f'key ACK at fixture line {sys._getframe(1).f_lineno}')
 
-            def hold_resize(rows, columns):
+            def last_frame():
+                end = capture.rfind(ACK)
+                begin = capture.rfind(b'\x1b[?2026h', 0, end)
+                return CSI.sub(b'', bytes(capture[max(0, begin):end]))
+
+            def settled(start, quiet=True):
+                def complete():
+                    delta = bytes(capture[start:])
+                    at = delta.find(b'\x1b[999B\r\n')
+                    return at >= 0 and ACK in delta[at:]
+                wait(complete, timeout=2, label='settled resize repair')
+                if quiet:
+                    frames = capture.count(ACK)
+                    pump(.22)
+                    assert capture.count(ACK) == frames, 'settled idle resize kept redrawing'
+
+            def hold_resize(rows, columns, settle=True, quiet=True):
                 start = len(capture)
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
                 os.killpg(child.pid, signal.SIGWINCH)
-                pump(.35)
-                # An in-flight pulse can need CAN/reset/sync-release/cursor-show,
-                # but resize alone must never send text, cursor movement or LF.
+                pump(.05)
+                # During the debounce, only release interrupted terminal controls.
                 delta = bytes(capture[start:])
-                assert delta.replace(CLEANUP, b'') == b'', 'resize emitted interface payload'
+                assert delta.replace(CLEANUP, b'') == b'', 'live resize emitted interface payload'
+                if settle:
+                    settled(start, quiet)
 
             try:
-                wait(lambda: ACK in capture)
+                wait(lambda: ACK in capture, label='startup ACK')
                 pump(.1)
+                start = len(capture)
                 for size in [(24, 60), (18, 60), (24, 80)]:
-                    hold_resize(*size)
+                    hold_resize(*size, settle=False)
+                settled(start)  # A burst gets one repair, without a key or content.
+                assert bytes(capture[start:]).count(b'\x1b[999B\r\n') == 1
                 assert Service.requests == 0
                 key(b'x')
                 assert b'x' in capture
                 key(b'\x15/settings\r')
                 assert b'Low-price input' in capture
                 initial_bytes = path.read_bytes()
-                hold_resize(20, 70)
-                key(b'\r')  # Revoked pre-resize ACK cannot toggle a preference.
+                hold_resize(20, 70, settle=False)
+                key(b'\r')  # Before the repair, the revoked ACK cannot toggle.
                 assert path.read_bytes() == initial_bytes, 'stale settings confirmation saved'
                 key(b'\r')
                 assert json.loads(path.read_text())['limits']['low_price_input'] is True
                 key(b'\r')
                 assert json.loads(path.read_text())['limits']['low_price_input'] is False
                 key(b'\x1b')
+                # Another settings frame may ACK before bare Escape expires.
+                # Do not merge the next Ctrl-U/text into that pending Escape.
+                wait(lambda: b'Settings>' not in last_frame(), label='settings actually closed')
                 assert Service.requests == 0
                 before = capture.count(ACK)
                 os.write(master, b'\x15resize-stream-proof\r')
-                wait(lambda: b'before-resize-proof' in capture and capture.count(ACK) > before)
+                wait(lambda: Service.requests == 1, label='stream command submitted')
+                wait(lambda: b'before-resize-proof' in capture and capture.count(ACK) > before, label='first stream content')
                 pump(.12)
-                hold_resize(18, 64)
+                hold_resize(18, 64, quiet=False)  # Busy viewport also recovers without data.
                 start = len(capture)
                 Service.more.set()
-                wait(lambda: b'after-resize-proof' in capture[start:] and ACK in capture[start:])
+                wait(lambda: b'after-resize-proof' in capture[start:] and ACK in capture[start:], label='stream continuation')
                 before = capture.count(ACK)
                 pump(.24)
                 assert capture.count(ACK) > before, 'animation did not resume after content'
                 Service.finish_gate.set()
                 # Stable post-finish frames end with the idle marker (SGR allowed).
                 start = len(capture)
-                wait(lambda: b'%>' in CSI.sub(b'', bytes(capture[start:])) and ACK in capture[start:])
+                wait(lambda: b'%>' in CSI.sub(b'', bytes(capture[start:])) and ACK in capture[start:], label='completed idle frame')
                 os.write(master, b'\x04')
                 child.wait(timeout=5)
                 pump(.05)
@@ -185,7 +211,7 @@ def run(app):
                 assert Service.requests == 1 and Service.failed is None, Service.failed
                 raw = bytes(capture)
                 assert not any(x in raw for x in (b'\x1b[2J', b'\x1b[3J', b'\x1b[?1049h', b'\x1b[?1047h'))
-                print('PASS resize-deferred: idle width/height/ABA hold, first-input recovery, stale Settings ACK denied, busy pulse held, content/animation resumed, primary=1, menu=0, termios/fd restored')
+                print('PASS resize-deferred: live width/height/ABA hold, one settled recovery without input, idle quiescence, stale Settings ACK denied, busy recovery, content/animation resumed, primary=1, menu=0, termios/fd restored')
             finally:
                 Service.more.set()
                 Service.finish_gate.set()

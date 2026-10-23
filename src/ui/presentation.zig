@@ -84,12 +84,13 @@ pub fn caption(a: std.mem.Allocator, name: []const u8, arguments: []const u8) !C
     return fromCall(a, call);
 }
 
-/// A normal tool row can exist before all arguments are available. Unknown
-/// targets show the sanitized tool name, never a special receipt placeholder.
+/// A normal tool row can exist before all arguments are available. Bash's >
+/// marker identifies the tool; leave its body empty until a reliable command
+/// exists. Other unknown targets retain the sanitized tool name.
 pub fn fromToolView(a: std.mem.Allocator, name: []const u8, fields: @import("../core/tool_preview.zig").Snapshot) !Caption {
     const call = try shared.tools.Call.fromFields(a, name, fields);
     defer call.deinit(a);
-    if (call.detail == null) return .{ .kind = call.kind, .label = try singleLine(a, name, 512) };
+    if (call.detail == null) return .{ .kind = call.kind, .label = if (call.kind == .bash) try a.dupe(u8, "") else try singleLine(a, name, 512) };
     return fromCall(a, call);
 }
 
@@ -112,6 +113,18 @@ pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
 /// Numeric observations survive Bridge text clipping. Missing is ?, not zero.
 /// This helper is called for successful results only; failures retain the path
 /// but must not claim any uncompleted read/write or requested-content line count.
+pub fn provisionalWrite(a: std.mem.Allocator, value: Caption, progress: @import("../core/write_preview.zig").Progress) !Caption {
+    std.debug.assert(value.kind == .write);
+    var marks: ?WriteMarks = null;
+    const label = if (progress.added != null and progress.deleted != null) blk: {
+        const added = value.label.len + "  ".len;
+        const removed = added + 1 + decimalLength(progress.added.?) + 1;
+        marks = .{ .added = .{ .start = added, .end = added + 1 + decimalLength(progress.added.?) }, .removed = .{ .start = removed, .end = removed + 1 + decimalLength(progress.deleted.?) } };
+        break :blk try std.fmt.allocPrint(a, "{s}  +{d} -{d} preview", .{ value.label, progress.added.?, progress.deleted.? });
+    } else try std.fmt.allocPrint(a, "{s}  +? -? preview", .{value.label});
+    return .{ .kind = .write, .label = label, .write_marks = marks };
+}
+
 pub fn completed(a: std.mem.Allocator, value: Caption, stats: ?line_stats.File) !Caption {
     var marks: ?WriteMarks = null;
     const label = switch (value.kind) {
@@ -163,7 +176,7 @@ fn activeIndicatorColor(now_ms: u64) []const u8 {
     return theme.command_pulse[shared.activity.commandStep(now_ms)];
 }
 
-pub const CommandSpan = struct { start: usize, end: usize, outcome: Outcome, write_marks: ?WriteMarks = null };
+pub const CommandSpan = struct { start: usize, end: usize, outcome: Outcome, write_marks: ?WriteMarks = null, generating: bool = false };
 
 pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome) ![]const u8 {
     const reason = if (outcome == .failed) value.failure_reason orelse "" else "";
@@ -212,7 +225,20 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         const has_prefix = begin == span.start and begin < body.len and std.mem.eql(u8, safe[begin..prefix_end], body[begin..text.nextCluster(body, begin, 0).end]);
         if (span.outcome == .pending and active_time_ms != null and has_prefix) {
             const now_ms = active_time_ms.?;
-            try out.writer.print("{s}{s}{s}{s}{s}", .{ activeIndicatorColor(now_ms), activity.spinner(now_ms), theme.muted, safe[prefix_end..end], theme.reset });
+            const indicator = if (span.generating) theme.muted else activeIndicatorColor(now_ms);
+            try out.writer.print("{s}{s}{s}", .{ indicator, activity.spinner(now_ms), theme.muted });
+            if (span.generating and span.write_marks != null) {
+                var cursor = prefix_end;
+                const marks = span.write_marks.?;
+                const ranges = [_]Range{ marks.added, marks.removed };
+                const colors = [_][]const u8{ theme.diff_added, theme.diff_removed };
+                for (ranges, colors) |range, tone| {
+                    if (range.start < cursor or range.end < range.start or range.end > end or range.end > body.len or !std.mem.eql(u8, safe[range.start..range.end], body[range.start..range.end])) continue;
+                    try out.writer.print("{s}{s}{s}{s}", .{ safe[cursor..range.start], tone, safe[range.start..range.end], theme.muted });
+                    cursor = range.end;
+                }
+                try out.writer.print("{s}{s}", .{ safe[cursor..end], theme.reset });
+            } else try out.writer.print("{s}{s}", .{ safe[prefix_end..end], theme.reset });
         } else {
             if (has_prefix) try out.writer.print("{s}{s}{s}", .{ theme.reset, prefixColor(span.outcome), safe[begin..prefix_end] });
             const summary_start = if (has_prefix) prefix_end else begin;
@@ -467,6 +493,35 @@ test "normal preview captions show names until reliable typed fields arrive" {
     try std.testing.expect(std.mem.find(u8, line, "0ms") == null);
 }
 
+test "bash rows show marker then command without a redundant tool name" {
+    const a = std.testing.allocator;
+    const early = try fromToolView(a, "bash", .{});
+    defer early.deinit(a);
+    const empty_body = try commandText(a, early, .pending);
+    defer a.free(empty_body);
+    try std.testing.expectEqualStrings("> ", empty_body);
+    const ready = try fromToolView(a, "bash", .{ .command = .{ .text = "printf owned" } });
+    defer ready.deinit(a);
+    const canonical = try caption(a, "bash", "{\"command\":\"printf owned\"}");
+    defer canonical.deinit(a);
+    try std.testing.expectEqualStrings(ready.label, canonical.label);
+    inline for (.{ Outcome.pending, Outcome.success, Outcome.failed, Outcome.canceled }) |outcome| {
+        const body = try commandText(a, ready, outcome);
+        defer a.free(body);
+        try std.testing.expect(std.mem.startsWith(u8, body, "> printf owned"));
+        try std.testing.expect(std.mem.find(u8, body, "> bash ") == null);
+    }
+    const done = try completed(a, canonical, null);
+    defer done.deinit(a);
+    try std.testing.expectEqualStrings("printf owned", done.label);
+    // Never strip a real command's own executable named bash.
+    const actual_bash = try caption(a, "bash", "{\"command\":\"bash run.sh\"}");
+    defer actual_bash.deinit(a);
+    const actual_body = try commandText(a, actual_bash, .pending);
+    defer a.free(actual_body);
+    try std.testing.expectEqualStrings("> bash run.sh", actual_body);
+}
+
 test "command captions are bounded single line UTF8 with literal three dots" {
     const a = std.testing.allocator;
     const cmd = try caption(a, "bash", "{\"command\":\"date\\nwhoami\\tmore\"}");
@@ -525,6 +580,28 @@ test "file captions expose safe paths and measured counts with unknown not guess
     const bad = try caption(a, "write_file", "{\"path\":\"unfinished");
     defer bad.deinit(a);
     try std.testing.expectEqualStrings("(file unavailable)", bad.label);
+}
+
+test "provisional write counts are explicit typed preview and generation stays muted" {
+    const a = std.testing.allocator;
+    const value: Caption = .{ .kind = .write, .label = "preview.zig" };
+    const known = try provisionalWrite(a, value, .{ .added = 12, .deleted = 3 });
+    defer known.deinit(a);
+    try std.testing.expectEqualStrings("preview.zig  +12 -3 preview", known.label);
+    const body = try commandText(a, known, .pending);
+    defer a.free(body);
+    const span: CommandSpan = .{ .start = 0, .end = body.len, .outcome = .pending, .write_marks = known.write_marks.?.shifted(2), .generating = true };
+    const first = try commandLine(a, body, &.{span}, 80, null, 0);
+    defer a.free(first);
+    const second = try commandLine(a, body, &.{span}, 80, null, 80);
+    defer a.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.indexOf(u8, first, theme.command_pulse[0]) == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, theme.diff_added ++ "+12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, theme.diff_removed ++ "-3") != null);
+    const unknown = try provisionalWrite(a, value, .{});
+    defer unknown.deinit(a);
+    try std.testing.expectEqualStrings("preview.zig  +? -? preview", unknown.label);
 }
 
 test "write count colors use numeric metadata not patterns in a hostile path" {

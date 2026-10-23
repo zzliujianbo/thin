@@ -2,6 +2,7 @@
 const std = @import("std");
 const fs = @import("../platform/filesystem.zig");
 const knowledge = @import("../core/knowledge.zig");
+const memory = @import("memory.zig");
 pub const State = enum { queued, sending, failed, uncertain, done };
 const Job = struct { schema: u8 = 1, id: []const u8, state: State, material: ?knowledge.Material };
 const Stored = struct { job: Job, charge: usize };
@@ -27,7 +28,9 @@ pub const Queue = struct {
         if (self.worker_fd != null) return error.Busy;
         const thin = try child(self.root.dir.handle, ".thin", true);
         defer fs.closeFd(thin);
-        const fd = fs.linux.openat(thin, "mem-jobs-owner", 2 | fs.linux.create | fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0o600);
+        const store = try child(thin, memory.directory_name, true);
+        defer fs.closeFd(store);
+        const fd = fs.linux.openat(store, memory.owner_name, 2 | fs.linux.create | fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0o600);
         if (fd < 0) return fs.osError();
         errdefer fs.closeFd(fd);
         if ((try fs.fileFromFd(fd).stat(self.root.io)).kind != .file) return error.NotRegularFile;
@@ -88,9 +91,11 @@ pub const Queue = struct {
     fn directory(self: *Queue, create: bool) !fs.Root {
         const thin = try child(self.root.dir.handle, ".thin", create);
         defer fs.closeFd(thin);
-        const fd = try child(thin, "mem-jobs", create);
+        const store = try child(thin, memory.directory_name, create);
+        defer fs.closeFd(store);
+        const fd = try child(store, memory.jobs_name, create);
         errdefer fs.closeFd(fd);
-        return .{ .dir = .{ .handle = fd }, .io = self.root.io, .allocator = self.root.allocator, .path = try std.fs.path.join(self.root.allocator, &.{ self.root.path, ".thin", "mem-jobs" }) };
+        return .{ .dir = .{ .handle = fd }, .io = self.root.io, .allocator = self.root.allocator, .path = try std.fs.path.join(self.root.allocator, &.{ self.root.path, ".thin", memory.directory_name, memory.jobs_name }) };
     }
     fn loadAll(_: *Queue, dir: *fs.Root, a: std.mem.Allocator) ![]Stored {
         var jobs: std.ArrayList(Stored) = .empty;
@@ -321,7 +326,7 @@ test "queue stale enqueue after manual write or delete cannot recreate forgotten
         // Deterministic delayed extraction, after mutation AND outbox purge.
         try std.testing.expectError(error.GenerationConflict, q.enqueue(a, m));
         try std.testing.expectEqualStrings("", try q.status(a));
-        const path = try std.fmt.allocPrint(a, ".thin/mem-jobs/{s}.json", .{m.id});
+        const path = try std.fmt.allocPrint(a, ".thin/memory/jobs/{s}.json", .{m.id});
         try std.testing.expectError(error.FileNotFound, root.readBinary(a, path, max_file_bytes));
     }
     var tmp = std.testing.tmpDir(.{});

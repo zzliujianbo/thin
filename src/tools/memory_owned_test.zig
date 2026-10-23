@@ -56,7 +56,7 @@ test "worker lease excludes independent process and status cannot recover sendin
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
         fs.closeFd(lease);
-        const fd = fs.linux.openat(root.dir.handle, ".thin/mem-jobs-owner", fs.linux.nofollow | fs.linux.cloexec, 0);
+        const fd = fs.linux.openat(root.dir.handle, ".thin/memory/jobs-owner", fs.linux.nofollow | fs.linux.cloexec, 0);
         if (fd < 0) _exit(2);
         const rc = fs.linux.flock(fd, 2 | 4);
         const busy = rc == -1 and std.c._errno().* == 11;
@@ -124,7 +124,7 @@ test "indexed retrieval reads only selected bodies always includes core and pers
     const binary = "other\n\x00";
     for (0..20) |i| {
         const key = try std.fmt.allocPrint(a, "unused-{d}", .{i});
-        const name = try std.fmt.allocPrint(a, ".thin/mem/{s}.md", .{key});
+        const name = try std.fmt.allocPrint(a, ".thin/memory/{s}.md", .{key});
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = binary });
     }
     const text = try repository.retrieve(a, "请使用中文编译工具", 1, 8192);
@@ -140,7 +140,7 @@ test "indexed retrieval reads only selected bodies always includes core and pers
     // Twenty matching titles: only the top fifteen may be fully read (plus
     // core). Poison the unselected five bodies to enforce the read ceiling.
     for (0..20) |i| {
-        const name = try std.fmt.allocPrint(a, ".thin/mem/ranked-{d:0>2}.md", .{i});
+        const name = try std.fmt.allocPrint(a, ".thin/memory/ranked-{d:0>2}.md", .{i});
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = if (i < 15) "target\nvalid" else "target\n\x00" });
     }
     const ranked = try repository.retrieve(a, "target", 1, 8192);
@@ -212,12 +212,12 @@ test "strict record and queue JSON reject unknown duplicate fields" {
     for ([_][]const u8{ "\"unknown\":1,", "\"schema\":1," }) |injection| {
         const pos = std.mem.findScalar(u8, entry.content, '{').?;
         const bad = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ entry.content[0 .. pos + 1], injection, entry.content[pos + 1 ..] });
-        try root.write(".thin/mem/project-strict.md", bad, true);
+        try root.write(".thin/memory/project-strict.md", bad, true);
         try std.testing.expectError(error.InvalidKnowledgeRecord, repository.retrieve(a, "rust", 1, 8192));
     }
     var q = queue.Queue.init(&root);
     try q.enqueue(a, m);
-    const name = try std.fmt.allocPrint(a, ".thin/mem-jobs/{s}.json", .{id});
+    const name = try std.fmt.allocPrint(a, ".thin/memory/jobs/{s}.json", .{id});
     const bytes = try root.readBinary(a, name, queue.max_file_bytes);
     for ([_][]const u8{ "\"unknown\":1,", "\"schema\":1," }) |injection| {
         const bad = try std.fmt.allocPrint(a, "{{{s}{s}", .{ injection, bytes[1..] });

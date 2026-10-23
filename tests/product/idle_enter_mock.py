@@ -218,13 +218,15 @@ def run(app, width, batched):
             mark = len(capture)
             send(b'\x15')
             pump_until(lambda: len(capture) > mark and capture.endswith(ACK))
-            # Resize alone leaves reflow to the terminal. A genuine later edit
-            # resumes the active region; this VT subset does not emulate reflow.
+            # Coalesce resizing, then repair without requiring user input.
+            # This VT subset does not emulate terminal reflow itself.
             mark = len(capture)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 40, 0, 0))
-            until = time.monotonic() + .25
+            until = time.monotonic() + .05
             pump_until(lambda: time.monotonic() >= until)
-            assert len(capture) == mark, 'idle resize repainted without input/content'
+            assert len(capture) == mark, 'live resize repainted before settling'
+            pump_until(lambda: len(capture) > mark and capture.endswith(ACK))
+            mark = len(capture)
             send(b'z')
             pump_until(lambda: len(capture) > mark and capture.endswith(ACK))
             mark = len(capture)

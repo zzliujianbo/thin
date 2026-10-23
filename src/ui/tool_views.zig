@@ -5,6 +5,7 @@ const std = @import("std");
 const p = @import("../core/protocol.zig");
 const r = @import("../core/runtime.zig");
 const presentation = @import("presentation.zig");
+const write_preview = @import("../core/write_preview.zig");
 const Allocator = std.mem.Allocator;
 const limit = 64;
 
@@ -12,6 +13,7 @@ pub const Entry = struct {
     key: p.ToolDisplayKey,
     caption: presentation.Caption,
     ready: bool,
+    write_progress: ?write_preview.Progress = null,
     order: usize,
 };
 
@@ -65,6 +67,11 @@ pub const Views = struct {
             const old = entry.caption;
             entry.caption = candidate;
             entry.ready = event.ready;
+            if (event.write_progress) |progress| {
+                const old_known = if (entry.write_progress) |old_progress| old_progress.added != null and old_progress.deleted != null else false;
+                const new_known = progress.added != null and progress.deleted != null;
+                if (!old_known or new_known) entry.write_progress = progress;
+            }
             if (became_ready) entry.order = self.nextOrder();
             old.deinit(a);
         } else {
@@ -72,6 +79,7 @@ pub const Views = struct {
                 .key = event.key,
                 .caption = candidate,
                 .ready = event.ready,
+                .write_progress = event.write_progress,
                 .order = if (event.ready) self.ready_count else limit,
             };
             if (self.entries.items.len == limit) {
@@ -229,6 +237,25 @@ test "tool views ready resists provisional rollback commit sorts and prunes" {
     try std.testing.expect(views.get(key(1, 5)) == null);
     views.commit(a, 1);
     try std.testing.expectEqual(@as(usize, 2), views.entries.items.len);
+}
+
+test "tool views preserve known write progress across late unknown updates" {
+    const a = std.testing.allocator;
+    var views: Views = .{};
+    defer views.deinit(a);
+    views.begin(a, 5);
+    var known = view(5, 1, "file", false);
+    known.name = "write_file";
+    known.write_progress = .{ .added = 4, .deleted = 2 };
+    try views.upsert(a, known);
+    var unknown = known;
+    unknown.write_progress = .{};
+    try views.upsert(a, unknown);
+    try std.testing.expectEqualDeep(@import("../core/write_preview.zig").Progress{ .added = 4, .deleted = 2 }, views.get(key(5, 1)).?.write_progress.?);
+    unknown.ready = true;
+    try views.upsert(a, unknown);
+    try std.testing.expect(views.get(key(5, 1)).?.ready);
+    try std.testing.expectEqualDeep(@import("../core/write_preview.zig").Progress{ .added = 4, .deleted = 2 }, views.get(key(5, 1)).?.write_progress.?);
 }
 
 test "tool views cloned caption owns label and preserves renderer metadata" {

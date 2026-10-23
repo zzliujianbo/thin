@@ -214,15 +214,17 @@ test "anthropic fragmented text tool JSON ordinal preview and usage" {
     try block(&s, 1, "{\"type\":\"tool_use\",\"id\":\"call\",\"name\":\"write_file\",\"input\":{}}");
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqual(@as(usize, 0), capture.bytes);
-    try delta(&s, 1, "{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":\"}");
-    try delta(&s, 1, "{\"type\":\"input_json_delta\",\"partial_json\":\"1}\"}");
+    const raw_one = "{ \"x\" : ";
+    const raw_two = "1 }";
+    try delta(&s, 1, try std.fmt.allocPrint(arena.allocator(), "{{\"type\":\"input_json_delta\",\"partial_json\":{s}}}", .{try j.encode(arena.allocator(), j.str(raw_one))}));
+    try delta(&s, 1, try std.fmt.allocPrint(arena.allocator(), "{{\"type\":\"input_json_delta\",\"partial_json\":{s}}}", .{try j.encode(arena.allocator(), j.str(raw_two))}));
     try stop(&s, 1);
     try end(&s, "tool_use");
     const out = (try s.finish()).success;
     try std.testing.expectEqualStrings("hello", out.message.blocks[0].text);
-    try std.testing.expectEqualStrings("{\"x\":1}", out.message.blocks[1].tool_call.arguments);
+    try std.testing.expectEqualStrings("{ \"x\" : 1 }", out.message.blocks[1].tool_call.arguments);
     try std.testing.expectEqual(@as(?u64, 19), out.usage.total());
-    try std.testing.expectEqual(@as(usize, 7), capture.bytes);
+    try std.testing.expectEqual(raw_one.len + raw_two.len, capture.bytes);
     try std.testing.expect(out.message.replay.?.retain_turn);
     try std.testing.expect(std.mem.indexOf(u8, out.message.replay.?.json, "citations") != null);
 }

@@ -7,6 +7,7 @@ const abi = @import("../platform/terminal_abi.zig");
 const openpty = abi.openpty;
 const regular = @import("regular_screen.zig");
 const spinner_theme = @import("../ui/theme.zig");
+const spinner_activity = @import("../ui/activity.zig");
 
 // libc 符号声明：fork/exec、信号、进程组与 PTY 控制相关函数。
 extern "c" fn fork() c_int;
@@ -869,9 +870,11 @@ fn approvalCancel(d: *Driver) !void {
     std.debug.print("APPROVAL_CANCEL_WAIT repeated_titles={d}\n", .{titles});
 
     // Standalone ESC: no following byte may mask the parser's 150ms expiry.
+    // Escape confirms the safe default Deny choice. The canonical denied tool
+    // result is then returned to the model exactly once for its final response.
     start = d.used;
     try d.send("\x1b");
-    try queuedScreen(d, a, start, &.{"Canceled"});
+    try queuedScreen(d, a, start, &.{"Approval denied; continuing without execution."});
     try queuedIdle(d, a, start);
     try approvalCancelScreen(d, view);
     try checkApprovalCancelRestored(view);
@@ -928,13 +931,10 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         // An actual scroll still redraws and needs a fresh completed frame;
         // freezing idle animation must not freeze input or approval controls.
         const scrolled = d.used;
-        try d.send("\x1b[B");
+        try d.send("\x1b[6~");
         try d.waitFrame(scrolled, "Approval #");
-        const armed = d.used;
-        try d.send("\t");
-        try d.waitFrame(armed, "Approval #");
         const denied = d.used;
-        try d.send("n");
+        try d.send("\r");
         try d.waitIdle(denied);
         return;
     }
@@ -960,13 +960,15 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
     // Both command preview and approval must belong to a completed new frame.
     try d.waitFrame(start, command);
     try d.waitFrame(start, "Approval #");
-    // Ordinary text (including y/n) belongs to the queue composer. Tab arms
-    // the separate one-shot approval controls, then await their fresh frame.
-    const armed = d.used;
-    try d.send("\t");
-    try d.waitFrame(armed, "Approval #");
+    // Approval is a modal selector. Deny is the safe default; allowing once
+    // requires a visible arrow-selected frame before Enter can authorize it.
+    if (!deny) {
+        const selected = d.used;
+        try d.send("\x1b[D");
+        try d.waitFrame(selected, "> Allow once");
+    }
     const answered = d.used;
-    try d.send(if (deny) "n" else "y");
+    try d.send("\r");
     if (cancel) {
         try d.quiet(200);
         try d.send("\x1b");
@@ -976,9 +978,7 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
     if (accept) {
         // These labels do not occur in the command preview. They prove that
         // actual local output is visible before any subsequent inference.
-        try d.waitFrame(answered, "stdout:");
-        try d.waitFrame(answered, "stderr:");
-        try d.waitFrame(answered, "exit: 7");
+        try d.waitFrame(answered, "Command exited with status 7");
         // Do not confuse OUT/ERR in the quoted command preview with actual
         // decoded stream lines. Keep the large screen off the driver's stack.
         const view = try std.heap.page_allocator.create(regular.Screen);
@@ -994,6 +994,7 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
             stderr_line = stderr_line or std.mem.eql(u8, value, "ERR");
         }
         try check(stdout_line and stderr_line);
+        try check(view.count("stdout:") == 0 and view.count("stderr:") == 0 and view.count("output encoding:") == 0 and view.count("exit: 0") == 0);
         // Exactly one explicit subsequent inference; the mock validates the
         // preceding canonical bash call/result, including streams and exit 7.
         const normal = d.used;
@@ -1005,11 +1006,8 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         const batch = d.used;
         try d.send("!rm -rf absent; touch batch-first\r!touch batch-tail\r");
         try d.waitFrame(batch, "Approval #");
-        const deny_armed = d.used;
-        try d.send("\t");
-        try d.waitFrame(deny_armed, "Approval #");
         const rejected = d.used;
-        try d.send("n");
+        try d.send("\r");
         try d.waitIdle(rejected);
         try d.quiet(150);
         try check(std.mem.indexOf(u8, d.output[rejected..d.used], "Approval #") == null);
@@ -1025,7 +1023,7 @@ fn previewAbsent(path: [*:0]const u8) !void {
     try check(access(path, 0) == -1 and c._errno().* == 2);
 }
 
-fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const u8, pending: bool) !void {
+fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const u8, pending: bool, summary: ?[]const u8) !void {
     const view = try a.create(regular.Screen);
     defer a.destroy(view);
     const until = now() + 10000;
@@ -1046,15 +1044,25 @@ fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const 
             const line = std.mem.trim(u8, row, " ");
             // Normal tool rows occupy at most floor(80 * .8) cells.
             try check(std.mem.trimEnd(u8, row, " ").len <= 64);
-            if (pending) try check(std.mem.startsWith(u8, line, "w "));
+            if (pending and summary == null) try check(std.mem.startsWith(u8, line, "w "));
             matched = true;
         }
         try check(matched);
         if (pending) {
-            // Name/field preview is static neutral, never warm execution UI.
-            const expected = try std.fmt.allocPrint(a, "w{s} ", .{spinner_theme.muted});
-            defer a.free(expected);
-            try check(std.mem.indexOf(u8, complete[start..], expected) != null);
+            if (summary) |value| {
+                try check(view.visible(value));
+                // The first complete generated row owns the full muted SGR;
+                // later sparse frames may update only its numeric suffix.
+                if (std.mem.eql(u8, needle, "write_file")) {
+                    var muted_spinner = false;
+                    for (0..10) |step| {
+                        const expected = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ spinner_theme.muted, spinner_activity.spinner(step * 80), spinner_theme.muted });
+                        defer a.free(expected);
+                        muted_spinner = muted_spinner or std.mem.indexOf(u8, complete[start..], expected) != null;
+                    }
+                    try check(muted_spinner);
+                }
+            }
         }
         for ([_][]const u8{ "receiving arguments", "Preparing write", "PREVIEW_RAW_CONTENT_SECRET" }) |hidden|
             try check(std.mem.indexOf(u8, complete, hidden) == null);
@@ -1070,23 +1078,23 @@ fn toolPreview(d: *Driver, init: std.process.Init, mode: []const u8, project: []
     try d.waitIdle(0);
     const start = d.used;
     try d.send("preview-task\r");
-    try previewFrame(d, a, start, "write_file", true);
+    try previewFrame(d, a, start, "write_file", true, "+? -? preview");
     try previewAbsent(target);
     std.debug.print("PREVIEW_GATE=header\n", .{});
     // The server now sends an unclosed path. A bounded observation window
     // proves it cannot leak the unreliable partial field into a normal row.
     try d.quiet(200);
-    try previewFrame(d, a, start, "write_file", true);
+    try previewFrame(d, a, start, "write_file", true, "+? -? preview");
     try check(std.mem.indexOf(u8, d.output[start..d.used], "preview-owned") == null);
     try previewAbsent(target);
     std.debug.print("PREVIEW_GATE=partial\n", .{});
     const path_start = d.used;
-    try previewFrame(d, a, path_start, "preview-owned.txt", true);
+    try previewFrame(d, a, path_start, "preview-owned.txt", true, "+1 -0 preview");
     try previewAbsent(target);
     std.debug.print("PREVIEW_GATE=path-absent\n", .{});
     // Content is already arriving but the call remains unfinished at this gate.
     try d.quiet(250);
-    try previewFrame(d, a, path_start, "preview-owned.txt", true);
+    try previewFrame(d, a, path_start, "preview-owned.txt", true, "+1 -0 preview");
     try previewAbsent(target);
     if (canceled) {
         const cancel_start = d.used;
@@ -1121,8 +1129,8 @@ fn toolPreview(d: *Driver, init: std.process.Init, mode: []const u8, project: []
         try d.waitFrame(start, "preview-final-answer");
         try d.waitIdle(start);
         try check(access(target, 0) == 0);
-        try previewFrame(d, a, start, "preview-owned.txt", false);
-        try previewFrame(d, a, start, "sleep 0.7", false);
+        try previewFrame(d, a, start, "preview-owned.txt", false, null);
+        try previewFrame(d, a, start, "sleep 0.7", false, null);
     }
     for ([_][]const u8{ "receiving arguments", "Preparing write", "PREVIEW_RAW_CONTENT_SECRET", "preview-bash-proof" }) |hidden|
         try check(std.mem.indexOf(u8, d.output[start..d.used], hidden) == null);
@@ -2241,7 +2249,16 @@ pub fn main(init: std.process.Init) !void {
         try d.send("\x1b[Z"); // Selected profile low -> medium.
         // Observe the acknowledged confirmation, then its automatic expiry.
         // Intermediate levels may render if PTY input arrives in separate reads.
-        try d.waitFrame(start, "(fixture-next) medium> ");
+        // The ACK-owned renderer may update only the changed effort cells;
+        // requiring the complete unchanged model prefix in the byte diff is
+        // invalid. Wait for a fresh complete frame carrying the changed
+        // effort cells, then inspect the replayed screen before the transient
+        // confirmation expires back to the ordinary percentage prompt.
+        try d.waitFrame(start, "medium");
+        const medium_screen = try d.screen();
+        try check(medium_screen.visible("(fixture-next) medium> "));
+        // The transient effort confirmation then expires back to the ordinary
+        // percentage prompt; only after observing it should this wait for idle.
         try d.waitIdle(start);
         start = d.used;
         try d.send("selection-second\r");
@@ -2315,8 +2332,21 @@ pub fn main(init: std.process.Init) !void {
         try EditorCheck.expect(&d, "\x1b[A", "history-one");
         try EditorCheck.expect(&d, "\x1b[B", "history-two");
         try EditorCheck.expect(&d, "\x1b[B", "");
-        try EditorCheck.expect(&d, "manual-draft\x1b[A\x1b[B", "manual-draft");
-        try EditorCheck.expect(&d, "\x15\x1b[A-edited\x1b[A\x1b[B", "history-two-edited");
+        // Keep each navigation/edit transaction separately observable. The
+        // input loop may stop consuming the current read after an ACK-owning
+        // history transition, so batching unrelated actions would make the
+        // fixture depend on kernel PTY read boundaries.
+        try EditorCheck.expect(&d, "manual-draft", "manual-draft");
+        try EditorCheck.expect(&d, "\x1b[A", "manual-draft");
+        try EditorCheck.expect(&d, "\x1b[B", "manual-draft");
+        try EditorCheck.expect(&d, "\x15", "");
+        try EditorCheck.expect(&d, "\x1b[A", "history-two");
+        // Recall preserves the preferred display column (zero here), so move
+        // explicitly to the end before testing a manual edit of the entry.
+        try EditorCheck.expect(&d, "\x1b[F", "history-two");
+        try EditorCheck.expect(&d, "-edited", "history-two-edited");
+        try EditorCheck.expect(&d, "\x1b[A", "history-two-edited");
+        try EditorCheck.expect(&d, "\x1b[B", "history-two-edited");
         const start = d.used;
         try d.send("\x15esc-task\r");
         try d.waitBusy(start);
@@ -2372,13 +2402,15 @@ pub fn main(init: std.process.Init) !void {
         try d.waitIdle(start);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "世界") != null);
 
-        // 依次把列宽改为40/80/120；每次确认模型输入前缀被重绘。
+        // 依次把列宽改为40/80/120；每次要求稳定几何后的新完整帧。
+        // ACK-owned差分不必重复未改变的提示符字节；专用resize夹具负责
+        // 核对底部位置、内容与150ms合并策略，这里只验证应用仍能完成重绘。
         for ([_]u16{ 40, 80, 120 }) |width| {
             size.col = width;
             const mark = d.used;
             // IOCSWINSZ 设置窗口尺寸，内核会向前台进程组发送 SIGWINCH，触发应用重绘。
             try check(c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &size) == 0);
-            try d.waitText(mark, "> ");
+            try d.waitFrame(mark, "");
         }
     }
 
