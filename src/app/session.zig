@@ -259,8 +259,11 @@ pub const Session = struct {
         self.loaded_selection = restored;
         self.pending = try self.store.loadOrInitialize();
         self.global_config = try cfg.clone(a, self.pending.?.value);
-        self.metadata_cache = metadata.load(&self.store.root) catch blk: {
-            self.metadata_blocked = true;
+        self.metadata_cache = metadata.load(&self.store.root) catch |err| blk: {
+            // A recognized older cache is not a poisoned store: the next claim
+            // rebuilds the current format, so startup/first idle poll may refresh.
+            // Future, malformed and I/O failures keep the cadence disabled.
+            if (err != error.OutdatedMetadataCache) self.metadata_blocked = true;
             break :blk .{};
         };
         // Capture saved defaults before the project overlay/capability clamp.
@@ -743,6 +746,10 @@ pub const Session = struct {
         // Claim before launching: first-run failures/timeouts must not create an
         // automatic retry on every start, and concurrent sessions share the claim.
         const claim = try metadata.claimAt(&self.store.root, requested | metadata.dev_bit, manual, self.metadataNow(), self.refreshPolicy());
+        // A successful claim means storage is a valid current-format cache again,
+        // so an earlier unreadable-cache block no longer applies. Failures above
+        // return before this point and keep the cadence disabled.
+        self.metadata_blocked = false;
         self.metadata_cache.refresh = claim.cache.refresh;
         job.requested = claim.mask;
         job.generations = claim.generations;
@@ -3854,4 +3861,121 @@ test "derived metadata protocol or format mismatch clears stale mapping and effo
     row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .anthropic, .map = .{ .high = "high" } });
     source.applyReasoningMetadata(&config);
     try std.testing.expect(!source.capabilitiesFor(config).known);
+}
+
+test "outdated cache recovers through automatic or explicit refresh only" {
+    // A recognized older document is dropped only at claim time; the startup
+    // cadence or an explicit refresh rebuilds the current format. Fake seams are
+    // installed before any poll and the literal credential keeps construction
+    // offline, so no real metadata endpoint is reachable.
+    const legacy_cache =
+        \\{"version":12,"attempted":3,"records":[{"selector":"deepseek/deepseek-flash","context_window":65536,"available":true}],"directory_mask":1,"models":[{"provider":"deepseek","id":"deepseek-flash","context_window":32768,"protocol":"chat","available":true}],"refresh":[{"generation":2,"last_attempt_ms":900,"last_success_ms":950,"successful":true},{},{},{}]}
+    ;
+    const config =
+        \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key":"fake-outdated-cache","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+    ;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ true, false }) |automatic| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path: [4096]u8 = undefined;
+        const home = path[0..try tmp.dir.realPath(io, &path)];
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        try writeSessionTestConfig(tmp.dir, config);
+        try tmp.dir.writeFile(io, .{ .sub_path = ".thin/model-metadata.json", .data = legacy_cache });
+        MetadataFixture.calls.store(0, .monotonic);
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = automatic });
+        defer session.deinit();
+        session.metadata_fetch = MetadataFixture.fetch;
+        session.metadata_dev_fetch = MetadataFixture.dev;
+        session.metadata_wall_ms = 1000000;
+        session.metadata_awake_ms = 1000000;
+        // Unreadable in memory, but not a poison state: cadence and manual
+        // refresh both stay eligible.
+        try std.testing.expect(!session.metadata_blocked);
+        try std.testing.expectEqual(@as(usize, 0), session.metadata_cache.directory.count);
+        if (automatic) {
+            // Cadence success is reported by the launched job, not by this
+            // return value: the branch may start refresh and still return false.
+            _ = Session.pollModels(&session, true);
+        } else {
+            // Opting out of automatic refresh must leave the old bytes alone
+            // and issue no request until the user asks for one.
+            try std.testing.expect(!Session.pollModels(&session, true));
+            try std.testing.expect(session.metadata_job == null);
+            try std.testing.expectEqual(@as(usize, 0), MetadataFixture.calls.load(.monotonic));
+            const untouched = try tmp.dir.readFileAlloc(io, ".thin/model-metadata.json", a, .limited(1 << 16));
+            defer a.free(untouched);
+            try std.testing.expectEqualStrings(legacy_cache, untouched);
+            try Session.refreshModels(&session);
+        }
+        try std.testing.expect(session.metadata_job != null);
+        MetadataFixture.finish(&session);
+        try std.testing.expect(Session.pollModels(&session, true));
+        try std.testing.expect(session.metadata_job == null);
+        try std.testing.expectEqual(@as(usize, 1), MetadataFixture.calls.load(.monotonic));
+        const disk = try metadata.load(&session.store.root);
+        const row = disk.directory.rows[disk.directory.find(.deepseek, "deepseek-flash").?];
+        try std.testing.expectEqual(@as(?u32, 1048576), row.tokens);
+        try std.testing.expectEqual(@as(?bool, true), row.available);
+        const body = try tmp.dir.readFileAlloc(io, ".thin/model-metadata.json", a, .limited(1 << 16));
+        defer a.free(body);
+        try std.testing.expect(std.mem.find(u8, body, "\"version\":14") != null);
+        try std.testing.expect(std.mem.find(u8, body, "\"version\":12") == null);
+    }
+}
+
+test "future or damaged cache blocks cadence until the file is moved away" {
+    const config =
+        \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key":"fake-poisoned-cache","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+    ;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_][]const u8{
+        \\{"version":15,"directory_mask":1,"models":[]}
+        ,
+        \\{"version":14,"models":"damaged"}
+        ,
+    }) |poisoned| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path: [4096]u8 = undefined;
+        const home = path[0..try tmp.dir.realPath(io, &path)];
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        try writeSessionTestConfig(tmp.dir, config);
+        try tmp.dir.writeFile(io, .{ .sub_path = ".thin/model-metadata.json", .data = poisoned });
+        MetadataFixture.calls.store(0, .monotonic);
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = true });
+        defer session.deinit();
+        session.metadata_fetch = MetadataFixture.fetch;
+        session.metadata_dev_fetch = MetadataFixture.dev;
+        session.metadata_wall_ms = 1000000;
+        session.metadata_awake_ms = 1000000;
+        // Permissions follow the same path as any other load failure, so this
+        // stays a strict refusal and never becomes an implicit rebuild.
+        try std.testing.expect(session.metadata_blocked);
+        try std.testing.expectEqual(@as(usize, 0), session.metadata_cache.directory.count);
+        try std.testing.expect(!Session.pollModels(&session, true));
+        try std.testing.expect(session.metadata_job == null);
+        try std.testing.expectEqual(@as(usize, 0), MetadataFixture.calls.load(.monotonic));
+        const untouched = try tmp.dir.readFileAlloc(io, ".thin/model-metadata.json", a, .limited(1 << 16));
+        defer a.free(untouched);
+        try std.testing.expectEqualStrings(poisoned, untouched);
+        // Only removing the refused document lets an explicit claim succeed,
+        // and that success clears the cadence block for this session.
+        try tmp.dir.deleteFile(io, ".thin/model-metadata.json");
+        try Session.refreshModels(&session);
+        try std.testing.expect(!session.metadata_blocked);
+        MetadataFixture.finish(&session);
+        try std.testing.expect(Session.pollModels(&session, true));
+        try std.testing.expect(session.metadata_job == null);
+        try std.testing.expectEqual(@as(usize, 1), MetadataFixture.calls.load(.monotonic));
+        const disk = try metadata.load(&session.store.root);
+        try std.testing.expect(disk.directory.find(.deepseek, "deepseek-flash") != null);
+    }
 }

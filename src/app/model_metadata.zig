@@ -648,8 +648,8 @@ pub fn eligible(cache: *const Cache, requested: u8, now: u64, policy: Policy) u8
     return mask;
 }
 
-/// Single-directory schema only. Older and future documents are rejected,
-/// never migrated or overwritten by a failed load/claim.
+/// Only current-schema data loads; older schemas are rebuilt by a refresh
+/// claim, while future and malformed documents stay rejected.
 pub const cache_version: u32 = 14;
 
 const Document = struct {
@@ -661,18 +661,19 @@ const Document = struct {
 
 fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
     try json_bound.bound(bytes, max_cache_bytes, 131072);
-    var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
-    defer parsed.deinit();
-    const doc = parsed.value;
-    if (doc.version != cache_version) return error.InvalidMetadata;
     // Typed JSON integer parsing also accepts numeric strings. Cache capability
-    // fields deliberately require JSON integer tokens, not that coercion.
+    // fields deliberately require JSON integer tokens, not that coercion. This
+    // raw pass also classifies an older integer schema so a claim can rebuild
+    // instead of being blocked by the stale document.
     {
         var raw = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
         defer raw.deinit();
         if (raw.value == .object) {
             const version = raw.value.object.get("version") orelse return error.InvalidMetadata;
-            if (version != .integer or version.integer != cache_version) return error.InvalidMetadata;
+            if (version != .integer) return error.InvalidMetadata;
+            if (version.integer < 0) return error.InvalidMetadata;
+            if (version.integer < cache_version) return error.OutdatedMetadataCache;
+            if (version.integer != cache_version) return error.InvalidMetadata;
             if (raw.value.object.get("directory_mask")) |mask| {
                 if (mask != .integer or mask.integer < 0 or mask.integer > all_mask) return error.InvalidMetadata;
             }
@@ -714,6 +715,10 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
             }
         }
     }
+    var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
+    defer parsed.deinit();
+    const doc = parsed.value;
+    if (doc.version != cache_version) return error.InvalidMetadata;
     if (doc.models.len > directory.max_models or doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
     var result: Cache = .{ .directory_mask = doc.directory_mask, .refresh = doc.refresh };
     for (doc.models) |record| {
@@ -821,7 +826,21 @@ pub fn claimAt(root: *fs.Root, requested: u8, manual: bool, now: u64, policy: Po
     if (requested & ~(all_mask | dev_bit) != 0) return error.InvalidMetadata;
     const fd = try lock(root);
     defer fs.closeFd(fd);
-    var cache = try load(root);
+    var cache = load(root) catch |err| switch (err) {
+        // Only an older document schema is rebuilt by a claim. Every other load
+        // failure stays authoritative, and nothing old is migrated on disk.
+        error.OutdatedMetadataCache => blk: {
+            // The random baseline invalidates publications still in flight from
+            // before the rebuild and leaves headroom for later increments.
+            var bytes: [8]u8 = undefined;
+            try root.io.randomSecure(&bytes);
+            const generation = (std.mem.readInt(u64, &bytes, .little) & ((@as(u64, 1) << 61) - 1)) | (@as(u64, 1) << 61);
+            var fresh: Cache = .{};
+            for (&fresh.refresh) |*timing| timing.generation = generation;
+            break :blk fresh;
+        },
+        else => return err,
+    };
     const mask = if (manual) requested else eligible(&cache, requested, now, policy);
     if (mask != 0) {
         for (source_bits, &cache.refresh) |source, *timing| {
@@ -1171,9 +1190,15 @@ test "metadata rejects old future unknown and malformed cache without writing" {
         defer a.free(body);
         try root.writeMode(file_name, body, true, 0o600);
         const before = try root.dir.statFile(root.io, file_name, .{});
-        try std.testing.expectError(error.InvalidMetadata, load(&root));
-        try std.testing.expectError(error.InvalidMetadata, claimAt(&root, all_mask | dev_bit, true, 1000, .{}));
-        try std.testing.expectError(error.InvalidMetadata, commitAt(&root, all_mask, .{}, 1000));
+        if (version < @as(usize, cache_version)) {
+            // Older schemas are classified for claims, never migrated here.
+            try std.testing.expectError(error.OutdatedMetadataCache, load(&root));
+            try std.testing.expectError(error.OutdatedMetadataCache, commitAt(&root, all_mask, .{}, 1000));
+        } else {
+            try std.testing.expectError(error.InvalidMetadata, load(&root));
+            try std.testing.expectError(error.InvalidMetadata, claimAt(&root, all_mask | dev_bit, true, 1000, .{}));
+            try std.testing.expectError(error.InvalidMetadata, commitAt(&root, all_mask, .{}, 1000));
+        }
         const bytes = try root.read(a, file_name, 0, max_cache_bytes);
         defer a.free(bytes.data);
         try std.testing.expectEqualStrings(body, bytes.data);
@@ -1193,6 +1218,45 @@ test "metadata rejects old future unknown and malformed cache without writing" {
         const bytes = try root.read(a, file_name, 0, max_cache_bytes);
         defer a.free(bytes.data);
         try std.testing.expectEqualStrings(body, bytes.data);
+    }
+}
+
+test "metadata stale document is rebuilt by manual and automatic claims only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const a = std.testing.allocator;
+    // A claim against a missing cache still starts at generation 1.
+    const first = try claimAt(&root, all_mask, true, 900, .{});
+    try std.testing.expectEqual(@as(u64, 1), first.generations[0]);
+    const stale = "{\"version\":12,\"attempted\":1750000000000,\"records\":[{\"id\":\"legacy\",\"context_window\":4096}],\"models\":[{\"provider\":\"deepseek\",\"id\":\"legacy\",\"context_window\":4096}]}";
+    var listing: Listing = .{};
+    for (providers.Id.all) |id| {
+        const source = try parseListing(a, "{\"data\":[{\"id\":\"fresh\",\"context_window\":8192}]}", id);
+        try mergeOfficial(&listing, &source, id);
+    }
+    for ([_]bool{ true, false }) |manual| {
+        try root.writeMode(file_name, stale, true, 0o600);
+        try std.testing.expectError(error.OutdatedMetadataCache, load(&root));
+        const bytes = try root.read(a, file_name, 0, max_cache_bytes);
+        defer a.free(bytes.data);
+        try std.testing.expectEqualStrings(stale, bytes.data);
+        const rebuilt = try claimAt(&root, all_mask, manual, 1000, .{});
+        try std.testing.expectEqual(all_mask, rebuilt.mask);
+        try std.testing.expectEqual(@as(usize, 0), rebuilt.cache.directory.count);
+        for (rebuilt.generations) |generation| try std.testing.expect(generation >= (@as(u64, 1) << 61));
+        const published = try commitClaimedAt(&root, all_mask, listing, rebuilt.generations, 1010);
+        try std.testing.expectEqual(all_mask, published.accepted);
+        const reloaded = try load(&root);
+        try std.testing.expectEqual(@as(usize, 3), reloaded.directory.count);
+        try std.testing.expectEqual(@as(?u32, 8192), reloaded.directory.rows[reloaded.directory.find(.deepseek, "fresh").?].tokens);
+        // A claim taken before the rebuild can no longer publish.
+        const delayed = try commitClaimedAt(&root, all_mask, listing, first.generations, 1020);
+        try std.testing.expectEqual(@as(u8, 0), delayed.accepted);
+        const after = try load(&root);
+        try std.testing.expectEqual(@as(usize, 3), after.directory.count);
+        try std.testing.expectEqual(@as(?u32, 8192), after.directory.rows[after.directory.find(.deepseek, "fresh").?].tokens);
     }
 }
 
