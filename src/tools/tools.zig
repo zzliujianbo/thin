@@ -20,6 +20,11 @@ const decision = @import("../core/decision.zig");
 const image = @import("../core/image.zig");
 const image_file = @import("image_file.zig");
 const subagent = @import("../core/subagent.zig");
+const background = @import("../core/background.zig");
+
+/// Foreground bash description. The background variant appends its own sentence
+/// so a child Tools without a service never advertises background capability.
+const bash_description = "Run bash in the startup project; cwd changes do not persist. With decision review disabled, ordinary commands run without approval prompts; classified high-risk commands require explicit approval each time. Denial means no execution. timeout_ms follows host limits; built-in default is 5 minutes. stdout/stderr retain bounded head/tail, not full logs.";
 
 /// 暴露给模型的工具 schema 列表；顺序是对外契约（测试依赖 read_file 在 0、memory 在 3）。
 pub const schemas = [_]p.ToolSchema{
@@ -39,7 +44,7 @@ pub const schemas = [_]p.ToolSchema{
     },
     .{
         .name = "bash",
-        .description = "Run bash in the startup project; cwd changes do not persist. With decision review disabled, ordinary commands run without approval prompts; classified high-risk commands require explicit approval each time. Denial means no execution. timeout_ms follows host limits; built-in default is 5 minutes. stdout/stderr retain bounded head/tail, not full logs.",
+        .description = bash_description,
         .parameters_json =
         \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}
         ,
@@ -57,6 +62,26 @@ pub const schemas = [_]p.ToolSchema{
 // command-confirmation decision. These static variants add no prompt allocation
 // and preserve tool IDs, order and parameter schemas.
 const decision_bash_description = "Run bash in the startup project; cwd changes do not persist. The configured reviewer's ask=true requires approval for this call; ask=false removes the extra command-approval prompt. The reviewer also chooses the command deadline. Unavailable or invalid review pauses without executing. Denial means no execution. Hard validation, task deadlines, cancellation and output limits apply. stdout/stderr retain bounded head/tail, not full logs.";
+
+/// Background variants only appear when the host supplied a background service
+/// to a root Tools. They state that the bounded timeout covers startup only, so
+/// neither the built-in 5 minutes nor a reviewer deadline is mistaken for the
+/// lifetime of a handed-off service.
+const background_bash_description = bash_description ++ " background=true starts a managed service in this Thin instance: the call returns after a bounded startup wait with an id; timeout_ms bounds only that startup wait, not how long the service keeps running. Manage it with the background tool.";
+const decision_background_bash_description = decision_bash_description ++ " background=true starts a managed service in this Thin instance: the reviewer deadline and timeout_ms bound only the bounded startup wait; after handoff the service keeps running until it is stopped or Thin exits. Manage it with the background tool.";
+const bash_background_parameters_json =
+    \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},"background":{"type":"boolean"}},"required":["command"],"additionalProperties":false}
+;
+
+/// One management tool, appended after every other root tool. It exists only
+/// for a root Tools with a background service and no child channel.
+const background_schema: p.ToolSchema = .{
+    .name = "background",
+    .description = "Manage background commands started with bash background=true in this Thin instance. list pages services by launch order (default 20, at most 100); status returns state, exit code/signal, startup time and cleanup errors; logs reads incremental stdout/stderr with absolute raw byte offsets and a bounded total budget (default 4096, at most 16384); stop cancels and joins exactly one service and returns its final state. Unknown or foreign ids are rejected. Status and exit are only returned here: nothing is appended to the conversation automatically and no inference runs because a process changed state.",
+    .parameters_json =
+    \\{"type":"object","properties":{"action":{"type":"string","enum":["list","status","logs","stop"]},"id":{"type":"string","minLength":1,"maxLength":64},"after":{"type":"integer","minimum":0},"stdout_offset":{"type":"integer","minimum":0},"stderr_offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["action"],"additionalProperties":false}
+    ,
+};
 const decision_memory_description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Only write candidates are reviewed for durable value; skipped writes make no change, and a useful candidate is not authorization. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.";
 const reviewed_schemas = blk: {
     var result = schemas;
@@ -65,7 +90,7 @@ const reviewed_schemas = blk: {
     break :blk result;
 };
 fn schemasForDecision(enabled: bool) []const p.ToolSchema {
-    return schemasFor(enabled, false, true, 0);
+    return schemasFor(enabled, false, true, 0, false);
 }
 
 const image_schema: p.ToolSchema = .{
@@ -118,18 +143,28 @@ const parent_message_schema: p.ToolSchema = .{
 const parent_schemas = [_]p.ToolSchema{ subagent_schema, get_subagent_schema, send_subagent_schema, cancel_subagent_schema };
 /// Channel variants: none, parent job control (4 tools), child message (1 tool).
 const channel_choices = 3;
-/// Largest schema set: read/write/bash/memory + image + 4 parent tools.
-const max_schemas = 9;
+/// Largest schema set: read/write/bash/memory + image + 4 parent tools +
+/// the background management tool.
+const max_schemas = 10;
 const schema_choices = 2;
 
-fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_on: bool, comptime channel: usize) [max_schemas]p.ToolSchema {
+fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_on: bool, comptime channel: usize, comptime background_on: bool) [max_schemas]p.ToolSchema {
     var result: [max_schemas]p.ToolSchema = undefined;
     var count: usize = 0;
     const base = if (review) &reviewed_schemas else &schemas;
     for (base, 0..) |schema, i| {
         // Preserve read/write/bash/memory order; only memory is conditional.
         if (i == 3 and !memory_on) continue;
-        result[count] = schema;
+        if (i == 2 and background_on) {
+            // Same name and index, but the parameters expose the optional
+            // background dimension and the description explains startup-only
+            // timeouts. A Tools without a service keeps the old schema bytes.
+            result[count] = .{
+                .name = schema.name,
+                .description = if (review) decision_background_bash_description else background_bash_description,
+                .parameters_json = bash_background_parameters_json,
+            };
+        } else result[count] = schema;
         count += 1;
     }
     if (image_on) {
@@ -145,38 +180,43 @@ fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_
         result[count] = parent_message_schema;
         count += 1;
     }
+    // Appended last so every previous tool keeps its index.
+    if (background_on) {
+        result[count] = background_schema;
+        count += 1;
+    }
     return result;
 }
 
 // Static table of the small feature matrix. Slices point into read-only data, so
 // a rebind never invalidates a previously handed-out schema slice.
 const schema_table = blk: {
-    @setEvalBranchQuota(40000);
-    var table: [schema_choices][schema_choices][schema_choices][channel_choices][max_schemas]p.ToolSchema = undefined;
-    for (0..schema_choices) |review| for (0..schema_choices) |image_on| for (0..schema_choices) |memory_on| for (0..channel_choices) |channel| {
-        table[review][image_on][memory_on][channel] = buildSchemas(review == 1, image_on == 1, memory_on == 1, channel);
+    @setEvalBranchQuota(80000);
+    var table: [schema_choices][schema_choices][schema_choices][schema_choices][channel_choices][max_schemas]p.ToolSchema = undefined;
+    for (0..schema_choices) |background_on| for (0..schema_choices) |review| for (0..schema_choices) |image_on| for (0..schema_choices) |memory_on| for (0..channel_choices) |channel| {
+        table[background_on][review][image_on][memory_on][channel] = buildSchemas(review == 1, image_on == 1, memory_on == 1, channel, background_on == 1);
     };
     break :blk table;
 };
 
-fn schemaCount(image_on: bool, memory_on: bool, channel: usize) usize {
+fn schemaCount(image_on: bool, memory_on: bool, channel: usize, background_on: bool) usize {
     const channel_count: usize = switch (channel) {
         1 => parent_schemas.len,
         2 => 1,
         else => 0,
     };
-    return 4 + @as(usize, @intFromBool(image_on)) + channel_count - @as(usize, @intFromBool(!memory_on));
+    return 4 + @as(usize, @intFromBool(image_on)) + channel_count + @as(usize, @intFromBool(background_on)) - @as(usize, @intFromBool(!memory_on));
 }
 
-fn schemasFor(review: bool, image_on: bool, memory_on: bool, channel: usize) []const p.ToolSchema {
+fn schemasFor(review: bool, image_on: bool, memory_on: bool, channel: usize, background_on: bool) []const p.ToolSchema {
     // Explicit pointer to read-only static storage: the slice address stays
     // valid for the whole process, independent of any host/executor move.
-    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(review)][@intFromBool(image_on)][@intFromBool(memory_on)][channel];
-    return set[0..schemaCount(image_on, memory_on, channel)];
+    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(background_on)][@intFromBool(review)][@intFromBool(image_on)][@intFromBool(memory_on)][channel];
+    return set[0..schemaCount(image_on, memory_on, channel, background_on)];
 }
 
 fn schemasForServices(review: bool, enabled: bool) []const p.ToolSchema {
-    return schemasFor(review, enabled, true, 0);
+    return schemasFor(review, enabled, true, 0, false);
 }
 pub const ReadImage = struct { path: []const u8, question: []const u8 = image.default_question };
 fn validateReadImage(r: ReadImage) !void {
@@ -189,8 +229,9 @@ fn validateReadImage(r: ReadImage) !void {
 pub const Read = struct { path: []const u8, offset: u64 = 0, limit: ?u32 = null };
 /// write_file 的解析结果；覆盖已有文件必须显式设置 overwrite。
 pub const Write = struct { path: []const u8, content: []const u8, overwrite: bool = false };
-/// bash 的解析结果；timeout_ms 为空时使用配置的默认超时。
-pub const Bash = struct { command: []const u8, timeout_ms: ?u32 = null };
+/// bash 的解析结果；timeout_ms 为空时使用配置的默认超时。background=true
+/// 只改变本次调用的执行方式：异步启动一个实例内托管服务。
+pub const Bash = struct { command: []const u8, timeout_ms: ?u32 = null, background: bool = false };
 
 /// memory 工具的解析结果；topic 为 core 或 ASCII slug，list 时不得携带其他字段。
 pub const Memory = struct {
@@ -210,6 +251,7 @@ pub const Action = union(enum) {
     read_image: ReadImage,
     write_file: Write,
     bash: Bash,
+    background: background.Query,
     memory: Memory,
     subagent: subagent.Request,
     get_subagent_result: subagent.Query,
@@ -225,7 +267,11 @@ pub const Action = union(enum) {
             .write_file => |w| try std.fmt.allocPrint(a, "{s} {s} ({d} bytes)", .{
                 if (w.overwrite) "Write/replace" else "Create", w.path, w.content.len,
             }),
-            .bash => |b| try std.fmt.allocPrint(a, "Run bash: {s}", .{b.command}),
+            .bash => |b| try std.fmt.allocPrint(a, "Run bash{s}: {s}", .{ if (b.background) " (background service)" else "", b.command }),
+            .background => |q| if (q.id) |id|
+                try std.fmt.allocPrint(a, "Background {s} {s}", .{ q.action.name(), id })
+            else
+                try std.fmt.allocPrint(a, "Background {s}", .{q.action.name()}),
             // create 与 update 的区别仅在于 expected_version 是否为空。
             .memory => |m| if (m.action == .write)
                 try std.fmt.allocPrint(a, "Memory {s}: {s} ({d} bytes)\n{s}", .{ if (m.expected_version == null) "create" else "update", m.topic.?, m.content.?.len, m.content.? })
@@ -293,6 +339,17 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
         const timeout = args.timeout_ms orelse limits.command_timeout_ms;
         if (timeout == 0 or timeout > limits.command_max_timeout_ms) return error.InvalidCommandTimeout;
         return .{ .bash = args };
+    }
+
+    if (std.mem.eql(u8, name, "background")) {
+        // action-specific strictness (irrelevant fields, quoted/numeric coercion,
+        // cursors, id charset) lives in the pure core raw parser; Tools only adds
+        // availability and maps every contract failure to its own error code.
+        const query = background.parseQuery(a, arguments) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackgroundQuery,
+        };
+        return .{ .background = query };
     }
 
     if (std.mem.eql(u8, name, "subagent")) {
@@ -397,6 +454,10 @@ pub const Tools = struct {
     /// parent job tools and rejects forged calls at prepare and direct execute;
     /// child Tools are built without one, so recursive delegation fails there.
     subagent: ?subagent.Service = null,
+    /// Optional instance-owned background registry. Only a root Tools with this
+    /// service and no child channel exposes bash background=true and the
+    /// management tool. It is a separate capability from subagents.
+    background: ?background.Service = null,
     /// Root-shared write/bash serialization. All children of one root task
     /// borrow the same gate, so concurrent jobs can reason and read in parallel
     /// while mutating tools wait. The parent is refused instead of sharing it:
@@ -418,6 +479,17 @@ pub const Tools = struct {
 
     fn parentChannelActive(self: *Tools) bool {
         return self.parent_channel != null;
+    }
+
+    /// A child Tools never gets a background registry, and a forged service on
+    /// a child channel still must not unlock background start or management:
+    /// only the accepted root may own instance-level services.
+    fn backgroundActive(self: *Tools) bool {
+        return self.background != null and self.parent_channel == null;
+    }
+
+    fn isBackgroundManaged(name: []const u8) bool {
+        return std.mem.eql(u8, name, "background");
     }
 
     fn isParentTool(name: []const u8) bool {
@@ -443,6 +515,8 @@ pub const Tools = struct {
 
     fn checkAvailableActions(self: *Tools, action: Action) !void {
         switch (action) {
+            .bash => |b| if (b.background and !self.backgroundActive()) return error.BackgroundDisabled,
+            .background => if (!self.backgroundActive()) return error.BackgroundDisabled,
             .subagent => |request| {
                 if (!self.subagentActive()) return error.SubagentDisabled;
                 try subagent.validate(request);
@@ -577,7 +651,7 @@ pub const Tools = struct {
     pub fn executor(self: *Tools) runtime.Executor {
         return .{
             .context = self,
-            .schemas = schemasFor(self.config.decisionActive(), self.image != null, self.allow_memory, self.channelChoice()),
+            .schemas = schemasFor(self.config.decisionActive(), self.image != null, self.allow_memory, self.channelChoice(), self.backgroundActive()),
             .prepare_fn = prepare,
             .execute_fn = executePrepared,
             .preview_write_fn = previewWrite,
@@ -600,16 +674,21 @@ pub const Tools = struct {
     /// the stable-history copy.
     fn beforeFinish(context_: *anyopaque, a: std.mem.Allocator, cancel: *const p.Cancellation) !?[]const u8 {
         const self: *Tools = @ptrCast(@alignCast(context_));
+        // A handed-off service is not stopped at normal stop: only its health
+        // (including asynchronous cleanup failure) is checked so the root task
+        // cannot report success after an unrecoverable cleanup failure.
+        if (self.backgroundActive()) if (self.background) |service| try service.checkReady();
         const service = self.subagent orelse return null;
         return service.beforeFinish(a, cancel);
     }
 
     /// Unified accepted-task cleanup: cancel/join or retain child jobs before
-    /// Runtime joins the watchdog and finalizes Memory.
+    /// Runtime joins the watchdog and finalizes Memory. Background services are
+    /// instance-owned and survive this root task; only their health is checked.
     fn endTask(context_: *anyopaque, cancel: *const p.Cancellation) !void {
         const self: *Tools = @ptrCast(@alignCast(context_));
-        const service = self.subagent orelse return;
-        try service.endTask(cancel);
+        if (self.subagent) |service| try service.endTask(cancel);
+        if (self.backgroundActive()) if (self.background) |service| try service.checkReady();
     }
 
     fn previewWrite(context_: *anyopaque, a: std.mem.Allocator, path: []const u8, cancel: *const p.Cancellation) !?@import("../core/write_preview.zig").Baseline {
@@ -636,6 +715,9 @@ pub const Tools = struct {
         if (!self.allow_memory and std.mem.eql(u8, call.name, "memory")) return error.MemoryDisabled;
         if (!self.subagentActive() and isParentTool(call.name)) return error.SubagentDisabled;
         if (!self.parentChannelActive() and std.mem.eql(u8, call.name, "message_parent")) return error.SubagentMessageDisabled;
+        // Pure availability boundary: a child Tools (parent channel) and any
+        // Tools without a registry must reject the management tool before parse.
+        if (isBackgroundManaged(call.name) and !self.backgroundActive()) return error.BackgroundDisabled;
         // Double guard: an active/uncollected child must not race a parent write
         // or command. Pure check, so prepare stays side-effect free.
         if (std.mem.eql(u8, call.name, "write_file") or std.mem.eql(u8, call.name, "bash")) {
@@ -643,6 +725,8 @@ pub const Tools = struct {
         }
         const action = try a.create(Action);
         action.* = try parse(a, call.name, call.arguments, self.config.limits);
+        // Forged background arguments fail here as well as in direct execute.
+        try self.checkAvailableActions(action.*);
         try self.checkImageAction(action.*);
         try self.checkFileAction(a, action.*);
         if (action.* == .read_file) {
@@ -695,6 +779,10 @@ pub const Tools = struct {
         // Readiness/poison and argument guards are pure and precede all I/O.
         try self.checkImageAction(action);
         try self.checkAvailableActions(action);
+        // An instance-level background cleanup failure poisons EVERY ordinary
+        // tool execution, not only background calls: side effects are no longer
+        // known-safe. The service health check never stops a handed-off job.
+        if (self.backgroundActive()) if (self.background) |service| try service.checkReady();
         // Second half of the double guard: a direct forged execute must not
         // bypass the parent write/bash conflict rule.
         try self.checkParentConflict(action);
@@ -762,6 +850,31 @@ pub const Tools = struct {
             },
 
             .bash => |b| {
+                if (b.background) {
+                    // Background start: keep the same risk classification and
+                    // approval path (prepare already attached them). Only the
+                    // bounded startup wait uses the timeout; the Manager owns
+                    // the running service without a Tools/Runtime deadline.
+                    const service = self.background orelse return error.BackgroundDisabled;
+                    if (self.parentChannelActive()) return error.BackgroundDisabled;
+                    try service.checkReady();
+                    const startup_ms: u32 = if (timeout) |policy| switch (policy) {
+                        .none => self.config.limits.command_timeout_ms,
+                        .milliseconds => |ms| if (ms == 0 or ms > self.config.limits.command_max_timeout_ms) return error.InvalidTimeout else ms,
+                    } else b.timeout_ms orelse self.config.limits.command_timeout_ms;
+                    if (cancel.isRequested()) return error.Canceled;
+                    // Start and handoff happen inside this call; the mutation
+                    // gate is released when it returns, never held across the
+                    // service lifetime.
+                    const started = try service.start(a, .{
+                        .command = b.command,
+                        .startup_timeout_ms = startup_ms,
+                        .log_bytes = self.config.limits.output_bytes,
+                        .term_grace_ms = self.config.limits.cleanup_grace_ms,
+                        .cleanup_timeout_ms = self.config.limits.cleanup_timeout_ms,
+                    }, cancel);
+                    return mapBackgroundResult(started, true);
+                }
                 // 超时、取消与输出上限都交给 process.run；返回的标记用于区分失败原因。
                 const limit: ?u32 = if (timeout) |policy| switch (policy) {
                     .none => null,
@@ -886,6 +999,19 @@ pub const Tools = struct {
                 return mapServiceResult(try service.cancel(a, request, cancel));
             },
 
+            .background => |query| {
+                const service = self.background orelse return error.BackgroundDisabled;
+                if (self.parentChannelActive()) return error.BackgroundDisabled;
+                // The ordinary-execution poison check above already returns
+                // error.CleanupFailed when the service is unhealthy, matching
+                // the documented fail-stop rule.
+                if (cancel.isRequested()) return error.Canceled;
+                const result = try service.control(a, query, cancel);
+                // Stopping one service never cancels the current Q&A: the
+                // service token is not propagated as parent Execution.canceled.
+                return mapBackgroundResult(result, query.action != .stop);
+            },
+
             .message_parent => |message| {
                 const channel = self.parent_channel orelse return error.SubagentMessageDisabled;
                 if (cancel.isRequested()) return error.Canceled;
@@ -911,6 +1037,25 @@ pub const Tools = struct {
             .text = result.text,
             .is_error = result.is_error or result.canceled or cleanup,
             .canceled = result.canceled and !cleanup,
+            .truncated = result.truncated,
+            .cleanup_failed = cleanup,
+            .memory_evidence = false,
+        };
+    }
+
+    /// Same verbatim contract for the instance background service: `text` is
+    /// already the bounded single-layer JSON result and is never re-encoded, so
+    /// a cleanup failure cannot be masked by a later allocation failure.
+    /// Cleanup failure outranks cancellation. A management `stop` reports the
+    /// stopped service's cancellation but must not mark the current Q&A call
+    /// canceled; only start/list/status/logs interrupted by the parent token do.
+    fn mapBackgroundResult(result: background.Result, propagate_canceled: bool) Execution {
+        const cleanup = result.cleanup_failed;
+        const canceled = propagate_canceled and result.canceled and !cleanup;
+        return .{
+            .text = result.text,
+            .is_error = result.is_error or canceled or cleanup,
+            .canceled = canceled,
             .truncated = result.truncated,
             .cleanup_failed = cleanup,
             .memory_evidence = false,
@@ -1203,4 +1348,255 @@ test "image tool strict arguments schemas guards and bounded text output" {
 
 test {
     _ = @import("command_risk.zig");
+}
+
+/// Records service calls without any process, filesystem or network work.
+const FakeBackground = struct {
+    calls: usize = 0,
+    checks: usize = 0,
+    controls: usize = 0,
+    poisoned: bool = false,
+    cleanup_failed: bool = false,
+    last_command: []const u8 = "",
+    last_startup_ms: u32 = 0,
+    last_log_bytes: u32 = 0,
+    last_grace_ms: u32 = 0,
+    last_cleanup_ms: u32 = 0,
+    last_query: background.Query = .{ .action = .list },
+    start_text: []const u8 = "{\"id\":\"0123456789ab-1\",\"status\":\"running\"}",
+    control_text: []const u8 = "{\"id\":\"0123456789ab-1\",\"status\":\"exited\",\"exit_code\":0}",
+
+    fn service(self: *@This()) background.Service {
+        return .{ .context = self, .start_fn = @This().start, .control_fn = @This().control, .check_fn = @This().check };
+    }
+
+    fn check(raw: *anyopaque) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.checks += 1;
+        if (self.poisoned) return error.CleanupFailed;
+    }
+
+    fn start(raw: *anyopaque, a: std.mem.Allocator, s: background.Start, cancel: *const p.Cancellation) anyerror!background.Result {
+        _ = a;
+        _ = cancel;
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        self.last_command = s.command;
+        self.last_startup_ms = s.startup_timeout_ms;
+        self.last_log_bytes = s.log_bytes;
+        self.last_grace_ms = s.term_grace_ms;
+        self.last_cleanup_ms = s.cleanup_timeout_ms;
+        return .{ .text = self.start_text, .cleanup_failed = self.cleanup_failed };
+    }
+
+    fn control(raw: *anyopaque, a: std.mem.Allocator, q: background.Query, cancel: *const p.Cancellation) anyerror!background.Result {
+        _ = a;
+        _ = cancel;
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.controls += 1;
+        self.last_query = q;
+        return .{ .text = self.control_text };
+    }
+};
+
+fn fakeParentMessage(_: *anyopaque, _: std.mem.Allocator, _: subagent.Message, _: *const p.Cancellation) anyerror!subagent.Result {
+    return .{ .text = "{}" };
+}
+
+fn fakeSubagentRun(_: *anyopaque, _: std.mem.Allocator, _: subagent.Request, _: *const p.Cancellation) anyerror!subagent.Result {
+    return .{ .text = "{}" };
+}
+
+fn fakeSubagentActive(_: *anyopaque) bool {
+    return true;
+}
+
+test "background schema is appended last and old schemas keep indexes" {
+    for ([_]bool{ false, true }) |review| {
+        const off = schemasFor(review, true, true, 1, false);
+        const on = schemasFor(review, true, true, 1, true);
+        try std.testing.expectEqual(@as(usize, 9), off.len);
+        try std.testing.expectEqual(@as(usize, 10), on.len);
+        try std.testing.expectEqualStrings("read_image", off[4].name);
+        try std.testing.expectEqualStrings("read_image", on[4].name);
+        for (off, on[0..9]) |old, new| try std.testing.expectEqualStrings(old.name, new.name);
+        try std.testing.expectEqualStrings("background", on[9].name);
+        // A Tools without a service keeps the old bash parameters exactly.
+        try std.testing.expect(std.mem.indexOf(u8, off[2].parameters_json, "background") == null);
+        try std.testing.expect(std.mem.indexOf(u8, on[2].parameters_json, "\"background\":{\"type\":\"boolean\"}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, on[2].description, "not how long the service keeps running") != null or
+            std.mem.indexOf(u8, on[2].description, "after handoff the service keeps running until it is stopped or Thin exits") != null);
+        for ([_]p.ToolSchema{ on[2], on[9] }) |schema| {
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, schema.parameters_json, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value == .object);
+        }
+    }
+    // Child Tools never advertise background capability or the management tool.
+    const child = schemasFor(true, false, false, 2, false);
+    try std.testing.expectEqual(@as(usize, 4), child.len);
+    try std.testing.expectEqualStrings("message_parent", child[3].name);
+    try std.testing.expect(std.mem.indexOf(u8, child[2].parameters_json, "background") == null);
+    for (child) |schema| try std.testing.expect(!std.mem.eql(u8, schema.name, "background"));
+    // Root without subagent still appends the management tool last.
+    const root_only = schemasFor(false, true, true, 0, true);
+    try std.testing.expectEqual(@as(usize, 6), root_only.len);
+    try std.testing.expectEqualStrings("background", root_only[5].name);
+}
+
+test "background bash and management arguments stay strict" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const plain = try parse(a, "bash", "{\"command\":\"true\"}", .{});
+    try std.testing.expect(!plain.bash.background);
+    const bg = try parse(a, "bash", "{\"command\":\"true\",\"background\":true}", .{});
+    try std.testing.expect(bg.bash.background);
+    // 严格 bool：数字/null 不能被当成 true/false 接受。
+    if (parse(a, "bash", "{\"command\":\"true\",\"background\":1}", .{})) |_| return error.ExpectedStrictBackground else |_| {}
+    if (parse(a, "bash", "{\"command\":\"true\",\"background\":null}", .{})) |_| return error.ExpectedStrictBackground else |_| {}
+    // 旧 command 长度上限不受 background 影响。
+    const long = try a.alloc(u8, 32769);
+    @memset(long, 'a');
+    const long_args = try std.fmt.allocPrint(a, "{{\"command\":\"{s}\"}}", .{long});
+    try std.testing.expectError(error.InvalidCommand, parse(a, "bash", long_args, .{}));
+
+    const logs = try parse(a, "background", "{\"action\":\"logs\",\"id\":\"0123456789ab-1\",\"stdout_offset\":4,\"limit\":128}", .{});
+    try std.testing.expect(logs.background.action == .logs);
+    try std.testing.expectEqual(@as(u64, 4), logs.background.stdout_offset.?);
+    try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"list\",\"extra\":1}", .{}));
+    try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"list\",\"id\":\"0123456789ab-1\"}", .{}));
+    try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"list\",\"limit\":101}", .{}));
+    try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"status\"}", .{}));
+    try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"stop\",\"id\":\"0123456789ab-1\",\"after\":0}", .{}));
+    try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"logs\",\"id\":\"ABCDEF012345-1\"}", .{}));
+}
+
+test "background capability is root-only approved and never re-encoded" {
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake: FakeBackground = .{};
+    var tools: Tools = .{ .root = undefined, .memory = undefined, .config = &config, .environment = &env };
+    var cancel: p.Cancellation = .{};
+
+    // No registry: forged background start and the management tool fail before I/O.
+    try std.testing.expectError(error.BackgroundDisabled, tools.execute(a, .{ .bash = .{ .command = "true", .background = true } }, &cancel));
+    try std.testing.expectError(error.BackgroundDisabled, tools.execute(a, .{ .background = .{ .action = .list } }, &cancel));
+    try std.testing.expectError(error.BackgroundDisabled, Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"true\",\"background\":true}" }));
+    try std.testing.expectError(error.BackgroundDisabled, Tools.prepare(&tools, a, .{ .id = "m", .name = "background", .arguments = "{\"action\":\"list\"}" }));
+
+    // Root service: prepare stays pure but still carries risk/review metadata.
+    tools.background = fake.service();
+    const prepared = try Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"rm -rf build\",\"background\":true}" });
+    try std.testing.expect(prepared.explicit_denial != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.description, "DANGEROUS bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.description, "background service") != null);
+    try std.testing.expect(prepared.decision_input != null);
+    try std.testing.expectEqual(@as(usize, 0), fake.checks);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    const managed = try Tools.prepare(&tools, a, .{ .id = "m", .name = "background", .arguments = "{\"action\":\"status\",\"id\":\"0123456789ab-1\"}" });
+    const managed_action: *const Action = @ptrCast(@alignCast(managed.payload));
+    try std.testing.expect(managed_action.* == .background);
+    try std.testing.expectEqual(@as(usize, 0), fake.checks);
+
+    // Cancellation during the bounded startup wait never starts a service. The
+    // existing early-cancel semantics are an Execution result, not an error.
+    cancel.cancel();
+    const canceled_early = try tools.execute(a, .{ .bash = .{ .command = "svc", .background = true } }, &cancel);
+    try std.testing.expect(canceled_early.canceled);
+    try std.testing.expect(canceled_early.is_error);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    cancel = .{};
+
+    // Start maps the configured finite startup budget, log capacity and cleanup policy.
+    const started = try tools.execute(a, .{ .bash = .{ .command = "python -u app.py", .background = true } }, &cancel);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("python -u app.py", fake.last_command);
+    try std.testing.expectEqual(@as(u32, config.limits.command_timeout_ms), fake.last_startup_ms);
+    try std.testing.expectEqual(config.limits.output_bytes, fake.last_log_bytes);
+    try std.testing.expectEqual(@as(u32, config.limits.cleanup_grace_ms), fake.last_grace_ms);
+    try std.testing.expectEqual(@as(u32, config.limits.cleanup_timeout_ms), fake.last_cleanup_ms);
+    try std.testing.expectEqualStrings(fake.start_text, started.text);
+    try std.testing.expect(!started.memory_evidence);
+    try std.testing.expect(!started.is_error);
+
+    // timeout_ms and a reviewer deadline bound only the startup wait; review
+    // choosing none still uses the configured finite command timeout.
+    var action = Action{ .bash = .{ .command = "svc", .background = true, .timeout_ms = 4321 } };
+    _ = try Tools.executePrepared(&tools, a, .{ .payload = &action, .description = "x" }, &cancel);
+    try std.testing.expectEqual(@as(u32, 4321), fake.last_startup_ms);
+    var none_action = Action{ .bash = .{ .command = "svc", .background = true, .timeout_ms = 9999 } };
+    _ = try Tools.executePrepared(&tools, a, .{ .payload = &none_action, .description = "x", .command_timeout = .none }, &cancel);
+    try std.testing.expectEqual(@as(u32, config.limits.command_timeout_ms), fake.last_startup_ms);
+
+    // stop returns the service's terminal state verbatim; stopping one service
+    // is not caller cancellation and must not mark this Q&A canceled.
+    const stopped = try tools.execute(a, .{ .background = .{ .action = .stop, .id = "0123456789ab-1" } }, &cancel);
+    try std.testing.expectEqualStrings(fake.control_text, stopped.text);
+    try std.testing.expect(!stopped.canceled);
+    try std.testing.expect(!stopped.is_error);
+    try std.testing.expect(!stopped.memory_evidence);
+    try std.testing.expect(fake.last_query.action == .stop);
+
+    // A cleanup failure is returned verbatim and poisons; no re-encoding.
+    fake.cleanup_failed = true;
+    const failed = try tools.execute(a, .{ .bash = .{ .command = "svc", .background = true } }, &cancel);
+    try std.testing.expect(failed.cleanup_failed);
+    try std.testing.expect(failed.is_error);
+    try std.testing.expectEqualStrings(fake.start_text, failed.text);
+    fake.cleanup_failed = false;
+
+    // A poisoned service fails ordinary tools and both lifecycle hooks without
+    // stopping the already handed-off service.
+    fake.poisoned = true;
+    const controls_before = fake.controls;
+    try std.testing.expectError(error.CleanupFailed, tools.execute(a, .{ .read_file = .{ .path = "x" } }, &cancel));
+    try std.testing.expectError(error.CleanupFailed, Tools.beforeFinish(&tools, a, &cancel));
+    try std.testing.expectError(error.CleanupFailed, Tools.endTask(&tools, &cancel));
+    try std.testing.expectEqual(controls_before, fake.controls);
+    fake.poisoned = false;
+
+    // A child channel rejects background even with a forged service, in prepare
+    // and direct execute, and its schema surface is the old child one.
+    tools.parent_channel = .{ .context = &fake, .message_fn = fakeParentMessage };
+    try std.testing.expectError(error.BackgroundDisabled, Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"true\",\"background\":true}" }));
+    try std.testing.expectError(error.BackgroundDisabled, tools.execute(a, .{ .bash = .{ .command = "true", .background = true } }, &cancel));
+    try std.testing.expectError(error.BackgroundDisabled, Tools.prepare(&tools, a, .{ .id = "m", .name = "background", .arguments = "{\"action\":\"list\"}" }));
+    try std.testing.expectError(error.BackgroundDisabled, tools.execute(a, .{ .background = .{ .action = .list } }, &cancel));
+    // A production child runs with memory disabled; mirror that here instead of
+    // changing the tools surface.
+    tools.allow_memory = false;
+    const child_schemas = tools.executor().schemas;
+    try std.testing.expectEqual(@as(usize, 4), child_schemas.len);
+    try std.testing.expect(std.mem.indexOf(u8, child_schemas[2].parameters_json, "background") == null);
+    tools.allow_memory = true;
+    tools.parent_channel = null;
+
+    // The existing parent/child mutation guard still refuses background bash.
+    var sub_marker: u8 = 0;
+    tools.subagent = .{ .context = &sub_marker, .run_fn = fakeSubagentRun, .active_fn = fakeSubagentActive };
+    try std.testing.expectError(error.SubagentActive, Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"true\",\"background\":true}" }));
+    try std.testing.expectError(error.SubagentActive, tools.execute(a, .{ .bash = .{ .command = "true", .background = true } }, &cancel));
+    tools.subagent = null;
+
+    // Default foreground bash is unchanged and never calls the background service.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
+    defer root.deinit();
+    tools.root = &root;
+    const calls_before = fake.calls;
+    const foreground = try tools.execute(a, .{ .bash = .{ .command = "printf ok" } }, &cancel);
+    try std.testing.expectEqual(calls_before, fake.calls);
+    try std.testing.expect(!foreground.is_error);
+    const fg = try std.json.parseFromSliceLeaky(std.json.Value, a, foreground.text, .{});
+    try std.testing.expectEqualStrings("ok", fg.object.get("stdout").?.string);
+    try std.testing.expect(fg.object.get("id") == null);
 }

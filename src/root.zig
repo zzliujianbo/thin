@@ -98,6 +98,9 @@ test {
     _ = @import("tests/context_usage_test.zig");
     _ = @import("core/subagent.zig");
     _ = @import("core/subagent_test.zig");
+    _ = @import("core/background.zig");
+    _ = @import("tests/background_service_test.zig");
+    _ = @import("tests/app_background_test.zig");
     _ = @import("tools/subagent_tool_test.zig");
     _ = @import("tests/subagent_service_test.zig");
     _ = @import("tests/subagent_app_test.zig");

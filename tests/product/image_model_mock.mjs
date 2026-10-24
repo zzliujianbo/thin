@@ -135,7 +135,8 @@ export async function imageModelRegressions({app,pty,execute}) {
           assert.deepEqual(system,primarySystem);
         }
         const names = body.tools.map(t=>t.function.name);
-        assert.deepEqual(names, [...FIRST_FOUR,...(selected && !off ? ['read_image'] : []),...SUBAGENT_FOUR]);
+        assert.deepEqual(names, [...FIRST_FOUR,...(selected && !off ? ['read_image'] : []),...SUBAGENT_FOUR,'background']);
+        assert.equal(names.at(-1),'background');
         assert.deepEqual(body.tools.slice(0,4),primaryTools,'Image changed an existing tool schema');
         if (isPty && mainPosts === 1) {
           assert.equal(auxPosts,0); assert.equal(body.messages.at(-1).content,WARMUP);

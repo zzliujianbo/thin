@@ -20,6 +20,8 @@ const knowledge = @import("../core/knowledge.zig");
 const MemoryCoordinator = @import("memory_service.zig").Coordinator;
 const subagent_service = @import("subagent_service.zig");
 const SubagentService = subagent_service.SubagentService;
+const background_service = @import("background_service.zig");
+const BackgroundService = background_service.BackgroundService;
 
 /// Idle replacement owners have never sent a request, and used owners have
 /// already joined the worker. An unreapable child is a fail-stop condition,
@@ -75,6 +77,11 @@ pub const App = struct {
     /// Owns the parent-domain subagent quota and any retained image cleanup
     /// owner. Its service is rebound to Tools on idle settings replacement.
     subagent: SubagentService,
+    /// Instance-owned background command registry. This is the only owner: it
+    /// survives connection/settings replacement and every executor rebind only
+    /// republishes its service value. Its deps are published once, after the
+    /// anchored root and the filtered command environment exist.
+    background: BackgroundService = .{},
 
     /// Agent 运行时，最后初始化，依赖前面所有字段。
     runtime: r.Runtime,
@@ -188,7 +195,19 @@ pub const App = struct {
         };
         self.environment = try tools.commandEnvironmentMany(a, environ, secret_names[0..secret_count]);
         errdefer self.environment.deinit();
-        self.executor = .{ .root = &self.root, .memory = &self.memory, .config = &self.config.value, .environment = &self.environment, .auth_path = self.auth_path };
+        // Publish the background owner exactly once, now that the anchored root
+        // and the minimal command environment are stable App fields. Each start
+        // freezes its own cwd dirfd/environment copy; a later connection or
+        // settings install must never rebuild or rebind this registry.
+        self.background = .{};
+        errdefer self.background.deinit();
+        self.background.deps = .{
+            .allocator = a,
+            .io = io,
+            .root = &self.root,
+            .environment = &self.environment,
+        };
+        self.executor = .{ .root = &self.root, .memory = &self.memory, .config = &self.config.value, .environment = &self.environment, .auth_path = self.auth_path, .background = self.background.service() };
         self.client = try http.Client.initWithEnv(a, io, &self.config.value, key, environ);
         errdefer self.client.deinit();
         self.decision_client = try DecisionClient.create(a, io, self.config.value, environ);
@@ -413,6 +432,9 @@ pub const App = struct {
         }
         self.executor.image = self.imageService();
         self.executor.subagent = self.subagent.service();
+        // Rebinding republishes the same instance-owned registry; running jobs
+        // keep their frozen cwd/environment and are never touched here.
+        self.executor.background = self.background.service();
         self.runtime.executor = self.executor.executor();
         // Schema edits affect future estimates, not the latest server-reported
         // primary usage (including fresh-session zero or genuinely unknown).
@@ -494,6 +516,9 @@ pub const App = struct {
         self.image_client = replacement.image_client;
         self.executor.image = self.imageService();
         self.executor.subagent = self.subagent.service();
+        // A connection install rebinds the same background owner; existing
+        // services keep their startup cwd/environment and cleanup policy.
+        self.executor.background = self.background.service();
         self.runtime.executor = self.executor.executor();
         self.recordSelection();
         self.allocator.destroy(replacement);
@@ -547,6 +572,10 @@ pub const App = struct {
         const a = self.allocator;
         self.subagent.deinit();
         self.runtime.deinit();
+        // Foreground tasks and delegated children are joined above. Only then
+        // notify every background service to cancel and join the whole set, so
+        // no worker can borrow a root/environment that is about to be released.
+        self.background.deinit();
         // Interactive exit/model replacement cancels immediately. Headless
         // success explicitly drains with signal handling before destruction.
         self.memory_coordinator.deinit();

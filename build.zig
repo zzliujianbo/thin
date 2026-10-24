@@ -167,6 +167,12 @@ pub fn build(b: *std.Build) void {
     const run_subagent = fixture(b, "node", "tests/product/subagent_mock.mjs", &.{exe}, &.{});
     b.step("test-subagent", "Run owned-loopback interactive subagent Runtime acceptance").dependOn(&run_subagent.step);
 
+    // Instance-owned background services: owned loopback plus a real PTY, so
+    // cross-task keep-alive is proven in one App instance (--print exits must
+    // clear every service, which is the correct headless semantic).
+    const run_background = fixture(b, "python3", "tests/product/background_mock.py", &.{exe}, &.{});
+    b.step("test-background", "Run owned-loopback background service lifecycle and cross-task acceptance").dependOn(&run_background.step);
+
     const run_idle_enter = fixture(b, "python3", "tests/product/idle_enter_mock.py", &.{exe}, &.{});
     b.step("test-idle-enter", "Run owned idle prompt newline PTYs (requires Python 3)").dependOn(&run_idle_enter.step);
 
@@ -211,6 +217,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_memory.step);
     test_all.dependOn(&run_memory_app.step);
     test_all.dependOn(&run_subagent.step);
+    test_all.dependOn(&run_background.step);
     test_all.dependOn(&run_presentation.step);
     test_all.dependOn(&run_http.step);
     test_all.dependOn(&run_anthropic.step);

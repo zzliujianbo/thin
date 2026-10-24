@@ -21,6 +21,21 @@ pub const OutputSink = struct {
     write_fn: *const fn (*anyopaque, []const u8) anyerror!void,
 };
 
+/// 已验证启动握手的通知内容：`launched` 为 true 表示 exec 成功且进程组归本模块所有。
+pub const LaunchNotice = struct {
+    pid: c.pid_t,
+    /// exec 成功（CLOEXEC 握手管道 EOF）；false 表示启动失败。
+    launched: bool,
+    /// 子进程确为自己进程组的组长，可用 -pid 对整组发信号。
+    group_owned: bool,
+};
+
+/// Borrowed, non-allocating launch notification.
+pub const LaunchNotify = struct {
+    context: *anyopaque,
+    notify_fn: *const fn (*anyopaque, LaunchNotice) void,
+};
+
 /// 子进程运行参数（超时、输出预算、清理时间预算）。
 pub const Options = struct {
     /// 命令 deadline；null 仅关闭此 deadline，取消和有界清理始终有效。
@@ -33,6 +48,26 @@ pub const Options = struct {
     /// triggers bounded cleanup before returning that error; cleanup_failed takes
     /// precedence and returns Result so the owner can poison its transport.
     stdout_sink: ?OutputSink = null,
+    /// Raw incremental stderr, independent of captured stderr. With a sink
+    /// stderr is counted/drained but never retained; Result.stderr is empty and
+    /// no stderr capture buffer is allocated. Same failure/cancellation rules as
+    /// stdout_sink; after cleanup both sinks are checked (stdout first).
+    stderr_sink: ?OutputSink = null,
+    /// Internal, for passive bounded log collectors only (background jobs).
+    /// Cancellation still triggers bounded TERM/KILL cleanup, but cleanup output
+    /// keeps reaching the sinks instead of being dropped, so the collector's raw
+    /// totals stay truthful.
+    /// Only valid when both callbacks are non-blocking passive appends that cannot
+    /// observe or act on cancellation. Transports keep false: no bytes are
+    /// delivered once cancellation begins. A callback error is always sticky and
+    /// still stops delivery.
+    /// 中文：仅内部使用。取消后仍继续投递清理输出，只适用于不阻塞、不感知取消的被动日志收集器；
+    /// transport 保持 false，回调错误照旧 sticky 停止。
+    continue_sinks_on_cancel: bool = false,
+    /// Bounded launch-handshake notification, delivered at most once, on the run
+    /// thread, as soon as the exec handshake resolves and before the next drain
+    /// batch. The callback must not allocate unboundedly, block, or re-enter run.
+    on_launch: ?LaunchNotify = null,
     /// 发送 TERM 后的宽限时间（毫秒），到期升级为 KILL。
     term_grace_ms: u32 = 1000,
     /// 清理阶段的总时间预算（毫秒），耗尽后报告 cleanup_failed。
@@ -264,6 +299,50 @@ const Capture = struct {
     }
 };
 
+/// 与子进程输出完全相同规则（非法 UTF-8、终端控制、方向控制、反斜杠）的
+/// 安全文本宽度，用于给任意已截断的原始字节分配恰好足够的输出空间。
+pub fn safeTextWidth(bytes: []const u8) usize {
+    var offset: usize = 0;
+    var width: usize = 0;
+    while (offset < bytes.len) {
+        const t = Capture.token(bytes[offset..]);
+        offset += t.raw;
+        width += t.width;
+    }
+    return width;
+}
+
+/// 用与 `Capture.render` 相同的转义规则编码一段原始字节，返回 allocator 分配的文本。
+/// 不截断输入；调用方负责先按预算切分（见 `safeTextFit`）。
+pub fn renderSafeText(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const dst = try allocator.alloc(u8, safeTextWidth(bytes));
+    errdefer allocator.free(dst);
+    var offset: usize = 0;
+    var used: usize = 0;
+    while (offset < bytes.len) {
+        const t = Capture.token(bytes[offset..]);
+        Capture.encode(dst[used..], bytes[offset..], t);
+        offset += t.raw;
+        used += t.width;
+    }
+    return dst[0..used];
+}
+
+/// 能完整编码进 `budget` 字节的最大原始前缀（不切断 UTF-8 字符或转义序列）。
+pub const TextFit = struct { raw: usize, width: usize };
+
+pub fn safeTextFit(bytes: []const u8, budget: usize) TextFit {
+    var offset: usize = 0;
+    var width: usize = 0;
+    while (offset < bytes.len) {
+        const t = Capture.token(bytes[offset..]);
+        if (width + t.width > budget) break;
+        offset += t.raw;
+        width += t.width;
+    }
+    return .{ .raw = offset, .width = width };
+}
+
 /// 将管道设为 O_NONBLOCK：无数据时 read 立即返回 EAGAIN，轮询循环不会被阻塞。
 fn nonblocking(fd: c.fd_t) !void {
     const flags = c.fcntl(fd, c.F.GETFL);
@@ -285,6 +364,8 @@ const SinkState = struct {
     failure: ?anyerror = null,
     stopped: bool = false,
     canceled: bool = false,
+    /// Bounded passive log callbacks keep receiving cleanup bytes after cancel.
+    continue_on_cancel: bool = false,
 
     fn write(self: *SinkState, bytes: []const u8) void {
         if (self.stopped) return;
@@ -294,7 +375,9 @@ const SinkState = struct {
             self.canceled = true;
         };
         self.canceled = self.canceled or self.cancel.isRequested();
-        if (self.canceled) {
+        // Transports are silenced on cancel; passive log collectors must keep the
+        // TERM/KILL cleanup bytes so their totals match the real stream.
+        if (self.canceled and !self.continue_on_cancel) {
             self.stopped = true;
             return;
         }
@@ -452,11 +535,25 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
     };
 
     // 两路输出各占一半预算：stdout 向上取整，stderr 向下取整，合计恰为 output_bytes。
-    var sink_state: ?SinkState = if (options.stdout_sink) |sink| .{ .sink = sink, .io = io, .cancel = cancel } else null;
-    const stdout_sink: ?*SinkState = if (sink_state) |*state| state else null;
-    var out: Capture = .{ .data = try allocator.alloc(u8, if (stdout_sink != null) 0 else (options.output_bytes + @as(u64, 1)) / 2) };
+    // 有 sink 的一路不分配捕获缓冲，原始字节只交给 callback。
+    var empty: [0]u8 = .{};
+    var out_sink_state: ?SinkState = if (options.stdout_sink) |sink| .{
+        .sink = sink,
+        .io = io,
+        .cancel = cancel,
+        .continue_on_cancel = options.continue_sinks_on_cancel,
+    } else null;
+    var err_sink_state: ?SinkState = if (options.stderr_sink) |sink| .{
+        .sink = sink,
+        .io = io,
+        .cancel = cancel,
+        .continue_on_cancel = options.continue_sinks_on_cancel,
+    } else null;
+    const stdout_sink: ?*SinkState = if (out_sink_state) |*state| state else null;
+    const stderr_sink: ?*SinkState = if (err_sink_state) |*state| state else null;
+    var out: Capture = .{ .data = if (stdout_sink != null) empty[0..] else try allocator.alloc(u8, (options.output_bytes + @as(u64, 1)) / 2) };
     defer allocator.free(out.data);
-    var err: Capture = .{ .data = try allocator.alloc(u8, options.output_bytes / 2) };
+    var err: Capture = .{ .data = if (stderr_sink != null) empty[0..] else try allocator.alloc(u8, options.output_bytes / 2) };
     defer allocator.free(err.data);
 
     // 计时起点，用于超时与清理期限（spawn 之前记录）。
@@ -512,6 +609,7 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
     // ownership=false 表示 PID 所有权已丢失（被他人回收），此后绝不再发信号。
     var ownership = true;
     var launch_status: spawn.Status = .pending;
+    var launch_notified = false;
 
     while (true) {
         // 启动握手与输出共享同一有界循环，不在 exec 错误管道上同步等待。
@@ -522,12 +620,22 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
             };
             if (launch_status == .failed and failure == null) failure = error.SpawnFailed;
         }
+        // 握手一旦有结果，最多通知一次；调用方据此完成交接，本函数继续接管清理。
+        if (!launch_notified and launch_status != .pending) {
+            launch_notified = true;
+            if (options.on_launch) |notify| notify.notify_fn(notify.context, .{
+                .pid = pid,
+                // 只有 exec 确实且无早期错误（含 signal 恢复失败）才是可交接的启动。
+                .launched = launch_status == .executed and failure == null,
+                .group_owned = group_owned,
+            });
+        }
         // 每轮先排空两路管道，避免子进程因管道写满而阻塞。
         if (out_ready) drain(child.stdout, &out, stdout_sink) catch |e| {
             failure = e;
             out_ready = false;
         };
-        if (err_ready) drain(child.stderr, &err, null) catch |e| {
+        if (err_ready) drain(child.stderr, &err, stderr_sink) catch |e| {
             failure = e;
             err_ready = false;
         };
@@ -549,20 +657,27 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
             result.canceled = true;
         };
         result.canceled = result.canceled or cancel.isRequested();
-        if (stdout_sink) |state| result.canceled = result.canceled or state.canceled;
+        for ([_]?*SinkState{ stdout_sink, stderr_sink }) |maybe_state| {
+            if (maybe_state) |state| result.canceled = result.canceled or state.canceled;
+        }
 
         // 进入清理的条件：已退出（需收拾残留后代）、出错、被取消或超时。先发 TERM，请求优雅退出。
         if (cleaning == null) {
             result.timed_out = !exited and if (options.timeout_ms) |limit| elapsed(io, start) >= limit else false;
             const sink_failed = if (stdout_sink) |state| state.failure != null else false;
-            if (exited or failure != null or sink_failed or result.canceled or result.timed_out) {
+            const err_sink_failed = if (stderr_sink) |state| state.failure != null else false;
+            if (exited or failure != null or sink_failed or err_sink_failed or result.canceled or result.timed_out) {
                 cleaning = std.Io.Clock.awake.now(io);
                 if (!signal(if (group_owned) -pid else pid, .TERM)) result.cleanup_failed = true;
             }
         }
 
-        if (result.canceled or result.timed_out) {
-            if (stdout_sink) |state| state.stopped = true;
+        // Log collectors opt into draining cleanup output; transports keep the
+        // original behavior of dropping all bytes after cancel/timeout.
+        if ((result.canceled or result.timed_out) and !options.continue_sinks_on_cancel) {
+            for ([_]?*SinkState{ stdout_sink, stderr_sink }) |maybe_state| {
+                if (maybe_state) |state| state.stopped = true;
+            }
         }
 
         // 清理阶段：超过宽限期后升级为 KILL；cleanup 预算需为 KILL 预留时间。
@@ -634,17 +749,57 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
     if (stdout_sink) |state| {
         if (state.failure) |e| return e;
     }
+    if (stderr_sink) |state| {
+        if (state.failure) |e| return e;
+    }
     if (failure) |e| return e;
 
     // Sink bytes are intentionally not retained, not truncated capture bytes.
     result.stdout = if (stdout_sink != null) try allocator.dupe(u8, "") else if (options.raw_output) try out.rawRender(allocator) else try out.render(allocator);
     errdefer allocator.free(result.stdout);
-    result.stderr = if (options.raw_output) try err.rawRender(allocator) else try err.render(allocator);
+    result.stderr = if (stderr_sink != null) try allocator.dupe(u8, "") else if (options.raw_output) try err.rawRender(allocator) else try err.render(allocator);
 
     // 发生省略或未读到 EOF，都说明输出不完整。
     result.truncated = out.omitted or err.omitted or !out.eof or !err.eof;
     return result;
 }
+
+// 双路 sink 探针：记录两路字节、调用次数与启动握手通知。
+const BothSinkProbe = struct {
+    out: std.ArrayList(u8) = .empty,
+    err: std.ArrayList(u8) = .empty,
+    out_calls: usize = 0,
+    err_calls: usize = 0,
+    notices: usize = 0,
+    notice: ?LaunchNotice = null,
+    fail_err: bool = false,
+    cancel: ?*p.Cancellation = null,
+
+    fn writeOut(context: *anyopaque, bytes: []const u8) !void {
+        const self: *BothSinkProbe = @ptrCast(@alignCast(context));
+        self.out_calls += 1;
+        try self.out.appendSlice(std.testing.allocator, bytes);
+        if (self.cancel) |token| token.cancel();
+    }
+
+    fn writeErr(context: *anyopaque, bytes: []const u8) !void {
+        const self: *BothSinkProbe = @ptrCast(@alignCast(context));
+        self.err_calls += 1;
+        try self.err.appendSlice(std.testing.allocator, bytes);
+        if (self.fail_err) return error.TestErrSinkFailed;
+    }
+
+    fn notify(context: *anyopaque, notice: LaunchNotice) void {
+        const self: *BothSinkProbe = @ptrCast(@alignCast(context));
+        self.notices += 1;
+        self.notice = notice;
+    }
+
+    fn deinit(self: *BothSinkProbe) void {
+        self.out.deinit(std.testing.allocator);
+        self.err.deinit(std.testing.allocator);
+    }
+};
 
 // Owned sink fixtures: the child cannot finish until its first chunk has been
 // observed and acknowledged by the callback. No timing/sleep-based inference.
@@ -785,6 +940,119 @@ test "stdout sink cancellation drains cleanup output without further callbacks" 
     try std.testing.expectEqualStrings("ready", sink.bytes.items);
     try std.testing.expectEqual(@as(u64, 12), result.stdout_bytes);
     try std.testing.expect(!result.truncated);
+}
+
+test "stderr sink retains nothing and launch notice reports owned exec once" {
+    var ctx = try TestContext.init();
+    defer ctx.deinit();
+    var probe: BothSinkProbe = .{};
+    defer probe.deinit();
+    var cancel: p.Cancellation = .{};
+    var options = test_options;
+    options.output_bytes = 16;
+    options.stdout_sink = .{ .context = &probe, .write_fn = BothSinkProbe.writeOut };
+    options.stderr_sink = .{ .context = &probe, .write_fn = BothSinkProbe.writeErr };
+    options.on_launch = .{ .context = &probe, .notify_fn = BothSinkProbe.notify };
+    const result = try run(std.testing.allocator, std.testing.io, ctx.root, "printf out; printf '%100s' '' >&2; printf tail", &ctx.env, options, &cancel);
+    defer freeResult(result);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term.?);
+    try std.testing.expect(!result.cleanup_failed and !result.canceled and !result.timed_out);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expectEqual(@as(u64, 7), result.stdout_bytes);
+    try std.testing.expectEqual(@as(u64, 100), result.stderr_bytes);
+    try std.testing.expectEqualStrings("outtail", probe.out.items);
+    try std.testing.expectEqual(@as(usize, 100), probe.err.items.len);
+    try std.testing.expectEqual(@as(usize, 1), probe.notices);
+    try std.testing.expect(probe.notice.?.launched and probe.notice.?.group_owned);
+    try std.testing.expect(probe.notice.?.pid > 1);
+    // 契约是 exec 握手完成后通知一次；通知与两路首次输出之间不存在跨 fd 的绝对顺序。
+}
+
+test "launch notice reports failed exec before cleanup and error" {
+    var ctx = try TestContext.init();
+    defer ctx.deinit();
+    var probe: BothSinkProbe = .{};
+    defer probe.deinit();
+    var cancel: p.Cancellation = .{};
+    const missing = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing-executable", .{ctx.root});
+    defer std.testing.allocator.free(missing);
+    var options = test_options;
+    options.on_launch = .{ .context = &probe, .notify_fn = BothSinkProbe.notify };
+    try std.testing.expectError(error.SpawnFailed, runExecutable(std.testing.allocator, std.testing.io, ctx.root, "exit 0", &ctx.env, options, &cancel, .{ .executable = missing }));
+    try std.testing.expectEqual(@as(usize, 1), probe.notices);
+    try std.testing.expect(!probe.notice.?.launched);
+}
+
+test "stderr sink error is sticky and cleanup failure takes precedence" {
+    var ctx = try TestContext.init();
+    defer ctx.deinit();
+    {
+        var probe: BothSinkProbe = .{ .fail_err = true };
+        defer probe.deinit();
+        var cancel: p.Cancellation = .{};
+        var options = test_options;
+        options.stderr_sink = .{ .context = &probe, .write_fn = BothSinkProbe.writeErr };
+        try std.testing.expectError(error.TestErrSinkFailed, run(std.testing.allocator, std.testing.io, ctx.root, "printf err >&2; while :; do :; done", &ctx.env, options, &cancel));
+        try std.testing.expectEqual(@as(usize, 1), probe.err_calls);
+    }
+    {
+        var probe: BothSinkProbe = .{ .fail_err = true };
+        defer probe.deinit();
+        var cancel: p.Cancellation = .{};
+        var options = test_options;
+        options.stderr_sink = .{ .context = &probe, .write_fn = BothSinkProbe.writeErr };
+        options.cleanup_timeout_ms = 0;
+        options.term_grace_ms = 0;
+        const result = try run(std.testing.allocator, std.testing.io, ctx.root, "trap '' TERM; printf err >&2; while :; do :; done", &ctx.env, options, &cancel);
+        defer freeResult(result);
+        if (result.unreaped_pid) |pid| {
+            const start = std.Io.Clock.awake.now(std.testing.io);
+            while (true) {
+                var status: c_int = 0;
+                const rc = c.waitpid(pid, &status, linux.W.NOHANG);
+                if (rc == pid or (rc < 0 and std.posix.errno(rc) == .CHILD)) break;
+                try std.testing.expect(rc == 0 or std.posix.errno(rc) == .INTR);
+                try std.testing.expect(elapsed(std.testing.io, start) < 2500);
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+            }
+        }
+        try std.testing.expect(result.cleanup_failed and result.truncated);
+        try std.testing.expectEqual(@as(usize, 1), probe.err_calls);
+    }
+}
+
+test "both sinks stop delivering after cancellation" {
+    var ctx = try TestContext.init();
+    defer ctx.deinit();
+    var cancel: p.Cancellation = .{};
+    var probe: BothSinkProbe = .{ .cancel = &cancel };
+    defer probe.deinit();
+    var options = test_options;
+    options.stdout_sink = .{ .context = &probe, .write_fn = BothSinkProbe.writeOut };
+    options.stderr_sink = .{ .context = &probe, .write_fn = BothSinkProbe.writeErr };
+    const result = try run(std.testing.allocator, std.testing.io, ctx.root, "trap 'printf cleanup; exit 0' TERM; printf ready; : > ready; while :; do :; done", &ctx.env, options, &cancel);
+    defer freeResult(result);
+    try std.testing.expect(result.canceled and !result.cleanup_failed);
+    try std.testing.expectEqual(@as(usize, 1), probe.out_calls);
+    try std.testing.expectEqualStrings("ready", probe.out.items);
+    try std.testing.expectEqual(@as(usize, 0), probe.err_calls);
+}
+
+test "safe text helpers reuse capture escaping exactly" {
+    const bytes = "a\x1b\x00\xff\r\n\\中\xe2\x80\xae";
+    const text = try renderSafeText(std.testing.allocator, bytes);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("a\\x1b\\x00\\xff\\x0d\n\\\\\xe4\xb8\xad\\xe2\\x80\\xae", text);
+    try std.testing.expectEqual(safeTextWidth(bytes), text.len);
+    for (0..text.len + 1) |budget| {
+        const fit = safeTextFit(bytes, budget);
+        try std.testing.expect(fit.width <= budget);
+        try std.testing.expect(fit.raw <= bytes.len);
+    }
+    const all = safeTextFit(bytes, text.len);
+    try std.testing.expectEqual(bytes.len, all.raw);
+    try std.testing.expectEqual(text.len, all.width);
 }
 
 // 测试上下文：临时目录、根路径，以及最小环境变量映射。
