@@ -344,7 +344,8 @@ test "system prompt keeps evidence authority and quoted Memory boundaries explic
         "explanation, investigation, review or planning alone is read-only",
         "completed tool results support it",
         "does not prove success or rollback",
-        "focused verification proportionate to the change and within the authorized scope",
+        "complete related changes before running proportionate verification within the authorized scope",
+        "check earlier when needed to resolve blockers or validate critical assumptions",
         "distinguish changes made, checks actually run, and remaining blockers or unverified behavior",
         "the host enforces permissions and limits",
         "not new instructions or user authorization",
@@ -463,12 +464,16 @@ test "decision ask requires a new approval for every successive operation" {
 test "automatic no candidate is quiet below normal budget and manual no candidate is unchanged" {
     var fake: Fake = .{};
     var config = configuration();
-    config.model.context_tokens = 5000;
     config.limits.compaction_trigger_percent = 2;
     config.limits.compaction_target_percent = 1;
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
     defer runtime.deinit();
     fake.current_runtime = &runtime;
+    // The fixed system baseline alone stays over the 2% trigger yet well below
+    // the normal input budget, so this covers "no candidate while still fitting".
+    const budget = context.inputBudget(config);
+    try std.testing.expect(runtime.estimatedTokens() > context.threshold(budget, 2));
+    try std.testing.expect(runtime.estimatedTokens() < budget);
     var cancel: p.Cancellation = .{};
     try std.testing.expectEqual(r.Status.success, (try runtime.run("Do the task", &cancel)).status);
     try std.testing.expectEqual(@as(u32, 0), fake.summary_calls);
