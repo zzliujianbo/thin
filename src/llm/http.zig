@@ -26,6 +26,9 @@ pub const Client = struct {
     authorization: []u8,
     /// 底层 HTTP 客户端，内部连接池随 Client 生命周期存在。
     http: std.http.Client,
+    /// Set once cleanupForClose has drained the native pool, so a retained
+    /// owner can retry only the unreaped proxy transport.
+    http_drained: bool = false,
     /// Guards request ownership and the timestamp, not merely pool traversal.
     request_mutex: Io.Mutex = .init,
     last_request_finish: ?Io.Timestamp = null,
@@ -73,6 +76,66 @@ pub const Client = struct {
             .http = .{ .allocator = allocator, .io = io },
             .session_id = session_id,
         };
+    }
+
+    /// Independent mutable client for one child Runtime. The frozen parent
+    /// authorization, CA/route transport and session identity are copied; the
+    /// key is never re-resolved from a filtered command environment.
+    pub fn cloneForConfig(self: *const Client, allocator: std.mem.Allocator, io: Io, config: *const cfg.Config) !Client {
+        if (config.model.protocol == .systemone or cfg.providers.Id.fromSystemOneUrl(config.provider.base_url) != null)
+            return error.UnsupportedProtocol;
+        if (!std.mem.startsWith(u8, self.authorization, "Bearer ") or self.authorization.len == "Bearer ".len)
+            return error.InvalidApiKey;
+        // The child config must resolve to the same explicit proxy route that
+        // this client already froze; never silently switch direct <-> proxied.
+        const expected = if (config.proxyFor(config.selected_provider, config.model.name)) |route| try route.url(allocator) else null;
+        defer if (expected) |url| allocator.free(url);
+        if (expected == null) {
+            if (self.proxy_http != null) return error.ProxyRouteChanged;
+        } else {
+            const transport = if (self.proxy_http) |*value| value else return error.ProxyRouteChanged;
+            if (transport.poisoned) return error.CleanupFailed;
+            const actual = transport.proxy_url orelse return error.ProxyRouteChanged;
+            if (!std.mem.eql(u8, expected.?, actual)) return error.ProxyRouteChanged;
+        }
+        const authorization = try allocator.dupe(u8, self.authorization);
+        errdefer {
+            std.crypto.secureZero(u8, authorization);
+            allocator.free(authorization);
+        }
+        const proxy_http: ?curl.Client = if (self.proxy_http) |*transport|
+            try curl.Client.initRouted(allocator, io, &transport.env, transport.proxy_url)
+        else
+            null;
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .config = config,
+            .authorization = authorization,
+            .proxy_http = proxy_http,
+            .http = .{ .allocator = allocator, .io = io },
+            .session_id = self.session_id,
+        };
+    }
+
+    /// Narrow idempotent close for a retained child owner. Drains the native
+    /// pool once, then attempts the owned proxy transport and refuses to free
+    /// the key while that transport still reports an unreaped child. On error
+    /// the caller must retain this value and retry; nothing here is lost.
+    pub fn cleanupForClose(self: *Client) error{CleanupFailed}!void {
+        if (!self.http_drained) {
+            self.http.deinit();
+            self.http_drained = true;
+        }
+        if (self.proxy_http) |*transport| {
+            transport.deinit();
+            if (transport.unreaped_pid != null) return error.CleanupFailed;
+        }
+        if (self.authorization.len != 0) {
+            std.crypto.secureZero(u8, self.authorization);
+            self.allocator.free(self.authorization);
+            self.authorization = &.{};
+        }
     }
 
     /// 释放连接池与密钥副本。

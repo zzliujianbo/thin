@@ -15,6 +15,9 @@ const DESCRIPTION = 'Owned one-pixel image inspected.';
 const REMOTE_SECRET = 'image-raw-remote-error-must-not-leak';
 const CALL = 'owned-read-image', FILE = 'owned-pixel.png';
 const FIRST_FOUR = ['read_file','write_file','bash','memory'];
+// Default root capability: the four parent job tools follow the base surface
+// (image, when selected, stays at index 4). No settings gate adds or removes them.
+const SUBAGENT_FOUR = ['subagent','get_subagent_result','send_subagent_message','cancel_subagent'];
 const defaults = {
   command_timeout_ms:300000, command_max_timeout_ms:3600000,
   read_bytes:65536, output_bytes:32768, low_price_input:false,
@@ -132,7 +135,7 @@ export async function imageModelRegressions({app,pty,execute}) {
           assert.deepEqual(system,primarySystem);
         }
         const names = body.tools.map(t=>t.function.name);
-        assert.deepEqual(names, selected && !off ? [...FIRST_FOUR,'read_image'] : FIRST_FOUR);
+        assert.deepEqual(names, [...FIRST_FOUR,...(selected && !off ? ['read_image'] : []),...SUBAGENT_FOUR]);
         assert.deepEqual(body.tools.slice(0,4),primaryTools,'Image changed an existing tool schema');
         if (isPty && mainPosts === 1) {
           assert.equal(auxPosts,0); assert.equal(body.messages.at(-1).content,WARMUP);

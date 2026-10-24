@@ -98,10 +98,15 @@ pub fn fromToolView(a: std.mem.Allocator, name: []const u8, fields: @import("../
 pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
     const kind = call.kind;
     if (kind == .other) return .{ .kind = kind, .label = try a.dupe(u8, "tool") };
+    // Child status is a bare tool-name row, not a new panel or message body.
+    if (kind == .parent_message) return .{ .kind = kind, .label = try a.dupe(u8, "message_parent") };
     const unavailable = switch (kind) {
         .bash => "(command unavailable)",
         .read, .write => "(file unavailable)",
         .memory => "(operation unavailable)",
+        .subagent => "(task unavailable)",
+        .subagent_id => "(id unavailable)",
+        .parent_message => unreachable,
         .other => unreachable,
     };
     const detail = call.detail orelse return .{ .kind = kind, .label = try a.dupe(u8, unavailable) };

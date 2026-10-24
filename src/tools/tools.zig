@@ -19,6 +19,7 @@ const command_risk = @import("command_risk.zig");
 const decision = @import("../core/decision.zig");
 const image = @import("../core/image.zig");
 const image_file = @import("image_file.zig");
+const subagent = @import("../core/subagent.zig");
 
 /// 暴露给模型的工具 schema 列表；顺序是对外契约（测试依赖 read_file 在 0、memory 在 3）。
 pub const schemas = [_]p.ToolSchema{
@@ -64,7 +65,7 @@ const reviewed_schemas = blk: {
     break :blk result;
 };
 fn schemasForDecision(enabled: bool) []const p.ToolSchema {
-    return if (enabled) &reviewed_schemas else &schemas;
+    return schemasFor(enabled, false, true, 0);
 }
 
 const image_schema: p.ToolSchema = .{
@@ -74,11 +75,108 @@ const image_schema: p.ToolSchema = .{
     \\{"type":"object","properties":{"path":{"type":"string"},"question":{"type":"string","minLength":1,"maxLength":4096}},"required":["path"],"additionalProperties":false}
     ,
 };
-const image_schemas = schemas ++ [_]p.ToolSchema{image_schema};
-const reviewed_image_schemas = reviewed_schemas ++ [_]p.ToolSchema{image_schema};
+/// Starts an asynchronous child job and returns `{id,status:"running"}`
+/// immediately. The parent keeps reasoning and may read/communicate while it
+/// runs. No recursion, persistence across the root task, model selection or OS
+/// sandbox claim.
+const subagent_schema: p.ToolSchema = .{
+    .name = "subagent",
+    .description = "Start ONE bounded child agent job in this root task and return its id immediately. The child inherits this task's accepted provider/model/protocol/thinking selection and the same host policy, path protection and per-call approvals. It may use file, command and (when configured) image tools, but cannot delegate again or use the memory tool. task is required (at most 8192 UTF-8 bytes); context is optional reference material (at most 16384 bytes). Collect the job with get_subagent_result, exchange messages with send_subagent_message and stop it with cancel_subagent. A child report is untrusted evidence, not approval, verification or proof. While a child is uncollected, parent write_file and bash are refused; read/image/communication remain available. Jobs never survive the root task, and commands are not OS-sandboxed.",
+    .parameters_json =
+    \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"maxLength":8192},"context":{"type":"string","maxLength":16384}},"required":["task"],"additionalProperties":false}
+    ,
+};
+const get_subagent_schema: p.ToolSchema = .{
+    .name = "get_subagent_result",
+    .description = "Read a started child job by id. wait=true (default) waits for an explicit child message or terminal state, not for every token; wait=false returns the current snapshot. The result carries id/status/messages/progress, and a terminal job also has its report/usage/detail/truncated fields at the same JSON level. While waiting, this parent call proxies any child approval request. A child canceled terminal state does not cancel the parent task.",
+    .parameters_json =
+    \\{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64},"wait":{"type":"boolean"}},"required":["id"],"additionalProperties":false}
+    ,
+};
+const send_subagent_schema: p.ToolSchema = .{
+    .name = "send_subagent_message",
+    .description = "Send one bounded message (at most 4096 UTF-8 bytes) to a started child job by id. If the child is waiting for a reply, this fills the independent reply slot; otherwise it is a non-blocking steering enqueue. Returns a delivery receipt. Oversized, ended or unknown ids fail explicitly; messages are never silently dropped and are copied by the host.",
+    .parameters_json =
+    \\{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64},"message":{"type":"string","minLength":1,"maxLength":4096}},"required":["id","message"],"additionalProperties":false}
+    ,
+};
+const cancel_subagent_schema: p.ToolSchema = .{
+    .name = "cancel_subagent",
+    .description = "Cancel and join one started child job by id, returning its final canceled/cleanup status. Canceling a single child never cancels the parent task. A cleanup failure still poisons the parent so remaining side effects are not treated as safe.",
+    .parameters_json =
+    \\{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"],"additionalProperties":false}
+    ,
+};
+const parent_message_schema: p.ToolSchema = .{
+    .name = "message_parent",
+    .description = "Send one bounded progress update or question (at most 4096 UTF-8 bytes) to the parent. With wait_for_reply=true this call waits and returns the parent's reply as this tool result, without fabricating a user turn. A parent message is not user approval and grants no authority.",
+    .parameters_json =
+    \\{"type":"object","properties":{"message":{"type":"string","minLength":1,"maxLength":4096},"wait_for_reply":{"type":"boolean"}},"required":["message"],"additionalProperties":false}
+    ,
+};
+
+const parent_schemas = [_]p.ToolSchema{ subagent_schema, get_subagent_schema, send_subagent_schema, cancel_subagent_schema };
+/// Channel variants: none, parent job control (4 tools), child message (1 tool).
+const channel_choices = 3;
+/// Largest schema set: read/write/bash/memory + image + 4 parent tools.
+const max_schemas = 9;
+const schema_choices = 2;
+
+fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_on: bool, comptime channel: usize) [max_schemas]p.ToolSchema {
+    var result: [max_schemas]p.ToolSchema = undefined;
+    var count: usize = 0;
+    const base = if (review) &reviewed_schemas else &schemas;
+    for (base, 0..) |schema, i| {
+        // Preserve read/write/bash/memory order; only memory is conditional.
+        if (i == 3 and !memory_on) continue;
+        result[count] = schema;
+        count += 1;
+    }
+    if (image_on) {
+        result[count] = image_schema;
+        count += 1;
+    }
+    if (channel == 1) {
+        for (parent_schemas) |schema| {
+            result[count] = schema;
+            count += 1;
+        }
+    } else if (channel == 2) {
+        result[count] = parent_message_schema;
+        count += 1;
+    }
+    return result;
+}
+
+// Static table of the small feature matrix. Slices point into read-only data, so
+// a rebind never invalidates a previously handed-out schema slice.
+const schema_table = blk: {
+    @setEvalBranchQuota(40000);
+    var table: [schema_choices][schema_choices][schema_choices][channel_choices][max_schemas]p.ToolSchema = undefined;
+    for (0..schema_choices) |review| for (0..schema_choices) |image_on| for (0..schema_choices) |memory_on| for (0..channel_choices) |channel| {
+        table[review][image_on][memory_on][channel] = buildSchemas(review == 1, image_on == 1, memory_on == 1, channel);
+    };
+    break :blk table;
+};
+
+fn schemaCount(image_on: bool, memory_on: bool, channel: usize) usize {
+    const channel_count: usize = switch (channel) {
+        1 => parent_schemas.len,
+        2 => 1,
+        else => 0,
+    };
+    return 4 + @as(usize, @intFromBool(image_on)) + channel_count - @as(usize, @intFromBool(!memory_on));
+}
+
+fn schemasFor(review: bool, image_on: bool, memory_on: bool, channel: usize) []const p.ToolSchema {
+    // Explicit pointer to read-only static storage: the slice address stays
+    // valid for the whole process, independent of any host/executor move.
+    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(review)][@intFromBool(image_on)][@intFromBool(memory_on)][channel];
+    return set[0..schemaCount(image_on, memory_on, channel)];
+}
+
 fn schemasForServices(review: bool, enabled: bool) []const p.ToolSchema {
-    if (!enabled) return schemasForDecision(review);
-    return if (review) &reviewed_image_schemas else &image_schemas;
+    return schemasFor(review, enabled, true, 0);
 }
 pub const ReadImage = struct { path: []const u8, question: []const u8 = image.default_question };
 fn validateReadImage(r: ReadImage) !void {
@@ -113,6 +211,11 @@ pub const Action = union(enum) {
     write_file: Write,
     bash: Bash,
     memory: Memory,
+    subagent: subagent.Request,
+    get_subagent_result: subagent.Query,
+    send_subagent_message: subagent.Send,
+    cancel_subagent: subagent.Cancel,
+    message_parent: subagent.Message,
 
     /// 生成展示给用户的授权描述；写入 memory 时附带完整内容，便于用户审阅后再批准。
     pub fn description(self: Action, a: std.mem.Allocator) ![]const u8 {
@@ -128,9 +231,29 @@ pub const Action = union(enum) {
                 try std.fmt.allocPrint(a, "Memory {s}: {s} ({d} bytes)\n{s}", .{ if (m.expected_version == null) "create" else "update", m.topic.?, m.content.?.len, m.content.? })
             else
                 try std.fmt.allocPrint(a, "Memory {s}: {s}", .{ @tagName(m.action), m.topic orelse "index" }),
+            // Display-only bounded task summary; never the context body.
+            .subagent => |request| try std.fmt.allocPrint(a, "Delegate subagent task: {s}{s}", .{
+                summaryText(request.task, 240),
+                if (request.task.len > 240) "..." else "",
+            }),
+            // Job-control captions expose only the bounded id, never messages.
+            .get_subagent_result => |query| try std.fmt.allocPrint(a, "Get subagent result {s}", .{query.id}),
+            .send_subagent_message => |message| try std.fmt.allocPrint(a, "Send subagent message {s}", .{message.id}),
+            .cancel_subagent => |request| try std.fmt.allocPrint(a, "Cancel subagent {s}", .{request.id}),
+            // Child status only; the parent must not see the message body in a
+            // generic row and no separate panel is introduced here.
+            .message_parent => try a.dupe(u8, "Message parent"),
         };
     }
 };
+
+/// Bounded, UTF-8-aligned display slice used for tool titles.
+fn summaryText(text: []const u8, limit: usize) []const u8 {
+    if (text.len <= limit) return text;
+    var end = limit;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    return text[0..end];
+}
 
 /// Parse and validate before requesting authorization. a is a short-lived arena.
 /// 在请求授权前解析并校验参数；a 是短生命周期 arena，返回值中的字符串都归它所有。
@@ -170,6 +293,45 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
         const timeout = args.timeout_ms orelse limits.command_timeout_ms;
         if (timeout == 0 or timeout > limits.command_max_timeout_ms) return error.InvalidCommandTimeout;
         return .{ .bash = args };
+    }
+
+    if (std.mem.eql(u8, name, "subagent")) {
+        // Raw escaping must not turn into unbounded parse work; decoded values
+        // are then bounded by validate(). Six bytes is the worst-case JSON
+        // escape of one UTF-8 byte, so legal escaped input is not rejected.
+        if (arguments.len > 6 * (subagent.max_task_bytes + subagent.max_context_bytes) + 1024)
+            return error.ArgumentsTooLarge;
+        const args = try std.json.parseFromSliceLeaky(subagent.Request, a, arguments, opts);
+        try subagent.validate(args);
+        return .{ .subagent = args };
+    }
+
+    if (std.mem.eql(u8, name, "get_subagent_result")) {
+        if (arguments.len > 6 * subagent.max_id_bytes + 256) return error.ArgumentsTooLarge;
+        const args = try std.json.parseFromSliceLeaky(subagent.Query, a, arguments, opts);
+        try subagent.validateQuery(args);
+        return .{ .get_subagent_result = args };
+    }
+
+    if (std.mem.eql(u8, name, "send_subagent_message")) {
+        if (arguments.len > 6 * (subagent.max_id_bytes + subagent.max_message_bytes) + 1024) return error.ArgumentsTooLarge;
+        const args = try std.json.parseFromSliceLeaky(subagent.Send, a, arguments, opts);
+        try subagent.validateSend(args);
+        return .{ .send_subagent_message = args };
+    }
+
+    if (std.mem.eql(u8, name, "cancel_subagent")) {
+        if (arguments.len > 6 * subagent.max_id_bytes + 256) return error.ArgumentsTooLarge;
+        const args = try std.json.parseFromSliceLeaky(subagent.Cancel, a, arguments, opts);
+        try subagent.validateCancel(args);
+        return .{ .cancel_subagent = args };
+    }
+
+    if (std.mem.eql(u8, name, "message_parent")) {
+        if (arguments.len > 6 * subagent.max_message_bytes + 1024) return error.ArgumentsTooLarge;
+        const args = try std.json.parseFromSliceLeaky(subagent.Message, a, arguments, opts);
+        try subagent.validateMessage(args);
+        return .{ .message_parent = args };
     }
 
     if (std.mem.eql(u8, name, "memory")) {
@@ -229,8 +391,76 @@ pub const Tools = struct {
     /// 由应用层传入的认证文件 realPath；与 Root.path 使用同一真实路径空间，
     /// 即使启动目录是 HOME 或 HOME 本身是别名，也不能通过模型文件工具泄露凭证。
     auth_path: ?[]const u8 = null,
-    /// Explicit opt-in; no service means no fifth schema and no file access.
+    /// Explicit opt-in; no service means no image schema and no file access.
     image: ?image.Service = null,
+    /// Optional in-process child service (parent Tools). Null hides the four
+    /// parent job tools and rejects forged calls at prepare and direct execute;
+    /// child Tools are built without one, so recursive delegation fails there.
+    subagent: ?subagent.Service = null,
+    /// Child-only channel. It exposes exactly the message_parent tool; it cannot
+    /// reach parent jobs, permissions, Runtime or Memory.
+    parent_channel: ?subagent.ParentChannel = null,
+    /// False hides the memory schema and rejects forged memory calls (child Tools).
+    allow_memory: bool = true,
+
+    /// Hidden capabilities are an execution boundary, not only a schema detail.
+    /// The parent surface exists exactly when the host supplied a service; there
+    /// is no separate persisted switch.
+    fn subagentActive(self: *Tools) bool {
+        return self.subagent != null;
+    }
+
+    fn parentChannelActive(self: *Tools) bool {
+        return self.parent_channel != null;
+    }
+
+    fn isParentTool(name: []const u8) bool {
+        return std.mem.eql(u8, name, "subagent") or std.mem.eql(u8, name, "get_subagent_result") or
+            std.mem.eql(u8, name, "send_subagent_message") or std.mem.eql(u8, name, "cancel_subagent");
+    }
+
+    /// Parent write/bash are refused while any child of this root is running or
+    /// uncollected, in BOTH prepare and execute. Reads, images and communication
+    /// stay available. This is not an OS sandbox claim.
+    fn checkParentConflict(self: *Tools, action: Action) !void {
+        const blocked = action == .write_file or action == .bash;
+        if (!blocked) return;
+        const service = self.subagent orelse return;
+        if (service.active()) return error.SubagentActive;
+    }
+
+    fn channelChoice(self: *Tools) usize {
+        if (self.subagentActive()) return 1;
+        if (self.parentChannelActive()) return 2;
+        return 0;
+    }
+
+    fn checkAvailableActions(self: *Tools, action: Action) !void {
+        switch (action) {
+            .subagent => |request| {
+                if (!self.subagentActive()) return error.SubagentDisabled;
+                try subagent.validate(request);
+            },
+            .get_subagent_result => |query| {
+                if (!self.subagentActive()) return error.SubagentDisabled;
+                try subagent.validateQuery(query);
+            },
+            .send_subagent_message => |message| {
+                if (!self.subagentActive()) return error.SubagentDisabled;
+                try subagent.validateSend(message);
+            },
+            .cancel_subagent => |request| {
+                if (!self.subagentActive()) return error.SubagentDisabled;
+                try subagent.validateCancel(request);
+            },
+            .message_parent => |message| {
+                if (!self.parentChannelActive()) return error.SubagentMessageDisabled;
+                try subagent.validateMessage(message);
+            },
+            .memory => if (!self.allow_memory) return error.MemoryDisabled,
+            else => {},
+        }
+    }
 
     fn checkImageAction(self: *Tools, action: Action) !void {
         if (action == .read_image) {
@@ -339,7 +569,41 @@ pub const Tools = struct {
 
     /// 把 Tools 包装成 runtime.Executor，供运行时调度 prepare 与 execute。
     pub fn executor(self: *Tools) runtime.Executor {
-        return .{ .context = self, .schemas = schemasForServices(self.config.decisionActive(), self.image != null), .prepare_fn = prepare, .execute_fn = executePrepared, .preview_write_fn = previewWrite };
+        return .{
+            .context = self,
+            .schemas = schemasFor(self.config.decisionActive(), self.image != null, self.allow_memory, self.channelChoice()),
+            .prepare_fn = prepare,
+            .execute_fn = executePrepared,
+            .preview_write_fn = previewWrite,
+            .begin_task_fn = beginTask,
+            .before_finish_fn = beforeFinish,
+            .end_task_fn = endTask,
+        };
+    }
+
+    /// Accepted-task hook. A child Tools carries no service, so it never resets
+    /// the parent delegation budget. The accepted-root cancellation token is
+    /// forwarded for job parent linking, never a local tool-call token.
+    fn beginTask(context_: *anyopaque, cancel: *const p.Cancellation) void {
+        const self: *Tools = @ptrCast(@alignCast(context_));
+        if (self.subagent) |service| service.beginTask(cancel);
+    }
+
+    /// Normal-stop hook: forward to the host service so active/uncollected jobs
+    /// produce one bounded context hint. Runtime owns the reminder budget and
+    /// the stable-history copy.
+    fn beforeFinish(context_: *anyopaque, a: std.mem.Allocator, cancel: *const p.Cancellation) !?[]const u8 {
+        const self: *Tools = @ptrCast(@alignCast(context_));
+        const service = self.subagent orelse return null;
+        return service.beforeFinish(a, cancel);
+    }
+
+    /// Unified accepted-task cleanup: cancel/join or retain child jobs before
+    /// Runtime joins the watchdog and finalizes Memory.
+    fn endTask(context_: *anyopaque, cancel: *const p.Cancellation) !void {
+        const self: *Tools = @ptrCast(@alignCast(context_));
+        const service = self.subagent orelse return;
+        try service.endTask(cancel);
     }
 
     fn previewWrite(context_: *anyopaque, a: std.mem.Allocator, path: []const u8, cancel: *const p.Cancellation) !?@import("../core/write_preview.zig").Baseline {
@@ -361,6 +625,16 @@ pub const Tools = struct {
     /// 解析并做路径校验，生成待授权的 Prepared；此阶段不产生任何副作用。
     fn prepare(context_: *anyopaque, a: std.mem.Allocator, call: p.ToolCall) !runtime.Prepared {
         const self: *Tools = @ptrCast(@alignCast(context_));
+        // Names the model was never offered must not become executable actions.
+        // Reject before parsing or allocating anything.
+        if (!self.allow_memory and std.mem.eql(u8, call.name, "memory")) return error.MemoryDisabled;
+        if (!self.subagentActive() and isParentTool(call.name)) return error.SubagentDisabled;
+        if (!self.parentChannelActive() and std.mem.eql(u8, call.name, "message_parent")) return error.SubagentMessageDisabled;
+        // Double guard: an active/uncollected child must not race a parent write
+        // or command. Pure check, so prepare stays side-effect free.
+        if (std.mem.eql(u8, call.name, "write_file") or std.mem.eql(u8, call.name, "bash")) {
+            if (self.subagent) |service| if (service.active()) return error.SubagentActive;
+        }
         const action = try a.create(Action);
         action.* = try parse(a, call.name, call.arguments, self.config.limits);
         try self.checkImageAction(action.*);
@@ -414,6 +688,10 @@ pub const Tools = struct {
     fn executeWithTimeout(self: *Tools, a: std.mem.Allocator, action: Action, timeout: ?decision.Timeout, cancel: *const p.Cancellation) !Execution {
         // Readiness/poison and argument guards are pure and precede all I/O.
         try self.checkImageAction(action);
+        try self.checkAvailableActions(action);
+        // Second half of the double guard: a direct forged execute must not
+        // bypass the parent write/bash conflict rule.
+        try self.checkParentConflict(action);
         // 执行前已取消则直接返回，不触碰磁盘或子进程。
         if (cancel.isRequested()) return .{ .text = "Canceled before execution", .is_error = true, .canceled = true };
 
@@ -563,9 +841,64 @@ pub const Tools = struct {
                     return .{ .text = encoded };
                 },
             },
+
+            .subagent => |request| {
+                const service = self.subagent orelse return error.SubagentDisabled;
+                // Readiness is checked here only: prepare stays pure.
+                try service.checkReady();
+                if (cancel.isRequested()) return error.Canceled;
+                return mapServiceResult(try service.run(a, request, cancel));
+            },
+
+            .get_subagent_result => |query| {
+                const service = self.subagent orelse return error.SubagentDisabled;
+                try service.checkReady();
+                if (cancel.isRequested()) return error.Canceled;
+                return mapServiceResult(try service.get(a, query, cancel));
+            },
+
+            .send_subagent_message => |message| {
+                const service = self.subagent orelse return error.SubagentDisabled;
+                try service.checkReady();
+                if (cancel.isRequested()) return error.Canceled;
+                return mapServiceResult(try service.send(a, message, cancel));
+            },
+
+            .cancel_subagent => |request| {
+                const service = self.subagent orelse return error.SubagentDisabled;
+                if (cancel.isRequested()) return error.Canceled;
+                return mapServiceResult(try service.cancel(a, request, cancel));
+            },
+
+            .message_parent => |message| {
+                const channel = self.parent_channel orelse return error.SubagentMessageDisabled;
+                if (cancel.isRequested()) return error.Canceled;
+                return mapServiceResult(try channel.message(a, message, cancel));
+            },
         }
 
         return .{ .text = try j.encode(a, value) };
+    }
+
+    /// The App owns encoding: Result.text is already the bounded tool-result
+    /// JSON (status incl. paused/canceled, report, usage, messages, ...). Pass it
+    /// through verbatim: re-encoding would double-wrap the JSON, drop statuses
+    /// Tools does not know, and add an allocation that could mask a cleanup
+    /// failure. Runtime's fitResult still bounds bytes. All communication and
+    /// delegation results stay single-layer JSON and never become automatic
+    /// Memory evidence. A child's canceled terminal state does not set the
+    /// parent Execution.canceled flag; that flag only follows the Result's
+    /// explicit parent-call cancellation.
+    fn mapServiceResult(result: subagent.Result) Execution {
+        const cleanup = result.cleanup_failed;
+        return .{
+            .text = result.text,
+            .is_error = result.is_error or result.canceled or cleanup,
+            .canceled = result.canceled and !cleanup,
+            .truncated = result.truncated,
+            .cleanup_failed = cleanup,
+            .memory_evidence = false,
+        };
     }
 };
 

@@ -11,6 +11,9 @@ pub fn icon(kind: Tool) []const u8 {
         .bash => ">",
         .read => "r",
         .write => "w",
+        .subagent => "a",
+        .subagent_id => "a",
+        .parent_message => "m",
         .other => "⚙",
     };
 }

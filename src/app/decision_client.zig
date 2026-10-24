@@ -99,6 +99,97 @@ pub const Client = struct {
         return .{ .context = self, .decide_fn = decide, .check_fn = checkService };
     }
 
+    /// Narrow idempotent close for a retained child owner. Every mutable
+    /// transport is drained first; an unreaped proxy/native child leaves this
+    /// owner intact for a later retry instead of freeing its configuration/key.
+    pub fn cleanupForClose(self: *Client) error{CleanupFailed}!void {
+        const a = self.allocator;
+        if (self.native) |*native| {
+            native.deinit();
+            if (native.unreaped_pid != null) return error.CleanupFailed;
+        }
+        if (self.resolved) |ready| if (ready.client) |*client| try client.cleanupForClose();
+        if (self.resolved) |resolved| {
+            cfg.release(&resolved.config);
+            a.destroy(resolved);
+            self.resolved = null;
+        }
+        if (self.key) |key| {
+            std.crypto.secureZero(u8, key);
+            a.free(key);
+            self.key = null;
+        }
+        a.free(self.home);
+        self.home = &.{};
+        self.transport_env.deinit();
+        self.transport_env = std.process.Environ.Map.init(a);
+        cfg.release(&self.source);
+        a.destroy(self);
+    }
+
+    /// Independent auxiliary owner for a child Runtime. Frozen declaration,
+    /// key, filtered CA transport and route are copied. A resolved declaration
+    /// reuses its frozen config to build a private HTTP client; an unresolved
+    /// one keeps the same lazy resolution policy and performs no probe here.
+    /// Mutable transports are never shared.
+    pub fn clone(self: *const Client) !*Client {
+        const a = self.allocator;
+        const io = self.io;
+        try self.checkCleanup();
+        const copy = try a.create(Client);
+        errdefer a.destroy(copy);
+
+        var source = try cfg.clone(a, self.source.value);
+        errdefer cfg.release(&source);
+        const home = try a.dupe(u8, self.home);
+        errdefer a.free(home);
+        const key: ?[]u8 = if (self.key) |value| try a.dupe(u8, value) else null;
+        errdefer if (key) |value| {
+            std.crypto.secureZero(u8, value);
+            a.free(value);
+        };
+
+        var transport_env = std.process.Environ.Map.init(a);
+        errdefer transport_env.deinit();
+        var env_it = self.transport_env.iterator();
+        while (env_it.next()) |entry| try transport_env.put(entry.key_ptr.*, entry.value_ptr.*);
+
+        var native: ?native_http.Client = null;
+        errdefer if (native) |*value| value.deinit();
+        if (self.native) |value| {
+            // Rebuild from the already filtered CA environment and frozen route.
+            native = try native_http.Client.initRouted(a, io, &transport_env, value.proxy_url);
+        }
+
+        var resolved: ?*Resolved = null;
+        if (self.resolved) |parent| {
+            const state = try a.create(Resolved);
+            errdefer a.destroy(state);
+            state.client = null;
+            state.config = try cfg.clone(a, parent.config.value);
+            errdefer cfg.release(&state.config);
+            if (state.config.value.model.protocol == .systemone) {
+                if (native == null) return error.DecisionUnavailable;
+            } else {
+                const frozen_key = key orelse return error.DecisionUnavailable;
+                state.client = try http.Client.initWithEnv(a, io, &state.config.value, frozen_key, &transport_env);
+            }
+            resolved = state;
+        }
+
+        copy.* = .{
+            .allocator = a,
+            .io = io,
+            .source = source,
+            .home = home,
+            .transport_env = transport_env,
+            .key = key,
+            .resolved = resolved,
+            .native = native,
+        };
+        return copy;
+    }
+
     fn loadCache(a: std.mem.Allocator, io: std.Io, home: []const u8, cache: *metadata.Cache) void {
         cache.* = .{};
         if (home.len == 0) return;
@@ -478,4 +569,30 @@ test "SystemOne creation stays lazy without capabilities or key and never passes
     const unavailable = (try Client.create(a, std.testing.io, config.value, &env)).?;
     defer unavailable.deinit();
     try std.testing.expect(unavailable.native == null);
+}
+
+test "resolved decision clone rebuilds a private client and keeps the frozen config" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("CURL_CA_BUNDLE", "/owned/decision-ca.pem");
+    var parsed = try cfg.parse(a,
+        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"context_tokens":32768,"protocol":"chat"}}},"judge":{"base_url":"http://judge.invalid/v1","api_key":"fake-judge-key","models":{"mini":{"context_tokens":16384,"protocol":"chat"}}}}},"decision":{"model":"judge/mini"}}
+    );
+    defer cfg.release(&parsed);
+    const parent = (try Client.create(a, std.testing.io, parsed.value, &env)).?;
+    defer parent.deinit();
+    const ready = try parent.resolve();
+    try std.testing.expect(ready.client != null);
+    const clone = try parent.clone();
+    defer clone.deinit();
+    try std.testing.expect(clone.resolved != null);
+    try std.testing.expect(clone.resolved.?.client != null);
+    const parent_http = if (ready.client) |*client| client else unreachable;
+    const clone_http = if (clone.resolved.?.client) |*client| client else unreachable;
+    try std.testing.expect(&clone_http.http != &parent_http.http);
+    try std.testing.expectEqualStrings("mini", clone.resolved.?.config.value.model.name);
+    try std.testing.expectEqualStrings("fake-judge-key", clone.key.?);
+    try std.testing.expectEqualStrings("/owned/decision-ca.pem", clone.transport_env.get("CURL_CA_BUNDLE").?);
+    try std.testing.expectEqual(@as(u64, 0), clone.calls);
 }

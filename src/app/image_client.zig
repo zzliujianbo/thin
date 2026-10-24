@@ -51,6 +51,31 @@ pub const Client = struct {
         return self;
     }
 
+    /// Independent image owner for a child Runtime. Copies the already frozen
+    /// endpoint/key/timeout and filtered CA/route transport; no environment key
+    /// resolution and no shared mutable curl process state.
+    pub fn clone(self: *const Client) !*Client {
+        if (self.isPoisoned()) return error.CleanupFailed;
+        const a = self.backing;
+        const copy = try a.create(Client);
+        copy.backing = a;
+        copy.wiping = .{ .backing = a };
+        const owned = copy.wiping.allocator();
+        errdefer {
+            var final_wipe: cfg.WipingAllocator = .{ .backing = a };
+            final_wipe.allocator().destroy(copy);
+        }
+        copy.key = try owned.dupe(u8, self.key);
+        errdefer owned.free(copy.key);
+        copy.endpoint = try owned.dupe(u8, self.endpoint);
+        errdefer owned.free(copy.endpoint);
+        copy.transport = try http.Client.initRouted(owned, self.io, &self.transport.env, self.transport.proxy_url);
+        copy.io = self.io;
+        copy.timeout_ms = self.timeout_ms;
+        copy.context_tokens = self.context_tokens;
+        return copy;
+    }
+
     /// Success destroys self. CleanupFailed retains a poisoned, retryable owner;
     /// callers must not clear the pointer or release its allocator/I/O lifetime.
     pub fn deinit(self: *Client) error{CleanupFailed}!void {

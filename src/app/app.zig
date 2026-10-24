@@ -18,6 +18,8 @@ const ImageClient = @import("image_client.zig").Client;
 const image_setup = @import("image_setup.zig");
 const knowledge = @import("../core/knowledge.zig");
 const MemoryCoordinator = @import("memory_service.zig").Coordinator;
+const subagent_service = @import("subagent_service.zig");
+const SubagentService = subagent_service.SubagentService;
 
 /// Idle replacement owners have never sent a request, and used owners have
 /// already joined the worker. An unreapable child is a fail-stop condition,
@@ -70,6 +72,9 @@ pub const App = struct {
     decision_client: ?*DecisionClient = null,
     image_client: ?*ImageClient = null,
     memory_coordinator: *MemoryCoordinator,
+    /// Owns the parent-domain subagent quota and any retained image cleanup
+    /// owner. Its service is rebound to Tools on idle settings replacement.
+    subagent: SubagentService,
 
     /// Agent 运行时，最后初始化，依赖前面所有字段。
     runtime: r.Runtime,
@@ -191,6 +196,28 @@ pub const App = struct {
         self.image_client = try image_setup.create(a, io, self.config.value, environ);
         errdefer if (self.image_client) |client| destroyImageClient(client);
         self.executor.image = self.imageService();
+
+        // The service borrows stable App field addresses. The parent Runtime is
+        // assigned below, but its address is stable and no service callback can
+        // run before the Runtime is fully initialized.
+        self.subagent = .{};
+        self.subagent.deps = .{
+            .allocator = a,
+            .config = &self.config.value,
+            .http_client = &self.client,
+            .decision = &self.decision_client,
+            .image = &self.image_client,
+            .root = &self.root,
+            .environment = &self.environment,
+            .auth_path = self.auth_path,
+            .home_path = self.home_path,
+            .shell_name = self.shell_name,
+            .session_cwd = self.session_cwd,
+            .runtime = &self.runtime,
+        };
+        // Subagent is a default capability: no settings gate, and the child
+        // runtime itself is the only recursion boundary (subagent = null).
+        self.executor.subagent = self.subagent.service();
 
         self.memory_coordinator = try MemoryCoordinator.create(a, io, &self.root, self.config.value, environ);
         errdefer self.memory_coordinator.deinit();
@@ -385,6 +412,7 @@ pub const App = struct {
             replacement.memory_coordinator = null;
         }
         self.executor.image = self.imageService();
+        self.executor.subagent = self.subagent.service();
         self.runtime.executor = self.executor.executor();
         // Schema edits affect future estimates, not the latest server-reported
         // primary usage (including fresh-session zero or genuinely unknown).
@@ -465,6 +493,7 @@ pub const App = struct {
         if (self.image_client) |client| destroyImageClient(client);
         self.image_client = replacement.image_client;
         self.executor.image = self.imageService();
+        self.executor.subagent = self.subagent.service();
         self.runtime.executor = self.executor.executor();
         self.recordSelection();
         self.allocator.destroy(replacement);
@@ -490,6 +519,9 @@ pub const App = struct {
         const path = try self.allocator.dupe(u8, opened.path);
         self.allocator.free(self.session_cwd);
         self.session_cwd = path;
+        // The subagent host borrows this slice; publish the replacement before
+        // the next delegated loadPolicy could read the freed old bytes.
+        self.subagent.deps.session_cwd = self.session_cwd;
     }
 
     fn loadSessionPolicy(ctx: *anyopaque, a: std.mem.Allocator) !session_context.Snapshot {
@@ -513,6 +545,7 @@ pub const App = struct {
     /// 按创建的逆序释放资源，最后销毁自身。
     pub fn deinit(self: *App) void {
         const a = self.allocator;
+        self.subagent.deinit();
         self.runtime.deinit();
         // Interactive exit/model replacement cancels immediately. Headless
         // success explicitly drains with signal handling before destruction.

@@ -37,6 +37,11 @@ pub const Execution = struct {
     truncated: bool = false,
     /// 进程组清理失败：会使 Runtime poisoned，之后拒绝继续运行。
     cleanup_failed: bool = false,
+    /// Automatic Memory evidence policy. False marks a result (for example a
+    /// delegated child report) that must not become a "verified tool fact"
+    /// even when the call reports success. Evaluated per result, not per name.
+    /// 中文：自动 Memory 证据策略；false 表示该成功结果不得作为已证实工具事实采集。
+    memory_evidence: bool = true,
     /// Optional measured file observations, copied by value across Host/Bridge.
     /// No content/authority; absent remains unknown, including synthetic errors.
     file_stats: ?@import("../util/line_stats.zig").File = null,
@@ -102,6 +107,23 @@ pub const Executor = struct {
     prepare_fn: *const fn (*anyopaque, std.mem.Allocator, p.ToolCall) anyerror!Prepared,
     /// 第二阶段：实际执行，必须响应传入的 cancellation。
     execute_fn: *const fn (*anyopaque, std.mem.Allocator, Prepared, *const p.Cancellation) anyerror!Execution,
+    /// Called once after run() actually accepts a task (busy swap won), before
+    /// the first model call. `cancel` is the accepted-root token (the same
+    /// object the watchdog cancels), never a local tool-call token. Used to
+    /// reset a per-root-task budget; a rejected Busy run must not call it.
+    /// Must not fail or run tools.
+    begin_task_fn: ?*const fn (*anyopaque, *const p.Cancellation) void = null,
+    /// Called after a normal model stop commits its assistant message and
+    /// discards tool views, but BEFORE the Inbox is sealed. A non-empty hint is
+    /// copied into the stable history arena as a `.context` message and the
+    /// model loop continues; it is never user input, Memory evidence or a
+    /// fabricated tool call. Returns null when nothing remains.
+    before_finish_fn: ?*const fn (*anyopaque, std.mem.Allocator, *const p.Cancellation) anyerror!?[]const u8 = null,
+    /// Unified end-of-accepted-task cleanup. Called on every exit path
+    /// (including an early watchdog-start failure), before the watchdog is
+    /// joined and before Memory finalization/finished. Cancel/join or retain
+    /// every child job here. A failure must poison the parent.
+    end_task_fn: ?*const fn (*anyopaque, *const p.Cancellation) anyerror!void = null,
     /// Optional display-only pre-write snapshot. It must never create or alter
     /// the target and any failure degrades only the provisional UI.
     preview_write_fn: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, *const p.Cancellation) anyerror!?write_preview.Baseline = null,
@@ -174,7 +196,7 @@ pub fn inputBudgetPause(detail: ?anyerror) bool {
 /// Policy/auxiliary pauses need their own explanation, not a round-limit hint.
 pub fn policyPause(detail: ?anyerror) bool {
     const cause = detail orelse return false;
-    return inputBudgetPause(detail) or cause == error.DecisionUnavailable;
+    return inputBudgetPause(detail) or cause == error.DecisionUnavailable or cause == error.SubagentInteractionRequired;
 }
 
 /// 发给宿主的运行时事件，按发生顺序同步送达 Host.emit_fn。
@@ -1153,6 +1175,8 @@ pub const Runtime = struct {
         /// Normal model calls this run, saturating so unlimited runs cannot
         /// overflow. Compaction is not counted toward max_rounds.
         rounds: u32 = 0,
+        /// Stop-time interaction reminders already delivered this accepted task.
+        finish_reminders: u8 = 0,
 
         /// 已执行的工具调用次数，受 max_tool_calls 限制。
         tool_calls: u32 = 0,
@@ -1209,6 +1233,9 @@ pub const Runtime = struct {
         // 占用运行权；defer 保证任何退出路径都会释放，防止永久 Busy。
         if (self.busy.swap(true, .acq_rel)) return error.Busy;
         defer self.busy.store(false, .release);
+        // Accepted-task hook only: resets owner budgets (e.g. delegation slots).
+        // A rejected Busy run above never reaches it.
+        if (self.executor.begin_task_fn) |begin_task| begin_task(self.executor.context, cancel);
         if (self.inbox) |box| box.beginRun();
         var inbox_success = false;
         defer if (self.inbox) |box| {
@@ -1235,9 +1262,14 @@ pub const Runtime = struct {
         var task = Task{};
         var watchdog = Watchdog{ .io = self.io, .timeout_ms = self.config.limits.task_timeout_ms, .cancel = cancel };
 
-        // 看门狗无法启动时直接以 failed 结束，不进入模型循环。
+        // 看门狗无法启动时直接以 failed 结束，不进入模型循环。Even this early
+        // path must run the unified end hook before publishing finished.
         var timer = Io.concurrent(self.io, Watchdog.run, .{&watchdog}) catch |err| {
-            const terminal = Terminal{ .status = .failed, .detail = err, .context_snapshot = self.contextSnapshot() };
+            var terminal = Terminal{ .status = .failed, .detail = err, .context_snapshot = self.contextSnapshot() };
+            if (self.executor.end_task_fn) |end_task| end_task(self.executor.context, cancel) catch {
+                self.poisoned = true;
+                terminal = .{ .status = .failed, .detail = error.CleanupFailed, .context_snapshot = self.contextSnapshot() };
+            };
             self.emit(.{ .finished = terminal }, cancel) catch {};
             return terminal;
         };
@@ -1250,9 +1282,16 @@ pub const Runtime = struct {
             .command => |text| self.commandInner(text, cancel, &task),
         };
         result catch |err| {
-            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached or err == error.DecisionUnavailable or inputBudgetPause(err)) .paused else .failed;
+            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached or err == error.DecisionUnavailable or err == error.SubagentInteractionRequired or inputBudgetPause(err)) .paused else .failed;
             task.terminal.detail = err;
             if (err == error.OutputLimitReached) task.terminal.model_failure = .output_limit;
+        };
+
+        // Children end before watchdog join, Memory finalization and finished on
+        // EVERY accepted path. An end/cleanup failure outranks success, cancel,
+        // timeout and paused, and poisons the parent Runtime.
+        if (self.executor.end_task_fn) |end_task| end_task(self.executor.context, cancel) catch {
+            self.poisoned = true;
         };
 
         // 先停止看门狗，之后读取 expired 才能反映本次 run 是否超时。
@@ -1410,7 +1449,10 @@ pub const Runtime = struct {
     /// Next host permission id. Stays strictly increasing for the Bridge lifetime.
     /// At u64 max, ask the host to drop its high-water mark and start a new epoch
     /// at 1. Without that callback, refuse instead of wrapping to 0.
-    fn allocatePermissionId(self: *Runtime) !u64 {
+    /// Public narrow seam for the owning host (e.g. mapping a child approval into
+    /// the parent approval domain). Callers must serialize access with run(); it
+    /// never resets the counter or the host high-water mark on its own.
+    pub fn allocatePermissionId(self: *Runtime) !u64 {
         if (self.permission_id == std.math.maxInt(u64)) {
             if (self.host.rebase_permission_fn) |rebase| {
                 try rebase(self.host.context);
@@ -1781,6 +1823,22 @@ pub const Runtime = struct {
                 try self.emit(.{ .assistant_committed = message.blocks }, cancel);
                 self.discardToolViews(cancel);
                 try checkCanceled(cancel);
+                // A child may still need collection or a reply. The host returns
+                // only a bounded status/ID hint; it is a context message, not a
+                // user turn, Memory evidence or a tool call. Bounded per accepted
+                // task so a cooperative child cannot extend the loop forever.
+                if (self.executor.before_finish_fn) |before_finish| {
+                    if (try before_finish(self.executor.context, result_arena.allocator(), cancel)) |hint| {
+                        if (task.finish_reminders >= @import("subagent.zig").max_finish_reminders)
+                            return error.SubagentInteractionRequired;
+                        task.finish_reminders += 1;
+                        const owned = self.arena.allocator();
+                        const copy = try owned.dupe(u8, hint);
+                        try appendContextMessage(owned, &self.history, copy);
+                        self.last_context_tokens = null;
+                        continue :model_loop;
+                    }
+                }
                 if (self.inbox) |box| {
                     // enqueue and sealing share one linearization lock. Late
                     // steering stays pending for idle host dispatch.
@@ -2534,7 +2592,7 @@ pub const Runtime = struct {
         } };
 
         try self.history.append(a, .{ .role = .tool, .blocks = blocks });
-        if (!result.is_error and !result.canceled and !result.truncated and !result.cleanup_failed) {
+        if (!result.is_error and !result.canceled and !result.truncated and !result.cleanup_failed and result.memory_evidence) {
             if (self.memory_capture) |capture| capture.add(.tool, result.text);
         }
         self.observer.notify(.{ .tool_completed = .{ .call_id = id, .result = result } });

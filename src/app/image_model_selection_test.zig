@@ -61,7 +61,7 @@ test "image Settings default Off exact logged candidates and independent transac
     try std.testing.expectEqual(@as(usize, 1), state.image_models.len);
     try std.testing.expect(contains(state.image_models, "vision/deepseek-flash"));
     try std.testing.expect(app.image_client == null);
-    try std.testing.expectEqual(@as(usize, 4), app.runtime.executor.schemas.len);
+    try std.testing.expectEqual(@as(usize, 8), app.runtime.executor.schemas.len);
     try std.testing.expectError(error.UnknownImageModel, choose(&session, "unlogged/deepseek-flash"));
     try std.testing.expectError(error.UnknownImageModel, choose(&session, "similar/DeepSeek-Flash"));
     try std.testing.expectError(error.UnknownImageModel, choose(&session, "vision/deepseek-v4-flash"));
@@ -70,7 +70,7 @@ test "image Settings default Off exact logged candidates and independent transac
     try std.testing.expectEqualStrings("vision/deepseek-flash", app.config.value.image.model.?);
     try std.testing.expectEqualStrings("fake-vision-own", app.image_client.?.key);
     try std.testing.expectEqualStrings("https://vision.invalid/v1/chat/completions", app.image_client.?.endpoint);
-    try std.testing.expectEqual(@as(usize, 5), app.runtime.executor.schemas.len);
+    try std.testing.expectEqual(@as(usize, 9), app.runtime.executor.schemas.len);
     try std.testing.expectEqualStrings("read_image", app.runtime.executor.schemas[4].name);
     try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
     const selected = app.image_client.?;
@@ -87,7 +87,7 @@ test "image Settings default Off exact logged candidates and independent transac
     try std.testing.expect(app.config.value.image.model == null);
     try std.testing.expect(!session.connection().current().image_enabled and session.connection().current().image_model == null);
     try expectPersistedImage(home, null);
-    try std.testing.expectEqual(@as(usize, 4), app.runtime.executor.schemas.len);
+    try std.testing.expectEqual(@as(usize, 8), app.runtime.executor.schemas.len);
     try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
     const bytes = try disk(home);
     defer a.free(bytes);
@@ -97,7 +97,7 @@ test "image Settings default Off exact logged candidates and independent transac
     try std.testing.expectEqualStrings("main/chat", saved.value.registry.?.default);
     try connection.image_fn.?(connection.context, .off);
     try std.testing.expect(app.image_client == null and app.config.value.image.model == null);
-    try std.testing.expectEqual(@as(usize, 4), app.runtime.executor.schemas.len);
+    try std.testing.expectEqual(@as(usize, 8), app.runtime.executor.schemas.len);
     try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
     const twice = try disk(home);
     defer a.free(twice);
@@ -162,7 +162,7 @@ fn contextSurvivesImageSettings(protocol: @import("../core/protocol.zig").Protoc
             try std.testing.expect(app.client.authorization.ptr == primary);
             try std.testing.expectEqualDeep(estimator, app.runtime.estimator);
             try std.testing.expectEqual(@as(usize, if (mode == .fresh) 0 else 1), reply.calls);
-            try std.testing.expectEqual(@as(usize, if (selection != null) 5 else 4), app.runtime.executor.schemas.len);
+            try std.testing.expectEqual(@as(usize, if (selection != null) 9 else 8), app.runtime.executor.schemas.len);
             const checkpoint = try app.runtime.checkpoint();
             try std.testing.expectEqual(if (mode == .missing) @as(?u64, null) else before.tokens, checkpoint.last_context_tokens);
         }
@@ -223,7 +223,7 @@ test "image Settings stale credential OOM and CAS failure publish nothing" {
     try std.testing.expectEqualStrings("vision/deepseek-flash", app.config.value.image.model.?);
     try std.testing.expectEqualStrings("vision/deepseek-flash", session.connection().current().image_model.?);
     try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
-    try std.testing.expectEqual(@as(usize, 5), app.runtime.executor.schemas.len);
+    try std.testing.expectEqual(@as(usize, 9), app.runtime.executor.schemas.len);
     const after = try disk(home);
     defer a.free(after);
     try std.testing.expectEqualStrings(changed, after);
@@ -327,11 +327,11 @@ test "image unavailable own key preserves main startup and fails before file acc
     defer session.deinit();
     const app = session.app.?;
     try std.testing.expect(app.image_client == null and app.config.value.imageActive());
-    try std.testing.expectEqual(@as(usize, 5), app.runtime.executor.schemas.len);
+    try std.testing.expectEqual(@as(usize, 9), app.runtime.executor.schemas.len);
     try std.testing.expectError(error.ImageModelUnavailable, app.executor.image.?.checkReady());
     try std.testing.expectEqualStrings("chat", app.config.value.model.name);
     const connection = session.connection();
     try connection.image_fn.?(connection.context, .off);
     try std.testing.expect(app.executor.image == null and app.image_client == null);
-    try std.testing.expectEqual(@as(usize, 4), app.runtime.executor.schemas.len);
+    try std.testing.expectEqual(@as(usize, 8), app.runtime.executor.schemas.len);
 }

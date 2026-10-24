@@ -3,22 +3,26 @@
 const std = @import("std");
 
 pub const Field = struct { text: []const u8, truncated: bool = false };
-pub const Snapshot = struct { path: ?Field = null, command: ?Field = null, action: ?Field = null, topic: ?Field = null };
+pub const Snapshot = struct { path: ?Field = null, command: ?Field = null, action: ?Field = null, topic: ?Field = null, task: ?Field = null, id: ?Field = null };
 
 const capacity = 1024;
 const max_depth = 32;
-const names = [_][]const u8{ "path", "command", "action", "topic", "content" };
+/// Top-level scalar previews. "content" streams through a hook instead of a
+/// buffer; "task" is the bounded delegation summary (never "context") and "id"
+/// addresses a started job without exposing any message body.
+const names = [_][]const u8{ "path", "command", "action", "topic", "task", "id", "content" };
+const content_index = 6;
 const Phase = enum { object_first, object_key, colon, value, object_after, array_first, array_value, array_after };
 const Mode = enum { syntax, string, number, literal };
 const Escape = enum { normal, escaped, unicode, low_slash, low_u };
 const Number = enum { minus, zero, integer, dot, fraction, exponent, exponent_sign, exponent_digits };
 
 pub const Extractor = struct {
-    buffers: [4][capacity]u8 = undefined,
-    lengths: [4]usize = @splat(0),
-    truncated: [4]bool = @splat(false),
-    present: [4]bool = @splat(false),
-    seen: [5]bool = @splat(false),
+    buffers: [6][capacity]u8 = undefined,
+    lengths: [6]usize = @splat(0),
+    truncated: [6]bool = @splat(false),
+    present: [6]bool = @splat(false),
+    seen: [7]bool = @splat(false),
     stack: [max_depth]Phase = undefined,
     depth: usize = 0,
     started: bool = false,
@@ -67,7 +71,7 @@ pub const Extractor = struct {
     pub fn snapshot(self: *const Extractor) Snapshot {
         if (self.invalid) return .{};
         var result: Snapshot = .{};
-        inline for (.{ "path", "command", "action", "topic" }, 0..) |name, i| {
+        inline for (.{ "path", "command", "action", "topic", "task", "id" }, 0..) |name, i| {
             if (self.present[i]) @field(result, name) = .{ .text = self.buffers[i][0..self.lengths[i]], .truncated = self.truncated[i] };
         }
         return result;
@@ -225,7 +229,7 @@ pub const Extractor = struct {
             self.key_len += len;
         } else if (self.depth == 1) {
             if (self.selected) |i| {
-                if (i == 4) {
+                if (i == content_index) {
                     if (self.content_context) |context| if (self.content_scalar_fn) |callback| callback(context, cp);
                     return;
                 }
@@ -351,7 +355,7 @@ pub const Extractor = struct {
         } else {
             if (self.depth == 1) {
                 if (self.selected) |i| {
-                    if (i == 4) {
+                    if (i == content_index) {
                         if (self.content_context) |context| if (self.content_end_fn) |callback| callback(context);
                     } else self.present[i] = true;
                 }
@@ -391,7 +395,7 @@ pub const Extractor = struct {
 
 fn expectEmpty(e: *const Extractor) !void {
     const s = e.snapshot();
-    try std.testing.expect(s.path == null and s.command == null and s.action == null and s.topic == null);
+    try std.testing.expect(s.path == null and s.command == null and s.action == null and s.topic == null and s.task == null);
 }
 
 fn checkGolden(e: *const Extractor) !void {
@@ -457,6 +461,32 @@ test "content hook receives decoded scalars close and revocation without storing
     try std.testing.expect(hook.revoked);
 }
 
+test "task is previewed while context body is not" {
+    const json = "{\"task\":\"inspect release path\",\"context\":\"parent notes with \\\"quotes\\\"\"}";
+    for (0..json.len + 1) |split| {
+        var e: Extractor = .{};
+        e.feed(json[0..split]);
+        e.feed(json[split..]);
+        try std.testing.expect(e.finish());
+        const s = e.snapshot();
+        try std.testing.expectEqualStrings("inspect release path", s.task.?.text);
+        try std.testing.expect(s.path == null and s.command == null and s.action == null and s.topic == null and s.id == null);
+    }
+}
+
+test "job id is previewed while message and reply bodies are not" {
+    const json = "{\"id\":\"job-7\",\"message\":\"private-body\",\"wait\":true,\"wait_for_reply\":false}";
+    for (0..json.len + 1) |split| {
+        var e: Extractor = .{};
+        e.feed(json[0..split]);
+        e.feed(json[split..]);
+        try std.testing.expect(e.finish());
+        const s = e.snapshot();
+        try std.testing.expectEqualStrings("job-7", s.id.?.text);
+        try std.testing.expect(s.task == null and s.path == null);
+    }
+}
+
 test "unknown content and nested names never publish and long keys do not alias" {
     const json = "{\"content\":\"\\\"path\\\":\\\"fake\\\"\",\"expected_version\":\"path\",\"nested\":[{\"path\":\"wrong\",\"command\":\"wrong\"}],\"pathTOOLONG\":\"wrong\",\"commandx\":\"wrong\",\"unknown\":[0,-0,10,-10,1.2,1E2,1e-2,true,false,null,{},[]]}";
     for (0..json.len + 1) |split| {
@@ -485,7 +515,7 @@ test "closed path available during 100KiB content without storing it" {
     try std.testing.expect(e.finish());
     try std.testing.expectEqualStrings("safe", e.snapshot().path.?.text);
     try std.testing.expectEqual(@as(usize, 4), e.lengths[0]);
-    try std.testing.expectEqual(@as(usize, 4096), @sizeOf(@TypeOf(e.buffers)));
+    try std.testing.expectEqual(@as(usize, 6 * 1024), @sizeOf(@TypeOf(e.buffers)));
 }
 
 test "strict invalid cases revoke all fields at every split and stay invalid" {

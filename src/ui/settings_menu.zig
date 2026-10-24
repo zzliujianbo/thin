@@ -133,6 +133,8 @@ test "settings preserve old values and expose eight preference rows" {
     try std.testing.expectEqualStrings("on", value(.{}, 7));
     try std.testing.expectEqualStrings("off", value(.{ .memory_auto = false }, 7));
     try std.testing.expectEqual(@as(?Key, .memory_auto), preferenceKey(7));
+    try std.testing.expectEqualStrings("", label(8));
+    try std.testing.expectEqualStrings("", value(.{}, 8));
     try std.testing.expectEqualStrings("Off", value(.{}, 6));
     try std.testing.expectEqualStrings("login/deepseek-flash", value(.{ .image_enabled = true, .image_model = "login/deepseek-flash" }, 6));
     try std.testing.expectEqualStrings("on", value(.{}, 0));

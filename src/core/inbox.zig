@@ -74,7 +74,21 @@ pub const Inbox = struct {
         };
         return index;
     }
+    /// Existing UI/session delivery: a sealed run may still queue the next
+    /// round, so no run-gate is applied here.
     pub fn enqueue(self: *Inbox, a: Allocator, kind: Kind, text: []const u8) !u64 {
+        return self.enqueueInternal(a, kind, text, false);
+    }
+    /// Job-side delivery for a run that is already executing: it is accepted
+    /// only while the same run is open (begun and not sealed). The check and the
+    /// slot commit share the Inbox lock with `sealTask`, so either the message
+    /// is queued first (and the seal fails) or the seal wins (and delivery is
+    /// refused) — never a delivered message that no child will ever consume.
+    /// Epoch 0 means no run has begun yet, where a pre-spawn message is allowed.
+    pub fn enqueueForRun(self: *Inbox, a: Allocator, kind: Kind, text: []const u8) !u64 {
+        return self.enqueueInternal(a, kind, text, true);
+    }
+    fn enqueueInternal(self: *Inbox, a: Allocator, kind: Kind, text: []const u8, require_open_run: bool) !u64 {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 or trimmed[0] == '/' or trimmed[0] == '!' or std.mem.findScalar(u8, text, 0) != null or !std.unicode.utf8ValidateSlice(text)) return error.InvalidInput;
         if (text.len > 65536) return error.InputTooLarge;
@@ -82,6 +96,7 @@ pub const Inbox = struct {
         errdefer entry.deinit();
         self.lock();
         defer self.unlock();
+        if (require_open_run and self.epoch != 0 and (!self.active or self.sealed)) return error.RunSealed;
         if (self.next_id == std.math.maxInt(u64) or self.revision == std.math.maxInt(u64)) return error.IdentityExhausted;
         if (self.bytes + text.len > 262144) return error.InboxFull;
         for (&self.slots) |*slot| if (slot.* == null) {
@@ -342,4 +357,47 @@ test "steering inbox slots remain reserved and snapshot owns previews" {
     var entry = box.withdraw(id).?;
     entry.deinit();
     try std.testing.expectEqualStrings("hello", snap.previews[0].text());
+}
+
+test "run-gated delivery linearizes with sealing and leaves UI enqueue unchanged" {
+    const a = std.testing.allocator;
+    var box: Inbox = .{};
+    defer box.deinit();
+    // Epoch 0: a message may still be parked before the child run exists.
+    const pre = try box.enqueueForRun(a, .steering, "before spawn");
+    box.beginRun();
+    const early = box.claimSteering().?;
+    try std.testing.expectEqual(pre, early.id);
+    var consumed_early = box.commit(early).?;
+    consumed_early.deinit();
+
+    // An open run accepts the message, and that pending owner is exactly what
+    // makes the seal fail.
+    _ = try box.enqueueForRun(a, .steering, "runtime message");
+    try std.testing.expect(!box.sealTask());
+    const pending = box.claimSteering().?;
+    var consumed = box.commit(pending).?;
+    consumed.deinit();
+    try std.testing.expect(box.sealTask());
+    // The seal won the race: a later run-gated delivery is refused instead of
+    // being queued for a run that already ended.
+    try std.testing.expectError(error.RunSealed, box.enqueueForRun(a, .steering, "after seal"));
+    // Original UI semantics are unchanged: a sealed run may still queue the
+    // next turn, and that queued entry does not reopen the run gate.
+    const next = try box.enqueue(a, .steering, "next turn");
+    try std.testing.expect(box.claimSteering() == null);
+    try std.testing.expectError(error.RunSealed, box.enqueueForRun(a, .steering, "during seal"));
+    box.finishRun(true);
+    try std.testing.expectError(error.RunSealed, box.enqueueForRun(a, .steering, "after finish"));
+    // claimSteering requires an active run; claimNext deliberately still lets an
+    // idle box prefer the queued steering entry. Restore that entry before the
+    // final assertion so a stale lease cannot mask it in deinit.
+    try std.testing.expect(box.claimSteering() == null);
+    const idle = box.claimNext().?;
+    box.restore(idle);
+    try std.testing.expectEqual(next, idle.id);
+    box.beginRun();
+    const resumed = box.claimSteering().?;
+    try std.testing.expectEqual(next, resumed.id);
+    box.restore(resumed);
 }

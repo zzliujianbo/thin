@@ -633,6 +633,18 @@ fn string(value: std.json.Value) ![]const u8 {
     return value.string;
 }
 
+/// Legacy preview builds may have persisted a top-level subagent switch. Accept
+/// only its exact old shape ({"enabled":bool}, key optional) and drop it:
+/// delegation is now unconditional, so a saved false must never disable it.
+fn discardLegacySubagent(value: std.json.Value) !void {
+    const fields = try object(value);
+    var it = fields.iterator();
+    while (it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "enabled")) return error.UnknownField;
+        if (entry.value_ptr.* != .bool) return error.UnexpectedToken;
+    }
+}
+
 fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Config) {
     const trimmed = std.mem.trimStart(u8, bytes, " \t\r\n");
     if (trimmed.len != 0 and trimmed[0] != '{') return error.UnexpectedToken;
@@ -643,8 +655,9 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
     const root = try object(tree.value);
     var keys = root.iterator();
     while (keys.next()) |entry| {
-        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "decision") and !std.mem.eql(u8, entry.key_ptr.*, "proxy") and !std.mem.eql(u8, entry.key_ptr.*, "image") and !std.mem.eql(u8, entry.key_ptr.*, "memory")) return error.UnknownField;
+        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "decision") and !std.mem.eql(u8, entry.key_ptr.*, "proxy") and !std.mem.eql(u8, entry.key_ptr.*, "image") and !std.mem.eql(u8, entry.key_ptr.*, "memory") and !std.mem.eql(u8, entry.key_ptr.*, "subagent")) return error.UnknownField;
     }
+    if (root.get("subagent")) |legacy| try discardLegacySubagent(legacy);
     const llm_value = root.get("llm") orelse return error.MissingField;
     const result: Config = blk: {
         const llm = try object(llm_value);
@@ -816,6 +829,63 @@ fn memoryAllocationCase(a: std.mem.Allocator) !void {
 
 test "memory config allocation failures release parse clone and disk candidates" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, memoryAllocationCase, .{});
+}
+
+test "legacy subagent switch is validated then dropped instead of persisted" {
+    const a = std.testing.allocator;
+    // Old preview builds may have saved the switch. Delegation is unconditional
+    // now, so both values are dropped rather than honored or rewritten; a saved
+    // false must never disable the capability.
+    inline for (.{ "", ",\"subagent\":{}", ",\"subagent\":{\"enabled\":false}", ",\"subagent\":{\"enabled\":true}" }) |suffix| {
+        var parsed = try parse(a, image_test_prefix ++ suffix ++ "}");
+        defer release(&parsed);
+        try std.testing.expectEqualStrings("p/main", parsed.value.registry.?.default);
+        var copied = try clone(a, parsed.value);
+        defer release(&copied);
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try writeDisk(copied.value, &out.writer);
+        try std.testing.expect(std.mem.find(u8, out.written(), "\"subagent\"") == null);
+        var tree = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
+        defer tree.deinit();
+        try std.testing.expect(!tree.value.object.contains("subagent"));
+        var again = try parse(a, out.written());
+        defer release(&again);
+        try std.testing.expectEqualDeep(parsed.value.limits, again.value.limits);
+        try std.testing.expectEqualDeep(parsed.value.memory, again.value.memory);
+    }
+    // The legacy object itself stays strict: no unknown keys, no wrong types.
+    inline for (.{ "null", "true", "0", "\"enabled\"", "[]", "{\"enabled\":null}", "{\"enabled\":0}", "{\"enabled\":\"true\"}", "{\"enabled\":[]}", "{\"enabled\":{}}" }) |bad| {
+        try std.testing.expectError(error.UnexpectedToken, parse(a, image_test_prefix ++ ",\"subagent\":" ++ bad ++ "}"));
+    }
+    inline for (.{ "model", "task", "Enabled", "max_runs", "allow_memory", "depth" }) |field| {
+        try std.testing.expectError(error.UnknownField, parse(a, image_test_prefix ++ ",\"subagent\":{\"" ++ field ++ "\":true}}"));
+    }
+    try std.testing.expectError(error.DuplicateField, parse(a, image_test_prefix ++ ",\"subagent\":{\"enabled\":true,\"enabled\":false}}"));
+    try std.testing.expectError(error.DuplicateField, parse(a, image_test_prefix ++ ",\"subagent\":{},\"subagent\":{}}"));
+}
+
+fn legacySubagentAllocationCase(a: std.mem.Allocator) !void {
+    inline for (.{ "{}", "{\"enabled\":false}", "{\"enabled\":true}" }) |legacy| {
+        var parsed = try parse(a, image_test_prefix ++ ",\"subagent\":" ++ legacy ++ "}");
+        defer release(&parsed);
+        var copied = try clone(a, parsed.value);
+        defer release(&copied);
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        writeDisk(copied.value, &out.writer) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
+        try std.testing.expect(std.mem.find(u8, out.written(), "\"subagent\"") == null);
+        var again = try parse(a, out.written());
+        defer release(&again);
+        try std.testing.expectEqualDeep(parsed.value.limits, again.value.limits);
+    }
+}
+
+test "legacy subagent config allocation failures release parse clone and disk candidates" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, legacySubagentAllocationCase, .{});
 }
 
 /// Candidate-only edits. Allocate replacement slices; never mutate shared registry memory.

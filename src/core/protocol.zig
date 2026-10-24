@@ -172,14 +172,23 @@ pub const Outcome = union(enum) { success: Response, failure: Failure };
 pub const Cancellation = struct {
     /// 取消标志；使用原子变量，允许跨线程读写。
     requested: std.atomic.Value(bool) = .init(false),
-    /// 请求取消。release 写入，与 isRequested 的 acquire 读取配对。
+    /// Read-only parent link (e.g. a child task's token). The parent must outlive
+    /// this object; chains are short and must not form cycles. Never write
+    /// through this pointer: a child-local timeout must not cancel the parent.
+    /// 中文：只读父令牌引用；父对象生命周期须更长，禁止成环，也禁止借它写入父取消位。
+    parent: ?*const Cancellation = null,
+    /// 请求取消。release 写入，与 isRequested 的 acquire 读取配对。只写本地标志。
     pub fn cancel(self: *Cancellation) void {
         self.requested.store(true, .release);
     }
 
-    /// 查询是否已请求取消。
+    /// 查询是否已请求取消：本地标志或父令牌之一为真。仅查询，不传播写入。
     pub fn isRequested(self: *const Cancellation) bool {
-        return self.requested.load(.acquire);
+        if (self.requested.load(.acquire)) return true;
+        const up = self.parent orelse return false;
+        // Defensive self-link guard: a malformed parent must not recurse.
+        if (up == self) return false;
+        return up.isRequested();
     }
 };
 
@@ -322,6 +331,23 @@ test "usage preserves unknown values and does not double-count reasoning or cach
         .cached_input_tokens = 8,
         .reasoning_tokens = 3,
     }).total());
+}
+
+// 验证：父取消只向下可见，子取消不会写回父令牌。
+test "cancellation reads the parent one way and writes locally only" {
+    var root: Cancellation = .{};
+    var child: Cancellation = .{ .parent = &root };
+    try std.testing.expect(!child.isRequested());
+    child.cancel();
+    try std.testing.expect(child.isRequested());
+    try std.testing.expect(!root.isRequested());
+    var sibling: Cancellation = .{ .parent = &root };
+    try std.testing.expect(!sibling.isRequested());
+    root.cancel();
+    try std.testing.expect(sibling.isRequested());
+    var self_link: Cancellation = .{};
+    self_link.parent = &self_link;
+    try std.testing.expect(!self_link.isRequested());
 }
 
 // 验证：续接兼容性必须同时检查 connection、model 和 protocol 三者。

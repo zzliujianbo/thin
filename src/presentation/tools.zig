@@ -13,12 +13,21 @@ pub const Kind = enum {
     bash,
     read,
     write,
+    /// Child-job start; only its bounded task summary is displayable.
+    subagent,
+    /// get/send/cancel job control; the bounded id is the only detail.
+    subagent_id,
+    /// Child -> parent status; no separate panel and no message body.
+    parent_message,
     other,
     pub fn fromName(name: []const u8) Kind {
         if (std.mem.eql(u8, name, "memory")) return .memory;
         if (std.mem.eql(u8, name, "bash")) return .bash;
         if (std.mem.eql(u8, name, "read_file")) return .read;
         if (std.mem.eql(u8, name, "write_file")) return .write;
+        if (std.mem.eql(u8, name, "subagent")) return .subagent;
+        if (std.mem.eql(u8, name, "get_subagent_result") or std.mem.eql(u8, name, "send_subagent_message") or std.mem.eql(u8, name, "cancel_subagent")) return .subagent_id;
+        if (std.mem.eql(u8, name, "message_parent")) return .parent_message;
         return .other;
     }
 };
@@ -54,7 +63,17 @@ pub const Call = struct {
             defer a.free(raw);
             return fromDetail(a, kind, raw);
         }
-        const value = parsed.value.object.get(if (kind == .bash) "command" else "path") orelse return .{ .kind = kind };
+        // A child status row only needs the tool name; never its message body.
+        if (kind == .parent_message) return .{ .kind = kind };
+        const value = parsed.value.object.get(switch (kind) {
+            .bash => "command",
+            // Only the delegation goal is a caption; context and every other
+            // argument stay out of the row entirely.
+            .subagent => "task",
+            // Job control exposes only the opaque bounded id.
+            .subagent_id => "id",
+            else => "path",
+        }) orelse return .{ .kind = kind };
         if (value != .string) return .{ .kind = kind };
         return fromDetail(a, kind, value.string);
     }
@@ -64,6 +83,11 @@ pub const Call = struct {
     pub fn fromFields(a: std.mem.Allocator, name: []const u8, fields: tool_preview.Snapshot) !Call {
         const kind = Kind.fromName(name);
         if (kind == .other) return .{ .kind = kind };
+        // A delegation row shows only the bounded task summary. `context` is
+        // deliberately not extracted, so it can never reach a caption.
+        if (kind == .subagent) return fromField(a, kind, fields.task);
+        if (kind == .subagent_id) return fromField(a, kind, fields.id);
+        if (kind == .parent_message) return .{ .kind = kind };
         if (kind == .memory) {
             const action = fields.action orelse return .{ .kind = kind };
             if (action.truncated) return .{ .kind = kind };
@@ -76,8 +100,13 @@ pub const Call = struct {
             return call;
         }
         const field = (if (kind == .bash) fields.command else fields.path) orelse return .{ .kind = kind };
-        var call = try fromDetail(a, kind, field.text);
-        call.truncated = call.truncated or field.truncated;
+        return fromField(a, kind, field);
+    }
+
+    fn fromField(a: std.mem.Allocator, kind: Kind, field: ?tool_preview.Field) !Call {
+        const value = field orelse return .{ .kind = kind };
+        var call = try fromDetail(a, kind, value.text);
+        call.truncated = call.truncated or value.truncated;
         return call;
     }
 
@@ -243,6 +272,68 @@ test "memory descriptions include known action and topic without bodies versions
     const long = try Call.init(a, "memory", long_args);
     defer long.deinit(a);
     try std.testing.expect(long.truncated and long.detail.?.len <= 512);
+}
+
+test "subagent captions keep only a bounded task summary and never context" {
+    const a = std.testing.allocator;
+    const call = try Call.init(a, "subagent", "{\"task\":\"检查资源释放路径\",\"context\":\"private-context-body\"}");
+    defer call.deinit(a);
+    try std.testing.expect(call.kind == .subagent);
+    try std.testing.expectEqualStrings("检查资源释放路径", call.detail.?);
+    try std.testing.expect(std.mem.find(u8, call.detail.?, "private-context-body") == null);
+    try std.testing.expect(!call.truncated);
+    const hostile = try Call.init(a, "subagent", "{\"task\":\"a\\u001b[2J\\tb\\n\"}");
+    defer hostile.deinit(a);
+    try std.testing.expect(std.mem.findScalar(u8, hostile.detail.?, '\x1b') == null);
+    try std.testing.expect(std.mem.findScalar(u8, hostile.detail.?, '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, hostile.detail.?, '\t') == null);
+    var args: std.Io.Writer.Allocating = .init(a);
+    defer args.deinit();
+    try args.writer.writeAll("{\"task\":\"");
+    for (0..2048) |_| try args.writer.writeAll("中");
+    try args.writer.writeAll("\",\"context\":\"hidden-body\"}");
+    const long = try Call.init(a, "subagent", args.written());
+    defer long.deinit(a);
+    try std.testing.expect(long.truncated and long.detail.?.len <= 512);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(long.detail.?));
+    try std.testing.expect(std.mem.find(u8, long.detail.?, "hidden-body") == null);
+    for ([_][]const u8{ "{}", "{\"context\":\"only\"}", "{\"task\":42}", "{\"task\":null}", "{\"task\":missing", "[]", "" }) |raw| {
+        const unknown = try Call.init(a, "subagent", raw);
+        defer unknown.deinit(a);
+        try std.testing.expect(unknown.kind == .subagent and unknown.detail == null);
+    }
+    // The typed streaming field is the same bounded summary; unrelated or
+    // context-like fields never become a task caption.
+    const streamed = try Call.fromFields(a, "subagent", .{ .task = .{ .text = "inspect release paths", .truncated = true }, .path = .{ .text = "wrong" } });
+    defer streamed.deinit(a);
+    try std.testing.expect(streamed.kind == .subagent and streamed.truncated);
+    try std.testing.expectEqualStrings("inspect release paths", streamed.detail.?);
+    const missing = try Call.fromFields(a, "subagent", .{ .path = .{ .text = "wrong" }, .command = .{ .text = "wrong" } });
+    defer missing.deinit(a);
+    try std.testing.expect(missing.kind == .subagent and missing.detail == null);
+}
+
+test "job control captions keep only ids and child status stays a bare tool name" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "get_subagent_result", "send_subagent_message", "cancel_subagent" }) |name| {
+        const args = try std.fmt.allocPrint(a, "{{\"id\":\"job-7\",\"message\":\"private-body\",\"wait\":false}}", .{});
+        defer a.free(args);
+        const call = try Call.init(a, name, args);
+        defer call.deinit(a);
+        try std.testing.expect(call.kind == .subagent_id);
+        try std.testing.expectEqualStrings("job-7", call.detail.?);
+        try std.testing.expect(std.mem.find(u8, call.detail.?, "private-body") == null);
+    }
+    const child = try Call.init(a, "message_parent", "{\"message\":\"private-body\",\"wait_for_reply\":true}");
+    defer child.deinit(a);
+    try std.testing.expect(child.kind == .parent_message and child.detail == null);
+    const streamed = try Call.fromFields(a, "cancel_subagent", .{ .id = .{ .text = "job-9", .truncated = true }, .task = .{ .text = "wrong" } });
+    defer streamed.deinit(a);
+    try std.testing.expect(streamed.kind == .subagent_id and streamed.truncated);
+    try std.testing.expectEqualStrings("job-9", streamed.detail.?);
+    const unknown = try Call.fromFields(a, "get_subagent_result", .{ .task = .{ .text = "wrong" } });
+    defer unknown.deinit(a);
+    try std.testing.expect(unknown.kind == .subagent_id and unknown.detail == null);
 }
 
 test "shared tools expose structured safe detail observations and bounded FIFO without styles" {

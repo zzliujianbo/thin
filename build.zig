@@ -162,6 +162,11 @@ pub fn build(b: *std.Build) void {
     const run_memory_app = fixture(b, "node", "tests/product/memory_auto_mock.mjs", &.{exe}, &.{});
     b.step("test-memory-app", "Run owned loopback automatic-memory CLI lifecycle acceptance").dependOn(&run_memory_app.step);
 
+    // Foreground subagent acceptance: real in-process child Runtime over owned
+    // loopback Chat/Responses/Anthropic wires plus default-off and denial cases.
+    const run_subagent = fixture(b, "node", "tests/product/subagent_mock.mjs", &.{exe}, &.{});
+    b.step("test-subagent", "Run owned-loopback interactive subagent Runtime acceptance").dependOn(&run_subagent.step);
+
     const run_idle_enter = fixture(b, "python3", "tests/product/idle_enter_mock.py", &.{exe}, &.{});
     b.step("test-idle-enter", "Run owned idle prompt newline PTYs (requires Python 3)").dependOn(&run_idle_enter.step);
 
@@ -205,6 +210,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_unit.step);
     test_all.dependOn(&run_memory.step);
     test_all.dependOn(&run_memory_app.step);
+    test_all.dependOn(&run_subagent.step);
     test_all.dependOn(&run_presentation.step);
     test_all.dependOn(&run_http.step);
     test_all.dependOn(&run_anthropic.step);
