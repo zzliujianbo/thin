@@ -12,7 +12,6 @@ const settings = struct {
     const relative_path = ".thin/settings.json";
 };
 const mem = @import("memory.zig");
-const memory_queue = @import("memory_queue.zig");
 const process = @import("../platform/process.zig");
 const j = @import("../util/json.zig");
 const runtime = @import("../core/runtime.zig");
@@ -46,9 +45,9 @@ pub const schemas = [_]p.ToolSchema{
     },
     .{
         .name = "memory",
-        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs. status returns automatic-job IDs/states without source text. retry uses a failed/uncertain job ID as topic and always needs explicit human approval because a previous inference may already have been billed; Auto memory must be On.",
+        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.",
         .parameters_json =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["list","read","write","delete","status","retry"]},"topic":{"type":"string"},"content":{"type":"string"},"expected_version":{"type":["string","null"]}},"required":["action"],"additionalProperties":false}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["list","read","write","delete"]},"topic":{"type":"string"},"content":{"type":"string"},"expected_version":{"type":["string","null"]}},"required":["action"],"additionalProperties":false}
         ,
     },
 };
@@ -57,7 +56,7 @@ pub const schemas = [_]p.ToolSchema{
 // command-confirmation decision. These static variants add no prompt allocation
 // and preserve tool IDs, order and parameter schemas.
 const decision_bash_description = "Run bash in the startup project; cwd changes do not persist. The configured reviewer's ask=true requires approval for this call; ask=false removes the extra command-approval prompt. The reviewer also chooses the command deadline. Unavailable or invalid review pauses without executing. Denial means no execution. Hard validation, task deadlines, cancellation and output limits apply. stdout/stderr retain bounded head/tail, not full logs.";
-const decision_memory_description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Only write candidates are reviewed for durable value; skipped writes make no change, and a useful candidate is not authorization. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs. status returns automatic-job IDs/states without source text. retry uses a failed/uncertain job ID as topic and always needs explicit human approval because a previous inference may already have been billed; Auto memory must be On.";
+const decision_memory_description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Only write candidates are reviewed for durable value; skipped writes make no change, and a useful candidate is not authorization. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.";
 const reviewed_schemas = blk: {
     var result = schemas;
     result[2].description = decision_bash_description;
@@ -97,8 +96,8 @@ pub const Bash = struct { command: []const u8, timeout_ms: ?u32 = null };
 
 /// memory 工具的解析结果；topic 为 core 或 ASCII slug，list 时不得携带其他字段。
 pub const Memory = struct {
-    /// 操作类型：list/read/write/delete/status/retry；retry 的 topic 是 job ID。
-    action: enum { list, read, write, delete, status, retry },
+    /// 操作类型：list/read/write/delete。
+    action: enum { list, read, write, delete },
     /// 目标主题；list 时必须为空。
     topic: ?[]const u8 = null,
     /// 写入内容，仅 write 使用。
@@ -176,13 +175,9 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
     if (std.mem.eql(u8, name, "memory")) {
         const args = try std.json.parseFromSliceLeaky(Memory, a, arguments, opts);
         // list 不接受 topic/content/版本号，保持调用形状严格。
-        if (args.action == .list or args.action == .status) {
+        if (args.action == .list) {
             if (args.topic != null or args.content != null or args.expected_version != null)
                 return error.InvalidMemoryArguments;
-        } else if (args.action == .retry) {
-            const id = args.topic orelse return error.MissingMemoryTopic;
-            if (id.len != 64 or args.content != null or args.expected_version != null) return error.InvalidMemoryArguments;
-            for (id) |byte| if (!(byte >= '0' and byte <= '9') and !(byte >= 'a' and byte <= 'f')) return error.InvalidMemoryArguments;
         } else {
             // 非 list 操作都必须带合法 topic（core 或 ASCII slug）。
             const topic = args.topic orelse return error.MissingMemoryTopic;
@@ -384,10 +379,7 @@ pub const Tools = struct {
             const finding = command_risk.classify(action.bash.command) orelse break :blk null;
             description = try std.fmt.allocPrint(a, "DANGEROUS bash ({s}). Explicit approval is required each time; choose Allow once or Deny in the confirmation popup.\n{s}", .{ finding.label, description });
             break :blk try std.fmt.allocPrint(a, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow each time.", .{finding.label});
-        } else if (action.* == .memory and action.memory.action == .retry)
-            "Memory retry was not executed. Explicit approval is required: an uncertain inference may already have been billed; retry can incur another charge."
-        else
-            null;
+        } else null;
         const review: ?decision.Input = switch (action.*) {
             .bash => |b| .{ .command = .{
                 .command = b.command,
@@ -536,22 +528,6 @@ pub const Tools = struct {
             .memory => |m| switch (m.action) {
                 .list => {
                     try j.put(a, &value, "current_snapshot", j.str(try self.memory.snapshot(a)));
-                },
-
-                .status => {
-                    var queue = memory_queue.Queue.init(self.root);
-                    try j.put(a, &value, "jobs", j.str(try queue.status(a)));
-                },
-
-                .retry => {
-                    if (!self.config.memory.auto) return error.MemoryAutoDisabled;
-                    try j.put(a, &value, "job", j.str(m.topic.?));
-                    try j.put(a, &value, "operation", j.str("queued"));
-                    const encoded = try j.encode(a, value);
-                    errdefer a.free(encoded);
-                    var queue = memory_queue.Queue.init(self.root);
-                    try queue.retry(a, m.topic.?);
-                    return .{ .text = encoded };
                 },
 
                 .read => {

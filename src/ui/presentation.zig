@@ -76,9 +76,9 @@ pub const Caption = struct {
     }
 };
 
-/// Parse only bounded canonical copies. Incomplete JSON must not guess a shell
-/// command; execution and approval keep their original unabridged parameters.
-pub fn caption(a: std.mem.Allocator, name: []const u8, arguments: []const u8) !Caption {
+/// Test-only: parse bounded canonical copies through the same shared Call path
+/// the production callers (fromCall/fromToolView) use.
+fn caption(a: std.mem.Allocator, name: []const u8, arguments: []const u8) !Caption {
     const call = try shared.tools.Call.init(a, name, arguments);
     defer call.deinit(a);
     return fromCall(a, call);

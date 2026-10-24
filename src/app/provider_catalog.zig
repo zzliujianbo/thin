@@ -100,10 +100,6 @@ pub fn flatPriceLimit(entry: Entry) ?u32 {
 pub fn connection(id: Id) cfg.Provider {
     return .{ .kind = id, .base_url = id.baseUrl(), .chat_max_tokens = true };
 }
-pub fn first(id: Id) Entry {
-    for (entries) |entry| if (entry.provider == id) return entry;
-    unreachable;
-}
 pub fn find(selector: []const u8) ?Entry {
     for (entries) |entry| if (std.mem.eql(u8, selector, entry.selector)) return entry;
     return null;
@@ -115,13 +111,13 @@ test "documented flat price ranges are limited to exact direct DeepSeek Chat rou
             try std.testing.expectEqual(@as(?u32, 1000000), flatPriceLimit(entry));
         } else try std.testing.expect(flatPriceLimit(entry) == null);
     }
-    var changed = first(.deepseek);
+    var changed = find("deepseek/deepseek-flash").?;
     changed.model.name = "deepseek-flash-future";
     try std.testing.expect(flatPriceLimit(changed) == null);
-    changed = first(.deepseek);
+    changed = find("deepseek/deepseek-flash").?;
     changed.model.protocol = .responses;
     try std.testing.expect(flatPriceLimit(changed) == null);
-    changed = first(.deepseek);
+    changed = find("deepseek/deepseek-flash").?;
     changed.provider = .opencode_go;
     try std.testing.expect(flatPriceLimit(changed) == null);
 }
@@ -136,7 +132,6 @@ test "provider presets select exact protocols and keep Zen and Go separate" {
         try std.testing.expectEqual(entry.provider, find(entry.selector).?.provider);
         for (entries[0..index]) |previous| try std.testing.expect(!std.mem.eql(u8, entry.selector, previous.selector));
     }
-    for (Id.all) |id| try std.testing.expectEqual(id, first(id).provider);
     try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1", connection(.opencode_go).base_url);
     try std.testing.expectEqualStrings("https://opencode.ai/zen/v1", connection(.opencode_zen).base_url);
     try std.testing.expect(find("opencode-go/claude-haiku-5-5").?.model.protocol == .anthropic);

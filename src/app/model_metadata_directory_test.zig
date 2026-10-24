@@ -704,6 +704,15 @@ test "official row fields survive public-only directory publication" {
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
+    // Cached declarations still require the only canonical wire spellings.
+    for ([_][]const u8{
+        "{\"version\":14,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-level\",\"reasoning\":{\"map\":{\"high\":\"intensive\"}}}]}",
+        "{\"version\":14,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-off\",\"reasoning\":{\"map\":{\"off\":\"disabled\"}}}]}",
+        "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"bad-off\",\"reasoning\":{\"format\":\"deepseek\",\"map\":{\"off\":\"none\"}}}]}",
+    }) |invalid| {
+        try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = invalid });
+        try t.expectError(error.InvalidMetadata, m.load(&root));
+    }
     const legacy = "{\"version\":14,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true,\"reasoning\":{\"map\":{\"high\":\"high\"}}}]}";
     try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = legacy });
     var cache = try m.commit(&root, 0, try m.parseDev(t.allocator,

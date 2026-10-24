@@ -1,8 +1,9 @@
 //! 前端共享的接收端计量与连续动画相位。无终端颜色、字符宽度或帧状态。
-//! Renderer-independent animation and throughput. No tokenizer or provider timing claim:
-//! rolling ~TPS estimates received visible text/arguments; final TPS uses reported
-//! output divided by client-observed normal request time (including TTFT). Tool
-//! and summary time are excluded. All clocks are supplied for deterministic tests.
+//! Renderer-independent animation and receive-rate display. It makes no cumulative
+//! or provider-derived claim: the only measurement is a rolling ~TPS window over
+//! received visible text/arguments of the current call. Tool and idle gaps are
+//! dropped because a new call restarts its own window; all clocks are supplied
+//! so the window stays deterministic in tests.
 const std = @import("std");
 
 /// UI bands, not provider performance grades. Unknown is not a slow/zero rate.
@@ -243,59 +244,35 @@ const Counts = struct {
 
 const Bucket = struct { tick: ?u64 = null, counts: Counts = .{} };
 
+/// Only the live window is measured: whether a call is open, its first received
+/// delta and the recent buckets those deltas landed in.
 pub const Meter = struct {
-    started_ms: ?u64 = null,
-    finished_ms: ?u64 = null,
-    call_started_ms: ?u64 = null,
+    call_active: bool = false,
     first_received_ms: ?u64 = null,
-    ttft_ms: ?u64 = null,
-    normal_ms: u64 = 0,
-    timing_valid: bool = true,
-    total: Counts = .{},
-    has_received: bool = false,
     buckets: [10]Bucket = @splat(.{}),
 
-    pub fn reset(self: *Meter, now_ms: u64) void {
-        self.* = .{ .started_ms = now_ms };
+    pub fn reset(self: *Meter) void {
+        self.* = .{};
     }
 
-    pub fn beginCall(self: *Meter, now_ms: u64) void {
-        self.endCall(now_ms);
-        self.call_started_ms = now_ms;
-        self.first_received_ms = null;
-        self.ttft_ms = null;
-        self.buckets = @splat(.{});
+    pub fn beginCall(self: *Meter) void {
+        self.* = .{ .call_active = true };
     }
 
-    pub fn endCall(self: *Meter, now_ms: u64) void {
-        if (self.call_started_ms) |start| {
-            const n = @addWithOverflow(self.normal_ms, now_ms -| start);
-            self.timing_valid = self.timing_valid and now_ms >= start and n[1] == 0;
-            self.normal_ms = n[0];
-            self.call_started_ms = null;
-        }
-    }
-
-    pub fn finish(self: *Meter, now_ms: u64) void {
-        self.endCall(now_ms);
-        self.finished_ms = now_ms;
+    pub fn endCall(self: *Meter) void {
+        self.call_active = false;
     }
 
     /// Count UTF-8 leading bytes rather than rounding each transport delta.
     /// Chunk boundaries (even inside a codepoint) must not multiply estimates.
     pub fn observe(self: *Meter, now_ms: u64, bytes: []const u8) void {
-        const start = self.call_started_ms orelse return;
+        if (!self.call_active) return;
         if (bytes.len == 0) return;
-        if (self.first_received_ms == null) {
-            self.first_received_ms = now_ms;
-            self.ttft_ms = now_ms -| start;
-        }
+        if (self.first_received_ms == null) self.first_received_ms = now_ms;
         var counts: Counts = .{};
         for (bytes) |byte| {
             if (byte < 128) counts.ascii += 1 else if (byte & 0xc0 != 0x80) counts.unicode += 1;
         }
-        self.total.add(counts);
-        self.has_received = true;
         const tick = now_ms / 100;
         const bucket = &self.buckets[tick % self.buckets.len];
         if (bucket.tick != tick) bucket.* = .{ .tick = tick };
@@ -304,7 +281,7 @@ pub const Meter = struct {
 
     /// Rate in tenths of tokens/s. A short window is unknown, not a spike.
     pub fn liveRate(self: *const Meter, now_ms: u64) ?u64 {
-        if (self.call_started_ms == null) return null;
+        if (!self.call_active) return null;
         const first = self.first_received_ms orelse return null;
         const window_ms = @min(@as(u64, 1000), now_ms -| first);
         if (window_ms < 250) return null;
@@ -315,21 +292,6 @@ pub const Meter = struct {
             if (at <= tick and tick - at < self.buckets.len) counts.add(bucket.counts);
         }
         return rate(counts.estimate(), window_ms);
-    }
-
-    pub fn average(self: *const Meter, reported_output: ?u64) ?u64 {
-        if (!self.timing_valid) return null;
-        return rate(reported_output, self.normal_ms);
-    }
-
-    pub fn estimatedAverage(self: *const Meter) ?u64 {
-        if (!self.has_received) return null;
-        return self.average(self.total.estimate());
-    }
-
-    pub fn elapsed(self: *const Meter, now_ms: u64) ?u64 {
-        const start = self.started_ms orelse return null;
-        return (self.finished_ms orelse now_ms) -| start;
     }
 };
 
@@ -378,49 +340,42 @@ test "model flow speeds up with TPS without backwards rate-change jumps" {
     try std.testing.expectEqual(@as(u64, 0), fast.units);
 }
 
-test "stream estimate does not depend on delta or UTF8 boundaries" {
+test "live rate does not depend on delta or UTF8 boundaries" {
     var together: Meter = .{};
-    together.reset(0);
-    together.beginCall(100);
+    together.beginCall();
     together.observe(100, "abcd你");
     var split: Meter = .{};
-    split.reset(0);
-    split.beginCall(100);
+    split.beginCall();
     for ("abcd你") |byte| split.observe(100, &.{byte});
-    try std.testing.expectEqual(together.total.estimate(), split.total.estimate());
-    try std.testing.expectEqual(@as(?u64, 4), together.total.estimate());
+    // (4 ascii + 2) / 3 + 1 wide codepoint * 2 = 4 tokens over the 500ms window.
+    try std.testing.expectEqual(@as(?u64, 80), together.liveRate(600));
     try std.testing.expectEqual(together.liveRate(600), split.liveRate(600));
 }
 
 test "rolling TPS becomes zero after idle and cannot invent a short window rate" {
     var m: Meter = .{};
-    m.beginCall(0);
+    m.beginCall();
     m.observe(0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     try std.testing.expect(m.liveRate(200) == null);
     try std.testing.expectEqual(@as(?u64, 400), m.liveRate(250));
     try std.testing.expectEqual(@as(?u64, 0), m.liveRate(1100));
-    m.endCall(1200);
+    m.endCall();
     try std.testing.expect(m.liveRate(1300) == null);
 }
 
-test "normal call averages exclude tool gaps and keep unknown usage unknown" {
+test "live rate excludes tool gaps new requests and finished or reset state" {
     var m: Meter = .{};
-    m.reset(0);
-    m.beginCall(100);
-    m.observe(250, "visible");
-    try std.testing.expectEqual(@as(?u64, 150), m.ttft_ms);
-    m.endCall(1100);
-    m.beginCall(6100); // Five seconds executing a tool are not generation time.
-    m.endCall(7100);
-    m.finish(7500);
-    try std.testing.expectEqual(@as(u64, 2000), m.normal_ms);
-    try std.testing.expectEqual(@as(?u64, 200), m.average(40));
-    try std.testing.expect(m.average(null) == null);
-    try std.testing.expectEqual(@as(?u64, 7500), m.elapsed(9000));
+    m.beginCall();
+    m.observe(1000, "abc"); // One token inside a 500ms window.
+    try std.testing.expectEqual(@as(?u64, 20), m.liveRate(1500));
+    m.endCall();
+    try std.testing.expect(m.liveRate(1600) == null);
+    // Six idle/tool seconds are not generation time: the next request opens its
+    // own window instead of inheriting the gap or the previous buckets.
+    m.beginCall();
+    m.observe(7000, "aaaaaa"); // Two tokens, nothing carried over.
+    try std.testing.expectEqual(@as(?u64, 40), m.liveRate(7500));
+    m.reset();
+    try std.testing.expect(m.liveRate(7600) == null);
     try std.testing.expect(rate(1, 0) == null);
-    var final_only: Meter = .{};
-    final_only.beginCall(0);
-    final_only.finish(1000);
-    try std.testing.expect(final_only.estimatedAverage() == null);
-    try std.testing.expectEqual(@as(?u64, 200), final_only.average(20));
 }

@@ -118,11 +118,6 @@ pub const App = struct {
         return initConfiguredAnchored(a, io, environ, &root, host, parsed);
     }
 
-    /// 接管 parsed（成功或失败均接管），供交互配置准备候选 App；此过程不发送模型请求。
-    pub fn initConfigured(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
-        return initConfiguredRoot(a, io, environ, project, null, null, host, parsed);
-    }
-
     /// Duplicate an already anchored project; never re-open its replaceable
     /// pathname during activation. parsed is consumed on success AND failure.
     pub fn initConfiguredAnchored(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
@@ -220,7 +215,7 @@ pub const App = struct {
         self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
         self.runtime.session_loader = .{ .context = self, .load_fn = loadSessionPolicy };
         self.runtime.observer = self.journal.observer();
-        self.runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieveMemory, .complete_fn = completeMemory };
+        self.runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieveMemory, .finalize_fn = finalizeMemory };
         self.recordSelection();
         return self;
     }
@@ -237,10 +232,9 @@ pub const App = struct {
         };
     }
 
-    fn completeMemory(raw: *anyopaque, capture: *const knowledge.Capture) void {
+    fn finalizeMemory(raw: *anyopaque, capture: *const knowledge.Capture, protocol: @import("../core/protocol.zig").Protocol, cancel: *const @import("../core/protocol.zig").Cancellation) void {
         const self: *App = @ptrCast(@alignCast(raw));
-        if (!self.config.value.memory.auto or capture.incomplete) return;
-        self.memory_coordinator.confirmProtocol(self.runtime.selector.effective());
+        if (!self.config.value.memory.auto) return;
         var wiping: cfg.WipingAllocator = .{ .backing = self.allocator };
         var arena = std.heap.ArenaAllocator.init(wiping.allocator());
         defer arena.deinit();
@@ -252,7 +246,7 @@ pub const App = struct {
             }
             filtered.add(source.kind, source.text);
         }
-        self.memory_coordinator.enqueue(&filtered) catch |err| self.memory_coordinator.reportFailure(err);
+        self.memory_coordinator.finalize(&filtered, protocol, cancel);
     }
 
     fn imageService(self: *App) ?image.Service {

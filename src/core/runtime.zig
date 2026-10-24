@@ -11,11 +11,12 @@ const decision = @import("decision.zig");
 const knowledge = @import("knowledge.zig");
 
 /// Owner-thread callbacks. Retrieval returns allocator-owned borrowed reference
-/// bytes; completion must copy synchronously before the task's wiped arena dies.
+/// bytes. Finalization runs synchronously before the accepted task publishes its
+/// finished event, and must not retain capture bytes past the callback.
 pub const MemoryHooks = struct {
     context: *anyopaque,
     retrieve_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, usize) anyerror![]const u8,
-    complete_fn: *const fn (*anyopaque, *const knowledge.Capture) void,
+    finalize_fn: *const fn (*anyopaque, *const knowledge.Capture, p.Protocol, *const p.Cancellation) void,
 };
 const session_context = @import("session_context.zig");
 const Io = std.Io;
@@ -1275,7 +1276,7 @@ pub const Runtime = struct {
         }
         if (task.terminal.status == .success) {
             if (self.memory_capture) |completed| {
-                if (self.memory_hooks) |hooks| hooks.complete_fn(hooks.context, completed);
+                if (self.memory_hooks) |hooks| hooks.finalize_fn(hooks.context, completed, self.selector.effective(), cancel);
             }
         }
 

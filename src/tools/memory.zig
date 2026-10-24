@@ -13,8 +13,6 @@ const config = @import("../core/config.zig");
 const Root = fs.Root;
 extern "c" fn fsync(c_int) c_int;
 pub const directory_name = "memory";
-pub const jobs_name = "jobs";
-pub const owner_name = "jobs-owner";
 
 fn exists(parent: c_int, name: [*:0]const u8) !bool {
     const fd = fs.linux.openat(parent, name, fs.linux.path_only | fs.linux.nofollow | fs.linux.cloexec, 0);
@@ -26,11 +24,18 @@ fn exists(parent: c_int, name: [*:0]const u8) !bool {
     return fs.osError();
 }
 
-fn lockOwner(parent: c_int, name: [*:0]const u8, io: std.Io) !c_int {
-    const fd = fs.linux.openat(parent, name, 2 | fs.linux.create | fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0o600);
-    if (fd < 0) return fs.osError();
+fn lockExistingOwner(parent: c_int, name: [*:0]const u8, io: std.Io) !?c_int {
+    const fd = fs.linux.openat(parent, name, 2 | fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0);
+    if (fd < 0) {
+        const e = std.c._errno().*;
+        if (e == 2 or e == 40) return null; // absent or symlink tombstone
+        return fs.osError();
+    }
     errdefer fs.closeFd(fd);
-    if ((try fs.fileFromFd(fd).stat(io)).kind != .file) return error.NotRegularFile;
+    if ((try fs.fileFromFd(fd).stat(io)).kind != .file) {
+        fs.closeFd(fd);
+        return null;
+    }
     while (fs.linux.flock(fd, 2 | 4) != 0) {
         const e = std.c._errno().*;
         if (e == 4) continue;
@@ -40,36 +45,33 @@ fn lockOwner(parent: c_int, name: [*:0]const u8, io: std.Io) !c_int {
     return fd;
 }
 
-fn legacyOwnerNeedsMigration(thin: c_int, io: std.Io) !bool {
-    const fd = fs.linux.openat(thin, "mem-jobs-owner", fs.linux.path_only | fs.linux.nofollow | fs.linux.cloexec, 0);
-    if (fd < 0) {
-        if (std.c._errno().* == 2) return false;
-        return fs.osError();
-    }
-    defer fs.closeFd(fd);
-    // A completed migration leaves a symlink tombstone. Old binaries use
-    // O_NOFOLLOW and therefore cannot recreate a second lease/queue namespace.
-    return (try fs.fileFromFd(fd).stat(io)).kind != .sym_link;
+fn hasRetiredArtifacts(thin: c_int) !bool {
+    if (try exists(thin, "mem") or try exists(thin, "mem-jobs") or try exists(thin, "mem-jobs-owner")) return true;
+    const memory = fs.openDirectory(thin, directory_name) catch |err| {
+        if (err == error.FileNotFound) return false;
+        return err;
+    };
+    defer fs.closeFd(memory);
+    return try exists(memory, "jobs") or try exists(memory, "jobs-owner");
 }
 
-fn hasLegacyLayout(thin: c_int, io: std.Io) !bool {
-    return try exists(thin, "mem") or try exists(thin, "mem-jobs") or try legacyOwnerNeedsMigration(thin, io);
+fn discard(parent: c_int, io: std.Io, name: []const u8) !void {
+    (std.Io.Dir{ .handle = parent }).deleteTree(io, name) catch |err| {
+        if (err != error.FileNotFound) return err;
+    };
 }
 
-/// One-time, no-merge migration from the original public layout. The durable
-/// outbox is moved, never discarded: queued work and failed/uncertain replay
-/// decisions remain authoritative. Both old and new worker lease inodes are
-/// locked before any rename, so a live worker or mixed destination fails closed.
+/// Preserve the final Memory store migration, but permanently discard every
+/// retired asynchronous outbox/lease artifact. Jobs are never parsed, moved,
+/// recovered or replayed. A live old worker lease makes startup fail Busy so it
+/// cannot publish stale Memory after the queue has been removed.
 pub fn migrateLayout(root: *Root) !void {
-    // Normal startup has no legacy artifacts and must not contend on the
-    // optional Memory root lock merely to prove that migration is unnecessary.
     const probe = fs.openDirectory(root.dir.handle, ".thin") catch |err| {
         if (err == error.FileNotFound) return;
         return err;
     };
     defer fs.closeFd(probe);
-    const migration_needed = try hasLegacyLayout(probe, root.io);
-    if (!migration_needed) return;
+    if (!try hasRetiredArtifacts(probe)) return;
 
     const locked = try fs.openDirectory(root.dir.handle, ".");
     defer fs.closeFd(locked);
@@ -81,50 +83,43 @@ pub fn migrateLayout(root: *Root) !void {
     }
     const thin = try fs.openDirectory(root.dir.handle, ".thin");
     defer fs.closeFd(thin);
-    if (!try hasLegacyLayout(thin, root.io)) return;
+    if (!try hasRetiredArtifacts(thin)) return;
 
     const old_memory = try exists(thin, "mem");
     const new_memory = try exists(thin, directory_name);
     if (old_memory and new_memory) return error.MemoryLayoutConflict;
-    const old_jobs = try exists(thin, "mem-jobs");
 
-    // Creating and locking the legacy owner closes the check/create race with
-    // an old worker. Its inode has no durable payload; the queue directory is
-    // the durable state that must be renamed intact.
-    const legacy_owner = try lockOwner(thin, "mem-jobs-owner", root.io);
-    defer fs.closeFd(legacy_owner);
+    var current_owner: ?c_int = null;
+    defer if (current_owner) |fd| fs.closeFd(fd);
+    if (new_memory) {
+        const memory = try fs.openDirectory(thin, directory_name);
+        defer fs.closeFd(memory);
+        current_owner = try lockExistingOwner(memory, "jobs-owner", root.io);
+    }
+    var old_embedded_owner: ?c_int = null;
+    defer if (old_embedded_owner) |fd| fs.closeFd(fd);
+    if (old_memory) {
+        const memory = try fs.openDirectory(thin, "mem");
+        defer fs.closeFd(memory);
+        old_embedded_owner = try lockExistingOwner(memory, "jobs-owner", root.io);
+    }
+    const legacy_owner = try lockExistingOwner(thin, "mem-jobs-owner", root.io);
+    defer if (legacy_owner) |fd| fs.closeFd(fd);
 
-    // If the store itself is legacy, establish the future destination lease
-    // inside it before the directory becomes visible under the new name.
-    const memory = if (old_memory)
-        try child(thin, "mem", false)
-    else
-        try child(thin, directory_name, true);
-    defer fs.closeFd(memory);
-    const destination_owner = try lockOwner(memory, owner_name, root.io);
-    defer fs.closeFd(destination_owner);
-
-    if (old_jobs and try exists(memory, jobs_name)) return error.MemoryLayoutConflict;
     if (old_memory) {
         if (std.c.renameat(thin, "mem", thin, directory_name) != 0) return fs.osError();
         if (fsync(thin) != 0) return fs.osError();
     }
-    if (old_jobs) {
-        if (std.c.renameat(thin, "mem-jobs", memory, jobs_name) != 0) return fs.osError();
-        if (fsync(memory) != 0 or fsync(thin) != 0) return fs.osError();
+    if (try exists(thin, directory_name)) {
+        const memory = try fs.openDirectory(thin, directory_name);
+        defer fs.closeFd(memory);
+        try discard(memory, root.io, "jobs");
+        try discard(memory, root.io, "jobs-owner");
+        if (fsync(memory) != 0) return fs.osError();
     }
-    // Atomically replace the old lease pathname with an O_NOFOLLOW tombstone.
-    // There is no unlink window in which a retrying legacy worker can create a
-    // fresh inode and run alongside the new worker.
-    const tombstone = ".mem-jobs-owner-tombstone";
-    if (std.c.symlinkat("memory/jobs-owner", thin, tombstone) != 0) {
-        if (std.c._errno().* != 17) return fs.osError();
-        if (std.c.unlinkat(thin, tombstone, 0) != 0) return fs.osError();
-        if (std.c.symlinkat("memory/jobs-owner", thin, tombstone) != 0) return fs.osError();
-    }
-    errdefer _ = std.c.unlinkat(thin, tombstone, 0);
-    if (std.c.renameat(thin, tombstone, thin, "mem-jobs-owner") != 0) return fs.osError();
-    if (fsync(memory) != 0 or fsync(thin) != 0) return fs.osError();
+    try discard(thin, root.io, "mem-jobs");
+    try discard(thin, root.io, "mem-jobs-owner");
+    if (fsync(thin) != 0) return fs.osError();
 }
 /// 一次读取的结果：content 为正文，version 为正文的 sha256 十六进制串（用作 CAS 比较依据）。
 pub const Entry = struct { content: []const u8, version: []const u8 };
@@ -305,12 +300,6 @@ pub const Store = struct {
         return self.generationUnlocked();
     }
 
-    /// Shared outbox transaction boundary. Caller MUST already hold the fresh
-    /// project-root flock (the same lock as write/delete); never re-enter lock().
-    pub fn generationLocked(self: *Store) !u64 {
-        return self.generationUnlocked();
-    }
-
     fn generationUnlocked(self: *Store) !u64 {
         var dir = self.directory(false) catch |err| {
             if (err == error.FileNotFound) return 0;
@@ -337,45 +326,6 @@ pub const Store = struct {
         if (fd < 0) return fs.osError();
         defer fs.closeFd(fd);
         if (fsync(fd) != 0 or fsync(dir.dir.handle) != 0) return fs.osError();
-        // Manual mutation invalidates every old-generation extraction. Forget
-        // its queued/failed/uncertain plaintext too, even while Auto is Off.
-        // The project flock is ALREADY held; do not re-enter Queue's lock.
-        try self.clearOutboxSources();
-    }
-
-    fn clearOutboxSources(self: *Store) !void {
-        const thin = try fs.openDirectory(self.root.dir.handle, ".thin");
-        defer fs.closeFd(thin);
-        const memory = fs.openDirectory(thin, directory_name) catch |err| {
-            if (err == error.FileNotFound) return;
-            return err;
-        };
-        defer fs.closeFd(memory);
-        const jobs = fs.openDirectory(memory, jobs_name) catch |err| {
-            if (err == error.FileNotFound) return;
-            return err;
-        };
-        defer fs.closeFd(jobs);
-        var iterator = (std.Io.Dir{ .handle = jobs }).iterate();
-        var count: usize = 0;
-        while (try iterator.next(self.root.io)) |item| {
-            count += 1;
-            if (count > 128) return error.InvalidJobStorage;
-            var owned_job = item.name.len == 69 and std.mem.endsWith(u8, item.name, ".json");
-            if (owned_job) for (item.name[0..64]) |byte| {
-                if (!(byte >= '0' and byte <= '9') and !(byte >= 'a' and byte <= 'f')) {
-                    owned_job = false;
-                    break;
-                }
-            };
-            if (!owned_job and !std.mem.startsWith(u8, item.name, ".thin-tmp-")) return error.InvalidJobStorage;
-            if (item.name.len > 255) return error.InvalidJobStorage;
-            var name: [256:0]u8 = undefined;
-            @memcpy(name[0..item.name.len], item.name);
-            name[item.name.len] = 0;
-            if (std.c.unlinkat(jobs, @ptrCast(&name), 0) != 0) return fs.osError();
-        }
-        if (fsync(jobs) != 0) return fs.osError();
     }
 
     pub fn coreSnapshot(self: *Store, a: std.mem.Allocator) ![]u8 {
@@ -592,7 +542,7 @@ fn testRoot(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Root {
     return Root.open(a, io, buffer[0..n]);
 }
 
-test "memory layout migration preserves shards jobs and owner without merging" {
+test "memory layout keeps shards and discards every retired jobs artifact" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -606,28 +556,26 @@ test "memory layout migration preserves shards jobs and owner without merging" {
     defer fs.closeFd(thin);
     try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(thin, "mem", 0o700));
     try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(thin, "mem-jobs", 0o700));
+    const old_mem = try fs.openDirectory(thin, "mem");
+    defer fs.closeFd(old_mem);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(old_mem, "jobs", 0o700));
     try root.writeMode(".thin/mem/core.md", "legacy core", false, 0o600);
-    try root.writeMode(".thin/mem-jobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", "legacy job", false, 0o600);
+    try root.writeMode(".thin/mem-jobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", "discarded legacy job", false, 0o600);
+    try root.writeMode(".thin/mem/jobs/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json", "discarded current job", false, 0o600);
     const owner = fs.linux.openat(thin, "mem-jobs-owner", 2 | fs.linux.create | fs.linux.exclusive | fs.linux.nofollow | fs.linux.cloexec, 0o600);
     try std.testing.expect(owner >= 0);
     fs.closeFd(owner);
 
     try migrateLayout(&root);
-    try migrateLayout(&root); // completed migrations are idempotent.
+    try migrateLayout(&root);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(thin, "mem"));
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(thin, "mem-jobs"));
+    try std.testing.expectError(error.FileNotFound, fs.openPath(thin, "mem-jobs-owner"));
+    try std.testing.expectError(error.FileNotFound, fs.openDirectory(thin, "memory/jobs"));
+    try std.testing.expectError(error.FileNotFound, fs.openPath(thin, "memory/jobs-owner"));
     const core = try root.readBinary(a, ".thin/memory/core.md", 1024);
     defer a.free(core);
     try std.testing.expectEqualStrings("legacy core", core);
-    const job = try root.readBinary(a, ".thin/memory/jobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", 1024);
-    defer a.free(job);
-    try std.testing.expectEqualStrings("legacy job", job);
-    const migrated_owner = fs.linux.openat(thin, "memory/jobs-owner", fs.linux.nofollow | fs.linux.cloexec, 0);
-    try std.testing.expect(migrated_owner >= 0);
-    fs.closeFd(migrated_owner);
-    const legacy_tombstone = try fs.openPath(thin, "mem-jobs-owner");
-    defer fs.closeFd(legacy_tombstone);
-    try std.testing.expectEqual(std.Io.File.Kind.sym_link, (try fs.fileFromFd(legacy_tombstone).stat(io)).kind);
 
     var conflict_tmp = std.testing.tmpDir(.{});
     defer conflict_tmp.cleanup();
@@ -648,14 +596,15 @@ test "memory layout migration preserves shards jobs and owner without merging" {
     const busy_thin = try fs.openDirectory(busy_root.dir.handle, ".thin");
     defer fs.closeFd(busy_thin);
     try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(busy_thin, directory_name, 0o700));
-    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(busy_thin, "mem-jobs", 0o700));
     const busy_memory = try fs.openDirectory(busy_thin, directory_name);
     defer fs.closeFd(busy_memory);
-    const busy_owner = try lockOwner(busy_memory, owner_name, io);
+    const busy_owner = fs.linux.openat(busy_memory, "jobs-owner", 2 | fs.linux.create | fs.linux.exclusive | fs.linux.nofollow | fs.linux.cloexec, 0o600);
+    try std.testing.expect(busy_owner >= 0);
     defer fs.closeFd(busy_owner);
+    try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(busy_owner, 2 | 4));
     try std.testing.expectError(error.Busy, migrateLayout(&busy_root));
-    const unmoved = try fs.openDirectory(busy_thin, "mem-jobs");
-    fs.closeFd(unmoved);
+    const retained = try fs.openPath(busy_memory, "jobs-owner");
+    fs.closeFd(retained);
 }
 
 // 空存储的 snapshot 不产生任何副作用；两个 Store 之间的 CAS 语义正确。

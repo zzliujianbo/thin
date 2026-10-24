@@ -659,25 +659,6 @@ const Document = struct {
     refresh: [4]Refresh = @splat(.{}),
 };
 
-fn canonicalCacheDeclaration(declaration: thinking.Declaration) !thinking.Declaration {
-    try declaration.validate();
-    var result = declaration;
-    if (declaration.map.off) |value| {
-        result.map.off = switch (declaration.format) {
-            .deepseek => if (std.mem.eql(u8, value, "off")) "off" else return error.InvalidMetadata,
-            .anthropic => if (std.mem.eql(u8, value, "disabled")) "disabled" else return error.InvalidMetadata,
-            .standard => if (std.mem.eql(u8, value, "none")) "none" else if (std.mem.eql(u8, value, "off")) "off" else return error.InvalidMetadata,
-        };
-    }
-    inline for (.{ "minimal", "low", "medium", "high", "xhigh", "max" }) |field| {
-        if (@field(declaration.map, field)) |value| {
-            if (!std.mem.eql(u8, value, field)) return error.InvalidMetadata;
-            @field(result.map, field) = field;
-        }
-    }
-    return result;
-}
-
 fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
     try json_bound.bound(bytes, max_cache_bytes, 131072);
     var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
@@ -751,8 +732,8 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
         row.protocol = record.protocol;
         row.dev_protocol = record.dev_protocol;
         row.dev_present = record.dev_present;
-        if (record.reasoning) |declaration| row.reasoning = try directory.Profile.from(try canonicalCacheDeclaration(declaration));
-        if (record.dev_reasoning) |declaration| row.dev_reasoning = try directory.Profile.from(try canonicalCacheDeclaration(declaration));
+        if (record.reasoning) |declaration| row.reasoning = try directory.Profile.from(declaration);
+        if (record.dev_reasoning) |declaration| row.dev_reasoning = try directory.Profile.from(declaration);
     }
     return result;
 }

@@ -5,9 +5,7 @@ const k = @import("../core/knowledge.zig");
 const p = @import("../core/protocol.zig");
 const decision = @import("../core/decision.zig");
 const Coordinator = @import("memory_service.zig").Coordinator;
-const Queue = @import("../tools/memory_queue.zig").Queue;
-// Coordinator consumes the frozen active selection, not a disk declaration
-// which still awaits App metadata resolution. Use a validated owned snapshot.
+
 fn fixtureConfig(a: std.mem.Allocator) !std.json.Parsed(cfg.Config) {
     return cfg.clone(a, .{
         .provider = .{ .base_url = "http://127.0.0.1:1", .api_key = "owned-memory-fixture-key" },
@@ -18,25 +16,33 @@ fn fixtureConfig(a: std.mem.Allocator) !std.json.Parsed(cfg.Config) {
 }
 const input = "I prefer concise explanations in all code reviews.";
 const Fake = struct {
-    calls: std.atomic.Value(usize) = .init(0),
-    reviews: std.atomic.Value(usize) = .init(0),
+    calls: usize = 0,
+    reviews: usize = 0,
     approve: bool = true,
     fail: bool = false,
+    bad_candidates: bool = false,
+    cancel_during_extract: bool = false,
     fn service(self: *@This()) k.Service {
         return .{ .context = self, .extract_fn = extract };
     }
     fn review(self: *@This()) decision.Service {
         return .{ .context = self, .decide_fn = decide };
     }
-    fn extract(raw: *anyopaque, a: std.mem.Allocator, material: k.Material, _: *const p.Cancellation) ![]const k.Candidate {
+    fn extract(raw: *anyopaque, a: std.mem.Allocator, material: k.Material, cancel: *const p.Cancellation) ![]const k.Candidate {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        _ = self.calls.fetchAdd(1, .acq_rel);
-        if (self.fail) return error.FixtureMemoryUnavailable;
+        self.calls += 1;
+        if (self.cancel_during_extract) {
+            @constCast(cancel).cancel();
+            return error.Canceled;
+        }
+        if (self.fail) return error.MemoryUnavailable;
+        // Deliberately invalid topic: Service.extract owns the only validation.
+        if (self.bad_candidates) return a.dupe(k.Candidate, &.{.{ .category = .preferences, .topic = "Bad Topic", .content = "prefers concise reviews", .source_id = material.sources[0].id, .quote = "prefer concise explanations" }});
         return a.dupe(k.Candidate, &.{.{ .category = .preferences, .topic = "response-style", .content = "Prefers concise code-review explanations.", .source_id = material.sources[0].id, .quote = "prefer concise explanations" }});
     }
     fn decide(raw: *anyopaque, _: std.mem.Allocator, _: decision.Input, _: *const p.Cancellation) !decision.Output {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        _ = self.reviews.fetchAdd(1, .acq_rel);
+        self.reviews += 1;
         return .{ .memory_write = self.approve };
     }
 };
@@ -48,78 +54,19 @@ fn begin(owner: *Coordinator, a: std.mem.Allocator, text: []const u8) !void {
     const reference = try owner.retrieve(a, text, 8192);
     a.free(reference);
 }
-fn submit(owner: *Coordinator, a: std.mem.Allocator, text: []const u8) !void {
+fn finalize(owner: *Coordinator, a: std.mem.Allocator, text: []const u8, cancel: *const p.Cancellation) void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var capture: k.Capture = .{ .allocator = arena.allocator() };
     capture.add(.user, text);
-    try owner.enqueue(&capture);
+    owner.finalize(&capture, .chat, cancel);
+}
+fn expectNoJobs(root: *fs.Root) !void {
+    try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin/memory/jobs"));
+    try std.testing.expectError(error.FileNotFound, fs.openPath(root.dir.handle, ".thin/memory/jobs-owner"));
 }
 
-fn rootContentionCase(retrieving: bool) !void {
-    const a = std.testing.allocator;
-    var backend = std.Io.Threaded.init(a, .{});
-    defer backend.deinit();
-    const io = backend.io();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try openRoot(a, io, tmp.dir);
-    defer root.deinit();
-    var config = try fixtureConfig(a);
-    defer cfg.release(&config);
-    var env = std.process.Environ.Map.init(a);
-    defer env.deinit();
-    const owner = try Coordinator.create(a, io, &root, config.value, &env);
-    defer owner.deinit();
-    // Keep Auto enabled, but join the idle worker before task retrieval wakes it.
-    // This regression needs no inference and no competing worker transaction.
-    owner.stop.store(true, .release);
-    if (owner.future) |*future| future.cancel(io);
-    owner.future = null;
-    try begin(owner, a, input);
-
-    const Releaser = struct {
-        io: std.Io,
-        fd: c_int,
-        released: std.atomic.Value(bool) = .init(false),
-        fn run(self: *@This()) void {
-            defer {
-                fs.closeFd(self.fd);
-                self.released.store(true, .release);
-            }
-            // Bound the old blocking implementation: it succeeds after release
-            // and fails expectError below rather than hanging the test runner.
-            std.Io.sleep(self.io, .fromMilliseconds(200), .awake) catch {};
-        }
-    };
-    var held: ?c_int = try fs.openDirectory(root.dir.handle, ".");
-    defer if (held) |fd| fs.closeFd(fd);
-    try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(held.?, 2 | 4));
-    var releaser: Releaser = .{ .io = io, .fd = held.? };
-    var release = try std.Io.concurrent(io, Releaser.run, .{&releaser});
-    held = null; // Only the releaser owns/closes this locked open description.
-    defer release.await(io);
-
-    if (retrieving) {
-        try std.testing.expectError(error.Busy, begin(owner, a, input));
-        try std.testing.expect(!owner.acceptance_valid.load(.acquire));
-    } else {
-        try std.testing.expectError(error.Busy, submit(owner, a, input));
-    }
-    try std.testing.expect(!releaser.released.load(.acquire));
-    try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
-    try std.testing.expectEqual(@as(u64, 0), owner.extractor.?.calls);
-}
-
-test "automatic memory root contention completion enqueue reports Busy without waiting or creating queue" {
-    try rootContentionCase(false);
-}
-
-test "automatic memory root contention task retrieval reports Busy and invalidates acceptance" {
-    try rootContentionCase(true);
-}
-
-test "automatic memory no startup request independent reviewer exact dedup and bounded task retrieval" {
+test "automatic Memory synchronously extracts reviews saves and creates no jobs" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -137,36 +84,31 @@ test "automatic memory no startup request independent reviewer exact dedup and b
     var fake: Fake = .{};
     owner.service_override = fake.service();
     owner.review_override = fake.review();
-    try std.testing.expectEqual(@as(usize, 0), fake.calls.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 0), owner.extractor.?.calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
+
     try begin(owner, a, input);
-    try submit(owner, a, input);
-    owner.finish();
-    try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), fake.reviews.load(.acquire));
+    var cancel: p.Cancellation = .{};
+    finalize(owner, a, input, &cancel);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reviews);
     try std.testing.expectEqual(@as(u64, 1), owner.completed.load(.acquire));
+    try std.testing.expectEqualStrings("Memory: saved", owner.notice().?);
     const entry = try owner.store.read(a, "preferences-response-style");
     defer a.free(entry.content);
     defer a.free(entry.version);
     try std.testing.expect(std.mem.find(u8, entry.content, "concise") != null);
-    const reference = try owner.retrieve(a, "code review concise", 512);
-    defer a.free(reference);
-    try std.testing.expect(reference.len <= 512 and std.mem.find(u8, reference, "concise") != null);
-    // A different source job proposing the same fact must not call the reviewer again.
-    try submit(owner, a, "Again: I prefer concise explanations in all code reviews.");
-    owner.finish();
-    try std.testing.expectEqual(@as(usize, 2), fake.calls.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), fake.reviews.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 0), owner.extractor.?.calls);
-    var queue = Queue.init(&root);
-    const status = try queue.status(a);
-    defer a.free(status);
-    try std.testing.expect(std.mem.find(u8, status, "done") != null);
-    try std.testing.expect(std.mem.find(u8, status, "concise") == null);
+    try expectNoJobs(&root);
+
+    try begin(owner, a, "Again: concise code reviews.");
+    finalize(owner, a, "Again: I prefer concise explanations in all code reviews.", &cancel);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reviews);
+    try std.testing.expectEqualStrings("Memory: no new durable entries", owner.notice().?);
+    try expectNoJobs(&root);
 }
 
-test "manual deletion during accepted task cannot be relearned by its automatic capture" {
+test "automatic Memory generation mutation skips before extraction" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -188,13 +130,44 @@ test "manual deletion during accepted task cannot be relearned by its automatic 
     defer a.free(entry.version);
     try begin(owner, a, input);
     try owner.store.delete("old", entry.version);
-    try submit(owner, a, input);
-    owner.finish();
-    try std.testing.expectEqual(@as(usize, 0), fake.calls.load(.acquire));
+    var cancel: p.Cancellation = .{};
+    finalize(owner, a, input, &cancel);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqualStrings("Memory: no new durable entries", owner.notice().?);
     try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-response-style"));
+    try expectNoJobs(&root);
 }
 
-test "auxiliary error is visible uncertain and never automatically replayed" {
+test "automatic Memory contention fails promptly without jobs" {
+    const a = std.testing.allocator;
+    var backend = std.Io.Threaded.init(a, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try openRoot(a, io, tmp.dir);
+    defer root.deinit();
+    var config = try fixtureConfig(a);
+    defer cfg.release(&config);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const owner = try Coordinator.create(a, io, &root, config.value, &env);
+    defer owner.deinit();
+    var fake: Fake = .{};
+    owner.service_override = fake.service();
+    try begin(owner, a, input);
+    const held = try fs.openDirectory(root.dir.handle, ".");
+    defer fs.closeFd(held);
+    try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(held, 2 | 4));
+    var cancel: p.Cancellation = .{};
+    finalize(owner, a, input, &cancel);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(u16, @intFromError(error.Busy)), owner.failure.load(.acquire));
+    try std.testing.expectEqualStrings("Memory: finalization failed", owner.notice().?);
+    try expectNoJobs(&root);
+}
+
+test "automatic Memory uncertainty and cancellation are terminal without replay" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -212,20 +185,80 @@ test "auxiliary error is visible uncertain and never automatically replayed" {
     var fake: Fake = .{ .fail = true };
     owner.service_override = fake.service();
     try begin(owner, a, input);
-    try submit(owner, a, input);
-    owner.finish();
-    try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.acquire));
+    var cancel: p.Cancellation = .{};
+    finalize(owner, a, input, &cancel);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(std.mem.find(u8, owner.notice().?, "uncertain") != null);
-    try submit(owner, a, input);
-    owner.finish();
-    try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.acquire));
-    var queue = Queue.init(&root);
-    const status = try queue.status(a);
-    defer a.free(status);
-    try std.testing.expect(std.mem.find(u8, status, "uncertain") != null);
+    try expectNoJobs(&root);
+
+    fake.fail = false;
+    fake.cancel_during_extract = true;
+    try begin(owner, a, input);
+    var second_cancel: p.Cancellation = .{};
+    finalize(owner, a, input, &second_cancel);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqualStrings("Memory: finalization canceled", owner.notice().?);
+    try std.testing.expect(second_cancel.isRequested());
+    try expectNoJobs(&root);
 }
 
-test "Auto memory Off creates no worker or queue and rejects known credentials" {
+test "invalid service candidates never reach storage" {
+    const a = std.testing.allocator;
+    var backend = std.Io.Threaded.init(a, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try openRoot(a, io, tmp.dir);
+    defer root.deinit();
+    var config = try fixtureConfig(a);
+    defer cfg.release(&config);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const owner = try Coordinator.create(a, io, &root, config.value, &env);
+    defer owner.deinit();
+    var fake: Fake = .{ .bad_candidates = true };
+    owner.service_override = fake.service();
+    try begin(owner, a, input);
+    var cancel: p.Cancellation = .{};
+    finalize(owner, a, input, &cancel);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(u16, @intFromError(error.InvalidMemoryCandidate)), owner.failure.load(.acquire));
+    try std.testing.expectEqualStrings("Memory: finalization failed", owner.notice().?);
+    // The rejected batch is never persisted, and no index shard is created.
+    try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-response-style"));
+    try expectNoJobs(&root);
+}
+
+test "known secret source is rejected before any auxiliary request" {
+    const a = std.testing.allocator;
+    var backend = std.Io.Threaded.init(a, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try openRoot(a, io, tmp.dir);
+    defer root.deinit();
+    var config = try fixtureConfig(a);
+    defer cfg.release(&config);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const owner = try Coordinator.create(a, io, &root, config.value, &env);
+    defer owner.deinit();
+    var fake: Fake = .{};
+    owner.service_override = fake.service();
+    try begin(owner, a, input);
+    var cancel: p.Cancellation = .{};
+    // The fixture provider key is known to this Coordinator only, not to Capture.
+    finalize(owner, a, "deploy with owned-memory-fixture-key please", &cancel);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(u16, @intFromError(error.SensitiveMemoryMaterial)), owner.failure.load(.acquire));
+    try std.testing.expectEqualStrings("Memory: finalization failed", owner.notice().?);
+    try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-response-style"));
+    try expectNoJobs(&root);
+}
+
+test "Auto Memory Off has no helper clients or storage side effects" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -240,8 +273,13 @@ test "Auto memory Off creates no worker or queue and rejects known credentials" 
     defer env.deinit();
     const owner = try Coordinator.create(a, backend.io(), &root, config.value, &env);
     defer owner.deinit();
-    try std.testing.expect(owner.future == null and owner.extractor == null);
-    try begin(owner, a, input);
-    try submit(owner, a, input);
+    try std.testing.expect(owner.extractor == null and owner.reviewer == null);
+    var capture_arena = std.heap.ArenaAllocator.init(a);
+    defer capture_arena.deinit();
+    var capture: k.Capture = .{ .allocator = capture_arena.allocator() };
+    capture.add(.user, input);
+    var cancel: p.Cancellation = .{};
+    owner.finalize(&capture, .chat, &cancel);
+    try std.testing.expect(owner.notice() == null);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
 }

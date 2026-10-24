@@ -86,10 +86,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // HTTP/SSE 测试需要本地 mock 服务：由 Node 脚本启动服务，并把编译好的测试程序作为参数传入。
-    const run_http = b.addSystemCommand(&.{"node"});
-    run_http.addFileArg(b.path("tests/product/http_mock.mjs"));
-    run_http.addArtifactArg(http_tests);
-    run_http.setCwd(b.path("."));
+    const run_http = fixture(b, "node", "tests/product/http_mock.mjs", &.{http_tests}, &.{});
     b.step("test-http", "Run local product HTTP/SSE integration tests (requires Node and OpenSSL)").dependOn(&run_http.step);
 
     const proxy_tests = b.addTest(.{
@@ -101,10 +98,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    const run_proxy = b.addSystemCommand(&.{"node"});
-    run_proxy.addFileArg(b.path("tests/product/proxy_mock.mjs"));
-    run_proxy.addArtifactArg(proxy_tests);
-    run_proxy.setCwd(b.path("."));
+    const run_proxy = fixture(b, "node", "tests/product/proxy_mock.mjs", &.{proxy_tests}, &.{});
     b.step("test-proxy", "Run owned allowlisted HTTP CONNECT and destination TLS fixtures").dependOn(&run_proxy.step);
 
     const systemone_tests = b.addTest(.{
@@ -116,10 +110,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    const run_systemone = b.addSystemCommand(&.{"node"});
-    run_systemone.addFileArg(b.path("tests/product/systemone_mock.mjs"));
-    run_systemone.addArtifactArg(systemone_tests);
-    run_systemone.setCwd(b.path("."));
+    const run_systemone = fixture(b, "node", "tests/product/systemone_mock.mjs", &.{systemone_tests}, &.{});
     b.step("test-systemone", "Run owned SystemOne/curl HTTP, proxy and TLS fixtures").dependOn(&run_systemone.step);
 
     const anthropic_tests = b.addTest(.{
@@ -131,10 +122,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    const run_anthropic = b.addSystemCommand(&.{"node"});
-    run_anthropic.addFileArg(b.path("tests/product/anthropic_mock.mjs"));
-    run_anthropic.addArtifactArg(anthropic_tests);
-    run_anthropic.setCwd(b.path("."));
+    const run_anthropic = fixture(b, "node", "tests/product/anthropic_mock.mjs", &.{anthropic_tests}, &.{});
     b.step("test-anthropic", "Run isolated Anthropic Messages HTTP/SSE fixtures").dependOn(&run_anthropic.step);
 
     // 终端 ABI 模块（libc termios 结构体布局）单独成模块，供 probes 测试导入。
@@ -152,10 +140,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // 探针测试：由 Node runner 调度，验证 Linux I/O 行为（需要 OpenSSL）。
-    const run = b.addSystemCommand(&.{"node"});
-    run.addFileArg(b.path("tests/probes/runner.mjs"));
-    run.addArtifactArg(probes);
-    run.setCwd(b.path("."));
+    const run = fixture(b, "node", "tests/probes/runner.mjs", &.{probes}, &.{});
     b.step("test-probes", "Run local Linux I/O probes (requires Node and OpenSSL)").dependOn(&run.step);
 
     // PTY 验收驱动：独立可执行文件，入口见 src/app_pty_test_root.zig。
@@ -171,104 +156,48 @@ pub fn build(b: *std.Build) void {
     });
 
     // 应用验收：Node 脚本同时拿到 thin 可执行文件与 PTY 驱动，在隔离环境中运行 CLI 与 PTY 测试。
-    const run_app = b.addSystemCommand(&.{"node"});
-    run_app.addFileArg(b.path("tests/product/app_mock.mjs"));
-    run_app.addArtifactArg(exe);
-    run_app.addArtifactArg(pty_driver);
-    run_app.setCwd(b.path("."));
+    const run_app = fixture(b, "node", "tests/product/app_mock.mjs", &.{ exe, pty_driver }, &.{});
     b.step("test-app", "Run isolated CLI and PTY application acceptance (requires Node)").dependOn(&run_app.step);
 
-    const run_memory_app = b.addSystemCommand(&.{"node"});
-    run_memory_app.addFileArg(b.path("tests/product/memory_auto_mock.mjs"));
-    run_memory_app.addArtifactArg(exe);
-    run_memory_app.setCwd(b.path("."));
+    const run_memory_app = fixture(b, "node", "tests/product/memory_auto_mock.mjs", &.{exe}, &.{});
     b.step("test-memory-app", "Run owned loopback automatic-memory CLI lifecycle acceptance").dependOn(&run_memory_app.step);
 
-    const run_idle_enter = b.addSystemCommand(&.{"python3"});
-    run_idle_enter.addFileArg(b.path("tests/product/idle_enter_mock.py"));
-    run_idle_enter.addArtifactArg(exe);
-    run_idle_enter.setCwd(b.path("."));
+    const run_idle_enter = fixture(b, "python3", "tests/product/idle_enter_mock.py", &.{exe}, &.{});
     b.step("test-idle-enter", "Run owned idle prompt newline PTYs (requires Python 3)").dependOn(&run_idle_enter.step);
 
-    const run_resize = b.addSystemCommand(&.{"python3"});
-    run_resize.addFileArg(b.path("tests/product/resize_deferred_mock.py"));
-    run_resize.addArtifactArg(exe);
-    run_resize.setCwd(b.path("."));
+    const run_resize = fixture(b, "python3", "tests/product/resize_deferred_mock.py", &.{exe}, &.{});
     b.step("test-resize-deferred", "Run owned deferred resize, animation and fresh-ACK PTY checks").dependOn(&run_resize.step);
 
     const viewport_step = b.step("test-resize-viewport", "Run owned tmux viewport, multiline composer and local-command lifecycle checks");
-    const run_viewport = b.addSystemCommand(&.{"python3"});
-    run_viewport.addFileArg(b.path("tests/product/resize_viewport_mock.py"));
-    run_viewport.addArtifactArg(exe);
-    run_viewport.setCwd(b.path("."));
-    viewport_step.dependOn(&run_viewport.step);
-
-    const run_viewport_wrap = b.addSystemCommand(&.{"python3"});
-    run_viewport_wrap.addFileArg(b.path("tests/product/resize_viewport_mock.py"));
-    run_viewport_wrap.addArtifactArg(exe);
-    run_viewport_wrap.addArg("--wrap");
-    run_viewport_wrap.setCwd(b.path("."));
-    viewport_step.dependOn(&run_viewport_wrap.step);
-
-    const run_viewport_command = b.addSystemCommand(&.{"python3"});
-    run_viewport_command.addFileArg(b.path("tests/product/resize_viewport_mock.py"));
-    run_viewport_command.addArtifactArg(exe);
-    run_viewport_command.addArg("--local-command");
-    run_viewport_command.setCwd(b.path("."));
-    viewport_step.dependOn(&run_viewport_command.step);
+    // Same script and artifacts; only the viewport mode differs.
+    const viewport_modes = [_][]const []const u8{ &.{}, &.{"--wrap"}, &.{"--local-command"} };
+    for (&viewport_modes) |mode| {
+        const run_viewport = fixture(b, "python3", "tests/product/resize_viewport_mock.py", &.{exe}, mode);
+        viewport_step.dependOn(&run_viewport.step);
+    }
 
     // Global settings acceptance reuses both application artifacts; the Node
     // fixture owns its loopback server and serial PTY launches.
-    const run_settings = b.addSystemCommand(&.{"node"});
-    run_settings.addFileArg(b.path("tests/product/global_settings_mock.mjs"));
-    run_settings.addArtifactArg(exe);
-    run_settings.addArtifactArg(pty_driver);
-    run_settings.setCwd(b.path("."));
+    const run_settings = fixture(b, "node", "tests/product/global_settings_mock.mjs", &.{ exe, pty_driver }, &.{});
     b.step("test-settings", "Run isolated global settings PTY acceptance without inference").dependOn(&run_settings.step);
 
     // Focused image group; normal test-app also includes it exactly once.
-    const run_image = b.addSystemCommand(&.{"node"});
-    run_image.addFileArg(b.path("tests/product/app_mock.mjs"));
-    run_image.addArtifactArg(exe);
-    run_image.addArtifactArg(pty_driver);
-    run_image.addArg("--image-model-only");
-    run_image.setCwd(b.path("."));
+    const run_image = fixture(b, "node", "tests/product/app_mock.mjs", &.{ exe, pty_driver }, &.{"--image-model-only"});
     b.step("test-image", "Run owned local-image HTTP and Settings PTY acceptance").dependOn(&run_image.step);
 
-    const run_command = b.addSystemCommand(&.{"node"});
-    run_command.addFileArg(b.path("tests/product/local_command_mock.mjs"));
-    run_command.addArtifactArg(exe);
-    run_command.addArtifactArg(pty_driver);
-    run_command.setCwd(b.path("."));
+    const run_command = fixture(b, "node", "tests/product/local_command_mock.mjs", &.{ exe, pty_driver }, &.{});
     b.step("test-command", "Run owned local-command approval, denial, cancellation and timeout PTYs").dependOn(&run_command.step);
 
-    const run_approval_cancel = b.addSystemCommand(&.{"node"});
-    run_approval_cancel.addFileArg(b.path("tests/product/approval_cancel_mock.mjs"));
-    run_approval_cancel.addArtifactArg(exe);
-    run_approval_cancel.addArtifactArg(pty_driver);
-    run_approval_cancel.setCwd(b.path("."));
+    const run_approval_cancel = fixture(b, "node", "tests/product/approval_cancel_mock.mjs", &.{ exe, pty_driver }, &.{});
     b.step("test-approval-cancel", "Run owned long-approval Escape context-restoration PTY").dependOn(&run_approval_cancel.step);
 
-    const run_tool_preview = b.addSystemCommand(&.{"node"});
-    run_tool_preview.addFileArg(b.path("tests/product/tool_preview_mock.mjs"));
-    run_tool_preview.addArtifactArg(exe);
-    run_tool_preview.addArtifactArg(pty_driver);
-    run_tool_preview.setCwd(b.path("."));
+    const run_tool_preview = fixture(b, "node", "tests/product/tool_preview_mock.mjs", &.{ exe, pty_driver }, &.{});
     b.step("test-tool-preview", "Run gated owned tool-preview streaming and cancellation PTYs").dependOn(&run_tool_preview.step);
 
-    const run_tool_presentation = b.addSystemCommand(&.{"node"});
-    run_tool_presentation.addFileArg(b.path("tests/product/app_mock.mjs"));
-    run_tool_presentation.addArtifactArg(exe);
-    run_tool_presentation.addArtifactArg(pty_driver);
-    run_tool_presentation.addArg("--tool-presentation-only");
-    run_tool_presentation.setCwd(b.path("."));
+    const run_tool_presentation = fixture(b, "node", "tests/product/app_mock.mjs", &.{ exe, pty_driver }, &.{"--tool-presentation-only"});
     b.step("test-tool-presentation", "Run owned tool animation, result rows, file counts and Memory captions").dependOn(&run_tool_presentation.step);
 
-    const run_queued = b.addSystemCommand(&.{"node"});
-    run_queued.addFileArg(b.path("tests/product/steering_followup_mock.mjs"));
-    run_queued.addArtifactArg(exe);
-    run_queued.addArtifactArg(pty_driver);
-    run_queued.setCwd(b.path("."));
+    const run_queued = fixture(b, "node", "tests/product/steering_followup_mock.mjs", &.{ exe, pty_driver }, &.{});
     b.step("test-queued", "Run owned steering, follow-up, withdrawal and stop-clear confirmation PTYs").dependOn(&run_queued.step);
 
     // 聚合步骤 `zig build test`：依次挂载所有离线测试（不含需要真实 API 的内容）。
@@ -291,6 +220,24 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_tool_preview.step);
     test_all.dependOn(&run_queued.step);
     test_all.dependOn(&run.step);
+}
+
+/// One owned-fixture runner: a Node/Python entry script launched from the repo
+/// root, then the built artifacts, then any mode flags. Order matters because
+/// the fixtures read argv positionally.
+fn fixture(
+    b: *std.Build,
+    runner: []const u8,
+    script: []const u8,
+    artifacts: []const *std.Build.Step.Compile,
+    args: []const []const u8,
+) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{runner});
+    run.addFileArg(b.path(script));
+    for (artifacts) |artifact| run.addArtifactArg(artifact);
+    for (args) |arg| run.addArg(arg);
+    run.setCwd(b.path("."));
+    return run;
 }
 
 /// Vendored CommonMark/GFM parser: builds offline, no system package/runtime

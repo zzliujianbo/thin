@@ -3,7 +3,6 @@ const fs = @import("../platform/filesystem.zig");
 const memory = @import("memory.zig");
 const knowledge = @import("../core/knowledge.zig");
 const repo = @import("knowledge_store.zig");
-const queue = @import("memory_queue.zig");
 const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 fn rootFor(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !fs.Root {
     var buf: [4096]u8 = undefined;
@@ -66,80 +65,6 @@ test "classified CAS category separation generation tombstones expiration and bo
     try std.testing.expectError(error.GenerationConflict, store.writeGuarded(a, "legacy", "resurrect", null, 1));
     try std.testing.expectEqualStrings("", try store.coreSnapshot(a));
 }
-test "outbox sending crash recovery explicit retry receipt and strict storage" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var backend = std.Io.Threaded.init(a, .{});
-    defer backend.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try rootFor(a, backend.io(), tmp.dir);
-    defer root.deinit();
-    var q = queue.Queue.init(&root);
-    try std.testing.expectEqual(@as(usize, 0), (try q.pending(a)).len);
-    try std.testing.expectEqualStrings("", try q.status(a));
-    const material: knowledge.Material = .{ .id = id, .generation = 0, .created_ms = 1, .sources = &.{.{ .id = 0, .kind = .user, .text = "PRIVATE BODY" }} };
-    try q.enqueue(a, material);
-    try q.enqueue(a, material);
-    try std.testing.expectEqual(@as(usize, 1), (try q.pending(a)).len);
-    try q.mark(a, id, .sending);
-    var recovered = queue.Queue.init(&root);
-    try std.testing.expectEqual(@as(usize, 0), (try recovered.pending(a)).len);
-    const active_status = try recovered.status(a);
-    try std.testing.expect(std.mem.find(u8, active_status, "sending") != null);
-    try std.testing.expectError(error.WorkerLeaseRequired, recovered.recover(a));
-    const lease = try recovered.acquireWorker(a);
-    defer fs.closeFd(lease);
-    try std.testing.expectError(error.Busy, q.acquireWorker(a));
-    try recovered.recover(a);
-    const status = try recovered.status(a);
-    try std.testing.expect(std.mem.find(u8, status, "uncertain") != null);
-    try std.testing.expect(std.mem.find(u8, status, "PRIVATE") == null);
-    try std.testing.expectError(error.InvalidJobTransition, recovered.mark(a, id, .queued));
-    try recovered.retry(a, id);
-    try std.testing.expectEqual(@as(usize, 1), (try recovered.pending(a)).len);
-    try recovered.mark(a, id, .sending);
-    try recovered.mark(a, id, .failed);
-    try std.testing.expectEqual(@as(usize, 0), (try recovered.pending(a)).len);
-    try recovered.retry(a, id);
-    try recovered.mark(a, id, .sending);
-    try recovered.mark(a, id, .done);
-    const name = try std.fmt.allocPrint(a, ".thin/memory/jobs/{s}.json", .{id});
-    const receipt = try root.readBinary(a, name, queue.max_file_bytes);
-    try std.testing.expect(std.mem.find(u8, receipt, "PRIVATE") == null);
-    try recovered.enqueue(a, material);
-    try std.testing.expectEqual(@as(usize, 0), (try recovered.pending(a)).len);
-    try std.testing.expectError(error.InvalidJobTransition, recovered.retry(a, id));
-    try root.write(name, "{bad", true);
-    try std.testing.expectError(error.SyntaxError, recovered.pending(a));
-    const oversized = try a.alloc(u8, queue.max_file_bytes + 1);
-    @memset(oversized, 'x');
-    try root.write(name, oversized, true);
-    try std.testing.expectError(error.FileTooLarge, recovered.pending(a));
-    const zname = try a.dupeSentinel(u8, name, 0);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.unlinkat(root.dir.handle, zname, 0));
-    try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("/not-read", root.dir.handle, zname));
-    try std.testing.expectError(error.SymlinkNotAllowed, recovered.pending(a));
-}
-
-test "outbox allocation failure before publication leaves no queued job" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var backend = std.Io.Threaded.init(a, .{});
-    defer backend.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try rootFor(a, backend.io(), tmp.dir);
-    defer root.deinit();
-    var q = queue.Queue.init(&root);
-    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    const material: knowledge.Material = .{ .id = id, .generation = 0, .created_ms = 1, .sources = &.{.{ .id = 0, .kind = .user, .text = "body" }} };
-    try std.testing.expectError(error.OutOfMemory, q.enqueue(failing.allocator(), material));
-    try std.testing.expectEqual(@as(usize, 0), (try q.pending(a)).len);
-}
-
 test "related budget hard cap preserves complete conditions before extractor" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -185,4 +110,114 @@ test "related budget hard cap preserves complete conditions before extractor" {
     try std.testing.expectEqual(@as(usize, 1), small_count);
     try std.testing.expect(bytes <= knowledge.max_retrieval_bytes);
     _ = try @import("../core/knowledge_codec.zig").encode(a, material);
+}
+
+test "indexed retrieval reads only selected bodies always includes core and persists bounded evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try rootFor(a, std.testing.io, tmp.dir);
+    defer root.deinit();
+    var store = memory.Store.init(&root, .{});
+    _ = try store.write(a, "core", "CORE 中文", null);
+    var repository = repo.Repository.init(&store);
+    const material: knowledge.Material = .{ .id = id, .generation = try store.generation(), .created_ms = 1, .sources = &.{.{ .id = 7, .kind = .tool, .text = "PRIVATE FULL SOURCE rust 中文" }} };
+    const candidate: knowledge.Candidate = .{ .category = .project, .topic = "compiler", .content = "rust 中文编译器", .source_id = 7, .quote = "rust" };
+    try std.testing.expectEqual(repo.Apply.created, try repository.apply(a, material, candidate));
+    const entry = try store.read(a, "project-compiler");
+    try std.testing.expect(std.mem.find(u8, entry.content, "\"source_id\":7") != null);
+    try std.testing.expect(std.mem.find(u8, entry.content, "\"source_kind\":\"tool\"") != null);
+    try std.testing.expect(std.mem.find(u8, entry.content, "\"quote\":\"rust\"") != null);
+    try std.testing.expect(std.mem.find(u8, entry.content, "PRIVATE FULL SOURCE") == null);
+    const binary = "other\n\x00";
+    for (0..20) |i| {
+        const key = try std.fmt.allocPrint(a, "unused-{d}", .{i});
+        const name = try std.fmt.allocPrint(a, ".thin/memory/{s}.md", .{key});
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = binary });
+    }
+    const text = try repository.retrieve(a, "请使用中文编译工具", 1, 8192);
+    try std.testing.expect(std.mem.startsWith(u8, text, "[Untrusted current local reference: core]"));
+    try std.testing.expect(std.mem.find(u8, text, "rust 中文编译器") != null);
+    try std.testing.expect(std.mem.find(u8, text, "unused-") == null);
+    try std.testing.expect(std.mem.find(u8, try repository.retrieve(a, "unrelated", 1, 8192), "CORE 中文") != null);
+    for (0..180) |n| {
+        const bounded = try repository.retrieve(a, "中文", 1, n);
+        try std.testing.expect(bounded.len <= n);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(bounded));
+    }
+    for (0..20) |i| {
+        const name = try std.fmt.allocPrint(a, ".thin/memory/ranked-{d:0>2}.md", .{i});
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = if (i < 15) "target\nvalid" else "target\n\x00" });
+    }
+    const ranked = try repository.retrieve(a, "target", 1, 8192);
+    try std.testing.expect(std.mem.find(u8, ranked, "ranked-14") != null);
+    try std.testing.expect(std.mem.find(u8, ranked, "ranked-15") == null);
+}
+
+test "inspect is side effect free and apply rechecks generation and CAS" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try rootFor(a, std.testing.io, tmp.dir);
+    defer root.deinit();
+    var store = memory.Store.init(&root, .{});
+    var repository = repo.Repository.init(&store);
+    var material: knowledge.Material = .{ .id = id, .generation = 0, .created_ms = 1, .sources = &.{.{ .id = 7, .kind = .tool, .text = "PRIVATE FULL SOURCE rust 中文" }} };
+    var candidate: knowledge.Candidate = .{ .category = .project, .topic = "preflight", .content = "rust", .source_id = 7, .quote = "rust" };
+    try std.testing.expectEqual(repo.Apply.created, try repository.inspect(a, material, candidate));
+    try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
+    try std.testing.expectEqual(repo.Apply.created, try repository.apply(a, material, candidate));
+    const before = try store.read(a, "project-preflight");
+    try std.testing.expectEqual(repo.Apply.unchanged, try repository.inspect(a, material, candidate));
+    candidate.content = "new rust";
+    try std.testing.expectEqual(repo.Apply.conflict, try repository.inspect(a, material, candidate));
+    candidate.expected_version = before.version;
+    material.related = &.{.{ .category = .project, .topic = "preflight", .content = "rust", .version = before.version }};
+    try std.testing.expectEqual(repo.Apply.updated, try repository.inspect(a, material, candidate));
+    try std.testing.expectEqualStrings(before.version, (try store.read(a, "project-preflight")).version);
+    var competing = candidate;
+    competing.content = "competing rust";
+    try std.testing.expectEqual(repo.Apply.updated, try repository.apply(a, material, competing));
+    try std.testing.expectEqual(repo.Apply.conflict, try repository.apply(a, material, candidate));
+    candidate.expected_version = (try store.read(a, "project-preflight")).version;
+    material.related = &.{.{ .category = .project, .topic = "preflight", .content = "competing rust", .version = candidate.expected_version.? }};
+    try std.testing.expectEqual(repo.Apply.updated, try repository.inspect(a, material, candidate));
+    const manual = try store.write(a, "manual", "user edit", null);
+    try std.testing.expectEqual(repo.Apply.conflict, try repository.apply(a, material, candidate));
+    material.generation = try store.generation();
+    try std.testing.expectEqual(repo.Apply.updated, try repository.inspect(a, material, candidate));
+    try store.delete("manual", manual.version);
+    try std.testing.expectEqual(repo.Apply.conflict, try repository.apply(a, material, candidate));
+    material.generation = try store.generation();
+    candidate.expires_at_ms = 2;
+    try std.testing.expectEqual(repo.Apply.expired, try repository.inspect(a, material, candidate));
+    candidate.expires_at_ms = null;
+    candidate.quote = "invented quote";
+    try std.testing.expectError(error.InvalidMemoryEvidence, repository.inspect(a, material, candidate));
+}
+
+test "strict persisted knowledge records reject unknown and duplicate schema fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try rootFor(a, std.testing.io, tmp.dir);
+    defer root.deinit();
+    var store = memory.Store.init(&root, .{});
+    var repository = repo.Repository.init(&store);
+    const material: knowledge.Material = .{ .id = id, .generation = 0, .created_ms = 1, .sources = &.{.{ .id = 7, .kind = .tool, .text = "PRIVATE FULL SOURCE rust 中文" }} };
+    const candidate: knowledge.Candidate = .{ .category = .project, .topic = "strict", .content = "rust", .source_id = 7, .quote = "rust" };
+    _ = try repository.apply(a, material, candidate);
+    const entry = try store.read(a, "project-strict");
+    for ([_][]const u8{ "\"unknown\":1,", "\"schema\":1," }) |injection| {
+        const pos = std.mem.findScalar(u8, entry.content, '{').?;
+        const bad = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ entry.content[0 .. pos + 1], injection, entry.content[pos + 1 ..] });
+        try root.write(".thin/memory/project-strict.md", bad, true);
+        try std.testing.expectError(error.InvalidKnowledgeRecord, repository.retrieve(a, "rust", 1, 8192));
+    }
 }

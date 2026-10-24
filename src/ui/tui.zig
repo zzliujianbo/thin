@@ -241,8 +241,8 @@ pub const Connection = struct {
         session_id: ?[32]u8 = null,
         /// Metadata-only catalog for this endpoint; never a credential catalog.
         models: []const core_config.Model = &.{},
-        /// Nonsecret logged-in aliases filter the flat model list. Null is
-        /// legacy unfiltered ownership; empty never means all providers.
+        /// Nonsecret logged-in aliases filter the flat model list. Empty means
+        /// no logged-in provider, never "all providers".
         model_providers: []const ModelProvider = &.{},
         model_context_official: []const bool = &.{},
         model_disabled: []const bool = &.{},
@@ -1749,7 +1749,7 @@ const Ui = struct {
         self.last_terminal = null;
         self.notice = if (local_command) "Running command" else "Running";
         if (local_command) self.parser.stop_feed = true;
-        self.display.reset(self.clock_ms);
+        self.display.reset();
         self.clearActiveTool();
         self.clearToolCaptions();
         self.scroll = 0;
@@ -1778,7 +1778,7 @@ const Ui = struct {
         self.mode = .compacting;
         self.last_terminal = null;
         self.notice = "Compacting context...";
-        self.display.reset(self.clock_ms);
+        self.display.reset();
         self.clearActiveTool();
         self.clearToolCaptions();
         self.closeCommandMenu();
@@ -2436,7 +2436,7 @@ const Ui = struct {
         self.prompt = null;
         self.last_terminal = try self.job.result();
         // Shared state applies owner-produced terminal context after join.
-        self.display.finish(self.last_terminal.?, self.clock_ms);
+        self.display.finish(self.last_terminal.?);
         const result = self.last_terminal.?;
 
         // 清理失败或无法安全继续时进入 poisoned，禁止再次提交。
@@ -5124,7 +5124,9 @@ test "file captions are contiguous but separated from final prose and percent co
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    const cap = try presentation.caption(std.testing.allocator, "write_file", "{\"path\":\"src/main.zig\",\"content\":\"do-not-show-body\"}");
+    const call = try shared.tools.Call.init(std.testing.allocator, "write_file", "{\"path\":\"src/main.zig\",\"content\":\"do-not-show-body\"}");
+    defer call.deinit(std.testing.allocator);
+    const cap = try presentation.fromCall(std.testing.allocator, call);
     defer cap.deinit(std.testing.allocator);
     try ui.toolCompleted(cap, .{ .text = "raw-json-must-stay-hidden", .file_stats = .{ .changes = .{ .modified = 1, .added = 2, .removed = 3 } } });
     const host = bridge.host();
@@ -6062,7 +6064,9 @@ test "read command errors include a safe reason after error and never display ra
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    const caption = try presentation.caption(std.testing.allocator, "read_file", "{\"path\":\"README.md\"}");
+    const call = try shared.tools.Call.init(std.testing.allocator, "read_file", "{\"path\":\"README.md\"}");
+    defer call.deinit(std.testing.allocator);
+    const caption = try presentation.fromCall(std.testing.allocator, call);
     defer caption.deinit(std.testing.allocator);
     try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .duration_ms = 3 });
     try std.testing.expectEqualStrings("r README.md [error] FileNotFound: file not found", ui.records.items[0].body.items);
@@ -6087,7 +6091,9 @@ test "sequential tool records from different frames have no gaps then final pros
     for ([_][]const u8{ "one.txt", "two.txt", "three.txt" }, 0..) |path, i| {
         const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
         defer std.testing.allocator.free(args);
-        const caption = try presentation.caption(std.testing.allocator, "read_file", args);
+        const call = try shared.tools.Call.init(std.testing.allocator, "read_file", args);
+        defer call.deinit(std.testing.allocator);
+        const caption = try presentation.fromCall(std.testing.allocator, call);
         defer caption.deinit(std.testing.allocator);
         try ui.toolCompleted(caption, .{ .text = "hidden-result", .file_stats = .{ .read = 1 } });
         try ui.draw();
@@ -6132,7 +6138,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.high)) ++ "fixture" ++ theme.reset ++ "\x1b[1m) " ++ theme.reset ++ "\x1b[1m?%" ++ theme.reset ++ "\x1b[1m>" ++ theme.reset ++ " input-default") != null);
     ui.finishFrame();
     ui.mode = .calling_model;
-    ui.display.reset(0);
+    ui.display.reset();
     ui.display.observe(.{ .state = .calling_model }, 0);
     for ([_]u64{ 1100, 3100, 9100 }) |now| {
         ui.clock_ms = now;
@@ -6145,7 +6151,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
         ui.finishFrame();
     }
     ui.display.observe(.{ .reasoning = "late thought" }, 9100);
-    ui.display.finish(.{ .status = .success }, 9200);
+    ui.display.finish(.{ .status = .success });
     ui.mode = null;
     owner.effort = .low;
     try ui.draw();
@@ -6240,7 +6246,6 @@ test "model only default color prompt has no headers cache or status and preserv
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     _ = try ui.editor.insert("hello\t你");
-    ui.display.normal_usage = .{ .input_tokens = 100, .cached_input_tokens = 90 };
     try ui.appendDraft(.reasoning, "unprefixed-thought");
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Thinking") == null);
@@ -6265,8 +6270,8 @@ test "single composer hides statistics and completion and uses flow and exact br
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     ui.mode = .calling_model;
-    ui.display.meter.reset(0);
-    ui.display.meter.beginCall(0);
+    ui.display.meter.reset();
+    ui.display.meter.beginCall();
     ui.display.meter.observe(100, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     ui.model_flow.advance(0, true, null);
     ui.clock_ms = 600;

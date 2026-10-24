@@ -113,7 +113,7 @@ const FakeContext = struct {
                 self.terminals += 1;
                 self.terminal = terminal;
                 try t.expectEqualDeep(self.owner.?.contextSnapshot(), terminal.context_snapshot.?);
-                if (self.display) |display| display.finish(terminal, 0);
+                if (self.display) |display| display.finish(terminal);
             },
             else => {},
         }

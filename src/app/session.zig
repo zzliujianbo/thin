@@ -34,7 +34,6 @@ test {
     _ = @import("image_model_selection_test.zig");
 }
 
-const MetadataTokens = [catalog.entries.len]?u32;
 const MetadataFetch = *const fn (std.mem.Allocator, std.Io, ProviderId, ?[]const u8) anyerror!metadata.Listing;
 const DevFetch = *const fn (std.mem.Allocator, std.Io) anyerror!metadata.Listing;
 const official_metadata_timeout_ms = 8000;
@@ -1537,7 +1536,7 @@ pub const Session = struct {
         const id = ProviderId.fromUrl((baseline.value.registry.?.find(name) orelse return error.UnknownProvider).connection.base_url);
         try cfg.setRegistryCredential(baseline.arena.allocator(), &baseline.value, name, key);
         try cfg.validate(baseline.value);
-        // Login never changes the global default or switches to catalog.first.
+        // Login never changes the global default or the current model selection.
         // Pending startup may activate only its already-resolved exact model.
         var initial: ?*App = null;
         errdefer if (initial) |value| value.deinit();

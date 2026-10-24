@@ -37,7 +37,7 @@ const Fake = struct {
         if (self.invalid_return) return &@as([8193]u8, @splat('x'));
         return if (self.reference.len <= maxbytes) self.reference else "";
     }
-    fn complete(raw: *anyopaque, capture: *const k.Capture) void {
+    fn finalize(raw: *anyopaque, capture: *const k.Capture, _: p.Protocol, _: *const p.Cancellation) void {
         const self: *Fake = @ptrCast(@alignCast(raw));
         self.completes += 1;
         self.source_count = capture.sources.items.len;
@@ -90,7 +90,7 @@ const Fake = struct {
     }
     fn init(self: *Fake, config: *cfg.Config) !r.Runtime {
         var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, config, .{ .context = self, .call_fn = call }, .{ .context = self, .schemas = &.{.{ .name = "probe", .description = "offline", .parameters_json = "{}" }}, .prepare_fn = prepare, .execute_fn = execute }, .{ .context = self, .emit_fn = event, .authorize_fn = authorize }, "stale startup snapshot");
-        runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieve, .complete_fn = complete };
+        runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieve, .finalize_fn = finalize };
         runtime.inbox = self.box;
         return runtime;
     }
@@ -123,7 +123,7 @@ fn lastReference(runtime: *r.Runtime) []const u8 {
 test "automatic Memory headless log-off captures user and complete tool only once" {
     var fake = Fake{ .tool = true };
     var config = configValue();
-    config.memory.auto = false; // Manual retrieval remains active; App gates enqueue.
+    config.memory.auto = false; // Manual retrieval remains active; App owns finalization policy.
     var runtime = try fake.init(&config);
     defer runtime.deinit();
     var cancel: p.Cancellation = .{};
@@ -176,7 +176,7 @@ test "automatic Memory never completes failure cancellation or assistant commit 
     }
 }
 
-test "automatic Memory refused response remains visible successful but never enqueues" {
+test "automatic Memory refused response remains visible successful but never finalizes" {
     var fake = Fake{ .refused = true };
     var config = configValue();
     var runtime = try fake.init(&config);

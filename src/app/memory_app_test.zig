@@ -118,7 +118,6 @@ test "App default automatic memory succeeds without logs or Decision and preserv
         var cancel: p.Cancellation = .{};
         const terminal = try app.runtime.run("I prefer concise explanations in all reviews.", &cancel);
         try std.testing.expectEqual(r.Status.success, terminal.status);
-        app.memory_coordinator.finish();
         try std.testing.expectEqual(@as(usize, 1), fake.calls);
         try std.testing.expectEqual(@as(usize, 1), fake.extracted.load(.acquire));
         const context = app.runtime.contextSnapshot();
@@ -135,7 +134,7 @@ test "App default automatic memory succeeds without logs or Decision and preserv
         var replacement = try app.prepareSettings(off.value, &env);
         defer replacement.deinit();
         app.installSettings(&replacement);
-        try std.testing.expect(!app.config.value.memory.auto and app.memory_coordinator.future == null);
+        try std.testing.expect(!app.config.value.memory.auto and app.memory_coordinator.extractor == null);
         try std.testing.expect(app.client.authorization.ptr == primary);
         try std.testing.expectEqualDeep(context, app.runtime.contextSnapshot());
         // Off is not a switch disabling manual memory or project retrieval.

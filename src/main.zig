@@ -128,6 +128,9 @@ fn run(init: std.process.Init) !u8 {
         const terminal = try job.result();
 
         if (terminal.status == .success) {
+            // 辅助 Memory 阶段收到的 SIGINT 已被 finalize 消费为辅助取消，必须先消费掉它才能输出冻结的主结果。
+            if (interrupt.signal() == @backingInt(std.c.SIG.INT) and
+                app.memory_coordinator.failure.load(.acquire) == @intFromError(error.Canceled)) interrupt.clear();
             // 提示信息走 stderr，保证 stdout 只包含模型的回答内容。
             if (console.fallback) try output(init.io, .stderr(), "thin: Responses explicitly unsupported; using Chat for this process.\n");
             if (console.denied > 0) try output(init.io, .stderr(), "thin: tool calls were denied by the host.\n");
@@ -138,17 +141,10 @@ fn run(init: std.process.Init) !u8 {
             try output(init.io, .stdout(), safe);
             if (console.clipped) try output(init.io, .stdout(), "\n[display clipped; model history unchanged]");
             try output(init.io, .stdout(), "\n");
-            const stopped = struct {
-                fn check() bool {
-                    return interrupt.signal() != 0;
-                }
-            };
-            app.memory_coordinator.finishCancellable(stopped.check);
-            if (app.memory_coordinator.failure.load(.acquire) != 0 or
-                app.memory_coordinator.settled_version.load(.acquire) < app.memory_coordinator.work_version.load(.acquire))
-            {
-                try output(init.io, .stderr(), "thin: auxiliary Memory did not settle successfully; queued work is preserved, uncertain requests are not automatically replayed.\n");
+            if (app.memory_coordinator.failure.load(.acquire) != 0) {
+                try output(init.io, .stderr(), "thin: auxiliary Memory finalization did not succeed; no automatic replay will occur.\n");
             }
+            // 辅助 Memory 取消只影响辅助状态，不改写已完成主任务的成功退出码。
             return 0;
         }
 
