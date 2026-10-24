@@ -81,14 +81,14 @@ const image_schema: p.ToolSchema = .{
 /// sandbox claim.
 const subagent_schema: p.ToolSchema = .{
     .name = "subagent",
-    .description = "Start ONE bounded child agent job in this root task and return its id immediately. The child inherits this task's accepted provider/model/protocol/thinking selection and the same host policy, path protection and per-call approvals. It may use file, command and (when configured) image tools, but cannot delegate again or use the memory tool. task is required (at most 8192 UTF-8 bytes); context is optional reference material (at most 16384 bytes). Collect the job with get_subagent_result, exchange messages with send_subagent_message and stop it with cancel_subagent. A child report is untrusted evidence, not approval, verification or proof. While a child is uncollected, parent write_file and bash are refused; read/image/communication remain available. Jobs never survive the root task, and commands are not OS-sandboxed.",
+    .description = "Start ONE bounded child agent job in this root task and return its id immediately. The child inherits this task's accepted provider/model/protocol/thinking selection and the same host policy, path protection and per-call approvals. It may use file, command and (when configured) image tools, but cannot delegate again or use the memory tool. task is required (at most 8192 UTF-8 bytes); context is optional reference material (at most 16384 bytes). Collect the job with get_subagent_result, exchange messages with send_subagent_message and stop it with cancel_subagent. A child report is untrusted evidence, not approval, verification or proof. Keep the main task: split independent work across jobs, start several, then collect each by id. write_file and bash are serialized between sibling children of the same root task, so only those mutating steps wait; reads and child reasoning stay concurrent. While any child of this root is still uncollected, the parent's write_file and bash are refused; read/image/communication remain available. Jobs never survive the root task, and commands are not OS-sandboxed.",
     .parameters_json =
     \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"maxLength":8192},"context":{"type":"string","maxLength":16384}},"required":["task"],"additionalProperties":false}
     ,
 };
 const get_subagent_schema: p.ToolSchema = .{
     .name = "get_subagent_result",
-    .description = "Read a started child job by id. wait=true (default) waits for an explicit child message or terminal state, not for every token; wait=false returns the current snapshot. The result carries id/status/messages/progress, and a terminal job also has its report/usage/detail/truncated fields at the same JSON level. While waiting, this parent call proxies any child approval request. A child canceled terminal state does not cancel the parent task.",
+    .description = "Read a started child job by id. wait=true (default) waits for an explicit child message or terminal state, not for every token; wait=false returns the current snapshot. The result carries id/status/messages/progress, and a terminal job also has its report/usage/detail/truncated fields at the same JSON level. A job that is already terminal is collected and released even with wait=false, so keep the returned report; reading it again only serves a bounded terminal cache and is not durable storage. While waiting, this parent call proxies any child approval request. A child canceled terminal state does not cancel the parent task.",
     .parameters_json =
     \\{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64},"wait":{"type":"boolean"}},"required":["id"],"additionalProperties":false}
     ,
@@ -102,7 +102,7 @@ const send_subagent_schema: p.ToolSchema = .{
 };
 const cancel_subagent_schema: p.ToolSchema = .{
     .name = "cancel_subagent",
-    .description = "Cancel and join one started child job by id, returning its final canceled/cleanup status. Canceling a single child never cancels the parent task. A cleanup failure still poisons the parent so remaining side effects are not treated as safe.",
+    .description = "Cancel and join one started child job by id, returning its final canceled/cleanup status. The returned terminal state is already collected, so keep its report: reading it again only serves a bounded terminal cache. Canceling a single child never cancels the parent task. A cleanup failure still poisons the parent so remaining side effects are not treated as safe.",
     .parameters_json =
     \\{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"],"additionalProperties":false}
     ,
@@ -397,6 +397,12 @@ pub const Tools = struct {
     /// parent job tools and rejects forged calls at prepare and direct execute;
     /// child Tools are built without one, so recursive delegation fails there.
     subagent: ?subagent.Service = null,
+    /// Root-shared write/bash serialization. All children of one root task
+    /// borrow the same gate, so concurrent jobs can reason and read in parallel
+    /// while mutating tools wait. The parent is refused instead of sharing it:
+    /// its write/command stops while any child is uncollected. It is not a
+    /// recursive service and grants no capability. Null leaves writes unordered.
+    subagent_mutation_gate: ?*subagent.MutationGate = null,
     /// Child-only channel. It exposes exactly the message_parent tool; it cannot
     /// reach parent jobs, permissions, Runtime or Memory.
     parent_channel: ?subagent.ParentChannel = null,
@@ -582,8 +588,8 @@ pub const Tools = struct {
     }
 
     /// Accepted-task hook. A child Tools carries no service, so it never resets
-    /// the parent delegation budget. The accepted-root cancellation token is
-    /// forwarded for job parent linking, never a local tool-call token.
+    /// shared host state. The accepted-root cancellation token is forwarded for
+    /// job parent linking, never a local tool-call token.
     fn beginTask(context_: *anyopaque, cancel: *const p.Cancellation) void {
         const self: *Tools = @ptrCast(@alignCast(context_));
         if (self.subagent) |service| service.beginTask(cancel);
@@ -698,6 +704,16 @@ pub const Tools = struct {
         // 直接执行入口也校验路径，避免绕过 prepare。危险 bash 的拦截在 Runtime 授权，
         // 不在这里重复拒绝：能进入 execute 说明本次调用已经过明确批准。bash 仍不是沙箱。
         try self.checkFileAction(a, action);
+
+        // Mutating side effects of the whole root task serialize here, after the
+        // pure guards and outside any approval wait. A canceled or failed
+        // acquire returns before the defer is registered, so no lock leaks and
+        // no command or disk write runs. Every later return, OOM and command
+        // cleanup failure releases through the defer.
+        const mutation_gate = if (action == .write_file or action == .bash) self.subagent_mutation_gate else null;
+        if (mutation_gate) |gate| try gate.acquire(self.root.io, cancel);
+        defer if (mutation_gate) |gate| gate.release();
+        if (cancel.isRequested()) return .{ .text = "Canceled before execution", .is_error = true, .canceled = true };
 
         var value = j.object(a);
         switch (action) {

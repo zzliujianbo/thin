@@ -2,12 +2,15 @@
 //! publication, prepare/execute visibility gates, strict bounded arguments,
 //! parent write/bash conflict protection, single-layer encoded JSON pass-through,
 //! child-channel isolation and the Runtime hook forwarding. No network, real
-//! config or filesystem.
+//! config or filesystem outside the temporary root used by the gate regression.
 
 const std = @import("std");
 const p = @import("../core/protocol.zig");
 const cfg = @import("../core/config.zig");
+const fs = @import("../platform/filesystem.zig");
 const image = @import("../core/image.zig");
+const mem = @import("memory.zig");
+const runtime = @import("../core/runtime.zig");
 const sub = @import("../core/subagent.zig");
 const tools_mod = @import("tools.zig");
 
@@ -179,6 +182,16 @@ test "subagent job tools publish exactly when the host service exists" {
     for ([_][]const u8{ "read_file", "write_file", "bash", "memory", "subagent", "get_subagent_result", "send_subagent_message", "cancel_subagent" }, parent) |name, schema| try std.testing.expectEqualStrings(name, schema.name);
     // Same capability set keeps handing out the same read-only slice.
     try std.testing.expectEqual(parent.ptr, tools.executor().schemas.ptr);
+    // The mutation rule is child-vs-child, and parent writes/commands are refused
+    // while any child is uncollected; models must not read it as parent-shared.
+    try std.testing.expect(std.mem.indexOf(u8, parent[4].description, "serialized between sibling children of the same root task") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent[4].description, "across the parent and all children") == null);
+    try std.testing.expect(std.mem.indexOf(u8, parent[4].description, "parent's write_file and bash are refused") != null);
+    // A terminal job is collected even with wait=false, so the report must be kept.
+    try std.testing.expect(std.mem.indexOf(u8, parent[5].description, "collected and released even with wait=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent[5].description, "bounded terminal cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent[7].description, "already collected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent[7].description, "bounded terminal cache") != null);
 
     var image_dummy: u8 = 0;
     tools.image = .{ .context = &image_dummy, .inspect_fn = FakeImage.inspect, .check_fn = FakeImage.check };
@@ -430,4 +443,272 @@ test "executor lifecycle hooks forward only when the service exists" {
     try executor.end_task_fn.?(executor.context, &cancel);
     try std.testing.expectEqual(@as(usize, 1), fake.begins);
     try std.testing.expectEqual(@as(usize, 1), fake.ends);
+}
+
+// The gate is a root-shared write/bash mutex, so a direct execute must take and
+// return it even when the call fails, a read must not block on it, and a caller
+// canceled before it ever reaches the gate must neither write nor clear another
+// owner's lock. This case is early-guard coverage only: no gate wait happens.
+test "root mutation gate releases on write success and failure and pre-cancel keeps other owners" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, io, buffer[0..n]);
+    defer root.deinit();
+    var config = fixtureConfig();
+    var store = mem.Store.init(&root, config.limits);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", "/usr/bin:/bin");
+    var gate: sub.MutationGate = .{};
+    var tools: Tools = .{
+        .root = &root,
+        .memory = &store,
+        .config = &config,
+        .environment = &env,
+        .subagent_mutation_gate = &gate,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cancel: p.Cancellation = .{};
+
+    // A successful write owns the gate for its side effects and then releases.
+    const written = try tools.execute(a, .{ .write_file = .{ .path = "note.txt", .content = "hi" } }, &cancel);
+    try std.testing.expect(std.mem.indexOf(u8, written.text, "note.txt") != null);
+    try std.testing.expect(!gate.held.load(.acquire));
+
+    // A rejected write (existing file without overwrite) still releases it.
+    try std.testing.expectError(error.PathAlreadyExists, tools.execute(a, .{ .write_file = .{ .path = "note.txt", .content = "again" } }, &cancel));
+    try std.testing.expect(!gate.held.load(.acquire));
+
+    // Another owner holds the gate: a caller whose token is already canceled is
+    // stopped by the early guard, so it performs no disk write and no command,
+    // and the held lock stays owned by that other caller.
+    gate.held.store(true, .release);
+    // Reads are not gated: they run while a writer owns the gate.
+    const read_while_held = try tools.execute(a, .{ .read_file = .{ .path = "note.txt" } }, &cancel);
+    try std.testing.expect(std.mem.indexOf(u8, read_while_held.text, "hi") != null);
+    var canceled: p.Cancellation = .{ .requested = .init(true) };
+    const blocked_write = try tools.execute(a, .{ .write_file = .{ .path = "canceled.txt", .content = "x" } }, &canceled);
+    try std.testing.expect(blocked_write.canceled);
+    try std.testing.expect(blocked_write.is_error);
+    const blocked_bash = try tools.execute(a, .{ .bash = .{ .command = "touch canceled.txt" } }, &canceled);
+    try std.testing.expect(blocked_bash.canceled);
+    try std.testing.expect(blocked_bash.is_error);
+    try std.testing.expect(gate.held.load(.acquire));
+    gate.release();
+    try std.testing.expect(!gate.held.load(.acquire));
+    // Neither canceled attempt created the file.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "canceled.txt", .{}));
+}
+
+// Test-only Io probe: a copy of std.testing.io's vtable records that the worker
+// really reached a sleep inside MutationGate.acquire and forwards every other
+// entry, with the original userdata, to the real transport. Nothing is hooked in
+// production; the waiter counter does not exist either.
+const GateSleepProbe = struct {
+    var sleep_seen = std.atomic.Value(bool).init(false);
+    var vtable: std.Io.VTable = undefined;
+    var installed = false;
+
+    /// Called per case, and only after every worker of the previous case joined.
+    fn reset() void {
+        sleep_seen.store(false, .release);
+    }
+
+    fn observed() bool {
+        return sleep_seen.load(.acquire);
+    }
+
+    fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+        sleep_seen.store(true, .release);
+        return std.testing.io.vtable.sleep(userdata, timeout);
+    }
+
+    fn io() std.Io {
+        if (!installed) {
+            vtable = std.testing.io.vtable.*;
+            vtable.sleep = sleep;
+            installed = true;
+        }
+        return .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    }
+};
+
+// One contended attempt: the owning test task holds the gate first, so only the
+// held gate can block this call and the token stays unrequested. `action`
+// selects the direct path; `prepared` selects the prepared executor path and is
+// prepared in the owning task, so no worker-side approval can mix in.
+const GateWaiter = struct {
+    tools: *Tools,
+    /// Null selects the prepared executor path through `prepared`.
+    action: ?tools_mod.Action = null,
+    prepared: ?runtime.Prepared = null,
+    cancel: p.Cancellation = .{},
+    /// Set however `run` returns, including errors, so an observer can bound
+    /// its wait instead of awaiting an unbounded future.
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *@This()) anyerror!void {
+        defer self.done.store(true, .release);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (self.action) |action| {
+            _ = try self.tools.execute(a, action, &self.cancel);
+        } else {
+            const prepared = self.prepared orelse return error.TestGateCaseMissingPrepared;
+            _ = try self.tools.executor().execute_fn(self.tools, a, prepared, &self.cancel);
+        }
+    }
+};
+
+// Cancelation must land on the contended gate sleep, so each case waits for the
+// probe signal instead of a start flag or a fixed delay. A regression that skips
+// the gate never sets the signal and fails here; one that blocks without
+// cancelation fails on the cancelation assertion.
+test "contended gate wait is reached and cancelable for direct write and prepared bash" {
+    const probe = GateSleepProbe.io();
+    // The observer keeps the original transport, so its own sleeps stay silent.
+    const io = std.testing.io;
+    const cases = [_]struct {
+        name: []const u8,
+        arguments: []const u8,
+        action: tools_mod.Action,
+        path: []const u8,
+        prepared: bool,
+    }{
+        .{
+            .name = "write_file",
+            .arguments = "{\"path\":\"gate-wait.txt\",\"content\":\"x\"}",
+            .action = .{ .write_file = .{ .path = "gate-wait.txt", .content = "x" } },
+            .path = "gate-wait.txt",
+            .prepared = false,
+        },
+        .{
+            .name = "bash",
+            .arguments = "{\"command\":\"touch gate-wait-bash.txt\"}",
+            .action = .{ .bash = .{ .command = "touch gate-wait-bash.txt" } },
+            .path = "gate-wait-bash.txt",
+            .prepared = true,
+        },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [4096]u8 = undefined;
+        const n = try tmp.dir.realPath(probe, &buffer);
+        var root = try fs.Root.open(std.testing.allocator, probe, buffer[0..n]);
+        defer root.deinit();
+        var config = fixtureConfig();
+        var store = mem.Store.init(&root, config.limits);
+        var env = std.process.Environ.Map.init(std.testing.allocator);
+        defer env.deinit();
+        try env.put("PATH", "/usr/bin:/bin");
+        var gate: sub.MutationGate = .{};
+        var tools: Tools = .{
+            .root = &root,
+            .memory = &store,
+            .config = &config,
+            .environment = &env,
+            .subagent_mutation_gate = &gate,
+        };
+        var main_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer main_arena.deinit();
+        // The owning test task takes the gate before the worker exists.
+        var owner_cancel: p.Cancellation = .{};
+        try gate.acquire(probe, &owner_cancel);
+        defer gate.release();
+        // Prepared on the main path: no worker-side approval and no decision.
+        var prepared: ?runtime.Prepared = null;
+        if (case.prepared) {
+            prepared = try tools.executor().prepare_fn(&tools, main_arena.allocator(), .{ .id = "gate-bash", .name = case.name, .arguments = case.arguments });
+            try std.testing.expect(prepared.?.explicit_denial == null);
+        }
+        GateSleepProbe.reset();
+        var waiter: GateWaiter = .{ .tools = &tools, .action = if (case.prepared) null else case.action, .prepared = prepared };
+        var future = try std.Io.concurrent(probe, GateWaiter.run, .{&waiter});
+        // Every path joins first (cancel is idempotent after it), then releases.
+        defer _ = future.cancel(probe) catch {};
+        var attempts: usize = 0;
+        while (!GateSleepProbe.observed()) : (attempts += 1) {
+            if (attempts == 5000) return error.TestGateWaiterNeverSlept;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+        // The worker is inside the contended acquire: nothing ran, nothing is
+        // canceled yet, and the owner still holds the gate.
+        try std.testing.expect(!waiter.cancel.isRequested());
+        try std.testing.expect(gate.held.load(.acquire));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, case.path, .{}));
+        // Cancelation reaches the gate sleep, not an earlier file IO.
+        try std.testing.expectError(error.Canceled, future.cancel(probe));
+        try std.testing.expect(gate.held.load(.acquire));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, case.path, .{}));
+        gate.release();
+        try std.testing.expect(!gate.held.load(.acquire));
+    }
+}
+
+// Positive control: after the same observation the owner releases and the
+// waiting call must finish and really write/execute, ending with a free gate. A
+// missing gate wait fails to observe the signal; a forgotten release hangs and
+// fails the completion assertion.
+test "released gate lets the waiting prepared bash run and frees the gate" {
+    const probe = GateSleepProbe.io();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(probe, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, probe, buffer[0..n]);
+    defer root.deinit();
+    var config = fixtureConfig();
+    var store = mem.Store.init(&root, config.limits);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", "/usr/bin:/bin");
+    var gate: sub.MutationGate = .{};
+    var tools: Tools = .{
+        .root = &root,
+        .memory = &store,
+        .config = &config,
+        .environment = &env,
+        .subagent_mutation_gate = &gate,
+    };
+    var main_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer main_arena.deinit();
+    const prepared = try tools.executor().prepare_fn(&tools, main_arena.allocator(), .{ .id = "gate-bash", .name = "bash", .arguments = "{\"command\":\"touch gate-released.txt\"}" });
+    try std.testing.expect(prepared.explicit_denial == null);
+
+    var owner_cancel: p.Cancellation = .{};
+    try gate.acquire(probe, &owner_cancel);
+    defer gate.release();
+    GateSleepProbe.reset();
+    var waiter: GateWaiter = .{ .tools = &tools, .prepared = prepared };
+    var future = try std.Io.concurrent(probe, GateWaiter.run, .{&waiter});
+    defer _ = future.cancel(probe) catch {};
+    var attempts: usize = 0;
+    while (!GateSleepProbe.observed()) : (attempts += 1) {
+        if (attempts == 5000) return error.TestGateWaiterNeverSlept;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    // Still nothing ran while the owner holds the gate.
+    try std.testing.expect(gate.held.load(.acquire));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "gate-released.txt", .{}));
+    // Hand the gate over: the waiting call proceeds, executes and releases.
+    gate.release();
+    // Bounded completion wait with the original transport. The exit defer still
+    // cancels and joins, so a stuck worker fails here instead of hanging.
+    var completed: usize = 0;
+    while (!waiter.done.load(.acquire)) : (completed += 1) {
+        if (completed == 5000) return error.TestGateWaiterNeverCompleted;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try future.await(probe);
+    try std.testing.expect(!gate.held.load(.acquire));
+    // The command really ran once the gate was handed over.
+    try tmp.dir.access(io, "gate-released.txt", .{});
 }

@@ -1,17 +1,21 @@
 //! Application-owned async subagent host.
 //!
-//! One accepted root task may start up to `subagent.max_runs_per_task` children
-//! and keep at most one not-yet-collected job. `run` only starts the worker and
-//! returns the job id; `get`/`send`/`cancel` drive the interaction and `endTask`
-//! cancels+joins everything before the root task settles.
+//! One accepted root task may start any number of children and keep them all
+//! addressable by id; there is no per-root start/parallelism quota. `run` only
+//! starts the worker and returns the job id; `get`/`send`/`cancel` drive one
+//! job at a time and `endTask` cancels+joins everything before the root task
+//! settles. The only remaining bound is a small re-read cache of already
+//! collected terminal views; it never limits starting or hides a live job.
 //!
 //! Threading contract:
 //! - The worker owns the child Runtime/Bridge/ChildSession and publishes job
 //!   state only under `Job.mutex`; it never touches the parent Runtime, Bridge,
-//!   Service job slot or parent permission domain.
+//!   the Service job list or parent permission domain.
 //! - Parent-side callbacks (run/get/send/cancel/beforeFinish/endTask) are
 //!   serialized by the parent Runtime and are the only writers of the Service
-//!   job slot, parent permission ids and emitted approval events.
+//!   job list, parent permission ids and emitted approval events. The job list
+//!   is therefore never locked; only child mutations are serialized, through
+//!   the shared `subagent.MutationGate` handed to every child Tools.
 //! - Owned job state lives on App's stable allocator. Request/message/report
 //!   bytes are always copied, never borrowed from a child or tool arena.
 //!
@@ -42,6 +46,13 @@ pub const max_progress_bytes: usize = subagent.max_progress_bytes;
 const max_permission_description: usize = 1024;
 /// Poll interval for still-cancellable waits. Never a busy spin.
 const poll_ms: u64 = 2;
+/// Same-root terminal views kept for already-collected ids: a re-read cache,
+/// not a start or concurrency limit. Uncollected jobs live in the job list and
+/// are never evicted by it.
+const max_collected_results: usize = 4;
+/// Bounded before-finish hint: at most this many job ids are listed.
+const finish_hint_max_ids: usize = 8;
+const finish_hint_capacity: usize = 1024;
 /// Cooperative window before `Future.cancel` is injected into the worker.
 const join_grace_ms: u64 = 20;
 
@@ -168,6 +179,14 @@ const Job = struct {
     /// worker takes ownership by clearing this slot.
     child: ?*ChildSession = null,
     retained_child: ?*ChildSession = null,
+    /// Parent-control-thread-only sibling link. Every job stays linked until it
+    /// is collected or the root ends, so `get`/`send`/`cancel` can address any
+    /// of them by id.
+    next: ?*Job = null,
+    /// Shared child-mutation gate owned by the Service. Only write_file/bash
+    /// execution inside a child Tools acquires it; model calls and reads stay
+    /// truly concurrent.
+    mutation_gate: ?*subagent.MutationGate = null,
     test_cleanup_failed: bool = false,
     test_encode_oom: bool = false,
 
@@ -245,31 +264,46 @@ const Job = struct {
     }
 };
 
-/// Owned by App. `runs` is the parent accepted-task quota: reset only by the
-/// Runtime begin-task hook, consumed before a child starts, never refunded.
+/// Owned by App. The job list, the retained-owner chain and the collected view
+/// cache are all root-scoped and reset only by the accepted-task lifecycle.
 pub const SubagentService = struct {
     deps: Deps = undefined,
-    runs: subagent.Runs = .{},
     /// Accepted-root cancellation, refreshed once per accepted root task.
     root_cancel: ?*const p.Cancellation = null,
-    /// A whole child owner retained after a transport could not confirm process
-    /// cleanup. Never allocated from a parent tool arena.
+    /// Whole child owners retained after a transport could not confirm process
+    /// cleanup. Chained so a second failure can never drop an earlier owner.
+    /// Never allocated from a parent tool arena.
     retained_child: ?*ChildSession = null,
+    /// Job list head for the current root. Written only by the serialized parent
+    /// control thread; `current` keeps its historical name.
     current: ?*Job = null,
-    /// Same-root terminal views kept for an already-collected id. IDs are never
-    /// reused across roots; a new accepted task clears this cache.
-    collected: [subagent.max_runs_per_task]?Collected = @splat(null),
+    /// Bounded FIFO of already-collected terminal views. A new accepted task
+    /// clears it; the oldest collected view is evicted first.
+    collected: [max_collected_results]?Collected = @splat(null),
+    collected_next: usize = 0,
     next_id: u64 = 0,
+    /// Shared by every child of this root so concurrent write_file/bash calls
+    /// are serialized while model calls and reads stay concurrent.
+    mutation_gate: subagent.MutationGate = .{},
     deinit_cancel: p.Cancellation = .{},
 
     pub fn deinit(self: *SubagentService) void {
         // endTask is the broker callback form; pass the Service as its opaque context.
         endTask(self, &self.deinit_cancel) catch {};
         self.clearCollected();
-        if (self.retained_child) |child| {
-            if (child.close()) @panic("subagent cleanup still failed; refusing to discard the owned child");
-            self.retained_child = null;
+        // Each retained owner is closed individually: one failure must not drop
+        // the owners chained behind it. A remaining failure is fail-stop, never
+        // a silent discard with a false "cleaned" claim.
+        var failed = false;
+        var node = self.retained_child;
+        while (node) |child| {
+            // Saved before close: a successful close frees the child itself.
+            const next = child.retained_next;
+            if (child.close()) failed = true;
+            node = next;
         }
+        if (failed) @panic("subagent cleanup still failed; refusing to discard an owned child");
+        self.retained_child = null;
     }
 
     pub fn service(self: *SubagentService) subagent.Service {
@@ -295,11 +329,11 @@ pub const SubagentService = struct {
     pub fn beginTask(self: *SubagentService, cancel: *const p.Cancellation) void {
         if (self.current != null) @panic("subagent job survived its accepted root task");
         self.clearCollected();
-        self.runs.reset();
         self.root_cancel = cancel;
     }
 
     fn clearCollected(self: *SubagentService) void {
+        self.collected_next = 0;
         const stable = self.deps.allocator;
         for (&self.collected) |*slot| {
             if (slot.*) |record| {
@@ -313,7 +347,8 @@ pub const SubagentService = struct {
 
     /// Keep a bounded terminal copy so a repeated same-root get/cancel can still
     /// read the outcome instead of failing closed. Cache OOM never alters the
-    /// result already returned to the parent.
+    /// result already returned to the parent, and an evicted id fails closed as
+    /// unknown rather than returning a stale sibling view.
     fn rememberCollected(self: *SubagentService, job: *Job, text: []const u8, is_error: bool) void {
         const stable = self.deps.allocator;
         const id_copy = stable.dupe(u8, job.id) catch return;
@@ -323,25 +358,10 @@ pub const SubagentService = struct {
         };
         const truncated = job.reportWasTruncated();
         const cleanup_failed = job.cleanup_failed;
-        var target: ?*?Collected = null;
-        for (&self.collected) |*slot| {
-            if (slot.*) |record| {
-                if (std.mem.eql(u8, record.id, job.id)) {
-                    target = slot;
-                    break;
-                }
-            }
-        }
-        if (target == null) for (&self.collected) |*slot| {
-            if (slot.* == null) {
-                target = slot;
-                break;
-            }
-        };
-        if (target == null) target = &self.collected[0];
-        const slot = target.?;
-        // Exactly one release for the replaced record, whichever branch picked
-        // the slot; the cached text is wiped before it leaves the allocator.
+        // Ring FIFO: the slot about to be reused holds the oldest collected
+        // view. This never touches an uncollected job, which stays in the list.
+        const slot = &self.collected[self.collected_next];
+        self.collected_next = (self.collected_next + 1) % self.collected.len;
         if (slot.*) |record| {
             wipeRelease(stable, record.text);
             stable.free(record.id);
@@ -366,8 +386,8 @@ pub const SubagentService = struct {
     }
 
     pub fn checkReady(self: *const SubagentService) !void {
-        // Health only: the launch quota is checked at start so the 4th start's
-        // get/send/cancel are not blocked.
+        // Health only: there is no start/concurrency quota to enforce here, so a
+        // late get/send/cancel of an older sibling is never blocked.
         if (self.retained_child != null) return error.CleanupFailed;
         if (self.deps.runtime.poisoned) return error.UnsafeToContinue;
         if (self.deps.decision.*) |client| {
@@ -388,11 +408,7 @@ pub const SubagentService = struct {
         const self: *SubagentService = @ptrCast(@alignCast(raw));
         try subagent.validate(request);
         try self.checkReady();
-        if (self.current != null) return error.SubagentJobPending;
         const root_cancel = self.root_cancel orelse return error.SubagentNotBegun;
-        // Consume before any fallible child construction. A failed start is not
-        // refunded; only a new accepted parent task resets the quota.
-        try self.runs.consume();
         if (cancel.isRequested() or root_cancel.isRequested()) return canceledParent();
 
         const stable = self.deps.allocator;
@@ -408,6 +424,7 @@ pub const SubagentService = struct {
             .allocator = stable,
             .deps = self.deps,
             .root_cancel = root_cancel,
+            .mutation_gate = &self.mutation_gate,
             .test_cleanup_failed = self.deps.test_cleanup_failed,
             .test_encode_oom = self.deps.test_encode_oom,
         };
@@ -455,6 +472,9 @@ pub const SubagentService = struct {
             try self.closeStartChild(job);
             return err;
         };
+        // Link only after a successful spawn: an unlinked job could never be
+        // addressed by id, collected or joined.
+        job.next = self.current;
         self.current = job;
         return .{ .text = receipt };
     }
@@ -471,8 +491,11 @@ pub const SubagentService = struct {
         }
     }
 
+    /// Take ownership of a child whose transport could not confirm cleanup. The
+    /// owner is chained, so several failing children keep every owner instead of
+    /// panicking away an earlier one.
     fn ownRetained(self: *SubagentService, child: *ChildSession) void {
-        if (self.retained_child != null) @panic("subagent already retains an uncollected child owner");
+        child.retained_next = self.retained_child;
         self.retained_child = child;
         self.deps.runtime.poisoned = true;
     }
@@ -640,31 +663,55 @@ pub const SubagentService = struct {
     }
 
     /// Bounded host-state hint only: no reasoning, no Runtime re-entry. The
-    /// accepted-task reminder budget belongs to Runtime, not to this host.
+    /// accepted-task reminder budget belongs to Runtime, not to this host. This
+    /// reports (never enforces) a bounded window over every live job: at most
+    /// `finish_hint_max_ids` ids are listed plus a count of the rest, and all of
+    /// them stay addressable by `get`/`cancel`.
     fn beforeFinish(raw: *anyopaque, a: std.mem.Allocator, cancel: *const p.Cancellation) !?[]const u8 {
         const self: *SubagentService = @ptrCast(@alignCast(raw));
-        const job = self.current orelse return null;
         if (cancel.isRequested()) return null;
-        job.lock();
-        defer job.unlock();
-        const status: []const u8 = if (job.isDone())
-            "finished but not collected"
-        else if (job.phase == .waiting)
-            "waiting_for_reply"
-        else if (job.permission.active)
-            "waiting_for_approval"
-        else
-            "running";
-        return try std.fmt.allocPrint(a, "Subagent {s} is {s}. Use get_subagent_result (or cancel_subagent) before finishing this task.", .{ job.id, status });
+        const head = self.current orelse return null;
+        var total: usize = 1;
+        var counter = head;
+        while (counter.next) |next| : (counter = next) total += 1;
+
+        var buffer: [finish_hint_capacity]u8 = undefined;
+        var len: usize = 0;
+        const header = std.fmt.bufPrint(buffer[0..], "Subagent jobs pending: {d}. Use get_subagent_result (or cancel_subagent) before finishing this task.", .{total}) catch return null;
+        // `header` already points at buffer[0..]; only record its length so the
+        // same buffer is not copied onto itself.
+        len = header.len;
+        var listed: usize = 0;
+        var node: ?*Job = head;
+        while (node) |job| {
+            if (listed == finish_hint_max_ids) break;
+            const status = jobStatus(job);
+            var id_buffer: [max_id_bytes + 32]u8 = undefined;
+            const part = std.fmt.bufPrint(&id_buffer, "{s}{s}:{s}", .{ if (listed == 0) " " else ", ", job.id, status }) catch break;
+            if (len + part.len > buffer.len) break;
+            appendBounded(&buffer, &len, part);
+            listed += 1;
+            node = job.next;
+        }
+        if (listed < total) {
+            var tail_buffer: [48]u8 = undefined;
+            const tail: []const u8 = std.fmt.bufPrint(&tail_buffer, "; {d} more not listed", .{total - listed}) catch "";
+            appendBounded(&buffer, &len, tail);
+        }
+        return try a.dupe(u8, buffer[0..len]);
     }
 
-    /// Cancel + short cooperative grace + Future.cancel/join + release. Safe for
-    /// every exit path and for repeated calls. Never abandons a worker.
+    /// Cancel every sibling FIRST, then short cooperative grace +
+    /// Future.cancel/join + release each. Safe for every exit path and for
+    /// repeated calls. Joining one job must never leave its siblings running, so
+    /// the cancellation pass is separate from the join pass.
     fn endTask(raw: *anyopaque, cancel: *const p.Cancellation) !void {
         _ = cancel;
         const self: *SubagentService = @ptrCast(@alignCast(raw));
-        if (self.current) |job| {
-            job.cancel.cancel();
+        var node = self.current;
+        while (node) |job| : (node = job.next) job.cancel.cancel();
+        // `releaseJob` unlinks the node it releases, so the head always advances.
+        while (self.current) |job| {
             self.joinJob(job);
             self.withdrawPermission(job);
             if (job.cleanup_failed) self.deps.runtime.poisoned = true;
@@ -682,9 +729,11 @@ pub const SubagentService = struct {
     // ------------------------------------------------------------------
 
     fn find(self: *SubagentService, id: []const u8) !*Job {
-        const job = self.current orelse return error.UnknownSubagentId;
-        if (!std.mem.eql(u8, job.id, id)) return error.UnknownSubagentId;
-        return job;
+        var node = self.current;
+        while (node) |job| : (node = job.next) {
+            if (std.mem.eql(u8, job.id, id)) return job;
+        }
+        return error.UnknownSubagentId;
     }
 
     fn joinJob(self: *SubagentService, job: *Job) void {
@@ -746,11 +795,24 @@ pub const SubagentService = struct {
     fn releaseJob(self: *SubagentService, job: *Job) void {
         std.debug.assert(job.joined);
         std.debug.assert(job.child == null);
+        // Unlink exactly this node: its siblings stay addressable and their
+        // state is untouched, so collecting or canceling one child is never a
+        // root-wide operation.
+        var link = &self.current;
+        var unlinked = false;
+        while (link.*) |node| {
+            if (node == job) {
+                link.* = job.next;
+                unlinked = true;
+                break;
+            }
+            link = &node.next;
+        }
+        std.debug.assert(unlinked);
         if (job.retained_child) |child| {
             // The child session cleared every Job/root/channel borrow during
             // close, so retaining it cannot resurrect a freed pointer.
-            if (self.retained_child != null)
-                @panic("subagent already retains an uncollected child owner");
+            child.retained_next = self.retained_child;
             self.retained_child = child;
             job.retained_child = null;
         }
@@ -774,7 +836,6 @@ pub const SubagentService = struct {
         wipeRelease(job.allocator, job.task);
         if (job.context) |context| wipeRelease(job.allocator, context);
         job.allocator.free(job.id);
-        if (self.current == job) self.current = null;
         job.allocator.destroy(job);
     }
 
@@ -886,9 +947,12 @@ pub const SubagentService = struct {
         };
         job.emitted_permission_id = id;
         // Keep an explicit source marker so the parent UI shows this came from a
-        // delegated child, not from the parent's own tool loop.
-        var description_buffer: [max_permission_description + 96]u8 = undefined;
-        const mapped_description = std.fmt.bufPrint(&description_buffer, "subagent {s}: {s}", .{ tool_name[0..tool_len], description[0..description_len] }) catch description[0..description_len];
+        // delegated child, not from the parent's own tool loop. The job id is
+        // part of the marker: several children may hold pending approvals with
+        // the same tool and operation text, and the parent must be able to tell
+        // which job it is deciding for.
+        var description_buffer: [max_permission_description + max_id_bytes + 96]u8 = undefined;
+        const mapped_description = std.fmt.bufPrint(&description_buffer, "subagent {s} {s}: {s}", .{ job.id, tool_name[0..tool_len], description[0..description_len] }) catch description[0..description_len];
         const mapped = r.Permission{
             .id = id,
             .tool_name = tool_name[0..tool_len],
@@ -986,6 +1050,22 @@ const Collected = struct {
 };
 
 const cleanup_report = "Subagent cleanup failed; a child process may remain alive. The parent task is poisoned and must not continue.";
+
+/// Bounded host-status view of one live job. Callers must not hold the lock.
+fn jobStatus(job: *Job) []const u8 {
+    job.lock();
+    defer job.unlock();
+    if (job.isDone()) return "finished but not collected";
+    if (job.phase == .waiting) return "waiting_for_reply";
+    if (job.permission.active) return "waiting_for_approval";
+    return "running";
+}
+
+fn appendBounded(buffer: []u8, len: *usize, text: []const u8) void {
+    const take = @min(text.len, buffer.len - len.*);
+    @memcpy(buffer[len.*..][0..take], text[0..take]);
+    len.* += take;
+}
 
 fn usageView(usage: p.Usage, calls: u32) UsageView {
     // No calls at all means the provider never reported anything; do not turn
@@ -1200,6 +1280,9 @@ const ChildSession = struct {
     /// Stable field address; every partial or successful close deinits it.
     policy_wiping: cfg.WipingAllocator = undefined,
     policy_arena: ?std.heap.ArenaAllocator = null,
+    /// Parent-side link used only after this owner was retained. Never read by a
+    /// worker and never borrowed by the job it came from.
+    retained_next: ?*ChildSession = null,
     test_cleanup_failed: bool = false,
     test_encode_oom: bool = false,
 
@@ -1236,6 +1319,11 @@ const ChildSession = struct {
             .auth_path = deps.auth_path,
             .image = if (self.image) |client| client.service() else null,
             .subagent = null,
+            // Shared per-root mutation gate: every child write_file/bash of this
+            // root serializes through it, while model calls and reads stay
+            // concurrent. The gate is borrowed from the Service, never owned by
+            // the child, and is not held across an approval or the job lifetime.
+            .subagent_mutation_gate = job.mutation_gate,
             .allow_memory = false,
             .parent_channel = .{ .context = self, .message_fn = parentMessage },
         };
@@ -1281,7 +1369,13 @@ const ChildSession = struct {
         }
         self.job = null;
         self.cancel = .{};
-        if (self.tools_ready) self.tools.parent_channel = null;
+        if (self.tools_ready) {
+            // Both borrows must be dropped before a retained owner outlives the
+            // job: the channel points at this session and the mutation gate at
+            // the Service, so neither may survive into retention.
+            self.tools.parent_channel = null;
+            self.tools.subagent_mutation_gate = null;
+        }
         var failed = self.test_cleanup_failed;
         if (self.decision) |client| {
             var converged = true;

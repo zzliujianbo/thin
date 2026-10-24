@@ -34,6 +34,19 @@
 //     subagent-direct         C: report
 //   child-dangerous-bash     R: start, get(wait)=success (approval proxied+denied), answer
 //                            C: dangerous bash, report
+//   chat-subagent-parallel   R: 6x start (one extra child each round), then six
+//                               get(wait) reads in the non-start order
+//                               [2,5,0,4,1,3], answer
+//                            C: 6 concurrent children, one model request and
+//                               one report each, all held on a single arrival
+//                               barrier that opens only after the 6th distinct
+//                               child request has really arrived
+//
+// The parallel case is the same-root concurrency proof: there is no start or
+// concurrency quota (only collected terminal views are cached), so six children
+// of one root must be in flight at the same time. The barrier makes that
+// observable without sleeps or request-count guessing: a serialized runtime
+// would block until the bounded task timeout instead of passing.
 //
 // The fake root model never invents ids: every get/send/cancel argument is
 // built from the parsed previous tool result. No hardcoded id format and no
@@ -958,6 +971,177 @@ function childApprovalDenialCase() {
   return plan;
 }
 
+// Parallel same-root delegation: six children are started by one root in six
+// consecutive rounds and must really be in flight at the same time. Every child
+// model request is held by the owned server on ONE barrier that opens only when
+// the sixth distinct child request has arrived; a serialized runtime would just
+// stop there and hit the bounded task timeout. Each child derives its index from
+// the request it actually received (not from arrival order) and reports it, and
+// every start id is taken from the previous start receipt (no id format is
+// assumed). The root then reads all six in the non-start order [2,5,0,4,1,3]
+// and collects each id exactly once, because only the most recent collected
+// terminal views are cached.
+const PARALLEL_COUNT = 6;
+const PARALLEL_ORDER = [2, 5, 0, 4, 1, 3];
+const PARALLEL_BARRIER = 'all-parallel-entered';
+const PARALLEL_CHILD_USAGE = {input: 140, output: 18};
+const PARALLEL_MARKER = /parallel-index-([0-9])/g;
+const parallelTask = index => `${CHILD_TASK} parallel-index-${index}`;
+const parallelReport = index => `child report: ${CHILD_TASK} parallel-index-${index}`;
+
+// The child's own delegated task text, never the arrival slot, identifies the job.
+function parallelChildIndex(plan, ctx) {
+  const found = new Set();
+  for (const text of userTexts(plan.protocol, ctx.body))
+    for (const match of String(text).matchAll(PARALLEL_MARKER)) found.add(Number(match[1]));
+  assert.equal(found.size, 1, 'each child request must carry exactly one parallel index');
+  const index = [...found][0];
+  assert(index >= 0 && index < PARALLEL_COUNT, 'parallel index must be in range');
+  assert(ctx.raw.includes(parallelTask(index)), 'the delegated parallel task must reach the child verbatim');
+  return index;
+}
+
+// One collection read: the snapshot must describe the child that was asked for.
+function collectParallel(plan, ctx, index) {
+  const snap = getResult(ctx.history);
+  assert.equal(snap.id, plan.parallelIds[index], `get must address the captured id of parallel index ${index}`);
+  assert.equal(snap.status, 'success', `parallel child ${index} must be terminal`);
+  assert.equal(snap.report, parallelReport(index), `parallel child ${index} must report only its own task`);
+  assert.equal(snap.truncated, false, 'a short parallel report must not be truncated');
+  assert.equal(snap.usage_scope, 'normal_and_summary_only', 'parallel usage scope');
+  assert.equal(snap.usage.normal_calls, 1, 'each parallel child runs exactly one model call');
+  assert.equal(snap.usage.summary_calls, 0, 'parallel children make no summary call');
+  assert.equal(snap.usage.normal.input_tokens, PARALLEL_CHILD_USAGE.input, 'parallel child input usage');
+  assert.equal(snap.usage.normal.output_tokens, PARALLEL_CHILD_USAGE.output, 'parallel child output usage');
+  assert(!snap.report.includes(PARENT_PRIVATE), 'parent private marker reached a child report');
+  assert.equal(plan.collected.has(index), false, `parallel index ${index} must be collected only once`);
+  plan.collected.add(index);
+}
+
+function parallelCallArgs(history, name) {
+  return history.calls.filter(call => call.name === name).map(call => {
+    let parsed;
+    try { parsed = JSON.parse(call.arguments); } catch { assert.fail(`${name} arguments must be JSON`); }
+    assert(parsed && typeof parsed === 'object', `${name} arguments must be an object`);
+    return parsed;
+  });
+}
+
+function assertParallelComplete(plan, ctx) {
+  const expected = Array.from({length: PARALLEL_COUNT}, (_, index) => index);
+  assert.deepEqual([...plan.collected].sort((a, b) => a - b), expected,
+    'every parallel child must be collected exactly once');
+  assert.equal(plan.parallelIds.length, PARALLEL_COUNT, 'six distinct start receipts must be captured');
+  assert.equal(new Set(plan.parallelIds).size, PARALLEL_COUNT, 'parallel jobs must have distinct ids');
+  assert.equal(plan.parallelEntered.size, PARALLEL_COUNT, 'six distinct child requests must have arrived');
+  assert.deepEqual([...plan.parallelEntered].sort((a, b) => a - b), expected,
+    'each parallel index must arrive exactly once');
+  assert.equal(plan.childRequests, PARALLEL_COUNT, 'each parallel child makes exactly one model request');
+  const starts = parallelCallArgs(ctx.history, 'subagent');
+  assert.equal(starts.length, PARALLEL_COUNT, 'exactly six subagent starts');
+  const tasks = starts.map(args => args.task);
+  assert.equal(new Set(tasks).size, PARALLEL_COUNT, 'every parallel start must carry a distinct task');
+  for (const index of expected)
+    assert(tasks.includes(parallelTask(index)), `missing parallel task ${index}`);
+  const gets = parallelCallArgs(ctx.history, 'get_subagent_result');
+  assert.equal(gets.length, PARALLEL_COUNT, 'exactly six collection reads');
+  assert.deepEqual(gets.map(args => plan.parallelIds.indexOf(args.id)), PARALLEL_ORDER,
+    'children must be collected in the declared non-start order');
+}
+
+function parallelCase() {
+  const plan = makePlan({
+    name: 'chat-subagent-parallel', protocol: 'chat', logging: true, childTask: CHILD_TASK,
+  });
+  plan.parallelIds = [];
+  plan.parallelEntered = new Set();
+  plan.parallelArrival = [];
+  plan.collected = new Set();
+  plan.stages.root = [];
+  plan.stages.child = [];
+
+  // One start per root round; the previous round's receipt supplies the id.
+  for (let index = 0; index < PARALLEL_COUNT; index += 1) {
+    plan.stages.root.push({
+      usage: {input: 40 + index * 4, output: 8},
+      check: ctx => {
+        if (index === 0) return;
+        const start = startResult(ctx.history);
+        assert.equal(start.status, 'running', 'every parallel start must return before collection');
+        assert.equal(plan.parallelIds.length, index - 1, 'start receipts must be captured in start order');
+        plan.parallelIds.push(start.id);
+        assert.equal(new Set(plan.parallelIds).size, plan.parallelIds.length, 'parallel ids must be distinct');
+      },
+      reply: ctx => ctx.call('subagent', {task: parallelTask(index)}),
+    });
+  }
+
+  // The sixth start is followed by one barrier wait and the first read.
+  plan.stages.root.push({
+    hold: PARALLEL_BARRIER, usage: {input: 90, output: 10},
+    check: ctx => {
+      const start = startResult(ctx.history);
+      assert.equal(start.status, 'running', 'the last parallel start must still be running');
+      assert.equal(plan.parallelIds.length, PARALLEL_COUNT - 1, 'only the last start receipt is outstanding');
+      plan.parallelIds.push(start.id);
+      assert.equal(new Set(plan.parallelIds).size, PARALLEL_COUNT, 'all six parallel ids must be distinct');
+    },
+    reply: ctx => ctx.call('get_subagent_result', {id: plan.parallelIds[PARALLEL_ORDER[0]], wait: true}),
+  });
+
+  // Each read collects one child and chains the next read, in the declared order.
+  for (let position = 0; position < PARALLEL_ORDER.length; position += 1) {
+    const final = position === PARALLEL_ORDER.length - 1;
+    plan.stages.root.push({
+      usage: {input: 100 + position * 4, output: final ? 14 : 10},
+      ...(final ? {expectedCalls: [
+        'subagent', 'subagent', 'subagent', 'subagent', 'subagent', 'subagent',
+        'get_subagent_result', 'get_subagent_result', 'get_subagent_result',
+        'get_subagent_result', 'get_subagent_result', 'get_subagent_result',
+      ]} : {}),
+      check: ctx => {
+        collectParallel(plan, ctx, PARALLEL_ORDER[position]);
+        if (final) assertParallelComplete(plan, ctx);
+      },
+      reply: ctx => final
+        ? ctx.text(ROOT_ANSWER)
+        : ctx.call('get_subagent_result', {id: plan.parallelIds[PARALLEL_ORDER[position + 1]], wait: true}),
+    });
+  }
+
+  // Every child is held until the sixth distinct child request has arrived, so
+  // only genuine concurrency can open the barrier.
+  for (let slot = 0; slot < PARALLEL_COUNT; slot += 1) {
+    plan.stages.child.push({
+      expectedCalls: [], hold: PARALLEL_BARRIER, usage: PARALLEL_CHILD_USAGE,
+      check: ctx => {
+        const index = parallelChildIndex(plan, ctx);
+        assert(!plan.parallelEntered.has(index), `parallel index ${index} must arrive once`);
+        plan.parallelEntered.add(index);
+        plan.parallelArrival.push(index);
+        assert(plan.parallelEntered.size <= PARALLEL_COUNT, 'too many parallel child requests');
+        if (plan.parallelEntered.size === PARALLEL_COUNT) fireSignal(plan, PARALLEL_BARRIER);
+      },
+      reply: ctx => ctx.text(parallelReport(parallelChildIndex(plan, ctx))),
+    });
+  }
+
+  plan.verify = async ({code, out, project}) => {
+    assert.equal(code, 0, 'six parallel same-root children must not fail the root task');
+    assert(out.includes(ROOT_ANSWER), 'parent final answer missing');
+    assert(!out.includes('Subagent mode:'), 'child mode note leaked to stdout');
+    assert.equal(plan.roleRequests.root, PARALLEL_COUNT + 1 + PARALLEL_ORDER.length,
+      'parallel root request count');
+    assert.equal(plan.roleRequests.child, PARALLEL_COUNT, 'parallel child request count');
+    assert.equal(plan.childRequests, PARALLEL_COUNT, 'each parallel child makes exactly one model request');
+    assert.equal(plan.parallelArrival.length, PARALLEL_COUNT, 'six child requests must have arrived');
+    assert.equal(plan.parallelEntered.size, PARALLEL_COUNT, 'six distinct child indices must have arrived');
+    assert.equal(plan.collected.size, PARALLEL_COUNT, 'all six children must be collected');
+    await assertParentArchive(project);
+  };
+  return plan;
+}
+
 // ---------------------------------------------------------------------------
 
 function stop() {
@@ -978,6 +1162,7 @@ try {
     directCase('responses-subagent-direct', 'responses'),
     directCase('anthropic-subagent-direct', 'anthropic'),
     childApprovalDenialCase(),
+    parallelCase(),
   ];
   const results = [];
   for (const plan of cases) {
@@ -997,6 +1182,10 @@ try {
     steeringDeliveredWhileChildModelRequestInFlight: true,
     progressMessageSnapshot: true,
     cancelLeavesRootCompletedAndChildExited: true,
+    parallelSameRootChildren: PARALLEL_COUNT,
+    parallelChildrenHeldOnOneArrivalBarrier: true,
+    parallelChildrenCollectedInNonStartOrder: PARALLEL_ORDER,
+    parallelChildrenCollectedExactlyOnce: true,
     legacySubagentEnabledFalseStillDelegates: true,
     foreignIdsRejectedForGetSendCancel: true,
     childFreshContext: true,
@@ -1006,7 +1195,7 @@ try {
     parentOnlySessionArchive: true,
     memoryAutoOffNoAuxiliaryRequest: true,
   }, null, 2) + '\n');
-  console.log('PASS subagent owned loopback acceptance: 8 cases (Q&A, steering, cancel, legacy switch, foreign ids, 2 wires, child approval denial)');
+  console.log('PASS subagent owned loopback acceptance: 9 cases (Q&A, steering, cancel, legacy switch, foreign ids, 2 wires, child approval denial, 6-way same-root parallel)');
 } catch (error) {
   // Assertion messages only; never dump headers, bodies or configuration.
   console.error(`Subagent owned loopback FAIL: ${error?.message ?? 'runner'}`);

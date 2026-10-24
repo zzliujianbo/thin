@@ -27,7 +27,15 @@ const Stub = struct {
     }
 };
 
-const Behavior = enum { text, tool_then_text, wait_for_cancel, ask_parent, progress_flood, steer_skip_write, progress_loop };
+const Behavior = enum { text, tool_then_text, wait_for_cancel, ask_parent, progress_flood, steer_skip_write, progress_loop, concurrent_write };
+
+/// Cross-child barrier for the concurrency regression. Every field is atomic, so
+/// independent FakeModel instances can share it without a data race; plain fake
+/// fields are still only read after the owning worker was joined.
+const Barrier = struct {
+    entered: std.atomic.Value(usize) = .init(0),
+    release: std.atomic.Value(bool) = .init(false),
+};
 
 /// Assistant tool-call message owned by the caller's arena. The Runtime validates
 /// the response after `call` returns, so a stack temporary would dangle.
@@ -57,6 +65,19 @@ const FakeModel = struct {
     // so the parent can ack without racing the child's ninth post.
     progress_flood_checked: std.atomic.Value(bool) = .init(false),
     hold: std.atomic.Value(bool) = .init(false),
+    /// ask_parent only: per-instance question and reply marker, so a test can
+    /// prove two siblings never see each other's question or reply.
+    question: []const u8 = "need direction",
+    reply_tag: []const u8 = "PARENT-REPLY-MARKER",
+    final_text: []const u8 = "answered",
+    /// concurrent_write only: the barrier to enter before the mutation call and
+    /// the exact per-child file payload to write through the shared gate.
+    barrier: ?*Barrier = null,
+    write_path: []const u8 = "",
+    write_tag: []const u8 = "",
+    /// Set by the worker just before it returns from a canceled wait; read only
+    /// after that worker was joined.
+    saw_cancel: bool = false,
 
     fn make(raw: *anyopaque, _: std.mem.Allocator, config: *const cfg.Config) !p.Model {
         const self: *FakeModel = @ptrCast(@alignCast(raw));
@@ -102,6 +123,7 @@ const FakeModel = struct {
                 while (!cancel.isRequested()) {
                     std.Io.sleep(self.io, .fromMilliseconds(2), .awake) catch break;
                 }
+                self.saw_cancel = true;
                 if (self.parent_cancel) |parent| self.parent_was_requested = parent.isRequested();
                 return .{ .failure = .{ .kind = .canceled, .message = "fixture canceled", .usage = .{ .input_tokens = 1, .output_tokens = 1 } } };
             },
@@ -122,12 +144,12 @@ const FakeModel = struct {
             },
             .ask_parent => {
                 const last = lastToolText(request) orelse return .{ .success = .{
-                    .message = try toolCallMessage(a, "ask-call", "message_parent", "{\"message\":\"need direction\",\"wait_for_reply\":true}"),
+                    .message = try toolCallMessage(a, "ask-call", "message_parent", try std.fmt.allocPrint(a, "{{\"message\":\"{s}\",\"wait_for_reply\":true}}", .{self.question})),
                     .finish = .tool_calls,
                 } };
-                if (std.mem.indexOf(u8, last, "PARENT-REPLY-MARKER") != null) self.saw_reply = true;
+                if (std.mem.indexOf(u8, last, self.reply_tag) != null) self.saw_reply = true;
                 return .{ .success = .{
-                    .message = try p.textMessage(a, .assistant, "answered"),
+                    .message = try p.textMessage(a, .assistant, self.final_text),
                     .finish = .stop,
                 } };
             },
@@ -172,6 +194,32 @@ const FakeModel = struct {
                 ),
                 .finish = .tool_calls,
             } },
+            .concurrent_write => {
+                const has_result = for (request.messages) |message| {
+                    if (message.role == .tool) break true;
+                } else false;
+                if (!has_result) {
+                    if (self.barrier) |barrier| {
+                        _ = barrier.entered.fetchAdd(1, .acq_rel);
+                        while (!barrier.release.load(.acquire)) {
+                            std.Io.sleep(self.io, .fromMilliseconds(1), .awake) catch break;
+                        }
+                    }
+                    return .{ .success = .{
+                        .message = try toolCallMessage(
+                            a,
+                            "concurrent-write",
+                            "write_file",
+                            try std.fmt.allocPrint(a, "{{\"path\":\"{s}\",\"content\":\"{s}\",\"overwrite\":true}}", .{ self.write_path, self.write_tag }),
+                        ),
+                        .finish = .tool_calls,
+                    } };
+                }
+                return .{ .success = .{
+                    .message = try p.textMessage(a, .assistant, self.report_text),
+                    .finish = .stop,
+                } };
+            },
             .text => return .{ .success = .{
                 .message = try p.textMessage(a, .assistant, self.report_text),
                 .finish = .stop,
@@ -279,7 +327,8 @@ const Fixture = struct {
         return self.runCurrentRoot(request);
     }
 
-    /// Start another job inside the current accepted root (no quota reset).
+    /// Start another job inside the current accepted root (no task lifecycle
+    /// reset; the root is not begun again).
     fn runCurrentRoot(self: *Fixture, request: subagent.Request) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -352,6 +401,14 @@ fn cancelLater(io: std.Io, cancel: *p.Cancellation) !void {
     cancel.cancel();
 }
 
+/// Live sibling jobs currently linked for the accepted root.
+fn jobCount(fix: *Fixture) usize {
+    var count: usize = 0;
+    var node = fix.service.current;
+    while (node) |job| : (node = job.next) count += 1;
+    return count;
+}
+
 test "subagent start returns an id and get collects isolated report usage and no artifacts" {
     const a = std.testing.allocator;
     const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
@@ -406,43 +463,61 @@ test "subagent inherits the parent effective protocol for chat responses and ant
     }
 }
 
-test "subagent quota resets only for a new accepted root and does not block get or send" {
+test "one root starts twelve children and only a bounded collected cache evicts" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
     defer fix.deinit();
-    var fake: FakeModel = .{ .io = std.testing.io };
+    var fake: FakeModel = .{ .io = io };
     fix.withModel(&fake);
-    var last_id: []u8 = &.{};
-    // One accepted root: only beginTask resets the per-root quota.
+
+    // Host-side re-read cache bound; it must never be a start or concurrency
+    // limit, and it never hides an uncollected job.
+    const cached_views: usize = 4;
+    const rounds: usize = 12;
+    var ids: [rounds][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
     fix.service.beginTask(&fix.parent_cancel);
-    var round: u32 = 0;
-    while (round < subagent.max_runs_per_task) : (round += 1) {
-        const id = try fix.runCurrentRoot(.{ .task = "bounded task" });
-        var parsed = try fix.get(id, true);
+    for (&ids) |*id| {
+        id.* = try fix.runCurrentRoot(.{ .task = "unlimited sibling task" });
+        started += 1;
+        var parsed = try fix.get(id.*, true);
         defer parsed.deinit();
         try std.testing.expectEqualStrings("success", parsed.value.object.get("status").?.string);
-        // The completed id stays readable in the same root.
+    }
+    // Twelve sequential starts in one accepted root all ran; a quota would have
+    // refused the fifth.
+    try std.testing.expectEqual(@as(usize, rounds), fake.calls);
+    try std.testing.expect(!fix.active());
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    // The most recent collected views are still readable...
+    for (ids[rounds - cached_views ..]) |id| {
         var again = try fix.getResult(id, true);
         defer again.deinit(a);
         try std.testing.expect(!again.is_error);
-        if (round == subagent.max_runs_per_task - 1) last_id = id else a.free(id);
     }
-    defer a.free(last_id);
-    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    // ...while an evicted, already-collected id fails closed as unknown instead
+    // of returning a stale sibling view.
+    for (ids[0 .. rounds - cached_views]) |id| {
+        try std.testing.expectError(error.UnknownSubagentId, fix.service.service().get(arena.allocator(), .{ .id = id }, &fix.parent_cancel));
+    }
 
-    // Health check stays clean and is not a quota gate for get/send.
+    // Health is not a quota gate and a start is never refused because an older
+    // sibling ran or was collected.
     try fix.service.checkReady();
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    try std.testing.expectError(error.SubagentRunsExhausted, fix.service.service().run(arena.allocator(), .{ .task = "too many" }, &fix.parent_cancel));
+    const extra = try fix.runCurrentRoot(.{ .task = "still allowed after twelve" });
+    var extra_done = try fix.get(extra, true);
+    defer extra_done.deinit();
+    try std.testing.expectEqualStrings("success", extra_done.value.object.get("status").?.string);
+    a.free(extra);
 
-    // A genuinely new accepted root resets the quota and the id cache.
+    // A new accepted root invalidates every id of the previous root.
     try fix.endTask();
-    const id = try fix.start(.{ .task = "new accepted task" });
-    defer a.free(id);
-    var parsed = try fix.get(id, true);
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 5), fake.calls);
+    fix.service.beginTask(&fix.parent_cancel);
+    try std.testing.expectError(error.UnknownSubagentId, fix.service.service().get(arena.allocator(), .{ .id = ids[rounds - 1] }, &fix.parent_cancel));
 }
 
 test "subagent long CJK report truncates at a UTF-8 boundary" {
@@ -842,23 +917,38 @@ test "unsupported child protocol fails the start without a child run" {
     try std.testing.expect(!fix.active());
 }
 
-test "start refuses while a job is uncollected and endTask is repeatable" {
+test "concurrent sibling starts are not refused and endTask is repeatable" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
     defer fix.deinit();
-    var fake: FakeModel = .{ .io = std.testing.io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
-    fix.withModel(&fake);
-    const id = try fix.start(.{ .task = "single uncollected job" });
-    defer a.free(id);
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    try std.testing.expectError(error.SubagentJobPending, fix.service.service().run(arena.allocator(), .{ .task = "second" }, &fix.parent_cancel));
+    var first: FakeModel = .{ .io = io };
+    var second: FakeModel = .{ .io = io };
+    fix.service.beginTask(&fix.parent_cancel);
+    fix.withModel(&first);
+    const one = try fix.runCurrentRoot(.{ .task = "first sibling" });
+    defer a.free(one);
+    // A second child starts while the first is still uncollected.
+    fix.withModel(&second);
+    const two = try fix.runCurrentRoot(.{ .task = "second sibling" });
+    defer a.free(two);
+    try std.testing.expectEqual(@as(usize, 2), jobCount(fix));
+    var first_done = try fix.get(one, true);
+    defer first_done.deinit();
+    var second_done = try fix.get(two, true);
+    defer second_done.deinit();
+    try std.testing.expectEqualStrings("success", first_done.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("success", second_done.value.object.get("status").?.string);
+    try std.testing.expect(!fix.active());
     try fix.endTask();
     try fix.endTask();
     try std.testing.expect(!fix.active());
+    try std.testing.expect(fix.service.current == null);
     // A new accepted root may start again.
     const next = try fix.start(.{ .task = "after end task" });
     defer a.free(next);
+    var parsed = try fix.get(next, true);
+    defer parsed.deinit();
     try fix.endTask();
 }
 
@@ -871,6 +961,9 @@ const ApprovalRecorder = struct {
     saw_source: bool = false,
     saw_operation: bool = false,
     saw_canceled: bool = false,
+    /// When set, every authorization must carry this job id in its description:
+    /// several siblings may hold identical pending approvals at the same time.
+    expect_source: []const u8 = "",
     io: std.Io = undefined,
     delay_ms: u64 = 0,
 
@@ -896,8 +989,10 @@ const ApprovalRecorder = struct {
         self.authorized += 1;
         try std.testing.expectEqual(self.id.?, permission.id);
         try std.testing.expect(std.mem.indexOf(u8, permission.description, "subagent") != null);
+        if (self.expect_source.len != 0)
+            try std.testing.expect(std.mem.indexOf(u8, permission.description, self.expect_source) != null);
         // Emit-before-authorize: the parent already published this id.
-        try std.testing.expectEqual(@as(usize, 1), self.emitted);
+        try std.testing.expectEqual(self.authorized, self.emitted);
         // A cooperative host must abort the prompt on the broker-local token:
         // the child's local timeout/steering cancels it without touching root.
         if (self.delay_ms != 0) {
@@ -1255,4 +1350,382 @@ test "send refuses a finished or canceled job that is not collected yet" {
     try waitUncollectedFinished(fix, service, 1_000);
     try std.testing.expectError(error.SubagentFinished, service.send(a, .{ .id = blocked, .message = "still too late" }, &live));
     try fix.endTask();
+}
+
+test "six children run at once and every mutation lands through the shared gate" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    fix.service.beginTask(&fix.parent_cancel);
+
+    const children = 6;
+    var barrier: Barrier = .{};
+    var fakes: [children]FakeModel = undefined;
+    var paths: [children][24]u8 = undefined;
+    var tags: [children][16]u8 = undefined;
+    var reports: [children][24]u8 = undefined;
+    var ids: [children][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    for (&fakes, 0..) |*fake, index| {
+        const tag = try std.fmt.bufPrint(&tags[index], "CHILD-{d}", .{index});
+        fake.* = .{
+            .io = io,
+            .behavior = .concurrent_write,
+            .barrier = &barrier,
+            .write_path = try std.fmt.bufPrint(&paths[index], "child-{d}.txt", .{index}),
+            .write_tag = tag,
+            .report_text = try std.fmt.bufPrint(&reports[index], "report-{d}", .{index}),
+        };
+    }
+    // Each start gets its own FakeModel context: the factory is replaced before
+    // every run, and the synchronous `make` inside the parent control path binds
+    // that instance to exactly one child worker.
+    for (&fakes, 0..) |*fake, index| {
+        fix.withModel(fake);
+        ids[index] = try fix.runCurrentRoot(.{ .task = "concurrent mutation" });
+        started = index + 1;
+    }
+    // Every child reached its own model call before any of them proceeds: a host
+    // that serialized sibling jobs could never reach six entries here.
+    const began = std.Io.Clock.awake.now(io);
+    while (barrier.entered.load(.acquire) < children) {
+        if (began.untilNow(io, .awake).toMilliseconds() > 5_000) return error.FixtureTimeout;
+        try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, children), jobCount(fix));
+    try std.testing.expect(fix.active());
+    barrier.release.store(true, .release);
+
+    // Six uncollected jobs with a four-slot re-read cache: none may be hidden.
+    for (ids, 0..) |id, index| {
+        var parsed = try fix.get(id, true);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("success", parsed.value.object.get("status").?.string);
+        try std.testing.expectEqualStrings(fakes[index].report_text, parsed.value.object.get("report").?.string);
+    }
+    try std.testing.expect(!fix.active());
+    // Every file holds exactly the payload of the child that wrote it.
+    for (&fakes) |*fake| {
+        const written = try fix.root.readBinary(a, fake.write_path, 4096);
+        defer a.free(written);
+        try std.testing.expectEqualStrings(fake.write_tag, written);
+    }
+}
+
+test "sibling jobs keep their questions and replies independent by id" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var first: FakeModel = .{
+        .io = io,
+        .behavior = .ask_parent,
+        .question = "need direction A",
+        .reply_tag = "REPLY-FIRST",
+        .final_text = "first answered",
+    };
+    var second: FakeModel = .{
+        .io = io,
+        .behavior = .ask_parent,
+        .question = "need direction B",
+        .reply_tag = "REPLY-SECOND",
+        .final_text = "second answered",
+    };
+    fix.service.beginTask(&fix.parent_cancel);
+    fix.withModel(&first);
+    const first_id = try fix.runCurrentRoot(.{ .task = "ask as first" });
+    defer a.free(first_id);
+    fix.withModel(&second);
+    const second_id = try fix.runCurrentRoot(.{ .task = "ask as second" });
+    defer a.free(second_id);
+
+    var ask_first = try fix.get(first_id, true);
+    defer ask_first.deinit();
+    try std.testing.expectEqualStrings("waiting_for_reply", ask_first.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("need direction A", ask_first.value.object.get("messages").?.array.items[0].object.get("message").?.string);
+    var ask_second = try fix.get(second_id, true);
+    defer ask_second.deinit();
+    try std.testing.expectEqualStrings("need direction B", ask_second.value.object.get("messages").?.array.items[0].object.get("message").?.string);
+
+    var reply_first = try fix.send(first_id, "REPLY-FIRST proceed");
+    defer reply_first.deinit();
+    try std.testing.expectEqualStrings("reply_delivered", reply_first.value.object.get("status").?.string);
+    // The addressed reply must not consume the sibling's question.
+    var still_second = try fix.get(second_id, true);
+    defer still_second.deinit();
+    try std.testing.expectEqualStrings("waiting_for_reply", still_second.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("need direction B", still_second.value.object.get("messages").?.array.items[0].object.get("message").?.string);
+
+    var first_done = try fix.get(first_id, true);
+    defer first_done.deinit();
+    try std.testing.expectEqualStrings("success", first_done.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("first answered", first_done.value.object.get("report").?.string);
+    // Read only after that worker was joined.
+    try std.testing.expect(first.saw_reply);
+    try std.testing.expect(!second.saw_reply);
+
+    var reply_second = try fix.send(second_id, "REPLY-SECOND go");
+    defer reply_second.deinit();
+    try std.testing.expectEqualStrings("reply_delivered", reply_second.value.object.get("status").?.string);
+    var second_done = try fix.get(second_id, true);
+    defer second_done.deinit();
+    try std.testing.expectEqualStrings("second answered", second_done.value.object.get("report").?.string);
+    try std.testing.expect(second.saw_reply);
+    try std.testing.expect(!fix.active());
+}
+
+test "canceling one sibling keeps the others running and collectable" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    fix.service.beginTask(&fix.parent_cancel);
+    var fakes: [3]FakeModel = undefined;
+    var ids: [3][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    for (&fakes, 0..) |*fake, index| {
+        fake.* = .{ .io = io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
+        fix.withModel(fake);
+        ids[index] = try fix.runCurrentRoot(.{ .task = "sibling task" });
+        started = index + 1;
+    }
+    // Every worker enters its own model call before anything is canceled: a
+    // worker canceled in the start/call window exits without setting its flag,
+    // so asserting on it later would be a race instead of a result.
+    for (&fakes) |*fake| try waitFlag(io, &fake.entered, 5_000);
+
+    var middle = try fix.cancelJob(ids[1]);
+    defer middle.deinit(a);
+    try std.testing.expect(middle.is_error);
+    // A single job cancel is never a parent cancel.
+    try std.testing.expect(!middle.canceled);
+    try std.testing.expect(!fix.parent_cancel.isRequested());
+    const middle_json = try std.json.parseFromSlice(std.json.Value, a, middle.text, .{ .allocate = .alloc_always });
+    defer middle_json.deinit();
+    try std.testing.expectEqualStrings("canceled", middle_json.value.object.get("status").?.string);
+
+    // The siblings are untouched and still addressable by their own ids.
+    try std.testing.expect(fix.active());
+    try std.testing.expectEqual(@as(usize, 2), jobCount(fix));
+    var alive_first = try fix.get(ids[0], false);
+    defer alive_first.deinit();
+    try std.testing.expectEqualStrings("running", alive_first.value.object.get("status").?.string);
+    var alive_last = try fix.get(ids[2], false);
+    defer alive_last.deinit();
+    try std.testing.expectEqualStrings("running", alive_last.value.object.get("status").?.string);
+
+    try fix.endTask();
+    try std.testing.expect(!fix.active());
+    try std.testing.expect(fix.service.current == null);
+    // Every worker was joined, so its plain flags are safe to read here.
+    try std.testing.expect(fakes[0].saw_cancel);
+    try std.testing.expect(fakes[1].saw_cancel);
+    try std.testing.expect(fakes[2].saw_cancel);
+    try std.testing.expect(!fix.parent_cancel.isRequested());
+}
+
+test "collecting siblings in any order keeps the job list intact" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    fix.service.beginTask(&fix.parent_cancel);
+    var fakes: [3]FakeModel = undefined;
+    var reports: [3][16]u8 = undefined;
+    var ids: [3][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    for (&fakes, 0..) |*fake, index| {
+        fake.* = .{ .io = io, .report_text = try std.fmt.bufPrint(&reports[index], "report-{d}", .{index}) };
+        fix.withModel(fake);
+        ids[index] = try fix.runCurrentRoot(.{ .task = "ordered collect" });
+        started = index + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), jobCount(fix));
+
+    // The chain is prepended, so the real head is ids[2] and the real tail is
+    // ids[0]. Collect the middle first, then head, then tail: no release may
+    // disturb the chain.
+    var middle = try fix.get(ids[1], true);
+    defer middle.deinit();
+    try std.testing.expectEqualStrings("report-1", middle.value.object.get("report").?.string);
+    try std.testing.expectEqual(@as(usize, 2), jobCount(fix));
+    var head = try fix.get(ids[2], true);
+    defer head.deinit();
+    try std.testing.expectEqualStrings("report-2", head.value.object.get("report").?.string);
+    var tail = try fix.get(ids[0], true);
+    defer tail.deinit();
+    try std.testing.expectEqualStrings("report-0", tail.value.object.get("report").?.string);
+    try std.testing.expect(!fix.active());
+    try std.testing.expect(fix.service.current == null);
+    // All three collected views stay re-readable (within the cache bound).
+    for (ids) |id| {
+        var again = try fix.getResult(id, true);
+        defer again.deinit(a);
+        try std.testing.expect(!again.is_error);
+    }
+}
+
+test "endTask cancels and joins every sibling and bounds the finish hint" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    // More siblings than the finish hint lists and more than the view cache.
+    const children = 9;
+    fix.service.beginTask(&fix.parent_cancel);
+    var fakes: [children]FakeModel = undefined;
+    var ids: [children][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    for (&fakes, 0..) |*fake, index| {
+        fake.* = .{ .io = io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
+        fix.withModel(fake);
+        ids[index] = try fix.runCurrentRoot(.{ .task = "join all siblings" });
+        started = index + 1;
+    }
+    // All workers must already be inside their model call, otherwise a canceled
+    // worker that never entered would leave its flag unset for the final
+    // assertions.
+    for (&fakes) |*fake| try waitFlag(io, &fake.entered, 5_000);
+    try std.testing.expectEqual(@as(usize, children), jobCount(fix));
+
+    const service = fix.service.service();
+    var probe: p.Cancellation = .{};
+    const hint = (try service.beforeFinish(a, &probe)).?;
+    defer a.free(hint);
+    // Bounded window over every live job, not an uncollected-job limit. Count
+    // only the per-id status suffix: the header tool name also contains
+    // "subagent_", and every waiting sibling's status is already deterministically
+    // "running" here.
+    try std.testing.expect(std.mem.indexOf(u8, hint, "jobs pending: 9") != null);
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, hint, ":running"));
+    // Head-first listing covers ids[1..]; the oldest sibling (the list tail) is
+    // the one left out. Match `${id}:` so "subagent_1" cannot prefix-match a
+    // longer id.
+    var needle_buffer: [96]u8 = undefined;
+    for (ids[1..]) |id| {
+        const needle = try std.fmt.bufPrint(&needle_buffer, "{s}:", .{id});
+        try std.testing.expect(std.mem.indexOf(u8, hint, needle) != null);
+    }
+    const omitted_id = try std.fmt.bufPrint(&needle_buffer, "{s}:", .{ids[0]});
+    try std.testing.expect(std.mem.indexOf(u8, hint, omitted_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "1 more not listed") != null);
+    try std.testing.expect(hint.len < 1024);
+
+    try fix.endTask();
+    try std.testing.expect(!fix.active());
+    try std.testing.expect(fix.service.current == null);
+    try std.testing.expect(fix.service.retained_child == null);
+    // Cancel-then-join covered every sibling, never just the head.
+    for (&fakes) |*fake| try std.testing.expect(fake.saw_cancel);
+    try std.testing.expect(!fix.parent_cancel.isRequested());
+}
+
+test "pending sibling approvals are brokered per job id" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var recorder: ApprovalRecorder = .{ .io = io };
+    fix.parent_runtime.host = .{ .context = &recorder, .emit_fn = ApprovalRecorder.emit, .authorize_fn = ApprovalRecorder.authorize };
+    fix.parent_runtime.permission_id = 100;
+    var first: ApprovalModel = .{};
+    var second: ApprovalModel = .{};
+    fix.service.beginTask(&fix.parent_cancel);
+    fix.service.deps.model_factory = .{ .context = &first, .make_fn = ApprovalModel.make };
+    const first_id = try fix.runCurrentRoot(.{ .task = "dangerous command one" });
+    defer a.free(first_id);
+    fix.service.deps.model_factory = .{ .context = &second, .make_fn = ApprovalModel.make };
+    const second_id = try fix.runCurrentRoot(.{ .task = "dangerous command two" });
+    defer a.free(second_id);
+
+    // Both children hold an identical pending approval at the same time.
+    const service = fix.service.service();
+    const began = std.Io.Clock.awake.now(io);
+    while (true) {
+        var probe: p.Cancellation = .{};
+        const hint = (try service.beforeFinish(a, &probe)) orelse return error.FixtureMissingJob;
+        defer a.free(hint);
+        if (std.mem.count(u8, hint, "waiting_for_approval") == 2) break;
+        if (began.untilNow(io, .awake).toMilliseconds() > 5_000) return error.FixtureTimeout;
+        try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    }
+
+    // A parent get brokers exactly the addressed job's approval, and the source
+    // marker carries that job id so the two prompts stay distinguishable.
+    recorder.expect_source = first_id;
+    var first_done = try fix.get(first_id, true);
+    defer first_done.deinit();
+    try std.testing.expectEqualStrings("success", first_done.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 1), recorder.authorized);
+
+    recorder.expect_source = second_id;
+    var second_done = try fix.get(second_id, true);
+    defer second_done.deinit();
+    try std.testing.expectEqualStrings("success", second_done.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 2), recorder.authorized);
+    try std.testing.expectEqual(@as(usize, 2), recorder.emitted);
+    try std.testing.expect(recorder.saw_source);
+    try std.testing.expect(recorder.saw_operation);
+    try std.testing.expect(!fix.active());
+}
+
+test "multiple retained cleanup owners are all kept until deinit closes them" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    // Start both before either collect: a retained owner makes `run` refuse with
+    // CleanupFailed, so the second start must already be running.
+    fix.service.deps.test_cleanup_failed = true;
+    var first: FakeModel = .{ .io = io };
+    var second: FakeModel = .{ .io = io };
+    fix.service.beginTask(&fix.parent_cancel);
+    fix.withModel(&first);
+    const first_id = try fix.runCurrentRoot(.{ .task = "cleanup failure one" });
+    defer a.free(first_id);
+    fix.withModel(&second);
+    const second_id = try fix.runCurrentRoot(.{ .task = "cleanup failure two" });
+    defer a.free(second_id);
+
+    // Registered before the first assertion: any failure path leaves no live job
+    // and clears the injected fault on every retained owner, so Fixture.deinit
+    // can close them instead of fail-stopping over the real error.
+    defer {
+        if (fix.service.current != null) fix.endTask() catch {};
+        var retained = fix.service.retained_child;
+        while (retained) |child| : (retained = child.retained_next) child.test_cleanup_failed = false;
+    }
+
+    var first_result = try fix.getResult(first_id, true);
+    defer first_result.deinit(a);
+    try std.testing.expect(first_result.cleanup_failed);
+    var second_result = try fix.getResult(second_id, true);
+    defer second_result.deinit(a);
+    try std.testing.expect(second_result.cleanup_failed);
+
+    // Also clear the fault before the explicit deinit below, which closes every
+    // owner immediately rather than at fixture teardown.
+    var owner = fix.service.retained_child;
+    while (owner) |child| : (owner = child.retained_next) child.test_cleanup_failed = false;
+
+    // Two failures, two owners: the chain never dropped one for the other.
+    var count: usize = 0;
+    owner = fix.service.retained_child;
+    while (owner) |child| : (owner = child.retained_next) {
+        try std.testing.expect(child.job == null);
+        try std.testing.expect(child.cancel.parent == null);
+        // The Service-owned mutation gate is a borrow and must be dropped too.
+        try std.testing.expect(child.tools.subagent_mutation_gate == null);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectError(error.CleanupFailed, fix.service.checkReady());
+    fix.service.deinit();
+    try std.testing.expect(fix.service.retained_child == null);
+    try std.testing.expect(fix.service.current == null);
 }

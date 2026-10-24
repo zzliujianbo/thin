@@ -1,5 +1,5 @@
 //! Offline regressions for the in-process subagent seam: request/message
-//! validation, bounded reports, the per-root-task budget, service wrappers, the
+//! validation, bounded reports, the root mutation gate, service wrappers, the
 //! ParentChannel, accepted-task hooks and the Runtime child-lifecycle contracts
 //! (stop reminder, context-not-user, 3-reminder pause, end-task ordering and
 //! cleanup domination). No network, App, UI or filesystem.
@@ -74,13 +74,28 @@ test "report bounding is utf8 aligned and explicit" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(bounded.text));
 }
 
-test "delegation budget resets only explicitly" {
-    var runs: sub.Runs = .{};
-    try std.testing.expectEqual(sub.max_runs_per_task, @as(u32, 4));
-    for (0..sub.max_runs_per_task) |_| try runs.consume();
-    try std.testing.expectError(error.SubagentRunsExhausted, runs.consume());
-    runs.reset();
-    try runs.consume();
+test "mutation gate owns exclusivity and cancellation never steals or frees it" {
+    const io = std.testing.io;
+    var gate: sub.MutationGate = .{};
+
+    // Uncontended acquire then release is visible in the shared flag.
+    var token: p.Cancellation = .{};
+    try gate.acquire(io, &token);
+    try std.testing.expect(gate.held.load(.acquire));
+    gate.release();
+    try std.testing.expect(!gate.held.load(.acquire));
+
+    // An already-canceled caller returns before taking the gate.
+    var canceled: p.Cancellation = .{ .requested = .init(true) };
+    try std.testing.expectError(error.Canceled, gate.acquire(io, &canceled));
+    try std.testing.expect(!gate.held.load(.acquire));
+
+    // A canceled waiter must not clear another owner's lock.
+    gate.held.store(true, .release);
+    try std.testing.expectError(error.Canceled, gate.acquire(io, &canceled));
+    try std.testing.expect(gate.held.load(.acquire));
+    gate.release();
+    try std.testing.expect(!gate.held.load(.acquire));
 }
 
 const FakeService = struct {
