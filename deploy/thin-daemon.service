@@ -1,0 +1,49 @@
+# Thin 每用户守护服务：样例，未安装、未启用。
+#
+# 这是 systemd **用户**单元，安装位置：~/.config/systemd/user/thin-daemon.service
+# 安装方式（部署动作，本仓库不执行）：
+#   install -Dm0644 deploy/thin-daemon.service ~/.config/systemd/user/thin-daemon.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now thin-daemon
+#
+# 退出登录后仍常驻，需要管理员授权的 lingering：
+#   loginctl enable-linger <你的账户>          # 需管理员/授权策略批准
+# 不能靠在 SSH 会话里 nohup/后台启动代替这个授权。
+#
+# 只以显式参数 `--daemon` 启动。默认 `thin` 仍是前台模式；
+# 本服务不会被普通 thin、`--connect`、`--attach` 或 `--resume` 隐式拉起。
+
+[Unit]
+Description=Thin per-user daemon (explicit --daemon)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# THIN:REPLACE 若安装目录不是 /usr/local/bin，必须与 install.sh 的 INSTALL_DIR 一致。
+ExecStart=/usr/local/bin/thin --daemon
+
+# 会话默认目录取该账户 HOME；会话实际根目录由 /cd 选择，不由本单元指定。
+WorkingDirectory=%h
+
+# THIN:REPLACE 凭据等环境变量从 0600 的环境文件读取（见 daemon.env.example）。
+# 前缀 `-` 表示文件不存在时不阻止启动；只存在于 SSH 交互 shell 的变量不会出现在这里。
+EnvironmentFile=-%h/.config/thin/daemon.env
+
+# 服务进程重启只恢复服务本身。Thin 不得自动重放已中断的任务，
+# 也不得因重启重新提交收费推理请求；中断会话标记为 interrupted，由用户显式继续。
+Restart=on-failure
+RestartSec=5
+
+# 停止时先 SIGTERM，让守护取消/通知/join 自己的会话与 worker，再兜底 SIGKILL。
+# KillMode=control-group 保证 worker 与服务同属一个 cgroup，服务被杀后不留孤儿会话，
+# 也不会出现“旧 worker 仍持有会话写租约”的分裂状态。
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# 守护自己创建的运行时 socket / 索引按 0600/0700 收紧。
+UMask=0077
+
+[Install]
+WantedBy=default.target

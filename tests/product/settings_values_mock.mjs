@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp, mkdir, writeFile, readFile, readdir, stat, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {assertConfigHome} from './assert_config_home.mjs';
 
 const MAIN_KEY = 'values-main-fake-never-log', AUX_KEY = 'values-aux-fake-never-log';
 const MAIN = 'fixture-main', AUX = 'family/judge';
@@ -134,7 +135,9 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
       const bytes = await readFile(configPath,'utf8');
       assert.deepEqual(JSON.parse(bytes),expected,'whole disk JSON changed outside target preference');
       assert.equal((await stat(configPath)).mode & 0o777,0o600);
-      assert.deepEqual(await readdir(join(home,'.thin')),['config.json']);
+      // A live PTY session may already publish the private discovery index, so
+      // only whitelist the root names here; index emptiness is checked on exit.
+      assert.deepEqual((await readdir(join(home,'.thin'))).filter(name => name !== 'session-index'),['config.json']);
       return bytes;
     }
     async function gate(name) {
@@ -181,6 +184,7 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
     assert(!result.output.includes('PTY_SESSION_ID='));
     assert.deepEqual(gates,phases); assert.equal(mainPosts,3); assert.equal(auxPosts,1);
     assert.equal(connections,2); await saved();
+    await assertConfigHome(home);
     assert.deepEqual((await readdir(project)).sort(),phases.map(n=>`settings-values-release-${n}`).sort());
     console.log('PASS settings/values: four preferences and shared request timeout; eight-row root; decision menu has no timeout; stage/cancel/invalid unchanged; output caps absent; zero menu HTTP; warm socket and canonical bash verified');
   } catch (error) {

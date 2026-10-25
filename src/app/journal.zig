@@ -425,6 +425,11 @@ pub const Journal = struct {
                     try self.record(a, "state", .{ .state = v });
                 },
                 .user_committed => |value| {
+                    // Runtime re-publishes the accepted direct input under id 0
+                    // before the first model call so the checkpoint stays
+                    // resumable. The submitted notification already logged that
+                    // user row; only nonzero steering ids add a second row.
+                    if (value.id == r.direct_input_id) return;
                     // Steering belongs to the accepted task, not a new submitted
                     // turn. Use the same bounded known-key redaction as prompts.
                     const t = try self.jsonText(a, value.text);
@@ -903,6 +908,8 @@ test "steering is a redacted user record in the accepted turn, not a new submiss
     defer journal.deinit();
     const observer = journal.observer();
     observer.notify(.{ .submitted = "original task" });
+    // Runtime's pre-model checkpoint republishes the direct input under id 0.
+    observer.notify(.{ .event = .{ .user_committed = .{ .id = 0, .text = "original task" } } });
     observer.notify(.{ .event = .{ .user_committed = .{ .id = 77, .text = "adjust fake-steering-key" } } });
     observer.notify(.{ .event = .{ .permission_cleared = 9 } });
     observer.notify(.{ .event = .{ .finished = .{ .status = .success } } });
@@ -912,6 +919,7 @@ test "steering is a redacted user record in the accepted turn, not a new submiss
     defer std.testing.allocator.free(content.data);
     try std.testing.expect(std.mem.indexOf(u8, content.data, "fake-steering-key") == null);
     var users: usize = 0;
+    var direct = false;
     var steered = false;
     var cleared = false;
     var lines = std.mem.splitScalar(u8, content.data, '\n');
@@ -930,6 +938,10 @@ test "steering is a redacted user record in the accepted turn, not a new submiss
                 try std.testing.expectEqual(@as(i64, 77), data.get("input_id").?.integer);
                 try std.testing.expectEqualStrings("adjust [redacted]", data.get("text").?.string);
                 steered = true;
+            } else {
+                try std.testing.expect(data.get("input_id") == null);
+                try std.testing.expectEqualStrings("original task", data.get("text").?.string);
+                direct = true;
             }
         }
         if (std.mem.eql(u8, event, "permission_cleared")) {
@@ -938,7 +950,7 @@ test "steering is a redacted user record in the accepted turn, not a new submiss
         }
     }
     try std.testing.expectEqual(@as(usize, 2), users);
-    try std.testing.expect(steered and cleared);
+    try std.testing.expect(direct and steered and cleared);
 }
 
 test "journal structured records redaction turns and first response" {

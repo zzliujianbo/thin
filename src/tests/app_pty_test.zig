@@ -27,6 +27,8 @@ extern "c" fn dup2(c_int, c_int) c_int;
 extern "c" fn execve([*:0]const u8, [*:null]const ?[*:0]const u8, [*:null]const ?[*:0]const u8) c_int;
 extern "c" fn _exit(c_int) noreturn;
 extern "c" fn waitpid(c_int, *c_int, c_int) c_int;
+/// 创建 0700 且属于本 UID 的独占目录；模板必须以 6 个 X 结尾。
+extern "c" fn mkdtemp([*:0]u8) ?[*:0]u8;
 extern "c" fn kill(c_int, c_int) c_int;
 extern "c" fn getpgid(c_int) c_int;
 
@@ -1050,6 +1052,9 @@ fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const 
         try check(matched);
         if (pending) {
             if (summary) |value| {
+                // The remote emitter may reveal the path one tick before the summary
+                // lands, so a legal intermediate frame is not a failure.
+                if (!view.visible(value)) continue;
                 try check(view.visible(value));
                 // The first complete generated row owns the full muted SGR;
                 // later sparse frames may update only its numeric suffix.
@@ -1304,10 +1309,16 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
             try queuedIdle(d, a, natural_start);
             try queuedGate(d, a, project, "natural-finished");
         }
-        // Selection and Enter in one read must NOT approve. Only the next,
-        // independent Enter after this complete dangerous-option ACK may act.
+        // Selection and Enter in one read must NOT approve. One write is not
+        // one read: the leading Up/Down may be ACKed alone while the trailing
+        // Enter stays queued, so an intermediate dangerous ACK can precede that
+        // tail Enter's safe reset. Therefore explicitly reselect safe and then
+        // danger as separate semantic ACKs, and only trust the independent
+        // Enter after the latest complete dangerous-option ACK.
         try queuedKey(d, a, "\x1b[B\r", &.{"> Stop and clear"});
         try queuedGate(d, a, project, "selected-not-approved");
+        try queuedKey(d, a, "\x1b[A", &.{"> Continue"});
+        try queuedKey(d, a, "\x1b[B", &.{"> Stop and clear"});
         const stop_start = d.used;
         try d.send("\r");
         try queuedIdle(d, a, stop_start);
@@ -1346,7 +1357,80 @@ pub fn testQueuedNatural(init: std.process.Init) !void {
     try main(init);
 }
 
+/// 入口：先创建本驱动独占的短运行时目录，再运行验收主体。主体返回后，只有在
+/// 该目录下的 worker 端点都不再接受连接时才删除目录。
 pub fn main(init: std.process.Init) !void {
+    // 前台实例会为自己启动 AF_UNIX worker，其 socket 位于
+    // `$XDG_RUNTIME_DIR/thin/workers/<instance>.sock`。未设置时产品会回落到共享的
+    // `/tmp/thin-<uid>`；因此这里在 fork 之前创建本驱动独占的短绝对运行时目录。
+    // mkdtemp 已给出 0700 且属于本 UID 的真实目录，正是产品要求的形态。
+    var runtime_buf: [32]u8 = undefined;
+    const runtime_template = "/tmp/tn-XXXXXX";
+    @memcpy(runtime_buf[0..runtime_template.len], runtime_template);
+    runtime_buf[runtime_template.len] = 0;
+    const runtime_z = mkdtemp(runtime_buf[0..runtime_template.len :0].ptr) orelse return error.RuntimeDirectoryNotCreated;
+    const runtime_path = std.mem.span(runtime_z);
+    // 最长实际路径为 <base>/thin/workers/<32 hex>.sock；保守按 14+32+5 预留 AF_UNIX 上限。
+    try check(std.fs.path.isAbsolute(runtime_path));
+    try check(runtime_path.len + 14 + 32 + 5 <= 107);
+    const runtime_stat = try std.Io.Dir.cwd().statFile(init.io, runtime_path, .{});
+    try check(@backingInt(runtime_stat.permissions) & 0o777 == 0o700);
+
+    const body_result: anyerror!void = runBody(init, runtime_path);
+    // worker 由 process.run 放入独立 process group：直属子进程被 kill/reap、
+    // PDEATHSIG 的 TERM 都是异步清理，因此不能靠 defer 顺序断言 worker 已退出。
+    // 删除目录前必须观察到这些 socket 不再接受连接。Thin 正常结束会自己 join
+    // 全部 worker，所以快路径立即完成；超时则显式失败并保留目录用于取证。
+    waitWorkersGone(init, runtime_path) catch |err| {
+        std.debug.print("PTY_RUNTIME_KEPT {s}\n", .{runtime_path});
+        return err;
+    };
+    try std.Io.Dir.cwd().deleteTreeMinStackSize(init.io, runtime_path);
+    return body_result;
+}
+
+/// 有界等待本驱动 runtime 下的 worker 端点全部消失。只读自己的目录、只做连接
+/// 探测：不扫描系统、不发任何 PID 信号，也不把超时当成功。
+fn waitWorkersGone(init: std.process.Init, runtime: []const u8) !void {
+    const a = init.arena.allocator();
+    const workers = try std.fmt.allocPrint(a, "{s}/thin/workers", .{runtime});
+    const until = now() + 10_000;
+    while (true) {
+        var live: usize = 0;
+        scan: {
+            var dir = std.Io.Dir.cwd().openDir(init.io, workers, .{ .iterate = true }) catch |err| switch (err) {
+                // 没有 worker 目录即代表本次运行从未启动 worker。
+                error.FileNotFound, error.NotDir => break :scan,
+                else => return err,
+            };
+            defer dir.close(init.io);
+            var it = dir.iterateAssumeFirstIteration();
+            while (try it.next(init.io)) |entry| {
+                if (!std.mem.endsWith(u8, entry.name, ".sock")) continue;
+                const endpoint = try std.fmt.allocPrint(a, "{s}/{s}", .{ workers, entry.name });
+                if (try endpointAccepts(init, endpoint)) live += 1;
+            }
+        }
+        if (live == 0) return;
+        if (now() >= until) return error.WorkerEndpointsStillLive;
+        // fd 为 -1 的 pollfd 会被忽略，这里充当 5 毫秒有界让步。
+        var idle = [_]c.pollfd{.{ .fd = -1, .events = 0, .revents = 0 }};
+        _ = c.poll(&idle, 1, 5);
+    }
+}
+
+/// 单个端点是否仍接受连接；拒绝或已消失即视为该 worker 已退出。
+fn endpointAccepts(init: std.process.Init, path: []const u8) !bool {
+    const address = try std.Io.net.UnixAddress.init(path);
+    const stream = std.Io.net.UnixAddress.connect(&address, init.io) catch |err| switch (err) {
+        error.ConnectionRefused, error.FileNotFound => return false,
+        else => return err,
+    };
+    stream.close(init.io);
+    return true;
+}
+
+fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     const a = init.arena.allocator();
     const bin = try a.dupeSentinel(u8, try required(init, "THIN_APP_BIN"), 0);
     const project = try a.dupeSentinel(u8, try required(init, "THIN_APP_TEST_PROJECT"), 0);
@@ -1379,7 +1463,10 @@ pub fn main(init: std.process.Init) !void {
     const timezone = init.environ_map.get("THIN_APP_TEST_TZ") orelse "UTC0";
     try check(std.mem.eql(u8, timezone, "UTC0") or std.mem.eql(u8, timezone, "UTC-8"));
     const timezone_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "TZ={s}", .{timezone}), 0);
-    const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", timezone_env, if (std.mem.eql(u8, mode, "resume-login") or std.mem.eql(u8, mode, "restore-no-key") or (restore_error != null and std.mem.eql(u8, restore_error.?, "ApiKeyNotFound"))) null else "THIN_FIXTURE_KEY=fixture-secret-never-log" };
+
+    const runtime_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "XDG_RUNTIME_DIR={s}", .{runtime_path}), 0);
+
+    const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", timezone_env, runtime_env, if (std.mem.eql(u8, mode, "resume-login") or std.mem.eql(u8, mode, "restore-no-key") or (restore_error != null and std.mem.eql(u8, restore_error.?, "ApiKeyNotFound"))) null else "THIN_FIXTURE_KEY=fixture-secret-never-log" };
 
     const interactive_argv = [_:null]?[*:0]const u8{ bin, "--no-model-auto-refresh" };
     const print_argv = [_:null]?[*:0]const u8{ bin, "--print", "large-output" };
@@ -1477,6 +1564,20 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // A startup refusal before task admission must fail closed: the owned
+    // child never reaches a composer, so finish on the real child and check its
+    // exit/termios cleanup rather than waiting for banner or idle.
+    if (std.mem.eql(u8, mode, "log-owner-refused")) {
+        try d.finish(1);
+        const output = d.output[0..d.used];
+        // Client.run 的固定前缀：拿不到执行锁时拒绝启动前台会话。
+        try check(std.mem.indexOf(u8, output, "thin: could not start the session worker") != null);
+        try check(std.mem.indexOf(u8, output, "thin --resume ") == null);
+        // Same early-shaped refusal as restore-error: no raw mode, no frame.
+        try check(std.mem.indexOfScalar(u8, output, 0x1b) == null);
+        return;
+    }
+
     // Startup refusals precede raw mode and the first frame. Check their exit
     // directly; waiting for a composer would mistake correct refusal for EOF.
     if (restore_error) |expected| {
@@ -1538,7 +1639,7 @@ pub fn main(init: std.process.Init) !void {
         try d.waitText(start, "manual-second-answer");
         try d.waitIdle(start);
         start = d.used;
-        try d.send("/co");
+        try d.send("/comp");
         try d.waitFrame(start, "/compact  Compact conversation");
         start = d.used;
         try d.send("\r");
@@ -1740,7 +1841,8 @@ pub fn main(init: std.process.Init) !void {
         try d.waitIdle(start);
     } else if (full_resume) {
         try d.waitFrame(0, if (std.mem.eql(u8, mode, "resume-login")) "Not logged in" else "prior tools are NOT rerun");
-        try check(std.mem.indexOf(u8, d.output[0..d.used], "resume-first-answer") != null);
+        // Actual history is delivered asynchronously after the restore notice.
+        try d.waitText(0, "resume-first-answer");
         try check(std.mem.indexOf(u8, d.output[0..d.used], "PRIVATE-RESUME-REASONING") == null);
         try d.quiet(150); // No startup model request or historical execution.
         if (std.mem.eql(u8, mode, "resume-login")) {

@@ -3,6 +3,10 @@
 zig-cache/
 zig-out/
 
+# Python fixture bytecode
+__pycache__/
+*.pyc
+
 # Project-private memory and runtime data
 /.thin/
 

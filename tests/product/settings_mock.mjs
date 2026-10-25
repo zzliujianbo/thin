@@ -4,6 +4,7 @@ import {mkdtemp, mkdir, writeFile, readFile, rm, access, stat, readdir} from 'no
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import assert from 'node:assert/strict';
+import {assertConfigHome} from './assert_config_home.mjs';
 
 const KEY = 'fixture-secret-never-log';
 const exists = p => access(p).then(() => true, () => false);
@@ -85,6 +86,15 @@ export async function settingsRegressions({app,pty,execute,send}) {
         assert.equal(expected.length,0);
         expected = levels.map(level => ({level,wire:map[level] ?? level,format,savedEffort,configPath}));
         const env = {PATH:'/usr/bin:/bin',HOME:home,LANG:'C.UTF-8',TERM:'xterm-256color',THIN_FIXTURE_KEY:KEY,THIN_APP_BIN:app,THIN_APP_TEST_HOME:home,THIN_APP_TEST_PROJECT:p,THIN_APP_TEST_URL:url,THIN_APP_TEST_MODE:mode};
+        // A prior PTY run may already have left a legal empty discovery index in
+        // HOME; record the real pre-run baseline instead of assuming a fresh HOME.
+        let beforeHomeNames, indexPath, beforeIndexKeys;
+        if (headless) {
+          await assertConfigHome(home);
+          beforeHomeNames = (await readdir(join(home,'.thin'))).sort();
+          indexPath = join(home,'.thin/session-index');
+          beforeIndexKeys = await exists(indexPath) ? (await readdir(indexPath)).sort() : null;
+        }
         const result = await execute(headless?app:pty,headless?['--no-log','--print','settings-task']:[],env,p,undefined,headless?30000:90000);
         if (fixtureError) throw fixtureError;
         const reason = result.output.match(/^error: ([A-Za-z][A-Za-z0-9_]{0,63})$/m)?.[1] ?? 'unclassified';
@@ -105,7 +115,12 @@ export async function settingsRegressions({app,pty,execute,send}) {
           }
           assert.deepEqual(await readdir(directory),legacy !== undefined?['.thin']:[]);
         }
-        assert.deepEqual(await readdir(join(home,'.thin')),['config.json']);
+        await assertConfigHome(home);
+        // A print run must not add index/project keys nor drop existing metadata.
+        if (headless) {
+          assert.deepEqual((await readdir(join(home,'.thin'))).sort(),beforeHomeNames);
+          assert.deepEqual(await exists(indexPath) ? (await readdir(indexPath)).sort() : null,beforeIndexKeys);
+        }
         return result;
       }
       async function savedGlobal(effort,{login=false}={}) {

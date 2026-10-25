@@ -7,6 +7,14 @@ const c = std.c;
 const abi = @import("../platform/terminal_abi.zig");
 const openpty = abi.openpty;
 
+// The remote transport exists only in an authenticated internal SSH child.
+// Ordinary local/PTY calls retain their original termios and fd behavior.
+extern "c" fn thin_ssh_active() c_int;
+extern "c" fn thin_ssh_read([*]u8, usize) isize;
+extern "c" fn thin_ssh_write([*]const u8, usize) isize;
+extern "c" fn thin_ssh_wait(c_int, c_int) c_int;
+extern "c" fn thin_ssh_size(*c_uint, *c_uint) void;
+
 // openat 以 AT_FDCWD(-100) 打开 /dev/tty；flags: 2=O_RDWR, 0x100=O_NOCTTY(不成为控制终端), 0x80000=O_CLOEXEC。
 extern "c" fn openat(c_int, [*:0]const u8, c_int, c_uint) c_int;
 // 查询终端的前台进程组，用于判断当前进程是否位于前台。
@@ -56,9 +64,16 @@ pub const Terminal = struct {
     /// 是否仍处于 raw/显示托管状态；restore 依赖它保证幂等。
     active: bool = true,
     restored: bool = false,
+    remote: bool = false,
 
     /// 打开控制终端 /dev/tty。要求 stdin/stdout 均为 tty，且当前进程位于前台进程组，否则后台写终端会被 SIGTTOU 挂起。
     pub fn open() !Terminal {
+        if (thin_ssh_active() == 1) {
+            var self: Terminal = .{ .fd = -1, .owned = false, .original = undefined, .original_flags = 0, .remote = true };
+            errdefer _ = self.restore();
+            try self.enterDisplay();
+            return self;
+        }
         if (c.isatty(0) != 1 or c.isatty(1) != 1) return error.TtyRequired;
         // 使用新的 open 文件描述，使 O_NONBLOCK 不会影响父 shell 继承的 stdio。
         const fd = openat(-100, "/dev/tty", 2 | nonblock | 0x80000 | 0x100, 0);
@@ -94,6 +109,11 @@ pub const Terminal = struct {
         errdefer {
             _ = self.restore();
         }
+        try self.enterDisplay();
+        return self;
+    }
+
+    fn enterDisplay(self: *Terminal) !void {
         // 进入序列的写入次数有上限（50），避免被背压无限阻塞。
         if (!self.writeBounded(enter, 50)) return error.TerminalSetupFailed;
         // Push earlier terminal output into scrollback, without clearing it or
@@ -109,11 +129,16 @@ pub const Terminal = struct {
         // CSI 0 A means one row, so a one-row terminal needs no movement.
         const length = if (rows > 1) rows * 2 + suffix.len else rows * 2;
         if (!self.writeBounded(start[0..length], 50)) return error.TerminalSetupFailed;
-        return self;
     }
 
     /// 查询终端尺寸。ioctl 失败或尺寸为 0 时回退为 80x24；上限为 512x200，防止异常尺寸撑爆缓冲。
     pub fn size(self: Terminal) Size {
+        if (self.remote) {
+            var columns: c_uint = 80;
+            var rows: c_uint = 24;
+            thin_ssh_size(&columns, &rows);
+            return .{ .columns = std.math.clamp(columns, 1, 512), .rows = std.math.clamp(rows, 1, 200) };
+        }
         var dimensions = std.mem.zeroes(c.winsize);
         if (c.ioctl(self.fd, std.os.linux.T.IOCGWINSZ, &dimensions) != 0) return .{ .columns = 80, .rows = 24 };
         return .{ .columns = if (dimensions.col == 0) 80 else @min(dimensions.col, 512), .rows = if (dimensions.row == 0) 24 else @min(dimensions.row, 200) };
@@ -121,6 +146,10 @@ pub const Terminal = struct {
 
     /// Reads without waiting; zero means no data currently, not application EOF.
     pub fn read(self: Terminal, out: []u8) !usize {
+        if (self.remote) {
+            const count = thin_ssh_read(out.ptr, out.len);
+            return if (count >= 0) @intCast(count) else error.TerminalDisconnected;
+        }
         const n = c.read(self.fd, out.ptr, out.len);
         if (n >= 0) return @intCast(n);
         // EINTR(4) 与 EAGAIN(11) 表示暂时无数据或被信号打断，返回 0；其他错误视为终端断开。
@@ -132,6 +161,10 @@ pub const Terminal = struct {
 
     /// Main loop keeps any unwritten tail and continues input/cancel handling.
     pub fn write(self: Terminal, bytes: []const u8) !usize {
+        if (self.remote) {
+            const count = thin_ssh_write(bytes.ptr, bytes.len);
+            return if (count >= 0) @intCast(count) else error.TerminalDisconnected;
+        }
         const n = c.write(self.fd, bytes.ptr, bytes.len);
         if (n >= 0) return @intCast(n);
         // EINTR(4) 与 EAGAIN(11) 表示暂时写不进去，返回 0 由主循环保留未写部分后重试。
@@ -143,6 +176,10 @@ pub const Terminal = struct {
 
     /// 用 poll 等待终端可读（want_write 时等待可写），最多等待 ms 毫秒。
     pub fn wait(self: Terminal, want_write: bool, ms: c_int) !void {
+        if (self.remote) {
+            if (thin_ssh_wait(@intFromBool(want_write), ms) != 0) return error.TerminalDisconnected;
+            return;
+        }
         // POLLIN(1) 始终监听；want_write 时额外监听 POLLOUT(4)。
         var descriptors = [_]c.pollfd{.{ .fd = self.fd, .events = @as(c_short, 1) | (if (want_write) @as(c_short, 4) else 0), .revents = 0 }};
         const result = c.poll(&descriptors, 1, ms);
@@ -172,6 +209,10 @@ pub const Terminal = struct {
     pub fn restore(self: *Terminal) bool {
         if (!self.active) return self.restored;
         self.active = false;
+        if (self.remote) {
+            self.restored = self.writeBounded(leave, 50);
+            return self.restored;
+        }
 
         var attrs_ok = false;
         // 最多重试 8 次；仅 EINTR(4) 时继续，其他错误直接放弃。
@@ -203,6 +244,10 @@ pub const Terminal = struct {
     pub fn writeAfterRestoreStopped(self: *Terminal, data: []const u8, stop: Stop) !void {
         if (self.active or !self.restored) return error.TerminalNotRestored;
         if (data.len > 256) return error.TerminalWriteLimit;
+        if (self.remote) {
+            if (!try self.writeBoundedStopped(data, 50, stop)) return error.TerminalWriteFailed;
+            return;
+        }
         const flags = c.fcntl(self.fd, 3);
         if (flags < 0 or c.fcntl(self.fd, 4, flags | nonblock) < 0) return error.TerminalWriteFailed;
         // Preserve the error until AFTER temporary flags have been restored.

@@ -42,6 +42,9 @@ pub const tools = @import("tools/tools.zig");
 /// 前端共享展示数据/状态；不包含终端帧或权限决策。
 pub const presentation = @import("presentation.zig");
 
+/// 交互/守护入口：foreground、daemon、connect、attach 与内部 worker 的统一路由。
+pub const daemon = @import("daemon/entry.zig");
+
 // 引用各模块以便 `zig build test-unit` 编译并运行它们的测试；
 // 集成测试与 UI 测试也在此统一挂载（build.zig 的 test-unit 步骤声明为离线运行，不需要网络或凭据）。
 test {
@@ -70,6 +73,19 @@ test {
     _ = @import("tests/automatic_memory_runtime_test.zig");
     _ = tools;
     _ = presentation;
+    _ = daemon;
+    // daemon 子模块只在运行时按需 @import；显式引用它们，让真实的安全边界、
+    // codec、RPC、spawn/supervisor/worker 与 session host/client 测试进入 test-unit。
+    _ = @import("daemon/unix.zig");
+    _ = @import("daemon/protocol.zig");
+    _ = @import("daemon/registry.zig");
+    _ = @import("daemon/spawn.zig");
+    _ = @import("daemon/supervisor.zig");
+    _ = @import("daemon/ssh.zig");
+    _ = @import("daemon/worker.zig");
+    _ = @import("daemon/client.zig");
+    _ = @import("app/session_host.zig");
+    _ = @import("ui/session_client.zig");
 
     _ = @import("tests/tools_integration_test.zig");
     _ = @import("tests/headless_integration_test.zig");

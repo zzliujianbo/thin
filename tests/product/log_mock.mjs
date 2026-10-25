@@ -1,7 +1,7 @@
 // 独立离线日志验收：只读取本 suite 创建的临时项目，永不读取用户日志。
 import http from 'node:http';
 import {spawn} from 'node:child_process';
-import {mkdtemp, mkdir, writeFile, readFile, rm, access, stat, readdir} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, access, stat, lstat, readdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import assert from 'node:assert/strict';
@@ -11,6 +11,37 @@ const JSON_KEY = 'fixture-quote-"-slash-\\-secret';
 const hidden = 'hidden-reasoning-must-not-be-persisted';
 const native = 'native-wire-marker-not-conversation';
 const exists = p => access(p).then(() => true, () => false);
+
+// 未提交的 idle 启动只允许 Lease.create 的私有命名空间与固定 inode owner anchor
+// (sessions/<32hex>.resume-lock = 33 字节 'A'|'C'+32 个零)；checkpoint、
+// .session/.jsonl、其他文件或 symlink 仍失败。.thin 来自 mkdirat(0o700)，只要求
+// 无 group/other 位（umask 只会更严），不硬猜精确 mode。
+async function noSubmissionState(project) {
+  const root = join(project, '.thin');
+  if (!await exists(root)) return;
+  const thin = await lstat(root);
+  assert(thin.isDirectory() && !thin.isSymbolicLink(), '.thin: not a real directory');
+  assert.equal(thin.mode & 0o077, 0, '.thin: not private to owner');
+  for (const name of await readdir(root)) assert.equal(name, 'sessions', `.thin/${name}: unexpected project state`);
+  const sessions = join(root, 'sessions'), info = await lstat(sessions);
+  assert(info.isDirectory() && !info.isSymbolicLink(), '.thin/sessions: not a real directory');
+  assert.equal(info.mode & 0o777, 0o700, '.thin/sessions: mode');
+  const entries = await readdir(sessions);
+  for (const name of entries) {
+    const path = join(sessions, name), entry = await lstat(path);
+    assert(entry.isFile() && !entry.isSymbolicLink(), `${name}: not a regular file`);
+    assert.equal(entry.mode & 0o777, 0o600, `${name}: mode`);
+    if (name === '.gitignore') { assert.equal(await readFile(path,'utf8'), '*\n'); continue; }
+    assert.match(name, /^[a-f0-9]{32}\.resume-lock$/, `${name}: unexpected project state`);
+    const marker = await readFile(path);
+    assert.equal(marker.length, 33, `${name}: marker length`);
+    assert(marker[0] === 0x41 || marker[0] === 0x43, `${name}: marker`);
+    assert(marker.subarray(1).every(byte => byte === 0), `${name}: marker padding`);
+  }
+  // 一次前台启动只持有一个 Root session lease；多个需实际 producer 证据。
+  assert(entries.filter(name => name.endsWith('.resume-lock')).length <= 1, 'more than one worker anchor');
+}
+
 const datePattern = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[.,]\d{9}[+-]\d{2}:\d{2}/;
 
 function send(res, text, call) {
@@ -160,7 +191,7 @@ async function scenario(app, pty, kind) {
     if (kind === 'failure' || kind === 'failure-pty') { await mkdir(join(project,'.thin')); await writeFile(join(project,'.thin/sessions'),'occupied'); }
     const env = {PATH:'/usr/bin:/bin', HOME:home, LANG:'C.UTF-8', TERM:'xterm-256color', THIN_FIXTURE_KEY:key,
       THIN_APP_BIN:app, THIN_APP_TEST_HOME:home, THIN_APP_TEST_PROJECT:project, THIN_APP_TEST_URL:url,
-      THIN_APP_TEST_MODE:kind === 'date-pty' ? 'date' : kind === 'failure-pty' ? 'log-failure' : 'log-idle'};
+      THIN_APP_TEST_MODE:kind === 'date-pty' ? 'date' : kind === 'failure-pty' ? 'log-owner-refused' : 'log-idle'};
     const isPty = ['date-pty','failure-pty','idle'].includes(kind);
     const args = kind === 'help' ? ['--help'] : kind === 'version' ? ['--version'] : ['--print',user, ...(kind === 'no-log' ? ['--no-log'] : [])];
     const began = Date.now();
@@ -173,15 +204,23 @@ async function scenario(app, pty, kind) {
       assert(result.stdout.includes('.thin/sessions/*.jsonl') && !result.stdout.includes('.thin/logs'), 'session path missing from help');
     }
     if (['help','version','idle','no-log'].includes(kind)) {
-      assert(!await exists(join(project,'.thin/sessions')), 'session record created without enabled submission');
+      // idle 启动由 PTY 驱动持有 Lease root anchor（33 字节 zero-digest resume-lock）；
+      // help/version/no-log 仍必须完全没有 sessions 目录。
+      if (kind === 'idle') await noSubmissionState(project);
+      else assert(!await exists(join(project,'.thin/sessions')), 'session record created without enabled submission');
       assert(!await exists(join(project,'.thin/logs')), 'legacy log directory created');
       assert(requests === (kind === 'no-log' ? 1 : 0), 'unexpected request count');
       if (kind === 'no-log') assert(result.stdout.includes(answer), 'no-log changed answer');
     } else if (kind === 'failure' || kind === 'failure-pty') {
-      assert(requests === 1, 'logger failure changed request count');
+      // print 路径：记录失败发生在任务受理之后，主结果照常完成。
       if (kind === 'failure') {
+        assert(requests === 1, 'logger failure changed request count');
         assert(result.stdout.includes(answer), 'logger failure changed answer');
         assert(result.stderr.includes('session recording disabled'), 'logger failure not visible on stderr');
+      } else {
+        // 前台启动在受理任何任务之前必须拿不到执行锁并 fail-closed：
+        // 既不启动 Runtime，也不得发出任何模型请求。
+        assert(requests === 0, 'owner refusal reached the model');
       }
       assert(await readFile(join(project,'.thin/sessions'),'utf8') === 'occupied', 'obstruction overwritten');
     } else {

@@ -1,4 +1,5 @@
-//! thin 程序入口：解析命令行，选择 --print 一次性模式或交互式 TUI 模式，并负责最终输出与退出码。
+//! thin 程序入口：解析命令行，保留 --print 一次性模式；其它所有模式（前台交互、守护服务、
+//! 连接、attach 与内部 worker）最终交给 daemon 入口的 run 处理。
 
 const std = @import("std");
 const cli = @import("app/cli.zig");
@@ -6,11 +7,10 @@ const App = @import("app/app.zig").App;
 const Session = @import("app/session.zig").Session;
 const Console = @import("app/console.zig").Console;
 const p = @import("core/protocol.zig");
-const r = @import("core/runtime.zig");
-const task = @import("core/task.zig");
 const interrupt = @import("platform/interrupt.zig");
-const Bridge = @import("ui/bridge.zig").Bridge;
-const tui = @import("ui/tui.zig");
+const task = @import("core/task.zig");
+const daemon = @import("daemon/entry.zig");
+const ssh = @import("daemon/ssh.zig");
 const text = @import("ui/text.zig");
 
 /// 进程入口：返回值即退出码。出错时打印错误信息并返回 1；被信号中断时返回 128 + 信号号。
@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) u8 {
 
 /// 把 bytes 写入 file，但在独立的并发任务中执行阻塞写。主线程轮询中断信号，
 /// 以便终端背压时仍能响应 Ctrl+C 而不被卡死。
-fn output(io: std.Io, file: std.Io.File, bytes: []const u8) !void {
+pub fn output(io: std.Io, file: std.Io.File, bytes: []const u8) !void {
     // 写任务的状态与借用的 bytes 都位于调用者栈上，因此必须等待任务结束后才能返回。
     const Write = struct {
         io: std.Io,
@@ -71,7 +71,7 @@ fn output(io: std.Io, file: std.Io.File, bytes: []const u8) !void {
 }
 
 /// 留档失败不改变任务成败或重试工具；用独立诊断提示缺失记录。
-fn reportLogFailure(io: std.Io, app: *App) void {
+pub fn reportLogFailure(io: std.Io, app: *App) void {
     // 生产者已 join；收尾也可能发现最后一条记录的写入失败。
     app.journal.finish();
     const err = app.journal.failure() orelse return;
@@ -80,7 +80,7 @@ fn reportLogFailure(io: std.Io, app: *App) void {
     output(io, .stderr(), message) catch {};
 }
 
-/// 主流程：解析参数，处理 --help/--version，然后进入 --print 或 TUI 分支。
+/// 主流程：解析参数，处理 --help/--version；--print 在本文件完成，其余模式交给 daemon 入口。
 fn run(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const options = try cli.parse(args);
@@ -93,8 +93,12 @@ fn run(init: std.process.Init) !u8 {
         return 0;
     }
 
-    // 交互模式需要真正的终端；管道或重定向场景必须使用 --print。
-    if (options.prompt == null and (std.c.isatty(0) != 1 or std.c.isatty(1) != 1)) return error.TtyRequiredUsePrint;
+    if (options.ssh_owner) |owner| try ssh.initializeConnection(init.gpa, init.environ_map, owner);
+    defer if (options.ssh_owner != null) ssh.close();
+
+    // 只有前台/connect/attach 需要真正的终端；daemon 与内部 worker 必须能在无 TTY 下运行。
+    // 管道或重定向场景仍必须使用 --print。
+    if (requiresInteractiveTty(options) and (std.c.isatty(0) != 1 or std.c.isatty(1) != 1)) return error.TtyRequiredUsePrint;
     try text.initLocale(); // Before application I/O or worker threads.
 
     var cancellation = p.Cancellation{};
@@ -168,29 +172,14 @@ fn run(init: std.process.Init) !u8 {
         return code;
     }
 
-    // 交互模式分支：Bridge 把 Runtime 事件和本次明确要求的审批转发给 TUI。
-    var bridge = Bridge.init(init.gpa, init.io, &cancellation);
-    defer bridge.deinit();
-
-    // 先建立可处于未配置状态的会话，再进入 TUI；/login 保存后才发布可用 Runtime。
-    var session = try Session.initWithOptions(init.gpa, init.io, init.environ_map, ".", bridge.host(), .{ .logging = options.logging, .restore_selection = options.restore_selection, .resume_session = options.resume_session, .auto_refresh_models = options.auto_refresh_models });
-    defer session.deinit();
-
-    var guard = try interrupt.Guard.install();
-    defer guard.deinit();
-
-    const code = tui.run(init.gpa, init.io, session.connection(), &bridge, &cancellation) catch |err| {
-        // TUI 已清理 producer/终端；错误路径也收尾日志，不让尾部故障静默丢失。
-        if (session.app) |app| reportLogFailure(init.io, app);
-        return err;
-    };
-    // 恢复终端属性后再提示一次，让退出后仍能看到留档失败信息。
-    if (session.app) |app| reportLogFailure(init.io, app);
-    if (code == 0 and interrupt.signal() == 0) reportResume(init, &session);
-    return exitCodeAfterRecording(code, interrupt.signal());
+    // 所有交互/守护/连接/attach/worker 分支统一交给 daemon 入口；
+    // --print 分支已在上方完整处理，行为未变。前台默认不自动拉起守护服务。
+    const code = try daemon.run(init, options);
+    if (options.ssh_owner != null) try ssh.finish(code);
+    return code;
 }
 
-fn exitCodeAfterRecording(code: u8, signal: u8) u8 {
+pub fn exitCodeAfterRecording(code: u8, signal: u8) u8 {
     // Persistence adds a post-TUI interval. Honor a signal during that interval
     // without hiding an already failed (especially poisoned) exit.
     return if (code == 0 and signal != 0) 128 + signal else code;
@@ -203,8 +192,29 @@ test "resume exit persistence honors late signals without masking prior failures
     try std.testing.expectEqual(@as(u8, 1), exitCodeAfterRecording(1, 15));
 }
 
-/// TUI has joined all producers and restored the terminal before this runs.
-fn reportResume(init: std.process.Init, session: *Session) void {
+/// 是否需要终端：--print 与 daemon/worker 不要求 TTY，仅交互前台/connect/attach 要求。
+fn requiresInteractiveTty(options: cli.Options) bool {
+    return options.prompt == null and options.ssh_owner == null and options.mode.requiresTty();
+}
+
+test "interactive tty gate excludes print daemon and worker modes" {
+    const id = "0123456789abcdef0123456789abcdef";
+    const socket = "/run/user/1000/thin/workers/session.sock";
+
+    try std.testing.expect(requiresInteractiveTty(try cli.parse(&.{"thin"})));
+    try std.testing.expect(requiresInteractiveTty(try cli.parse(&.{ "thin", "--resume", id })));
+    try std.testing.expect(requiresInteractiveTty(try cli.parse(&.{ "thin", "--connect" })));
+    try std.testing.expect(requiresInteractiveTty(try cli.parse(&.{ "thin", "--attach", id })));
+
+    // 无 TTY 也必须能进入：一次性输出、守护服务与内部 worker。
+    try std.testing.expect(!requiresInteractiveTty(try cli.parse(&.{ "thin", "--print", "go" })));
+    try std.testing.expect(!requiresInteractiveTty(try cli.parse(&.{ "thin", "--daemon" })));
+    try std.testing.expect(!requiresInteractiveTty(try cli.parse(&.{ "thin", "--internal-worker", socket, id, "daemon" })));
+    try std.testing.expect(!requiresInteractiveTty(try cli.parse(&.{ "thin", "--internal-worker", socket, id, "foreground", "--worker-resume" })));
+}
+
+/// TUI/worker 已 join 所有 producer 并恢复终端属性后，由交互入口调用。
+pub fn reportResume(init: std.process.Init, session: *Session) void {
     const saved = session.saveOnExit() catch |err| {
         var buffer: [256]u8 = undefined;
         const warning = std.fmt.bufPrint(&buffer, "thin: full conversation was NOT saved for resume: {s}. No resume command is available for this exit.\n", .{@errorName(err)}) catch return;

@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp, mkdir, writeFile, readFile, readdir, stat, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {assertConfigHome} from './assert_config_home.mjs';
 
 const MAIN_KEY = 'decision-main-fake-never-log';
 const AUX_KEY = 'decision-aux-fake-never-log';
@@ -238,7 +239,7 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
       assert.equal(mainPosts,3); assert.equal(auxPosts,1);
       assert.equal(connections,2);
       await saved();
-      assert.deepEqual(await readdir(join(home,'.thin')),['config.json']);
+      await assertConfigHome(home);
       assert.equal(await readFile(join(project,'reviewer-owned.txt'),'utf8'),'decision-shell-proof\n', 'low-risk project write actually executed without approval');
       assert.deepEqual((await readdir(project)).sort(),[...['opened','canceled','selected'].map(n=>`decision-model-release-${n}`),'reviewer-owned.txt'].sort());
       console.log(`PASS decision-model/${query}: ${native ? 'SystemOne' : 'Chat'} selected by protocol; primary=3 aux=1; save HTTP=0; warm primary socket retained; canonical bash result verified`);

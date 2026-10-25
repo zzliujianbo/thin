@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
-import {mkdtemp, mkdir, writeFile, readFile, stat, readdir, rm} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, stat, lstat, readdir, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 
@@ -132,6 +132,25 @@ async function values(f, low, decision, newlySelected = false) {
   assert.deepEqual(JSON.parse(await readFile(f.configPath, 'utf8')), expected);
   assert.equal((await stat(f.configPath)).mode & 0o777, 0o600);
 }
+// HOME/.thin may hold config/settings plus the daemon's private discovery
+// index. The index is optional (lazy) but must never persist session records:
+// real 0700 directories only, bounded depth, no files below a project key.
+async function thinHome(home, allowed) {
+  const root = join(home, '.thin');
+  const info = await lstat(root);
+  assert(info.isDirectory() && !info.isSymbolicLink(), `${root}: not a real directory`);
+  for (const name of await readdir(root)) assert(name === 'session-index' || allowed.includes(name), `unexpected path: .thin/${name}`);
+  let index;
+  try { index = await lstat(join(root, 'session-index')); } catch (e) { if (e.code === 'ENOENT') return; throw e; }
+  assert(index.isDirectory() && !index.isSymbolicLink(), '.thin/session-index: not a real directory');
+  assert.equal(index.mode & 0o777, 0o700, '.thin/session-index: mode');
+  for (const key of await readdir(join(root, 'session-index'), {withFileTypes:true})) {
+    assert(key.isDirectory() && !key.isSymbolicLink(), `.thin/session-index/${key.name}: not a real directory`);
+    const dir = join(root, 'session-index', key.name);
+    assert.equal((await lstat(dir)).mode & 0o777, 0o700, `${dir}: mode`);
+    for (const name of await readdir(dir)) assert.fail(`${dir}/${name}: session data persisted`);
+  }
+}
 async function snapshot(path) {
   return {bytes:await readFile(path), info:await stat(path, {bigint:true})};
 }
@@ -167,7 +186,7 @@ try {
   await missing(n.settings);
   await unchanged(n);
   await untouched(n.configPath, unconfigured);
-  assert.deepEqual(await readdir(join(n.home, '.thin')), ['config.json']);
+  await thinHome(n.home, ['config.json']);
   // Reverse preferences in a retired file must be ignored, including low-price.
   const existing = '{ "version": 1, "low_price_input": false, "decision_enabled": false }\n';
   await writeFile(n.settings, existing, {mode:0o600});
@@ -187,7 +206,7 @@ try {
   await values(p, true, true, true);
   await untouched(p.configPath, nativeSaved);
   await untouched(p.settings, nativeLegacy);
-  for (const x of [f, n, p]) assert.deepEqual((await readdir(join(x.home, '.thin'))).sort(), ['config.json','settings.json']);
+  for (const x of [f, n, p]) await thinHome(x.home, ['config.json','settings.json']);
   console.log(`PASS test-settings: scenarios=${scenarios}, HTTP requests=${requests}, connections=${connections}`);
 } catch (error) {
   console.error(`FAIL test-settings: completed scenarios=${scenarios}, HTTP requests=${requests}, connections=${connections}`);

@@ -2,14 +2,29 @@
 const std = @import("std");
 const text = @import("text.zig");
 
-pub const Command = enum { model, auth, compact, settings };
+pub const Command = enum { model, auth, compact, settings, sessions, cd, attach, detach, close, exit };
 pub const Item = struct { command: Command, value: []const u8, arguments: []const u8 = "", description: []const u8 };
 pub const items = [_]Item{
     .{ .command = .model, .value = "/model", .arguments = "[exact-id|--refresh]", .description = "Select model" },
     .{ .command = .auth, .value = "/login", .description = "Configure provider" },
     .{ .command = .compact, .value = "/compact", .description = "Compact conversation" },
     .{ .command = .settings, .value = "/settings", .description = "Global settings" },
+    .{ .command = .sessions, .value = "/ls", .arguments = "[--running] [--page N]", .description = "List sessions" },
+    .{ .command = .cd, .value = "/cd", .arguments = "<dir>", .description = "Change launcher directory" },
+    .{ .command = .attach, .value = "/attach", .arguments = "[--takeover] <id>", .description = "Attach a session" },
+    .{ .command = .detach, .value = "/detach", .description = "Leave session view" },
+    .{ .command = .close, .value = "/close", .arguments = "[--force] <id>", .description = "Close a session" },
+    .{ .command = .exit, .value = "/exit", .description = "Leave this frontend" },
 };
+
+/// Session management is only offered when a remote adapter is attached; the
+/// local foreground mode never advertises commands it cannot execute.
+pub fn sessionOnly(command: Command) bool {
+    return switch (command) {
+        .model, .auth, .compact, .settings => false,
+        else => true,
+    };
+}
 
 pub const Matches = struct {
     commands: [items.len]Command = undefined,
@@ -130,15 +145,21 @@ pub const Menu = struct {
 
 test "slash suggestions preserve model login compact order and support local fuzzy search" {
     const all = suggestions("/", 1, false);
-    try std.testing.expectEqual(@as(usize, 4), all.len);
+    try std.testing.expectEqual(items.len, all.len);
     try std.testing.expectEqual(Command.model, all.commands[0]);
     try std.testing.expectEqual(Command.auth, all.commands[1]);
     try std.testing.expectEqual(Command.compact, all.commands[2]);
-    for ([_][]const u8{ "/co", "/CPT", "/compact" }) |query| {
+    try std.testing.expectEqual(Command.settings, all.commands[3]);
+    for ([_][]const u8{ "/CPT", "/compact" }) |query| {
         const found = suggestions(query, query.len, false);
         try std.testing.expectEqual(@as(usize, 1), found.len);
         try std.testing.expectEqual(Command.compact, found.commands[0]);
     }
+    // /co now genuinely prefixes /compact and /close; both stay candidates.
+    const co = suggestions("/co", 3, false);
+    try std.testing.expectEqual(@as(usize, 2), co.len);
+    try std.testing.expectEqual(Command.compact, co.commands[0]);
+    try std.testing.expectEqual(Command.close, co.commands[1]);
     for ([_][]const u8{ "/mo", "/MD", "/model" }) |query| {
         const found = suggestions(query, query.len, false);
         try std.testing.expectEqual(@as(usize, 1), found.len);
@@ -147,6 +168,22 @@ test "slash suggestions preserve model login compact order and support local fuz
     const auth = suggestions("/lgn", 4, false);
     try std.testing.expectEqual(@as(usize, 1), auth.len);
     try std.testing.expectEqual(Command.auth, auth.commands[0]);
+    for ([_][]const u8{ "/ls", "/cd", "/attach", "/detach", "/exit" }) |query| {
+        const found = suggestions(query, query.len, false);
+        try std.testing.expect(found.len >= 1);
+        // Subsequence matching may offer extra candidates (/ls also matches
+        // /close); the exact command must always be present.
+        var hit = false;
+        for (found.commands[0..found.len]) |command| {
+            if (std.mem.eql(u8, info(command).value, query)) hit = true;
+        }
+        try std.testing.expect(hit);
+    }
+}
+
+test "session commands are classified apart from local commands" {
+    try std.testing.expect(!sessionOnly(.model) and !sessionOnly(.auth) and !sessionOnly(.compact) and !sessionOnly(.settings));
+    for ([_]Command{ .sessions, .cd, .attach, .detach, .close, .exit }) |command| try std.testing.expect(sessionOnly(command));
 }
 
 test "slash suggestions exclude arguments multiline prompts paste and mid-token cursor" {
@@ -164,7 +201,7 @@ test "command rows are bounded clipped and mark the selection" {
         for (rendered.lines) |line| a.free(line);
         a.free(rendered.lines);
     }
-    try std.testing.expectEqual(@as(usize, 4), rendered.lines.len);
+    try std.testing.expectEqual(@as(usize, 8), rendered.lines.len);
     try std.testing.expect(rendered.can_confirm);
     try std.testing.expectEqual(@as(usize, 1), rendered.selected_line.?);
     try std.testing.expect(std.mem.indexOf(u8, rendered.lines[1], "> ") != null);
@@ -289,7 +326,7 @@ test "slash selection wraps and dismissal lasts until an edit" {
     var menu: Menu = .{};
     const all = suggestions("/", 1, false);
     menu.move(false, all.len);
-    try std.testing.expectEqual(Command.settings, menu.choice(all).?);
+    try std.testing.expectEqual(Command.exit, menu.choice(all).?);
     menu.move(true, all.len);
     try std.testing.expectEqual(Command.model, menu.choice(all).?);
     menu.move(true, all.len);

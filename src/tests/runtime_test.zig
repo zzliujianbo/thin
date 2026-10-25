@@ -32,6 +32,12 @@ const Fake = struct {
     denied_seen: bool = false,
     /// 完成第几次普通调用之后改为返回纯文本结束。
     stop_after: u32 = 1,
+    /// 观察者收到的直接输入提交次数（id 0 仅为直接输入保留）。
+    direct_observed: usize = 0,
+    /// 宿主收到的直接输入回显次数；应当始终为 0，避免重复显示。
+    direct_host_echoes: usize = 0,
+    /// 为 true 时要求每次普通模型调用前直接输入已提交。
+    check_direct_order: bool = false,
     /// 每次模型响应包含的工具调用数量。
     calls_per_response: usize = 1,
     /// Fake 明确要求逐次审批，用于保留批准、拒绝与取消生命周期覆盖。
@@ -191,6 +197,8 @@ const Fake = struct {
         }
 
         self.normal_calls += 1;
+        // 直接输入必须在首次请求发出前已成为可保存的提交。
+        if (self.check_direct_order) try std.testing.expectEqual(@as(usize, 1), self.direct_observed);
         // 记录历史中出现过的被拒绝工具结果，用于断言拒绝已反馈给模型。
         for (req.messages) |msg| for (msg.blocks) |block| {
             if (block == .tool_result and block.tool_result.is_error) self.denied_seen = true;
@@ -274,6 +282,10 @@ const Fake = struct {
                 self.last_result = value.result.text;
             },
             .tool_started => |value| self.last_started_ms = value.started_ms,
+            // 直接输入仍不得经宿主回显，否则与提交方已绘制的行重复。
+            .user_committed => |value| if (value.id == r.direct_input_id) {
+                self.direct_host_echoes += 1;
+            },
             .finished => self.terminals += 1,
             .compacted => {
                 self.compactions += 1;
@@ -302,6 +314,12 @@ const Fake = struct {
             },
             else => {},
         }
+    }
+
+    /// 观察者回调：只统计直接输入的提交信号，不参与授权或显示。
+    fn observe(ctx: ?*anyopaque, observation: r.Observation) void {
+        const self: *Fake = @ptrCast(@alignCast(ctx.?));
+        if (observation == .event and observation.event == .user_committed and observation.event.user_committed.id == r.direct_input_id) self.direct_observed += 1;
     }
 
     /// 审批回调：计数，可选地触发取消，并返回预设的审批决定。
@@ -2160,6 +2178,41 @@ test "Anthropic restored output metadata is displayable but only current capacit
             try t.expectEqual(@as(u32, 1), terminal.usage.normal_calls);
         }
     }
+}
+
+test "retained direct input is observed once before the first call without a host echo" {
+    var fake: Fake = .{ .check_direct_order = true };
+    var config = configuration();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    runtime.observer = .{ .context = &fake, .notify_fn = Fake.observe };
+    var cancel: p.Cancellation = .{};
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("direct goal", &cancel)).status);
+    // One tool round, then the second call stops; retention must not repeat.
+    try std.testing.expectEqual(@as(usize, 1), fake.direct_observed);
+    try std.testing.expectEqual(@as(u32, 2), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 1), fake.executions);
+    try std.testing.expectEqual(@as(usize, 0), fake.direct_host_echoes);
+    const user = runtime.messages()[0];
+    try std.testing.expectEqualStrings("direct goal", user.blocks[0].text);
+    // Owned retention, not the caller's borrowed literal.
+    try std.testing.expect(user.blocks[0].text.ptr != "direct goal".ptr);
+}
+
+test "rejected input never checkpoints a direct commit" {
+    var fake: Fake = .{};
+    var config = configuration();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
+    defer runtime.deinit();
+    runtime.observer = .{ .context = &fake, .notify_fn = Fake.observe };
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run("   ", &cancel);
+    try std.testing.expectEqual(error.InvalidInput, terminal.detail.?);
+    try std.testing.expectEqual(@as(usize, 0), fake.direct_observed);
+    try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.direct_host_echoes);
+    try std.testing.expectEqual(@as(usize, 0), runtime.messages().len);
 }
 
 // Runtime 忙时拒绝新的提交；宿主断开时停止执行，并报告 HostDisconnected。

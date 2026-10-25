@@ -195,7 +195,10 @@ pub const Session = struct {
     /// a later save publishes a clean generation.
     checkpoint_failure: std.atomic.Value(u16) = .init(0),
 
-    pub const Options = struct { restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, logging: bool = true, auto_refresh_models: bool = false };
+    /// `session_id` is the explicit identity of a NEW session (daemon/foreground
+    /// worker); resume keeps its own source id and rejects a conflicting value.
+    /// `auto_refresh_models` is opt-in and never implied by ownership.
+    pub const Options = struct { session_id: ?ids.Id = null, restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, logging: bool = true, auto_refresh_models: bool = false };
 
     /// 只做本地初始化；缺少凭证时保持 pending，不发起试探请求。
     pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host) !Session {
@@ -205,12 +208,25 @@ pub const Session = struct {
     pub fn initWithOptions(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host, options: Options) !Session {
         const home = environ.get("HOME") orelse return error.MissingHome;
         if (options.resume_session != null and options.restore_selection != null) return error.InvalidArguments;
-        const id = options.resume_session orelse try ids.generate(io);
+        if (options.session_id) |given| {
+            if (!ids.valid(given)) return error.InvalidSessionID;
+            if (options.resume_session) |source| if (!std.mem.eql(u8, &source, &given)) return error.InvalidArguments;
+            if (options.restore_selection) |source| if (std.mem.eql(u8, &source, &given)) {
+                // Restoring a selection into the same id would overwrite the source.
+                return error.InvalidArguments;
+            };
+        }
+        const id = options.resume_session orelse options.session_id orelse try ids.generate(io);
         var project_root = try fs.Root.open(a, io, project);
         var project_moved = false;
         errdefer if (!project_moved) project_root.deinit();
-        var lease: ?resume_store.Lease = if (options.resume_session) |source_id| resume_store.Lease.open(&project_root, source_id, options.logging) catch |err| switch (err) {
-            error.SessionInUse, error.AccessDenied, error.ReadOnlyFileSystem, error.UnsafeResumeFile => try resume_store.Lease.open(&project_root, source_id, false),
+        // Every resume takes the execution lease first, whatever the log policy:
+        // `--no-log` suppresses journal/checkpoint publication, not single
+        // ownership of this Session id. Only a log viewer may fall back to
+        // read-only history beside a live writer.
+        var lease: ?resume_store.Lease = if (options.resume_session) |source_id| resume_store.Lease.open(&project_root, source_id, true) catch |err| switch (err) {
+            error.SessionInUse => if (options.logging) try resume_store.Lease.open(&project_root, source_id, false) else return error.SessionInUse,
+            error.AccessDenied, error.ReadOnlyFileSystem, error.UnsafeResumeFile => try resume_store.Lease.open(&project_root, source_id, false),
             else => return err,
         } else null;
         errdefer if (lease) |*owned| owned.deinit();
@@ -245,7 +261,9 @@ pub const Session = struct {
             .project_root = project_root,
             .resume_lease = lease,
             .resumed = options.resume_session != null,
-            .read_only = options.logging and if (lease) |owned| !owned.writable else false,
+            // Logging never buys write rights: a non-writable lease can only
+            // view history and never activates an App or publishes state.
+            .read_only = if (lease) |owned| !owned.writable else false,
             .metadata_auto = options.auto_refresh_models,
             // Restored sessions do no startup fetch, but regain timed refresh.
             .metadata_next_check_ms = if (restored != null) @as(i64, @intCast(std.Io.Clock.awake.now(io).toMilliseconds())) + 60000 else 0,
@@ -2035,6 +2053,64 @@ test "concurrent checkpoint writer allows read only history without credentials"
     try expectSessionTestHistory(&reader);
     try std.testing.expect(!try reader.saveOnExit());
     try std.testing.expectError(error.ResumeReadOnly, reader.connection().configure("fake-not-published"));
+}
+
+test "no-log resume cannot build a second runtime beside a live writer" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    const id = try fixture.saveHistory();
+    var writer = try fixture.open(.{ .resume_session = id });
+    defer writer.deinit();
+    try std.testing.expect(writer.resume_lease.?.writable);
+    try std.testing.expect(writer.app != null);
+    // `--no-log` suppresses checkpoint publishing, not single ownership: the
+    // live owner must reject the second Runtime instead of granting an
+    // unlocked writable-looking session.
+    try std.testing.expectError(error.SessionInUse, fixture.open(.{ .resume_session = id, .logging = false }));
+    try std.testing.expect(writer.resume_lease.?.writable);
+    try std.testing.expect(writer.app != null);
+    try expectSessionTestHistory(&writer);
+}
+
+test "released lease runs no-log resume without republishing checkpoint or config" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    const a = std.testing.allocator;
+    const id = try fixture.saveHistory();
+    {
+        var writer = try fixture.open(.{ .resume_session = id });
+        defer writer.deinit();
+        try std.testing.expectError(error.SessionInUse, fixture.open(.{ .resume_session = id, .logging = false }));
+    }
+    var buffer: [100]u8 = undefined;
+    const checkpoint_path = try std.fmt.bufPrint(&buffer, ".thin/sessions/{s}.session", .{id});
+    const checkpoint_before = try fixture.tmp.dir.readFileAlloc(std.testing.io, checkpoint_path, a, .limited(1 << 20));
+    defer a.free(checkpoint_before);
+    const config_before = try fixture.tmp.dir.readFileAlloc(std.testing.io, ".thin/config.json", a, .limited(1 << 16));
+    defer a.free(config_before);
+    var resumed = try fixture.open(.{ .resume_session = id, .logging = false });
+    defer resumed.deinit();
+    try std.testing.expect(!resumed.read_only);
+    try std.testing.expect(!resumed.logging);
+    try std.testing.expect(resumed.resume_lease.?.writable);
+    try std.testing.expect(resumed.app != null);
+    try expectSessionTestHistory(&resumed);
+    // The execution lease, not the log policy, is what blocks the second writer.
+    try std.testing.expectError(error.SessionInUse, resume_store.Lease.open(&resumed.project_root, id, true));
+    // Logging viewers keep the read-only history path; only the Host rejects a
+    // writable worker, Session.init itself must not fail here.
+    var viewer = try fixture.open(.{ .resume_session = id });
+    defer viewer.deinit();
+    try std.testing.expect(viewer.read_only);
+    try std.testing.expect(viewer.app == null);
+    try std.testing.expect(!viewer.resume_lease.?.writable);
+    try std.testing.expect(!try resumed.saveOnExit());
+    const checkpoint_after = try fixture.tmp.dir.readFileAlloc(std.testing.io, checkpoint_path, a, .limited(1 << 20));
+    defer a.free(checkpoint_after);
+    try std.testing.expectEqualSlices(u8, checkpoint_before, checkpoint_after);
+    const config_after = try fixture.tmp.dir.readFileAlloc(std.testing.io, ".thin/config.json", a, .limited(1 << 16));
+    defer a.free(config_after);
+    try std.testing.expectEqualSlices(u8, config_before, config_after);
 }
 
 test "changed credential and current budgets do not authenticate or reject checkpoint loading" {

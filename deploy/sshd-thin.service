@@ -1,0 +1,30 @@
+# Thin 专用 OpenSSH 实例：样例，未安装、未启用。
+#
+# 这是 systemd **系统**单元，安装位置：/etc/systemd/system/sshd-thin.service
+# 需要管理员授权后才能安装与启用。
+#
+# 它与管理用 sshd.service 完全独立：不覆盖 22 端口配置，不修改现有 sshd 单元，
+# 不改动 PAM 栈，也不改动机器上已有的防火墙规则。
+# 开放端口、绑定地址与防火墙变更属于单独的部署授权。
+#
+# 安装前先做只读语法校验（不启动服务）：
+#   sshd -t -f /etc/ssh/sshd_config.thin
+
+[Unit]
+Description=Thin dedicated OpenSSH entry
+Documentation=man:sshd(8) man:sshd_config(5)
+After=network.target
+# 同一台机器上只能运行一个 Thin 专用入口实例。
+Before=shutdown.target
+
+[Service]
+Type=simple
+# THIN:REPLACE 按发行版确认 sshd 路径（/usr/sbin/sshd 或 /usr/bin/sshd）。
+# -D 保持前台由 systemd 托管，不在 sshd 内部再做一次 fork。
+ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config.thin
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

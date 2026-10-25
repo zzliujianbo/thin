@@ -16,6 +16,10 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64)
         @panic("ThinAgent v1 supports Linux x86_64 only");
     const optimize = b.standardOptimizeOption(.{});
+    // Normal builds use the system libssh development package. These build-only
+    // paths also permit an extracted SDK without installing packages globally.
+    const ssh_include = b.option([]const u8, "ssh-include", "Directory containing libssh/ headers");
+    const ssh_library = b.option([]const u8, "ssh-library", "Absolute libssh shared-library path (otherwise link system ssh)");
 
     // 可供其他前端直接导入；不链接TTY/libc宽度/Markdown C parser。
     const presentation = b.addModule("presentation", .{
@@ -39,6 +43,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addMarkdown(b, exe.root_module);
+    addSsh(b, exe.root_module, ssh_include, ssh_library);
     b.installArtifact(exe);
 
     // `zig build run -- [参数]`：先编译再运行 thin，参数写在 `--` 之后传给程序，类似 cargo run。
@@ -58,6 +63,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addMarkdown(b, unit.root_module);
+    addSsh(b, unit.root_module, ssh_include, ssh_library);
     // Test-only parser copy with allocation injection; never linked into thin.
     unit.root_module.addCSourceFile(.{ .file = b.path("src/tests/md4c_fault_test.c"), .flags = &.{"-std=c11"} });
     const run_unit = b.addRunArtifact(unit);
@@ -155,6 +161,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    addSsh(b, pty_driver.root_module, ssh_include, ssh_library);
+
+    const run_ssh = fixture(b, "python3", "tests/product/ssh_mock.py", &.{exe}, &.{});
+    b.step("test-ssh", "Run owned single-listener SSH/TUI/key/lifecycle acceptance (requires OpenSSH)").dependOn(&run_ssh.step);
+
     // 应用验收：Node 脚本同时拿到 thin 可执行文件与 PTY 驱动，在隔离环境中运行 CLI 与 PTY 测试。
     const run_app = fixture(b, "node", "tests/product/app_mock.mjs", &.{ exe, pty_driver }, &.{});
     b.step("test-app", "Run isolated CLI and PTY application acceptance (requires Node)").dependOn(&run_app.step);
@@ -172,6 +183,10 @@ pub fn build(b: *std.Build) void {
     // clear every service, which is the correct headless semantic).
     const run_background = fixture(b, "python3", "tests/product/background_mock.py", &.{exe}, &.{});
     b.step("test-background", "Run owned-loopback background service lifecycle and cross-task acceptance").dependOn(&run_background.step);
+
+    // Daemon/attach/takeover acceptance over owned loopback and a real PTY.
+    const run_daemon = fixture(b, "python3", "tests/product/daemon_mock.py", &.{exe}, &.{});
+    b.step("test-daemon", "Run owned daemon/attach/takeover/approval/SIGTERM acceptance").dependOn(&run_daemon.step);
 
     const run_idle_enter = fixture(b, "python3", "tests/product/idle_enter_mock.py", &.{exe}, &.{});
     b.step("test-idle-enter", "Run owned idle prompt newline PTYs (requires Python 3)").dependOn(&run_idle_enter.step);
@@ -218,6 +233,8 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_memory_app.step);
     test_all.dependOn(&run_subagent.step);
     test_all.dependOn(&run_background.step);
+    test_all.dependOn(&run_daemon.step);
+    test_all.dependOn(&run_ssh.step);
     test_all.dependOn(&run_presentation.step);
     test_all.dependOn(&run_http.step);
     test_all.dependOn(&run_anthropic.step);
@@ -251,6 +268,14 @@ fn fixture(
     for (args) |arg| run.addArg(arg);
     run.setCwd(b.path("."));
     return run;
+}
+
+fn addSsh(b: *std.Build, module: *std.Build.Module, include: ?[]const u8, library: ?[]const u8) void {
+    if (include) |path| module.addSystemIncludePath(.{ .cwd_relative = path });
+    for ([_][]const u8{ "ssh_keys.c", "ssh_transport.c" }) |file| {
+        module.addCSourceFile(.{ .file = b.path(b.fmt("src/daemon/{s}", .{file})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    }
+    if (library) |path| module.addObjectFile(.{ .cwd_relative = path }) else module.linkSystemLibrary("ssh", .{});
 }
 
 /// Vendored CommonMark/GFM parser: builds offline, no system package/runtime

@@ -118,6 +118,8 @@ const Copy = struct {
                 c.fields.command = self.field(v.fields.command);
                 c.fields.action = self.field(v.fields.action);
                 c.fields.topic = self.field(v.fields.topic);
+                c.fields.task = self.field(v.fields.task);
+                c.fields.id = self.field(v.fields.id);
                 break :blk .{ .tool_view = c };
             },
             .permission => |v| .{ .permission = .{ .id = v.id, .tool_name = self.text(v.tool_name), .description = self.text(v.description) } },
@@ -494,4 +496,85 @@ test "steering interrupts matching pending permission outside bridge lock withou
     try std.testing.expect(bridge.pending == null and bridge.answer == null);
     try std.testing.expect(!cancel.isRequested());
     try std.testing.expectEqual(@as(usize, 1), inbox.snapshot().steering);
+}
+
+// Regression: tool_view.task/id snapshots stayed borrowed from the producer's
+// JSON extractor, so encoding them after the producer moved on read freed
+// memory (worker segfault on the second background-management round). All six
+// snapshot fields must be owned by the Item, not merely byte-equal.
+test "tool view copy owns all six snapshot fields after producer storage is freed" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+
+    const expected = [_][]const u8{ "path.txt", "run.sh", "open", "topic-x", "delegate summary", "job-7" };
+    var borrowed: [expected.len][]u8 = undefined;
+    {
+        // Producer-side arena: released and overwritten before the consumer pops.
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        for (expected, 0..) |value, i| borrowed[i] = try arena.allocator().dupe(u8, value);
+        try host_.emit_fn(host_.context, .{ .tool_view = .{
+            .key = .{ .generation = 5, .index = 2 },
+            .name = "background",
+            .fields = .{
+                .path = .{ .text = borrowed[0] },
+                .command = .{ .text = borrowed[1], .truncated = true },
+                .action = .{ .text = borrowed[2] },
+                .topic = .{ .text = borrowed[3] },
+                .task = .{ .text = borrowed[4] },
+                .id = .{ .text = borrowed[5], .truncated = true },
+            },
+            .ready = true,
+        } }, &cancel);
+        for (borrowed) |slice| @memset(slice, 'x');
+    }
+
+    var item = bridge.pop().?;
+    defer item.deinit();
+    const view = item.event.tool_view;
+    try t.expect(!item.display_truncated);
+    try t.expectEqualStrings("background", view.name);
+    inline for (.{ "path", "command", "action", "topic", "task", "id" }, 0..) |name, i| {
+        const text = @field(view.fields, name).?.text;
+        try t.expectEqualStrings(expected[i], text);
+        // Ownership, not only equal bytes: every non-empty text lives in storage.
+        const lo = @intFromPtr(item.storage.ptr);
+        try t.expect(@intFromPtr(text.ptr) >= lo);
+        try t.expect(@intFromPtr(text.ptr) + text.len <= lo + item.storage.len);
+    }
+    // Producer-side truncation flags survive; no clipping happened here.
+    try t.expect(view.fields.command.?.truncated);
+    try t.expect(view.fields.id.?.truncated);
+    try t.expect(!view.fields.task.?.truncated);
+}
+
+// The shared measure/copy budget must account for task and stop on a codepoint
+// boundary; UTF-8 safety here mirrors the existing field-cap coverage.
+test "task snapshot clipping stops on a utf8 boundary inside the shared item cap" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+
+    const huge = try t.allocator.alloc(u8, item_budget + 8);
+    defer t.allocator.free(huge);
+    var i: usize = 0;
+    while (i + 3 <= huge.len) : (i += 3) @memcpy(huge[i..][0..3], "\xe5\xad\x97");
+    try host_.emit_fn(host_.context, .{ .tool_view = .{
+        .key = .{ .generation = 1, .index = 0 },
+        .name = "",
+        .fields = .{ .task = .{ .text = huge } },
+    } }, &cancel);
+
+    var item = bridge.pop().?;
+    defer item.deinit();
+    const task = item.event.tool_view.fields.task.?;
+    try t.expectEqual(item_budget - 1, task.text.len);
+    try t.expectEqual(item_budget - 1, item.storage.len);
+    try t.expect(task.truncated and item.display_truncated);
+    try t.expect(std.unicode.utf8ValidateSlice(task.text));
 }

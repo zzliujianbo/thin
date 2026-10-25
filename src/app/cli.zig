@@ -3,15 +3,65 @@
 const std = @import("std");
 const ids = @import("session_id.zig");
 
+/// 运行模式。默认是普通本地前台；绝不因为缺少参数、连接失败或历史恢复而进入守护模式。
+/// foreground/connect/attach 需要真正的终端，daemon 与内部 worker 必须能在无 TTY 环境运行。
+pub const Mode = enum {
+    foreground,
+    daemon,
+    connect,
+    attach,
+    worker,
+
+    pub fn requiresTty(self: Mode) bool {
+        return switch (self) {
+            .foreground, .connect, .attach => true,
+            .daemon, .worker => false,
+        };
+    }
+};
+
+/// 内部 worker 会话的 owner：普通前台启动器，还是守护服务。仅 --internal-worker 使用。
+pub const WorkerOwner = enum { foreground, daemon };
+
 /// 解析后的选项。prompt 为 null 表示交互模式；非 null 表示 --print 一次性模式。
 /// 普通工具调用直接执行；危险 bash 在执行前按命令内容分类，必须逐次明确批准。
 /// 这不是沙箱。--print 没有审批界面，因此直接拒绝危险命令。
-pub const Options = struct { prompt: ?[]const u8 = null, restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, logging: bool = true, auto_refresh_models: bool = true, help: bool = false, version: bool = false };
+pub const Options = struct {
+    prompt: ?[]const u8 = null,
+    restore_selection: ?ids.Id = null,
+    resume_session: ?ids.Id = null,
+    logging: bool = true,
+    auto_refresh_models: bool = true,
+    help: bool = false,
+    version: bool = false,
+    /// 默认普通前台；只有显式的 --daemon/--connect/--attach 或内部 worker 参数会改变它。
+    mode: Mode = .foreground,
+    /// --attach 的目标会话；连接既有会话，不隐式启动服务。
+    attach_session: ?ids.Id = null,
+    /// Explicit daemon-only numeric TCP address, e.g. 127.0.0.1:2222 or [::1]:2222.
+    ssh_listen: ?[]const u8 = null,
+    /// Internal SSH+TUI child. Accepted socket is stdin; parent pid is checked.
+    ssh_owner: ?u32 = null,
+    /// 仅与 --attach 一起使用，表示替换已有的可写控制台。
+    takeover: bool = false,
+    /// 内部 worker 的 AF_UNIX endpoint；只由 --internal-worker 设置。
+    worker_endpoint: ?[]const u8 = null,
+    /// 内部 worker 承载的会话 ID；只由 --internal-worker 设置。
+    worker_session: ?ids.Id = null,
+    /// 内部 worker 的会话 owner；只由 --internal-worker 设置。
+    worker_owner: WorkerOwner = .daemon,
+    /// 仅内部允许：worker 从既有 checkpoint 恢复，不得与公开 --resume/--restore-selection 混用。
+    worker_resume: bool = false,
+    /// 仅内部允许：worker 按原 --restore-selection 语义只读入旧选择（新空会话），不得与公开 flag 混用。
+    worker_restore_selection: ?ids.Id = null,
+};
 
 /// 解析 argv。args[0] 是程序名，因此从 1 开始遍历。
-/// 无效参数返回错误（InvalidArguments、UnknownOption），由调用方决定如何提示。
+/// 无效参数返回错误（InvalidArguments、InvalidSessionID、UnknownOption），由调用方决定如何提示。
 pub fn parse(args: []const [:0]const u8) !Options {
     var result: Options = .{};
+    // 已出现的运行模式（公开 flag 或内部 worker）；用于检测重复与互斥。
+    var selected: ?Mode = null;
 
     // 使用显式索引循环，以便 --print 能在处理时跳过下一个参数（即 prompt）。
     var i: usize = 1;
@@ -25,15 +75,108 @@ pub fn parse(args: []const [:0]const u8) !Options {
         } else if (std.mem.eql(u8, arg, "--restore-selection") or std.mem.eql(u8, arg, "--resume")) {
             if (result.restore_selection != null or result.resume_session != null or i + 1 >= args.len) return error.InvalidArguments;
             i += 1;
-            if (args[i].len != 32) return error.InvalidSessionID;
-            const id: ids.Id = args[i][0..32].*;
-            if (!ids.valid(id)) return error.InvalidSessionID;
+            const id = try parseId(args[i]);
             if (std.mem.eql(u8, arg, "--resume")) result.resume_session = id else result.restore_selection = id;
+        } else if (std.mem.eql(u8, arg, "--daemon") or std.mem.eql(u8, arg, "--connect")) {
+            // 显式守护服务模式；--connect 只连接已运行的同类服务，永不自动拉起。
+            const mode: Mode = if (std.mem.eql(u8, arg, "--daemon")) .daemon else .connect;
+            if (selected != null) return error.InvalidArguments;
+            selected = mode;
+            result.mode = mode;
+        } else if (std.mem.eql(u8, arg, "--ssh-listen")) {
+            if (result.ssh_listen != null or i + 1 >= args.len) return error.InvalidArguments;
+            i += 1;
+            if (args[i].len == 0) return error.InvalidArguments;
+            result.ssh_listen = args[i];
+        } else if (std.mem.eql(u8, arg, "--internal-ssh")) {
+            if (selected != null or i + 1 >= args.len) return error.InvalidArguments;
+            i += 1;
+            for (args[i]) |byte| if (byte < '0' or byte > '9') return error.InvalidArguments;
+            const owner = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidArguments;
+            if (owner <= 1 or owner > std.math.maxInt(c_int)) return error.InvalidArguments;
+            result.ssh_owner = owner;
+            result.mode = .connect;
+            selected = .connect;
+        } else if (std.mem.eql(u8, arg, "--attach")) {
+            if (selected != null or result.attach_session != null or i + 1 >= args.len) return error.InvalidArguments;
+            i += 1;
+            result.attach_session = try parseId(args[i]);
+            selected = .attach;
+            result.mode = .attach;
+        } else if (std.mem.eql(u8, arg, "--takeover")) {
+            if (result.takeover) return error.InvalidArguments;
+            result.takeover = true;
+        } else if (std.mem.eql(u8, arg, "--internal-worker")) {
+            // 内部入口，不在 help 中推广：endpoint、会话 ID、owner 三项必填。
+            if (selected != null or i + 3 >= args.len) return error.InvalidArguments;
+            i += 1;
+            if (args[i].len == 0) return error.InvalidArguments;
+            result.worker_endpoint = args[i];
+            i += 1;
+            result.worker_session = try parseId(args[i]);
+            i += 1;
+            if (std.mem.eql(u8, args[i], "foreground")) {
+                result.worker_owner = .foreground;
+            } else if (std.mem.eql(u8, args[i], "daemon")) {
+                result.worker_owner = .daemon;
+            } else return error.InvalidArguments;
+            selected = .worker;
+            result.mode = .worker;
+        } else if (std.mem.eql(u8, arg, "--worker-resume")) {
+            if (result.worker_resume) return error.InvalidArguments;
+            result.worker_resume = true;
+        } else if (std.mem.eql(u8, arg, "--worker-restore-selection")) {
+            // 内部入口，不在 help 中推广：把老的 --restore-selection 迁入 foreground worker。
+            if (result.worker_restore_selection != null or i + 1 >= args.len) return error.InvalidArguments;
+            i += 1;
+            result.worker_restore_selection = try parseId(args[i]);
         } else return error.UnknownOption;
     }
 
+    if (result.ssh_listen != null and result.mode != .daemon) return error.InvalidArguments;
     if ((result.restore_selection != null or result.resume_session != null) and result.prompt != null) return error.InvalidArguments;
+    // 显式运行模式与 --print/--resume/--restore-selection 互斥；--resume 仍属于普通前台模式。
+    if (selected != null and (result.prompt != null or result.resume_session != null or result.restore_selection != null)) return error.InvalidArguments;
+    // 只有 --attach 可以带 --takeover：替换已有的可写控制台，而不是新起服务。
+    if (result.takeover and result.mode != .attach) return error.InvalidArguments;
+    // 内部 worker 的恢复标记只能在 worker 模式使用，且不得与公开 --resume/--restore-selection 混用。
+    if (result.worker_resume and (result.mode != .worker or result.resume_session != null or result.restore_selection != null or result.prompt != null)) return error.InvalidArguments;
+    // 内部 worker 的选择恢复同样只允许 worker 模式，并与 --worker-resume、公开模式参数互斥。
+    if (result.worker_restore_selection != null and
+        (result.mode != .worker or result.worker_resume or result.resume_session != null or result.restore_selection != null or result.prompt != null)) return error.InvalidArguments;
     return result;
+}
+
+test "SSH listener is explicit daemon-only; internal child is not a public attach mode" {
+    const daemon = try parse(&.{ "thin", "--ssh-listen", "127.0.0.1:2222", "--daemon" });
+    try std.testing.expectEqual(Mode.daemon, daemon.mode);
+    try std.testing.expectEqualStrings("127.0.0.1:2222", daemon.ssh_listen.?);
+    try std.testing.expect((try parse(&.{"thin"})).ssh_listen == null);
+    const child = try parse(&.{ "thin", "--internal-ssh", "1234", "--no-model-auto-refresh" });
+    try std.testing.expectEqual(Mode.connect, child.mode);
+    try std.testing.expectEqual(@as(u32, 1234), child.ssh_owner.?);
+    try std.testing.expect(!child.auto_refresh_models);
+    for ([_][]const [:0]const u8{
+        &.{ "thin", "--ssh-listen", "127.0.0.1:2222" },
+        &.{ "thin", "--connect", "--ssh-listen", "127.0.0.1:2222" },
+        &.{ "thin", "--daemon", "--ssh-listen" },
+        &.{ "thin", "--daemon", "--ssh-listen", "" },
+        &.{ "thin", "--daemon", "--ssh-listen", "a", "--ssh-listen", "b" },
+        &.{ "thin", "--internal-ssh", "1" },
+        &.{ "thin", "--internal-ssh", "-4" },
+        &.{ "thin", "--internal-ssh", "+4" },
+        &.{ "thin", "--internal-ssh", "2147483648" },
+        &.{ "thin", "--internal-ssh", "4", "--daemon" },
+        &.{ "thin", "--internal-ssh", "4", "--print", "x" },
+    }) |args| try std.testing.expectError(error.InvalidArguments, parse(args));
+}
+
+/// 会话 ID 必须是 32 个小写十六进制字符；调用方不做二次校验。
+fn parseId(value: []const u8) !ids.Id {
+    if (value.len != 32) return error.InvalidSessionID;
+    const id: ids.Id = value[0..32].*;
+    if (!ids.valid(id)) return error.InvalidSessionID;
+    return id;
 }
 
 /// 帮助文本，由 --help 输出。字符串内容即为用户可见的文档。
@@ -44,7 +187,31 @@ pub const help =
     \\       thin --print "prompt" [--no-log]
     \\       thin --restore-selection <32-lowerhex-session-id> [--no-log]
     \\       thin --resume <32-lowerhex-session-id> [--no-log]
+    \\       thin --daemon [--ssh-listen <numeric-address:port>] [--no-log]
+    \\       thin --connect [--no-log]
+    \\       thin --attach <32-lowerhex-session-id> [--takeover] [--no-log]
     \\       thin --help | --version
+    \\
+    \\Modes: ordinary local foreground by default; nothing starts a service implicitly.
+    \\Only --daemon explicitly runs the per-user service, kept in the foreground
+    \\for a service manager (no self-daemonizing fork).
+    \\--ssh-listen is daemon-only and opt-in; e.g. 127.0.0.1:2222 or [::1]:2222.
+    \\It serves only the TUI via libssh/public-key authentication, never a shell.
+    \\Use protocol user thin; put Ed25519 public keys in ~/.thin/authorized_keys.
+    \\Keep ~/.thin mode 0700 and key files 0600. A missing host key is generated
+    \\at ~/.thin/ssh_host_ed25519_key; an existing identity is never overwritten.
+    \\No password/PAM, exec, SFTP, forwarding, or system SSH configuration is used.
+    \\--connect joins the already running daemon service; it requires that service.
+    \\--attach <id> joins an existing session worker, which ordinary foreground thin
+    \\or the daemon may publish, so it does not require a running daemon.
+    \\Neither --connect nor --attach starts a service and neither sends a request.
+    \\A missing service, endpoint or session is reported, never auto-started.
+    \\--daemon, --connect and --attach are mutually exclusive and also exclude
+    \\--print, --resume and --restore-selection; a repeated mode flag is an error.
+    \\--takeover is valid only with --attach and replaces the previous writable console.
+    \\Foreground, connect and attach need a terminal; the daemon does not.
+    \\A session keeps one writable owner; an unattended dangerous command still waits.
+    \\Disconnecting from a daemon session detaches the view, it does not cancel work.
     \\
     \\Configuration: ~/.thin/config.json
     \\Startup initializes a missing/empty file for DeepSeek (deepseek-flash).
@@ -203,4 +370,188 @@ test "CLI ordinary tools run directly and print requires a prompt" {
     try std.testing.expect(!(try parse(&.{ "thin", "--print", "hello", "--no-log" })).logging);
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--print" }));
     try std.testing.expectError(error.UnknownOption, parse(&.{ "thin", "--config", "other.json" }));
+}
+
+// 默认必须是普通前台：不因为没有模式参数、不因为历史恢复而进入守护模式。
+test "CLI defaults to foreground and resume stays foreground" {
+    const plain = try parse(&.{"thin"});
+    try std.testing.expectEqual(Mode.foreground, plain.mode);
+    try std.testing.expect(plain.attach_session == null and !plain.takeover);
+    try std.testing.expect(plain.worker_endpoint == null and plain.worker_session == null);
+    try std.testing.expectEqual(WorkerOwner.daemon, plain.worker_owner);
+    try std.testing.expect(!plain.worker_resume);
+
+    const id = "0123456789abcdef0123456789abcdef";
+    const resumed = try parse(&.{ "thin", "--resume", id });
+    try std.testing.expectEqual(Mode.foreground, resumed.mode);
+    try std.testing.expectEqualStrings(id, &resumed.resume_session.?);
+    const restored = try parse(&.{ "thin", "--restore-selection", id });
+    try std.testing.expectEqual(Mode.foreground, restored.mode);
+    try std.testing.expectEqualStrings(id, &restored.restore_selection.?);
+    const printed = try parse(&.{ "thin", "--print", "hello" });
+    try std.testing.expectEqual(Mode.foreground, printed.mode);
+
+    // 仅前台/connect/attach 需要终端；daemon 与内部 worker 必须能在无 TTY 下进入。
+    try std.testing.expect(Mode.foreground.requiresTty());
+    try std.testing.expect(Mode.connect.requiresTty());
+    try std.testing.expect(Mode.attach.requiresTty());
+    try std.testing.expect(!Mode.daemon.requiresTty());
+    try std.testing.expect(!Mode.worker.requiresTty());
+}
+
+test "CLI daemon connect attach are exclusive with each other and other run modes" {
+    const id = "0123456789abcdef0123456789abcdef";
+    const other = "fedcba9876543210fedcba9876543210";
+
+    try std.testing.expectEqual(Mode.daemon, (try parse(&.{ "thin", "--daemon" })).mode);
+    try std.testing.expectEqual(Mode.connect, (try parse(&.{ "thin", "--connect" })).mode);
+    const attached = try parse(&.{ "thin", "--attach", id });
+    try std.testing.expectEqual(Mode.attach, attached.mode);
+    try std.testing.expectEqualStrings(id, &attached.attach_session.?);
+    try std.testing.expect(!attached.takeover);
+
+    // 重复与互相冲突。
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--daemon", "--daemon" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--connect", "--connect" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--daemon", "--connect" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--connect", "--daemon" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--daemon", "--attach", id }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach", id, "--connect" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach", id, "--attach", other }));
+
+    // 与 --print/--resume/--restore-selection 冲突，包括反向顺序。
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--daemon", "--print", "go" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--print", "go", "--connect" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach", id, "--print", "go" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--daemon", "--resume", id }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--resume", id, "--connect" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach", id, "--restore-selection", id }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--restore-selection", id, "--attach", id }));
+
+    // 缺少或无效的会话 ID。
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach" }));
+    try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--attach", "../session" }));
+    try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--attach", "0123456789abcdef0123456789abcdeF" }));
+
+    // --no-log / 无模式 flag 不会改变模式。
+    const quiet = try parse(&.{ "thin", "--daemon", "--no-log" });
+    try std.testing.expectEqual(Mode.daemon, quiet.mode);
+    try std.testing.expect(!quiet.logging);
+}
+
+test "CLI takeover belongs to attach only" {
+    const id = "0123456789abcdef0123456789abcdef";
+    const attached = try parse(&.{ "thin", "--attach", id, "--takeover" });
+    try std.testing.expectEqual(Mode.attach, attached.mode);
+    try std.testing.expect(attached.takeover);
+
+    // 不带 --attach，或在其它模式下使用，一律拒绝；重复也一样。
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--takeover" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--daemon", "--takeover" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--connect", "--takeover" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--print", "go", "--takeover" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach", id, "--takeover", "--takeover" }));
+}
+
+// 内部 worker 入口：不在 help 推广，但必须能在无 TTY 环境中完整表达 owner 与 endpoint。
+test "CLI internal worker carries endpoint session and owner" {
+    const id = "0123456789abcdef0123456789abcdef";
+    const socket = "/run/user/1000/thin/workers/session.sock";
+
+    const daemon_side = try parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--no-log" });
+    try std.testing.expectEqual(Mode.worker, daemon_side.mode);
+    try std.testing.expect(!Mode.worker.requiresTty());
+    try std.testing.expectEqualStrings(socket, daemon_side.worker_endpoint.?);
+    try std.testing.expectEqualStrings(id, &daemon_side.worker_session.?);
+    try std.testing.expectEqual(WorkerOwner.daemon, daemon_side.worker_owner);
+    try std.testing.expect(!daemon_side.worker_resume and !daemon_side.logging);
+
+    const foreground_side = try parse(&.{ "thin", "--internal-worker", socket, id, "foreground" });
+    try std.testing.expectEqual(WorkerOwner.foreground, foreground_side.worker_owner);
+    try std.testing.expectEqual(Mode.worker, foreground_side.mode);
+
+    const resumed_worker = try parse(&.{ "thin", "--worker-resume", "--internal-worker", socket, id, "foreground" });
+    try std.testing.expectEqual(Mode.worker, resumed_worker.mode);
+    try std.testing.expect(resumed_worker.worker_resume);
+
+    // 缺参、空 endpoint、未知 owner、无效 ID。
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker", socket, id }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker", "", id, "daemon" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker", socket, id, "system" }));
+    try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--internal-worker", socket, "not-a-session", "daemon" }));
+
+    // 重复 worker 入口或与公开模式混用都是冲突。
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--internal-worker", socket, id, "daemon" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--daemon", "--internal-worker", socket, id, "daemon" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--print", "go" }));
+
+    // --worker-resume 是内部标记：不能与公开 --resume/--restore-selection 混用，也不能单独使用。
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--worker-resume" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--resume", id }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--restore-selection", id }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--worker-resume", "--worker-resume", "--internal-worker", socket, id, "daemon" }));
+    try std.testing.expect(std.mem.indexOf(u8, help, "--worker-restore-selection") == null);
+}
+
+// 老 --restore-selection 迁入 foreground worker 的内部选项：仍保持公开参数为普通前台。
+test "CLI worker restore-selection is worker-only and exclusive" {
+    const id = "0123456789abcdef0123456789abcdef";
+    const prior = "fedcba9876543210fedcba9876543210";
+    const socket = "/run/user/1000/thin/workers/session.sock";
+
+    // 合法：两个 worker 模式都可带，且不写公开字段。
+    const migrated = try parse(&.{ "thin", "--internal-worker", socket, id, "foreground", "--worker-restore-selection", prior });
+    try std.testing.expectEqual(Mode.worker, migrated.mode);
+    try std.testing.expectEqualStrings(prior, &migrated.worker_restore_selection.?);
+    try std.testing.expect(migrated.restore_selection == null and !migrated.worker_resume);
+    try std.testing.expectEqualStrings(id, &migrated.worker_session.?);
+
+    // 参数顺序无关。
+    const reordered = try parse(&.{ "thin", "--worker-restore-selection", prior, "--internal-worker", socket, id, "daemon" });
+    try std.testing.expectEqualStrings(prior, &reordered.worker_restore_selection.?);
+    try std.testing.expectEqual(WorkerOwner.daemon, reordered.worker_owner);
+
+    // 公开 --restore-selection 仍是普通前台，不设置内部字段。
+    const public = try parse(&.{ "thin", "--restore-selection", id });
+    try std.testing.expectEqual(Mode.foreground, public.mode);
+    try std.testing.expect(public.worker_restore_selection == null);
+
+    // 无参数仍是普通前台：它不是 worker 负例。
+    const plain = try parse(&.{"thin"});
+    try std.testing.expectEqual(Mode.foreground, plain.mode);
+    try std.testing.expect(plain.worker_restore_selection == null and plain.worker_session == null);
+
+    // 表格：全部拒绝的组合。
+    const rejected = [_][]const [:0]const u8{
+        &.{ "thin", "--worker-restore-selection", prior }, // 缺内部入口
+        &.{ "thin", "--worker-restore-selection" }, // 缺参数
+        &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection" }, // 缺参数
+        &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", prior, "--worker-restore-selection", prior }, // 重复
+        &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-resume", "--worker-restore-selection", prior }, // 与 worker-resume 混用
+        &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", prior, "--worker-resume" },
+        &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", prior, "--resume", id }, // 公开 resume
+        &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", prior, "--restore-selection", id }, // 公开 restore
+        &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", prior, "--print", "go" }, // 公开 print
+    };
+    for (rejected) |args| try std.testing.expectError(error.InvalidArguments, parse(args));
+
+    // 非法 ID 保持 InvalidSessionID。
+    try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", "../session" }));
+    try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", "0123456789ABCDEF0123456789ABCDEF" }));
+}
+
+test "CLI help documents explicit modes without advertising internal entry" {
+    try std.testing.expect(std.mem.indexOf(u8, help, "ordinary local foreground by default") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Only --daemon explicitly runs the per-user service") != null);
+    // 只有 --connect 依赖 daemon；--attach 可连普通前台公布的 worker，两者都不自启服务。
+    try std.testing.expect(std.mem.indexOf(u8, help, "--connect joins the already running daemon service") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "or the daemon may publish, so it does not require a running daemon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Neither --connect nor --attach starts a service") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "requires an already running service") == null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "are mutually exclusive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--takeover is valid only with --attach") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "need a terminal; the daemon does not") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--internal-worker") == null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--worker-resume") == null);
 }

@@ -12,7 +12,7 @@ import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
-import {mkdtemp, mkdir, writeFile, readFile, rm, access, stat, readdir} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, access, stat, lstat, readdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {resolve, join} from 'node:path';
 import assert from 'node:assert/strict';
@@ -43,6 +43,56 @@ const injection = '\x1b]52;c;ZXZpbA==\x07';
 
 // 异步判断路径是否存在（access 成功即 true）。
 const exists = p => access(p).then(() => true, () => false);
+
+// 未提交对话只允许 Lease.create 的私有命名空间与固定 inode owner anchor
+// (sessions/<32hex>.resume-lock = 33 字节 'A'|'C'+32 个零)；checkpoint、
+// .session/.jsonl、其他文件或 symlink 仍失败。.thin 来自 mkdirat(0o700)，只要求
+// 无 group/other 位（umask 只会更严），不硬猜精确 mode。
+async function noSubmissionState(project) {
+  const root = join(project, '.thin');
+  if (!await exists(root)) return;
+  const thin = await lstat(root);
+  assert(thin.isDirectory() && !thin.isSymbolicLink(), '.thin: not a real directory');
+  assert.equal(thin.mode & 0o077, 0, '.thin: not private to owner');
+  for (const name of await readdir(root)) assert.equal(name, 'sessions', `.thin/${name}: unexpected project state`);
+  const sessions = join(root, 'sessions'), info = await lstat(sessions);
+  assert(info.isDirectory() && !info.isSymbolicLink(), '.thin/sessions: not a real directory');
+  assert.equal(info.mode & 0o777, 0o700, '.thin/sessions: mode');
+  const entries = await readdir(sessions);
+  for (const name of entries) {
+    const path = join(sessions, name), entry = await lstat(path);
+    assert(entry.isFile() && !entry.isSymbolicLink(), `${name}: not a regular file`);
+    assert.equal(entry.mode & 0o777, 0o600, `${name}: mode`);
+    if (name === '.gitignore') { assert.equal(await readFile(path,'utf8'), '*\n'); continue; }
+    assert.match(name, /^[a-f0-9]{32}\.resume-lock$/, `${name}: unexpected project state`);
+    const marker = await readFile(path);
+    assert.equal(marker.length, 33, `${name}: marker length`);
+    assert(marker[0] === 0x41 || marker[0] === 0x43, `${name}: marker`);
+    assert(marker.subarray(1).every(byte => byte === 0), `${name}: marker padding`);
+  }
+  // 一次前台启动只持有一个 Root session lease；多个需实际 producer 证据。
+  assert(entries.filter(name => name.endsWith('.resume-lock')).length <= 1, 'more than one worker anchor');
+}
+
+// HOME/.thin 只允许 config.json 与可选的私有 discovery index：
+// index 必须是真实 0700 目录，其下 project 键也是空 0700 真实目录，
+// 任何 record/jsonl/其他文件或 symlink 都失败。
+async function thinHome(home, allowed) {
+  const root = join(home, '.thin');
+  const info = await lstat(root);
+  assert(info.isDirectory() && !info.isSymbolicLink(), `${root}: not a real directory`);
+  for (const name of await readdir(root)) assert(name === 'session-index' || allowed.includes(name), `unexpected path: .thin/${name}`);
+  let index;
+  try { index = await lstat(join(root, 'session-index')); } catch (e) { if (e.code === 'ENOENT') return; throw e; }
+  assert(index.isDirectory() && !index.isSymbolicLink(), '.thin/session-index: not a real directory');
+  assert.equal(index.mode & 0o777, 0o700, '.thin/session-index: mode');
+  for (const key of await readdir(join(root, 'session-index'), {withFileTypes:true})) {
+    assert(key.isDirectory() && !key.isSymbolicLink(), `.thin/session-index/${key.name}: not a real directory`);
+    const dir = join(root, 'session-index', key.name);
+    assert.equal((await lstat(dir)).mode & 0o777, 0o700, `${dir}: mode`);
+    for (const name of await readdir(dir)) assert.fail(`${dir}/${name}: session data persisted`);
+  }
+}
 
 // 构造伪造的工具调用对象，arguments 为 JSON 字符串，与真实 API 格式一致。
 const tool = (id, name, args) => ({id, name, arguments: JSON.stringify(args)});
@@ -574,7 +624,7 @@ async function scenario(name, protocol, kind, isPty = false) {
     }
     if (kind === 'menu-navigation') {
       assert.equal(await readFile(join(home,'.thin/config.json'),'utf8'), navigationConfig, 'menu navigation changed configuration');
-      assert.deepEqual(await readdir(join(home,'.thin')), ['config.json'], 'menu navigation saved credentials');
+      await thinHome(home, ['config.json']);
     }
     if (kind === 'auth-go') {
       const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
@@ -587,8 +637,7 @@ async function scenario(name, protocol, kind, isPty = false) {
     if (['exit-no-submit','exit-unconfigured','exit-secret','exit-batched','menu-navigation','auth-go'].includes(kind)) {
       assert.equal(requests,0, 'exit identity must not send a request');
       // Global defaults need no project artifact before any submission.
-      const projectThin = join(project,'.thin');
-      assert(!await exists(projectThin), 'identity/no-submission created project storage');
+      await noSubmissionState(project);
       if (['exit-unconfigured','exit-secret'].includes(kind)) {
         const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
         assert.equal(disk.llm.providers.local.api_key,null, 'Ctrl+D secret exit must not save input');
@@ -649,12 +698,14 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert.equal((await stat(authPath)).mode & 0o777, 0o600, 'auth file must be private');
       assert.equal(auth.llm.providers[kind === 'auth-activate' ? 'local' : 'deepseek'].api_key_env ?? '', '');
       if (kind !== 'auth-activate') {
-        assert(!await exists(join(project,'.thin/sessions')), 'initialization created session records without submission');
+        await noSubmissionState(project);
         // With no metadata/declaration, persist the logical medium preference
         // without manufacturing a supported high level before authentication.
-        // No submission may create archives or any other project artifact.
-        assert.deepEqual((await readdir(project)).sort(), ['seed.txt'], 'unexpected project files');
-        assert(!await exists(join(project,'.thin')), 'initialization created project settings');
+        // No submission may create archives or any other project artifact; the
+        // host's fixed ownership anchor (.thin/ plus its .resume-lock/.gitignore)
+        // is the only tolerated entry, so verify project files excluding .thin.
+        assert.deepEqual((await readdir(project)).filter(name => name !== '.thin').sort(), ['seed.txt'], 'unexpected project files');
+        assert(!await exists(join(project,'.thin/settings.json')), 'initialization created project settings');
         assert.equal(auth.llm.reasoning_effort,'medium');
         const declared = auth.llm.providers.deepseek.models['deepseek-flash'];
         assert.equal(declared.protocol,'chat');
@@ -744,7 +795,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert.equal(disk.llm.providers.local.api_key_env,'THIN_FIXTURE_KEY');
       assert(!JSON.stringify(disk).includes(KEY), 'environment credential was persisted');
       assert.equal((await stat(path)).mode & 0o777,0o600);
-      assert(!await exists(join(project,'.thin/sessions')), 'empty selection created session history');
+      await noSubmissionState(project);
     }
     if (kind === 'model-select') {
       assert.equal(requests,4, 'selection issued discovery or extra requests');

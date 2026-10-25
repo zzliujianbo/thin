@@ -827,8 +827,48 @@ fn memoryAllocationCase(a: std.mem.Allocator) !void {
     }
 }
 
+/// The callbacks may grow through realloc, so a fail-index matrix over the raw
+/// allocator is not deterministic: a successful remap removes an allocation and
+/// the exhaustive pass can then report NondeterministicMemoryUsage. Run the
+/// exhaustive matrix behind WipingAllocator (which always allocates anew), then
+/// scan the same bound again with the plain allocator to keep the normal
+/// growth-then-OOM path under test.
+fn checkConfigAllocationFailures(comptime case: anytype) !void {
+    const Stable = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var wiping: WipingAllocator = .{ .backing = a };
+            try case(wiping.allocator());
+        }
+    };
+    // Strict exhaustive matrix over a deterministic allocation sequence.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Stable.run, .{});
+
+    // The uninterrupted run gives the allocation-sequence upper bound.
+    var nofail = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try Stable.run(nofail.allocator());
+    const bound = nofail.alloc_index;
+    try std.testing.expectEqual(nofail.allocated_bytes, nofail.freed_bytes);
+    try std.testing.expect(bound > 0);
+
+    var resized_then_oom: usize = 0;
+    for (0..bound) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        if (case(failing.allocator())) |_| {
+            // Fewer allocations are allowed: a successful remap can save one.
+            try std.testing.expect(!failing.has_induced_failure);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            if (failing.resize_index > 0) resized_then_oom += 1;
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    // Prove the normal path still reaches OOM after a real remap succeeded.
+    try std.testing.expect(resized_then_oom > 0);
+}
+
 test "memory config allocation failures release parse clone and disk candidates" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, memoryAllocationCase, .{});
+    try checkConfigAllocationFailures(memoryAllocationCase);
 }
 
 test "legacy subagent switch is validated then dropped instead of persisted" {
@@ -885,7 +925,7 @@ fn legacySubagentAllocationCase(a: std.mem.Allocator) !void {
 }
 
 test "legacy subagent config allocation failures release parse clone and disk candidates" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, legacySubagentAllocationCase, .{});
+    try checkConfigAllocationFailures(legacySubagentAllocationCase);
 }
 
 /// Candidate-only edits. Allocate replacement slices; never mutate shared registry memory.

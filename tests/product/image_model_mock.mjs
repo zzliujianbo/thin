@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp, mkdir, writeFile, readFile, readdir, stat, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {assertConfigHome} from './assert_config_home.mjs';
 
 const MAIN_KEY = 'image-primary-fake-never-log', AUX_KEY = 'image-aux-fake-never-log';
 const MAIN = 'fixture-main', SELECTOR = 'aux/deepseek-flash';
@@ -243,9 +244,17 @@ export async function imageModelRegressions({app,pty,execute}) {
       }
       assert.equal(result.code,0); assert.equal(result.signal,null);
       assert.equal(mainPosts,isPty ? 4 : 2); assert.equal(auxPosts,1); assert.equal(connections,2);
+      // Only a real interactive shutdown publishes a saved id; headless never does.
+      let savedId = null;
+      if (isPty) {
+        const saved = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
+        assert.equal(saved.length,1,'saved session id missing');
+        savedId = saved[0][1];
+      }
       if (isPty) {
         assert.deepEqual(gates,['opened','canceled','selected','off']); await saved(false);
-        assert.deepEqual(await readdir(join(home,'.thin')),['config.json']);
+        // This owner published a checkpoint, so its discovery record is retained.
+        await assertConfigHome(home,{project,id:savedId});
         assert.deepEqual((await readdir(project)).sort(),['.thin',FILE,...gates.map(n=>`image-model-release-${n}`)].sort());
       } else {
         assert(result.output.includes('image-tool-result-verified'));
@@ -275,6 +284,7 @@ export async function imageModelRegressions({app,pty,execute}) {
           // checkpoint. The real logged PTY must publish canonical state.
           const checkpoint = sessionFiles.filter(n=>n.endsWith('.session'));
           assert.equal(checkpoint.length,1,'canonical checkpoint missing');
+          assert.equal(checkpoint[0],`${savedId}.session`,'checkpoint does not match saved id');
           const bytes = await readFile(join(sessionDir,checkpoint[0]));
           assert(bytes.includes(Buffer.from(DESCRIPTION)),'image result absent from checkpoint');
           assert(bytes.includes(Buffer.from('image-off-verified')),'final checkpoint not current');

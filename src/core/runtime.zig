@@ -259,6 +259,10 @@ pub const Host = struct {
     }
 };
 
+/// Directly submitted text has no Inbox entry. Committed Inbox ids start at 1,
+/// so 0 is reserved for the accepted task's original input.
+pub const direct_input_id: u64 = 0;
+
 /// 只读的宿主观察接口；不授予权限、不改变运行结果，也不拥有借用的字符串。
 /// 应用层可用于本地留档，Runtime 不负责文件路径或存储。回调必须自行处理失败。
 pub const Observation = union(enum) {
@@ -1709,10 +1713,20 @@ pub const Runtime = struct {
         // uses estimatedTokens(), which includes this appended reference.
     }
 
+    /// Publish the accepted direct input to observers exactly once, before the
+    /// first model call, so a crashed run still has a resumable checkpoint. The
+    /// submitting frontend already rendered this text, so never emit it as a
+    /// Host event -- that would duplicate the user row.
     fn retainCurrentInput(self: *Runtime, retained: *bool) !void {
         if (retained.*) return;
         self.history.items[self.protected_index] = try p.cloneMessage(self.arena.allocator(), self.history.items[self.protected_index]);
         retained.* = true;
+        const blocks = self.history.items[self.protected_index].blocks;
+        if (blocks.len == 0) return;
+        switch (blocks[0]) {
+            .text => |text| self.observer.notify(.{ .event = .{ .user_committed = .{ .id = direct_input_id, .text = text } } }),
+            else => {},
+        }
     }
 
     fn reserveSteering(self: *Runtime) bool {

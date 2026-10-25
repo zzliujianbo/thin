@@ -29,6 +29,7 @@ const activity = @import("activity.zig");
 const presentation = @import("presentation.zig");
 const shared = @import("../presentation.zig");
 const bridge_module = @import("bridge.zig");
+const session_client = @import("session_client.zig");
 const Io = std.Io;
 
 pub const ModelProvider = picker_module.Provider;
@@ -39,6 +40,8 @@ const StopIdentity = struct {
     task_epoch: u64,
     revision: u64,
     busy: bool,
+    /// Remote control epoch: takeover makes an open confirmation stale.
+    remote_epoch: u64 = 0,
 };
 
 /// 单条显示记录的字节上限（128 KiB）。超出部分只影响显示，不影响模型历史。
@@ -205,7 +208,15 @@ fn localHistoryCall(messages: []const p.Message, index: usize) ?[]const u8 {
 /// 当前等待用户审批的工具调用。description 由 Ui 的 allocator 持有，由 clearPermission 释放。
 /// clipped 表示预览被截断；pasted 表示审批期间出现过粘贴。两者任一为真时只能拒绝。
 const ApprovalChoice = enum { allow_once, deny };
-const Permission = struct { id: u64, description: []const u8, clipped: bool, pasted: bool = false, choice: ApprovalChoice = .deny };
+const Permission = struct {
+    id: u64,
+    description: []const u8,
+    clipped: bool,
+    pasted: bool = false,
+    choice: ApprovalChoice = .deny,
+    /// Remote control epoch the approval was displayed in; 0 for local.
+    epoch: u64 = 0,
+};
 
 /// UI-owned callbacks; the application owns the runtime and configuration lifetime.
 pub const Connection = struct {
@@ -231,9 +242,25 @@ pub const Connection = struct {
     /// Explicit metadata refresh and bounded owner polling, separate from LLM jobs.
     refresh_models_fn: ?*const fn (*anyopaque) anyerror!void = null,
     poll_models_fn: ?*const fn (*anyopaque, bool) bool = null,
+    /// Optional remote session adapter (daemon --connect / --attach). When set,
+    /// the TUI never dereferences a Runtime: tasks, Inbox, approvals and
+    /// checkpoints stay owned by the backend and the UI only submits, ACKs and
+    /// renders. Absent keeps the original local foreground ownership path.
+    session_client: ?session_client.Client = null,
 
     pub const State = struct {
         runtime: ?*r.Runtime,
+        /// Remote session is attachable: submitting plus model/settings UI are
+        /// allowed even though `runtime` is null. Two session owners never
+        /// coexist for one connection.
+        available: bool = false,
+        /// Owner-reported task activity of the attached remote session.
+        busy: bool = false,
+        /// Borrowed display-only session identity; never used as a path.
+        session_label: ?[]const u8 = null,
+        launcher_dir: ?[]const u8 = null,
+        /// Controller epoch; a change invalidates old approvals and queue sends.
+        control_epoch: u64 = 0,
         /// Immutable app-prepared startup snapshot; no runtime dereference in draw.
         initial_context: ?r.ContextSnapshot = null,
         model: []const u8,
@@ -306,6 +333,12 @@ pub const Connection = struct {
     }
 };
 
+/// Configured means a local Runtime exists or a remote session is available;
+/// never infer it from model text or from the absence of a Runtime alone.
+fn configured(state: Connection.State) bool {
+    return state.runtime != null or state.available;
+}
+
 /// TUI 入口：打开终端，运行事件循环直到退出，并恢复终端属性。返回进程退出码。
 pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge_module.Bridge, cancel: *p.Cancellation) !u8 {
     // Snapshot immutable identity BEFORE the loop; never inspect writer Store.
@@ -327,6 +360,9 @@ pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge
     defer a.free(banner);
     _ = try ui.add(.notice, banner);
     if (connection.initial_history_fn) |history| try ui.restoreHistory(history(connection.context));
+    // Remote attach may already own a running task; adopt its epoch before the
+    // first frame so a stale approval or queue send cannot cross sessions.
+    if (connection.session_client) |client| ui.adoptRemoteSession(client);
 
     // 事件循环出错时直接返回，资源释放交给上面的 defer。
     const result = ui.loop() catch |err| {
@@ -441,6 +477,20 @@ const Ui = struct {
     stop_identity: ?StopIdentity = null,
     displayed_stop: ?u64 = null,
     frame_stop: ?u64 = null,
+    /// Remote control epoch currently displayed; a change retires old ACK
+    /// authority and any queue ownership for the replaced session.
+    remote_epoch: u64 = 0,
+    remote_observed_busy: bool = false,
+    remote_kind: session_client.TaskKind = .prompt,
+    /// Consecutive idle observations used to settle a lost remote terminal.
+    remote_idle_ticks: u8 = 0,
+    /// Epoch injected with the next display event; copied into the approval so
+    /// the decision is bound to the session that displayed it.
+    inject_epoch: u64 = 0,
+    /// Owned backend notice text; never a dangling borrowed reply buffer.
+    notice_owned: ?[]u8 = null,
+    /// Owned id of a pending busy-session /close confirmation.
+    stop_close: ?[]const u8 = null,
 
     /// 用户请求退出；若任务仍在运行，会等它结束后再退出。
     want_exit: bool = false,
@@ -538,6 +588,9 @@ const Ui = struct {
 
     /// 释放 Ui 持有的全部资源。顺序很重要：先关 bridge 并取消任务，再等待 worker 结束，否则 worker 可能仍在访问 Ui 字段。
     fn deinit(self: *Ui) void {
+        // Remote sessions: release this view/control only. Never send a task
+        // cancel from teardown; the backend keeps running and saves state.
+        if (self.connection.session_client) |client| client.detach();
         // 关闭 bridge 并发出取消，让后台任务尽快退出。
         self.bridge.close();
         self.cancel.cancel();
@@ -568,6 +621,450 @@ const Ui = struct {
             pending.editor.deinit();
         }
         self.input_history.deinit(self.allocator);
+        if (self.notice_owned) |owned| self.allocator.free(owned);
+        if (self.stop_close) |id| self.allocator.free(id);
+    }
+
+    // ---- Remote session adapter -------------------------------------------------
+    // Local foreground ownership stays exactly as before. When Connection carries
+    // a session_client, tasks/Inbox/approvals belong to the backend: the UI
+    // submits, acknowledges and renders, and never dereferences a Runtime.
+
+    fn remote(self: *const Ui) ?session_client.Client {
+        return self.connection.session_client;
+    }
+
+    /// True for a locally executed !command, which projects literal streams.
+    fn commandKind(self: *const Ui) bool {
+        if (self.remote() != null) return self.remote_kind == .command;
+        return self.job.kind == .command;
+    }
+
+    fn promptKind(self: *const Ui) bool {
+        if (self.remote() != null) return self.remote_kind == .prompt;
+        return self.job.kind == .prompt;
+    }
+
+    /// Queue state for rendering and the open/enter stop confirmation. Remote
+    /// counts come from the owner snapshot; local counts from the UI-owned Inbox.
+    fn queueSnapshot(self: *Ui) inbox_module.Snapshot {
+        const client = self.remote() orelse return self.inbox.snapshot();
+        const snapshot = client.snapshot();
+        var mirror = inbox_module.Snapshot{
+            .revision = snapshot.queue_revision,
+            .steering = snapshot.steering,
+            .follow_up = snapshot.follow_up,
+            .newest_id = snapshot.newest_id,
+            .newest_bytes = snapshot.newest_bytes,
+            .paused = snapshot.queue_paused,
+            .confirming = self.stop_open,
+            .active = snapshot.busy,
+            .epoch = snapshot.control_epoch,
+        };
+        const shown = @min(snapshot.previews.len, @min(mirror.previews.len, session_client.max_previews));
+        for (snapshot.previews[0..shown], 0..) |preview, index| {
+            var entry = &mirror.previews[index];
+            entry.id = preview.id;
+            entry.kind = preview.kind;
+            var n = @min(entry.bytes.len, preview.text.len);
+            while (n < preview.text.len and n > 0 and preview.text[n] & 0xc0 == 0x80) n -= 1;
+            @memcpy(entry.bytes[0..n], preview.text[0..n]);
+            entry.len = n;
+            mirror.preview_count += 1;
+        }
+        return mirror;
+    }
+
+    /// Startup attach: adopt the owner epoch and any already-running task.
+    fn adoptRemoteSession(self: *Ui, client: session_client.Client) void {
+        const snapshot = client.snapshot();
+        self.remote_epoch = snapshot.control_epoch;
+        self.remote_observed_busy = snapshot.busy;
+        self.remote_kind = snapshot.task_kind;
+        if (snapshot.busy) {
+            self.busy = true;
+            self.mode = snapshot.mode orelse .calling_model;
+            self.notice = "Attached; task is running";
+        } else if (snapshot.attached) {
+            self.notice = "Ready";
+        }
+    }
+
+    /// Transfer the next backend display event into the local Bridge. Only one
+    /// event is injected per tick into a provably empty queue: this thread both
+    /// produces and consumes that queue, so a blocking emit on a full queue
+    /// could never make progress.
+    fn pumpRemote(self: *Ui) !void {
+        const client = self.remote() orelse return;
+        var snapshot = client.snapshot();
+        if (snapshot.control_epoch != self.remote_epoch) {
+            self.remote_epoch = snapshot.control_epoch;
+            self.resetSessionView(snapshot);
+            snapshot = client.snapshot();
+        }
+        if (self.bridgeEmpty()) {
+            const delivered = pollRemote(client, self.allocator) catch |err| blk: {
+                self.notice = session_client.describe(err);
+                self.requestDraw();
+                break :blk null;
+            };
+            if (delivered) |value| {
+                var item = value;
+                defer item.deinit();
+                self.inject_epoch = item.epoch;
+                if (item.event == .permission or item.event == .permission_cleared) {
+                    // Approvals are backend-owned. The local Bridge's pending id
+                    // belongs to a Runtime authorize() call that never happens
+                    // remotely, so routing them there would strand the next one.
+                    self.applyEvent(item.event, item.display_truncated, item.canonical_complete) catch {
+                        self.notice = "Approval display failed; reattach to resync";
+                        self.requestDraw();
+                    };
+                } else {
+                    const host = self.bridge.host();
+                    host.emit_fn(host.context, item.event, self.cancel) catch |err| switch (err) {
+                        error.Canceled => {},
+                        else => {
+                            self.notice = "Display queue rejected a session event; reattach to resync";
+                            self.requestDraw();
+                        },
+                    };
+                }
+            }
+        }
+        self.adoptRemoteActivity(client.snapshot());
+    }
+
+    /// Take the next delta that belongs to the current control epoch. Deltas a
+    /// replaced controller queued before takeover are discarded, never rendered
+    /// or allowed to authorize anything in the new session view.
+    fn pollRemote(client: session_client.Client, a: std.mem.Allocator) !?session_client.Item {
+        for (0..8) |_| {
+            const polled = try client.poll(a);
+            var item = polled orelse return null;
+            if (item.epoch != 0 and item.epoch != client.snapshot().control_epoch) {
+                item.deinit();
+                continue;
+            }
+            return item;
+        }
+        return null;
+    }
+
+    fn bridgeEmpty(self: *const Ui) bool {
+        std.debug.assert(std.c.pthread_mutex_lock(&self.bridge.mutex) == .SUCCESS);
+        defer std.debug.assert(std.c.pthread_mutex_unlock(&self.bridge.mutex) == .SUCCESS);
+        return self.bridge.len == 0 and self.bridge.outstanding == 0 and self.bridge.bytes == 0 and self.bridge.active == 0;
+    }
+
+    /// Track owner-reported activity. A task that becomes idle without a
+    /// delivered terminal is settled explicitly after a second observation, so
+    /// a lost result never leaves the composer stuck in a busy state.
+    fn adoptRemoteActivity(self: *Ui, snapshot: *const session_client.Snapshot) void {
+        if (snapshot.busy) {
+            self.remote_idle_ticks = 0;
+            // The owner can stay busy across two tasks: completing the previous
+            // task clears the local view while `remote_observed_busy` is still
+            // true. Re-adopt whenever the owner reports a task and the local
+            // view is idle, or the next task could never become visible.
+            if (!self.busy) {
+                self.busy = true;
+                self.mode = snapshot.mode orelse .calling_model;
+                self.remote_kind = snapshot.task_kind;
+                self.notice = "Attached; task is running";
+                self.approval_paste_seen = false;
+                self.requestDraw();
+            }
+        } else if (self.busy and (self.remote_observed_busy or self.remote_idle_ticks != 0)) {
+            // Consecutive idle samples must keep accumulating after the first one
+            // clears `remote_observed_busy`; entering this branch at all already
+            // requires a busy sample, either now or when the count started.
+            self.remote_idle_ticks +|= 1;
+            if (self.remote_idle_ticks >= 2 and self.bridge.terminal == null and self.bridgeEmpty()) self.settleRemoteIdle();
+        }
+        self.remote_observed_busy = snapshot.busy;
+    }
+
+    fn settleRemoteIdle(self: *Ui) void {
+        self.busy = false;
+        self.mode = null;
+        self.remote_idle_ticks = 0;
+        if (self.draft) |index| self.records.items[index].interrupted = true;
+        self.discardReasoning();
+        self.draft = null;
+        self.clearActiveTool();
+        self.clearToolCaptions();
+        self.tool_views.clear(self.allocator);
+        self.clearPermission();
+        self.last_terminal = null;
+        self.notice = "Remote task ended without a terminal result; reattach to verify";
+        self.requestDraw();
+    }
+
+    /// A new control epoch (attach/takeover/session switch) revokes every piece
+    /// of display authority that belonged to the old session.
+    fn resetSessionView(self: *Ui, snapshot: *const session_client.Snapshot) void {
+        // The owner's snapshot is the only source of epoch identity; nothing is
+        // read from a local Runtime for an attached remote session.
+        self.remote_epoch = snapshot.control_epoch;
+        self.clearPermission();
+        self.stop_open = false;
+        self.stop_danger = false;
+        self.stop_identity = null;
+        self.stop_generation +%= 1;
+        self.displayed_stop = null;
+        self.frame_stop = null;
+        if (self.stop_close) |id| {
+            self.allocator.free(id);
+            self.stop_close = null;
+        }
+        self.detachInbox();
+        self.queue_owner = null;
+        self.inbox.deinit();
+        self.inbox = .{};
+        self.clearActiveTool();
+        self.clearToolCaptions();
+        self.tool_calls.deinit(self.allocator);
+        self.tool_calls = .{};
+        self.tool_views.clear(self.allocator);
+        for (self.records.items) |*record| record.deinit(self.allocator);
+        self.records.clearRetainingCapacity();
+        self.draft = null;
+        self.reasoning = null;
+        self.dropped_display = false;
+        self.scroll = 0;
+        self.last_terminal = null;
+        self.mode = null;
+        self.display = .{};
+        self.model_flow = .{};
+        self.has_submitted = false;
+        self.poisoned = false;
+        self.want_exit = false;
+        self.closeSettingsMenu();
+        self.closeProviderPicker();
+        self.closeModelPicker();
+        self.closeCommandMenu();
+        self.secret_mode = false;
+        self.secret_quarantine = false;
+        self.secret.wipe();
+        self.secret_provider = null;
+        self.parser.secretMode(false);
+        self.input_history.deinit(self.allocator);
+        self.dropHistoryDraft();
+        self.wipeEditor();
+        self.bridge.reset() catch {};
+        // A new epoch may restart approval ids; rebase only while nothing is
+        // pending so a stale decision cannot approve the first new request.
+        const host = self.bridge.host();
+        if (host.rebase_permission_fn) |rebase| rebase(host.context) catch {};
+        self.discardResizedFrame();
+        self.displayed_permission = null;
+        self.displayed_permission_choice = null;
+        self.frame_permission = null;
+        self.frame_permission_choice = null;
+        self.displayed_model_epoch = null;
+        self.displayed_model_generation = null;
+        self.displayed_command_generation = null;
+        self.displayed_provider_generation = null;
+        self.displayed_settings_generation = null;
+        self.displayed_decision_fingerprint = null;
+        self.frame_decision_fingerprint = null;
+        self.model_epoch +%= 1;
+        self.command_menu.changed();
+        self.task_epoch +%= 1;
+        self.remote_kind = snapshot.task_kind;
+        self.remote_observed_busy = snapshot.busy;
+        self.remote_idle_ticks = 0;
+        self.busy = snapshot.busy;
+        if (snapshot.busy) self.mode = snapshot.mode orelse self.mode;
+        self.notice = if (snapshot.busy) "Attached; task is running" else "Ready";
+        self.display_changed = true;
+        self.resize_waiting = false;
+        self.resize_redraw_at_ms = null;
+        self.frame_fresh = false;
+        self.dirty = true;
+    }
+
+    fn adoptNotice(self: *Ui, value: []u8) void {
+        if (self.notice_owned) |old| self.allocator.free(old);
+        self.notice_owned = value;
+        self.notice = value;
+    }
+
+    /// Session-management commands are parsed before busy/steering handling: they
+    /// never enter model history, Steering, FollowUp or an inference request.
+    fn runManageText(self: *Ui, command: []const u8) bool {
+        const trimmed = std.mem.trim(u8, command, " \t");
+        if (trimmed.len == 0 or trimmed[0] != '/') return false;
+        const name_end = std.mem.findAny(u8, trimmed, " \t\r\n") orelse trimmed.len;
+        const name = trimmed[0..name_end];
+        const is_list = std.mem.eql(u8, name, "/ls");
+        const is_cd = std.mem.eql(u8, name, "/cd");
+        const is_attach = std.mem.eql(u8, name, "/attach") or std.mem.eql(u8, name, "/attch");
+        const is_detach = std.mem.eql(u8, name, "/detach");
+        const is_exit = std.mem.eql(u8, name, "/exit");
+        const is_close = std.mem.eql(u8, name, "/close");
+        if (!(is_list or is_cd or is_attach or is_detach or is_exit or is_close)) return false;
+        // The editor is wiped below; parse an owned copy so arguments stay valid.
+        const owned = self.allocator.dupe(u8, trimmed) catch {
+            self.wipeEditor();
+            self.notice = "Out of memory; command not sent";
+            return true;
+        };
+        defer self.allocator.free(owned);
+        self.wipeEditor();
+        const backend = self.remote() orelse {
+            self.notice = "Session commands need a daemon connection (thin --connect)";
+            return true;
+        };
+        const name_end_owned = std.mem.findAny(u8, owned, " \t\r\n") orelse owned.len;
+        const rest = std.mem.trim(u8, owned[name_end_owned..], " \t");
+        if (std.mem.findScalar(u8, owned, '\n') != null or std.mem.findScalar(u8, owned, '\r') != null or std.mem.findScalar(u8, owned, 0) != null) {
+            self.notice = "Session commands are single-line";
+            return true;
+        }
+        if (is_detach or is_exit) {
+            if (rest.len != 0) {
+                self.notice = if (is_detach) "Usage: /detach" else "Usage: /exit";
+                return true;
+            }
+            self.applyManage(backend, if (is_detach) .detach else .exit);
+            return true;
+        }
+        if (is_cd) {
+            if (rest.len == 0 or rest.len > 4096) {
+                self.notice = "Usage: /cd <directory>";
+                return true;
+            }
+            // No chdir and no bash string: the backend validates the path,
+            // detaches first and changes only the launcher directory.
+            self.applyManage(backend, .{ .cd = rest });
+            return true;
+        }
+        var words: [4][]const u8 = undefined;
+        const count = splitWords(rest, &words);
+        if (is_list) {
+            var running_only = false;
+            var page: usize = 0;
+            var index: usize = 0;
+            while (index < count) : (index += 1) {
+                const word = words[index];
+                if (std.mem.eql(u8, word, "--running")) {
+                    running_only = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, word, "--page") and index + 1 < count) {
+                    index += 1;
+                    page = std.fmt.parseInt(usize, words[index], 10) catch {
+                        self.notice = "Usage: /ls [--running] [--page N]";
+                        return true;
+                    };
+                    continue;
+                }
+                self.notice = "Usage: /ls [--running] [--page N]";
+                return true;
+            }
+            self.applyManage(backend, .{ .list = .{ .running_only = running_only, .page = page } });
+            return true;
+        }
+        var force = false;
+        var takeover = false;
+        var id: ?[]const u8 = null;
+        for (words[0..count]) |word| {
+            if (is_attach and std.mem.eql(u8, word, "--takeover")) {
+                takeover = true;
+                continue;
+            }
+            if (is_close and std.mem.eql(u8, word, "--force")) {
+                force = true;
+                continue;
+            }
+            if (word.len != 0 and word[0] == '-') {
+                self.notice = if (is_attach) "Usage: /attach [--takeover] <id>" else "Usage: /close [--force] <id>";
+                return true;
+            }
+            if (id != null) {
+                self.notice = if (is_attach) "Usage: /attach [--takeover] <id>" else "Usage: /close [--force] <id>";
+                return true;
+            }
+            id = word;
+        }
+        const session_id = id orelse {
+            self.notice = if (is_attach) "Usage: /attach [--takeover] <id>" else "Usage: /close [--force] <id>";
+            return true;
+        };
+        if (session_id.len == 0 or session_id.len > 256) {
+            self.notice = "Invalid session id";
+            return true;
+        }
+        if (is_attach) {
+            self.applyManage(backend, .{ .attach = .{ .id = session_id, .takeover = takeover } });
+        } else {
+            self.startClose(backend, session_id, force);
+        }
+        return true;
+    }
+
+    fn splitWords(text_: []const u8, out: *[4][]const u8) usize {
+        var count: usize = 0;
+        var it = std.mem.tokenizeAny(u8, text_, " \t");
+        while (it.next()) |word| {
+            if (count == out.len) break;
+            out[count] = word;
+            count += 1;
+        }
+        return count;
+    }
+
+    fn applyManage(self: *Ui, client: session_client.Client, request: session_client.Manage) void {
+        var outcome = client.manage(self.allocator, request) catch |err| {
+            self.notice = session_client.describe(err);
+            self.requestDraw();
+            return;
+        };
+        defer outcome.deinit(self.allocator);
+        const leaving = outcome.exit;
+        if (outcome.switched) self.resetSessionView(client.snapshot());
+        if (outcome.listing) |listing| _ = self.add(.notice, listing) catch {};
+        if (outcome.notice) |notice| {
+            // Transfer ownership instead of copying a bounded listing twice.
+            outcome.notice = null;
+            self.adoptNotice(notice);
+        } else if (outcome.listing != null) {
+            self.notice = "Ready";
+        }
+        if (leaving) self.requestQuit();
+        self.requestDraw();
+    }
+
+    fn attachedSession(self: *const Ui, id: []const u8) bool {
+        const hex = self.connection.current().session_id orelse return false;
+        if (id.len != hex.len * 2) return false;
+        const alphabet = "0123456789abcdef";
+        for (hex, 0..) |byte, index| {
+            if (id[index * 2] != alphabet[byte >> 4] or id[index * 2 + 1] != alphabet[byte & 0x0f]) return false;
+        }
+        return true;
+    }
+
+    /// Busy close needs an explicit confirmation; `--force` is the typed form of
+    /// the same intent. Unknown (not attached) sessions are decided by the owner.
+    fn startClose(self: *Ui, client: session_client.Client, id: []const u8, force: bool) void {
+        if (!force and self.busy and self.attachedSession(id)) {
+            if (self.stop_close) |old| self.allocator.free(old);
+            self.stop_close = self.allocator.dupe(u8, id) catch {
+                self.notice = "Out of memory; close not requested";
+                return;
+            };
+            self.stop_open = true;
+            self.stop_danger = false;
+            self.stop_identity = self.stopIdentity();
+            self.invalidateStop();
+            self.parser.stop_feed = true;
+            self.notice = "Session is busy; confirm close";
+            return;
+        }
+        self.applyManage(client, .{ .close = .{ .id = id, .force = force } });
     }
 
     /// 释放当前审批的描述并清空审批状态（包括已显示的审批 id/choice）。
@@ -777,7 +1274,8 @@ const Ui = struct {
             }
         }
         if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
-        if (notice.len == 0 and state.runtime == null and (state.settings_notice == null or state.model.len == 0)) notice = "Not configured: /login, then /model";
+        if (notice.len == 0 and !configured(state) and (state.settings_notice == null or state.model.len == 0)) notice = "Not configured: /login, then /model";
+        if (notice.len == 0 and self.remote() != null and !state.available) notice = "Daemon connection unavailable; /exit and reconnect";
         if (notice.len == 0 and state.settings_error == null) if (state.pending_default_effort) |effort| {
             notice = try std.fmt.allocPrint(a, "Default thinking: {s}; awaiting model capabilities", .{effort.name() orelse "unknown"});
         };
@@ -791,7 +1289,7 @@ const Ui = struct {
         if (state.log_error) |err| return std.fmt.allocPrint(a, "{s}{s}REC FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
         if (!state.logging_enabled) return std.fmt.allocPrint(a, "{s}{s}recording off", .{ notice, if (notice.len != 0) " | " else "" });
         // Advisory worker state never replaces failures, approvals or queued input.
-        if (notice.len == 0 and self.permission == null and !self.stop_open and self.inbox.snapshot().newest_id == null and !self.inbox.snapshot().paused) {
+        if (notice.len == 0 and self.permission == null and !self.stop_open and self.queueSnapshot().newest_id == null and !self.queueSnapshot().paused) {
             if (self.metadata_toast) |toast| return toast.text;
             if (state.memory_notice) |memory_notice| if (self.presentMemoryNotice(memory_notice)) |visible| return visible;
         }
@@ -843,9 +1341,17 @@ const Ui = struct {
 
     /// 把一个 bridge 事件应用到 UI 状态：追加文本、更新状态、插入审批或工具记录等。
     fn event(self: *Ui, item: bridge_module.Item) !void {
+        return self.applyEvent(item.event, item.display_truncated, item.canonical_complete);
+    }
+
+    /// One typed event applied to the UI. Local workers reach this through the
+    /// Bridge; remote display deltas reuse the same path, with approvals applied
+    /// directly because their authorization belongs to the backend, not to the
+    /// local Bridge's Runtime-pending bookkeeping.
+    fn applyEvent(self: *Ui, event_: r.Event, display_truncated: bool, canonical_complete: bool) !void {
         self.requestDraw();
-        self.display.observe(item.event, self.clock_ms);
-        switch (item.event) {
+        self.display.observe(event_, self.clock_ms);
+        switch (event_) {
             .state => |state| self.mode = state,
             .user_committed => |v| {
                 self.draft = null;
@@ -857,14 +1363,14 @@ const Ui = struct {
             },
             .text => |v| {
                 try self.appendDraft(.assistant, v);
-                if (item.display_truncated and self.draft != null) {
+                if (display_truncated and self.draft != null) {
                     self.records.items[self.draft.?].clipped = true;
                     self.records.items[self.draft.?].invalidate();
                 }
             },
             .reasoning => |v| {
                 try self.appendDraft(.reasoning, v);
-                if (item.display_truncated and self.reasoning != null) {
+                if (display_truncated and self.reasoning != null) {
                     self.records.items[self.reasoning.?].clipped = true;
                     self.records.items[self.reasoning.?].invalidate();
                 }
@@ -872,15 +1378,15 @@ const Ui = struct {
             .assistant_committed => |blocks| {
                 try self.captureToolCaptions(blocks);
                 // Runtime's command marker is canonical provenance, not model prose.
-                if (self.job.kind != .command)
-                    try self.replaceCommitted(blocks, item.display_truncated, item.canonical_complete);
+                if (!self.commandKind())
+                    try self.replaceCommitted(blocks, display_truncated, canonical_complete);
             },
             .permission => |permission| {
                 self.closeModelPicker();
                 // 新审批到来时先释放旧的；粘贴标记沿用到这次请求。
                 self.clearPermission();
                 self.approval_paste_seen = self.approval_paste_seen or self.parser.pasted;
-                self.permission = .{ .id = permission.id, .description = try self.allocator.dupe(u8, permission.description), .clipped = item.display_truncated, .pasted = self.approval_paste_seen };
+                self.permission = .{ .id = permission.id, .description = try self.allocator.dupe(u8, permission.description), .clipped = display_truncated, .pasted = self.approval_paste_seen, .epoch = self.inject_epoch };
                 self.permission_scroll = 0;
             },
             .tool_started => |tool| {
@@ -905,7 +1411,7 @@ const Ui = struct {
                     try self.toolCompleted(caption, tool.result);
                     if (tool.display_key) |identity| self.tool_views.remove(self.allocator, identity);
                 }
-                if (self.job.kind == .command) try self.localCommandOutput(tool.result.text, tool.result.truncated or item.display_truncated);
+                if (self.commandKind()) try self.localCommandOutput(tool.result.text, tool.result.truncated or display_truncated);
             },
             .context_snapshot => {},
             .usage => {},
@@ -944,7 +1450,9 @@ const Ui = struct {
         self.ctrl_d_exit = true;
         self.want_exit = true;
         self.parser.stop_feed = true;
-        if (self.busy) self.cancel.cancel();
+        // A remote frontend leaves without canceling the daemon-owned task;
+        // deinit reports the detach. Explicit Ctrl-C still cancels it.
+        if (self.busy and self.remote() == null) self.cancel.cancel();
     }
     fn exitAuthorized(self: *const Ui) bool {
         return self.ctrl_d_exit or interrupt.signal() != 0;
@@ -983,7 +1491,19 @@ const Ui = struct {
             self.command_matches = .{};
             return;
         }
-        const matches = command_menu_module.suggestions(self.editor.bytes.items, self.editor.cursor, self.editor_pasted);
+        const found = command_menu_module.suggestions(self.editor.bytes.items, self.editor.cursor, self.editor_pasted);
+        // Session management is only executable with a remote adapter; hide it
+        // from local foreground mode instead of advertising a dead command.
+        var matches = command_menu_module.Matches{};
+        if (self.remote() != null) {
+            matches = found;
+        } else {
+            for (found.commands[0..found.len]) |command| {
+                if (command_menu_module.sessionOnly(command)) continue;
+                matches.commands[matches.len] = command;
+                matches.len += 1;
+            }
+        }
         if (matches.len == 0) {
             self.command_matches = .{};
             return;
@@ -1358,7 +1878,7 @@ const Ui = struct {
         self.closeCommandMenu();
         self.closeProviderPicker();
         const state = self.connection.current();
-        self.provider_choices = provider_picker_module.choices(state.runtime == null and state.provider == null);
+        self.provider_choices = provider_picker_module.choices(!configured(state) and state.provider == null);
         self.provider_picker.selected = 0;
         for (self.provider_choices.items[0..self.provider_choices.len], 0..) |choice, index| {
             if (choice == .provider and state.provider == choice.provider) self.provider_picker.selected = index;
@@ -1548,6 +2068,10 @@ const Ui = struct {
     fn submit(self: *Ui) !void {
         if (self.exitAuthorized()) return;
         const command = std.mem.trim(u8, self.editor.bytes.items, " \t\r\n");
+        // Session management resolves before steering: /ls, /cd, /attach,
+        // /detach, /exit and /close work while a task is busy and never enter
+        // the model, Steering or FollowUp.
+        if (self.runManageText(command)) return;
         if (self.busy) return self.enqueueDraft(.steering);
         // Slash commands keep their original modal/secret and stop-feed
         // boundary. Inference/local execution alone needs the display barrier.
@@ -1569,6 +2093,15 @@ const Ui = struct {
             }
             if (!self.queueOwnerMatches()) {
                 self.notice = "Queue belongs to another session; Ctrl-C to clear explicitly";
+                return;
+            }
+            if (self.remote()) |client| {
+                client.queueResume(self.remote_epoch) catch |err| {
+                    self.notice = session_client.describe(err);
+                    return;
+                };
+                self.wipeEditor();
+                self.notice = "Queue resumed";
                 return;
             }
             self.inbox.@"resume"();
@@ -1596,7 +2129,10 @@ const Ui = struct {
         }
         if (std.mem.eql(u8, command, "/help")) {
             self.wipeEditor();
-            _ = try self.add(.notice, "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)\n!command  Run a local command without main-model inference");
+            _ = try self.add(.notice, if (self.remote() != null)
+                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)\n/ls [--running] [--page N]  List sessions\n/cd <dir>  Change launcher directory\n/attach [--takeover] <id>  Attach a session\n/detach  Leave the session view\n/close [--force] <id>  Close a session\n/exit  Leave this frontend\n!command  Run a local command without main-model inference"
+            else
+                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)\n!command  Run a local command without main-model inference");
             return;
         }
         if (std.mem.eql(u8, command, "/settings") or std.mem.startsWith(u8, command, "/settings ") or std.mem.startsWith(u8, command, "/settings\t")) {
@@ -1614,6 +2150,8 @@ const Ui = struct {
                 self.notice = "Compaction requires an idle, non-pasted session";
             } else if (!no_arguments) {
                 self.notice = "Usage: /compact (no arguments)";
+            } else if (self.remote()) |client| {
+                _ = try self.remoteStart(client, .compact, "");
             } else if (self.connection.current().runtime) |runtime| {
                 if (runtime.messages().len == 0) {
                     self.notice = "No conversation to compact yet";
@@ -1665,7 +2203,7 @@ const Ui = struct {
                     self.notice = "Setup requires a drained session bridge";
                     return;
                 };
-                if (self.connection.configure_provider_fn != null) self.openProviderPicker() else if (self.connection.current().runtime != null) self.notice = "Already configured; /login does not replace this session" else self.beginSecret(null);
+                if (self.connection.configure_provider_fn != null) self.openProviderPicker() else if (configured(self.connection.current())) self.notice = "Already configured; /login does not replace this session" else self.beginSecret(null);
             }
             return;
         }
@@ -1686,6 +2224,10 @@ const Ui = struct {
             return;
         }
         const state = self.connection.current();
+        if (self.remote()) |client| {
+            if (try self.remoteStart(client, if (local_command) .command else .prompt, self.editor.bytes.items)) self.wipeEditor();
+            return;
+        }
         const runtime = state.runtime orelse {
             self.wipeEditor();
             self.notice = if (state.model.len == 0) "Not configured: /login, then /model" else state.settings_notice orelse "Not configured: use /login first";
@@ -1785,6 +2327,87 @@ const Ui = struct {
         self.scroll = 0;
     }
 
+    /// Remote task submission. The backend owns the task, its jobs and its
+    /// cancellation; the UI only publishes the accepted submission locally and
+    /// adopts owner-reported activity. Returns false when nothing was accepted,
+    /// in which case the draft and display are unchanged.
+    fn remoteStart(self: *Ui, client: session_client.Client, kind: session_client.TaskKind, value: []const u8) !bool {
+        if (!self.queueOwnerMatches()) {
+            self.notice = "Queue belongs to another session; Ctrl-C to clear explicitly";
+            return false;
+        }
+        if (!client.snapshot().available) {
+            self.notice = "Session unavailable; /exit and reconnect";
+            return false;
+        }
+        self.bridge.reset() catch {
+            self.notice = "Submission requires a drained session display queue";
+            return false;
+        };
+        self.approval_paste_seen = false;
+        // Prepare display and history ownership before the backend accepts the
+        // request so an accepted task cannot lose its visible user row.
+        var history_entry: ?[]u8 = null;
+        if (kind != .compact) history_entry = try self.input_history.prepare(self.allocator, value);
+        var history_committed = false;
+        defer if (!history_committed) {
+            if (history_entry) |entry| @import("input_history.zig").History.discard(self.allocator, entry);
+        };
+        var record = Record{ .kind = .user };
+        var record_moved = false;
+        defer if (!record_moved) record.deinit(self.allocator);
+        if (kind != .compact) try record.append(self.allocator, value);
+        if (kind != .compact) try self.records.ensureUnusedCapacity(self.allocator, 1);
+        client.submit(self.remote_epoch, kind, value) catch |err| {
+            self.notice = session_client.describe(err);
+            return false;
+        };
+        // Accepted: publish the row, evict old display rows, commit history.
+        var bytes: usize = record.body.items.len;
+        for (self.records.items) |old| bytes += old.body.items.len;
+        while (self.records.items.len != 0 and (self.records.items.len >= 64 or bytes > 1024 * 1024)) {
+            var removed = self.records.orderedRemove(0);
+            bytes -= removed.body.items.len;
+            removed.deinit(self.allocator);
+            if (self.draft) |i| self.draft = if (i == 0) null else i - 1;
+            if (self.reasoning) |i| self.reasoning = if (i == 0) null else i - 1;
+            self.dropped_display = true;
+        }
+        if (kind != .compact) {
+            self.records.appendAssumeCapacity(record);
+            record_moved = true;
+        }
+        if (history_entry) |entry| {
+            self.input_history.commit(self.allocator, entry);
+            history_committed = true;
+        }
+        self.dropHistoryDraft();
+        self.task_epoch +%= 1;
+        self.remote_kind = kind;
+        self.remote_observed_busy = false;
+        self.remote_idle_ticks = 0;
+        self.has_submitted = true;
+        self.busy = true;
+        self.compact_composer = false;
+        self.mode = switch (kind) {
+            .command => .executing_tool,
+            .compact => .compacting,
+            .prompt => .calling_model,
+        };
+        self.last_terminal = null;
+        self.notice = switch (kind) {
+            .command => "Running command",
+            .compact => "Compacting context...",
+            .prompt => "Running",
+        };
+        if (kind == .command) self.parser.stop_feed = true;
+        self.display.reset();
+        self.clearActiveTool();
+        self.clearToolCaptions();
+        self.scroll = 0;
+        return true;
+    }
+
     fn dropHistoryDraft(self: *Ui) void {
         if (self.history_draft) |*draft| {
             draft.clear();
@@ -1855,6 +2478,11 @@ const Ui = struct {
     }
 
     fn queueOwnerMatches(self: *Ui) bool {
+        if (self.remote()) |client| {
+            // The backend owns the queue; a takeover must have replaced this
+            // frontend before any new send is accepted.
+            return client.snapshot().control_epoch == self.remote_epoch;
+        }
         const snapshot = self.inbox.snapshot();
         if (snapshot.steering + snapshot.follow_up == 0 and !snapshot.active) return true;
         const owner = self.queue_owner orelse return false;
@@ -1869,12 +2497,28 @@ const Ui = struct {
             self.notice = "Only ordinary conversation text can be queued";
             return;
         }
-        if (self.poisoned or self.stop_open or !self.queueOwnerMatches() or self.attached_runtime == null) {
+        if (self.poisoned or self.stop_open or !self.queueOwnerMatches()) {
             self.notice = "Queue unavailable for this task/session";
             return;
         }
-        if (kind == .steering and self.job.kind != .prompt) {
+        if (kind == .steering and !self.promptKind()) {
             self.notice = "Local commands/compaction accept Alt-Enter FollowUp only";
+            return;
+        }
+        if (self.remote()) |client| {
+            // Delivery, pause and terminal state stay owned by the backend; a
+            // failed enqueue keeps the draft so the user can retry.
+            client.enqueue(self.remote_epoch, kind, self.editor.bytes.items) catch |err| {
+                self.notice = session_client.describe(err);
+                return;
+            };
+            self.wipeEditor();
+            self.parser.stop_feed = true;
+            self.notice = if (kind == .steering) "Steering pending" else "FollowUp pending";
+            return;
+        }
+        if (self.attached_runtime == null) {
+            self.notice = "Queue unavailable for this task/session";
             return;
         }
         _ = self.inbox.enqueue(self.allocator, kind, self.editor.bytes.items) catch {
@@ -1887,6 +2531,8 @@ const Ui = struct {
     }
 
     fn dispatchNext(self: *Ui) !void {
+        // The backend dispatches its own queue; the UI never launches a remote job.
+        if (self.remote() != null) return;
         if (self.busy or self.future != null or self.exitAuthorized() or self.poisoned or self.stop_open or
             self.secret_mode or self.secret_quarantine or self.settings_open or self.provider_open or self.model_picker != null) return;
         // finishRun's sticky pause is authoritative, including explicit resume.
@@ -1916,7 +2562,7 @@ const Ui = struct {
 
     fn stopIdentity(self: *Ui) StopIdentity {
         const state = self.connection.current();
-        return .{ .runtime = state.runtime, .session = state.session_id, .task_epoch = self.task_epoch, .revision = self.inbox.snapshot().revision, .busy = self.busy };
+        return .{ .runtime = state.runtime, .session = state.session_id, .task_epoch = self.task_epoch, .revision = self.queueSnapshot().revision, .busy = self.busy, .remote_epoch = self.remote_epoch };
     }
 
     fn invalidateStop(self: *Ui) void {
@@ -1927,13 +2573,24 @@ const Ui = struct {
     }
 
     fn refreshStop(self: *Ui) void {
-        const revision = self.inbox.snapshot().revision;
+        const revision = self.queueSnapshot().revision;
         if (self.queue_revision != revision) {
             self.queue_revision = revision;
             self.requestDraw();
         }
         if (!self.stop_open) return;
         const identity = self.stopIdentity();
+        if (self.remote() != null) {
+            if (self.stop_identity) |old| {
+                if (old.remote_epoch != identity.remote_epoch or !std.meta.eql(old.session, identity.session)) {
+                    // The owner behind this modal was replaced. Close against the
+                    // old identity (its epoch no longer matches, so no release is
+                    // sent) instead of rebinding Esc to the new session.
+                    self.closeStop();
+                    return;
+                }
+            }
+        }
         if (!std.meta.eql(self.stop_identity, @as(?StopIdentity, identity))) {
             self.stop_identity = identity;
             self.stop_danger = false;
@@ -1942,16 +2599,37 @@ const Ui = struct {
     }
 
     fn closeStop(self: *Ui) void {
+        // Release only the owner this modal was opened against. A takeover or
+        // session switch since then owns a different barrier and must not be
+        // unbound by a late close; busy/revision changes never block release.
+        const was_open = self.stop_open;
+        const identity = self.stop_identity;
+        if (self.remote()) |client| {
+            if (was_open and identity != null) {
+                const current = client.snapshot();
+                if (identity.?.remote_epoch == current.control_epoch and std.meta.eql(identity.?.session, current.session_id)) {
+                    client.setConfirming(identity.?.remote_epoch, false) catch {
+                        // The modal is already gone, so stop gating on it; the
+                        // owner clears the barrier on detach/EOF instead.
+                        self.notice = "Stop dismissed; remote confirmation barrier not released until disconnect";
+                    };
+                }
+            }
+        } else self.inbox.pauseClaims(false);
         self.stop_open = false;
         self.stop_danger = false;
-        self.inbox.pauseClaims(false);
         self.stop_identity = null;
+        if (self.stop_close) |id| {
+            self.allocator.free(id);
+            self.stop_close = null;
+        }
         self.invalidateStop();
         self.parser.stop_feed = true;
     }
 
     fn stopKey(self: *Ui, event_: input.Event) void {
         self.refreshStop();
+        if (!self.stop_open) return;
         switch (event_) {
             .quit => self.requestQuit(),
             .escape => self.closeStop(),
@@ -1981,11 +2659,24 @@ const Ui = struct {
                     self.refreshStop();
                     return;
                 }
-                if (!self.inbox.cancelClear(identity.revision, self.cancel)) {
+                if (self.stop_close != null) {
+                    // Explicit confirmation for closing a busy session; the
+                    // backend performs cancel/join/save and releases ownership.
+                    self.confirmClose();
+                    return;
+                }
+                if (self.remote()) |client| {
+                    client.cancelClear(self.remote_epoch, identity.revision) catch |err| {
+                        self.notice = session_client.describe(err);
+                        self.closeStop();
+                        return;
+                    };
+                } else if (!self.inbox.cancelClear(identity.revision, self.cancel)) {
                     self.refreshStop();
                     return;
                 }
                 self.clearPermission();
+                // The owner clears its own barrier on a successful cancel/clear.
                 self.stop_open = false;
                 self.stop_identity = null;
                 self.invalidateStop();
@@ -2008,14 +2699,37 @@ const Ui = struct {
     }
 
     fn openStop(self: *Ui) void {
-        const snapshot = self.inbox.snapshot();
+        const snapshot = self.queueSnapshot();
         if (!self.busy and snapshot.steering + snapshot.follow_up == 0) return;
-        self.inbox.pauseClaims(true);
+        if (self.remote()) |client| {
+            // The owner gates new launches behind its own confirming flag and
+            // adopts a fresh snapshot on success, so request the barrier before
+            // the modal claims anything and authorize against the adopted queue
+            // revision. A rejected request must never open a fake-safe modal.
+            client.setConfirming(self.remote_epoch, true) catch |err| {
+                self.notice = session_client.describe(err);
+                self.requestDraw();
+                self.parser.stop_feed = true;
+                return;
+            };
+        } else self.inbox.pauseClaims(true);
         self.stop_open = true;
         self.stop_danger = false;
         self.stop_identity = self.stopIdentity();
         self.invalidateStop();
         self.parser.stop_feed = true;
+    }
+
+    /// Busy /close confirmation accepted: cancel, join, save and release via
+    /// the backend. Teardown of the local modal stays local.
+    fn confirmClose(self: *Ui) void {
+        const id = self.stop_close orelse return;
+        const client = self.remote() orelse {
+            self.closeStop();
+            return;
+        };
+        self.applyManage(client, .{ .close = .{ .id = id, .force = true } });
+        self.closeStop();
     }
 
     fn escapeQueue(self: *Ui) !void {
@@ -2024,8 +2738,27 @@ const Ui = struct {
             self.notice = "Draft kept; clear it before withdrawing a pending message";
             return;
         }
-        const snapshot = self.inbox.snapshot();
+        const snapshot = self.queueSnapshot();
         if (snapshot.newest_id) |id| {
+            if (self.remote()) |client| {
+                const withdrawn = client.withdraw(self.allocator, self.remote_epoch, id) catch |err| {
+                    self.notice = session_client.describe(err);
+                    return;
+                };
+                const draft = withdrawn orelse {
+                    self.notice = "Message already consumed; nothing withdrawn";
+                    return;
+                };
+                defer self.allocator.free(draft);
+                if (!(try self.editor.insert(draft))) {
+                    self.notice = "Could not withdraw into the draft; pending message kept";
+                    return;
+                }
+                self.editor_pasted = false;
+                self.input_history.index = null;
+                self.notice = "Pending message withdrawn as plain draft";
+                return;
+            }
             self.editor.bytes.ensureTotalCapacity(self.editor.allocator, snapshot.newest_bytes) catch {
                 self.notice = "Could not prepare editor; pending message kept";
                 return;
@@ -2045,6 +2778,18 @@ const Ui = struct {
     }
 
     fn requestCancel(self: *Ui) void {
+        if (self.remote()) |client| {
+            // Only the current task is canceled; the attached session, its
+            // queue ownership and this connection stay alive.
+            client.cancel(self.remote_epoch) catch |err| {
+                self.notice = session_client.describe(err);
+                return;
+            };
+            self.notice = "Cancellation requested; cleaning up, not rolling back effects";
+            self.clearPermission();
+            self.parser.stop_feed = true;
+            return;
+        }
         self.inbox.pause();
         self.cancel.cancel();
         self.notice = "Cancellation requested; cleaning up, not rolling back effects";
@@ -2157,7 +2902,17 @@ const Ui = struct {
             self.notice = if (permission.pasted) "Paste detected: deny this request and ask again" else "Preview unavailable: deny and request a smaller operation";
             return;
         }
-        if (self.bridge.decide(permission.id, decision)) self.notice = if (decision == .deny) "Request denied" else "Allowed once" else self.notice = "Permission expired";
+        if (self.remote()) |client| {
+            // The decision is bound to the epoch that displayed the request; the
+            // backend rejects approvals from a replaced controller.
+            client.approve(permission.epoch, permission.id, decision) catch |err| {
+                self.notice = session_client.describe(err);
+                self.clearPermission();
+                self.parser.stop_feed = true;
+                return;
+            };
+            self.notice = if (decision == .deny) "Request denied" else "Allowed once";
+        } else if (self.bridge.decide(permission.id, decision)) self.notice = if (decision == .deny) "Request denied" else "Allowed once" else self.notice = "Permission expired";
         self.clearPermission();
         self.parser.stop_feed = true;
     }
@@ -2233,7 +2988,7 @@ const Ui = struct {
             self.stopKey(event_);
             return;
         }
-        if (event_ == .cancel and (self.busy or self.inbox.snapshot().newest_id != null)) {
+        if (event_ == .cancel and (self.busy or self.queueSnapshot().newest_id != null)) {
             self.openStop();
             return;
         }
@@ -2241,7 +2996,7 @@ const Ui = struct {
             self.permissionKey(event_);
             return;
         }
-        if (event_ == .escape and (self.busy or self.inbox.snapshot().newest_id != null)) {
+        if (event_ == .escape and (self.busy or self.queueSnapshot().newest_id != null)) {
             try self.escapeQueue();
             return;
         }
@@ -2414,10 +3169,27 @@ const Ui = struct {
         };
     }
 
+    /// 判断是否有任务可以收尾。远端终态由本线程经 Bridge 交付，本地 busy 只是
+    /// 视图：两个任务之间它可能已经为 false，所以不能把真实 terminal 留在
+    /// Bridge 里等一个永远不会再出现的 busy 周期。本地任务仍需 busy 且
+    /// job.done 才 join，保持 acquire/release 配对。
+    fn finishReadyTask(self: *Ui) !void {
+        if (self.remote() != null) {
+            // The terminal event is produced and consumed on this thread; no
+            // cross-thread race is involved.
+            if (self.bridge.terminal != null) try self.complete();
+        } else if (self.busy and self.job.done.load(.acquire)) {
+            try self.complete();
+        }
+    }
+
     /// 收尾已结束的后台任务：等待 worker、排空剩余事件、记录终态并更新状态。
     fn complete(self: *Ui) !void {
-        self.future.?.await(self.io);
-        self.future = null;
+        const is_remote = self.remote() != null;
+        if (self.future) |*future| {
+            future.await(self.io);
+            self.future = null;
+        }
         self.detachInbox();
 
         // The producer can finish after our per-tick drain limit. Once joined,
@@ -2428,19 +3200,28 @@ const Ui = struct {
             try self.event(item);
         }
         self.busy = false;
+        self.remote_idle_ticks = 0;
 
         // 取走 bridge 中记录的终止信息，避免残留到下一次运行。
-        _ = self.bridge.takeTerminal();
+        const bridge_terminal = self.bridge.takeTerminal();
         self.clearPermission();
         if (self.prompt) |prompt| self.allocator.free(prompt);
         self.prompt = null;
-        self.last_terminal = try self.job.result();
+        // Remote terminal events are injected through the display Bridge; the
+        // local path keeps its joined Job result. No terminal means no result.
+        self.last_terminal = if (is_remote)
+            (bridge_terminal orelse {
+                self.settleRemoteIdle();
+                return;
+            })
+        else
+            try self.job.result();
         // Shared state applies owner-produced terminal context after join.
         self.display.finish(self.last_terminal.?);
         const result = self.last_terminal.?;
 
         // 清理失败或无法安全继续时进入 poisoned，禁止再次提交。
-        if (result.status != .success) self.inbox.pause();
+        if (result.status != .success and !is_remote) self.inbox.pause();
         self.poisoned = if (result.detail) |detail| detail == error.CleanupFailed or detail == error.UnsafeToContinue else false;
         self.notice = switch (result.status) {
             .success => "Ready",
@@ -2520,6 +3301,9 @@ const Ui = struct {
             self.expireEffortFlash();
             self.expireMetadataToast();
             self.expireMemoryNotice();
+            // Remote output arrives as polled typed deltas and is injected into
+            // the same Bridge a local worker uses, one event per idle queue.
+            try self.pumpRemote();
             // 每轮最多处理 64 个事件，避免大量输出阻塞输入与绘制。
             for (0..64) |_| {
                 var item = self.bridge.pop() orelse break;
@@ -2528,7 +3312,7 @@ const Ui = struct {
             }
 
             // acquire 与 worker 的 release 配对，确保读到任务结果。
-            if (self.busy and self.job.done.load(.acquire)) try self.complete();
+            try self.finishReadyTask();
             if (!self.log_warning_seen and self.connection.current().log_error != null) {
                 self.log_warning_seen = true;
                 // 记录故障有独立临时hint，不改变Runtime任务结果。
@@ -2536,14 +3320,15 @@ const Ui = struct {
                 self.requestDraw();
             }
 
-            // 收到信号（如 SIGINT）：转为退出请求并取消任务。
+            // 收到信号（如 SIGINT）：转为退出请求并取消任务。A remote task is
+            // owned by the backend, so a frontend signal only detaches.
             if (interrupt.signal() != 0) {
                 self.want_exit = true;
-                self.cancel.cancel();
+                if (self.remote() == null) self.cancel.cancel();
             }
 
-            // 任务结束后才真正退出；若由信号触发，退出码为 128 + 信号编号。
-            if (self.exitAuthorized() and !self.busy) {
+            // 任务结束后才真正退出；远程前端最后一次 ACK 后即可离开。
+            if (self.exitAuthorized() and (!self.busy or self.remote() != null)) {
                 try self.drainExit();
                 return if (interrupt.signal() != 0) 128 + interrupt.signal() else 0;
             }
@@ -3083,7 +3868,7 @@ const Ui = struct {
         // One frame-local plain render serves both sizing and the deny-only latch.
         const approval_lines = if (self.permission) |permission| try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false }) else empty_rendered;
         // State is an app-prepared immutable value; never dereference Runtime.
-        const queue_snapshot = self.inbox.snapshot();
+        const queue_snapshot = self.queueSnapshot();
         const base_hint = try self.hint(a, state);
         const queue_pending = queue_snapshot.steering + queue_snapshot.follow_up != 0;
         const hint_line = if (queue_pending or queue_snapshot.paused)
@@ -3139,11 +3924,23 @@ const Ui = struct {
                 }));
             }
         }
-        const stop_title = try std.fmt.allocPrint(a, "{s} | Steering {d} FollowUp {d}", .{ if (self.busy) "Task running" else "Task ended", queue_snapshot.steering, queue_snapshot.follow_up });
-        const stop_choices = [_][]const u8{ stop_title, if (self.stop_danger) "  Continue" else "> Continue", if (self.stop_danger) "> Stop and clear" else "  Stop and clear" };
-        const stop_fits = self.stop_open and candidate_limit >= stop_choices.len and
-            cols >= text.width(stop_title) and cols >= text.width(stop_choices[1]) and cols >= text.width(stop_choices[2]);
-        const popup_lines: []const []const u8 = if (self.stop_open) (if (stop_fits) &stop_choices else &.{"Resize to confirm stop (Esc continues)"}) else if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else if (menu_visible) menu_rows.lines else queue_lines.items;
+        // A pending busy /close confirmation reuses the same bottom-pinned, fully
+        // ACKed two-choice popup as the queue stop confirmation.
+        const stop_title = if (self.stop_close != null)
+            try std.fmt.allocPrint(a, "Close busy session | Steering {d} FollowUp {d}", .{ queue_snapshot.steering, queue_snapshot.follow_up })
+        else
+            try std.fmt.allocPrint(a, "{s} | Steering {d} FollowUp {d}", .{ if (self.busy) "Task running" else "Task ended", queue_snapshot.steering, queue_snapshot.follow_up });
+        const stop_choices = [_][]const u8{
+            stop_title,
+            if (self.stop_danger) "  Cancel" else "> Cancel",
+            if (self.stop_danger) "> Close session" else "  Close session",
+        };
+        const stop_choices_queue = [_][]const u8{ stop_title, if (self.stop_danger) "  Continue" else "> Continue", if (self.stop_danger) "> Stop and clear" else "  Stop and clear" };
+        const stop_popup: []const []const u8 = if (self.stop_close != null) &stop_choices else &stop_choices_queue;
+        const narrow = [_][]const u8{"Resize to confirm (Esc continues)"};
+        const stop_fits = self.stop_open and candidate_limit >= stop_popup.len and
+            cols >= text.width(stop_title) and cols >= text.width(stop_popup[1]) and cols >= text.width(stop_popup[2]);
+        const popup_lines: []const []const u8 = if (self.stop_open) (if (stop_fits) stop_popup else &narrow) else if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else if (menu_visible) menu_rows.lines else queue_lines.items;
         const selected_line = if (self.stop_open) @as(?usize, if (self.stop_danger) 2 else 1) else if (self.settings_open) settings_rows.selected_line else if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else menu_rows.selected_line;
         const checked_mask: u16 = if (self.stop_open) 0 else if (self.provider_open) provider_rows.checked_mask else if (self.model_picker != null) picker_rows.checked_mask else 0;
         const popup_gap: usize = @intFromBool(popup_lines.len != 0);
@@ -10091,4 +10888,619 @@ test "configure enables same-process submit without sending secrets or commands"
     try std.testing.expectEqualStrings("hello", runtime.messages()[0].blocks[0].text);
     try std.testing.expectEqualStrings("hello", ui.records.items[0].body.items);
     for (ui.records.items) |record| try std.testing.expect(std.mem.find(u8, record.body.items, "sk-fixture-secret") == null);
+}
+
+// ---- Remote adapter focused tests -------------------------------------------
+// A fake backend proves UI-side ownership rules without sockets, daemon code or
+// a real Runtime: the client owns tasks/queues/approvals, and the UI only
+// submits, acknowledges and renders.
+
+const FakeRemote = struct {
+    snapshot: session_client.Snapshot = .{ .available = true, .attached = true, .control_epoch = 1 },
+    item: ?session_client.Item = null,
+    submits: usize = 0,
+    last_submit_epoch: u64 = 0,
+    last_submit_kind: session_client.TaskKind = .prompt,
+    text: [64]u8 = @splat(0),
+    text_len: usize = 0,
+    cancels: usize = 0,
+    cancel_clears: usize = 0,
+    last_cancel_clear_revision: u64 = 0,
+    confirmings: usize = 0,
+    last_confirming_epoch: u64 = 0,
+    last_confirming_active: bool = false,
+    last_confirming_revision: u64 = 0,
+    detaches: usize = 0,
+    approvals: usize = 0,
+    last_approve_epoch: u64 = 0,
+    last_approve_id: u64 = 0,
+    enqueues: usize = 0,
+    last_enqueue_epoch: u64 = 0,
+    last_enqueue_kind: session_client.QueueKind = .steering,
+    resumes: usize = 0,
+    manages: usize = 0,
+    last_manage: ?std.meta.Tag(session_client.Manage) = null,
+    manage_switched: bool = false,
+    manage_exit: bool = false,
+    submit_failure: ?anyerror = null,
+
+    fn client(self: *FakeRemote) session_client.Client {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn record(self: *FakeRemote, value: []const u8) void {
+        self.text_len = @min(value.len, self.text.len);
+        @memcpy(self.text[0..self.text_len], value[0..self.text_len]);
+    }
+
+    fn from(ctx: *anyopaque) *FakeRemote {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn snapshotFn(ctx: *anyopaque) *const session_client.Snapshot {
+        return &from(ctx).snapshot;
+    }
+    fn submitFn(ctx: *anyopaque, epoch: u64, kind: session_client.TaskKind, value: []const u8) anyerror!void {
+        const self = from(ctx);
+        self.submits += 1;
+        self.last_submit_epoch = epoch;
+        self.last_submit_kind = kind;
+        self.record(value);
+        if (self.submit_failure) |err| return err;
+    }
+    fn pollFn(ctx: *anyopaque, _: std.mem.Allocator) anyerror!?session_client.Item {
+        const self = from(ctx);
+        const value = self.item orelse return null;
+        self.item = null;
+        return value;
+    }
+    fn cancelFn(ctx: *anyopaque, _: u64) anyerror!void {
+        from(ctx).cancels += 1;
+    }
+    fn cancelClearFn(ctx: *anyopaque, _: u64, revision: u64) anyerror!void {
+        const self = from(ctx);
+        self.cancel_clears += 1;
+        self.last_cancel_clear_revision = revision;
+    }
+    fn setConfirmingFn(ctx: *anyopaque, epoch: u64, active: bool) anyerror!void {
+        const self = from(ctx);
+        self.confirmings += 1;
+        self.last_confirming_epoch = epoch;
+        self.last_confirming_active = active;
+        // The owner adopts a complete fresh snapshot on every barrier change;
+        // only the queue revision matters here, so the UI must rebuild its stop
+        // identity from the adopted value instead of a pre-RPC sample.
+        self.snapshot.queue_revision +%= 1;
+        self.last_confirming_revision = self.snapshot.queue_revision;
+    }
+    fn approveFn(ctx: *anyopaque, epoch: u64, id: u64, _: r.Decision) anyerror!void {
+        const self = from(ctx);
+        self.approvals += 1;
+        self.last_approve_epoch = epoch;
+        self.last_approve_id = id;
+    }
+    fn enqueueFn(ctx: *anyopaque, epoch: u64, kind: session_client.QueueKind, value: []const u8) anyerror!void {
+        const self = from(ctx);
+        self.enqueues += 1;
+        self.last_enqueue_epoch = epoch;
+        self.last_enqueue_kind = kind;
+        self.record(value);
+    }
+    fn withdrawFn(_: *anyopaque, _: std.mem.Allocator, _: u64, _: u64) anyerror!?[]u8 {
+        return null;
+    }
+    fn queueResumeFn(ctx: *anyopaque, _: u64) anyerror!void {
+        from(ctx).resumes += 1;
+    }
+    fn manageFn(ctx: *anyopaque, _: std.mem.Allocator, request: session_client.Manage) anyerror!session_client.Outcome {
+        const self = from(ctx);
+        self.manages += 1;
+        self.last_manage = std.meta.activeTag(request);
+        if (self.manage_switched) self.snapshot.control_epoch +%= 1;
+        return .{ .switched = self.manage_switched, .exit = self.manage_exit };
+    }
+    fn detachFn(ctx: *anyopaque) void {
+        from(ctx).detaches += 1;
+    }
+
+    const vtable = session_client.VTable{
+        .snapshot_fn = snapshotFn,
+        .submit_fn = submitFn,
+        .poll_fn = pollFn,
+        .cancel_fn = cancelFn,
+        .cancel_clear_fn = cancelClearFn,
+        .set_confirming_fn = setConfirmingFn,
+        .approve_fn = approveFn,
+        .enqueue_fn = enqueueFn,
+        .withdraw_fn = withdrawFn,
+        .queue_resume_fn = queueResumeFn,
+        .manage_fn = manageFn,
+        .detach_fn = detachFn,
+    };
+
+    fn current(ctx: *anyopaque) Connection.State {
+        const self = from(ctx);
+        return .{
+            .runtime = null,
+            .available = self.snapshot.available,
+            .busy = self.snapshot.busy,
+            .session_id = self.snapshot.session_id,
+            .control_epoch = self.snapshot.control_epoch,
+            .model = "fixture",
+            .base_url = "",
+        };
+    }
+    fn configure(_: *anyopaque, _: []const u8) !void {
+        return error.FixtureNotConfigured;
+    }
+};
+
+fn remoteUi(fake: *FakeRemote, bridge: *bridge_module.Bridge, cancel: *p.Cancellation) Ui {
+    var ui = Ui{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .connection = .{ .context = fake, .current_fn = FakeRemote.current, .configure_fn = FakeRemote.configure, .session_client = fake.client() },
+        .bridge = bridge,
+        .cancel = cancel,
+        .terminal = undefined,
+        .editor = .{ .allocator = std.testing.allocator },
+        .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" },
+        .size = .{ .columns = 80, .rows = 24 },
+    };
+    ui.adoptRemoteSession(fake.client());
+    return ui;
+}
+
+fn drainBridge(ui: *Ui) !void {
+    while (ui.bridge.pop()) |value| {
+        var item = value;
+        defer item.deinit();
+        try ui.event(item);
+    }
+}
+
+fn typeDraft(ui: *Ui, value: []const u8) !void {
+    _ = try ui.editor.insert(value);
+}
+
+test "remote deinit detaches and never cancels or clears the daemon task" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 4 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqual(@as(u64, 4), ui.remote_epoch);
+    ui.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fake.detaches);
+    try std.testing.expectEqual(@as(usize, 0), fake.cancels);
+    try std.testing.expectEqual(@as(usize, 0), fake.cancel_clears);
+}
+
+test "remote submit is sent once and a rejected submit keeps the draft and starts nothing" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try typeDraft(&ui, "hello");
+    fake.submit_failure = error.Transport;
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 1), fake.submits);
+    try std.testing.expect(!ui.busy and ui.future == null);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try std.testing.expectEqualStrings("hello", ui.editor.bytes.items);
+    try std.testing.expectEqualStrings("Connection lost; the task was not canceled", ui.notice);
+
+    fake.submit_failure = null;
+    try ui.submit();
+    // Exactly one accepted request: no implicit retry of the rejected one.
+    try std.testing.expectEqual(@as(usize, 2), fake.submits);
+    try std.testing.expectEqual(@as(u64, 1), fake.last_submit_epoch);
+    try std.testing.expectEqual(session_client.TaskKind.prompt, fake.last_submit_kind);
+    try std.testing.expectEqualStrings("hello", fake.text[0..fake.text_len]);
+    try std.testing.expect(ui.busy and ui.remote_kind == .prompt);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqualStrings("hello", ui.records.items[0].body.items);
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+}
+
+test "remote approval binds the epoch that displayed it and bypasses the local bridge" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 6, .{ .permission = .{ .id = 11, .tool_name = "bash", .description = "rm -rf build" } });
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expect(ui.permission != null);
+    try std.testing.expectEqual(@as(u64, 6), ui.permission.?.epoch);
+    // Approvals are backend-owned: the local Bridge must not hold a pending id.
+    try std.testing.expect(ui.bridge.pending == null);
+    ui.decidePermission(.deny, false);
+    try std.testing.expectEqual(@as(usize, 1), fake.approvals);
+    try std.testing.expectEqual(@as(u64, 6), fake.last_approve_epoch);
+    try std.testing.expectEqual(@as(u64, 11), fake.last_approve_id);
+    try std.testing.expect(ui.permission == null);
+}
+
+test "remote queue sends bind the current epoch and are never launched locally" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.remote_kind = .prompt;
+    try typeDraft(&ui, "please continue");
+    try ui.enqueueDraft(.steering);
+    try std.testing.expectEqual(@as(usize, 1), fake.enqueues);
+    try std.testing.expectEqual(@as(u64, 6), fake.last_enqueue_epoch);
+    try std.testing.expectEqual(session_client.QueueKind.steering, fake.last_enqueue_kind);
+    try std.testing.expectEqualStrings("please continue", fake.text[0..fake.text_len]);
+    try std.testing.expectEqualStrings("Steering pending", ui.notice);
+    try std.testing.expectEqual(@as(usize, 0), ui.inbox.snapshot().steering);
+
+    ui.busy = false;
+    try ui.dispatchNext();
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+}
+
+test "remote management commands run while busy instead of entering steering" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.remote_kind = .prompt;
+    try typeDraft(&ui, "/ls --running");
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .list), fake.last_manage);
+    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+
+    // /attach runs before steering too and adopts the new owner snapshot.
+    fake.manage_switched = true;
+    fake.snapshot.busy = true;
+    fake.snapshot.mode = .awaiting_permission;
+    fake.snapshot.task_kind = .prompt;
+    fake.item = try session_client.ownEvent(std.testing.allocator, 6, .{ .text = "old session draft" });
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expect(ui.draft != null);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 6, .{ .permission = .{ .id = 3, .tool_name = "bash", .description = "old approval" } });
+    try ui.pumpRemote();
+    try std.testing.expect(ui.permission != null);
+
+    try typeDraft(&ui, "/attach --takeover session-b");
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 2), fake.manages);
+    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .attach), fake.last_manage);
+    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
+    try std.testing.expectEqual(@as(u64, 7), ui.remote_epoch);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try std.testing.expect(ui.draft == null);
+    try std.testing.expect(ui.permission == null);
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqual(@as(?r.State, .awaiting_permission), ui.mode);
+}
+
+test "remote terminal completes without a local future and marks the task idle once" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true;
+    ui.remote_kind = .prompt;
+    ui.mode = .calling_model;
+    try std.testing.expect(ui.future == null);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 6, .{ .finished = (session_client.Terminal{ .status = .success }).toRuntime() });
+    try ui.pumpRemote();
+    try std.testing.expect(ui.bridge.terminal != null);
+    try ui.complete();
+    try std.testing.expect(!ui.busy);
+    try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
+    try std.testing.expect(ui.bridge.terminal == null);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    // No second completion from a null future or an already consumed terminal.
+    try std.testing.expect(ui.bridge.pop() == null);
+}
+
+test "remote lost terminal fallback settles only after two consecutive idle samples" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 8 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try std.testing.expect(ui.busy);
+    const records_before = ui.records.items.len;
+    // One idle sample is not enough, and it must leave the view busy.
+    fake.snapshot.busy = false;
+    try ui.pumpRemote();
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqual(@as(u8, 1), ui.remote_idle_ticks);
+    try std.testing.expect(ui.last_terminal == null);
+    // The second consecutive idle sample settles the view without a success.
+    try ui.pumpRemote();
+    try std.testing.expect(!ui.busy);
+    try std.testing.expect(ui.mode == null);
+    try std.testing.expectEqual(@as(u8, 0), ui.remote_idle_ticks);
+    try std.testing.expect(ui.last_terminal == null);
+    try std.testing.expectEqualStrings("Remote task ended without a terminal result; reattach to verify", ui.notice);
+    try std.testing.expectEqual(records_before, ui.records.items.len);
+}
+
+test "remote idle fallback never settles without an observed busy sample" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 9 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try std.testing.expect(!ui.busy);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    try ui.pumpRemote();
+    try ui.pumpRemote();
+    try std.testing.expectEqual(@as(u8, 0), ui.remote_idle_ticks);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    // A local busy view alone is not evidence of remote activity either.
+    ui.busy = true;
+    ui.notice = "Calling model";
+    try ui.pumpRemote();
+    try ui.pumpRemote();
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqualStrings("Calling model", ui.notice);
+}
+
+test "remote idle fallback count resets when the backend reports busy again" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 10 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.snapshot.busy = false;
+    try ui.pumpRemote();
+    try std.testing.expectEqual(@as(u8, 1), ui.remote_idle_ticks);
+    try std.testing.expect(ui.busy);
+    // Busy again: the count restarts, so a single later idle cannot settle.
+    fake.snapshot.busy = true;
+    try ui.pumpRemote();
+    try std.testing.expectEqual(@as(u8, 0), ui.remote_idle_ticks);
+    try std.testing.expect(ui.busy);
+    fake.snapshot.busy = false;
+    try ui.pumpRemote();
+    try std.testing.expect(ui.busy);
+    try std.testing.expect(ui.last_terminal == null);
+    try std.testing.expectEqualStrings("Attached; task is running", ui.notice);
+    try ui.pumpRemote();
+    try std.testing.expect(!ui.busy);
+    try std.testing.expect(ui.last_terminal == null);
+    try std.testing.expectEqualStrings("Remote task ended without a terminal result; reattach to verify", ui.notice);
+}
+
+test "remote idle fallback yields to a real terminal consumed by the normal path" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 11 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 11, .{ .finished = (session_client.Terminal{ .status = .success }).toRuntime() });
+    try ui.pumpRemote();
+    try std.testing.expect(ui.bridge.terminal != null);
+    // Idle samples while the terminal is pending must not synthesize a fallback.
+    fake.snapshot.busy = false;
+    try ui.pumpRemote();
+    try ui.pumpRemote();
+    try std.testing.expect(ui.busy);
+    try std.testing.expect(ui.last_terminal == null);
+    try ui.complete();
+    try std.testing.expect(!ui.busy);
+    try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
+    try std.testing.expect(ui.bridge.terminal == null);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+}
+
+test "remote finished terminal is consumed from an idle local view without a future" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 12 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    // The previous task already returned the view to idle. The second task can
+    // start and finish between two client snapshots, so no busy sample exists,
+    // yet its real terminal is already waiting in the Bridge.
+    try std.testing.expect(!ui.busy and ui.future == null);
+    ui.mode = .calling_model;
+    fake.item = try session_client.ownEvent(std.testing.allocator, 12, .{ .finished = (session_client.Terminal{ .status = .success }).toRuntime() });
+    try ui.pumpRemote();
+    try std.testing.expect(ui.bridge.terminal != null);
+    try std.testing.expect(!ui.busy);
+    try std.testing.expectEqual(@as(?r.State, .calling_model), ui.mode);
+    // The loop's readiness helper, not a direct complete() call, must consume it.
+    try ui.finishReadyTask();
+    try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
+    try std.testing.expect(ui.bridge.terminal == null);
+    try std.testing.expect(ui.mode == null);
+    try std.testing.expect(!ui.busy);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    // Idempotent: no terminal is left to consume on a later tick.
+    try ui.finishReadyTask();
+    try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
+}
+
+test "remote owner still busy re-adopts the next task after the local view went idle" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 13 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    // Task 1: the owner stays busy while its terminal returns the local view to
+    // idle, so `remote_observed_busy` is still true afterwards.
+    try std.testing.expect(ui.busy and ui.remote_observed_busy);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 13, .{ .finished = (session_client.Terminal{ .status = .success }).toRuntime() });
+    try ui.pumpRemote();
+    try ui.finishReadyTask();
+    try std.testing.expect(!ui.busy);
+    try std.testing.expect(ui.remote_observed_busy);
+    // Task 2 starts while the owner is still busy: no idle snapshot intervenes,
+    // so requiring `!remote_observed_busy` here would never adopt it.
+    fake.snapshot.mode = .calling_model;
+    fake.snapshot.task_kind = .command;
+    try ui.pumpRemote();
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqual(@as(?r.State, .calling_model), ui.mode);
+    try std.testing.expectEqual(session_client.TaskKind.command, ui.remote_kind);
+    try std.testing.expect(ui.remote_observed_busy);
+    try std.testing.expectEqualStrings("Attached; task is running", ui.notice);
+}
+
+test "startup attach restores a running partial stream and pending approval" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .mode = .awaiting_permission, .control_epoch = 3 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqual(@as(?r.State, .awaiting_permission), ui.mode);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 3, .{ .text = "partial answer" });
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expect(ui.draft != null);
+    try std.testing.expectEqualStrings("partial answer", ui.records.items[0].body.items);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 3, .{ .permission = .{ .id = 5, .tool_name = "bash", .description = "pending approval" } });
+    try ui.pumpRemote();
+    try std.testing.expect(ui.permission != null);
+    try std.testing.expectEqual(@as(u64, 3), ui.permission.?.epoch);
+    try std.testing.expectEqualStrings("pending approval", ui.permission.?.description);
+}
+
+test "deltas from a replaced control epoch are dropped before display" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 5, .{ .text = "stale controller output" });
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expect(ui.draft == null);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+}
+
+test "remote busy close requires confirmation before any backend close or steering" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 2, .session_id = @splat(0) } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.remote_kind = .prompt;
+    const current = "0000000000000000000000000000000000000000000000000000000000000000";
+    try typeDraft(&ui, "/close " ++ current);
+    try ui.submit();
+    // Busy and attached: nothing is sent yet; the ACKed popup owns the decision.
+    try std.testing.expectEqual(@as(usize, 0), fake.manages);
+    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
+    try std.testing.expect(ui.stop_open);
+    try std.testing.expect(ui.stop_close != null);
+    try std.testing.expectEqualStrings(current, ui.stop_close.?);
+
+    // The typed --force form is an explicit confirmation and skips the popup.
+    ui.closeStop();
+    try typeDraft(&ui, "/close --force " ++ current);
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .close), fake.last_manage);
+    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
+    try std.testing.expect(!ui.stop_open);
+}
+
+test "remote stop gates the owner first and authorizes the adopted queue revision" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 5, .queue_revision = 11, .session_id = @splat(1) } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.remote_kind = .prompt;
+    try std.testing.expectEqual(@as(u64, 11), ui.stopIdentity().revision);
+    try Ui.key(&ui, .cancel);
+    try std.testing.expect(ui.stop_open and !ui.stop_danger);
+    // Exactly one owner request, before the modal exists, and the adopted
+    // snapshot (revision 12) is what the identity authorizes against.
+    try std.testing.expectEqual(@as(usize, 1), fake.confirmings);
+    try std.testing.expect(fake.last_confirming_active);
+    try std.testing.expectEqual(@as(u64, 5), fake.last_confirming_epoch);
+    try std.testing.expectEqual(@as(u64, 12), fake.last_confirming_revision);
+    try std.testing.expectEqual(@as(u64, 12), ui.stop_identity.?.revision);
+    try std.testing.expect(ui.queueSnapshot().confirming);
+    // Esc releases the barrier without asking the owner to clear the queue.
+    try Ui.key(&ui, .escape);
+    try std.testing.expectEqual(@as(usize, 2), fake.confirmings);
+    try std.testing.expect(!fake.last_confirming_active);
+    try std.testing.expectEqual(@as(usize, 0), fake.cancel_clears);
+    try std.testing.expect(!ui.stop_open and ui.stop_identity == null);
+}
+
+test "remote stop requested for a replaced owner is never unbound by a late close" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 5, .queue_revision = 3, .session_id = @splat(2) } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.remote_kind = .prompt;
+    try Ui.key(&ui, .cancel);
+    try std.testing.expectEqual(@as(usize, 1), fake.confirmings);
+    // A takeover replaced the epoch and also ended the busy task: the revision
+    // and busy changes alone must not stop Esc from releasing the old barrier.
+    fake.snapshot.control_epoch = 6;
+    fake.snapshot.busy = false;
+    ui.remote_epoch = 6;
+    ui.busy = false;
+    try Ui.key(&ui, .escape);
+    try std.testing.expectEqual(@as(usize, 1), fake.confirmings);
+    try std.testing.expect(!ui.stop_open);
+
+    // Opening a modal and losing the owner before Esc must also stay silent.
+    fake.snapshot.busy = true;
+    ui.busy = true;
+    try Ui.key(&ui, .cancel);
+    try std.testing.expectEqual(@as(usize, 2), fake.confirmings);
+    fake.snapshot.control_epoch = 7;
+    fake.snapshot.session_id = @splat(3);
+    ui.remote_epoch = 7;
+    try Ui.key(&ui, .escape);
+    try std.testing.expectEqual(@as(usize, 2), fake.confirmings);
+    try std.testing.expect(!ui.stop_open);
+}
+
+test "local stop keeps gating the UI inbox without a remote barrier request" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true;
+    try Ui.key(&ui, .cancel);
+    try std.testing.expect(ui.stop_open and ui.inbox.snapshot().confirming);
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(!ui.stop_open and !ui.inbox.snapshot().confirming);
+    try std.testing.expect(!cancel.isRequested());
 }

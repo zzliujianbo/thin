@@ -87,6 +87,13 @@ def run(app):
     try:
         with tempfile.TemporaryDirectory(prefix='thin-resize-') as root:
             home, project = Path(root) / 'home', Path(root) / 'project'
+            # The foreground starts its own AF_UNIX worker under
+            # $XDG_RUNTIME_DIR/thin. An owned short base keeps every socket
+            # inside this fixture instead of the shared /tmp/thin-<uid> fallback.
+            runtime = Path(root) / 'r'
+            runtime.mkdir(mode=0o700)
+            assert runtime.is_absolute() and (runtime.stat().st_mode & 0o777) == 0o700, 'owned runtime must be an absolute 0700 directory'
+            assert len(str(runtime)) + 14 + 32 + 5 <= 107, 'AF_UNIX socket path budget exceeded'
             (home / '.thin').mkdir(parents=True)
             project.mkdir()
             config = {'memory': {'auto': False}, 'llm': {'default': 'owned/fixture-model', 'providers': {'owned': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_RESIZE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'safety_tokens': 100, 'request_timeout_ms': 20000, 'task_timeout_ms': 30000}}
@@ -102,7 +109,7 @@ def run(app):
             # preexec_fn after forking the parent's HTTP server thread.
             launcher = 'import fcntl, os, sys, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); os.execv(sys.argv[1], sys.argv[1:])'
             child = subprocess.Popen([sys.executable, '-c', launcher, app, '--no-log', '--no-model-auto-refresh'], stdin=slave, stdout=slave, stderr=slave, cwd=project, start_new_session=True,
-                                     env={'PATH': '/usr/bin:/bin', 'HOME': str(home), 'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_RESIZE_KEY': 'owned-resize-fake-only'})
+                                     env={'PATH': '/usr/bin:/bin', 'HOME': str(home), 'XDG_RUNTIME_DIR': str(runtime), 'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_RESIZE_KEY': 'owned-resize-fake-only'})
             capture = bytearray()
 
             def pump(duration=.03):

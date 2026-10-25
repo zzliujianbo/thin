@@ -130,6 +130,13 @@ def run(app, width, batched):
     thread.start()
     with tempfile.TemporaryDirectory(prefix='thin-idle-enter-') as base:
         home, project = Path(base) / 'home', Path(base) / 'project'
+        # The foreground starts its own AF_UNIX worker under $XDG_RUNTIME_DIR/thin.
+        # An owned short base keeps sockets inside this fixture instead of the
+        # shared /tmp/thin-<uid> fallback. It is removed by the parent context.
+        runtime = Path(base) / 'r'
+        runtime.mkdir(mode=0o700)
+        assert runtime.is_absolute() and (runtime.stat().st_mode & 0o777) == 0o700, 'owned runtime must be an absolute 0700 directory'
+        assert len(str(runtime)) + 14 + 32 + 5 <= 107, 'AF_UNIX socket path budget exceeded'
         (home / '.thin').mkdir(parents=True)
         project.mkdir()
         config = {'memory': {'auto': False}, 'llm': {'default': 'local/fixture-model', 'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'safety_tokens': 100, 'request_timeout_ms': 10000, 'task_timeout_ms': 15000}}
@@ -148,7 +155,7 @@ def run(app, width, batched):
 
         child = subprocess.Popen([app, '--no-log', '--no-model-auto-refresh'], stdin=slave, stdout=slave, stderr=slave,
                                  cwd=project, preexec_fn=child_setup,
-                                 env={'PATH': '/usr/bin:/bin', 'HOME': str(home), 'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_IDLE_KEY': 'idle-fixture-only'})
+                                 env={'PATH': '/usr/bin:/bin', 'HOME': str(home), 'XDG_RUNTIME_DIR': str(runtime), 'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_IDLE_KEY': 'idle-fixture-only'})
         screen = Screen(width)
         capture = bytearray()
 

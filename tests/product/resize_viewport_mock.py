@@ -71,7 +71,14 @@ def run(app, wrap=False, local_command=False):
             cfg.chmod(0o600)
             rc = root / 'tmux.conf'
             rc.write_text('set -g status off\nset -g default-terminal xterm-256color\nset -g history-limit 2000\nset -g remain-on-exit on\n')
-            env = {'PATH': '/usr/bin:/bin', 'HOME': str(home), 'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_VIEW_KEY': 'owned-fake-only'}
+            # The foreground starts its own AF_UNIX worker under
+            # $XDG_RUNTIME_DIR/thin. An owned short base keeps every socket
+            # inside this fixture instead of the shared /tmp/thin-<uid> fallback.
+            runtime = root / 'r'
+            runtime.mkdir(mode=0o700)
+            assert runtime.is_absolute() and (runtime.stat().st_mode & 0o777) == 0o700, 'owned runtime must be an absolute 0700 directory'
+            assert len(str(runtime)) + 14 + 32 + 5 <= 107, 'AF_UNIX socket path budget exceeded'
+            env = {'PATH': '/usr/bin:/bin', 'HOME': str(home), 'XDG_RUNTIME_DIR': str(runtime), 'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_VIEW_KEY': 'owned-fake-only'}
             base = ['tmux', '-S', str(root / 'sock'), '-f', str(rc)]
             # Foreground server remains our reapable child, not a daemon owned
             # by another session. No ambient socket/config or real user TTY.

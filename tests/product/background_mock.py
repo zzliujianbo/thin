@@ -604,6 +604,13 @@ def run_print(app, workspace, url):
 
 def run_pty(app, workspace, url):
     home, project, config_path, config_bytes = prepare(workspace, 'pty', url)
+    # The foreground starts its own AF_UNIX worker under $XDG_RUNTIME_DIR/thin.
+    # An owned short base keeps every socket inside this fixture instead of the
+    # shared /tmp/thin-<uid> fallback; it is removed with the workspace context.
+    runtime = workspace / 'runtime'
+    runtime.mkdir(mode=0o700)
+    assert runtime.is_absolute() and (runtime.stat().st_mode & 0o777) == 0o700, 'owned runtime must be an absolute 0700 directory'
+    assert len(str(runtime)) + 14 + 32 + 5 <= 107, 'AF_UNIX socket path budget exceeded'
     owned, state = Owned(project), {'turn': 0, 'phase': 0, 'log_runs': 0, 'pty_id': None}
     Model.plan = pty_plan(owned, state)
     Model.failed = None
@@ -618,6 +625,7 @@ def run_pty(app, workspace, url):
     child = subprocess.Popen([app, '--no-log', '--no-model-auto-refresh'], stdin=slave,
                              stdout=slave, stderr=slave, cwd=project, preexec_fn=child_setup,
                              env={'PATH': '/usr/bin:/bin', 'HOME': str(home),
+                                  'XDG_RUNTIME_DIR': str(runtime),
                                   'LANG': 'C.UTF-8', 'TERM': 'xterm-256color'})
     capture = bytearray()
     screen = Screen(90)
