@@ -784,10 +784,33 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
     // A batched command plus Enter may be processed in one read; require the
     // replayed Settings root before sending navigation keys.
     try decisionModelScreen(d, a, &.{ "Low-price input", "Decision model" }, &.{});
-    try settingsValueSelect(d, a, "Proxy models");
-    try decisionModelScreen(d, a, &.{ "> Proxy models", "Low-price input" }, &.{});
+    try settingsValueSelect(d, a, "Proxy");
+    try decisionModelScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{});
     try settingsKey(d, "\r");
     if (configured) {
+        // Root 8 opens the second level on Address. Its editor is prefilled
+        // with the saved endpoint; an abandoned draft writes nothing.
+        try decisionModelScreen(d, a, &.{ "> Address", "Models" }, &.{ "Search> ", "Address> " });
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
+        try settingsKey(d, "\x1510.9.9.9:1");
+        try decisionModelScreen(d, a, &.{ "Address> ", "10.9.9.9:1" }, &.{});
+        try settingsKey(d, "\x1b");
+        try decisionModelScreen(d, a, &.{ "> Address", "127.0.0.1:8888" }, &.{ "Address> ", "10.9.9.9:1" });
+        try settingsProxyGate(d, a, project, "address-canceled");
+        // One complete frame for the edited endpoint authorizes exactly one
+        // save; the preserved member list keeps its single entry.
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
+        try settingsKey(d, "\x15127.0.0.2:9999");
+        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.2:9999" }, &.{});
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{ "> Address", "127.0.0.2:9999", "1 selected" }, &.{"Address> "});
+        try settingsProxyGate(d, a, project, "address-changed");
+        // Models opens the existing multi-select list from the second level.
+        try settingsValueSelect(d, a, "Models");
+        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Address> "});
+        try settingsKey(d, "\r");
         // The pre-existing allowlist entry stays checked on open.
         try settingsProxyState(d, a, "zen/fixture-zen/model-x", true);
         try settingsProxyGate(d, a, project, "opened");
@@ -811,10 +834,17 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         try settingsKey(d, "\r");
         try settingsProxyState(d, a, "go/Repo/Model-X", true);
         try settingsProxyGate(d, a, project, "added");
-        // Left returns to the root menu with index 8 still selected.
+        // Left leaves the list for the second level, Esc leaves Models for the
+        // root row that owns it; each step keeps its owning selection.
         try settingsKey(d, "\x1b[D");
-        try decisionModelScreen(d, a, &.{ "> Proxy models", "Low-price input" }, &.{"Search> "});
+        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Search> "});
+        try settingsKey(d, "\x1b");
+        try decisionModelScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
         try settingsProxyGate(d, a, project, "root-return");
+        // Reopen lands on Address; Models then opens the list again.
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{"> Address"}, &.{"Address> "});
+        try settingsValueSelect(d, a, "Models");
         try settingsKey(d, "\r");
         // A full reopen does not keep all three targets inside the bounded
         // window, so each membership proof starts from its own search query.
@@ -835,8 +865,9 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         try settingsProxySearch(d, a, "zen/fixture-zen/model-x");
         try settingsProxyState(d, a, "zen/fixture-zen/model-x", true);
         try settingsProxyGate(d, a, project, "removed");
+        // Escape from the list lands on Models; Enter reopens the same list.
         try settingsKey(d, "\x1b");
-        try decisionModelScreen(d, a, &.{ "> Proxy models", "Low-price input" }, &.{});
+        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Search> "});
         try settingsKey(d, "\r");
         // Same bounded window after reopen: search each target before proving
         // its checked state from a complete frame.
@@ -847,20 +878,80 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         try settingsProxySearch(d, a, "zen/fixture-zen/model-x");
         try settingsProxyState(d, a, "zen/fixture-zen/model-x", true);
         try settingsProxyGate(d, a, project, "persisted");
+        // The list itself returns to Models before the shared root Escape.
+        try settingsKey(d, "\x1b");
+        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Search> "});
+        // Models is a second level; one more Escape reaches the root row that
+        // owns it, so both branches leave from the same screen.
+        try settingsKey(d, "\x1b");
+        try decisionModelScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
     } else {
-        // Opening without root.proxy shows the fixed notice and disabled rows.
-        try decisionModelScreen(d, a, &.{ "Proxy host/port not configured; saving is disabled", "[ ]" }, &.{"[x]"});
+        // Models is the blocked child: opening without root.proxy shows the
+        // fixed notice and Enter reports the missing endpoint instead of
+        // guessing or writing one.
+        try settingsValueSelect(d, a, "Models");
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{ "Proxy host/port not configured", "[ ]" }, &.{"[x]"});
         try settingsProxyGate(d, a, project, "opened");
-        // Enter on any candidate is refused; no address is guessed or written.
         try d.send("\r");
         try d.quiet(50);
+        try decisionModelScreen(d, a, &.{"Configure a proxy"}, &.{"[x]"});
         try settingsProxyGate(d, a, project, "unconfigured");
+        // An invalid port never lands: the editor keeps its draft and the
+        // submenu keeps the unconfigured row underneath.
+        try settingsKey(d, "\x1b");
+        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Search> "});
+        try settingsValueSelect(d, a, "Address");
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{ "Address> ", "Not configured" }, &.{});
+        try settingsKey(d, "127.0.0.1:0");
+        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.1:0" }, &.{});
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{ "Invalid proxy address", "Address> " }, &.{});
+        try settingsProxyGate(d, a, project, "invalid");
+        // A visible, fully acknowledged address is the first savable state.
+        try settingsKey(d, "\x15127.0.0.1:8888");
+        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{ "> Address", "127.0.0.1:8888" }, &.{"Address> "});
+        try settingsProxyGate(d, a, project, "address-saved");
+        // The saved endpoint makes the very first toggle savable.
+        try settingsValueSelect(d, a, "Models");
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{"Search> "}, &.{"Proxy host/port not configured"});
+        try settingsProxySearch(d, a, "zen/fixture-zen/model-x");
+        try settingsProxyState(d, a, "zen/fixture-zen/model-x", false);
+        try settingsKey(d, "\r");
+        try settingsProxyState(d, a, "zen/fixture-zen/model-x", true);
+        try settingsProxyGate(d, a, project, "member-added");
+        // Empty input disables the proxy through the same acknowledged save.
+        try settingsKey(d, "\x1b");
+        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Search> "});
+        try settingsValueSelect(d, a, "Address");
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
+        // The submenu row behind still prints the saved endpoint, so only the
+        // cleared composer's own completed frame may authorize the save. The
+        // offset must predate the Ctrl-U send: settingsKey already pumps that
+        // frame to completion, so a later offset can never see a frame start.
+        const erased = d.used;
+        try settingsKey(d, "\x15");
+        try d.waitFrame(erased, "");
+        const empty = try d.screen();
+        try check(std.mem.startsWith(u8, &empty.grid[empty.row], "Address> "));
+        try check(std.mem.indexOf(u8, &empty.grid[empty.row], "127.0.0.1:8888") == null);
+        try settingsKey(d, "\r");
+        try decisionModelScreen(d, a, &.{ "> Address", "Not configured" }, &.{"Address> "});
+        try settingsProxyGate(d, a, project, "cleared");
+        // Esc leaves the second level for the root row, which now reports the
+        // removed endpoint instead of a stale host:port.
+        try settingsKey(d, "\x1b");
+        try decisionModelScreen(d, a, &.{ "> Proxy", "Not configured", "Low-price input" }, &.{"Address> "});
+        try settingsProxyGate(d, a, project, "reopened");
     }
-    // Both branches end inside the picker: the first Escape returns to the
-    // Settings root and the second closes Settings. Each phase needs its own
-    // acknowledged screen; one batch may not consume both presses.
-    try settingsKey(d, "\x1b");
-    try decisionModelScreen(d, a, &.{ "> Proxy models", "Low-price input" }, &.{"Search> "});
+    // Both branches end on the Settings root with Proxy selected: one Escape
+    // closes Settings and needs its own acknowledged screen.
+    try decisionModelScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
     const start = d.used;
     try d.send("\x1b");
     try d.waitIdle(start);

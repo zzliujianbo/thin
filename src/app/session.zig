@@ -473,7 +473,7 @@ pub const Session = struct {
 
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .proxy_fn = setProxyModel, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -686,6 +686,10 @@ pub const Session = struct {
             // to the primary only in a later session.
             .proxy_configured = self.global_config.?.value.proxy != null,
             .proxy_models = if (self.global_config.?.value.proxy) |value| value.models else &.{},
+            // Host/port are public routing facts for the settings editor; the
+            // endpoint itself is never credential material.
+            .proxy_address = if (self.global_config.?.value.proxy) |value| value.address else null,
+            .proxy_port = if (self.global_config.?.value.proxy) |value| value.port else 0,
             .memory_auto = config.memory.auto,
             .memory_notice = if (self.app) |app| app.memoryNotice() else null,
             .global_settings_available = !self.read_only,
@@ -1354,6 +1358,19 @@ pub const Session = struct {
         // Duplicate add and absent removal are intentional no-write no-ops.
         if (!try proxy_selection.apply(declaration.arena.allocator(), &declaration.value, name, enabled)) return;
         if (enabled) try self.validateProxyMember(name);
+        try self.persistSettings(&declaration, .proxy_models);
+    }
+
+    /// Settings-editor endpoint save. Empty input disables the proxy; a new
+    /// host/port keeps the current exact allowlist. The active primary client
+    /// stays frozen, while auxiliary owners follow the latest declaration.
+    fn setProxyAddress(raw: *anyopaque, address: []const u8) !void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        try self.guardSelection();
+        var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
+        defer cfg.release(&declaration);
+        // Identical endpoint and already-off are intentional no-write no-ops.
+        if (!try proxy_selection.applyAddress(declaration.arena.allocator(), &declaration.value, address)) return;
         try self.persistSettings(&declaration, .proxy_models);
     }
 
@@ -4347,4 +4364,139 @@ test "pending snapshot adopts an explicit proxy save without activating a route"
     // Validation still rejects an undeclared raw ID before any write.
     try std.testing.expectError(error.UnknownProxyModel, proxyToggle(&session, "aux/undecided", true));
     try std.testing.expectEqual(@as(usize, 2), session.pending.?.value.proxy.?.models.len);
+}
+
+fn setProxyEndpoint(session: *Session, raw: []const u8) !void {
+    const connection = session.connection();
+    const callback = connection.proxy_address_fn orelse return error.ProxyCallbackUnavailable;
+    try callback(connection.context, raw);
+}
+
+test "proxy endpoint save keeps members and moves only independent helpers" {
+    const a = std.testing.allocator;
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    try writeSessionTestConfig(fixture.tmp.dir, proxy_helper_config);
+    try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
+    try fixture.env.put("PROXY_IMG_KEY", "fake-img-key");
+    var session = try fixture.open(.{ .logging = false });
+    defer session.deinit();
+    const app = session.app.?;
+    const auth = app.client.authorization.ptr;
+    const session_id = app.client.session_id;
+    const messages = app.runtime.messages().len;
+    const decision_before = app.decision_client.?;
+    const image_before = app.image_client.?;
+    try std.testing.expect(decision_before.native.?.proxy_url == null);
+    try std.testing.expect(image_before.transport.proxy_url == null);
+
+    // Install exact memberships so every independent helper uses the route.
+    try proxyToggle(&session, "aux/native/raw", true);
+    try proxyToggle(&session, "img/deepseek-flash", true);
+    try proxyToggle(&session, "main/chat", true);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.reviewer.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
+
+    const saved = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(saved);
+    // Surrounding whitespace and an identical host/port are no-write no-ops.
+    try setProxyEndpoint(&session, "  127.0.0.1:18080\n");
+    const after_noop = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(after_noop);
+    try std.testing.expectEqualStrings(saved, after_noop);
+    var parsed_before = try cfg.parse(a, after_noop);
+    defer cfg.release(&parsed_before);
+
+    try setProxyEndpoint(&session, "[2001:db8::5]:8443");
+    var state = session.connection().current();
+    try std.testing.expect(state.proxy_configured);
+    try std.testing.expectEqualStrings("2001:db8::5", state.proxy_address.?);
+    try std.testing.expectEqual(@as(u16, 8443), state.proxy_port);
+    try std.testing.expectEqual(@as(usize, 4), state.proxy_models.len);
+    // Auxiliary owners follow the new endpoint with the same exact members.
+    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.decision_client.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.image_client.?.transport.proxy_url.?);
+    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.memory_coordinator.reviewer.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
+    try std.testing.expectEqual(@as(usize, 4), app.memory_coordinator.reviewer.?.source.value.proxy.?.models.len);
+
+    // The primary client, auth, identity and history never move; its frozen
+    // declaration keeps the original endpoint and allowlist.
+    try std.testing.expect(app.client.authorization.ptr == auth);
+    try std.testing.expectEqual(session_id, app.client.session_id);
+    try std.testing.expect(app.client.config == &app.config.value);
+    try std.testing.expectEqualStrings("chat", app.config.value.model.name);
+    try std.testing.expectEqual(messages, app.runtime.messages().len);
+    try std.testing.expect(app.client.proxy_http == null);
+    try std.testing.expectEqualStrings("127.0.0.1", app.config.value.proxy.?.address);
+    try std.testing.expectEqual(@as(usize, 1), app.config.value.proxy.?.models.len);
+
+    // An ordinary preference save must not revert helper routes to the frozen
+    // primary endpoint, and must keep unrelated settings intact.
+    const decision_now = app.decision_client.?;
+    const image_now = app.image_client.?;
+    const connection = session.connection();
+    try connection.preference_fn.?(connection.context, .compaction_enabled, 0);
+    try std.testing.expect(app.decision_client.? == decision_now);
+    try std.testing.expect(app.image_client.? == image_now);
+    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.decision_client.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.memory_coordinator.reviewer.?.native.?.proxy_url.?);
+    try std.testing.expect(!app.config.value.limits.compaction_enabled);
+    try std.testing.expect(app.client.authorization.ptr == auth);
+
+    // CAS conflict rolls the declaration, disk and helper ownership back.
+    const persisted = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(persisted);
+    const decision_before_conflict = app.decision_client.?;
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/config.json", .data = "{}" });
+    try std.testing.expectError(error.AuthVersionConflict, setProxyEndpoint(&session, "192.0.2.5:8888"));
+    try std.testing.expectEqualStrings("2001:db8::5", session.global_config.?.value.proxy.?.address);
+    try std.testing.expect(app.decision_client.? == decision_before_conflict);
+    try std.testing.expect(app.client.authorization.ptr == auth);
+    const failed = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(failed);
+    try std.testing.expectEqualStrings("{}", failed);
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/config.json", .data = persisted });
+
+    // Clearing disables the proxy everywhere and removes it from disk state.
+    try setProxyEndpoint(&session, " \t ");
+    state = session.connection().current();
+    try std.testing.expect(!state.proxy_configured);
+    try std.testing.expect(state.proxy_address == null);
+    try std.testing.expectEqual(@as(u16, 0), state.proxy_port);
+    try std.testing.expectEqual(@as(usize, 0), state.proxy_models.len);
+    try std.testing.expect(app.decision_client.?.native.?.proxy_url == null);
+    try std.testing.expect(app.image_client.?.transport.proxy_url == null);
+    try std.testing.expect(app.memory_coordinator.reviewer.?.native.?.proxy_url == null);
+    try std.testing.expect(app.memory_coordinator.extractor.?.transport.?.proxy_http == null);
+    try std.testing.expect(app.client.authorization.ptr == auth);
+    try std.testing.expect(app.client.config == &app.config.value);
+    try std.testing.expectEqual(messages, app.runtime.messages().len);
+    const cleared = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(cleared);
+    try std.testing.expect(std.mem.find(u8, cleared, "\"proxy\"") == null);
+    var parsed_cleared = try cfg.parse(a, cleared);
+    defer cfg.release(&parsed_cleared);
+    try std.testing.expect(parsed_cleared.value.proxy == null);
+    try std.testing.expectEqualStrings("aux/native/raw", parsed_cleared.value.decision.?.model);
+}
+
+test "pending proxy endpoint save updates the pending snapshot only" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    try writeSessionTestConfig(fixture.tmp.dir, proxy_pending_config);
+    try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
+    var session = try fixture.open(.{ .logging = false });
+    defer session.deinit();
+    try std.testing.expect(session.app == null);
+    try setProxyEndpoint(&session, "192.0.2.7:1080");
+    try std.testing.expectEqualStrings("192.0.2.7", session.pending.?.value.proxy.?.address);
+    try std.testing.expectEqual(@as(u16, 1080), session.pending.?.value.proxy.?.port);
+    try std.testing.expectEqual(@as(usize, 1), session.pending.?.value.proxy.?.models.len);
+    try std.testing.expectEqualStrings("aux/native/raw", session.pending.?.value.proxy.?.models[0]);
+    try setProxyEndpoint(&session, "");
+    try std.testing.expect(session.pending.?.value.proxy == null);
+    try std.testing.expect(session.app == null);
 }

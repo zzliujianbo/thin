@@ -335,9 +335,12 @@ const Pub = struct {
     image_enabled: bool = false,
     decision_model: ?[]const u8 = null,
     image_model: ?[]const u8 = null,
-    /// Public proxy state only: whether the owner has a proxy allowlist and the
-    /// exact bounded model ids on it. Never an address, port or credential.
+    /// Public proxy state: whether the owner has a proxy allowlist, the exact
+    /// bounded model ids on it, and the one non-secret host/port pair. Never a
+    /// scheme, credential, header or path. The address borrows `doc`.
     proxy_configured: bool = false,
+    proxy_address: ?[]const u8 = null,
+    proxy_port: u16 = 0,
     proxy_models: []const []const u8 = &.{},
     context_limit: u32 = 0,
     allow_custom: bool = true,
@@ -500,6 +503,7 @@ pub const Client = struct {
             .decision_fn = decisionFn,
             .image_fn = imageFn,
             .proxy_fn = proxyFn,
+            .proxy_address_fn = proxyAddressFn,
             .refresh_models_fn = refreshModelsFn,
             .poll_models_fn = pollModelsFn,
             .session_client = self.vtable(),
@@ -753,6 +757,8 @@ pub const Client = struct {
         state.decision_models = try cloneModels(arena, cfg.decision_models);
         state.decision_model = if (cfg.decision_model) |name| try arena.dupe(u8, name) else null;
         state.proxy_configured = cfg.proxy_configured;
+        state.proxy_address = if (cfg.proxy_address) |address| try arena.dupe(u8, address) else null;
+        state.proxy_port = cfg.proxy_port;
         // Each name is copied into the arena: the published projection must not
         // outlive the settings document it was parsed from.
         if (cfg.proxy_models.len != 0) {
@@ -970,6 +976,7 @@ pub const Client = struct {
         next.decision_model = read.text(view, "decision_model");
         next.image_model = read.text(view, "image_model");
         next.proxy_configured = read.flag(view, "proxy_configured", false);
+        adoptProxyEndpoint(&next, read.field(view, "proxy_address"), read.field(view, "proxy_port"), next.proxy_configured);
         try parseProxyModels(self.a, &next, read.field(view, "proxy_models"));
         next.context_limit = @intCast(@min(read.uint(view, "context_limit") orelse 0, std.math.maxInt(u32)));
         next.allow_custom = read.flag(view, "allow_custom_models", true);
@@ -2187,6 +2194,24 @@ pub const Client = struct {
         self.rebuild();
     }
 
+    /// Explicit proxy endpoint mutation: one strict `value` string, or an empty
+    /// string to clear. The endpoint is parsed locally first, so malformed input
+    /// produces zero wire traffic. The request carries the existing controller
+    /// epoch (worker) or project (setup control), never a new field.
+    fn proxyAddressFn(context: *anyopaque, value: []const u8) anyerror!void {
+        const self = fromContext(context);
+        if (value.len > core_config.max_proxy_endpoint_bytes) return error.InvalidInput;
+        _ = core_config.parseProxyEndpoint(value) catch return error.InvalidInput;
+        var req = try self.settingsRequest(.proxy_address);
+        defer req.deinit();
+        try req.put("value", value);
+        var resp = try req.exchange(quick_timeout_ms);
+        defer resp.deinit();
+        self.dirty = true;
+        self.refreshSettings();
+        self.rebuild();
+    }
+
     fn helperSelection(self: *Client, op: protocol.Op, choice: decision_picker.Choice) !void {
         var req = try self.settingsRequest(op);
         defer req.deinit();
@@ -2475,6 +2500,38 @@ fn parseModels(a: std.mem.Allocator, next: *Pub, value: ?std.json.Value, slot: M
         .decision_models => next.decision_models = models,
         .image_models => next.image_models = models,
     }
+}
+
+/// Strict public proxy endpoint adoption. A legacy snapshot that omits BOTH
+/// new fields keeps `proxy_configured` readable without inventing an endpoint.
+/// When a field is present the pair must be complete and truthful: a bare host
+/// (no scheme, credentials or path) plus a 1..65535 port, validated against the
+/// canonical parser on its bracketed IPv6 form. A configured=false snapshot may
+/// only carry null/0. The adopted string stays a window into the retained doc.
+fn adoptProxyEndpoint(next: *Pub, address_value: ?std.json.Value, port_value: ?std.json.Value, configured: bool) void {
+    if (address_value == null and port_value == null) return;
+    const address: ?[]const u8 = switch (address_value orelse .null) {
+        .string => |text| text,
+        .null => null,
+        else => return,
+    };
+    const number = valueU64(port_value orelse .{ .integer = 0 }) orelse return;
+    if (number > std.math.maxInt(u16)) return;
+    const port: u16 = @intCast(number);
+    if (!configured) return;
+    const host = address orelse return;
+    if (host.len == 0 or host.len > 253 or port == 0) return;
+    // Reusing the strict parser on `host:port` / `[IPv6]:port` rejects schemes,
+    // credentials, paths and smuggled second ports without a second grammar.
+    var buffer: [core_config.max_proxy_endpoint_bytes + 8]u8 = undefined;
+    const text = if (std.mem.findScalar(u8, host, ':') != null)
+        std.fmt.bufPrint(&buffer, "[{s}]:{d}", .{ host, port }) catch return
+    else
+        std.fmt.bufPrint(&buffer, "{s}:{d}", .{ host, port }) catch return;
+    const endpoint = (core_config.parseProxyEndpoint(text) catch return) orelse return;
+    if (endpoint.port != port or !std.mem.eql(u8, endpoint.address, host)) return;
+    next.proxy_address = host;
+    next.proxy_port = port;
 }
 
 /// Bounded proxy allowlist decode: non-empty name strings only, exact count so
@@ -2775,10 +2832,11 @@ test "refused cancel clear refreshes and reports QueueChanged" {
 test "settings requests route to worker epoch or connect setup project" {
     const a = testing.allocator;
     const ops = [_]protocol.Op{
-        .settings,     .model_select,   .effort,
-        .cycle_effort, .login,          .preference,
-        .setting,      .decision_model, .image_model,
-        .proxy_model,  .refresh_models, .poll_metadata,
+        .settings,      .model_select,   .effort,
+        .cycle_effort,  .login,          .preference,
+        .setting,       .decision_model, .image_model,
+        .proxy_model,   .proxy_address,  .refresh_models,
+        .poll_metadata,
     };
 
     var worker = try pairOf(a);
@@ -3314,6 +3372,112 @@ test "proxy mutations refuse unusable names before any wire traffic" {
     defer refresh.deinit();
     try std.testing.expect(client.state.proxy_models.len == 0);
     try std.testing.expect(!client.state.proxy_configured);
+}
+
+test "proxy endpoint request carries the exact value and publishes an owned IPv6 pair" {
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+
+    try pair.reply(1, "\"note\":0");
+    try pair.reply(2, "\"proxy_configured\":true,\"proxy_address\":\"2001:db8::1\",\"proxy_port\":8080,\"proxy_models\":[\"p/m\"]");
+    try Client.proxyAddressFn(@ptrCast(client), "[2001:db8::1]:8080");
+
+    var mutation = try readFrameJson(&pair, a);
+    defer mutation.deinit();
+    const root = mutation.value.object;
+    try std.testing.expectEqualStrings("proxy_address", root.get("op").?.string);
+    try std.testing.expectEqual(@as(i64, 5), root.get("epoch").?.integer);
+    try std.testing.expectEqualStrings("[2001:db8::1]:8080", root.get("value").?.string);
+    try std.testing.expect(root.get("project") == null);
+
+    var refresh = try readFrameJson(&pair, a);
+    defer refresh.deinit();
+    try std.testing.expectEqualStrings("settings", refresh.value.object.get("op").?.string);
+
+    try std.testing.expectEqualStrings("2001:db8::1", client.state.proxy_address.?);
+    try std.testing.expectEqual(@as(u16, 8080), client.state.proxy_port);
+    // The published address is an arena-owned copy, not a window into the doc.
+    try std.testing.expect(client.state.proxy_address.?.ptr != client.pubcfg.proxy_address.?.ptr);
+    try std.testing.expectEqual(@as(usize, 1), client.state.proxy_models.len);
+
+    // An empty value is a real clear request, not an omitted field.
+    try pair.reply(3, "\"note\":0");
+    try pair.reply(4, "\"proxy_configured\":false,\"proxy_address\":null,\"proxy_port\":0,\"proxy_models\":[]");
+    try Client.proxyAddressFn(@ptrCast(client), "");
+    var clear = try readFrameJson(&pair, a);
+    defer clear.deinit();
+    try std.testing.expectEqualStrings("", clear.value.object.get("value").?.string);
+    var cleared = try readFrameJson(&pair, a);
+    defer cleared.deinit();
+    try std.testing.expect(client.state.proxy_address == null);
+    try std.testing.expectEqual(@as(u16, 0), client.state.proxy_port);
+}
+
+test "proxy endpoint rejects unusable input before any wire traffic" {
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+
+    for ([_][]const u8{
+        "host",
+        "2001:db8::1",
+        "host:0",
+        "host:70000",
+        "[2001:db8::1]",
+        "user@host:8080",
+        "http://host:8080",
+        "host:8080/path",
+        "bad host:8080",
+    }) |value| {
+        try std.testing.expectError(error.InvalidInput, Client.proxyAddressFn(@ptrCast(client), value));
+    }
+    const too_long = try a.alloc(u8, core_config.max_proxy_endpoint_bytes + 1);
+    defer a.free(too_long);
+    @memset(too_long, 'a');
+    try std.testing.expectError(error.InvalidInput, Client.proxyAddressFn(@ptrCast(client), too_long));
+    try expectNoFrame(&pair);
+}
+
+test "settings keep legacy proxy snapshots readable and never invent endpoints" {
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+
+    // An older owner omits both new fields entirely: configured + allowlist stay
+    // readable, the endpoint stays absent and the list is not cleared.
+    try pair.reply(1, "\"proxy_configured\":true,\"proxy_models\":[\"opencode-go/deepseek-v3\"]");
+    client.refreshSettings();
+    client.rebuild();
+    try std.testing.expect(client.state.proxy_configured);
+    try std.testing.expectEqual(@as(usize, 1), client.state.proxy_models.len);
+    try std.testing.expect(client.state.proxy_address == null);
+    try std.testing.expectEqual(@as(u16, 0), client.state.proxy_port);
+
+    // A configured snapshot with a malformed pair is dropped as an endpoint but
+    // still keeps the allowlist.
+    try pair.reply(2, "\"proxy_configured\":true,\"proxy_address\":\"bad host\",\"proxy_port\":8080,\"proxy_models\":[\"opencode-go/deepseek-v3\"]");
+    client.refreshSettings();
+    client.rebuild();
+    try std.testing.expect(client.state.proxy_address == null);
+    try std.testing.expectEqual(@as(usize, 1), client.state.proxy_models.len);
+
+    // A configured=false snapshot carrying a host is not trusted either.
+    try pair.reply(3, "\"proxy_configured\":false,\"proxy_address\":\"10.0.0.9\",\"proxy_port\":3128,\"proxy_models\":[]");
+    client.refreshSettings();
+    client.rebuild();
+    try std.testing.expect(client.state.proxy_address == null);
+    try std.testing.expectEqual(@as(u16, 0), client.state.proxy_port);
+
+    // A complete IPv4 pair is adopted exactly.
+    try pair.reply(4, "\"proxy_configured\":true,\"proxy_address\":\"10.0.0.9\",\"proxy_port\":3128,\"proxy_models\":[]");
+    client.refreshSettings();
+    client.rebuild();
+    try std.testing.expectEqualStrings("10.0.0.9", client.state.proxy_address.?);
+    try std.testing.expectEqual(@as(u16, 3128), client.state.proxy_port);
 }
 
 test "stale control epoch pages are dropped instead of rendered" {

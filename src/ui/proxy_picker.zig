@@ -87,9 +87,11 @@ fn hashString(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
 /// Fixed-size identity proof over the candidates, the selected list and the
 /// configured host/port state. Work stays bounded; oversized state cannot
 /// authorize a save instead of allocating a snapshot.
-pub fn fingerprint(models: []const cfg.Model, providers: ?[]const Provider, selected_models: []const []const u8, proxy_configured: bool) ?Fingerprint {
+pub fn fingerprint(models: []const cfg.Model, providers: ?[]const Provider, selected_models: []const []const u8, proxy_configured: bool, proxy_address: ?[]const u8, proxy_port: u16) ?Fingerprint {
     const entries = providers orelse &.{};
     if (models.len > max_models or entries.len > max_providers or selected_models.len > max_selected) return null;
+    const address = proxy_address orelse "";
+    if (address.len > cfg.max_proxy_endpoint_bytes) return null;
     var candidates: usize = 0;
     for (models) |model| {
         if (!eligible(model, entries)) continue;
@@ -103,6 +105,10 @@ pub fn fingerprint(models: []const cfg.Model, providers: ?[]const Provider, sele
     }
     const flags = [1]u8{@intFromBool(proxy_configured)};
     hash.update(&flags);
+    // The endpoint is part of the identity: a concurrent address change must
+    // invalidate the acknowledged model toggle.
+    hashString(&hash, address);
+    hash.update(std.mem.asBytes(&proxy_port));
     hash.update(std.mem.asBytes(&selected_models.len));
     for (selected_models) |name| {
         if (name.len > max_name_bytes) return null;
@@ -111,7 +117,7 @@ pub fn fingerprint(models: []const cfg.Model, providers: ?[]const Provider, sele
     return hash.finalResult();
 }
 
-pub fn rows(a: std.mem.Allocator, menu: Menu, models: []const cfg.Model, providers: ?[]const Provider, selected_models: []const []const u8, proxy_configured: bool, query: []const u8, columns: usize, max_rows: usize) !Rows {
+pub fn rows(a: std.mem.Allocator, menu: Menu, models: []const cfg.Model, providers: ?[]const Provider, selected_models: []const []const u8, proxy_configured: bool, proxy_address: ?[]const u8, proxy_port: u16, query: []const u8, columns: usize, max_rows: usize) !Rows {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (out.items) |line| a.free(line);
@@ -141,13 +147,15 @@ pub fn rows(a: std.mem.Allocator, menu: Menu, models: []const cfg.Model, provide
         }
         selected_line = selected - start;
     }
-    if (!proxy_configured and max_rows > out.items.len) try append(a, &out, "Proxy host/port not configured; saving is disabled", columns);
+    if (!proxy_configured and max_rows > out.items.len) try append(a, &out, "Proxy host/port not configured; Enter shows what is missing", columns);
     if (max_rows > out.items.len) try append(a, &out, "Up/Down select  Enter toggle  Left/Esc back", columns);
     return .{
         .lines = try out.toOwnedSlice(a),
         .selected_line = selected_line,
-        .can_confirm = proxy_configured and !menu.pasted and total != 0 and menu.selected < total and complete and
-            fingerprint(models, providers, selected_models, proxy_configured) != null,
+        // A missing endpoint still acknowledges the frame so Enter can report
+        // the blocker instead of silently doing nothing.
+        .can_confirm = !menu.pasted and total != 0 and menu.selected < total and complete and
+            fingerprint(models, providers, selected_models, proxy_configured, proxy_address, proxy_port) != null,
     };
 }
 
@@ -199,32 +207,37 @@ test "proxy candidates use logged aliases preserve raw IDs and never synthesize 
     try std.testing.expect(isSelected(&.{ "other/one", "login/Family/Proxy" }, "login/Family/Proxy"));
 }
 
-test "proxy fingerprint binds candidates selection and configured state" {
-    const before = fingerprint(&profiles, &logged, &.{"login/Family/Proxy"}, true).?;
+test "proxy fingerprint binds candidates selection and configured endpoint" {
+    const before = fingerprint(&profiles, &logged, &.{"login/Family/Proxy"}, true, "10.0.0.1", 8080).?;
     try std.testing.expectEqual(@as(usize, 32), before.len);
-    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &logged, &.{"login/Family/Proxy"}, false).?));
-    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &logged, &.{ "login/Family/Proxy", "login/native/Judge" }, true).?));
-    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &logged, &.{"login/native/Judge"}, true).?));
-    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &[_]Provider{ .{ .name = "login" }, .{ .name = "second" } }, &.{"login/Family/Proxy"}, true).?));
-    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, null, &.{"login/Family/Proxy"}, true).?));
+    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &logged, &.{"login/Family/Proxy"}, false, "10.0.0.1", 8080).?));
+    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &logged, &.{ "login/Family/Proxy", "login/native/Judge" }, true, "10.0.0.1", 8080).?));
+    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &logged, &.{"login/native/Judge"}, true, "10.0.0.1", 8080).?));
+    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &logged, &.{"login/Family/Proxy"}, true, "10.0.0.2", 8080).?));
+    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &logged, &.{"login/Family/Proxy"}, true, "10.0.0.1", 8081).?));
+    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &logged, &.{"login/Family/Proxy"}, true, null, 0).?));
+    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, &[_]Provider{ .{ .name = "login" }, .{ .name = "second" } }, &.{"login/Family/Proxy"}, true, "10.0.0.1", 8080).?));
+    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, null, &.{"login/Family/Proxy"}, true, "10.0.0.1", 8080).?));
     var changed = profiles;
     changed[0].protocol = .responses;
-    try std.testing.expectEqualSlices(u8, &before, &fingerprint(&changed, &logged, &.{"login/Family/Proxy"}, true).?);
+    try std.testing.expectEqualSlices(u8, &before, &fingerprint(&changed, &logged, &.{"login/Family/Proxy"}, true, "10.0.0.1", 8080).?);
     changed[0].name = "login/Family/Other";
-    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&changed, &logged, &.{"login/Family/Proxy"}, true).?));
+    try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&changed, &logged, &.{"login/Family/Proxy"}, true, "10.0.0.1", 8080).?));
     const too_many: [max_models + 1]cfg.Model = @splat(profiles[0]);
-    try std.testing.expect(fingerprint(&too_many, &logged, &.{}, true) == null);
+    try std.testing.expect(fingerprint(&too_many, &logged, &.{}, true, "10.0.0.1", 8080) == null);
     const too_many_selected: [max_selected + 1][]const u8 = @splat("login/Family/Proxy");
-    try std.testing.expect(fingerprint(&profiles, &logged, &too_many_selected, true) == null);
+    try std.testing.expect(fingerprint(&profiles, &logged, &too_many_selected, true, "10.0.0.1", 8080) == null);
     const long_name: [max_name_bytes + 1]u8 = @splat('a');
-    try std.testing.expect(fingerprint(&profiles, &logged, &.{&long_name}, true) == null);
+    try std.testing.expect(fingerprint(&profiles, &logged, &.{&long_name}, true, "10.0.0.1", 8080) == null);
+    const long_address: [cfg.max_proxy_endpoint_bytes + 1]u8 = @splat('a');
+    try std.testing.expect(fingerprint(&profiles, &logged, &.{}, true, &long_address, 8080) == null);
 }
 
-test "proxy rows mark checked models and only confirm complete configured rows" {
+test "proxy rows confirm complete rows and surface a missing endpoint" {
     const a = std.testing.allocator;
     const chosen = [_][]const u8{"login/native/Judge"};
     for (0..count(&profiles, &logged, "")) |selected| for (0..7) |height| for (0..70) |columns| {
-        const rendered = try rows(a, .{ .selected = selected }, &profiles, &logged, &chosen, true, "", columns, height);
+        const rendered = try rows(a, .{ .selected = selected }, &profiles, &logged, &chosen, true, "10.0.0.1", 8080, "", columns, height);
         defer freeRows(a, rendered);
         try std.testing.expect(rendered.lines.len <= height);
         for (rendered.lines) |line| try std.testing.expect(text.width(line) <= columns);
@@ -241,21 +254,23 @@ test "proxy rows mark checked models and only confirm complete configured rows" 
             try std.testing.expect(std.mem.startsWith(u8, rendered.lines[index][2..], if (selected == 1) "[x]" else "[ ]"));
         }
     };
-    const unconfigured = try rows(a, .{}, &profiles, &logged, &.{}, false, "", 80, 10);
+    const unconfigured = try rows(a, .{}, &profiles, &logged, &.{}, false, null, 0, "", 80, 10);
     defer freeRows(a, unconfigured);
-    try std.testing.expect(!unconfigured.can_confirm);
-    try std.testing.expectEqualStrings("Proxy host/port not configured; saving is disabled", unconfigured.lines[2]);
-    const pasted = try rows(a, .{ .pasted = true }, &profiles, &logged, &.{}, true, "", 80, 3);
+    // The frame is acknowledged so Enter reports the missing endpoint; the
+    // owner callback still refuses to save anything.
+    try std.testing.expect(unconfigured.can_confirm);
+    try std.testing.expectEqualStrings("Proxy host/port not configured; Enter shows what is missing", unconfigured.lines[2]);
+    const pasted = try rows(a, .{ .pasted = true }, &profiles, &logged, &.{}, true, "10.0.0.1", 8080, "", 80, 3);
     defer freeRows(a, pasted);
     try std.testing.expect(!pasted.can_confirm);
-    const missing = try rows(a, .{}, &profiles, &logged, &.{}, true, "missing", 80, 3);
+    const missing = try rows(a, .{}, &profiles, &logged, &.{}, true, "10.0.0.1", 8080, "missing", 80, 3);
     defer freeRows(a, missing);
     try std.testing.expect(!missing.can_confirm and missing.selected_line == null);
     try std.testing.expectEqualStrings("No matching models", missing.lines[0]);
-    const clipped = try rows(a, .{}, &profiles, &logged, &.{}, true, "", 6, 1);
+    const clipped = try rows(a, .{}, &profiles, &logged, &.{}, true, "10.0.0.1", 8080, "", 6, 1);
     defer freeRows(a, clipped);
     try std.testing.expect(!clipped.can_confirm and text.width(clipped.lines[0]) <= 6);
-    const empty = try rows(a, .{}, &profiles, &logged, &.{}, true, "", 80, 0);
+    const empty = try rows(a, .{}, &profiles, &logged, &.{}, true, "10.0.0.1", 8080, "", 80, 0);
     defer a.free(empty.lines);
     try std.testing.expect(empty.lines.len == 0 and empty.selected_line == null and !empty.can_confirm);
 }
@@ -265,7 +280,7 @@ test "proxy rows keep one bounded window for large catalogs" {
     const models: [40]cfg.Model = @splat(.{ .name = "login/Native/Judge", .protocol = .systemone, .context_tokens = 0 });
     try std.testing.expectEqual(@as(usize, 40), count(&models, &logged, ""));
     for ([_]usize{ 1, 2, 3, 10, 100 }) |height| {
-        const rendered = try rows(a, .{ .selected = 39 }, &models, &logged, &.{}, true, "", 80, height);
+        const rendered = try rows(a, .{ .selected = 39 }, &models, &logged, &.{}, true, "10.0.0.1", 8080, "", 80, height);
         defer freeRows(a, rendered);
         try std.testing.expect(rendered.can_confirm);
         try std.testing.expect(rendered.lines.len <= @min(height, 11));
@@ -280,7 +295,7 @@ test "proxy rows keep one bounded window for large catalogs" {
 
 fn allocationCase(a: std.mem.Allocator) !void {
     for ([_][]const u8{ "", "JUDGE", "missing" }) |query| {
-        const rendered = try rows(a, .{ .selected = 1 }, &profiles, &logged, &.{"login/Family/Proxy"}, true, query, 40, 7);
+        const rendered = try rows(a, .{ .selected = 1 }, &profiles, &logged, &.{"login/Family/Proxy"}, true, "10.0.0.1", 8080, query, 40, 7);
         defer freeRows(a, rendered);
     }
 }

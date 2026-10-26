@@ -795,6 +795,7 @@ pub const SessionHost = struct {
             .decision_model => self.handleDecisionModel(a, request, connection_id),
             .image_model => self.handleImageModel(a, request, connection_id),
             .proxy_model => self.handleProxyModel(a, request, connection_id),
+            .proxy_address => self.handleProxyAddress(a, request, connection_id),
             .refresh_models => self.handleRefresh(a, request, connection_id),
             .poll_metadata => self.handlePollMetadata(a, request, connection_id),
             .close => self.handleClose(a, request, connection_id),
@@ -1303,9 +1304,12 @@ pub const SessionHost = struct {
         try out.field("low_price_input_enabled", state.low_price_input_enabled);
         try out.field("image_enabled", state.image_enabled);
         try out.field("image_model", state.image_model);
-        // Proxy allowlist projection: configured flag plus the exact bounded
-        // model ids. Never an endpoint, a port or a credential.
+        // Proxy projection: presence of a configuration is the only enable
+        // state; address/port are the one non-secret host/port pair allowed on
+        // the wire. Never a scheme, credential, header or path.
         try out.field("proxy_configured", state.proxy_configured);
+        try out.field("proxy_address", state.proxy_address);
+        try out.field("proxy_port", state.proxy_port);
         try encodeProxyModels(&out, state.proxy_models);
         try out.field("memory_auto", state.memory_auto);
         try out.field("memory_notice", state.memory_notice);
@@ -1524,6 +1528,24 @@ pub const SessionHost = struct {
         const enabled = request.requiredBool("enabled") catch |err| return errorReply(a, request.id, err);
         const callback = self.connection.proxy_fn orelse return errorReply(a, request.id, error.Unsupported);
         callback(self.connection.context, name, enabled) catch |err| return errorReply(a, request.id, err);
+        self.refreshConnection();
+        var out = protocol.Out.init(a);
+        defer out.deinit();
+        try out.ok(request.id);
+        return replyFrame(&out);
+    }
+
+    /// Explicit proxy endpoint mutation. `value` is mandatory and strict: an
+    /// empty string clears the configured endpoint, anything else must parse as
+    /// a bare host:port (or [IPv6]:port). The endpoint is validated locally
+    /// before the owner callback so a malformed request never reaches it, and a
+    /// failed save never republishes a settings projection.
+    fn handleProxyAddress(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
+        self.requireIdleControl(request, connection_id) catch |err| return errorReply(a, request.id, err);
+        const value = request.stringField("value", cfg.max_proxy_endpoint_bytes) catch |err| return errorReply(a, request.id, err);
+        _ = cfg.parseProxyEndpoint(value) catch return errorReply(a, request.id, error.InvalidProxyEndpoint);
+        const callback = self.connection.proxy_address_fn orelse return errorReply(a, request.id, error.Unsupported);
+        callback(self.connection.context, value) catch |err| return errorReply(a, request.id, err);
         self.refreshConnection();
         var out = protocol.Out.init(a);
         defer out.deinit();
@@ -2627,13 +2649,57 @@ const FakeProxyView = struct {
     prev_context: *anyopaque,
     configured: bool,
     names: []const []const u8,
+    address: ?[]const u8 = null,
+    port: u16 = 0,
 
     fn current(context: *anyopaque) tui.Connection.State {
         const self: *FakeProxyView = @ptrCast(@alignCast(context));
         var state = self.prev_fn(self.prev_context);
         state.proxy_configured = self.configured;
         state.proxy_models = self.names;
+        state.proxy_address = self.address;
+        state.proxy_port = self.port;
         return state;
+    }
+};
+
+/// Records the exact endpoint string handed to the owner callback. The value is
+/// copied because the request document dies before the assertion runs.
+const ProxyAddressSink = struct {
+    calls: usize = 0,
+    len: usize = 0,
+    value: [cfg.max_proxy_endpoint_bytes]u8 = undefined,
+    fail: bool = false,
+
+    fn set(context: *anyopaque, value: []const u8) anyerror!void {
+        const self: *ProxyAddressSink = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        self.len = @min(value.len, self.value.len);
+        @memcpy(self.value[0..self.len], value[0..self.len]);
+        if (self.fail) return error.InvalidProxyEndpoint;
+    }
+
+    fn recorded(self: *const ProxyAddressSink) []const u8 {
+        return self.value[0..self.len];
+    }
+};
+
+/// Test-only pairing of a fake settings view with the endpoint recorder. Both
+/// the current projection and the save callback share one hosted context, so a
+/// raw cast to either half would corrupt the other; every entry point forwards
+/// to its own half instead.
+const ProxyViewSink = struct {
+    view: FakeProxyView,
+    sink: *ProxyAddressSink,
+
+    fn current(context: *anyopaque) tui.Connection.State {
+        const self: *ProxyViewSink = @ptrCast(@alignCast(context));
+        return FakeProxyView.current(@ptrCast(&self.view));
+    }
+
+    fn set(context: *anyopaque, value: []const u8) anyerror!void {
+        const self: *ProxyViewSink = @ptrCast(@alignCast(context));
+        return ProxyAddressSink.set(self.sink, value);
     }
 };
 
@@ -2737,6 +2803,160 @@ test "proxy mutations require the live epoch and one exact model id" {
     }
 }
 
+test "proxy endpoint mutation is strict, epoch-bound and publishes only on success" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const project_len = try tmp.dir.realPath(io, &path_buffer);
+    const project = path_buffer[0..project_len];
+    var environ = std.process.Environ.Map.init(a);
+    defer environ.deinit();
+    try environ.put("HOME", project);
+
+    const id = try ids.generate(io);
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    defer host.deinit();
+    {
+        const attached = try dispatchJson(host, a, "{\"v\":1,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+        defer a.free(attached);
+        try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
+    }
+
+    const session_ctx: *anyopaque = @ptrCast(&host.session);
+    var sink = ProxyAddressSink{};
+
+    // A full IPv6 endpoint reaches the owner verbatim; a successful save also
+    // republishes the session connection, so the test fake must disappear.
+    {
+        // Capture the real session connection before the fake view is installed
+        // so the fake falls back to the live projection, then hand the same
+        // connection back once this scope leaves.
+        host.refreshConnection();
+        var proxy = ProxyViewSink{
+            .view = .{
+                .prev_fn = host.connection.current_fn,
+                .prev_context = host.connection.context,
+                .configured = true,
+                .names = &.{},
+                .address = "stale.invalid",
+                .port = 9,
+            },
+            .sink = &sink,
+        };
+        host.connection.current_fn = ProxyViewSink.current;
+        host.connection.context = &proxy;
+        host.connection.proxy_address_fn = ProxyViewSink.set;
+        defer host.refreshConnection();
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":2,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"[2001:db8::1]:8080\"}", 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
+        try std.testing.expectEqual(@as(usize, 1), sink.calls);
+        try std.testing.expectEqualStrings("[2001:db8::1]:8080", sink.recorded());
+        try std.testing.expect(host.connection.context == session_ctx);
+    }
+
+    // An empty value is a real clear and still reaches the owner callback.
+    {
+        host.connection.proxy_address_fn = ProxyAddressSink.set;
+        host.connection.context = &sink;
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":3,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}", 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
+        try std.testing.expectEqual(@as(usize, 2), sink.calls);
+        try std.testing.expectEqualStrings("", sink.recorded());
+    }
+
+    // Every malformed or loose shape is rejected before the callback.
+    host.connection.proxy_address_fn = ProxyAddressSink.set;
+    host.connection.context = &sink;
+    for ([_][]const u8{
+        "{\"v\":1,\"id\":4,\"op\":\"proxy_address\",\"epoch\":1}",
+        "{\"v\":1,\"id\":5,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
+        "{\"v\":1,\"id\":6,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
+        "{\"v\":1,\"id\":7,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"2001:db8::1\"}",
+        "{\"v\":1,\"id\":8,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:0\"}",
+        "{\"v\":1,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:70000\"}",
+        "{\"v\":1,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"user@host:8080\"}",
+        "{\"v\":1,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"http://host:8080\"}",
+    }) |json| {
+        const frame = try dispatchJson(host, a, json, 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "unsupported") == null);
+        try std.testing.expectEqual(@as(usize, 2), sink.calls);
+    }
+    {
+        var long_value: [cfg.max_proxy_endpoint_bytes + 1]u8 = undefined;
+        @memset(&long_value, 'a');
+        const too_long = try std.fmt.allocPrint(a, "{{\"v\":1,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"{s}\"}}", .{long_value[0..]});
+        defer a.free(too_long);
+        const frame = try dispatchJson(host, a, too_long, 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "input_too_large") != null);
+        try std.testing.expectEqual(@as(usize, 2), sink.calls);
+    }
+
+    // Socket and epoch binding, then the idle guard: none reach the callback.
+    {
+        const stale = try dispatchJson(host, a, "{\"v\":1,\"id\":13,\"op\":\"proxy_address\",\"epoch\":9,\"value\":\"host:8080\"}", 7);
+        defer a.free(stale);
+        try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
+    }
+    {
+        const foreign = try dispatchJson(host, a, "{\"v\":1,\"id\":14,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 8);
+        defer a.free(foreign);
+        try std.testing.expect(std.mem.indexOf(u8, foreign, "stale_control") != null);
+    }
+    {
+        host.reset_failed = error.ResetFailed;
+        defer host.reset_failed = null;
+        const busy = try dispatchJson(host, a, "{\"v\":1,\"id\":15,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
+        defer a.free(busy);
+        try std.testing.expect(std.mem.indexOf(u8, busy, "busy") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), sink.calls);
+
+    // A failed owner save returns an error and must NOT republish the settings
+    // projection: the installed view survives exactly as it was.
+    {
+        host.refreshConnection();
+        var proxy = ProxyViewSink{
+            .view = .{
+                .prev_fn = host.connection.current_fn,
+                .prev_context = host.connection.context,
+                .configured = true,
+                .names = &.{},
+                .address = "old.invalid",
+                .port = 1,
+            },
+            .sink = &sink,
+        };
+        host.connection.current_fn = ProxyViewSink.current;
+        host.connection.context = &proxy;
+        host.connection.proxy_address_fn = ProxyViewSink.set;
+        sink.fail = true;
+        defer sink.fail = false;
+        defer host.refreshConnection();
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":16,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
+        try std.testing.expectEqual(@as(usize, 3), sink.calls);
+        try std.testing.expect(host.connection.context == @as(*anyopaque, @ptrCast(&proxy)));
+    }
+
+    // Without an owner callback the op is unsupported, never silently accepted.
+    {
+        host.connection.context = session_ctx;
+        host.connection.proxy_address_fn = null;
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":17,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "unsupported") != null);
+        try std.testing.expectEqual(@as(usize, 3), sink.calls);
+    }
+}
+
 test "settings reply publishes the proxy allowlist without addresses or secrets" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -2759,6 +2979,8 @@ test "settings reply publishes the proxy allowlist without addresses or secrets"
         .prev_context = host.connection.context,
         .configured = true,
         .names = &names,
+        .address = "2001:db8::1",
+        .port = 8443,
     };
     {
         host.connection.current_fn = FakeProxyView.current;
@@ -2773,6 +2995,10 @@ test "settings reply publishes the proxy allowlist without addresses or secrets"
         defer doc.deinit();
         const root = doc.value.object;
         try std.testing.expectEqual(true, root.get("proxy_configured").?.bool);
+        // Only the non-secret host/port pair is published: no scheme, path,
+        // credentials or headers, and a full IPv6 address stays verbatim.
+        try std.testing.expectEqualStrings("2001:db8::1", root.get("proxy_address").?.string);
+        try std.testing.expectEqual(@as(i64, 8443), root.get("proxy_port").?.integer);
         const list = root.get("proxy_models").?.array;
         try std.testing.expectEqual(names.len, list.items.len);
         try std.testing.expectEqualStrings(names[0], list.items[0].string);
@@ -2817,6 +3043,8 @@ test "settings reply publishes the proxy allowlist without addresses or secrets"
         defer doc.deinit();
         const root = doc.value.object;
         try std.testing.expectEqual(false, root.get("proxy_configured").?.bool);
+        try std.testing.expect(root.get("proxy_address").? == .null);
+        try std.testing.expectEqual(@as(i64, 0), root.get("proxy_port").?.integer);
         try std.testing.expectEqual(@as(usize, 0), root.get("proxy_models").?.array.items.len);
     }
 }

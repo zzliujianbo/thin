@@ -378,6 +378,7 @@ const Supervisor = struct {
             .decision_model,
             .image_model,
             .proxy_model,
+            .proxy_address,
             .refresh_models,
             .poll_metadata,
             => self.handleSetup(request, active),
@@ -1003,10 +1004,29 @@ test "supervisor keeps one private setup host per socket without registering a s
         const reply = try controlRoundTrip(&supervisor, &client, frame);
         defer a.free(reply);
         try std.testing.expect(std.mem.indexOf(u8, reply, "\"proxy_configured\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "\"proxy_address\":null") != null);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "\"proxy_port\":0") != null);
         try std.testing.expect(std.mem.indexOf(u8, reply, "\"proxy_models\":[]") != null);
     }
 
-    // 8. EOF destroys the slot and its setup host; nothing was ever listed.
+    // 8. Proxy endpoint edits route to the private setup host. An invalid
+    //    endpoint is rejected by the host itself, so routing is proven without
+    //    depending on whether this owner also wired its save callback.
+    {
+        const body = try std.fmt.allocPrint(a, ",\"value\":\"user@host:8080\",\"epoch\":1,\"project\":\"{s}\"", .{elsewhere});
+        defer a.free(body);
+        const frame = try setupOpFrame(a, 9, "proxy_address", body);
+        defer a.free(frame);
+        const reply = try controlRoundTrip(&supervisor, &client, frame);
+        defer a.free(reply);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "\"ok\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "invalid_input") != null);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "unsupported") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), supervisor.created.items.len);
+    try std.testing.expectEqual(@as(usize, 0), workers.list.items.len);
+
+    // 9. EOF destroys the slot and its setup host; nothing was ever listed.
     client.close();
     supervisor.serveTick();
     try std.testing.expect(supervisor.slots[0] == null);

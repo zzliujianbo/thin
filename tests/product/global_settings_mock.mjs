@@ -302,12 +302,15 @@ try {
   let learned = await snapshot(proxy.configPath);
   assert.deepEqual(JSON.parse(proxy.config).proxy, expectedProxy);
   const proxyOrder = [];
+  // Each gate names exactly the proxy fields its save edits; everything else in
+  // the declaration must stay as written by the previous save.
   const proxyStates = {
-    'native-added':[proxyModels.existing, proxyModels.native],
-    'added':[proxyModels.existing, proxyModels.native, proxyModels.second],
-    'removed':[proxyModels.existing, proxyModels.native],
+    'address-changed':{address:'127.0.0.2', port:9999, models:[proxyModels.existing]},
+    'native-added':{models:[proxyModels.existing, proxyModels.native]},
+    'added':{models:[proxyModels.existing, proxyModels.native, proxyModels.second]},
+    'removed':{models:[proxyModels.existing, proxyModels.native]},
   };
-  const proxyPhases = ['opened','unlogged','native-added','added','root-return','reopened','removed','persisted'];
+  const proxyPhases = ['address-canceled','address-changed','opened','unlogged','native-added','added','root-return','reopened','removed','persisted'];
   await run('settings-proxy-configured', proxy.home, proxy.project, url, {
     watchdogMs: 90000,
     gate: async name => {
@@ -318,12 +321,12 @@ try {
         await missing(join(proxy.project, '.thin/settings.json'));
         await missing(join(proxy.project, '.thin/sessions'));
         if (proxyStates[name]) {
-          expectedProxy = {...expectedProxy, models:[...proxyStates[name]]};
+          expectedProxy = {...expectedProxy, ...proxyStates[name], models:[...proxyStates[name].models]};
           expected = canonicalConfig(proxy, expectedProxy);
           const disk = JSON.parse(await readFile(proxy.configPath, 'utf8'));
-          assert.deepEqual(disk, expected, `${name}: only proxy.models may change`);
-          assert.equal(disk.proxy.address, '127.0.0.1', `${name}: proxy address`);
-          assert.equal(disk.proxy.port, 8888, `${name}: proxy port`);
+          assert.deepEqual(disk, expected, `${name}: only the edited proxy fields may change`);
+          assert.equal(disk.proxy.address, expectedProxy.address, `${name}: proxy address`);
+          assert.equal(disk.proxy.port, expectedProxy.port, `${name}: proxy port`);
           assert.equal((await stat(proxy.configPath)).mode & 0o777, 0o600, `${name}: mode`);
           learned = await snapshot(proxy.configPath);
         } else await untouched(proxy.configPath, learned);
@@ -338,10 +341,15 @@ try {
   await thinHome(proxy.home, ['config.json','settings.json']);
   assert.deepEqual((await readdir(proxy.project)).sort(), proxyPhases.map(n => `settings-proxy-release-${n}`).sort());
 
-  // Without a proxy host/port the picker is read-only and never writes.
+  // Configure from absence, then remove the complete declaration without a toggle.
   const off = await proxyFixture('proxy-unconfigured', url, false);
   const offSnapshot = await snapshot(off.configPath);
-  const offPhases = ['opened','unconfigured'];
+  let offLearned = offSnapshot;
+  const offEdits = {
+    'address-saved':{address:'127.0.0.1', port:8888, models:[]},
+    'member-added':{address:'127.0.0.1', port:8888, models:[proxyModels.existing]},
+  };
+  const offPhases = ['opened','unconfigured','invalid','address-saved','member-added','cleared','reopened'];
   const offOrder = [];
   await run('settings-proxy-unconfigured', off.home, off.project, url, {
     watchdogMs: 90000,
@@ -349,8 +357,14 @@ try {
       try {
         offOrder.push(name);
         assert(offPhases.includes(name), `${name}: unknown proxy gate`);
-        await untouched(off.configPath, offSnapshot);
-        assert.equal(await readFile(off.configPath, 'utf8'), off.config, `${name}: declarations changed`);
+        if (offEdits[name] || name === 'cleared') {
+          const next = offEdits[name];
+          const disk = JSON.parse(await readFile(off.configPath, 'utf8'));
+          assert.deepEqual(disk, canonicalConfig(off, next), `${name}: unexpected declaration change`);
+          if (name === 'cleared') assert(!Object.hasOwn(disk, 'proxy'), `${name}: proxy must be removed`);
+          assert.equal((await stat(off.configPath)).mode & 0o777, 0o600, `${name}: mode`);
+          offLearned = await snapshot(off.configPath);
+        } else await untouched(off.configPath, offLearned);
         await missing(off.settings);
         await missing(join(off.project, '.thin/settings.json'));
         await missing(join(off.project, '.thin/sessions'));
@@ -360,6 +374,7 @@ try {
     },
   });
   assert.deepEqual(offOrder, offPhases);
+  assert.deepEqual(JSON.parse(await readFile(off.configPath, 'utf8')), canonicalConfig(off), 'final off whole JSON');
   await thinHome(off.home, ['config.json']);
   assert.deepEqual((await readdir(off.project)).sort(), offPhases.map(n => `settings-proxy-release-${n}`).sort());
 

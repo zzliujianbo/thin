@@ -230,6 +230,9 @@ pub const Connection = struct {
     /// Exact proxy-model routing toggle: the owner saves the list and
     /// republishes its snapshot. Settings only; no network request here.
     proxy_fn: ?*const fn (*anyopaque, []const u8, bool) anyerror!void = null,
+    /// Owner saves (host:port or [IPv6]:port) or clears (empty) the endpoint.
+    /// Settings only; the main route changes with the next session.
+    proxy_address_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     context: *anyopaque,
     current_fn: *const fn (*anyopaque) State,
     configure_fn: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -302,6 +305,9 @@ pub const Connection = struct {
         decision_model: ?[]const u8 = null,
         /// Owner-published proxy host/port availability; never inferred or guessed.
         proxy_configured: bool = false,
+        /// Owner-published bare host (IPv6 without brackets); null means none.
+        proxy_address: ?[]const u8 = null,
+        proxy_port: u16 = 0,
         /// Exact provider/raw-ID strings routed through that proxy, in order.
         proxy_models: []const []const u8 = &.{},
         global_settings_available: bool = true,
@@ -424,6 +430,10 @@ const Ui = struct {
     image_open: bool = false,
     /// Searchable multi-select proxy child. Enter saves one exact model.
     proxy_open: bool = false,
+    /// Proxy second level: Address and Models rows.
+    proxy_sub_open: bool = false,
+    /// Proxy address editor; the submenu stays visible above it.
+    proxy_address_open: bool = false,
     settings_value_picker: ?settings_value_module.Picker = null,
     settings_return_selected: usize = 0,
     settings_menu: settings_menu_module.Menu = .{},
@@ -1652,14 +1662,23 @@ const Ui = struct {
         }
         self.proxy_restore = null;
     }
-    /// The proxy child takes ownership of the editor as its search query and
-    /// keeps the Settings-root draft aside, so returning never destroys it.
+    fn anyProxyOpen(self: *const Ui) bool {
+        return self.proxy_open or self.proxy_sub_open or self.proxy_address_open;
+    }
+    /// Only these children replace the editor; a bare submenu keeps the root draft.
+    fn proxyEditorBorrowed(self: *const Ui) bool {
+        return self.proxy_open or self.proxy_address_open;
+    }
+    /// The proxy child takes ownership of the editor and keeps the Settings-root
+    /// draft aside, so returning never destroys it. The submenu stays behind it.
     fn beginProxyPicker(self: *Ui) void {
         self.dropProxyRestore();
         self.proxy_restore = self.editor;
         self.editor = .{ .allocator = self.allocator };
         self.editor_pasted = false;
         self.proxy_open = true;
+        self.proxy_sub_open = true;
+        self.proxy_address_open = false;
         self.settings_menu.clear();
         self.settings_menu.selected = 0;
         self.displayed_proxy_fingerprint = null;
@@ -1668,7 +1687,38 @@ const Ui = struct {
         self.frame_settings_generation = null;
         self.parser.stop_feed = true;
     }
-    fn endProxyPicker(self: *Ui) void {
+    /// Prefill is committed only after its buffer exists, so a failed open can
+    /// neither leak nor drop the parent draft. The current endpoint is never
+    /// rewritten by the UI; the owner publishes what it saved.
+    fn beginProxyAddress(self: *Ui, state: Connection.State) !void {
+        var buffer: [settings_menu_module.endpoint_buffer_bytes]u8 = undefined;
+        const current = endpointText(&buffer, state);
+        var next: input.Editor = .{ .allocator = self.allocator };
+        errdefer next.deinit();
+        try next.bytes.ensureTotalCapacity(self.allocator, current.len);
+        next.bytes.appendSliceAssumeCapacity(current);
+        next.cursor = current.len;
+        self.dropProxyRestore();
+        self.dropHistoryDraft();
+        self.vertical_column = null;
+        self.input_history.index = null;
+        self.proxy_restore = self.editor;
+        self.editor = next;
+        self.editor_pasted = false;
+        self.proxy_open = false;
+        self.proxy_sub_open = true;
+        self.proxy_address_open = true;
+        self.settings_menu.clear();
+        self.settings_menu.selected = 0;
+        self.displayed_proxy_fingerprint = null;
+        self.frame_proxy_fingerprint = null;
+        self.displayed_settings_generation = null;
+        self.frame_settings_generation = null;
+        self.parser.stop_feed = true;
+        self.notice = "Address";
+    }
+    /// Restores the Settings-root draft owned by proxy_restore exactly once.
+    fn endProxyEditor(self: *Ui) void {
         self.dropHistoryDraft();
         self.vertical_column = null;
         self.input_history.index = null;
@@ -1681,12 +1731,14 @@ const Ui = struct {
     }
     fn closeSettingsMenu(self: *Ui) void {
         if (self.settingsModelOpen()) self.wipeEditor();
-        if (self.proxy_open) self.endProxyPicker();
+        if (self.proxyEditorBorrowed()) self.endProxyEditor();
         self.dropProxyRestore();
         self.settings_open = false;
         self.decision_open = false;
         self.image_open = false;
         self.proxy_open = false;
+        self.proxy_sub_open = false;
+        self.proxy_address_open = false;
         self.displayed_decision_fingerprint = null;
         self.frame_decision_fingerprint = null;
         self.displayed_proxy_fingerprint = null;
@@ -1707,9 +1759,9 @@ const Ui = struct {
         self.notice = "Ready";
     }
     fn backToSettings(self: *Ui) void {
-        const parent: usize = if (self.image_open) 6 else if (self.proxy_open) 8 else 1;
+        const parent: usize = if (self.image_open) 6 else if (self.anyProxyOpen()) 8 else 1;
         if (self.settingsModelOpen()) self.wipeEditor();
-        if (self.proxy_open) self.endProxyPicker();
+        if (self.proxyEditorBorrowed()) self.endProxyEditor();
         self.displayed_decision_fingerprint = null;
         self.frame_decision_fingerprint = null;
         self.displayed_proxy_fingerprint = null;
@@ -1718,6 +1770,8 @@ const Ui = struct {
         self.decision_open = false;
         self.image_open = false;
         self.proxy_open = false;
+        self.proxy_sub_open = false;
+        self.proxy_address_open = false;
         self.settings_menu.clear();
         self.settings_menu.selected = parent;
         self.displayed_settings_generation = null;
@@ -1871,19 +1925,196 @@ const Ui = struct {
     fn settingsQueryChanged(self: *Ui) void {
         if (self.proxy_open) self.proxyQueryChanged() else self.decisionQueryChanged();
     }
+    /// Any address edit revokes the acknowledgement; only a fresh complete
+    /// frame can authorize a save, even inside one read or paste batch.
+    fn proxyAddressChanged(self: *Ui) void {
+        self.settings_menu.generation +%= 1;
+        self.displayed_settings_generation = null;
+        self.frame_settings_generation = null;
+    }
+    fn addressFits(self: *const Ui, columns: usize) bool {
+        return text.width("Address> ") + text.width(self.editor.bytes.items) <= columns;
+    }
+    /// Back from a proxy child lands on the row that owned it; the Settings
+    /// root and its draft are untouched.
+    fn backToProxySubmenu(self: *Ui, selected: usize) void {
+        if (self.proxyEditorBorrowed()) self.endProxyEditor();
+        self.proxy_open = false;
+        self.proxy_address_open = false;
+        self.proxy_sub_open = true;
+        self.displayed_proxy_fingerprint = null;
+        self.frame_proxy_fingerprint = null;
+        self.settings_menu.clear();
+        self.settings_menu.selected = selected;
+        self.displayed_settings_generation = null;
+        self.frame_settings_generation = null;
+        self.parser.stop_feed = true;
+        self.notice = "Ready";
+    }
+    fn openProxyAddress(self: *Ui) void {
+        self.beginProxyAddress(self.connection.current()) catch {
+            self.notice = "Out of memory; address editor not opened";
+        };
+    }
+    /// Empty input removes the proxy through the same owner callback. The UI
+    /// never mutates its own endpoint: a failed save keeps the old value.
+    fn saveProxyAddress(self: *Ui, state: Connection.State) void {
+        if (!state.global_settings_available) {
+            self.notice = "Global settings unavailable; changes disabled";
+            return;
+        }
+        const raw = std.mem.trim(u8, self.editor.bytes.items, " \t");
+        const parsed = core_config.parseProxyEndpoint(raw) catch {
+            self.notice = "Invalid proxy address; use host:port, [IPv6]:port, or empty to disable";
+            return;
+        };
+        const save = self.connection.proxy_address_fn orelse {
+            self.notice = "Global settings unavailable; changes disabled";
+            return;
+        };
+        var buffer: [settings_menu_module.endpoint_buffer_bytes]u8 = undefined;
+        const value: []const u8 = if (parsed) |endpoint| blk: {
+            if (endpoint.address.len == 0 or endpoint.port == 0) {
+                self.notice = "Invalid proxy address; use host:port, [IPv6]:port, or empty to disable";
+                return;
+            }
+            if (std.mem.findScalar(u8, endpoint.address, ':') != null)
+                break :blk std.fmt.bufPrint(&buffer, "[{s}]:{d}", .{ endpoint.address, endpoint.port }) catch {
+                    self.notice = "Invalid proxy address; use host:port, [IPv6]:port, or empty to disable";
+                    return;
+                };
+            break :blk std.fmt.bufPrint(&buffer, "{s}:{d}", .{ endpoint.address, endpoint.port }) catch {
+                self.notice = "Invalid proxy address; use host:port, [IPv6]:port, or empty to disable";
+                return;
+            };
+        } else "";
+        self.bridge.reset() catch {
+            self.notice = "Settings require a drained session bridge";
+            return;
+        };
+        save(self.connection.context, value) catch {
+            self.notice = "Could not save setting; previous value kept";
+            return;
+        };
+        // The owner publishes; then the submenu shows the saved endpoint.
+        self.display.context = self.connection.current().initial_context;
+        const disabled = parsed == null;
+        self.backToProxySubmenu(0);
+        self.notice = if (disabled) "Empty disables proxy; a new session applies it" else "Saved proxy address; main route applies in a new session";
+    }
+    fn proxySubKey(self: *Ui, event_: input.Event) !void {
+        switch (event_) {
+            .quit => self.requestQuit(),
+            .escape, .cancel, .left => self.backToSettings(),
+            .up, .down => self.settings_menu.move(event_ == .down, settings_menu_module.proxy_labels.len),
+            .paste_start => self.settings_menu.markPaste(),
+            .enter => {
+                if (!self.settingsIdle() or self.frame.len != 0 or self.settings_menu.pasted or
+                    self.displayed_settings_generation != self.settings_menu.generation) return;
+                // Opening a child consumes the acknowledgement.
+                self.settings_menu.generation +%= 1;
+                self.displayed_settings_generation = null;
+                self.frame_settings_generation = null;
+                self.parser.stop_feed = true;
+                const state = self.connection.current();
+                if (!state.global_settings_available) {
+                    self.notice = "Global settings unavailable; changes disabled";
+                    return;
+                }
+                if (self.settings_menu.selected == 0) {
+                    self.openProxyAddress();
+                    return;
+                }
+                self.beginProxyPicker();
+                if (!state.proxy_configured) self.notice = "Configure a proxy address first; saving is disabled";
+            },
+            else => {},
+        }
+    }
+    fn proxyAddressKey(self: *Ui, event_: input.Event) !void {
+        switch (event_) {
+            .quit => self.requestQuit(),
+            .escape, .cancel => self.backToProxySubmenu(0),
+            // Left is a cursor move while text remains; at the raw origin it
+            // cancels without writing, matching the Custom value editor.
+            .left => {
+                if (self.editor.cursor == 0) {
+                    self.backToProxySubmenu(0);
+                    return;
+                }
+                self.proxyAddressChanged();
+                self.editor.left();
+            },
+            .right => {
+                self.proxyAddressChanged();
+                self.editor.right();
+            },
+            .home => {
+                self.proxyAddressChanged();
+                self.editor.cursor = 0;
+            },
+            .end => {
+                self.proxyAddressChanged();
+                self.editor.cursor = self.editor.bytes.items.len;
+            },
+            .paste_start => {
+                self.proxyAddressChanged();
+                self.notice = "Address pasted; review it, then Enter after redraw saves";
+            },
+            .text => |value| {
+                self.proxyAddressChanged();
+                if (value.value.len > core_config.max_proxy_endpoint_bytes -| self.editor.bytes.items.len) {
+                    self.notice = "Address limit: 320 bytes";
+                    return;
+                }
+                _ = try self.editor.insert(value.value);
+                if (value.pasted) self.notice = "Address pasted; review it, then Enter after redraw saves";
+            },
+            .backspace, .delete, .clear, .kill_end => {
+                self.proxyAddressChanged();
+                switch (event_) {
+                    .backspace => self.editor.backspace(),
+                    .delete => self.editor.delete(),
+                    .clear => self.wipeEditor(),
+                    .kill_end => self.editor.bytes.items.len = self.editor.cursor,
+                    else => unreachable,
+                }
+            },
+            .enter => {
+                if (!self.settingsIdle() or self.editor_pasted or self.parser.batch_paste or self.frame.len != 0 or
+                    self.settings_menu.pasted) return;
+                // Visible state authorizes the save: text that cannot be shown
+                // in full is refused with a reason instead of failing silently.
+                if (self.editor.bytes.items.len > core_config.max_proxy_endpoint_bytes or !self.addressFits(self.size.columns -| 1)) {
+                    self.proxyAddressChanged();
+                    self.parser.stop_feed = true;
+                    self.notice = "Resize: the full address must be visible to save";
+                    return;
+                }
+                if (self.displayed_settings_generation != self.settings_menu.generation) return;
+                // Consume the acknowledgement before any attempt; a repeated
+                // Enter in the same read batch cannot save twice.
+                self.proxyAddressChanged();
+                self.parser.stop_feed = true;
+                self.saveProxyAddress(self.connection.current());
+            },
+            else => {},
+        }
+    }
     /// One acknowledged Enter toggles exactly one exact model. The owner saves
     /// and republishes, so failed saves leave the checkbox and configuration
     /// unchanged. Never derive a proxy address here.
     fn toggleProxy(self: *Ui, acknowledged: ?proxy_picker_module.Fingerprint, state: Connection.State) !void {
         const previous = acknowledged orelse return;
-        const current = proxy_picker_module.fingerprint(state.models, state.model_providers, state.proxy_models, state.proxy_configured) orelse return;
+        const current = proxy_picker_module.fingerprint(state.models, state.model_providers, state.proxy_models, state.proxy_configured, state.proxy_address, state.proxy_port) orelse return;
         if (!std.mem.eql(u8, &previous, &current)) return;
         if (!state.global_settings_available) {
             self.notice = "Global settings unavailable; changes disabled";
             return;
         }
         if (!state.proxy_configured) {
-            self.notice = "Configure a proxy host and port first";
+            // An acknowledged Enter reports the blocker; it is never silent.
+            self.notice = "Configure a proxy address first; saving is disabled";
             return;
         }
         const name = proxy_picker_module.candidate(state.models, state.model_providers, self.editor.bytes.items, self.settings_menu.selected) orelse return;
@@ -1906,7 +2137,15 @@ const Ui = struct {
     }
     fn settingsKey(self: *Ui, event_: input.Event) !void {
         if (self.settings_value_picker != null) return self.settingsValueKey(event_);
-        if (self.settingsQueryOpen() and (event_ == .left or event_ == .escape or event_ == .cancel)) {
+        if (self.proxy_address_open) return self.proxyAddressKey(event_);
+        if (self.proxy_open and (event_ == .left or event_ == .escape or event_ == .cancel)) {
+            self.backToProxySubmenu(1);
+            return;
+        }
+        // The active models picker keeps the parent marker for its breadcrumb,
+        // so it must not intercept its own query, navigation or Enter.
+        if (self.proxy_sub_open and !self.proxy_open) return self.proxySubKey(event_);
+        if (self.settingsModelOpen() and (event_ == .left or event_ == .escape or event_ == .cancel)) {
             self.backToSettings();
             return;
         }
@@ -1994,8 +2233,7 @@ const Ui = struct {
                     return;
                 }
                 if (!self.settingsQueryOpen() and self.settings_menu.selected == 8) {
-                    self.beginProxyPicker();
-                    self.notice = "Ready";
+                    self.backToProxySubmenu(0);
                     return;
                 }
                 if (!self.settingsQueryOpen()) {
@@ -4079,7 +4317,7 @@ const Ui = struct {
         if (self.model_picker) |*picker| try picker.captureChoice(a, picker_rows.selected_choice);
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, candidate_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
-        var settings_rows = if (self.settings_open and self.settings_value_picker != null) try settings_value_module.rows(a, self.settings_menu, self.settings_value_picker.?, cols, candidate_limit) else if (self.settings_open and self.proxy_open) try proxy_picker_module.rows(a, self.settings_menu, state.models, state.model_providers, state.proxy_models, state.proxy_configured, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open and self.settingsModelOpen()) try decision_picker_module.rows(a, self.settings_menu, self.settingsModels(state), state.model_providers, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, .{
+        const settings_snapshot: settings_menu_module.Snapshot = .{
             .low_price_input_enabled = state.low_price_input_enabled,
             .decision_enabled = state.decision_enabled,
             .decision_model = state.decision_model,
@@ -4087,10 +4325,13 @@ const Ui = struct {
             .image_model = state.image_model,
             .memory_auto = state.memory_auto,
             .proxy_configured = state.proxy_configured,
+            .proxy_address = state.proxy_address,
+            .proxy_port = state.proxy_port,
             .proxy_model_count = state.proxy_models.len,
             .global_settings_available = state.global_settings_available,
             .limits = state.limits,
-        }, cols, candidate_limit) else settings_menu_module.Rows{ .lines = &.{} };
+        };
+        var settings_rows = if (self.settings_open and self.settings_value_picker != null) try settings_value_module.rows(a, self.settings_menu, self.settings_value_picker.?, cols, candidate_limit) else if (self.settings_open and self.proxy_open) try proxy_picker_module.rows(a, self.settings_menu, state.models, state.model_providers, state.proxy_models, state.proxy_configured, state.proxy_address, state.proxy_port, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open and self.proxy_sub_open) try settings_menu_module.proxyRows(a, self.settings_menu, settings_snapshot, cols, candidate_limit) else if (self.settings_open and self.settingsModelOpen()) try decision_picker_module.rows(a, self.settings_menu, self.settingsModels(state), state.model_providers, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, settings_snapshot, cols, candidate_limit) else settings_menu_module.Rows{ .lines = &.{} };
         if (self.settings_value_picker) |picker| {
             settings_rows.can_confirm = settings_rows.can_confirm and text.width(settingsValueTitle(picker.key)) <= cols;
         }
@@ -4299,10 +4540,12 @@ const Ui = struct {
             }
             if (popup_span == popup_lines.len) {
                 if (stop_fits) self.frame_stop = self.stop_generation;
-                if (!self.stop_open and self.settings_open and settings_rows.can_confirm) {
+                if (!self.stop_open and self.settings_open and settings_rows.can_confirm and
+                    (!self.proxy_address_open or self.addressFits(cols)))
+                {
                     self.frame_settings_generation = self.settings_menu.generation;
                     if (self.settingsModelOpen()) self.frame_decision_fingerprint = decision_picker_module.fingerprint(self.settingsModels(state), state.model_providers);
-                    if (self.proxy_open) self.frame_proxy_fingerprint = proxy_picker_module.fingerprint(state.models, state.model_providers, state.proxy_models, state.proxy_configured);
+                    if (self.proxy_open) self.frame_proxy_fingerprint = proxy_picker_module.fingerprint(state.models, state.model_providers, state.proxy_models, state.proxy_configured, state.proxy_address, state.proxy_port);
                 }
                 if (!self.stop_open and self.provider_open and provider_rows.can_confirm) self.frame_provider_generation = self.provider_picker.generation;
                 if (self.model_picker) |picker| {
@@ -4324,6 +4567,15 @@ const Ui = struct {
                 try putInputLine(writer, a, rows, "API key> ", masks[0..count], cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols, count + 10) - 1});
+            } else if (self.proxy_address_open) {
+                // The endpoint editor owns the composer line while the submenu
+                // stays visible; nothing is saved before a fresh full frame.
+                const value = try editorDisplay(a, self.editor.bytes.items);
+                try putInputLine(writer, a, rows, "Address> ", value, cols);
+                cursor_offset = tail_out.written().len;
+                const typed = try editorDisplay(a, self.editor.bytes.items[0..self.editor.cursor]);
+                const column = @min(cols -| 1, text.width("Address> ") + text.width(typed));
+                try writer.print("\r\x1b[{d}C", .{column -| 1});
             } else if (self.settings_open and !self.settingsQueryOpen()) {
                 try putInputLine(writer, a, rows, "Settings> ", "", cols);
                 cursor_offset = tail_out.written().len;
@@ -4504,6 +4756,15 @@ fn sessionArgumentsValid(name: []const u8, args: []const u8) bool {
 }
 
 /// 输入行的显示副本：Tab 固定展开为四个空格，测宽、裁剪与输出共用；不修改提交字节。
+/// Prefill text for the proxy address editor; empty means no endpoint exists.
+fn endpointText(buffer: []u8, state: Connection.State) []const u8 {
+    const address = state.proxy_address orelse return "";
+    if (state.proxy_port == 0) return address;
+    if (std.mem.findScalar(u8, address, ':') != null)
+        return std.fmt.bufPrint(buffer, "[{s}]:{d}", .{ address, state.proxy_port }) catch address;
+    return std.fmt.bufPrint(buffer, "{s}:{d}", .{ address, state.proxy_port }) catch address;
+}
+
 fn editorDisplay(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     const safe = try text.sanitize(a, bytes, 256 * 1024);
     defer a.free(safe);
@@ -7958,6 +8219,14 @@ const SelectionFixture = struct {
     proxy_fail: bool = false,
     proxy_last: ?[]const u8 = null,
     proxy_last_enabled: bool = false,
+    /// Owner-published endpoint; members and endpoint are independent.
+    proxy_address: ?[]const u8 = null,
+    proxy_port: u16 = 0,
+    proxy_address_buf: [253]u8 = undefined,
+    proxy_endpoint: [core_config.max_proxy_endpoint_bytes]u8 = undefined,
+    proxy_endpoint_len: usize = 0,
+    proxy_address_saves: usize = 0,
+    proxy_address_fail: bool = false,
     const profiles = [_]core_config.Model{.{ .name = "fixture/fixture-next", .context_tokens = 65536 }};
     /// Owner-side proxy list mutation: the UI never edits its own copy.
     fn proxyToggle(raw: *anyopaque, name: []const u8, enabled: bool) !void {
@@ -7980,6 +8249,32 @@ const SelectionFixture = struct {
             self.proxy_len -= 1;
         }
     }
+    /// Owner-side endpoint mutation: parse, own the host bytes, publish. A
+    /// failed save leaves the previous endpoint and members untouched. An empty
+    /// value removes the whole proxy like the backend: the member list is
+    /// dropped too, and no state survives for the next session.
+    fn proxyEndpoint(raw: *anyopaque, value: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.proxy_address_saves += 1;
+        if (value.len > self.proxy_endpoint.len) return error.TestSelectionFailure;
+        @memcpy(self.proxy_endpoint[0..value.len], value);
+        self.proxy_endpoint_len = value.len;
+        if (self.proxy_address_fail) return error.TestSelectionFailure;
+        self.proxy_address = null;
+        self.proxy_port = 0;
+        self.proxy_configured = false;
+        if (value.len == 0) {
+            for (self.proxy_list[0..self.proxy_len]) |*entry| entry.* = "";
+            self.proxy_len = 0;
+            return;
+        }
+        const parsed = (try core_config.parseProxyEndpoint(value)).?;
+        if (parsed.address.len > self.proxy_address_buf.len) return error.TestSelectionFailure;
+        @memcpy(self.proxy_address_buf[0..parsed.address.len], parsed.address);
+        self.proxy_address = self.proxy_address_buf[0..parsed.address.len];
+        self.proxy_port = parsed.port;
+        self.proxy_configured = true;
+    }
     fn refreshMetadata(ctx: *anyopaque) !void {
         const self: *SelectionFixture = @ptrCast(@alignCast(ctx));
         self.refreshes += 1;
@@ -7996,11 +8291,11 @@ const SelectionFixture = struct {
         return true;
     }
     fn connection(self: *@This()) Connection {
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .select_model_fn = select, .set_effort_fn = setEffort, .proxy_fn = proxyToggle };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .select_model_fn = select, .set_effort_fn = setEffort, .proxy_fn = proxyToggle, .proxy_address_fn = proxyEndpoint };
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .selection_name = if (std.mem.eql(u8, self.name, "fixture-old")) "fixture/fixture-old" else if (std.mem.eql(u8, self.name, "fixture-next")) "fixture/fixture-next" else self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default, .proxy_configured = self.proxy_configured, .proxy_models = self.proxy_list[0..self.proxy_len] };
+        return .{ .runtime = null, .model = self.name, .selection_name = if (std.mem.eql(u8, self.name, "fixture-old")) "fixture/fixture-old" else if (std.mem.eql(u8, self.name, "fixture-next")) "fixture/fixture-next" else self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default, .proxy_configured = self.proxy_configured, .proxy_address = self.proxy_address, .proxy_port = self.proxy_port, .proxy_models = self.proxy_list[0..self.proxy_len] };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;
@@ -11078,7 +11373,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
         .{ .name = "fixture/two", .protocol = .systemone, .context_tokens = 0 },
         .{ .name = "unlogged/three", .context_tokens = 32768 },
     };
-    var fixture: SelectionFixture = .{ .profiles_override = &models, .proxy_configured = true };
+    var fixture: SelectionFixture = .{ .profiles_override = &models, .proxy_configured = true, .proxy_address = "10.0.0.1", .proxy_port = 8080 };
     defer fixture.deinit();
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -11091,10 +11386,26 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     // Settings-root draft: the child must never destroy it.
     _ = try ui.editor.insert("draft");
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Proxy models") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Proxy") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Proxy models") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "10.0.0.1:8080") != null);
+    ui.finishFrame();
+    // Root Enter opens the second level; Address stays selected by default.
+    try ui.parser.feed("\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expect(ui.proxy_sub_open and !ui.proxy_open and !ui.proxy_address_open);
+    try std.testing.expect(!ui.decision_open and !ui.image_open);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "> Address") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "10.0.0.1:8080") != null);
+    ui.finishFrame();
+    // Down reaches Models, which opens the existing acknowledged picker.
+    try ui.parser.feed("\x1b[B", input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
     ui.finishFrame();
     try ui.parser.feed("\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
-    try std.testing.expect(ui.proxy_open and !ui.decision_open and !ui.image_open);
+    try std.testing.expect(ui.proxy_open and ui.proxy_sub_open and !ui.proxy_address_open);
+    try std.testing.expect(!ui.decision_open and !ui.image_open);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "[ ] fixture/one") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "unlogged/three") == null);
@@ -11140,14 +11451,70 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     try std.testing.expectEqual(@as(usize, 4), fixture.proxy_saves);
     try std.testing.expectEqualStrings("fixture/two", fixture.proxy_last.?);
     try std.testing.expect(!fixture.proxy_last_enabled);
-    // Left/Esc returns to the parent row and restores the parent draft.
+    // Esc from the picker lands on the Models row and restores the parent draft.
     try ui.settingsKey(.escape);
-    try std.testing.expect(!ui.proxy_open and ui.settings_open);
+    try std.testing.expect(!ui.proxy_open and ui.proxy_sub_open and ui.settings_open);
+    try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
+    try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
+    // Esc from the second level returns to the root Proxy row, draft intact.
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.escape);
+    try std.testing.expect(!ui.proxy_sub_open and !ui.proxy_address_open and ui.settings_open);
     try std.testing.expectEqual(@as(usize, 8), ui.settings_menu.selected);
     try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
 }
 
-test "settings proxy submenu refuses saving without a configured host and port" {
+test "proxy picker owns its query while the parent submenu stays marked" {
+    try text.initLocale();
+    const models = [_]core_config.Model{
+        .{ .name = "fixture/one", .context_tokens = 32768 },
+        .{ .name = "fixture/two", .context_tokens = 32768 },
+    };
+    var fixture: SelectionFixture = .{ .profiles_override = &models, .proxy_configured = true, .proxy_address = "10.0.0.1", .proxy_port = 8080 };
+    defer fixture.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 8;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try ui.settingsKey(.down);
+    try ui.draw();
+    ui.finishFrame();
+    // Models opens the picker while the parent marker stays set.
+    try ui.settingsKey(.enter);
+    try std.testing.expect(ui.proxy_open and ui.proxy_sub_open and !ui.proxy_address_open);
+    // The query reaches the picker editor and filters its rows.
+    try ui.settingsKey(.{ .text = .{ .value = "two", .pasted = false } });
+    try std.testing.expectEqualStrings("two", ui.editor.bytes.items);
+    try std.testing.expect(ui.proxy_open and ui.proxy_sub_open);
+    try std.testing.expectEqual(@as(usize, 1), proxy_picker_module.count(SelectionFixture.current(&fixture).models, SelectionFixture.current(&fixture).model_providers, ui.editor.bytes.items));
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "[ ] fixture/two") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "fixture/one") == null);
+    ui.finishFrame();
+    // A complete ACKed Enter toggles the filtered row instead of Address.
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
+    try std.testing.expectEqualStrings("fixture/two", fixture.proxy_last.?);
+    try std.testing.expect(fixture.proxy_last_enabled);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
+    try std.testing.expect(ui.proxy_open and !ui.proxy_address_open);
+    try std.testing.expectEqualStrings("two", ui.editor.bytes.items);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Saved proxy models") != null);
+    // Esc still returns to the parent Models row, keeping the submenu.
+    try ui.settingsKey(.escape);
+    try std.testing.expect(!ui.proxy_open and ui.proxy_sub_open and !ui.proxy_address_open and ui.settings_open);
+    try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
+}
+
+test "settings proxy submenu reports a missing endpoint instead of stalling" {
     try text.initLocale();
     const models = [_]core_config.Model{.{ .name = "fixture/one", .context_tokens = 32768 }};
     var fixture: SelectionFixture = .{ .profiles_override = &models };
@@ -11163,23 +11530,270 @@ test "settings proxy submenu refuses saving without a configured host and port" 
     try ui.draw();
     ui.finishFrame();
     try ui.settingsKey(.enter);
-    try std.testing.expect(ui.proxy_open);
+    try std.testing.expect(ui.proxy_sub_open and !ui.proxy_open);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "not configured") != null);
-    // Saving stays disabled: no guessed address and no save callback.
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Not configured") != null);
+    ui.finishFrame();
+    // Models opens without an endpoint and states the blocker up front.
+    try ui.parser.feed("\x1b[B", input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try ui.draw();
     ui.finishFrame();
     try ui.settingsKey(.enter);
-    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_saves);
+    try std.testing.expect(ui.proxy_open);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Configure a proxy address first") != null);
     try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "not configured") != null);
+    ui.finishFrame();
+    // An acknowledged Enter still refuses to guess an endpoint or save a model.
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_saves);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Configure a proxy address first") != null);
+    try std.testing.expect(ui.proxy_open);
+    // Address opens with an empty prefill and an invalid value never lands.
+    try ui.settingsKey(.escape);
+    try ui.settingsKey(.up);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expect(ui.proxy_address_open and ui.proxy_sub_open and !ui.proxy_open);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Address> ") != null);
     ui.finishFrame();
     try ui.settingsKey(.{ .text = .{ .value = "fixture", .pasted = false } });
     try ui.draw();
     ui.finishFrame();
     try ui.settingsKey(.enter);
-    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_saves);
-    try std.testing.expect(ui.proxy_open and ui.input_history.entries.items.len == 0);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Invalid proxy address") != null);
+    try std.testing.expect(ui.proxy_address_open and !fixture.proxy_configured);
+    try std.testing.expect(ui.input_history.entries.items.len == 0);
+    // The owner guard also refuses directly once settings became unavailable.
+    const saves = fixture.proxy_address_saves;
+    ui.saveProxyAddress(.{ .runtime = null, .model = "", .base_url = "", .global_settings_available = false });
+    try std.testing.expectEqual(saves, fixture.proxy_address_saves);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Global settings unavailable") != null);
+    try std.testing.expect(ui.proxy_address_open);
 }
 
+test "proxy address enables model toggles and empty removes proxy configuration" {
+    try text.initLocale();
+    const models = [_]core_config.Model{.{ .name = "fixture/one", .context_tokens = 32768 }};
+    var fixture: SelectionFixture = .{ .profiles_override = &models };
+    defer fixture.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 8;
+    try ui.draw();
+    ui.finishFrame();
+    // Root 8 -> second level -> Address, prefilled empty when nothing is set.
+    try ui.settingsKey(.enter);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expect(ui.proxy_address_open and ui.editor.bytes.items.len == 0);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("127.0.0.1:8888", input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_address_saves);
+    try std.testing.expectEqualStrings("127.0.0.1:8888", fixture.proxy_endpoint[0..fixture.proxy_endpoint_len]);
+    try std.testing.expectEqualStrings("127.0.0.1", fixture.proxy_address.?);
+    try std.testing.expectEqual(@as(u16, 8888), fixture.proxy_port);
+    try std.testing.expect(fixture.proxy_configured);
+    // A saved address returns to the second level, never to the editor.
+    try std.testing.expect(!ui.proxy_address_open and ui.proxy_sub_open and !ui.proxy_open);
+    try std.testing.expectEqual(@as(usize, 0), ui.settings_menu.selected);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Saved proxy address") != null);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "new session") != null);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "127.0.0.1:8888") != null);
+    ui.finishFrame();
+    // Models now accepts one acknowledged toggle.
+    try ui.settingsKey(.down);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
+    try std.testing.expectEqualStrings("fixture/one", fixture.proxy_last.?);
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_len);
+    // Changing the address keeps the existing members.
+    try ui.settingsKey(.escape);
+    try ui.settingsKey(.up);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqualStrings("127.0.0.1:8888", ui.editor.bytes.items);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.clear);
+    try ui.settingsKey(.{ .text = .{ .value = "10.0.0.1:3128", .pasted = false } });
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 2), fixture.proxy_address_saves);
+    try std.testing.expectEqualStrings("10.0.0.1", fixture.proxy_address.?);
+    try std.testing.expectEqual(@as(u16, 3128), fixture.proxy_port);
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_len);
+    // Empty input removes the whole proxy through the same callback, dropping
+    // the member list as the backend does; nothing survives the disable.
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expect(ui.proxy_address_open);
+    try std.testing.expectEqualStrings("10.0.0.1:3128", ui.editor.bytes.items);
+    try ui.settingsKey(.clear);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 3), fixture.proxy_address_saves);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_endpoint_len);
+    try std.testing.expect(fixture.proxy_address == null and fixture.proxy_port == 0);
+    try std.testing.expect(!fixture.proxy_configured);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_len);
+    try std.testing.expectEqual(@as(usize, 0), SelectionFixture.current(&fixture).proxy_models.len);
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Empty disables proxy") != null);
+    try std.testing.expect(!ui.proxy_address_open and ui.proxy_sub_open);
+}
+
+test "proxy address saves only when the endpoint fits the reserved columns" {
+    try text.initLocale();
+    const models = [_]core_config.Model{.{ .name = "fixture/one", .context_tokens = 32768 }};
+    var fixture: SelectionFixture = .{ .profiles_override = &models };
+    defer fixture.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 8;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expect(ui.proxy_address_open);
+    // 63+1+2 host plus ":8888" is 71 bytes; with the 9-byte prompt it needs
+    // exactly the 80 reserved columns of an 81-column terminal.
+    const endpoint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aa:8888";
+    try std.testing.expectEqual(@as(usize, 71), endpoint.len);
+    try ui.parser.feed(endpoint, input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try ui.draw();
+    ui.finishFrame();
+    // At 80 columns the row keeps one spare column, so the text is not fully
+    // visible: the save is refused with a reason instead of silently failing.
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Resize") != null);
+    try std.testing.expect(ui.proxy_address_open);
+    // One wider column authorizes the same text after a fresh complete frame.
+    ui.resize(.{ .columns = 81, .rows = 24 });
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_address_saves);
+    try std.testing.expectEqualStrings(endpoint, fixture.proxy_endpoint[0..fixture.proxy_endpoint_len]);
+    try std.testing.expectEqual(@as(usize, 66), fixture.proxy_address.?.len);
+    try std.testing.expectEqual(@as(u16, 8888), fixture.proxy_port);
+    try std.testing.expect(!ui.proxy_address_open and ui.proxy_sub_open);
+}
+
+test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" {
+    try text.initLocale();
+    const models = [_]core_config.Model{.{ .name = "fixture/one", .context_tokens = 32768 }};
+    var fixture: SelectionFixture = .{ .profiles_override = &models, .proxy_configured = true, .proxy_address = "10.0.0.1", .proxy_port = 8080 };
+    defer fixture.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 8;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expect(ui.proxy_address_open);
+    try std.testing.expectEqualStrings("10.0.0.1:8080", ui.editor.bytes.items);
+    // An invalid endpoint is refused explicitly and never lands.
+    try ui.settingsKey(.clear);
+    try ui.settingsKey(.{ .text = .{ .value = "10.0.0.1:0", .pasted = false } });
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Invalid proxy address") != null);
+    try std.testing.expectEqualStrings("10.0.0.1", fixture.proxy_address.?);
+    try std.testing.expect(ui.proxy_address_open);
+    // Esc cancels without writing and the saved endpoint is still shown.
+    try ui.settingsKey(.escape);
+    try std.testing.expect(!ui.proxy_address_open and ui.proxy_sub_open);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "10.0.0.1:8080") != null);
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqualStrings("10.0.0.1:8080", ui.editor.bytes.items);
+    // Text and Enter in one read batch cannot save: the edit revoked the ACK.
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("9\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
+    try std.testing.expect(ui.proxy_address_open);
+    // Pasting only edits the buffer; the same batch Enter is refused too.
+    try ui.settingsKey(.clear);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\x1b[200~10.0.0.9:3128\x1b[201~\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expectEqualStrings("10.0.0.9:3128", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "pasted") != null);
+    try std.testing.expect(ui.proxy_address_open);
+    // An owner save failure keeps the previous endpoint and consumes the ACK.
+    // The paste batch taints Enter for the rest of its read, so the attempt
+    // arrives as a fresh read of its own after a complete frame.
+    fixture.proxy_address_fail = true;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_address_saves);
+    try std.testing.expectEqualStrings("10.0.0.1", fixture.proxy_address.?);
+    try std.testing.expectEqual(@as(u16, 8080), fixture.proxy_port);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "previous value kept") != null);
+    try std.testing.expect(ui.proxy_address_open);
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_address_saves);
+    fixture.proxy_address_fail = false;
+    // A fresh complete frame after the same edit does save it, and the retry
+    // is again a new read rather than a byte of the previous one.
+    try ui.draw();
+    ui.finishFrame();
+    try ui.parser.feed("\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expectEqual(@as(usize, 2), fixture.proxy_address_saves);
+    try std.testing.expectEqualStrings("10.0.0.9", fixture.proxy_address.?);
+    try std.testing.expectEqual(@as(u16, 3128), fixture.proxy_port);
+    try std.testing.expect(!ui.proxy_address_open and ui.proxy_sub_open);
+}
 test "remote history replay seeds input history without touching the editor" {
     try text.initLocale();
     const a = std.testing.allocator;

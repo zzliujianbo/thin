@@ -188,6 +188,48 @@ fn validAlias(value: []const u8) bool {
 /// Allocator-owned URL bytes; caller must free with the allocator passed to url.
 pub const OwnedURL = []u8;
 
+/// One settings-editor proxy host/port pair. Bounded so a single declaration line
+/// can never grow a config field without limit.
+pub const max_proxy_endpoint_bytes: usize = 320;
+
+/// Borrowed host plus numeric port. `address` is never a URL, credentials or a
+/// bracketed IPv6 literal; it points into the caller's `raw` input.
+pub const ProxyEndpoint = struct { address: []const u8, port: u16 };
+
+/// Parse `host:port` or `[IPv6]:port`. Surrounding ASCII whitespace is ignored
+/// and an all-whitespace input means "no proxy". Anything else is rejected:
+/// schemes, userinfo, paths, unbracketed IPv6, zone identifiers and controls.
+/// Pure function: no I/O, no allocation; the address borrows `raw`.
+pub fn parseProxyEndpoint(raw: []const u8) !?ProxyEndpoint {
+    // Bound raw bytes before trimming: callers cap the wire/editor payload, so
+    // unbounded whitespace must fail rather than masquerade as a clear.
+    if (raw.len > max_proxy_endpoint_bytes) return error.InputTooLarge;
+    const trimmed = std.mem.trim(u8, raw, " \t\n\r\x0b\x0c");
+    if (trimmed.len == 0) return null;
+    var address: []const u8 = undefined;
+    var port_text: []const u8 = undefined;
+    if (trimmed[0] == '[') {
+        const close = std.mem.findScalar(u8, trimmed, ']') orelse return error.InvalidProxyAddress;
+        if (close < 2 or close + 1 >= trimmed.len or trimmed[close + 1] != ':') return error.InvalidProxyAddress;
+        address = trimmed[1..close];
+        // Brackets are an IPv6-only form; a bracketed DNS/IPv4 literal is a URL habit.
+        if (std.mem.findScalar(u8, address, ':') == null) return error.InvalidProxyAddress;
+        port_text = trimmed[close + 2 ..];
+    } else {
+        const colon = std.mem.findScalar(u8, trimmed, ':') orelse return error.InvalidProxyAddress;
+        // A second colon is an unbracketed IPv6 literal, not host:port.
+        if (std.mem.findScalar(u8, trimmed[colon + 1 ..], ':') != null) return error.InvalidProxyAddress;
+        address = trimmed[0..colon];
+        port_text = trimmed[colon + 1 ..];
+    }
+    if (port_text.len == 0 or port_text.len > 5) return error.InvalidProxyPort;
+    for (port_text) |c| if (!std.ascii.isDigit(c)) return error.InvalidProxyPort;
+    const port = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidProxyPort;
+    if (port == 0) return error.InvalidProxyPort;
+    try validateProxyAddress(address);
+    return .{ .address = address, .port = port };
+}
+
 /// Explicit HTTP forward proxy, independent of provider endpoints and model scope.
 /// HTTP only, not SOCKS and not an API URL. Address is an unbracketed DNS/IP
 /// host, never a URL or credentials; port is separate.
@@ -1707,4 +1749,54 @@ test "credential and image parser cleanup and release zero owned allocations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.reject, .{});
     try std.testing.expect(observer.frees > 0);
     try std.testing.expect(!observer.dirty_free);
+}
+
+test "proxy endpoint parses host forms and borrows the input" {
+    const ipv4 = " 127.0.0.1:8080\t";
+    const parsed4 = (try parseProxyEndpoint(ipv4)).?;
+    try std.testing.expectEqualStrings("127.0.0.1", parsed4.address);
+    try std.testing.expectEqual(@as(u16, 8080), parsed4.port);
+    // The address is a slice of the caller's bytes, not a copy.
+    try std.testing.expect(parsed4.address.ptr == ipv4.ptr + 1);
+
+    const dns = try parseProxyEndpoint("proxy.example.invalid.:3128");
+    try std.testing.expectEqualStrings("proxy.example.invalid.", dns.?.address);
+    try std.testing.expectEqual(@as(u16, 3128), dns.?.port);
+
+    // Only bracketed IPv6 literals are accepted, and the brackets are removed.
+    const v6raw = "[::1]:65535";
+    const v6 = (try parseProxyEndpoint(v6raw)).?;
+    try std.testing.expectEqualStrings("::1", v6.address);
+    try std.testing.expectEqual(@as(u16, 65535), v6.port);
+    try std.testing.expect(v6.address.ptr == v6raw.ptr + 1);
+
+    // All-whitespace (including a stripped control-only input) disables a proxy.
+    try std.testing.expect((try parseProxyEndpoint("")) == null);
+    try std.testing.expect((try parseProxyEndpoint(" \t\r\n")) == null);
+    // Whitespace at the exact bound is still a clear, not an overflow.
+    const exact_blank: [max_proxy_endpoint_bytes]u8 = @splat(' ');
+    try std.testing.expect((try parseProxyEndpoint(&exact_blank)) == null);
+}
+
+test "proxy endpoint rejects malformed, unbounded and non-host forms" {
+    try std.testing.expectError(error.InvalidProxyPort, parseProxyEndpoint("127.0.0.1:0"));
+    try std.testing.expectError(error.InvalidProxyPort, parseProxyEndpoint("127.0.0.1:65536"));
+    try std.testing.expectError(error.InvalidProxyPort, parseProxyEndpoint("127.0.0.1:"));
+    try std.testing.expectError(error.InvalidProxyPort, parseProxyEndpoint("127.0.0.1:-1"));
+    try std.testing.expectError(error.InvalidProxyPort, parseProxyEndpoint("127.0.0.1:80x"));
+    // Schemes, userinfo and paths are not endpoints.
+    try std.testing.expectError(error.InvalidProxyAddress, parseProxyEndpoint("http://127.0.0.1:8080"));
+    try std.testing.expectError(error.InvalidProxyAddress, parseProxyEndpoint("user:secret@127.0.0.1:8080"));
+    try std.testing.expectError(error.InvalidProxyPort, parseProxyEndpoint("127.0.0.1:8080/v1"));
+    // Unbracketed IPv6, zone identifiers and bracketed non-IPv6 are refused.
+    try std.testing.expectError(error.InvalidProxyAddress, parseProxyEndpoint("::1:8080"));
+    try std.testing.expectError(error.InvalidProxyAddress, parseProxyEndpoint("[fe80::1%25eth0]:8080"));
+    try std.testing.expectError(error.InvalidProxyAddress, parseProxyEndpoint("[127.0.0.1]:8080"));
+    try std.testing.expectError(error.InvalidProxyAddress, parseProxyEndpoint("bad\nhost:80"));
+    try std.testing.expectError(error.InvalidProxyAddress, parseProxyEndpoint("host name:80"));
+    const oversized: [max_proxy_endpoint_bytes + 1]u8 = @splat('a');
+    try std.testing.expectError(error.InputTooLarge, parseProxyEndpoint(&oversized));
+    // Raw-byte bound applies before trimming, so whitespace cannot dodge it.
+    const oversized_blank: [max_proxy_endpoint_bytes + 1]u8 = @splat(' ');
+    try std.testing.expectError(error.InputTooLarge, parseProxyEndpoint(&oversized_blank));
 }

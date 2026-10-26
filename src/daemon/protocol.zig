@@ -72,6 +72,9 @@ pub fn errorCode(err: anyerror) ErrorCode {
         // server faults: an unusable proxy/provider/credential request must
         // never surface as an opaque internal failure.
         error.ProxyNotConfigured, error.UnknownProvider, error.UnknownProxyModel, error.ApiKeyNotFound, error.MissingRegistry, error.InvalidDefault => .invalid_input,
+        // A malformed proxy endpoint (host/port text, scheme, credentials or an
+        // out-of-range port) is a caller mistake, never an owner fault.
+        error.InvalidProxyAddress, error.InvalidProxyPort, error.InvalidProxyEndpoint, error.InvalidProxyAuthority => .invalid_input,
         error.InputTooLarge, error.OutOfMemory => .input_too_large,
         error.InboxFull, error.QueueFull => .queue_full,
         error.QueueEmpty, error.RunSealed => .queue_empty,
@@ -192,6 +195,10 @@ pub const Op = enum {
     /// Proxy allowlist mutation: one exact provider/raw model id plus an
     /// explicit enable flag. Never carries an endpoint or a credential.
     proxy_model,
+    /// Explicit proxy endpoint mutation: one required `value` string holding a
+    /// strict host:port (or [IPv6]:port). An empty value clears the endpoint;
+    /// presence of configuration is the only enable state.
+    proxy_address,
     refresh_models,
     poll_metadata,
     close,
@@ -1614,6 +1621,29 @@ test "numeric and enum request fields reject wrong types instead of defaulting" 
     try std.testing.expectError(error.BadRequest, request.boolField("epoch", true));
     try std.testing.expectEqual(true, try request.boolField("level", false));
     try std.testing.expectEqual(true, try request.requiredBool("level"));
+}
+
+test "proxy_address accepts an empty clear and maps endpoint rejections to invalid_input" {
+    const a = std.testing.allocator;
+    var cleared = try parseRequest(a, "{\"v\":1,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}");
+    defer cleared.deinit();
+    try std.testing.expectEqual(Op.proxy_address, cleared.op);
+    try std.testing.expectEqualStrings("", try cleared.stringField("value", 320));
+
+    // A missing, null or non-string `value` is a bad request, never a clear.
+    for ([_][]const u8{
+        "{\"v\":1,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1}",
+        "{\"v\":1,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
+        "{\"v\":1,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
+    }) |json| {
+        var request = try parseRequest(a, json);
+        defer request.deinit();
+        try std.testing.expectError(error.BadRequest, request.stringField("value", 320));
+    }
+
+    try std.testing.expectEqual(ErrorCode.invalid_input, errorCode(error.InvalidProxyAddress));
+    try std.testing.expectEqual(ErrorCode.invalid_input, errorCode(error.InvalidProxyPort));
+    try std.testing.expectEqual(ErrorCode.input_too_large, errorCode(error.InputTooLarge));
 }
 
 test "proxy_model request keeps the full u64 epoch and rejects loose parameters" {
