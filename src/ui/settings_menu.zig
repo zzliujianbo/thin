@@ -9,6 +9,7 @@ pub const Menu = provider.Picker;
 pub const labels = [_][]const u8{
     "Low-price input", "Decision model", "Auto compaction", "Command timeout",
     "Request timeout", "Task timeout",   "Image model",     "Auto memory",
+    "Proxy models",
 };
 pub const count = labels.len;
 pub const Snapshot = struct {
@@ -19,6 +20,9 @@ pub const Snapshot = struct {
     image_model: ?[]const u8 = null,
     /// Borrowed provider/rawID reference; rows copies the displayed bytes.
     decision_model: ?[]const u8 = null,
+    /// Owner-published proxy host/port state; never inferred from the model list.
+    proxy_configured: bool = false,
+    proxy_model_count: usize = 0,
     global_settings_available: bool = true,
     limits: cfg.Limits = .{},
 };
@@ -41,6 +45,9 @@ pub fn value(state: Snapshot, selected: usize) []const u8 {
         0 => if (state.low_price_input_enabled) "on" else "off",
         1 => if (!state.decision_enabled) "Off" else state.decision_model orelse "Not set",
         6 => if (!state.image_enabled) "Off" else state.image_model orelse "Not set",
+        // The exact selected count is formatted by rows; value() keeps the
+        // borrowed empty/unknown form only.
+        8 => if (state.proxy_model_count == 0) "Off" else "",
         2 => if (state.limits.compaction_enabled) "on" else "off",
         7 => if (state.memory_auto) "on" else "off",
         3, 4, 5 => "s",
@@ -57,6 +64,7 @@ pub fn description(selected: usize) []const u8 {
         5 => "Whole task timeout in s (up to 3 decimals); maximum 86400 s (24 hours).",
         6 => "Read images through a separate helper returning text. Off unless explicitly selected.",
         7 => "Automatically extract and maintain useful memory. On by default.",
+        8 => "Route selected exact models through the configured proxy. A new session applies it.",
         else => "",
     };
 }
@@ -70,6 +78,7 @@ fn renderedValue(state: Snapshot, selected: usize, buffer: *[32]u8) ![]const u8 
         3 => try time.format(buffer, state.limits.command_timeout_ms),
         4 => try time.format(buffer, state.limits.request_timeout_ms),
         5 => try time.format(buffer, state.limits.task_timeout_ms),
+        8 => if (state.proxy_model_count == 0) "Off" else try std.fmt.bufPrint(buffer, "{d} selected", .{state.proxy_model_count}),
         else => value(state, selected),
     };
 }
@@ -93,9 +102,9 @@ pub fn rows(a: std.mem.Allocator, menu: Menu, state: Snapshot, columns: usize, m
         const gap = label_width - text.width(label(index));
         const raw = try std.fmt.allocPrint(a, "{s}{s}{s}  {s}", .{ if (index == selected) "> " else "  ", label(index), padding[0..gap], v });
         defer a.free(raw);
-        // Decision only opens a read-only submenu; its current value is not
-        // being saved. All saving root rows still require the complete value.
-        if (index == selected) complete = if (index == 1 or index == 6)
+        // Decision/Image/Proxy only open a read-only submenu; their current
+        // value is not being saved. All saving root rows keep the full check.
+        if (index == selected) complete = if (index == 1 or index == 6 or index == 8)
             2 + text.width(label(index)) <= columns
         else
             text.width(raw) <= columns;
@@ -127,14 +136,17 @@ fn freeRows(a: std.mem.Allocator, rendered: Rows) void {
     for (rendered.lines) |line| a.free(line);
     a.free(rendered.lines);
 }
-test "settings preserve old values and expose eight preference rows" {
-    try std.testing.expectEqual(@as(usize, 8), count);
+test "settings preserve old values and expose nine preference rows" {
+    try std.testing.expectEqual(@as(usize, 9), count);
     try std.testing.expectEqualStrings("Auto memory", label(7));
     try std.testing.expectEqualStrings("on", value(.{}, 7));
     try std.testing.expectEqualStrings("off", value(.{ .memory_auto = false }, 7));
     try std.testing.expectEqual(@as(?Key, .memory_auto), preferenceKey(7));
-    try std.testing.expectEqualStrings("", label(8));
-    try std.testing.expectEqualStrings("", value(.{}, 8));
+    try std.testing.expectEqualStrings("Proxy models", label(8));
+    try std.testing.expectEqual(@as(?Key, null), preferenceKey(8));
+    try std.testing.expectEqualStrings("Off", value(.{}, 8));
+    try std.testing.expectEqualStrings("", value(.{ .proxy_model_count = 2 }, 8));
+    try std.testing.expectEqualStrings("", label(9));
     try std.testing.expectEqualStrings("Off", value(.{}, 6));
     try std.testing.expectEqualStrings("login/deepseek-flash", value(.{ .image_enabled = true, .image_model = "login/deepseek-flash" }, 6));
     try std.testing.expectEqualStrings("on", value(.{}, 0));
@@ -149,6 +161,27 @@ test "settings preserve old values and expose eight preference rows" {
     try std.testing.expectEqual(@as(?Key, null), preferenceKey(6));
     try std.testing.expect(std.mem.find(u8, description(0), "unknown") != null);
     try std.testing.expect(std.mem.find(u8, description(1), "Memory") != null);
+    try std.testing.expect(std.mem.find(u8, description(8), "proxy") != null);
+}
+test "Proxy root row opens on its static label and renders the selected count" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqualStrings("Proxy models", label(8));
+    for (0..90) |columns| {
+        const rendered = try rows(a, .{ .selected = 8 }, .{ .proxy_configured = true, .proxy_model_count = 3 }, columns, 1);
+        defer freeRows(a, rendered);
+        // Opening the child menu never requires the (unsaved) value to fit.
+        try std.testing.expectEqual(columns >= 2 + label(8).len, rendered.can_confirm);
+        try std.testing.expect(text.width(rendered.lines[0]) <= columns);
+    }
+    const counted = try rows(a, .{ .selected = 8 }, .{ .proxy_configured = true, .proxy_model_count = 3 }, 80, 1);
+    defer freeRows(a, counted);
+    try std.testing.expect(std.mem.find(u8, counted.lines[0], "3 selected") != null);
+    const empty = try rows(a, .{ .selected = 8 }, .{}, 80, 1);
+    defer freeRows(a, empty);
+    try std.testing.expect(std.mem.find(u8, empty.lines[0], "Off") != null);
+    const pasted = try rows(a, .{ .selected = 8, .pasted = true }, .{}, 80, 3);
+    defer freeRows(a, pasted);
+    try std.testing.expect(!pasted.can_confirm);
 }
 test "settings bounded windows keep selection visible and clipping disables confirmation" {
     const a = std.testing.allocator;

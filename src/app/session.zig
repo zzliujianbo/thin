@@ -23,6 +23,7 @@ const model_resolver = @import("model_resolver.zig");
 const fs = @import("../platform/filesystem.zig");
 const decision_selection = @import("decision_selection.zig");
 const image_selection = @import("image_selection.zig");
+const proxy_selection = @import("proxy_selection.zig");
 const image = @import("../core/image.zig");
 const settings_preferences = @import("../core/settings.zig");
 
@@ -472,7 +473,7 @@ pub const Session = struct {
 
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .proxy_fn = setProxyModel, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -680,6 +681,11 @@ pub const Session = struct {
             .image_enabled = config.imageActive(),
             .image_models = self.display_image_models,
             .image_model = if (config.imageActive()) config.image.model else null,
+            // Publish the current global declaration, not the frozen primary
+            // route: an explicit proxy edit applies to helpers immediately and
+            // to the primary only in a later session.
+            .proxy_configured = self.global_config.?.value.proxy != null,
+            .proxy_models = if (self.global_config.?.value.proxy) |value| value.models else &.{},
             .memory_auto = config.memory.auto,
             .memory_notice = if (self.app) |app| app.memoryNotice() else null,
             .global_settings_available = !self.read_only,
@@ -1338,12 +1344,41 @@ pub const Session = struct {
 
     /// Save is the final fallible operation. Swapping with the caller keeps its
     /// deferred release responsible for wiping the previous global declaration.
+    fn setProxyModel(raw: *anyopaque, name: []const u8, enabled: bool) !void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        try self.guardSelection();
+        // Address/port belong to the global declaration; never invent a route.
+        if (self.global_config.?.value.proxy == null) return error.ProxyNotConfigured;
+        var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
+        defer cfg.release(&declaration);
+        // Duplicate add and absent removal are intentional no-write no-ops.
+        if (!try proxy_selection.apply(declaration.arena.allocator(), &declaration.value, name, enabled)) return;
+        if (enabled) try self.validateProxyMember(name);
+        try self.persistSettings(&declaration, .proxy_models);
+    }
+
+    /// Owner-side revalidation: the exact declared/available row, its own alias
+    /// and a present local credential. SystemOne and unknown windows are real
+    /// declarations, so generic auxiliary eligibility must not filter them.
+    fn validateProxyMember(self: *Session, name: []const u8) !void {
+        const global = self.global_config.?.value;
+        const reference = try cfg.splitDefault(name);
+        const provider = (global.registry orelse return error.MissingRegistry).find(reference.provider) orelse return error.UnknownProvider;
+        if (!self.hasLocalCredential(provider.connection)) return error.ApiKeyNotFound;
+        const candidates = try self.buildModels(global, global);
+        defer self.freeDisplayModels(candidates);
+        for (candidates) |model| if (std.mem.eql(u8, name, model.name)) return;
+        return error.UnknownProxyModel;
+    }
+
     fn persistSettings(self: *Session, declaration: *std.json.Parsed(cfg.Config), refresh: App.SettingsRefresh) !void {
         try cfg.validate(declaration.value);
         var prepared: ?App.SettingsReplacement = if (self.app) |app| try app.prepareSettingsRefresh(declaration.value, self.environ, refresh) else null;
         defer if (prepared) |*value| value.deinit();
         var pending: ?std.json.Parsed(cfg.Config) = if (self.app == null)
-            try decision_selection.activeClone(self.allocator, self.pending.?.value, declaration.value)
+            // A pending snapshot is not an active route, so an explicit proxy
+            // save may update it; ordinary saves keep its previous route.
+            try proxy_selection.pendingClone(self.allocator, self.pending.?.value, declaration.value, refresh == .proxy_models)
         else
             null;
         defer if (pending) |*value| cfg.release(value);
@@ -4054,4 +4089,262 @@ test "future or damaged cache blocks cadence until the file is moved away" {
         const disk = try metadata.load(&session.store.root);
         try std.testing.expect(disk.directory.find(.deepseek, "deepseek-flash") != null);
     }
+}
+
+const proxy_session_config =
+    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"review/raw/id":{"protocol":"chat","context_tokens":32768},"native/raw":{"protocol":"systemone"},"unknown/raw":{}}},"unlogged":{"base_url":"https://unlogged.invalid/v1","api_key_env":"PROXY_MISSING_KEY","models":{"m":{"protocol":"chat","context_tokens":65536}}}}},"decision":{"model":"aux/native/raw","enabled":true},"limits":{"low_price_input":false},"proxy":{"address":"10.0.0.9","port":3128,"models":["aux/review/raw/id"]}}
+;
+
+const proxy_helper_config =
+    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"native/raw":{"protocol":"systemone"},"review/raw/id":{"protocol":"chat","context_tokens":32768}}},"img":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"PROXY_IMG_KEY","models":{"deepseek-flash":{"protocol":"chat","context_tokens":65536}}}}},"decision":{"model":"aux/native/raw","enabled":true},"image":{"model":"img/deepseek-flash"},"limits":{"low_price_input":false},"proxy":{"address":"127.0.0.1","port":18080,"models":["aux/review/raw/id"]}}
+;
+
+const proxy_pending_config =
+    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key_env":"PROXY_MAIN_MISSING","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"native/raw":{"protocol":"systemone"},"other/raw":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false},"proxy":{"address":"10.0.0.9","port":3128,"models":["aux/native/raw"]}}
+;
+
+fn readSessionConfigBytes(dir: std.Io.Dir) ![]u8 {
+    return dir.readFileAlloc(std.testing.io, ".thin/config.json", std.testing.allocator, .limited(1 << 16));
+}
+
+fn proxyToggle(session: *Session, name: []const u8, enabled: bool) !void {
+    const connection = session.connection();
+    const callback = connection.proxy_fn orelse return error.ProxyCallbackUnavailable;
+    try callback(connection.context, name, enabled);
+}
+
+test "proxy allowlist revalidates exact rows credentials and preserves unrelated settings" {
+    const a = std.testing.allocator;
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    try writeSessionTestConfig(fixture.tmp.dir, proxy_session_config);
+    try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
+    var session = try fixture.open(.{ .logging = false });
+    defer session.deinit();
+    const app = session.app.?;
+    const auth = app.client.authorization.ptr;
+    const initial = session.connection().current();
+    try std.testing.expect(initial.proxy_configured);
+    try std.testing.expectEqual(@as(usize, 1), initial.proxy_models.len);
+    try std.testing.expectEqualStrings("aux/review/raw/id", initial.proxy_models[0]);
+
+    const saved = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(saved);
+    // Duplicate add and absent delete are no-write no-ops.
+    try proxyToggle(&session, "aux/review/raw/id", true);
+    try proxyToggle(&session, "aux/absent", false);
+    const after_noop = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(after_noop);
+    try std.testing.expectEqualStrings(saved, after_noop);
+    try std.testing.expectEqual(@as(usize, 1), session.connection().current().proxy_models.len);
+
+    // Strict alias/raw-ID identity: exact alias, case-sensitive raw ID, full raw.
+    try std.testing.expectError(error.UnknownProvider, proxyToggle(&session, "Main/chat", true));
+    try std.testing.expectError(error.UnknownProxyModel, proxyToggle(&session, "main/CHAT", true));
+    try std.testing.expectError(error.UnknownProxyModel, proxyToggle(&session, "aux/review/raw/id/extra", true));
+    try std.testing.expectError(error.UnknownProxyModel, proxyToggle(&session, "aux/absent", true));
+    try std.testing.expectError(error.InvalidDefault, proxyToggle(&session, "no-slash", true));
+
+    // Declared SystemOne and unknown-window rows are real declarations, not
+    // generic auxiliary candidates; logged-in literal keys are accepted.
+    try proxyToggle(&session, "aux/native/raw", true);
+    try proxyToggle(&session, "aux/unknown/raw", true);
+    try proxyToggle(&session, "main/chat", true);
+    try std.testing.expectError(error.ApiKeyNotFound, proxyToggle(&session, "unlogged/m", true));
+
+    try proxyToggle(&session, "aux/native/raw", false);
+    try fixture.env.put("PROXY_AUX_KEY", "");
+    try std.testing.expectError(error.ApiKeyNotFound, proxyToggle(&session, "aux/native/raw", true));
+    // An already selected duplicate remains a no-write no-op even after its
+    // credential disappears; only a real insertion revalidates the key.
+    try proxyToggle(&session, "aux/review/raw/id", true);
+    try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
+
+    const state = session.connection().current();
+    try std.testing.expectEqual(@as(usize, 3), state.proxy_models.len);
+    try std.testing.expectEqualStrings("aux/review/raw/id", state.proxy_models[0]);
+    try std.testing.expectEqualStrings("aux/unknown/raw", state.proxy_models[1]);
+    try std.testing.expectEqualStrings("main/chat", state.proxy_models[2]);
+    // The frozen primary route keeps its original allowlist for this session.
+    try std.testing.expectEqual(@as(usize, 1), app.config.value.proxy.?.models.len);
+    try std.testing.expectEqualStrings("aux/review/raw/id", app.config.value.proxy.?.models[0]);
+    try std.testing.expect(app.client.authorization.ptr == auth);
+    try std.testing.expect(app.client.config == &app.config.value);
+    try std.testing.expectEqualStrings("chat", app.config.value.model.name);
+
+    const persisted = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(persisted);
+    var parsed = try cfg.parse(a, persisted);
+    defer cfg.release(&parsed);
+    try std.testing.expectEqualStrings("10.0.0.9", parsed.value.proxy.?.address);
+    try std.testing.expectEqual(@as(u16, 3128), parsed.value.proxy.?.port);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.proxy.?.models.len);
+    try std.testing.expectEqualStrings("aux/review/raw/id", parsed.value.proxy.?.models[0]);
+    try std.testing.expectEqualStrings("aux/unknown/raw", parsed.value.proxy.?.models[1]);
+    try std.testing.expectEqualStrings("main/chat", parsed.value.proxy.?.models[2]);
+    try std.testing.expectEqualStrings("aux/native/raw", parsed.value.decision.?.model);
+    try std.testing.expect(!parsed.value.limits.low_price_input);
+    try std.testing.expectEqualStrings("fake-main-key", parsed.value.registry.?.find("main").?.connection.api_key.?);
+}
+
+test "proxy refresh switches helper routes while primary client and history stay frozen" {
+    const a = std.testing.allocator;
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    try writeSessionTestConfig(fixture.tmp.dir, proxy_helper_config);
+    try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
+    try fixture.env.put("PROXY_IMG_KEY", "fake-img-key");
+    var session = try fixture.open(.{ .logging = false });
+    defer session.deinit();
+    const app = session.app.?;
+    const auth = app.client.authorization.ptr;
+    const session_id = app.client.session_id;
+    const messages = app.runtime.messages().len;
+    const decision_before = app.decision_client.?;
+    const image_before = app.image_client.?;
+    const memory_before = app.memory_coordinator;
+    try std.testing.expect(decision_before.native != null);
+    try std.testing.expect(decision_before.native.?.proxy_url == null);
+    try std.testing.expect(image_before.transport.proxy_url == null);
+    try std.testing.expectEqual(@as(u64, 0), decision_before.calls);
+    // The memory coordinator owns independent extractor/reviewer routes.
+    try std.testing.expect(memory_before.reviewer != null);
+    try std.testing.expect(memory_before.reviewer.?.native != null);
+    try std.testing.expect(memory_before.reviewer.?.native.?.proxy_url == null);
+    try std.testing.expect(memory_before.extractor != null);
+    try std.testing.expect(memory_before.extractor.?.transport != null);
+    try std.testing.expect(memory_before.extractor.?.transport.?.proxy_http == null);
+
+    try proxyToggle(&session, "aux/native/raw", true);
+    const decision_after = app.decision_client.?;
+    try std.testing.expect(decision_after != decision_before);
+    try std.testing.expect(decision_after.native != null);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", decision_after.native.?.proxy_url.?);
+    try std.testing.expectEqual(@as(u64, 0), decision_after.calls);
+    // Both auxiliary owners are replaced, even when only one route changed.
+    try std.testing.expect(app.image_client.? != image_before);
+    try std.testing.expect(app.image_client.?.transport.proxy_url == null);
+    // Its independent reviewer route follows the same latest allowlist, while
+    // the extractor keeps its own primary-model route.
+    const memory_after = app.memory_coordinator;
+    try std.testing.expect(memory_after != memory_before);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", memory_after.reviewer.?.native.?.proxy_url.?);
+    try std.testing.expectEqual(@as(usize, 2), memory_after.reviewer.?.source.value.proxy.?.models.len);
+    try std.testing.expect(memory_after.extractor.?.transport.?.proxy_http == null);
+    // The primary transport, auth, model, session and history never move.
+    try std.testing.expect(app.client.authorization.ptr == auth);
+    try std.testing.expectEqual(session_id, app.client.session_id);
+    try std.testing.expect(app.client.config == &app.config.value);
+    try std.testing.expectEqualStrings("chat", app.config.value.model.name);
+    try std.testing.expectEqualStrings("main", app.config.value.selected_provider.?);
+    try std.testing.expectEqual(@as(usize, 1), app.config.value.proxy.?.models.len);
+    try std.testing.expectEqual(messages, app.runtime.messages().len);
+    var helper_route = false;
+    for (decision_after.source.value.proxy.?.models) |name| {
+        if (std.mem.eql(u8, name, "aux/native/raw")) helper_route = true;
+    }
+    try std.testing.expect(helper_route);
+
+    // Removing the membership returns the reviewer to a direct route.
+    try proxyToggle(&session, "aux/native/raw", false);
+    const memory_direct = app.memory_coordinator;
+    try std.testing.expect(memory_direct != memory_after);
+    try std.testing.expect(memory_direct.reviewer.?.native.?.proxy_url == null);
+    try std.testing.expectEqual(@as(usize, 1), memory_direct.reviewer.?.source.value.proxy.?.models.len);
+    try std.testing.expect(memory_direct.extractor.?.transport.?.proxy_http == null);
+    try proxyToggle(&session, "aux/native/raw", true);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.reviewer.?.native.?.proxy_url.?);
+
+    try proxyToggle(&session, "img/deepseek-flash", true);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
+    const current = session.connection().current();
+    try std.testing.expectEqual(@as(usize, 3), current.proxy_models.len);
+
+    // The extractor's coordinator config carries the latest allowlist too, so an
+    // explicit primary membership proxies only that helper transport.
+    try proxyToggle(&session, "main/chat", true);
+    try std.testing.expectEqual(@as(usize, 4), session.connection().current().proxy_models.len);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
+    try std.testing.expect(app.client.proxy_http == null);
+
+    // An ordinary preference save must not revoke the already installed helper
+    // routes or republish a primary client. The rebuilt memory coordinator must
+    // keep the latest list rather than reverting to the frozen proxy config.
+    const decision_now = app.decision_client.?;
+    const image_now = app.image_client.?;
+    const memory_now = app.memory_coordinator;
+    const connection = session.connection();
+    try connection.preference_fn.?(connection.context, .compaction_enabled, 0);
+    try std.testing.expect(app.decision_client.? == decision_now);
+    try std.testing.expect(app.image_client.? == image_now);
+    try std.testing.expect(app.memory_coordinator != memory_now);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.reviewer.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
+    try std.testing.expectEqual(@as(usize, 4), app.memory_coordinator.reviewer.?.source.value.proxy.?.models.len);
+    try std.testing.expect(app.client.authorization.ptr == auth);
+    try std.testing.expect(app.client.config == &app.config.value);
+    try std.testing.expect(app.client.proxy_http == null);
+    try std.testing.expectEqual(@as(usize, 1), app.config.value.proxy.?.models.len);
+    try std.testing.expectEqualStrings("chat", app.config.value.model.name);
+    try std.testing.expect(!app.config.value.limits.compaction_enabled);
+
+    const persisted = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(persisted);
+    var parsed = try cfg.parse(a, persisted);
+    defer cfg.release(&parsed);
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.proxy.?.models.len);
+    try std.testing.expectEqualStrings("img/deepseek-flash", parsed.value.proxy.?.models[2]);
+    try std.testing.expectEqualStrings("main/chat", parsed.value.proxy.?.models[3]);
+}
+
+test "proxy membership CAS conflict rolls back declaration and helper ownership" {
+    const a = std.testing.allocator;
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    try writeSessionTestConfig(fixture.tmp.dir, proxy_session_config);
+    try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
+    var session = try fixture.open(.{ .logging = false });
+    defer session.deinit();
+    const app = session.app.?;
+    try proxyToggle(&session, "aux/native/raw", true);
+    const saved = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(saved);
+    const decision = app.decision_client.?;
+    const auth = app.client.authorization.ptr;
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/config.json", .data = "{}" });
+    try std.testing.expectError(error.AuthVersionConflict, proxyToggle(&session, "main/chat", true));
+    try std.testing.expectEqual(@as(usize, 2), session.global_config.?.value.proxy.?.models.len);
+    try std.testing.expect(app.decision_client.? == decision);
+    try std.testing.expect(app.client.authorization.ptr == auth);
+    try std.testing.expect(app.client.config == &app.config.value);
+    try std.testing.expectEqual(@as(usize, 1), app.config.value.proxy.?.models.len);
+    const failed = try readSessionConfigBytes(fixture.tmp.dir);
+    defer a.free(failed);
+    try std.testing.expectEqualStrings("{}", failed);
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/config.json", .data = saved });
+    try proxyToggle(&session, "main/chat", true);
+    try std.testing.expectEqual(@as(usize, 3), session.global_config.?.value.proxy.?.models.len);
+}
+
+test "pending snapshot adopts an explicit proxy save without activating a route" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    try writeSessionTestConfig(fixture.tmp.dir, proxy_pending_config);
+    try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
+    var session = try fixture.open(.{ .logging = false });
+    defer session.deinit();
+    try std.testing.expect(session.app == null);
+    try proxyToggle(&session, "aux/other/raw", false);
+    try std.testing.expect(session.app == null);
+    try std.testing.expectEqual(@as(usize, 1), session.pending.?.value.proxy.?.models.len);
+    try proxyToggle(&session, "aux/other/raw", true);
+    try std.testing.expect(session.app == null);
+    try std.testing.expectEqual(@as(usize, 2), session.pending.?.value.proxy.?.models.len);
+    try std.testing.expectEqualStrings("aux/native/raw", session.pending.?.value.proxy.?.models[0]);
+    try std.testing.expectEqualStrings("aux/other/raw", session.pending.?.value.proxy.?.models[1]);
+    // Validation still rejects an undeclared raw ID before any write.
+    try std.testing.expectError(error.UnknownProxyModel, proxyToggle(&session, "aux/undecided", true));
+    try std.testing.expectEqual(@as(usize, 2), session.pending.?.value.proxy.?.models.len);
 }

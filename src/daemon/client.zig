@@ -335,6 +335,10 @@ const Pub = struct {
     image_enabled: bool = false,
     decision_model: ?[]const u8 = null,
     image_model: ?[]const u8 = null,
+    /// Public proxy state only: whether the owner has a proxy allowlist and the
+    /// exact bounded model ids on it. Never an address, port or credential.
+    proxy_configured: bool = false,
+    proxy_models: []const []const u8 = &.{},
     context_limit: u32 = 0,
     allow_custom: bool = true,
     pending_effort: ?shared.ReasoningEffort = null,
@@ -495,6 +499,7 @@ pub const Client = struct {
             .setting_fn = settingFn,
             .decision_fn = decisionFn,
             .image_fn = imageFn,
+            .proxy_fn = proxyFn,
             .refresh_models_fn = refreshModelsFn,
             .poll_models_fn = pollModelsFn,
             .session_client = self.vtable(),
@@ -747,6 +752,14 @@ pub const Client = struct {
         state.decision_enabled = cfg.decision_enabled;
         state.decision_models = try cloneModels(arena, cfg.decision_models);
         state.decision_model = if (cfg.decision_model) |name| try arena.dupe(u8, name) else null;
+        state.proxy_configured = cfg.proxy_configured;
+        // Each name is copied into the arena: the published projection must not
+        // outlive the settings document it was parsed from.
+        if (cfg.proxy_models.len != 0) {
+            const names = try arena.alloc([]const u8, cfg.proxy_models.len);
+            for (cfg.proxy_models, 0..) |name, index| names[index] = try arena.dupe(u8, name);
+            state.proxy_models = names;
+        }
         state.global_settings_available = !cfg.read_only;
         state.limits = cfg.limits;
         state.reasoning_effort = cfg.effort;
@@ -956,6 +969,8 @@ pub const Client = struct {
         next.image_enabled = read.flag(view, "image_enabled", false);
         next.decision_model = read.text(view, "decision_model");
         next.image_model = read.text(view, "image_model");
+        next.proxy_configured = read.flag(view, "proxy_configured", false);
+        try parseProxyModels(self.a, &next, read.field(view, "proxy_models"));
         next.context_limit = @intCast(@min(read.uint(view, "context_limit") orelse 0, std.math.maxInt(u32)));
         next.allow_custom = read.flag(view, "allow_custom_models", true);
         next.pending_effort = if (read.text(view, "pending_effort")) |name| shared.ReasoningEffort.fromName(name) else null;
@@ -981,6 +996,9 @@ pub const Client = struct {
         if (value.models.len != 0) self.a.free(value.models);
         if (value.decision_models.len != 0) self.a.free(value.decision_models);
         if (value.image_models.len != 0) self.a.free(value.image_models);
+        // Only the name array is owned here; each name is a window into
+        // `doc`, which is released below.
+        if (value.proxy_models.len != 0) self.a.free(value.proxy_models);
         if (value.providers.len != 0) self.a.free(value.providers);
         if (value.context_official.len != 0) self.a.free(value.context_official);
         if (value.disabled.len != 0) self.a.free(value.disabled);
@@ -1034,9 +1052,28 @@ pub const Client = struct {
         // A page from another control epoch is stale: drop it completely.
         const page = self.pageEpoch(&resp);
         if (page) |epoch| if (epoch == 0) return;
+        // The page replaces the queue: an entry that fails after earlier ones
+        // were decoded must not publish a partial replay, so the previous
+        // cursor and an empty queue are restored before the error escapes.
+        const previous_cursor = self.cursor;
         self.clearPending();
+        errdefer {
+            self.clearPending();
+            self.cursor = previous_cursor;
+        }
         self.cursor = base;
+        // Only the items this page produced are marked, and only after each one
+        // passed its own epoch check inside `pushEvent`. An empty page marks
+        // nothing: the UI already resets on the epoch switch, so no synthetic
+        // content event is fabricated.
+        const before = self.pending.items.len;
         for (entries.items) |entry| try self.pushEvent(entry);
+        if (self.pending.items.len == before) return;
+        for (0..self.pending.items.len - before) |offset| {
+            const item = &self.pending.items[before + offset];
+            item.history_replay = true;
+            item.history_reset = offset == 0;
+        }
     }
 
     fn readEvents(self: *Client) !void {
@@ -2133,6 +2170,23 @@ pub const Client = struct {
         try self.helperSelection(.image_model, choice);
     }
 
+    /// One explicit proxy allowlist mutation. The callback carries the complete
+    /// provider/raw-model id and the enable flag; this adapter never invents an
+    /// endpoint and never sends proxy credentials or addresses on the wire.
+    fn proxyFn(context: *anyopaque, name: []const u8, enabled: bool) anyerror!void {
+        const self = fromContext(context);
+        if (name.len == 0 or name.len > protocol.max_name) return error.InvalidInput;
+        var req = try self.settingsRequest(.proxy_model);
+        defer req.deinit();
+        try req.put("name", name);
+        try req.put("enabled", enabled);
+        var resp = try req.exchange(quick_timeout_ms);
+        defer resp.deinit();
+        self.dirty = true;
+        self.refreshSettings();
+        self.rebuild();
+    }
+
     fn helperSelection(self: *Client, op: protocol.Op, choice: decision_picker.Choice) !void {
         var req = try self.settingsRequest(op);
         defer req.deinit();
@@ -2423,6 +2477,33 @@ fn parseModels(a: std.mem.Allocator, next: *Pub, value: ?std.json.Value, slot: M
     }
 }
 
+/// Bounded proxy allowlist decode: non-empty name strings only, exact count so
+/// the owned array is freed with its own length. Every name stays a window into
+/// the retained settings document.
+fn parseProxyModels(a: std.mem.Allocator, next: *Pub, value: ?std.json.Value) !void {
+    const array = switch (value orelse return) {
+        .array => |items| items,
+        else => return,
+    };
+    var used: usize = 0;
+    for (array.items) |entry| switch (entry) {
+        .string => |name| used += @intFromBool(name.len != 0),
+        else => {},
+    };
+    if (used == 0) return;
+    const names = try a.alloc([]const u8, used);
+    var index: usize = 0;
+    for (array.items) |entry| switch (entry) {
+        .string => |name| {
+            if (name.len == 0) continue;
+            names[index] = name;
+            index += 1;
+        },
+        else => {},
+    };
+    next.proxy_models = names;
+}
+
 fn parseProviders(a: std.mem.Allocator, next: *Pub, value: ?std.json.Value) !void {
     const array = switch (value orelse return) {
         .array => |items| items,
@@ -2694,10 +2775,10 @@ test "refused cancel clear refreshes and reports QueueChanged" {
 test "settings requests route to worker epoch or connect setup project" {
     const a = testing.allocator;
     const ops = [_]protocol.Op{
-        .settings,       .model_select,   .effort,
-        .cycle_effort,   .login,          .preference,
-        .setting,        .decision_model, .image_model,
-        .refresh_models, .poll_metadata,
+        .settings,     .model_select,   .effort,
+        .cycle_effort, .login,          .preference,
+        .setting,      .decision_model, .image_model,
+        .proxy_model,  .refresh_models, .poll_metadata,
     };
 
     var worker = try pairOf(a);
@@ -3083,10 +3164,18 @@ test "lost window resets to an owned history snapshot then resumes deltas" {
     try client.readHistory();
     try std.testing.expectEqual(@as(u64, 42), client.cursor);
     try std.testing.expectEqual(@as(usize, 3), client.pending.items.len);
+    // A snapshot page is local replay metadata: the whole page is marked and
+    // only its first item announces the reset.
+    try std.testing.expect(client.pending.items[0].history_replay);
+    try std.testing.expect(client.pending.items[0].history_reset);
+    try std.testing.expect(client.pending.items[1].history_replay and !client.pending.items[1].history_reset);
+    try std.testing.expect(client.pending.items[2].history_replay and !client.pending.items[2].history_reset);
 
     var first = client.pending.orderedRemove(0);
     defer first.deinit();
     try std.testing.expectEqual(@as(u64, 5), first.epoch);
+    // Moving the owned item preserves its local history metadata.
+    try std.testing.expect(first.history_replay and first.history_reset);
     try std.testing.expectEqualStrings("hello", first.event.user_committed.text);
     var second = client.pending.orderedRemove(0);
     defer second.deinit();
@@ -3105,6 +3194,126 @@ test "lost window resets to an owned history snapshot then resumes deltas" {
     try std.testing.expectEqual(@as(u64, 43), client.cursor);
     try std.testing.expectEqual(@as(usize, 1), client.pending.items.len);
     try std.testing.expectEqualStrings("more", client.pending.items[0].event.text);
+    // A live delta is display-only: it must never enter input history.
+    try std.testing.expect(!client.pending.items[0].history_replay);
+    try std.testing.expect(!client.pending.items[0].history_reset);
+}
+
+test "a refetched history page resets its first item and an empty page marks nothing" {
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+
+    // Codec provenance (truncation, incomplete canonical list) travels beside
+    // the local history markers instead of replacing them.
+    const clipped = try protocol.encodeEventMeta(a, .{ .text = "partial" }, .{ .epoch = 5, .truncated = true, .canonical_complete = false });
+    defer a.free(clipped);
+    const page = try std.fmt.allocPrint(a, "\"base\":12,\"epoch\":5,\"entries\":[{s}]", .{clipped});
+    defer a.free(page);
+    try pair.reply(1, page);
+    try client.readHistory();
+    try std.testing.expectEqual(@as(usize, 1), client.pending.items.len);
+    try std.testing.expect(client.pending.items[0].history_replay);
+    try std.testing.expect(client.pending.items[0].history_reset);
+    try std.testing.expect(client.pending.items[0].display_truncated);
+    try std.testing.expect(!client.pending.items[0].canonical_complete);
+
+    // An empty page replaces the queue and fabricates no content event; the UI
+    // already resets on the epoch switch, so nothing needs a fake "reset" item.
+    try pair.reply(2, "\"base\":13,\"epoch\":5,\"entries\":[]");
+    try client.readHistory();
+    try std.testing.expectEqual(@as(u64, 13), client.cursor);
+    try std.testing.expectEqual(@as(usize, 0), client.pending.items.len);
+}
+
+test "a history page that fails mid-decode publishes nothing and stays retryable" {
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+
+    // A known resume point: a broken page must not move it forward.
+    client.cursor = 7;
+    const user = try protocol.encodeEvent(a, .{ .user_committed = .{ .id = 1, .text = "kept" } });
+    defer a.free(user);
+    // The valid entry decodes first, then a numeric entry is rejected by
+    // `pushEvent`: the earlier decoded item is already sitting in the queue.
+    const broken = try std.fmt.allocPrint(a, "\"base\":11,\"epoch\":5,\"entries\":[{s},7]", .{user});
+    defer a.free(broken);
+    try pair.reply(1, broken);
+    try testing.expectError(error.ProtocolError, client.readHistory());
+    try std.testing.expectEqual(@as(usize, 0), client.pending.items.len);
+    try std.testing.expectEqual(@as(u64, 7), client.cursor);
+
+    // The same page, now whole, replays from scratch and marks its first item.
+    const page = try std.fmt.allocPrint(a, "\"base\":11,\"epoch\":5,\"entries\":[{s}]", .{user});
+    defer a.free(page);
+    try pair.reply(2, page);
+    try client.readHistory();
+    try std.testing.expectEqual(@as(u64, 11), client.cursor);
+    try std.testing.expectEqual(@as(usize, 1), client.pending.items.len);
+    try std.testing.expect(client.pending.items[0].history_replay);
+    try std.testing.expect(client.pending.items[0].history_reset);
+    try std.testing.expectEqualStrings("kept", client.pending.items[0].event.user_committed.text);
+}
+
+test "proxy allowlist mutation carries the exact model id and publishes an owned list" {
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+
+    // The mutation frame and the settings refresh the adapter sends right after
+    // it are both queued before the call reads them.
+    try pair.reply(1, "\"note\":0");
+    try pair.reply(2, "\"proxy_configured\":true,\"proxy_models\":[\"opencode-go/deepseek-v3\",\"deepseek/deepseek-chat\"],\"proxy_models_truncated\":false");
+    try Client.proxyFn(@ptrCast(client), "opencode-go/deepseek-v3", true);
+
+    var mutation = try readFrameJson(&pair, a);
+    defer mutation.deinit();
+    const root = mutation.value.object;
+    try std.testing.expectEqualStrings("proxy_model", root.get("op").?.string);
+    try std.testing.expectEqual(@as(i64, 5), root.get("epoch").?.integer);
+    try std.testing.expectEqualStrings("opencode-go/deepseek-v3", root.get("name").?.string);
+    try std.testing.expectEqual(true, root.get("enabled").?.bool);
+
+    var refresh = try readFrameJson(&pair, a);
+    defer refresh.deinit();
+    try std.testing.expectEqualStrings("settings", refresh.value.object.get("op").?.string);
+
+    // The published projection owns exact copies of the bounded name list.
+    try std.testing.expect(client.state.proxy_configured);
+    try std.testing.expectEqual(@as(usize, 2), client.state.proxy_models.len);
+    try std.testing.expectEqualStrings("opencode-go/deepseek-v3", client.state.proxy_models[0]);
+    try std.testing.expectEqualStrings("deepseek/deepseek-chat", client.state.proxy_models[1]);
+}
+
+test "proxy mutations refuse unusable names before any wire traffic" {
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+
+    try std.testing.expectError(error.InvalidInput, Client.proxyFn(@ptrCast(client), "", true));
+    const too_long = try a.alloc(u8, protocol.max_name + 1);
+    defer a.free(too_long);
+    @memset(too_long, 'm');
+    try std.testing.expectError(error.InvalidInput, Client.proxyFn(@ptrCast(client), too_long, true));
+    try expectNoFrame(&pair);
+
+    // Disabling an entry is still a real mutation with the same exact name.
+    try pair.reply(1, "\"note\":0");
+    try pair.reply(2, "\"proxy_configured\":false,\"proxy_models\":[]");
+    try Client.proxyFn(@ptrCast(client), "opencode-go/deepseek-v3", false);
+    var mutation = try readFrameJson(&pair, a);
+    defer mutation.deinit();
+    try std.testing.expectEqual(false, mutation.value.object.get("enabled").?.bool);
+    try std.testing.expectEqualStrings("opencode-go/deepseek-v3", mutation.value.object.get("name").?.string);
+    var refresh = try readFrameJson(&pair, a);
+    defer refresh.deinit();
+    try std.testing.expect(client.state.proxy_models.len == 0);
+    try std.testing.expect(!client.state.proxy_configured);
 }
 
 test "stale control epoch pages are dropped instead of rendered" {

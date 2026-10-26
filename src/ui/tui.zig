@@ -16,6 +16,7 @@ const provider_picker_module = @import("provider_picker.zig");
 const command_menu_module = @import("command_menu.zig");
 const settings_menu_module = @import("settings_menu.zig");
 const decision_picker_module = @import("decision_picker.zig");
+const proxy_picker_module = @import("proxy_picker.zig");
 const preference = @import("../core/settings.zig");
 const settings_value_module = @import("settings_value_picker.zig");
 const local_command_output = @import("local_command_output.zig");
@@ -226,6 +227,9 @@ pub const Connection = struct {
     image_fn: ?*const fn (*anyopaque, DecisionChoice) anyerror!void = null,
     setting_fn: ?*const fn (*anyopaque, Setting, bool) anyerror!void = null,
     preference_fn: ?*const fn (*anyopaque, preference.Key, ?u32) anyerror!void = null,
+    /// Exact proxy-model routing toggle: the owner saves the list and
+    /// republishes its snapshot. Settings only; no network request here.
+    proxy_fn: ?*const fn (*anyopaque, []const u8, bool) anyerror!void = null,
     context: *anyopaque,
     current_fn: *const fn (*anyopaque) State,
     configure_fn: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -296,6 +300,10 @@ pub const Connection = struct {
         /// Owned by the session, resolved with auxiliary rather than chat limits.
         decision_models: []const core_config.Model = &.{},
         decision_model: ?[]const u8 = null,
+        /// Owner-published proxy host/port availability; never inferred or guessed.
+        proxy_configured: bool = false,
+        /// Exact provider/raw-ID strings routed through that proxy, in order.
+        proxy_models: []const []const u8 = &.{},
         global_settings_available: bool = true,
         limits: core_config.Limits = .{},
         /// Immutable configured request option, not inferred from stream time.
@@ -414,6 +422,8 @@ const Ui = struct {
     settings_open: bool = false,
     decision_open: bool = false,
     image_open: bool = false,
+    /// Searchable multi-select proxy child. Enter saves one exact model.
+    proxy_open: bool = false,
     settings_value_picker: ?settings_value_module.Picker = null,
     settings_return_selected: usize = 0,
     settings_menu: settings_menu_module.Menu = .{},
@@ -421,6 +431,10 @@ const Ui = struct {
     frame_settings_generation: ?u64 = null,
     displayed_decision_fingerprint: ?decision_picker_module.Fingerprint = null,
     frame_decision_fingerprint: ?decision_picker_module.Fingerprint = null,
+    displayed_proxy_fingerprint: ?proxy_picker_module.Fingerprint = null,
+    frame_proxy_fingerprint: ?proxy_picker_module.Fingerprint = null,
+    /// Settings-root editor draft captured while the proxy child owns the editor.
+    proxy_restore: ?input.Editor = null,
     provider_choices: provider_picker_module.Choices = .{},
     displayed_provider_generation: ?u64 = null,
     frame_provider_generation: ?u64 = null,
@@ -621,6 +635,7 @@ const Ui = struct {
             pending.editor.deinit();
         }
         self.input_history.deinit(self.allocator);
+        self.dropProxyRestore();
         if (self.notice_owned) |owned| self.allocator.free(owned);
         if (self.stop_close) |id| self.allocator.free(id);
     }
@@ -712,6 +727,7 @@ const Ui = struct {
                 var item = value;
                 defer item.deinit();
                 self.inject_epoch = item.epoch;
+                self.adoptReplayHistory(&item);
                 if (item.event == .permission or item.event == .permission_cleared) {
                     // Approvals are backend-owned. The local Bridge's pending id
                     // belongs to a Runtime authorize() call that never happens
@@ -749,6 +765,31 @@ const Ui = struct {
             return item;
         }
         return null;
+    }
+
+    /// Poll returns only items whose epoch still matches the current controller,
+    /// so a real history snapshot may reset and seed the session input history.
+    /// Display replay never becomes execution: only complete, unreduced
+    /// canonical user_committed text is copied. A reset leaves an ordinary
+    /// editor untouched; only an unsent draft parked by Up browsing is moved
+    /// back so the reset cannot lose it. Live/queued events carry neither
+    /// marker, so they cannot duplicate a history entry.
+    fn adoptReplayHistory(self: *Ui, item: *const session_client.Item) void {
+        if (item.history_reset) {
+            if (self.input_history.index != null and self.history_draft != null) {
+                self.restoreHistoryDraft();
+            } else self.dropHistoryDraft();
+            self.input_history.deinit(self.allocator);
+        }
+        if (!item.history_replay or item.display_truncated or !item.canonical_complete) return;
+        const committed = switch (item.event) {
+            .user_committed => |value| value.text,
+            else => return,
+        };
+        const trimmed = std.mem.trimStart(u8, committed, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] == '/') return;
+        const owned = self.input_history.prepare(self.allocator, committed) catch return;
+        self.input_history.commit(self.allocator, owned);
     }
 
     fn bridgeEmpty(self: *const Ui) bool {
@@ -869,6 +910,8 @@ const Ui = struct {
         self.displayed_settings_generation = null;
         self.displayed_decision_fingerprint = null;
         self.frame_decision_fingerprint = null;
+        self.displayed_proxy_fingerprint = null;
+        self.frame_proxy_fingerprint = null;
         self.model_epoch +%= 1;
         self.command_menu.changed();
         self.task_epoch +%= 1;
@@ -1594,16 +1637,60 @@ const Ui = struct {
     fn settingsModelOpen(self: *const Ui) bool {
         return self.decision_open or self.image_open;
     }
+    /// Any settings child that borrows the editor as a bounded query.
+    fn settingsQueryOpen(self: *const Ui) bool {
+        return self.settingsModelOpen() or self.proxy_open;
+    }
     fn settingsModels(self: *const Ui, state: Connection.State) []const core_config.Model {
         return if (self.image_open) state.image_models else state.decision_models;
     }
+    fn dropProxyRestore(self: *Ui) void {
+        if (self.proxy_restore) |*draft| {
+            draft.clear();
+            std.crypto.secureZero(u8, draft.bytes.allocatedSlice());
+            draft.deinit();
+        }
+        self.proxy_restore = null;
+    }
+    /// The proxy child takes ownership of the editor as its search query and
+    /// keeps the Settings-root draft aside, so returning never destroys it.
+    fn beginProxyPicker(self: *Ui) void {
+        self.dropProxyRestore();
+        self.proxy_restore = self.editor;
+        self.editor = .{ .allocator = self.allocator };
+        self.editor_pasted = false;
+        self.proxy_open = true;
+        self.settings_menu.clear();
+        self.settings_menu.selected = 0;
+        self.displayed_proxy_fingerprint = null;
+        self.frame_proxy_fingerprint = null;
+        self.displayed_settings_generation = null;
+        self.frame_settings_generation = null;
+        self.parser.stop_feed = true;
+    }
+    fn endProxyPicker(self: *Ui) void {
+        self.dropHistoryDraft();
+        self.vertical_column = null;
+        self.input_history.index = null;
+        std.crypto.secureZero(u8, self.editor.bytes.allocatedSlice());
+        self.editor.clear();
+        self.editor.deinit();
+        self.editor = self.proxy_restore orelse .{ .allocator = self.allocator };
+        self.proxy_restore = null;
+        self.editor_pasted = false;
+    }
     fn closeSettingsMenu(self: *Ui) void {
         if (self.settingsModelOpen()) self.wipeEditor();
+        if (self.proxy_open) self.endProxyPicker();
+        self.dropProxyRestore();
         self.settings_open = false;
         self.decision_open = false;
         self.image_open = false;
+        self.proxy_open = false;
         self.displayed_decision_fingerprint = null;
         self.frame_decision_fingerprint = null;
+        self.displayed_proxy_fingerprint = null;
+        self.frame_proxy_fingerprint = null;
         self.settings_value_picker = null;
         self.settings_menu.clear();
         self.parser.stop_feed = true;
@@ -1620,13 +1707,17 @@ const Ui = struct {
         self.notice = "Ready";
     }
     fn backToSettings(self: *Ui) void {
-        const parent: usize = if (self.image_open) 6 else 1;
+        const parent: usize = if (self.image_open) 6 else if (self.proxy_open) 8 else 1;
         if (self.settingsModelOpen()) self.wipeEditor();
+        if (self.proxy_open) self.endProxyPicker();
         self.displayed_decision_fingerprint = null;
         self.frame_decision_fingerprint = null;
+        self.displayed_proxy_fingerprint = null;
+        self.frame_proxy_fingerprint = null;
         self.settings_value_picker = null;
         self.decision_open = false;
         self.image_open = false;
+        self.proxy_open = false;
         self.settings_menu.clear();
         self.settings_menu.selected = parent;
         self.displayed_settings_generation = null;
@@ -1769,9 +1860,53 @@ const Ui = struct {
         self.displayed_decision_fingerprint = null;
         self.frame_decision_fingerprint = null;
     }
+    fn proxyQueryChanged(self: *Ui) void {
+        self.settings_menu.selected = 0;
+        self.settings_menu.generation +%= 1;
+        self.displayed_settings_generation = null;
+        self.frame_settings_generation = null;
+        self.displayed_proxy_fingerprint = null;
+        self.frame_proxy_fingerprint = null;
+    }
+    fn settingsQueryChanged(self: *Ui) void {
+        if (self.proxy_open) self.proxyQueryChanged() else self.decisionQueryChanged();
+    }
+    /// One acknowledged Enter toggles exactly one exact model. The owner saves
+    /// and republishes, so failed saves leave the checkbox and configuration
+    /// unchanged. Never derive a proxy address here.
+    fn toggleProxy(self: *Ui, acknowledged: ?proxy_picker_module.Fingerprint, state: Connection.State) !void {
+        const previous = acknowledged orelse return;
+        const current = proxy_picker_module.fingerprint(state.models, state.model_providers, state.proxy_models, state.proxy_configured) orelse return;
+        if (!std.mem.eql(u8, &previous, &current)) return;
+        if (!state.global_settings_available) {
+            self.notice = "Global settings unavailable; changes disabled";
+            return;
+        }
+        if (!state.proxy_configured) {
+            self.notice = "Configure a proxy host and port first";
+            return;
+        }
+        const name = proxy_picker_module.candidate(state.models, state.model_providers, self.editor.bytes.items, self.settings_menu.selected) orelse return;
+        const save = self.connection.proxy_fn orelse {
+            self.notice = "Global settings unavailable; changes disabled";
+            return;
+        };
+        self.bridge.reset() catch {
+            self.notice = "Settings require a drained session bridge";
+            return;
+        };
+        save(self.connection.context, name, !proxy_picker_module.isSelected(state.proxy_models, name)) catch {
+            self.notice = "Could not save setting; previous value kept";
+            return;
+        };
+        // The owner publishes; the UI never rewrites its own selected copy.
+        self.display.context = self.connection.current().initial_context;
+        self.frame_settings_generation = null;
+        self.notice = "Saved proxy models; main route applies in a new session";
+    }
     fn settingsKey(self: *Ui, event_: input.Event) !void {
         if (self.settings_value_picker != null) return self.settingsValueKey(event_);
-        if (self.settingsModelOpen() and (event_ == .left or event_ == .escape or event_ == .cancel)) {
+        if (self.settingsQueryOpen() and (event_ == .left or event_ == .escape or event_ == .cancel)) {
             self.backToSettings();
             return;
         }
@@ -1783,15 +1918,15 @@ const Ui = struct {
             .text => |value| {
                 if (value.pasted) {
                     self.settings_menu.markPaste();
-                } else if (self.settingsModelOpen()) {
-                    self.decisionQueryChanged();
+                } else if (self.settingsQueryOpen()) {
+                    self.settingsQueryChanged();
                     if (value.value.len <= 256 -| self.editor.bytes.items.len) {
                         _ = try self.editor.insert(value.value);
                     } else self.notice = "Search limit: 256 bytes";
                 }
             },
-            .backspace, .delete, .clear, .kill_end => if (self.settingsModelOpen()) {
-                self.decisionQueryChanged();
+            .backspace, .delete, .clear, .kill_end => if (self.settingsQueryOpen()) {
+                self.settingsQueryChanged();
                 switch (event_) {
                     .backspace => self.editor.backspace(),
                     .delete => self.editor.delete(),
@@ -1800,18 +1935,24 @@ const Ui = struct {
                     else => unreachable,
                 }
             },
-            .right => if (self.settingsModelOpen()) {
+            .right => if (self.settingsQueryOpen()) {
                 self.editor.right();
             },
-            .home => if (self.settingsModelOpen()) {
+            .home => if (self.settingsQueryOpen()) {
                 self.editor.cursor = 0;
             },
-            .end => if (self.settingsModelOpen()) {
+            .end => if (self.settingsQueryOpen()) {
                 self.editor.cursor = self.editor.bytes.items.len;
             },
             .up, .down => {
                 const state = self.connection.current();
-                self.settings_menu.move(event_ == .down, if (self.settingsModelOpen()) decision_picker_module.count(self.settingsModels(state), state.model_providers, self.editor.bytes.items) else settings_menu_module.labels.len);
+                const total: usize = if (self.proxy_open)
+                    proxy_picker_module.count(state.models, state.model_providers, self.editor.bytes.items)
+                else if (self.settingsModelOpen())
+                    decision_picker_module.count(self.settingsModels(state), state.model_providers, self.editor.bytes.items)
+                else
+                    settings_menu_module.labels.len;
+                self.settings_menu.move(event_ == .down, total);
             },
             .enter => {
                 if (!self.settingsIdle() or self.editor_pasted or self.frame.len != 0 or self.settings_menu.pasted or
@@ -1823,8 +1964,12 @@ const Ui = struct {
                 const acknowledged = self.displayed_decision_fingerprint;
                 self.displayed_decision_fingerprint = null;
                 self.frame_decision_fingerprint = null;
+                const acknowledged_proxy = self.displayed_proxy_fingerprint;
+                self.displayed_proxy_fingerprint = null;
+                self.frame_proxy_fingerprint = null;
                 self.parser.stop_feed = true;
                 const state = self.connection.current();
+                if (self.proxy_open) return self.toggleProxy(acknowledged_proxy, state);
                 if (self.settingsModelOpen()) {
                     const previous = acknowledged orelse return;
                     const current = decision_picker_module.fingerprint(self.settingsModels(state), state.model_providers) orelse return;
@@ -1834,7 +1979,7 @@ const Ui = struct {
                     self.notice = "Global settings unavailable; changes disabled";
                     return;
                 }
-                if (!self.settingsModelOpen() and (self.settings_menu.selected == 1 or self.settings_menu.selected == 6)) {
+                if (!self.settingsQueryOpen() and (self.settings_menu.selected == 1 or self.settings_menu.selected == 6)) {
                     self.wipeEditor();
                     self.image_open = self.settings_menu.selected == 6;
                     self.decision_open = !self.image_open;
@@ -1848,7 +1993,12 @@ const Ui = struct {
                     self.notice = "Ready";
                     return;
                 }
-                if (!self.settingsModelOpen()) {
+                if (!self.settingsQueryOpen() and self.settings_menu.selected == 8) {
+                    self.beginProxyPicker();
+                    self.notice = "Ready";
+                    return;
+                }
+                if (!self.settingsQueryOpen()) {
                     if (settings_menu_module.preferenceKey(self.settings_menu.selected)) |key_| {
                         if (key_ == .compaction_enabled) {
                             _ = self.savePreference(key_, @intFromBool(!state.limits.compaction_enabled));
@@ -2431,6 +2581,22 @@ const Ui = struct {
         self.clearToolCaptions();
         self.scroll = 0;
         return true;
+    }
+
+    /// Return the unsent draft parked by Up browsing to the editor without
+    /// allocating: bytes, cursor and paste provenance are the ones the user
+    /// left behind. The moved value is cleared from `history_draft` first so
+    /// `wipeEditor`'s own cleanup cannot free it twice.
+    fn restoreHistoryDraft(self: *Ui) void {
+        const draft = self.history_draft orelse return;
+        const pasted = self.history_draft_pasted;
+        self.history_draft = null;
+        self.wipeEditor();
+        self.editor.deinit();
+        self.editor = draft;
+        self.editor_pasted = pasted;
+        self.history_draft_pasted = false;
+        self.vertical_column = null;
     }
 
     fn dropHistoryDraft(self: *Ui) void {
@@ -3507,6 +3673,7 @@ const Ui = struct {
         self.displayed_provider_generation = if (self.frame_fresh) self.frame_provider_generation else null;
         self.displayed_settings_generation = if (self.frame_fresh) self.frame_settings_generation else null;
         self.displayed_decision_fingerprint = if (self.frame_fresh and self.displayed_settings_generation != null) self.frame_decision_fingerprint else null;
+        self.displayed_proxy_fingerprint = if (self.frame_fresh and self.displayed_settings_generation != null) self.frame_proxy_fingerprint else null;
         self.tail_height = self.frame_height;
         self.tail_cursor_rows_up = if (self.frame_fresh) self.frame_cursor_rows_up else 0;
         self.tail_composer_rows = if (self.frame_fresh) self.frame_composer_rows else 1;
@@ -3631,18 +3798,19 @@ const Ui = struct {
     const PreparedComposer = struct { decoration: presentation.Prompt, layout: composer_layout.Layout };
 
     fn prepareComposer(self: *Ui, a: std.mem.Allocator, state: Connection.State, cols: usize) !PreparedComposer {
-        // Preserve the existing slash-argument privacy boundary before wrapping.
+        // Mask only genuinely sensitive or invalid slash arguments. Trailing
+        // whitespace alone never hides anything, and product-supported ordinary
+        // arguments (/attach, /cd, /close, /ls) stay visible and editable.
         const trimmed = std.mem.trimStart(u8, self.editor.bytes.items, " \t\r\n");
         const is_model = modelCommand(trimmed);
-        const model_args = if (is_model) std.mem.trim(u8, trimmed["/model".len..], " \t\r\n") else "";
-        const safe_model = is_model and (model_args.len == 0 or picker_module.manualName(model_args));
-        const hide_arguments = !safe_model and std.mem.startsWith(u8, trimmed, "/") and (std.mem.findScalar(u8, trimmed, ' ') != null or std.mem.findScalar(u8, trimmed, '\t') != null or std.mem.findScalar(u8, trimmed, '\r') != null or std.mem.findScalar(u8, trimmed, '\n') != null);
         const command_end = std.mem.findAny(u8, trimmed, " \t\r\n") orelse trimmed.len;
+        const name = trimmed[0..command_end];
+        const hide_arguments = std.mem.startsWith(u8, trimmed, "/") and sensitiveArguments(name, trimmed[command_end..]);
         const hidden_hint: []const u8 = if (is_model)
             "/model [arguments hidden; use one model ID]"
-        else if (std.mem.eql(u8, trimmed[0..command_end], "/login"))
+        else if (std.mem.eql(u8, name, "/login"))
             "/login [arguments hidden; no key argument]"
-        else if (std.mem.eql(u8, trimmed[0..command_end], "/compact"))
+        else if (std.mem.eql(u8, name, "/compact"))
             "/compact [arguments hidden; no arguments]"
         else
             "/ [command arguments hidden]";
@@ -3911,13 +4079,15 @@ const Ui = struct {
         if (self.model_picker) |*picker| try picker.captureChoice(a, picker_rows.selected_choice);
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, candidate_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
-        var settings_rows = if (self.settings_open and self.settings_value_picker != null) try settings_value_module.rows(a, self.settings_menu, self.settings_value_picker.?, cols, candidate_limit) else if (self.settings_open and self.settingsModelOpen()) try decision_picker_module.rows(a, self.settings_menu, self.settingsModels(state), state.model_providers, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, .{
+        var settings_rows = if (self.settings_open and self.settings_value_picker != null) try settings_value_module.rows(a, self.settings_menu, self.settings_value_picker.?, cols, candidate_limit) else if (self.settings_open and self.proxy_open) try proxy_picker_module.rows(a, self.settings_menu, state.models, state.model_providers, state.proxy_models, state.proxy_configured, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open and self.settingsModelOpen()) try decision_picker_module.rows(a, self.settings_menu, self.settingsModels(state), state.model_providers, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, .{
             .low_price_input_enabled = state.low_price_input_enabled,
             .decision_enabled = state.decision_enabled,
             .decision_model = state.decision_model,
             .image_enabled = state.image_enabled,
             .image_model = state.image_model,
             .memory_auto = state.memory_auto,
+            .proxy_configured = state.proxy_configured,
+            .proxy_model_count = state.proxy_models.len,
             .global_settings_available = state.global_settings_available,
             .limits = state.limits,
         }, cols, candidate_limit) else settings_menu_module.Rows{ .lines = &.{} };
@@ -3926,6 +4096,7 @@ const Ui = struct {
         }
         self.frame_settings_generation = null;
         self.frame_decision_fingerprint = null;
+        self.frame_proxy_fingerprint = null;
         const menu_visible = !release_idle and self.commandMenuVisible();
         const menu_rows = if (menu_visible) try command_menu_module.rows(a, self.command_matches, self.command_menu.selected, cols, candidate_limit) else command_menu_module.Rows{ .lines = &.{} };
         if (menu_visible) self.command_menu.selected = @min(self.command_menu.selected, self.command_matches.len - 1);
@@ -3967,20 +4138,35 @@ const Ui = struct {
         const content_body_limit = body_limit -| (popup_lines.len + popup_gap);
         self.frame_model_epoch = null;
         self.frame_model_generation = null;
+        // Transient reasoning is a reversible OVERLAY over rows that are already
+        // ACKed at this exact width, never a bottom growth that scrolls canonical
+        // rows out of view. A pending canonical row in the same frame would also
+        // grow the tail; defer the window to the next fresh frame instead of
+        // committing reasoning rows. The initial tail==0 screen and an abandoned
+        // tail keep their existing baseline geometry.
+        const thinking_overlay = thinking != null and transcript_rows == 0 and history_valid and
+            self.tail_height != 0 and !self.abandon_tail and !release_idle;
+        const thinking_deferred = thinking != null and !thinking_overlay and
+            self.tail_height != 0 and !self.abandon_tail;
+        const show_thinking = thinking != null and !thinking_deferred;
         const wanted_body = if (self.stop_open) 0 else if (self.permission != null)
             @min(body_limit, 1 + @max(1, approval_lines.lines.len))
-        else if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (thinking != null) @min(thinking_gap + @min(3, thinking_lines.len), content_body_limit) else @min(lines.items.len, content_body_limit);
+        else if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (show_thinking) @min(thinking_gap + @min(3, thinking_lines.len), content_body_limit) else @min(lines.items.len, content_body_limit);
         // Initial blank space keeps the first conversation at the top. Each
         // immutable row consumes it; expanding drafts scroll old content upward.
         // Never shrink a tail without replacing it by committed rows: the editor
         // therefore stays on the physical bottom row, without absolute positioning.
         const available = if (release_idle) @as(usize, 1) else if (self.tail_height == 0 or self.abandon_tail) self.size.rows else self.tail_height;
-        const rows = @min(self.size.rows, @max(footer_rows + popup_lines.len + popup_gap + wanted_body, available -| transcript_rows));
-        // Popups and history preview grow UP into exact ACKed transcript rows,
-        // without pushing duplicate content into native scrollback. Keep these
-        // restoration rows when returning from preview to the normal live tail.
-        // Unknown/reflowed/partially written rows never grant upward ownership.
-        const borrow_count = if ((popup_lines.len != 0 or preview or self.permission != null) and transcript_rows == 0)
+        const wanted_rows = @min(self.size.rows, @max(footer_rows + popup_lines.len + popup_gap + wanted_body, available -| transcript_rows));
+        // Only known ACKed rows may fund the overlay; unknown/partial state shows
+        // fewer reasoning rows instead of inventing physical rows.
+        const rows = if (thinking_overlay) @min(wanted_rows, @min(self.size.rows, self.tail_height + above.len)) else wanted_rows;
+        // Popups, history preview and the reasoning overlay grow UP into exact
+        // ACKed transcript rows, without pushing duplicate content into native
+        // scrollback. Keep these restoration rows when returning to the normal
+        // live tail. Unknown/reflowed/partially written rows never grant upward
+        // ownership.
+        const borrow_count = if ((popup_lines.len != 0 or preview or self.permission != null or thinking_overlay) and transcript_rows == 0)
             @min(rows -| self.tail_height, above.len)
         else
             0;
@@ -4078,7 +4264,7 @@ const Ui = struct {
                 try putToneLine(writer, a, body_rows, choices, cols, theme.accent);
                 self.frame_permission = permission.id;
                 self.frame_permission_choice = self.permission.?.choice;
-            } else if (thinking != null) {
+            } else if (show_thinking) {
                 // Latest THREE content rows, without any title/prefix.
                 const visible_rows = @min(3, content_body_rows -| thinking_gap);
                 const start = thinking_lines.len -| visible_rows;
@@ -4116,6 +4302,7 @@ const Ui = struct {
                 if (!self.stop_open and self.settings_open and settings_rows.can_confirm) {
                     self.frame_settings_generation = self.settings_menu.generation;
                     if (self.settingsModelOpen()) self.frame_decision_fingerprint = decision_picker_module.fingerprint(self.settingsModels(state), state.model_providers);
+                    if (self.proxy_open) self.frame_proxy_fingerprint = proxy_picker_module.fingerprint(state.models, state.model_providers, state.proxy_models, state.proxy_configured);
                 }
                 if (!self.stop_open and self.provider_open and provider_rows.can_confirm) self.frame_provider_generation = self.provider_picker.generation;
                 if (self.model_picker) |picker| {
@@ -4137,7 +4324,7 @@ const Ui = struct {
                 try putInputLine(writer, a, rows, "API key> ", masks[0..count], cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols, count + 10) - 1});
-            } else if (self.settings_open and !self.settingsModelOpen()) {
+            } else if (self.settings_open and !self.settingsQueryOpen()) {
                 try putInputLine(writer, a, rows, "Settings> ", "", cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols - 1, 10)});
@@ -4145,8 +4332,8 @@ const Ui = struct {
                 try putInputLine(writer, a, rows, "Provider> ", "", cols);
                 cursor_offset = tail_out.written().len;
                 try writer.print("\r\x1b[{d}C", .{@min(cols - 1, 10)});
-            } else if (self.settingsModelOpen() or self.model_picker != null) {
-                const query = if (self.settingsModelOpen()) &self.editor else &self.model_picker.?.query;
+            } else if (self.settingsQueryOpen() or self.model_picker != null) {
+                const query = if (self.settingsQueryOpen()) &self.editor else &self.model_picker.?.query;
                 const decorated: []const u8 = "Search> ";
                 const prefix = try editorDisplay(a, query.bytes.items[0..query.cursor]);
                 var start: usize = 0;
@@ -4245,6 +4432,75 @@ fn compactCommand(command: []const u8) bool {
 
 fn modelCommand(command: []const u8) bool {
     return std.mem.eql(u8, command, "/model") or std.mem.startsWith(u8, command, "/model ") or std.mem.startsWith(u8, command, "/model\t");
+}
+
+/// True when the slash arguments must stay masked. Only non-empty arguments of
+/// no-argument or unknown commands, /login credentials and malformed values are
+/// sensitive; ordinary supported argument shapes stay visible and editable.
+fn sensitiveArguments(name: []const u8, rest: []const u8) bool {
+    const args = std.mem.trim(u8, rest, " \t\r\n");
+    if (args.len == 0) return false; // Trailing whitespace alone is never sensitive.
+    if (std.mem.findAny(u8, args, "\r\n") != null) return true; // Commands are single-line.
+    if (std.mem.eql(u8, name, "/cd")) return args.len > 4096;
+    if (std.mem.eql(u8, name, "/model")) return !picker_module.manualName(args);
+    if (std.mem.eql(u8, name, "/ls")) return !listArgumentsValid(args);
+    if (std.mem.eql(u8, name, "/attach") or std.mem.eql(u8, name, "/attch") or std.mem.eql(u8, name, "/close"))
+        return !sessionArgumentsValid(name, args);
+    if (std.mem.eql(u8, name, "/queue")) return !std.mem.eql(u8, args, "resume");
+    // /login, /compact, /help, /detach, /exit and unknown commands take no
+    // arguments; non-empty text cannot be told apart from an accidental paste.
+    return true;
+}
+
+fn decimalWord(word: []const u8) bool {
+    if (word.len == 0) return false;
+    for (word) |byte| if (byte < '0' or byte > '9') return false;
+    return true;
+}
+
+/// Tokenizes into the same bounded shape the management parser accepts.
+fn splitQuiet(value: []const u8, out: *[4][]const u8) usize {
+    var count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, value, " \t");
+    while (it.next()) |word| {
+        if (count == out.len) return out.len + 1;
+        out[count] = word;
+        count += 1;
+    }
+    return count;
+}
+
+fn listArgumentsValid(args: []const u8) bool {
+    var words: [4][]const u8 = undefined;
+    const count = splitQuiet(args, &words);
+    if (count > words.len) return false;
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        const word = words[index];
+        if (std.mem.eql(u8, word, "--running")) continue;
+        if (std.mem.eql(u8, word, "--page") and index + 1 < count and decimalWord(words[index + 1])) {
+            index += 1;
+            continue;
+        }
+        if (decimalWord(word)) continue;
+        return false;
+    }
+    return true;
+}
+
+fn sessionArgumentsValid(name: []const u8, args: []const u8) bool {
+    var words: [4][]const u8 = undefined;
+    const count = splitQuiet(args, &words);
+    if (count == 0 or count > words.len) return false;
+    const flag = if (std.mem.eql(u8, name, "/close")) "--force" else "--takeover";
+    var id: ?[]const u8 = null;
+    for (words[0..count]) |word| {
+        if (std.mem.eql(u8, word, flag)) continue;
+        if (word.len != 0 and word[0] == '-') return false;
+        if (id != null) return false;
+        id = word;
+    }
+    return (id orelse return false).len <= 256;
 }
 
 /// 输入行的显示副本：Tab 固定展开为四个空格，测宽、裁剪与输出共用；不修改提交字节。
@@ -6766,6 +7022,21 @@ fn discardFixtureFrame(ui: *Ui) void {
     for (ui.records.items) |*record| record.discardPendingFlow();
 }
 
+/// Test fixture: commit real canonical rows through complete frames so the
+/// ACKed above rows are physically on the replay screen and the live tail is
+/// reduced to a compact footer. Returns each marker exactly once on screen.
+fn seedCompactAckedTail(ui: *Ui, screen: *@import("../tests/regular_screen.zig").Screen) !void {
+    _ = try ui.add(.user, "canon-a");
+    _ = try ui.add(.user, "canon-b1\ncanon-b2\ncanon-b3\ncanon-b4\ncanon-b5\ncanon-b6");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    _ = try ui.add(.user, "canon-c1\ncanon-c2\ncanon-c3\ncanon-c4\ncanon-c5\ncanon-c6\ncanon-c7\ncanon-c8\ncanon-c9\ncanon-c10\ncanon-c11\ncanon-c12\ncanon-c13");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+}
+
 fn tailAllocationDraw(ui: *Ui) !void {
     // draw writes only to std.Io.Writer.Allocating, never terminal I/O. Its
     // drain translates allocator OOM to WriteFailed; the fault-test helper
@@ -7680,7 +7951,35 @@ const SelectionFixture = struct {
     metadata_effort: ?shared.ReasoningEffort = null,
     key_matched: bool = false,
     fail: bool = false,
+    proxy_configured: bool = false,
+    proxy_list: [8][]const u8 = @splat(""),
+    proxy_len: usize = 0,
+    proxy_saves: usize = 0,
+    proxy_fail: bool = false,
+    proxy_last: ?[]const u8 = null,
+    proxy_last_enabled: bool = false,
     const profiles = [_]core_config.Model{.{ .name = "fixture/fixture-next", .context_tokens = 65536 }};
+    /// Owner-side proxy list mutation: the UI never edits its own copy.
+    fn proxyToggle(raw: *anyopaque, name: []const u8, enabled: bool) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.proxy_saves += 1;
+        self.proxy_last = name;
+        self.proxy_last_enabled = enabled;
+        if (self.proxy_fail) return error.TestSelectionFailure;
+        var index: usize = 0;
+        while (index < self.proxy_len) : (index += 1) {
+            if (std.mem.eql(u8, self.proxy_list[index], name)) break;
+        }
+        if (enabled) {
+            if (index == self.proxy_len and self.proxy_len < self.proxy_list.len) {
+                self.proxy_list[self.proxy_len] = name;
+                self.proxy_len += 1;
+            }
+        } else if (index < self.proxy_len) {
+            std.mem.copyForwards([]const u8, self.proxy_list[index..self.proxy_len], self.proxy_list[index + 1 .. self.proxy_len]);
+            self.proxy_len -= 1;
+        }
+    }
     fn refreshMetadata(ctx: *anyopaque) !void {
         const self: *SelectionFixture = @ptrCast(@alignCast(ctx));
         self.refreshes += 1;
@@ -7697,11 +7996,11 @@ const SelectionFixture = struct {
         return true;
     }
     fn connection(self: *@This()) Connection {
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .select_model_fn = select, .set_effort_fn = setEffort };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .select_model_fn = select, .set_effort_fn = setEffort, .proxy_fn = proxyToggle };
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .selection_name = if (std.mem.eql(u8, self.name, "fixture-old")) "fixture/fixture-old" else if (std.mem.eql(u8, self.name, "fixture-next")) "fixture/fixture-next" else self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default };
+        return .{ .runtime = null, .model = self.name, .selection_name = if (std.mem.eql(u8, self.name, "fixture-old")) "fixture/fixture-old" else if (std.mem.eql(u8, self.name, "fixture-next")) "fixture/fixture-next" else self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default, .proxy_configured = self.proxy_configured, .proxy_models = self.proxy_list[0..self.proxy_len] };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;
@@ -10029,6 +10328,185 @@ test "slash menu grows a short tail and cannot authorize a clipped panel" {
     try std.testing.expect(ui.model_picker == null and !ui.secret_mode);
 }
 
+test "transient reasoning borrows ACKed rows and restores the canonical region" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 80, .rows = 24 };
+    try seedCompactAckedTail(&ui, &screen);
+    try std.testing.expect(ui.tail_height <= 4);
+    try std.testing.expect(ui.menu_history.?.above.len >= 10);
+    const history_before = screen.history_len;
+    const tail_before = ui.tail_height;
+    try ui.appendDraft(.reasoning, "think-A\nthink-B\nthink-C");
+    try ui.draw();
+    const overlay_rows = ui.frame_height;
+    // The window only borrows known ACKed rows; it never invents height.
+    try std.testing.expect(overlay_rows > tail_before);
+    try std.testing.expect(overlay_rows <= tail_before + ui.menu_history.?.above.len);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "think-B") != null);
+    try screen.replay(ui.frame);
+    // Tiny overlay frame adds no native rows and overwrites no scrollback.
+    try std.testing.expectEqual(history_before, screen.history_len);
+    try std.testing.expectEqual(@as(usize, 0), screen.count("canon-c13"));
+    ui.finishFrame();
+    // Exactly the rows above the old tail were borrowed, and they stay owned.
+    try std.testing.expectEqual(overlay_rows - tail_before, ui.menu_history.?.borrowed.len);
+    try std.testing.expectEqual(overlay_rows - tail_before, ui.tail_height - tail_before);
+    // Paused finish: the borrowed canonical rows return to their physical rows.
+    ui.discardReasoning();
+    ui.notice = "DecisionUnavailable: HTTP 429";
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "think-") == null);
+    try std.testing.expectEqual(overlay_rows, ui.frame_height);
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(history_before, screen.history_len);
+    const base = screen.rows - ui.frame_height;
+    const restored = [_]struct { row: usize, marker: []const u8 }{
+        .{ .row = base, .marker = "canon-c10" },
+        .{ .row = base + 1, .marker = "canon-c11" },
+        .{ .row = base + 2, .marker = "canon-c12" },
+        .{ .row = base + 3, .marker = "canon-c13" },
+    };
+    for (restored) |entry| {
+        try std.testing.expectEqual(@as(usize, 1), screen.count(entry.marker));
+        try std.testing.expect(std.mem.startsWith(u8, std.mem.trimEnd(u8, &screen.grid[entry.row], " "), entry.marker));
+    }
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
+}
+
+test "pending user row in the reasoning frame defers the overlay instead of growing it" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 80, .rows = 24 };
+    try seedCompactAckedTail(&ui, &screen);
+    const tail_before = ui.tail_height;
+    try ui.appendDraft(.reasoning, "think-A\nthink-B\nthink-C");
+    _ = try ui.add(.user, "pending-row");
+    try ui.draw();
+    // The real canonical row commits; the reasoning window waits for a fresh ACK.
+    try std.testing.expect(std.mem.find(u8, ui.frame, "pending-row") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "think-B") == null);
+    try std.testing.expect(ui.frame_height <= tail_before);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    // The deferred window appears only on the next complete frame, and the
+    // committed row it borrows stays restorable instead of being duplicated.
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "think-B") != null);
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("think-B"));
+    try std.testing.expect(screen.count("pending-row") <= 1);
+    ui.finishFrame();
+    var restorable = false;
+    for (ui.menu_history.?.borrowed) |row| {
+        if (std.mem.find(u8, row, "pending-row") != null) restorable = true;
+    }
+    try std.testing.expect(restorable);
+    // Hiding the window puts the borrowed canonical row back on screen once.
+    ui.discardReasoning();
+    ui.notice = "DecisionUnavailable: HTTP 429";
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "think-") == null);
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("pending-row"));
+    ui.finishFrame();
+}
+
+test "resized reasoning frame invalidates old ACK and recovers a bounded viewport" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 80, .rows = 24 };
+    // Height-only shrink: the top `overflow` rows leave the viewport into native
+    // history, the remaining rows move up, rows beyond the new logical height are
+    // cleared, and the cursor drops by the same amount. Not a reflow model.
+    const Shrink = struct {
+        fn apply(target: *@import("../tests/regular_screen.zig").Screen, new_rows: usize) !void {
+            const old_rows = target.rows;
+            if (new_rows == 0 or new_rows >= old_rows or old_rows > target.grid.len) return;
+            const overflow = old_rows - new_rows;
+            if (target.history_len + overflow > target.history.len) return error.ScrollbackLimit;
+            for (0..overflow) |i| target.history[target.history_len + i] = target.grid[i];
+            target.history_len += overflow;
+            for (0..new_rows) |row_index| target.grid[row_index] = target.grid[row_index + overflow];
+            for (new_rows..target.grid.len) |row_index| target.grid[row_index] = @splat(' ');
+            target.row -|= overflow;
+            target.wrap = false;
+            target.rows = new_rows;
+        }
+    };
+    // Only the live viewport must stay deduplicated. Screen.count/Screen.visible
+    // scan native history too, where a recovered preview may legitimately remain.
+    const viewport = struct {
+        fn count(target: *const @import("../tests/regular_screen.zig").Screen, needle: []const u8) usize {
+            var total: usize = 0;
+            for (target.grid[0..target.rows], 0..) |_, row_index|
+                total += std.mem.count(u8, &target.grid[row_index], needle);
+            return total;
+        }
+    };
+    const markers = [_][]const u8{ "canon-c10", "canon-c11", "canon-c12", "canon-c13", "think-B" };
+    try seedCompactAckedTail(&ui, &screen);
+    try ui.appendDraft(.reasoning, "think-A\nthink-B\nthink-C");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    for (markers) |marker| try std.testing.expect(screen.count(marker) <= 1);
+    // Partial geometry (same width, unknown height) grants no upward ownership.
+    ui.tail_size = .{ .columns = ui.size.columns, .rows = ui.size.rows + 1 };
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "think-") == null);
+    try screen.replay(ui.frame);
+    ui.finishFrame();
+    for (markers) |marker| try std.testing.expect(screen.count(marker) <= 1);
+    const records_before = ui.records.items.len;
+    // Height-only resize invalidates every old ACKed geometry.
+    ui.resize(.{ .columns = 80, .rows = 18 });
+    try Shrink.apply(&screen, 18);
+    try ui.draw();
+    // A full rewrite replaces the aborted tail; no upward borrow from old ACKs.
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[999B") != null);
+    try std.testing.expectEqual(@as(usize, 18), ui.frame_height);
+    try screen.replay(ui.frame);
+    // A lost geometry permits one conservative viewport recovery: it may revive
+    // an old visual preview in native history. Such rows are display previews,
+    // not a canonical re-commit of transcript or completed execution records,
+    // so the full document may hold them twice while the viewport holds them once.
+    for (markers) |marker| try std.testing.expect(viewport.count(&screen, marker) <= 1);
+    try std.testing.expectEqual(records_before, ui.records.items.len);
+    for (ui.records.items) |record| {
+        if (record.kind == .reasoning) continue;
+        try std.testing.expect(record.output);
+    }
+    // Freeze what that single recovery produced; stability means no further
+    // appends or duplicate rows, not that history matches the pre-resize state.
+    var recovered: [markers.len]usize = undefined;
+    for (markers, 0..) |marker, index| recovered[index] = screen.count(marker);
+    const recovered_history = screen.history_len;
+    ui.finishFrame();
+    // The next stable frame re-establishes geometry without replaying canonical rows.
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 18), ui.frame_height);
+    try screen.replay(ui.frame);
+    for (markers, 0..) |marker, index| {
+        try std.testing.expectEqual(recovered[index], screen.count(marker));
+        try std.testing.expect(viewport.count(&screen, marker) <= 1);
+    }
+    try std.testing.expectEqual(recovered_history, screen.history_len);
+    ui.finishFrame();
+}
+
 test "slash menu never opens for pasted arguments unknown tokens or busy sessions" {
     try text.initLocale();
     var cancel = p.Cancellation{};
@@ -10542,6 +11020,268 @@ test "slash composer frames keep model prefixes and hide credentials with comman
         try std.testing.expect(!ui.secret_mode and !ui.provider_open);
         try std.testing.expectEqual(@as(usize, 0), fixture.provider_saves);
     }
+}
+
+test "slash composer keeps supported management arguments visible without submitting" {
+    try text.initLocale();
+    const cases = [_]struct { raw: []const u8, shown: []const u8, hidden: ?[]const u8 = null }{
+        .{ .raw = "/attach 0123456789abcdef0123456789abcdef", .shown = "/attach 0123456789abcdef0123456789abcdef" },
+        .{ .raw = "/attach --takeover 0123456789abcdef0123456789abcdef", .shown = "/attach --takeover 0123456789abcdef0123456789abcdef" },
+        .{ .raw = "/attch 0123456789abcdef0123456789abcdef", .shown = "/attch 0123456789abcdef0123456789abcdef" },
+        .{ .raw = "/close 0123456789abcdef0123456789abcdef --force", .shown = "/close 0123456789abcdef0123456789abcdef --force" },
+        .{ .raw = "/cd /srv/work dir", .shown = "/cd /srv/work dir" },
+        .{ .raw = "/ls --running --page 2", .shown = "/ls --running --page 2" },
+        .{ .raw = "/ls 2", .shown = "/ls 2" },
+        .{ .raw = "/ls ", .shown = "/ls " },
+        .{ .raw = "/detach   ", .shown = "/detach   " },
+        .{ .raw = "/login ", .shown = "/login " },
+        .{ .raw = "/compact\t", .shown = "/compact    " },
+        .{ .raw = "/attach bad!id extra", .shown = "/ [command arguments hidden]", .hidden = "bad!id" },
+        .{ .raw = "/ls --page", .shown = "/ [command arguments hidden]", .hidden = "--page" },
+        .{ .raw = "/login fakecredential", .shown = "/login [arguments hidden; no key argument]", .hidden = "fakecredential" },
+        .{ .raw = "/unknown fakecredential", .shown = "/ [command arguments hidden]", .hidden = "fakecredential" },
+        .{ .raw = "/model one two", .shown = "/model [arguments hidden; use one model ID]", .hidden = "one two" },
+    };
+    for (cases) |case| {
+        var cancel = p.Cancellation{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var fixture = SelectionFixture{};
+        defer fixture.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.connection = fixture.connection();
+        ui.connection.configure_provider_fn = SelectionFixture.configureProvider;
+        _ = try ui.editor.insert(case.raw);
+        try ui.draw();
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        try screen.replay(ui.frame);
+        try std.testing.expect(std.mem.find(u8, &screen.grid[23], case.shown) != null);
+        if (case.hidden) |hidden| {
+            try std.testing.expect(std.mem.find(u8, ui.frame, hidden) == null);
+            try std.testing.expectEqual(@as(usize, 0), screen.count(hidden));
+        }
+        // Drawing only: no command may run from a composer frame.
+        try std.testing.expectEqualStrings(case.raw, ui.editor.bytes.items);
+        try std.testing.expect(!ui.secret_mode and !ui.provider_open and ui.future == null and !ui.busy);
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.provider_saves);
+        discardFixtureFrame(&ui);
+    }
+}
+
+test "settings proxy submenu toggles one acknowledged row and keeps parent draft" {
+    try text.initLocale();
+    const models = [_]core_config.Model{
+        .{ .name = "fixture/one", .context_tokens = 32768 },
+        // Native protocol and unknown capacity remain selectable.
+        .{ .name = "fixture/two", .protocol = .systemone, .context_tokens = 0 },
+        .{ .name = "unlogged/three", .context_tokens = 32768 },
+    };
+    var fixture: SelectionFixture = .{ .profiles_override = &models, .proxy_configured = true };
+    defer fixture.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 8;
+    // Settings-root draft: the child must never destroy it.
+    _ = try ui.editor.insert("draft");
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Proxy models") != null);
+    ui.finishFrame();
+    try ui.parser.feed("\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expect(ui.proxy_open and !ui.decision_open and !ui.image_open);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "[ ] fixture/one") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "unlogged/three") == null);
+    ui.finishFrame();
+    // One ACKed Enter saves exactly one model; the same batch cannot flip twice.
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
+    try std.testing.expectEqualStrings("fixture/one", fixture.proxy_last.?);
+    try std.testing.expect(fixture.proxy_last_enabled);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Saved proxy models") != null);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "new session") != null);
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "[x] fixture/one") != null);
+    ui.finishFrame();
+    // A second model can be toggled without leaving the submenu.
+    try ui.parser.feed("\x1b[B", input.Sink{ .context = &ui, .emit_fn = Ui.key });
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 2), fixture.proxy_saves);
+    try std.testing.expectEqualStrings("fixture/two", fixture.proxy_last.?);
+    try std.testing.expectEqual(@as(usize, 2), fixture.proxy_len);
+    // Owner save failure keeps the checkbox and the query, and still consumes ACK.
+    fixture.proxy_fail = true;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 3), fixture.proxy_saves);
+    try std.testing.expectEqual(@as(usize, 2), fixture.proxy_len);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "previous value kept") != null);
+    try std.testing.expect(ui.proxy_open);
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 3), fixture.proxy_saves);
+    fixture.proxy_fail = false;
+    // Search keeps the exact case and inner slashes of the saved name.
+    try ui.settingsKey(.{ .text = .{ .value = "TWO", .pasted = false } });
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 4), fixture.proxy_saves);
+    try std.testing.expectEqualStrings("fixture/two", fixture.proxy_last.?);
+    try std.testing.expect(!fixture.proxy_last_enabled);
+    // Left/Esc returns to the parent row and restores the parent draft.
+    try ui.settingsKey(.escape);
+    try std.testing.expect(!ui.proxy_open and ui.settings_open);
+    try std.testing.expectEqual(@as(usize, 8), ui.settings_menu.selected);
+    try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
+}
+
+test "settings proxy submenu refuses saving without a configured host and port" {
+    try text.initLocale();
+    const models = [_]core_config.Model{.{ .name = "fixture/one", .context_tokens = 32768 }};
+    var fixture: SelectionFixture = .{ .profiles_override = &models };
+    defer fixture.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 8;
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expect(ui.proxy_open);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "not configured") != null);
+    // Saving stays disabled: no guessed address and no save callback.
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_saves);
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.{ .text = .{ .value = "fixture", .pasted = false } });
+    try ui.draw();
+    ui.finishFrame();
+    try ui.settingsKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), fixture.proxy_saves);
+    try std.testing.expect(ui.proxy_open and ui.input_history.entries.items.len == 0);
+}
+
+test "remote history replay seeds input history without touching the editor" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 5 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try typeDraft(&ui, "my draft");
+    fake.item = try session_client.ownEvent(a, 5, .{ .user_committed = .{ .id = 1, .text = "first" } });
+    fake.item.?.history_replay = true;
+    fake.item.?.history_reset = true;
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    try std.testing.expectEqualStrings("first", ui.input_history.entries.items[0]);
+    try std.testing.expectEqualStrings("my draft", ui.editor.bytes.items);
+    fake.item = try session_client.ownEvent(a, 5, .{ .user_committed = .{ .id = 2, .text = "second" } });
+    fake.item.?.history_replay = true;
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expectEqual(@as(usize, 2), ui.input_history.entries.items.len);
+    try std.testing.expectEqualStrings("second", ui.input_history.entries.items[1]);
+    // Live and queued events carry no replay marker and never duplicate history.
+    fake.item = try session_client.ownEvent(a, 5, .{ .user_committed = .{ .id = 3, .text = "live" } });
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expectEqual(@as(usize, 2), ui.input_history.entries.items.len);
+    // Truncated, incomplete, blank and slash-replayed text is skipped.
+    fake.item = try session_client.ownEvent(a, 5, .{ .user_committed = .{ .id = 4, .text = "truncated" } });
+    fake.item.?.history_replay = true;
+    fake.item.?.display_truncated = true;
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    fake.item = try session_client.ownEvent(a, 5, .{ .user_committed = .{ .id = 5, .text = "incomplete" } });
+    fake.item.?.history_replay = true;
+    fake.item.?.canonical_complete = false;
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    for ([_][]const u8{ "   ", "  /secret command" }) |skipped| {
+        fake.item = try session_client.ownEvent(a, 5, .{ .user_committed = .{ .id = 6, .text = skipped } });
+        fake.item.?.history_replay = true;
+        try ui.pumpRemote();
+        try drainBridge(&ui);
+    }
+    try std.testing.expectEqual(@as(usize, 2), ui.input_history.entries.items.len);
+    // Up/Down browse the replayed prompts and restore the unsent draft.
+    ui.editor.cursor = 0;
+    try Ui.key(&ui, .up);
+    try std.testing.expectEqualStrings("second", ui.editor.bytes.items);
+    try Ui.key(&ui, .down);
+    try std.testing.expectEqualStrings("my draft", ui.editor.bytes.items);
+    // A stale epoch item is discarded by the poll epoch check before any reset.
+    fake.snapshot.control_epoch = 6;
+    fake.item = try session_client.ownEvent(a, 5, .{ .user_committed = .{ .id = 7, .text = "stale" } });
+    fake.item.?.history_replay = true;
+    fake.item.?.history_reset = true;
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+}
+
+test "remote history reset while browsing returns the unsent draft to the editor" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 5 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    for ([_][]const u8{ "old-one", "old-two" }) |message|
+        ui.input_history.commit(a, try ui.input_history.prepare(a, message));
+    try typeDraft(&ui, "unsent draft");
+    ui.editor_pasted = true;
+    // Browsing only starts at the exact raw origin, so the parked draft carries
+    // cursor 0 and its pasted provenance; Up then shows the newest prompt.
+    ui.editor.cursor = 0;
+    try Ui.key(&ui, .up);
+    try std.testing.expectEqualStrings("old-two", ui.editor.bytes.items);
+    try std.testing.expect(ui.input_history.index != null and ui.history_draft != null and ui.history_draft_pasted);
+    const parked = ui.history_draft.?.bytes.items.ptr;
+    const parked_cursor = ui.history_draft.?.cursor;
+    // A same-epoch replay reset replaces the list instead of dropping the form.
+    fake.item = try session_client.ownEvent(a, 5, .{ .user_committed = .{ .id = 9, .text = "replayed" } });
+    fake.item.?.history_replay = true;
+    fake.item.?.history_reset = true;
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    try std.testing.expectEqualStrings("replayed", ui.input_history.entries.items[0]);
+    try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
+    try std.testing.expectEqual(parked_cursor, ui.editor.cursor);
+    try std.testing.expectEqual(parked, ui.editor.bytes.items.ptr); // moved owner, no copy
+    try std.testing.expect(ui.editor_pasted);
+    try std.testing.expect(ui.input_history.index == null and ui.history_draft == null and !ui.history_draft_pasted);
+    // Down from the restored origin is not browsing: nothing is lost.
+    try Ui.key(&ui, .down);
+    try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
+    try std.testing.expectEqual(parked, ui.editor.bytes.items.ptr);
+    try std.testing.expect(ui.editor_pasted and ui.history_draft == null and ui.input_history.index == null);
 }
 
 test "secret prompt masks keys shows destination and erases cancel error and paste tails" {

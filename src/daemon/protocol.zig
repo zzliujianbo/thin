@@ -64,14 +64,19 @@ pub const ErrorCode = enum {
 pub fn errorCode(err: anyerror) ErrorCode {
     return switch (err) {
         error.StaleControl => .stale_control,
-        error.Busy, error.TaskStillRunning => .busy,
+        error.Busy, error.TaskStillRunning, error.AuthVersionConflict => .busy,
         error.Unavailable, error.SessionInUse, error.PeerUidMismatch => .unavailable,
         error.SessionNotFound, error.FileNotFound => .not_found,
         error.InvalidInput, error.InvalidArguments, error.InvalidSessionID => .invalid_input,
+        // Configuration and selection rejections are caller mistakes, not
+        // server faults: an unusable proxy/provider/credential request must
+        // never surface as an opaque internal failure.
+        error.ProxyNotConfigured, error.UnknownProvider, error.UnknownProxyModel, error.ApiKeyNotFound, error.MissingRegistry, error.InvalidDefault => .invalid_input,
         error.InputTooLarge, error.OutOfMemory => .input_too_large,
         error.InboxFull, error.QueueFull => .queue_full,
         error.QueueEmpty, error.RunSealed => .queue_empty,
         error.InputBudgetExceeded, error.InputBudgetSummaryFailed, error.UnknownInputPriceThreshold => .input_budget,
+        error.Unsupported => .unsupported,
         error.Canceled => .canceled,
         error.PermissionExpired, error.InvalidPermission => .permission_expired,
         error.NoOfficialProvider => .no_official_provider,
@@ -184,6 +189,9 @@ pub const Op = enum {
     setting,
     decision_model,
     image_model,
+    /// Proxy allowlist mutation: one exact provider/raw model id plus an
+    /// explicit enable flag. Never carries an endpoint or a credential.
+    proxy_model,
     refresh_models,
     poll_metadata,
     close,
@@ -274,6 +282,16 @@ pub const Request = struct {
 
     pub fn boolField(self: *const Request, name: []const u8, default: bool) !bool {
         const value = self.field(name) orelse return default;
+        return switch (value) {
+            .bool => |b| b,
+            else => error.BadRequest,
+        };
+    }
+
+    /// Required strict boolean. A missing field is a bad request instead of a
+    /// caller default, so an enable/disable decision is always explicit.
+    pub fn requiredBool(self: *const Request, name: []const u8) !bool {
+        const value = self.field(name) orelse return error.BadRequest;
         return switch (value) {
             .bool => |b| b,
             else => error.BadRequest,
@@ -1595,6 +1613,33 @@ test "numeric and enum request fields reject wrong types instead of defaulting" 
     try std.testing.expectError(error.BadRequest, request.stringEnum(Op, "epoch"));
     try std.testing.expectError(error.BadRequest, request.boolField("epoch", true));
     try std.testing.expectEqual(true, try request.boolField("level", false));
+    try std.testing.expectEqual(true, try request.requiredBool("level"));
+}
+
+test "proxy_model request keeps the full u64 epoch and rejects loose parameters" {
+    const a = std.testing.allocator;
+    const high: u64 = @as(u64, std.math.maxInt(i64)) + 7;
+    const body = try std.fmt.allocPrint(a, "{{\"v\":1,\"id\":3,\"op\":\"proxy_model\",\"epoch\":{d},\"name\":\"opencode-go/deepseek-v3\",\"enabled\":true}}", .{high});
+    defer a.free(body);
+    var request = try parseRequest(a, body);
+    defer request.deinit();
+    try std.testing.expectEqual(Op.proxy_model, request.op);
+    // An epoch above i64.max is exact, never truncated through a signed parse.
+    try std.testing.expectEqual(high, try request.u64Field("epoch"));
+    // The name is the complete provider/raw-model id, slash included.
+    try std.testing.expectEqualStrings("opencode-go/deepseek-v3", try request.stringField("name", max_name));
+    try std.testing.expectEqual(true, try request.requiredBool("enabled"));
+
+    // Absent, stringly or numeric enable flags are bad requests, not defaults.
+    var loose = try parseRequest(a, "{\"v\":1,\"id\":4,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}");
+    defer loose.deinit();
+    try std.testing.expectError(error.BadRequest, loose.requiredBool("enabled"));
+    var stringly = try parseRequest(a, "{\"v\":1,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}");
+    defer stringly.deinit();
+    try std.testing.expectError(error.BadRequest, stringly.requiredBool("enabled"));
+    var numeric_epoch = try parseRequest(a, "{\"v\":1,\"id\":6,\"op\":\"proxy_model\",\"epoch\":\"1\",\"name\":\"p/m\",\"enabled\":false}");
+    defer numeric_epoch.deinit();
+    try std.testing.expectError(error.BadRequest, numeric_epoch.u64Field("epoch"));
 }
 
 test "decode rejects duplicate keys, deep nesting, quoted numbers and bad kinds" {
@@ -1893,6 +1938,32 @@ test "private startup exit codes roundtrip and never widen" {
     // The private boot mapping never widens the public v1 IPC category: a
     // SelectionNotFound failure keeps its pre-existing internal classification.
     try std.testing.expectEqual(.internal, errorCode(error.SelectionNotFound));
+}
+
+test "wire error codes keep unsupported distinct from internal" {
+    try std.testing.expectEqual(.unsupported, errorCode(error.Unsupported));
+    // Everything unlisted still falls back to the internal category.
+    try std.testing.expectEqual(.internal, errorCode(error.CleanupFailed));
+}
+
+test "wire error codes classify configuration rejections as invalid input" {
+    const cases = [_]anyerror{
+        error.ProxyNotConfigured,
+        error.UnknownProvider,
+        error.UnknownProxyModel,
+        error.ApiKeyNotFound,
+        error.MissingRegistry,
+        error.InvalidDefault,
+    };
+    for (cases) |err| {
+        try std.testing.expectEqual(.invalid_input, errorCode(err));
+    }
+    // A stale version guard loses a race against a newer credential write; the
+    // request itself was well formed, so it is retry-busy rather than invalid.
+    try std.testing.expectEqual(.busy, errorCode(error.AuthVersionConflict));
+    // Reclassification never widens the neighbors it sits between.
+    try std.testing.expectEqual(.unsupported, errorCode(error.Unsupported));
+    try std.testing.expectEqual(.internal, errorCode(error.CleanupFailed));
 }
 
 test "decision diagnostic terminal roundtrip owns labels and rejects invalid wire values" {

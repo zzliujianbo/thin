@@ -124,6 +124,13 @@ pub const Item = struct {
     event: r.Event,
     display_truncated: bool = false,
     canonical_complete: bool = true,
+    /// Local adapter metadata only: this item came from an owned history page,
+    /// not from the live delta stream. It is never a Runtime or wire event
+    /// field, and the TUI decides what a replay means for its own history.
+    history_replay: bool = false,
+    /// Local adapter metadata only: the first item of a history snapshot that
+    /// replaces the previous page, so a consumer can reset before replaying.
+    history_reset: bool = false,
     storage: Storage,
     allocator: std.mem.Allocator,
 
@@ -135,7 +142,9 @@ pub const Item = struct {
 
 /// Bounded, caller-owned deep copy of one typed event. Adapters build an
 /// `r.Event` from their own typed snapshot/delta and call this before returning
-/// it from `poll`; thereafter no backend memory is borrowed.
+/// it from `poll`; thereafter no backend memory is borrowed. The local history
+/// markers stay false here: only an adapter that read an owned history page
+/// sets them on the items it produced.
 pub fn ownEvent(a: std.mem.Allocator, epoch: u64, event: r.Event) !Item {
     var measure = Copy{};
     _ = measure.event(event);

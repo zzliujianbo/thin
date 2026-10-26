@@ -702,6 +702,172 @@ fn settingsValueChoose(d: *Driver, a: std.mem.Allocator, label: []const u8, pare
     try decisionModelScreen(d, a, &.{selected}, &.{"Custom ("});
 }
 
+// Node validates the saved whole JSON and request counts before releasing
+// each owned gate. Marker emission follows a complete replayed UI frame.
+fn settingsProxyGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
+    const path = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "{s}/settings-proxy-release-{s}", .{ project, name }), 0);
+    try check(access(path, 0) == -1 and c._errno().* == 2);
+    std.debug.print("SETTINGS_PROXY_GATE={s}\n", .{name});
+    const until = now() + 10000;
+    while (now() < until) {
+        if (access(path, 0) == 0) return;
+        try check(c._errno().* == 2);
+        try d.drain(20);
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.SettingsProxyGateTimeout;
+}
+
+/// Exact row state from one complete acknowledged frame. The query composer
+/// also echoes the model text, so only a row carrying its own inline checkbox
+/// can prove the owner-published membership; an arbitrary new frame cannot.
+fn settingsProxyState(d: *Driver, a: std.mem.Allocator, model: []const u8, checked: bool) !void {
+    const view = try a.create(regular.Screen);
+    defer a.destroy(view);
+    const box = if (checked) "[x]" else "[ ]";
+    const opposite = if (checked) "[ ]" else "[x]";
+    const until = now() + 10000;
+    while (now() < until) {
+        try d.drain(20);
+        const raw = d.output[0..d.used];
+        if (std.mem.lastIndexOf(u8, raw, "\x1b[?25h")) |ack| {
+            view.* = .{};
+            try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
+            var found: ?usize = null;
+            var total: usize = 0;
+            for (0..view.history_len + view.grid.len) |i| {
+                const line = if (i < view.history_len) &view.history[i] else &view.grid[i - view.history_len];
+                if (std.mem.indexOf(u8, line, model) == null) continue;
+                if (std.mem.indexOf(u8, line, "[ ]") == null and std.mem.indexOf(u8, line, "[x]") == null) continue;
+                total += 1;
+                found = i;
+            }
+            if (total == 1) {
+                const line = if (found.? < view.history_len) &view.history[found.?] else &view.grid[found.? - view.history_len];
+                if (std.mem.indexOf(u8, line, box) != null and std.mem.indexOf(u8, line, opposite) == null) return;
+            }
+        }
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.SettingsProxyStateDeadline;
+}
+
+/// Replace the child search query instead of assuming an unfiltered window.
+/// Clearing and typing share one input batch: an already empty query still
+/// needs no separate frame of its own.
+fn settingsProxySearch(d: *Driver, a: std.mem.Allocator, query: []const u8) !void {
+    try settingsKey(d, try std.fmt.allocPrint(a, "\x15{s}", .{query}));
+}
+
+// Proxy allowlist: read-only without root.proxy, otherwise one acknowledged
+// per-row save that keeps the submenu open. Every write needs its own fresh
+// complete frame; the same input batch may not toggle twice.
+fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: []const u8) !void {
+    const a = init.arena.allocator();
+    const configured = std.mem.eql(u8, mode, "settings-proxy-configured");
+    try check(configured or std.mem.eql(u8, mode, "settings-proxy-unconfigured"));
+    try d.waitIdle(0);
+    // Unsubmitted management drafts stay ordinary editable text: the exact
+    // draft is visible in the composer, no hidden-arguments placeholder is
+    // substituted, and nothing runs because Enter is never sent.
+    for ([_][]const u8{ "/attach ", "/cd /tmp/owned path" }) |draft| {
+        const visible = std.mem.trimEnd(u8, draft, " \t\r\n");
+        try settingsKey(d, draft);
+        try decisionModelScreen(d, a, &.{visible}, &.{"command arguments hidden"});
+        const view = try d.screen();
+        const composer = &view.grid[view.row];
+        try check(std.mem.indexOf(u8, composer, visible) != null);
+        try check(std.mem.indexOf(u8, composer, "command arguments hidden") == null);
+        try settingsKey(d, "\x15");
+    }
+    try settingsKey(d, "/settings\r");
+    // A batched command plus Enter may be processed in one read; require the
+    // replayed Settings root before sending navigation keys.
+    try decisionModelScreen(d, a, &.{ "Low-price input", "Decision model" }, &.{});
+    try settingsValueSelect(d, a, "Proxy models");
+    try decisionModelScreen(d, a, &.{ "> Proxy models", "Low-price input" }, &.{});
+    try settingsKey(d, "\r");
+    if (configured) {
+        // The pre-existing allowlist entry stays checked on open.
+        try settingsProxyState(d, a, "zen/fixture-zen/model-x", true);
+        try settingsProxyGate(d, a, project, "opened");
+        // A declared alias without a resolvable local credential is not a
+        // candidate: filtering to it offers no saveable row and Enter is inert.
+        try settingsProxySearch(d, a, "ghost/Case-Model");
+        try decisionModelScreen(d, a, &.{"No matching models"}, &.{});
+        try d.send("\r");
+        try d.quiet(40);
+        try decisionModelScreen(d, a, &.{"No matching models"}, &.{"[x]"});
+        try settingsProxyGate(d, a, project, "unlogged");
+        // One batch with two Enters toggles exactly once and stays in the menu.
+        try settingsProxySearch(d, a, "native/family/native-review");
+        try settingsProxyState(d, a, "native/family/native-review", false);
+        try settingsKey(d, "\r\r");
+        try settingsProxyState(d, a, "native/family/native-review", true);
+        try settingsProxyGate(d, a, project, "native-added");
+        // Second literal-key model: raw ID keeps its inner slash and upper case.
+        try settingsProxySearch(d, a, "go/Repo/Model-X");
+        try settingsProxyState(d, a, "go/Repo/Model-X", false);
+        try settingsKey(d, "\r");
+        try settingsProxyState(d, a, "go/Repo/Model-X", true);
+        try settingsProxyGate(d, a, project, "added");
+        // Left returns to the root menu with index 8 still selected.
+        try settingsKey(d, "\x1b[D");
+        try decisionModelScreen(d, a, &.{ "> Proxy models", "Low-price input" }, &.{"Search> "});
+        try settingsProxyGate(d, a, project, "root-return");
+        try settingsKey(d, "\r");
+        // A full reopen does not keep all three targets inside the bounded
+        // window, so each membership proof starts from its own search query.
+        try settingsProxySearch(d, a, "zen/fixture-zen/model-x");
+        try settingsProxyState(d, a, "zen/fixture-zen/model-x", true);
+        try settingsProxySearch(d, a, "native/family/native-review");
+        try settingsProxyState(d, a, "native/family/native-review", true);
+        try settingsProxySearch(d, a, "go/Repo/Model-X");
+        try settingsProxyState(d, a, "go/Repo/Model-X", true);
+        try settingsProxyGate(d, a, project, "reopened");
+        // Uncheck one row; the preserved entry and the other addition stay.
+        try settingsProxySearch(d, a, "go/Repo/Model-X");
+        try settingsProxyState(d, a, "go/Repo/Model-X", true);
+        try settingsKey(d, "\r");
+        try settingsProxyState(d, a, "go/Repo/Model-X", false);
+        try settingsProxySearch(d, a, "native/family/native-review");
+        try settingsProxyState(d, a, "native/family/native-review", true);
+        try settingsProxySearch(d, a, "zen/fixture-zen/model-x");
+        try settingsProxyState(d, a, "zen/fixture-zen/model-x", true);
+        try settingsProxyGate(d, a, project, "removed");
+        try settingsKey(d, "\x1b");
+        try decisionModelScreen(d, a, &.{ "> Proxy models", "Low-price input" }, &.{});
+        try settingsKey(d, "\r");
+        // Same bounded window after reopen: search each target before proving
+        // its checked state from a complete frame.
+        try settingsProxySearch(d, a, "native/family/native-review");
+        try settingsProxyState(d, a, "native/family/native-review", true);
+        try settingsProxySearch(d, a, "go/Repo/Model-X");
+        try settingsProxyState(d, a, "go/Repo/Model-X", false);
+        try settingsProxySearch(d, a, "zen/fixture-zen/model-x");
+        try settingsProxyState(d, a, "zen/fixture-zen/model-x", true);
+        try settingsProxyGate(d, a, project, "persisted");
+    } else {
+        // Opening without root.proxy shows the fixed notice and disabled rows.
+        try decisionModelScreen(d, a, &.{ "Proxy host/port not configured; saving is disabled", "[ ]" }, &.{"[x]"});
+        try settingsProxyGate(d, a, project, "opened");
+        // Enter on any candidate is refused; no address is guessed or written.
+        try d.send("\r");
+        try d.quiet(50);
+        try settingsProxyGate(d, a, project, "unconfigured");
+    }
+    // Both branches end inside the picker: the first Escape returns to the
+    // Settings root and the second closes Settings. Each phase needs its own
+    // acknowledged screen; one batch may not consume both presses.
+    try settingsKey(d, "\x1b");
+    try decisionModelScreen(d, a, &.{ "> Proxy models", "Low-price input" }, &.{"Search> "});
+    const start = d.used;
+    try d.send("\x1b");
+    try d.waitIdle(start);
+    const closed = try d.screen();
+    try check(!closed.visible("Low-price input") and !closed.visible("Search> "));
+}
+
 fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8) !void {
     const a = init.arena.allocator();
     try d.waitIdle(0);
@@ -2211,6 +2377,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\"written_bytes\"") == null);
     } else if (std.mem.startsWith(u8, mode, "tool-preview-")) {
         try toolPreview(&d, init, mode, project);
+    } else if (std.mem.startsWith(u8, mode, "settings-proxy-")) {
+        try settingsProxy(&d, init, mode, project);
     } else if (std.mem.eql(u8, mode, "settings-values")) {
         try settingsValuesJourney(&d, init, project);
     } else if (std.mem.eql(u8, mode, "settings-image-model")) {

@@ -55,14 +55,14 @@ pub const Client = struct {
         return self;
     }
 
-    /// Fail-stop: a poisoned/unreaped curl owner must never be discarded. A void
+    /// Fail-stop: an unreaped curl child must never be discarded. A void
     /// destructor cannot transfer retryable ownership, so terminate before freeing
     /// its config/allocator. This mirrors the application's fail-stop shutdown.
     pub fn deinit(self: *Client) void {
-        if (self.transport) |*transport| {
-            transport.deinit();
-            if (transport.proxy_http) |proxy| if (proxy.poisoned or proxy.unreaped_pid != null) @panic("memory transport cleanup failed");
-        }
+        // Drain the pool, close the proxy transport and free the key in one place:
+        // a clean close legitimately marks the curl owner poisoned, so only an
+        // actual unreaped child is fatal here.
+        if (self.transport) |*transport| transport.cleanupForClose() catch @panic("memory transport cleanup failed");
         const owned = self.wiping.allocator();
         if (self.key) |key| owned.free(key);
         cfg.release(&self.source);
@@ -376,6 +376,21 @@ test "memory client frozen wire limits are independent of decoded JSON and prese
 test "memory client zero startup owns frozen config key and independent route OOM" {
     try creationCase(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, creationCase, .{});
+}
+test "memory client unrequested proxy transport closes cleanly without a child" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("SYNTHETIC_MEMORY_KEY", "own-key");
+    var config = testConfig();
+    const models = [_][]const u8{"primary/primary/model"};
+    config.proxy = .{ .address = "proxy.invalid", .port = 8888, .models = &models };
+    const client = try Client.create(a, std.testing.io, config, &env);
+    defer client.deinit();
+    try std.testing.expectEqual(@as(u64, 0), client.calls);
+    try std.testing.expect(client.transport != null);
+    const proxy = if (client.transport) |*transport| if (transport.proxy_http) |*value| value else return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+    try std.testing.expect(proxy.unreaped_pid == null and !proxy.poisoned);
 }
 test "memory client fake normal request preserves usage cancellation no tools no partial batch" {
     const a = std.testing.allocator;

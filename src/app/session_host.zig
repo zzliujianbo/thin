@@ -794,6 +794,7 @@ pub const SessionHost = struct {
             .setting => self.handleSetting(a, request, connection_id),
             .decision_model => self.handleDecisionModel(a, request, connection_id),
             .image_model => self.handleImageModel(a, request, connection_id),
+            .proxy_model => self.handleProxyModel(a, request, connection_id),
             .refresh_models => self.handleRefresh(a, request, connection_id),
             .poll_metadata => self.handlePollMetadata(a, request, connection_id),
             .close => self.handleClose(a, request, connection_id),
@@ -1302,6 +1303,10 @@ pub const SessionHost = struct {
         try out.field("low_price_input_enabled", state.low_price_input_enabled);
         try out.field("image_enabled", state.image_enabled);
         try out.field("image_model", state.image_model);
+        // Proxy allowlist projection: configured flag plus the exact bounded
+        // model ids. Never an endpoint, a port or a credential.
+        try out.field("proxy_configured", state.proxy_configured);
+        try encodeProxyModels(&out, state.proxy_models);
         try out.field("memory_auto", state.memory_auto);
         try out.field("memory_notice", state.memory_notice);
         try out.field("decision_enabled", state.decision_enabled);
@@ -1382,6 +1387,17 @@ pub const SessionHost = struct {
         var flag_buffer: [64]u8 = undefined;
         const flag = try std.fmt.bufPrint(&flag_buffer, "{s}_truncated", .{name});
         try out.field(flag, models.len > limit);
+    }
+
+    /// Bounded proxy allowlist projection: model names only. The list is a
+    /// public setting, so a truncated tail is reported instead of silently
+    /// shortened; an empty list stays a real JSON array.
+    fn encodeProxyModels(out: *protocol.Out, names: []const []const u8) !void {
+        const limit: usize = @min(names.len, max_proxy_models);
+        try out.beginArray("proxy_models");
+        for (names[0..limit]) |name| try out.arrayValue(name);
+        try out.endArray();
+        try out.field("proxy_models_truncated", names.len > limit);
     }
 
     fn handleModelSelect(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
@@ -1498,6 +1514,23 @@ pub const SessionHost = struct {
         return replyFrame(&out);
     }
 
+    /// Proxy allowlist mutation. The wire carries only one exact
+    /// provider/raw-model id and an explicit enable flag; the owner callback
+    /// decides whether an endpoint may exist. Nothing here creates one.
+    fn handleProxyModel(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
+        self.requireIdleControl(request, connection_id) catch |err| return errorReply(a, request.id, err);
+        const name = request.stringField("name", protocol.max_name) catch |err| return errorReply(a, request.id, err);
+        if (name.len == 0) return errorReply(a, request.id, error.InvalidInput);
+        const enabled = request.requiredBool("enabled") catch |err| return errorReply(a, request.id, err);
+        const callback = self.connection.proxy_fn orelse return errorReply(a, request.id, error.Unsupported);
+        callback(self.connection.context, name, enabled) catch |err| return errorReply(a, request.id, err);
+        self.refreshConnection();
+        var out = protocol.Out.init(a);
+        defer out.deinit();
+        try out.ok(request.id);
+        return replyFrame(&out);
+    }
+
     fn handleRefresh(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
         self.requireIdleControl(request, connection_id) catch |err| return errorReply(a, request.id, err);
         const callback = self.connection.refresh_models_fn orelse return errorReply(a, request.id, error.Unsupported);
@@ -1586,6 +1619,8 @@ fn providerFromSlug(slug: []const u8) ?providers.Id {
 }
 
 const allowed = [_][]const u8{ "deepseek", "opencode-zen", "opencode-go" };
+/// Publication bound for the proxy allowlist, mirroring the model catalogs.
+const max_proxy_models: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Isolated lifecycle test (temp HOME/project, no network, no real config)
@@ -2562,6 +2597,227 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
+    }
+}
+
+/// Records every proxy mutation that actually reached the owner callback. The
+/// name is copied into owned storage because the request document dies first.
+const ProxySink = struct {
+    calls: usize = 0,
+    name_len: usize = 0,
+    name: [128]u8 = undefined,
+    last_enabled: bool = false,
+
+    fn set(context: *anyopaque, name: []const u8, enabled: bool) anyerror!void {
+        const self: *ProxySink = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        self.name_len = @min(name.len, self.name.len);
+        @memcpy(self.name[0..self.name_len], name[0..self.name_len]);
+        self.last_enabled = enabled;
+    }
+
+    fn recorded(self: *const ProxySink) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
+/// Owner-side projection wrapper for the public proxy settings only.
+const FakeProxyView = struct {
+    prev_fn: *const fn (*anyopaque) tui.Connection.State,
+    prev_context: *anyopaque,
+    configured: bool,
+    names: []const []const u8,
+
+    fn current(context: *anyopaque) tui.Connection.State {
+        const self: *FakeProxyView = @ptrCast(@alignCast(context));
+        var state = self.prev_fn(self.prev_context);
+        state.proxy_configured = self.configured;
+        state.proxy_models = self.names;
+        return state;
+    }
+};
+
+test "proxy mutations require the live epoch and one exact model id" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const project_len = try tmp.dir.realPath(io, &path_buffer);
+    const project = path_buffer[0..project_len];
+    var environ = std.process.Environ.Map.init(a);
+    defer environ.deinit();
+    try environ.put("HOME", project);
+
+    const id = try ids.generate(io);
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    defer host.deinit();
+
+    {
+        const attached = try dispatchJson(host, a, "{\"v\":1,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+        defer a.free(attached);
+        try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
+    }
+
+    var sink = ProxySink{};
+
+    // The current epoch on the controller socket reaches the owner with the
+    // complete provider/raw-model id and the explicit enable flag. A successful
+    // mutation refreshes the connection, so the sink is reinstalled per call.
+    {
+        host.connection.proxy_fn = ProxySink.set;
+        host.connection.context = &sink;
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":2,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"opencode-go/deepseek-v3\",\"enabled\":true}", 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
+        try std.testing.expectEqual(@as(usize, 1), sink.calls);
+        try std.testing.expectEqualStrings("opencode-go/deepseek-v3", sink.recorded());
+        try std.testing.expect(sink.last_enabled);
+    }
+    // Disabling the same entry is a real mutation, not a no-op inference.
+    {
+        host.connection.proxy_fn = ProxySink.set;
+        host.connection.context = &sink;
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":3,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"opencode-go/deepseek-v3\",\"enabled\":false}", 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
+        try std.testing.expectEqual(@as(usize, 2), sink.calls);
+        try std.testing.expect(!sink.last_enabled);
+    }
+    // Every later refusal keeps the owner callback untouched.
+    host.connection.proxy_fn = ProxySink.set;
+    host.connection.context = &sink;
+    // A stale epoch and a foreign socket both fail with stale_control; a
+    // missing epoch is a bad request. None of them reaches the callback.
+    {
+        const stale = try dispatchJson(host, a, "{\"v\":1,\"id\":4,\"op\":\"proxy_model\",\"epoch\":9,\"name\":\"p/m\",\"enabled\":true}", 7);
+        defer a.free(stale);
+        try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
+    }
+    {
+        const foreign = try dispatchJson(host, a, "{\"v\":1,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 8);
+        defer a.free(foreign);
+        try std.testing.expect(std.mem.indexOf(u8, foreign, "stale_control") != null);
+    }
+    {
+        const bare = try dispatchJson(host, a, "{\"v\":1,\"id\":6,\"op\":\"proxy_model\",\"name\":\"p/m\",\"enabled\":true}", 7);
+        defer a.free(bare);
+        try std.testing.expect(std.mem.indexOf(u8, bare, "\"ok\":false") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), sink.calls);
+    // Loose parameter shapes are rejected instead of defaulted.
+    for ([_][]const u8{
+        "{\"v\":1,\"id\":7,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}",
+        "{\"v\":1,\"id\":8,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}",
+        "{\"v\":1,\"id\":9,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"\",\"enabled\":true}",
+        "{\"v\":1,\"id\":10,\"op\":\"proxy_model\",\"epoch\":1,\"enabled\":true}",
+    }) |json| {
+        const frame = try dispatchJson(host, a, json, 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
+        try std.testing.expectEqual(@as(usize, 2), sink.calls);
+    }
+    // A busy owner refuses before the callback runs.
+    {
+        host.reset_failed = error.ResetFailed;
+        defer host.reset_failed = null;
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":11,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "busy") != null);
+        try std.testing.expectEqual(@as(usize, 2), sink.calls);
+    }
+    // Without an owner callback the op is unsupported, never silently accepted.
+    {
+        host.connection.proxy_fn = null;
+        defer host.connection.proxy_fn = ProxySink.set;
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":12,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "unsupported") != null);
+        try std.testing.expectEqual(@as(usize, 2), sink.calls);
+    }
+}
+
+test "settings reply publishes the proxy allowlist without addresses or secrets" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const project_len = try tmp.dir.realPath(io, &path_buffer);
+    const project = path_buffer[0..project_len];
+    var environ = std.process.Environ.Map.init(a);
+    defer environ.deinit();
+    try environ.put("HOME", project);
+
+    const id = try ids.generate(io);
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    defer host.deinit();
+
+    const names = [_][]const u8{ "opencode-go/deepseek-v3", "deepseek/deepseek-chat" };
+    var fake = FakeProxyView{
+        .prev_fn = host.connection.current_fn,
+        .prev_context = host.connection.context,
+        .configured = true,
+        .names = &names,
+    };
+    {
+        host.connection.current_fn = FakeProxyView.current;
+        host.connection.context = &fake;
+        defer {
+            host.connection.current_fn = fake.prev_fn;
+            host.connection.context = fake.prev_context;
+        }
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":20,\"op\":\"settings\"}", 7);
+        defer a.free(frame);
+        var doc = try parseWholeReply(a, frame);
+        defer doc.deinit();
+        const root = doc.value.object;
+        try std.testing.expectEqual(true, root.get("proxy_configured").?.bool);
+        const list = root.get("proxy_models").?.array;
+        try std.testing.expectEqual(names.len, list.items.len);
+        try std.testing.expectEqualStrings(names[0], list.items[0].string);
+        try std.testing.expectEqualStrings(names[1], list.items[1].string);
+        try std.testing.expectEqual(false, root.get("proxy_models_truncated").?.bool);
+        // A model id is projected verbatim: no endpoint, host or credential.
+        for (list.items) |entry| {
+            try std.testing.expect(std.mem.indexOf(u8, entry.string, "://") == null);
+            try std.testing.expect(std.mem.indexOf(u8, entry.string, "@") == null);
+        }
+        for ([_][]const u8{ "\"key\"", "api_key", "credential", "sk-" }) |needle| {
+            try std.testing.expect(std.mem.indexOf(u8, frame, needle) == null);
+        }
+    }
+
+    // The catalog bound is reported, not silently truncated.
+    var many: [257][]const u8 = undefined;
+    for (&many) |*entry| entry.* = "p/m";
+    fake.names = &many;
+    fake.configured = true;
+    {
+        host.connection.current_fn = FakeProxyView.current;
+        host.connection.context = &fake;
+        defer {
+            host.connection.current_fn = fake.prev_fn;
+            host.connection.context = fake.prev_context;
+        }
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":21,\"op\":\"settings\"}", 7);
+        defer a.free(frame);
+        var doc = try parseWholeReply(a, frame);
+        defer doc.deinit();
+        const root = doc.value.object;
+        try std.testing.expectEqual(@as(usize, max_proxy_models), root.get("proxy_models").?.array.items.len);
+        try std.testing.expectEqual(true, root.get("proxy_models_truncated").?.bool);
+    }
+
+    // The real projection stays unconfigured with a real empty array.
+    {
+        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":22,\"op\":\"settings\"}", 7);
+        defer a.free(frame);
+        var doc = try parseWholeReply(a, frame);
+        defer doc.deinit();
+        const root = doc.value.object;
+        try std.testing.expectEqual(false, root.get("proxy_configured").?.bool);
+        try std.testing.expectEqual(@as(usize, 0), root.get("proxy_models").?.array.items.len);
     }
 }
 

@@ -377,6 +377,7 @@ const Supervisor = struct {
             .setting,
             .decision_model,
             .image_model,
+            .proxy_model,
             .refresh_models,
             .poll_metadata,
             => self.handleSetup(request, active),
@@ -963,7 +964,49 @@ test "supervisor keeps one private setup host per socket without registering a s
     try std.testing.expect(supervisor.slots[0].?.setup.?.host != setup_host);
     try std.testing.expectEqual(@as(usize, 0), workers.list.items.len);
 
-    // 6. EOF destroys the slot and its setup host; nothing was ever listed.
+    // 6. Proxy allowlist mutations route to the private setup host, not to a
+    //    worker. The owner refuses without a configured proxy endpoint, but the
+    //    control router no longer answers `unsupported`.
+    {
+        const body = try std.fmt.allocPrint(a, ",\"name\":\"\",\"enabled\":true,\"project\":\"{s}\"", .{elsewhere});
+        defer a.free(body);
+        const frame = try setupOpFrame(a, 6, "proxy_model", body);
+        defer a.free(frame);
+        const reply = try controlRoundTrip(&supervisor, &client, frame);
+        defer a.free(reply);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "\"ok\":false") != null);
+        // The host already validates the id, so routing is proven without
+        // depending on the owner's proxy-configuration refusal code.
+        try std.testing.expect(std.mem.indexOf(u8, reply, "invalid_input") != null);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "unsupported") == null);
+    }
+    {
+        const body = try std.fmt.allocPrint(a, ",\"name\":\"p/m\",\"enabled\":true,\"project\":\"{s}\"", .{elsewhere});
+        defer a.free(body);
+        const frame = try setupOpFrame(a, 7, "proxy_model", body);
+        defer a.free(frame);
+        const reply = try controlRoundTrip(&supervisor, &client, frame);
+        defer a.free(reply);
+        // Any host answer proves routing; the exact refusal stays the owner's
+        // proxy-configuration decision, not this test's assumption.
+        try std.testing.expect(std.mem.indexOf(u8, reply, "\"ok\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "unsupported") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), supervisor.created.items.len);
+    try std.testing.expectEqual(@as(usize, 0), workers.list.items.len);
+    // 7. The public settings projection carries the proxy fields.
+    {
+        const body = try std.fmt.allocPrint(a, ",\"project\":\"{s}\"", .{elsewhere});
+        defer a.free(body);
+        const frame = try setupOpFrame(a, 8, "settings", body);
+        defer a.free(frame);
+        const reply = try controlRoundTrip(&supervisor, &client, frame);
+        defer a.free(reply);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "\"proxy_configured\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "\"proxy_models\":[]") != null);
+    }
+
+    // 8. EOF destroys the slot and its setup host; nothing was ever listed.
     client.close();
     supervisor.serveTick();
     try std.testing.expect(supervisor.slots[0] == null);

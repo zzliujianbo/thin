@@ -312,7 +312,7 @@ pub const App = struct {
         return client.service().inspect(a, input, cancel);
     }
 
-    pub const SettingsRefresh = enum { none, decision, image_model };
+    pub const SettingsRefresh = enum { none, decision, image_model, proxy_models };
     pub const SettingsReplacement = struct {
         config: ?std.json.Parsed(cfg.Config) = null,
         replace_decision: bool,
@@ -362,11 +362,15 @@ pub const App = struct {
         }
         try std.json.Stringify.value(self.config.value.decision, .{}, &before.writer);
         try std.json.Stringify.value(declaration.decision, .{}, &after.writer);
+        const proxy_refresh = refresh == .proxy_models;
         var result: SettingsReplacement = .{
-            .replace_decision = refresh == .decision or
+            // An explicit proxy edit replaces both auxiliary owners so their
+            // next request uses the new allowlist. The primary client/config
+            // stay frozen; result.config keeps the active proxy below.
+            .replace_decision = refresh == .decision or proxy_refresh or
                 self.config.value.limits.request_timeout_ms != declaration.limits.request_timeout_ms or
                 !std.mem.eql(u8, before.written(), after.written()),
-            .replace_image = refresh == .image_model or
+            .replace_image = refresh == .image_model or proxy_refresh or
                 self.config.value.limits.request_timeout_ms != declaration.limits.request_timeout_ms or
                 !optionalStringEqual(self.config.value.image.model, declaration.image.model),
             .changes_tools = self.config.value.decisionActive() != decision_enabled or
@@ -377,7 +381,14 @@ pub const App = struct {
         result.replace_memory = result.replace_decision or self.config.value.memory.auto != declaration.memory.auto or
             !std.meta.eql(self.config.value.limits, declaration.limits);
         if (result.replace_memory) {
-            result.memory_coordinator = try MemoryCoordinator.create(self.allocator, self.root.io, &self.root, result.config.?.value, environ);
+            // The coordinator owns independent extractor/reviewer clients, so it
+            // follows the latest auxiliary allowlist even when the active config
+            // keep its frozen proxy. This local borrow is valid only for the call;
+            // create() clones it, and later ordinary rebuilds reuse the same
+            // declaration list instead of reverting to the frozen route.
+            var memory_config = result.config.?.value;
+            memory_config.proxy = declaration.proxy;
+            result.memory_coordinator = try MemoryCoordinator.create(self.allocator, self.root.io, &self.root, memory_config, environ);
         }
         if (result.replace_decision) {
             // Login may have replaced the global declaration since this chat's
