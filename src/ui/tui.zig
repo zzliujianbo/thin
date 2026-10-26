@@ -1263,14 +1263,27 @@ const Ui = struct {
         }
         if (self.commandMenuVisible()) return "";
         var notice: []const u8 = "";
-        var model_failed = false;
+        var terminal_issue = false;
         if (self.last_terminal) |result| {
             if (result.status != .success and (result.status != .paused or result.model_failure == .output_limit or r.policyPause(result.detail))) {
                 var formatted: std.Io.Writer.Allocating = .init(a);
                 defer formatted.deinit();
-                try shared.failure.write(&formatted.writer, self.notice, result.detail, result.model_failure, result.http_status);
+                // The notice can have been reset by a menu or reconnect. Task
+                // status owns its label; never render "Ready: <failure>".
+                const label = switch (result.status) {
+                    .paused => "Paused",
+                    .failed => "Failed",
+                    .canceled => "Canceled; prior side effects remain",
+                    .success => unreachable,
+                };
+                if (result.status == .canceled and result.detail != null and result.detail.? == error.Canceled)
+                    try formatted.writer.writeAll(label)
+                else if (result.detail != null and result.detail.? == error.DecisionUnavailable)
+                    try shared.failure.writeDecision(&formatted.writer, result.decision_failure)
+                else
+                    try shared.failure.write(&formatted.writer, label, result.detail, result.model_failure, result.http_status);
                 notice = try a.dupe(u8, formatted.written());
-                model_failed = result.status == .failed and result.model_failure != null;
+                terminal_issue = true;
             }
         }
         if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
@@ -1281,19 +1294,31 @@ const Ui = struct {
         };
         if (state.settings_error) |err| {
             notice = try std.fmt.allocPrint(a, "{s}{s}SETTINGS FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
-        } else if (!model_failed) {
+        } else if (!terminal_issue) {
             if (state.settings_notice) |warning| {
                 if (!std.mem.eql(u8, notice, warning)) notice = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ notice, if (notice.len != 0) " | " else "", warning });
             }
         }
         if (state.log_error) |err| return std.fmt.allocPrint(a, "{s}{s}REC FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
-        if (!state.logging_enabled) return std.fmt.allocPrint(a, "{s}{s}recording off", .{ notice, if (notice.len != 0) " | " else "" });
+        if (!state.logging_enabled and !terminal_issue) return std.fmt.allocPrint(a, "{s}{s}recording off", .{ notice, if (notice.len != 0) " | " else "" });
         // Advisory worker state never replaces failures, approvals or queued input.
         if (notice.len == 0 and self.permission == null and !self.stop_open and self.queueSnapshot().newest_id == null and !self.queueSnapshot().paused) {
             if (self.metadata_toast) |toast| return toast.text;
             if (state.memory_notice) |memory_notice| if (self.presentMemoryNotice(memory_notice)) |visible| return visible;
         }
         return notice;
+    }
+
+    fn footerHint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
+        const base = try self.hint(a, state);
+        const queue = self.queueSnapshot();
+        // A paused empty Inbox has nothing to resume. The task failure is the
+        // actionable issue; do not invent a second warning for S:0/F:0.
+        if (queue.steering == 0 and queue.follow_up == 0) return base;
+        return std.fmt.allocPrint(a, "{s}{s}S:{d} F:{d} {s}", .{
+            base,                                                      if (base.len != 0) " | " else "", queue.steering, queue.follow_up,
+            if (queue.paused) "paused (/queue resume)" else "pending",
+        });
     }
 
     /// 正文的首个非空增量替换三行思考；迟到的推理不再抢回正文区域。
@@ -3869,12 +3894,7 @@ const Ui = struct {
         const approval_lines = if (self.permission) |permission| try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false }) else empty_rendered;
         // State is an app-prepared immutable value; never dereference Runtime.
         const queue_snapshot = self.queueSnapshot();
-        const base_hint = try self.hint(a, state);
-        const queue_pending = queue_snapshot.steering + queue_snapshot.follow_up != 0;
-        const hint_line = if (queue_pending or queue_snapshot.paused)
-            try std.fmt.allocPrint(a, "S:{d} F:{d} {s}{s}{s}", .{ queue_snapshot.steering, queue_snapshot.follow_up, if (queue_snapshot.paused) "paused (/queue resume)" else "pending", if (base_hint.len != 0) " | " else "", base_hint })
-        else
-            base_hint;
+        const hint_line = try self.footerHint(a, state);
         // Normal output keeps its empty gap; acknowledged shell-like idle
         // lines instead keep a single-row composer without extra redraw scroll.
         const hint_hash = std.hash.Wyhash.hash(0, hint_line);
@@ -6849,10 +6869,55 @@ test "input and decision policy pauses explain their cause rather than round lim
         ui.last_terminal = .{ .status = .paused, .detail = detail };
         ui.notice = "Paused";
         const line = try ui.hint(arena.allocator(), ui.connection.current());
-        try std.testing.expect(std.mem.find(u8, line, @errorName(detail)) != null);
+        try std.testing.expect(std.mem.find(u8, line, if (detail == error.DecisionUnavailable) "decision review failed" else @errorName(detail)) != null);
         try std.testing.expect(std.mem.find(u8, line, "round limit") == null);
         try std.testing.expect(std.mem.find(u8, line, "HTTP") == null);
     }
+}
+
+test "decision pause wins over stale Ready thinking warnings and empty queue pause" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var state = ui.connection.current();
+    state.settings_notice = "Saved thinking level not applied: model capabilities unknown";
+    state.pending_default_effort = .medium;
+    state.logging_enabled = false;
+    ui.notice = "Ready";
+    ui.last_terminal = .{ .status = .paused, .detail = error.DecisionUnavailable };
+    ui.inbox.pause();
+    const expected = "Paused: decision review failed; operation not executed";
+    try std.testing.expectEqualStrings(expected, try ui.footerHint(arena.allocator(), state));
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, expected) != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "S:0 F:0") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/queue resume") == null);
+    ui.finishFrame();
+    // Real queued input remains visible, but never ahead of the failure.
+    _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "retained queued input");
+    const queued = try ui.footerHint(arena.allocator(), state);
+    try std.testing.expect(std.mem.startsWith(u8, queued, expected));
+    try std.testing.expect(std.mem.find(u8, queued, "S:0 F:1 paused (/queue resume)") != null);
+    try std.testing.expect(std.mem.find(u8, queued, "Saved thinking") == null);
+    // Real storage failures are not hidden by the new priority policy.
+    state.settings_error = error.TestSettingsFailure;
+    state.log_error = error.TestLogFailure;
+    const storage = try ui.footerHint(arena.allocator(), state);
+    try std.testing.expect(std.mem.find(u8, storage, "SETTINGS FAILED") != null);
+    try std.testing.expect(std.mem.find(u8, storage, "REC FAILED") != null);
+    state.settings_error = null;
+    state.log_error = null;
+    state.logging_enabled = true;
+    // Cancellation must retain the meaningful side-effect warning even when a
+    // later redraw/menu has reset the transient notice to Ready.
+    ui.last_terminal = .{ .status = .canceled, .detail = error.Canceled };
+    try std.testing.expectEqualStrings("Canceled; prior side effects remain", try ui.hint(arena.allocator(), state));
+    ui.last_terminal = null;
+    try std.testing.expect(std.mem.find(u8, try ui.hint(arena.allocator(), state), "Saved thinking") != null);
 }
 
 test "read command errors include a safe reason after error and never display raw results" {
@@ -11339,6 +11404,45 @@ test "remote finished terminal is consumed from an idle local view without a fut
     // Idempotent: no terminal is left to consume on a later tick.
     try ui.finishReadyTask();
     try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
+}
+
+test "remote decision diagnostic survives terminal copies and empty paused queue stays hidden" {
+    var fake = FakeRemote{ .snapshot = .{
+        .available = true,
+        .attached = true,
+        .control_epoch = 12,
+        .queue_paused = true,
+    } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    var diagnostic: @import("../core/decision.zig").Diagnostic = .{
+        .stage = .http,
+        .backend = .systemone,
+        .operation = .command,
+        .http_status = 403,
+    };
+    diagnostic.setError(error.DecisionUnavailable);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 12, .{ .finished = (session_client.Terminal{
+        .status = .paused,
+        .failure = .decision_unavailable,
+        .decision_failure = diagnostic,
+    }).toRuntime() });
+    // Source reuse cannot mutate any queued diagnostic storage.
+    diagnostic.setError(error.UnrelatedLaterFailure);
+    try ui.pumpRemote();
+    try ui.finishReadyTask();
+    try std.testing.expectEqualStrings("DecisionUnavailable", ui.last_terminal.?.decision_failure.?.causeName());
+    ui.notice = "Ready";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const line = try ui.footerHint(arena.allocator(), ui.connection.current());
+    try std.testing.expectEqualStrings("Paused: decision review failed [HTTP 403]; operation not executed", line);
+    try std.testing.expect(ui.queueSnapshot().paused);
+    fake.snapshot.follow_up = 1;
+    try std.testing.expect(std.mem.find(u8, try ui.footerHint(arena.allocator(), ui.connection.current()), "/queue resume") != null);
 }
 
 test "remote owner still busy re-adopts the next task after the local view went idle" {

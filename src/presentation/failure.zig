@@ -5,6 +5,7 @@ const std = @import("std");
 const p = @import("../core/protocol.zig");
 
 pub fn write(writer: *std.Io.Writer, label: []const u8, detail: ?anyerror, kind: ?p.FailureKind, status: ?u16) !void {
+    if (detail) |err| if (err == error.DecisionUnavailable) return writeDecision(writer, null);
     try writer.writeAll(label);
     // Put the status before verbose details so narrow terminal rows retain it.
     if (status) |code| try writer.print(" [HTTP {d}]", .{code});
@@ -12,7 +13,6 @@ pub fn write(writer: *std.Io.Writer, label: []const u8, detail: ?anyerror, kind:
         try writer.print(": {s}", .{@errorName(err)});
         if (err == error.InputBudgetExceeded) try writer.writeAll("; estimated input budget reached; compact context or adjust input policy");
         if (err == error.InputBudgetSummaryFailed) try writer.writeAll("; summary failed; history kept, no further inference sent");
-        if (err == error.DecisionUnavailable) try writer.writeAll("; decision review unavailable; operation not executed, no further inference sent");
         if (err == error.UnknownInputPriceThreshold) try writer.writeAll("; low-price threshold unavailable; refresh metadata and reselect, or explicitly disable limits.low_price_input");
         if (err == error.UnknownModelOutputCapacity) try writer.writeAll("; Anthropic requires a verified model output capacity; refresh metadata and reselect the model");
     }
@@ -27,6 +27,20 @@ pub fn write(writer: *std.Io.Writer, label: []const u8, detail: ?anyerror, kind:
     }
 }
 
+/// Compact current-operation summary; detailed cause/stage stay in JSONL.
+/// A separate auxiliary status is never labelled as the primary model's HTTP.
+pub fn writeDecision(writer: *std.Io.Writer, diagnostic: ?@import("../core/decision.zig").Diagnostic) !void {
+    const stage = if (diagnostic) |value| value.stage else .review;
+    try writer.writeAll(switch (stage) {
+        .credentials => "Paused: decision credentials unavailable",
+        .transport => "Paused: decision connection failed",
+        .decode, .validate => "Paused: invalid decision response",
+        else => "Paused: decision review failed",
+    });
+    if (diagnostic) |value| if (value.http_status) |code| try writer.print(" [HTTP {d}]", .{code});
+    try writer.writeAll(if (stage == .credentials) "; check /settings" else "; operation not executed");
+}
+
 test "output limit pause explains shared output budget without implying network failure" {
     var buffer: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
@@ -34,6 +48,19 @@ test "output limit pause explains shared output budget without implying network 
     try std.testing.expectEqualStrings("Paused: OutputLimitReached / output_limit; provider output limit reached; split the response or lower reasoning effort", writer.buffered());
     try std.testing.expect(std.mem.find(u8, writer.buffered(), "HTTP") == null);
     try std.testing.expect(std.mem.find(u8, writer.buffered(), "ModelRequestFailed") == null);
+}
+
+test "decision summary stays concise and never borrows primary HTTP or error prose" {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try write(&writer, "Ready", error.DecisionUnavailable, .authentication, 401);
+    try std.testing.expectEqualStrings("Paused: decision review failed; operation not executed", writer.buffered());
+    var diagnostic: @import("../core/decision.zig").Diagnostic = .{ .stage = .http, .backend = .systemone, .http_status = 403 };
+    diagnostic.setError(error.DecisionUnavailable);
+    writer = std.Io.Writer.fixed(&buffer);
+    try writeDecision(&writer, diagnostic);
+    try std.testing.expectEqualStrings("Paused: decision review failed [HTTP 403]; operation not executed", writer.buffered());
+    try std.testing.expect(std.mem.find(u8, writer.buffered(), "DecisionUnavailable") == null);
 }
 
 test "failure diagnostics expose HTTP status early without provider text" {

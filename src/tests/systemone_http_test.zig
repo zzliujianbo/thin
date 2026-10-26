@@ -185,6 +185,23 @@ test "SystemOne owned failures never retry redirect or silently fallback" {
         try t.expect(client.last_usage.input_tokens == null and client.last_usage.output_tokens == null);
         if (std.mem.eql(u8, scenario, "forbidden")) try t.expectEqual(@as(?u16, 403), client.last_http_status);
         if (std.mem.eql(u8, scenario, "server-error")) try t.expectEqual(@as(?u16, 500), client.last_http_status);
+        if (is_cancel) {
+            try t.expect(client.last_failure == null);
+        } else {
+            const diagnostic = client.last_failure.?;
+            try t.expectEqual(decision.Diagnostic.Backend.systemone, diagnostic.backend);
+            try t.expectEqual(decision.Diagnostic.Operation.command, diagnostic.operation);
+            try t.expectEqual(client.last_http_status, diagnostic.http_status);
+            try t.expect(diagnostic.causeName().len != 0);
+            if (std.mem.startsWith(u8, scenario, "invalid") or std.mem.eql(u8, scenario, "missing-answers")) {
+                try t.expectEqual(decision.Diagnostic.Stage.decode, diagnostic.stage);
+                try t.expectEqualStrings("InvalidDecisionOutput", diagnostic.causeName());
+            }
+            if (std.mem.eql(u8, scenario, "forbidden") or std.mem.eql(u8, scenario, "server-error") or std.mem.eql(u8, scenario, "redirect")) {
+                try t.expectEqual(decision.Diagnostic.Stage.http, diagnostic.stage);
+            }
+            if (is_stall) try t.expectEqual(decision.Diagnostic.Stage.transport, diagnostic.stage);
+        }
     }
 }
 
@@ -206,6 +223,11 @@ test "SystemOne real curl CONNECT TLS CA and hostname verification" {
             } else |_| {}
             try independent(client, 1);
             try t.expect(client.last_http_status == null);
+            const diagnostic = client.last_failure.?;
+            try t.expectEqual(decision.Diagnostic.Stage.transport, diagnostic.stage);
+            // curl 60 means certificate verification failed; no body or stderr
+            // enters diagnostics and the owned fixture still proves zero HTTP.
+            try t.expectEqual(@as(?u8, 60), diagnostic.transport_exit_code);
         }
     }
 }

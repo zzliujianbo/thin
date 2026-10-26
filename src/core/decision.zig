@@ -13,12 +13,58 @@ pub const RefineItem = struct { id: []const u8, text: []const u8 };
 pub const Input = union(enum) { command: Command, memory_write: MemoryWrite, refine_outputs: []const RefineItem };
 pub const CommandResult = struct { timeout: Timeout, ask: bool };
 pub const Output = union(enum) { command: CommandResult, memory_write: bool, refine_outputs: []const RefineItem };
+/// Value-only diagnostics: no credentials, endpoints, model/provider prose,
+/// request input or response body. Error labels are local enum names only.
+pub const Diagnostic = struct {
+    pub const Stage = enum { review, resolve, credentials, encode, transport, http, decode, validate };
+    pub const Backend = enum { unknown, systemone, generative };
+    pub const Operation = std.meta.Tag(Input);
+    stage: Stage = .review,
+    backend: Backend = .unknown,
+    operation: Operation = .command,
+    cause: [96]u8 = @splat(0),
+    cause_len: u8 = 0,
+    http_status: ?u16 = null,
+    model_failure: ?p.FailureKind = null,
+    transport_exit_code: ?u8 = null,
+
+    pub fn setError(self: *Diagnostic, err: anyerror) void {
+        const name = @errorName(err);
+        const n = @min(name.len, self.cause.len);
+        self.cause = @splat(0);
+        @memcpy(self.cause[0..n], name[0..n]);
+        self.cause_len = @intCast(n);
+    }
+
+    /// Strict bounded wire label; never reconstruct a process-local anyerror.
+    pub fn setCause(self: *Diagnostic, name: []const u8) !void {
+        if (name.len == 0 or name.len > self.cause.len) return error.BadRequest;
+        for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.BadRequest;
+        self.cause = @splat(0);
+        @memcpy(self.cause[0..name.len], name);
+        self.cause_len = @intCast(name.len);
+    }
+
+    pub fn causeName(self: *const Diagnostic) []const u8 {
+        return self.cause[0..self.cause_len];
+    }
+};
+
 pub const Service = struct {
     context: *anyopaque,
     decide_fn: *const fn (*anyopaque, std.mem.Allocator, Input, *const p.Cancellation) anyerror!Output,
     /// Optional pure lifecycle guard; must never launch work. Lets an owner
     /// expose sticky cleanup failure even for a pre-canceled call.
     check_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    /// Read immediately after a failed review on its single owning thread.
+    diagnostic_fn: ?*const fn (*anyopaque) ?Diagnostic = null,
+
+    pub fn failureDiagnostic(self: Service, input: Input, err: anyerror) Diagnostic {
+        if (self.diagnostic_fn) |get| if (get(self.context)) |value| return value;
+        var value: Diagnostic = .{ .operation = input };
+        value.setError(err);
+        return value;
+    }
 
     pub fn decide(self: Service, a: std.mem.Allocator, input: Input, cancel: *const p.Cancellation) !Output {
         if (self.check_fn) |check| try check(self.context);

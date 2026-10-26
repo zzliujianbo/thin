@@ -26,6 +26,8 @@ pub const Client = struct {
     calls: u64 = 0,
     last_usage: p.Usage = .{},
     last_http_status: ?u16 = null,
+    diagnostic: policy.Diagnostic = .{},
+    last_failure: ?policy.Diagnostic = null,
 
     const Resolved = struct {
         config: std.json.Parsed(cfg.Config),
@@ -96,7 +98,7 @@ pub const Client = struct {
     }
 
     pub fn service(self: *Client) policy.Service {
-        return .{ .context = self, .decide_fn = decide, .check_fn = checkService };
+        return .{ .context = self, .decide_fn = decide, .check_fn = checkService, .diagnostic_fn = failureDiagnostic };
     }
 
     /// Narrow idempotent close for a retained child owner. Every mutable
@@ -223,7 +225,9 @@ pub const Client = struct {
         try cfg.validate(config.*);
         state.client = null;
         if (config.model.protocol != .systemone) {
-            const key = self.key orelse return error.DecisionUnavailable;
+            self.diagnostic.stage = .credentials;
+            const key = self.key orelse return error.ApiKeyNotFound;
+            self.diagnostic.stage = .resolve;
             state.client = try http.Client.initWithEnv(a, self.io, config, key, &self.transport_env);
         } else if (self.native == null) {
             // Metadata can identify the native protocol after creation. Prepare
@@ -247,16 +251,42 @@ pub const Client = struct {
         if (self.resolved) |ready| if (ready.client) |client| if (client.proxy_http) |transport| if (transport.poisoned) return error.CleanupFailed;
     }
 
+    fn failureDiagnostic(raw: *anyopaque) ?policy.Diagnostic {
+        const self: *Client = @ptrCast(@alignCast(raw));
+        return self.last_failure;
+    }
+
     fn decide(raw: *anyopaque, a: std.mem.Allocator, input: policy.Input, cancel: *const p.Cancellation) !policy.Output {
         const self: *Client = @ptrCast(@alignCast(raw));
         self.last_usage = .{};
         self.last_http_status = null;
+        self.last_failure = null;
+        self.diagnostic = .{ .stage = .resolve, .operation = input };
+        const output = self.decideInner(a, input, cancel) catch |err| {
+            if (err != error.Canceled) {
+                self.diagnostic.setError(err);
+                self.diagnostic.http_status = self.last_http_status;
+                if (self.diagnostic.stage == .transport) if (self.native) |native| {
+                    if (native.last_error) |cause| self.diagnostic.setError(cause);
+                    self.diagnostic.transport_exit_code = native.last_exit_code;
+                };
+                self.last_failure = self.diagnostic;
+            }
+            // Preserve public resolve errors while retaining their local cause.
+            // This path never retries a failed or uncertain review.
+            if (self.diagnostic.stage == .resolve or self.diagnostic.stage == .credentials)
+                return if (err == error.OutOfMemory or err == error.CleanupFailed or err == error.Canceled) err else error.DecisionUnavailable;
+            return err;
+        };
+        self.last_failure = null;
+        return output;
+    }
+
+    fn decideInner(self: *Client, a: std.mem.Allocator, input: policy.Input, cancel: *const p.Cancellation) !policy.Output {
         try self.checkCleanup();
         if (cancel.isRequested()) return error.Canceled;
-        const ready = self.resolve() catch |err| {
-            if (err == error.OutOfMemory) return err;
-            return error.DecisionUnavailable;
-        };
+        const ready = try self.resolve();
+        self.diagnostic.backend = if (ready.config.value.model.protocol == .systemone) .systemone else .generative;
         if (ready.config.value.model.protocol == .systemone)
             return self.callNative(a, ready.config.value, input, cancel);
         return self.call(a, ready.config.value, ready.client.?.model(), input, cancel);
@@ -268,7 +298,9 @@ pub const Client = struct {
         if (cancel.isRequested()) return error.Canceled;
         if (input == .refine_outputs and input.refine_outputs.len == 0)
             return .{ .refine_outputs = try output_allocator.alloc(policy.RefineItem, 0) };
-        const key = self.key orelse return error.DecisionUnavailable;
+        self.diagnostic.stage = .credentials;
+        const key = self.key orelse return error.ApiKeyNotFound;
+        self.diagnostic.stage = .encode;
         const declared = self.source.value.decision.?;
         // Native routing comes only from the independently resolved protocol;
         // SystemOne never borrows generative capabilities or the primary key.
@@ -279,9 +311,12 @@ pub const Client = struct {
         const endpoint = try std.fmt.allocPrint(a, "{s}/systemone", .{std.mem.trimEnd(u8, config.provider.base_url, "/")});
         if (cancel.isRequested()) return error.Canceled;
         self.calls +|= 1;
+        self.diagnostic.stage = .transport;
         const response = try transport.post(a, endpoint, key, payload, config.limits.request_timeout_ms, cancel);
         self.last_http_status = response.status;
+        self.diagnostic.stage = .http;
         if (response.status != 200) return error.DecisionUnavailable;
+        self.diagnostic.stage = .decode;
         const result = try systemone.parseResponse(output_allocator, input, response.body);
         self.last_usage = result.usage;
         if (cancel.isRequested()) {
@@ -296,6 +331,7 @@ pub const Client = struct {
         var scratch = std.heap.ArenaAllocator.init(output_allocator);
         defer scratch.deinit();
         const a = scratch.allocator();
+        self.diagnostic.stage = .encode;
         const body = try policy.encodeInput(a, input);
         const messages = [_]p.Message{try p.textMessage(a, .user, body)};
         const system = policy.instruction(input);
@@ -318,17 +354,21 @@ pub const Client = struct {
         try @import("../core/checkpoint.zig").validateRequestHistory(a, request);
         if (cancel.isRequested()) return error.Canceled;
         self.calls +|= 1;
+        self.diagnostic.stage = .transport;
         const result = try model.call(a, request, .{});
         if (cancel.isRequested()) return error.Canceled;
         const response = switch (result) {
             .failure => |failure| {
                 self.last_usage = failure.usage;
                 self.last_http_status = failure.http_status;
+                self.diagnostic.model_failure = failure.kind;
+                if (failure.http_status != null) self.diagnostic.stage = .http;
                 return if (failure.kind == .canceled) error.Canceled else error.DecisionUnavailable;
             },
             .success => |success| success,
         };
         self.last_usage = response.usage;
+        self.diagnostic.stage = .decode;
         if (response.finish != .stop or response.message.role != .assistant) return error.InvalidDecision;
         var text: std.ArrayList(u8) = .empty;
         for (response.message.blocks) |block| switch (block) {
@@ -542,8 +582,15 @@ test "SystemOne creation stays lazy without capabilities or key and never passes
     try std.testing.expectError(error.DecisionUnavailable, missing.service().decide(a, input, &cancel));
     try std.testing.expectEqual(p.Protocol.systemone, missing.resolved.?.config.value.model.protocol);
     try std.testing.expect(missing.resolved.?.client == null);
+    const diagnostic = missing.last_failure.?;
+    try std.testing.expectEqual(policy.Diagnostic.Stage.credentials, diagnostic.stage);
+    try std.testing.expectEqual(policy.Diagnostic.Backend.systemone, diagnostic.backend);
+    try std.testing.expectEqual(policy.Diagnostic.Operation.memory_write, diagnostic.operation);
+    try std.testing.expectEqualStrings("ApiKeyNotFound", diagnostic.causeName());
+    try std.testing.expect(diagnostic.http_status == null and diagnostic.transport_exit_code == null);
     const empty = try missing.service().decide(a, .{ .refine_outputs = &.{} }, &cancel);
     policy.freeOutput(a, empty);
+    try std.testing.expect(missing.last_failure == null);
     try std.testing.expectEqual(@as(u64, 0), missing.calls);
     try env.put("SYSTEMONE_KEY", "fake-explicit-native-only");
     try env.put("PRIVATE_OTHER_KEY", "fake-must-not-reach-curl");

@@ -855,6 +855,17 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("failure", if (terminal.detail) |detail| failureCode(detail) else "other");
             try out.field("model_failure", terminal.model_failure);
             try out.field("http", terminal.http_status);
+            if (terminal.decision_failure) |diagnostic| {
+                try out.beginObject("decision_failure");
+                try out.field("stage", diagnostic.stage);
+                try out.field("backend", diagnostic.backend);
+                try out.field("operation", diagnostic.operation);
+                try out.field("cause", diagnostic.causeName());
+                try out.field("http_status", diagnostic.http_status);
+                try out.field("model_failure", diagnostic.model_failure);
+                try out.field("transport_exit_code", diagnostic.transport_exit_code);
+                try out.endObject();
+            }
             try out.beginObject("usage");
             try out.field("normal_calls", terminal.usage.normal_calls);
             try out.field("summary_calls", terminal.usage.summary_calls);
@@ -1377,9 +1388,29 @@ fn decodeTerminalChecked(object: std.json.ObjectMap) !r.Terminal {
         .detail = detail,
         .model_failure = try optionalEnum(p.FailureKind, object, "model_failure"),
         .http_status = if (try optionalU64(object, "http")) |code| @intCast(@min(code, 999)) else null,
+        .decision_failure = if (try optionalObject(object, "decision_failure")) |value| try decodeDecisionDiagnostic(value) else null,
         .usage = usage,
         .context_snapshot = context,
     };
+}
+
+fn decodeDecisionDiagnostic(object: std.json.ObjectMap) !@import("../core/decision.zig").Diagnostic {
+    const Diagnostic = @import("../core/decision.zig").Diagnostic;
+    var value: Diagnostic = .{
+        .stage = try requireEnum(Diagnostic.Stage, object, "stage"),
+        .backend = try requireEnum(Diagnostic.Backend, object, "backend"),
+        .operation = try requireEnum(Diagnostic.Operation, object, "operation"),
+        .model_failure = try optionalEnum(p.FailureKind, object, "model_failure"),
+    };
+    try value.setCause(try requireText(object, "cause"));
+    if (try optionalU64(object, "http_status")) |status| {
+        if (status < 100 or status > 599) return error.BadRequest;
+        value.http_status = @intCast(status);
+    }
+    if (try optionalU64(object, "transport_exit_code")) |code| {
+        value.transport_exit_code = std.math.cast(u8, code) orelse return error.BadRequest;
+    }
+    return value;
 }
 
 /// Compatibility wrapper for callers that already validated the frame; the
@@ -1862,4 +1893,45 @@ test "private startup exit codes roundtrip and never widen" {
     // The private boot mapping never widens the public v1 IPC category: a
     // SelectionNotFound failure keeps its pre-existing internal classification.
     try std.testing.expectEqual(.internal, errorCode(error.SelectionNotFound));
+}
+
+test "decision diagnostic terminal roundtrip owns labels and rejects invalid wire values" {
+    const a = std.testing.allocator;
+    var diagnostic: @import("../core/decision.zig").Diagnostic = .{
+        .stage = .transport,
+        .backend = .systemone,
+        .operation = .command,
+        .transport_exit_code = 60,
+    };
+    diagnostic.setError(error.DecisionTransport);
+    const event: r.Event = .{ .finished = .{
+        .status = .paused,
+        .detail = error.DecisionUnavailable,
+        .decision_failure = diagnostic,
+    } };
+    try expectEventRoundTrip(a, event);
+    const encoded = try encodeEvent(a, event);
+    defer a.free(encoded);
+    var decoded = try decodeEvent(a, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("DecisionTransport", decoded.event.finished.decision_failure.?.causeName());
+    try std.testing.expectEqual(@as(?u8, 60), decoded.event.finished.decision_failure.?.transport_exit_code);
+    try std.testing.expect(decoded.event.finished.http_status == null);
+    var doc = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always });
+    defer doc.deinit();
+    const allocator = doc.arena.allocator();
+    const fields = &doc.value.object.getPtr("decision_failure").?.object;
+    try fields.put(allocator, "cause", .{ .string = "raw response\nsecret" });
+    try std.testing.expectError(error.BadRequest, decodeTerminalChecked(doc.value.object));
+    try fields.put(allocator, "cause", .{ .string = "DecisionTransport" });
+    try fields.put(allocator, "http_status", .{ .integer = 600 });
+    try std.testing.expectError(error.BadRequest, decodeTerminalChecked(doc.value.object));
+    try fields.put(allocator, "http_status", .{ .null = {} });
+    try fields.put(allocator, "transport_exit_code", .{ .integer = 256 });
+    try std.testing.expectError(error.BadRequest, decodeTerminalChecked(doc.value.object));
+    try fields.put(allocator, "transport_exit_code", .{ .integer = 60 });
+    try fields.put(allocator, "stage", .{ .string = "unknown-stage" });
+    try std.testing.expectError(error.BadRequest, decodeTerminalChecked(doc.value.object));
+    _ = doc.value.object.swapRemove("decision_failure");
+    try std.testing.expect((try decodeTerminalChecked(doc.value.object)).decision_failure == null);
 }

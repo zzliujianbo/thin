@@ -179,6 +179,8 @@ pub const Terminal = struct {
     model_failure: ?p.FailureKind = null,
     /// 最后一次模型请求的 HTTP 状态码（若有）。
     http_status: ?u16 = null,
+    /// Independent auxiliary failure; never reuse primary HTTP/usage fields.
+    decision_failure: ?decision.Diagnostic = null,
     usage: UsageTotals = .{},
     context_snapshot: ?ContextSnapshot = null,
 };
@@ -2452,11 +2454,17 @@ pub const Runtime = struct {
                         return err;
                     }
                     if (kind == .normal and self.reserveSteering()) break :calls;
+                    task.terminal.decision_failure = service.failureDiagnostic(input, err);
                     return error.DecisionUnavailable;
                 };
                 try checkCanceled(cancel);
                 if (kind == .normal and self.reserveSteering()) break :calls;
-                validateDecisionOutput(input, output) catch return error.DecisionUnavailable;
+                validateDecisionOutput(input, output) catch |err| {
+                    var diagnostic: decision.Diagnostic = .{ .stage = .validate, .operation = input };
+                    diagnostic.setError(err);
+                    task.terminal.decision_failure = diagnostic;
+                    return error.DecisionUnavailable;
+                };
                 switch (input) {
                     .command => {
                         prepared.command_timeout = output.command.timeout;

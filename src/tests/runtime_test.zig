@@ -427,6 +427,13 @@ test "decision failure invalid fake variant timeout and cancellation stop withou
         try std.testing.expectEqual(if (mode == 5) r.Status.failed else if (mode == 4) r.Status.canceled else r.Status.paused, result.status);
         try std.testing.expectEqual(if (mode == 5) error.CleanupFailed else if (mode == 4) error.Canceled else error.DecisionUnavailable, result.detail.?);
         try std.testing.expectEqual(mode == 5, runtime.poisoned);
+        if (mode < 4) {
+            const diagnostic = result.decision_failure.?;
+            try std.testing.expectEqual(auxiliary.Diagnostic.Operation.command, diagnostic.operation);
+            try std.testing.expectEqual(if (mode == 0) auxiliary.Diagnostic.Stage.review else .validate, diagnostic.stage);
+            if (mode == 0) try std.testing.expectEqualStrings("FixtureUnavailable", diagnostic.causeName());
+            try std.testing.expect(diagnostic.http_status == null and result.http_status == null);
+        } else try std.testing.expect(result.decision_failure == null);
         try std.testing.expectEqual(@as(u32, 1), fake.normal_calls);
         try std.testing.expectEqual(@as(usize, 1), fake.decision_calls);
         try std.testing.expectEqual(@as(u32, 0), fake.permissions + fake.executions);

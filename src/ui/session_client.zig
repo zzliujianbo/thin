@@ -97,6 +97,7 @@ pub const Terminal = struct {
     failure: Failure = .other,
     model_failure: ?p.FailureKind = null,
     http_status: ?u16 = null,
+    decision_failure: ?@import("../core/decision.zig").Diagnostic = null,
     usage: r.UsageTotals = .{},
     context: ?r.ContextSnapshot = null,
 
@@ -106,6 +107,7 @@ pub const Terminal = struct {
             .detail = if (self.status == .success) null else self.failure.toError(),
             .model_failure = self.model_failure,
             .http_status = self.http_status,
+            .decision_failure = self.decision_failure,
             .usage = self.usage,
             .context_snapshot = self.context,
         };

@@ -50,6 +50,10 @@ pub const Client = struct {
     unreaped_pid: ?c.pid_t = null,
     explicit_route: bool = false,
     proxy_url: ?[]u8 = null,
+    /// Safe numeric/local-enum evidence for the latest nonstreaming request.
+    /// Never retain curl stderr, response body, configuration or credentials.
+    last_exit_code: ?u8 = null,
+    last_error: ?anyerror = null,
 
     /// Owned route; null explicitly forces direct even if the parent exports
     /// proxy variables. A listed model cannot be bypassed by ambient NO_PROXY.
@@ -92,6 +96,15 @@ pub const Client = struct {
     }
 
     pub fn post(self: *Client, a: std.mem.Allocator, url: []const u8, key: []const u8, payload: []const u8, timeout_ms: u32, cancel: *const protocol.Cancellation) !Response {
+        self.last_exit_code = null;
+        self.last_error = null;
+        return self.postInner(a, url, key, payload, timeout_ms, cancel) catch |err| {
+            if (self.last_error == null) self.last_error = err;
+            return err;
+        };
+    }
+
+    fn postInner(self: *Client, a: std.mem.Allocator, url: []const u8, key: []const u8, payload: []const u8, timeout_ms: u32, cancel: *const protocol.Cancellation) !Response {
         if (self.poisoned) return error.CleanupFailed;
         try checkCancel(self.io, cancel);
         const config = try makeConfigRouted(a, url, key, payload, timeout_ms, self.explicit_route, self.proxy_url);
@@ -110,11 +123,16 @@ pub const Client = struct {
             .term_grace_ms = 200,
             .cleanup_timeout_ms = 5000,
         }, cancel) catch |err| {
+            self.last_error = err;
             try checkCancel(self.io, cancel);
             return if (err == error.OutOfMemory) error.OutOfMemory else error.DecisionTransport;
         };
         defer a.free(result.stdout);
         defer a.free(result.stderr);
+        if (result.term) |term| switch (term) {
+            .exited => |code| self.last_exit_code = code,
+            else => {},
+        };
         return self.acceptResult(a, result, cancel);
     }
 

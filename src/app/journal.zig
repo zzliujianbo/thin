@@ -462,7 +462,22 @@ pub const Journal = struct {
                 .fallback => |v| try self.record(a, "fallback", .{ .protocol = v }),
                 .compacted => |v| try self.record(a, "compacted", v),
                 .compaction_failed => |v| try self.record(a, "compaction_failed", .{ .error_name = @errorName(v) }),
-                .finished => |v| try self.record(a, "finished", .{ .status = v.status, .detail = if (v.detail) |err| @errorName(err) else null, .model_failure = v.model_failure, .http_status = v.http_status, .usage = v.usage }),
+                .finished => |v| try self.record(a, "finished", .{
+                    .status = v.status,
+                    .detail = if (v.detail) |err| @errorName(err) else null,
+                    .model_failure = v.model_failure,
+                    .http_status = v.http_status,
+                    .decision_failure = if (v.decision_failure) |*diagnostic| .{
+                        .stage = diagnostic.stage,
+                        .backend = diagnostic.backend,
+                        .operation = diagnostic.operation,
+                        .cause = diagnostic.causeName(),
+                        .http_status = diagnostic.http_status,
+                        .model_failure = diagnostic.model_failure,
+                        .transport_exit_code = diagnostic.transport_exit_code,
+                    } else null,
+                    .usage = v.usage,
+                }),
             },
         }
     }
@@ -983,7 +998,19 @@ test "journal structured records redaction turns and first response" {
     observer.notify(.{ .event = .{ .tool_started = .{ .id = 7, .name = "read" } } });
     observer.notify(.{ .tool_completed = .{ .call_id = "call_1", .result = .{ .text = "{\"value\":\"fake\\u0022\\u005csecret\"}", .canceled = true } } });
     observer.notify(.{ .event = .{ .tool_result = .{ .id = 7, .name = "read", .result = .{ .text = "NEVER_DUPLICATE_BODY" } } } });
-    observer.notify(.{ .event = .{ .finished = .{ .status = .failed, .detail = error.TestFailure, .http_status = 503 } } });
+    var diagnostic: @import("../core/decision.zig").Diagnostic = .{
+        .stage = .http,
+        .backend = .systemone,
+        .operation = .command,
+        .http_status = 403,
+    };
+    diagnostic.setError(error.DecisionUnavailable);
+    observer.notify(.{ .event = .{ .finished = .{
+        .status = .failed,
+        .detail = error.TestFailure,
+        .http_status = 503,
+        .decision_failure = diagnostic,
+    } } });
     observer.notify(.{ .submitted = "second" });
     observer.notify(.{ .event = .{ .state = .compacting } });
     observer.notify(.{ .event = .{ .tool_preview = .{ .index = 0, .arguments = "hidden" } } });
@@ -1041,6 +1068,15 @@ test "journal structured records redaction turns and first response" {
         if (std.mem.eql(u8, event, "finished") and turn == 1) {
             try std.testing.expectEqualStrings("TestFailure", data.get("detail").?.string);
             try std.testing.expectEqual(@as(i64, 503), data.get("http_status").?.integer);
+            const diagnostic_fields = data.get("decision_failure").?.object;
+            try std.testing.expectEqual(@as(u32, 7), diagnostic_fields.count());
+            try std.testing.expectEqualStrings("http", diagnostic_fields.get("stage").?.string);
+            try std.testing.expectEqualStrings("systemone", diagnostic_fields.get("backend").?.string);
+            try std.testing.expectEqualStrings("command", diagnostic_fields.get("operation").?.string);
+            try std.testing.expectEqualStrings("DecisionUnavailable", diagnostic_fields.get("cause").?.string);
+            try std.testing.expectEqual(@as(i64, 403), diagnostic_fields.get("http_status").?.integer);
+            try std.testing.expect(diagnostic_fields.get("transport_exit_code").? == .null);
+            try std.testing.expect(diagnostic_fields.get("model_failure").? == .null);
         }
     }
     try std.testing.expectEqual(@as(usize, 2), first_count);
