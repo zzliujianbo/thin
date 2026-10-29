@@ -126,6 +126,12 @@ test {
     _ = @import("ui/terminal.zig");
     _ = @import("ui/input.zig");
     _ = @import("ui/input_history.zig");
+    _ = @import("core/session_failure.zig");
+    _ = @import("util/stream_text.zig");
+    _ = @import("ui/body_stream.zig");
+    _ = @import("ui/whitelist.zig");
+    _ = @import("ui/whitelist_render.zig");
+    _ = @import("ui/markdown_writer.zig");
     _ = @import("ui/markdown.zig");
     _ = @import("ui/tail_frame.zig");
     _ = @import("ui/stream_prefix.zig");

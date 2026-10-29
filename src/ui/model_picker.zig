@@ -246,15 +246,7 @@ fn compactTokens(buffer: []u8, tokens: u32) ![]const u8 {
 
 /// Input is already sanitized; preserve whole display clusters without styling.
 fn clip(a: Allocator, value: []const u8, columns: usize) ![]const u8 {
-    var end: usize = 0;
-    var width: usize = 0;
-    while (end < value.len) {
-        const cluster = text.nextCluster(value, end, width);
-        if (cluster.width > columns - width) break;
-        width += cluster.width;
-        end = cluster.end;
-    }
-    return a.dupe(u8, value[0..end]);
+    return a.dupe(u8, value[0..text.fitBytes(value, columns)]);
 }
 
 pub fn manualName(name: []const u8) bool {

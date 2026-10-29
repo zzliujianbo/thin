@@ -14,6 +14,7 @@
 const std = @import("std");
 const r = @import("../core/runtime.zig");
 const p = @import("../core/protocol.zig");
+const Failure = @import("../core/session_failure.zig").Failure;
 const tool_stream = @import("../core/tool_stream.zig");
 const preview = @import("../core/tool_preview.zig");
 const ids = @import("../app/session_id.zig");
@@ -151,7 +152,7 @@ pub fn startupError(code: u8) ?anyerror {
     return null;
 }
 
-/// Wire names must remain identical to `ui/session_client.Failure` tags.
+/// Wire names must remain identical to `core/session_failure.Failure` tags.
 pub fn failureCode(err: anyerror) []const u8 {
     return switch (err) {
         error.CleanupFailed => "cleanup_failed",
@@ -1368,7 +1369,7 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
         } };
     } else if (std.mem.eql(u8, kind, "compaction_failed")) {
         const failure = failureFromName(try requireText(object, "code"));
-        event = .{ .compaction_failed = @import("../ui/session_client.zig").Failure.toError(failure) orelse error.RemoteFailure };
+        event = .{ .compaction_failed = Failure.toError(failure) orelse error.RemoteFailure };
     } else if (std.mem.eql(u8, kind, "assistant")) {
         const array = try requireArray(object, "blocks");
         const count = @min(array.items.len, max_blocks);
@@ -1395,8 +1396,8 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
     };
 }
 
-fn failureFromName(name: []const u8) @import("../ui/session_client.zig").Failure {
-    return std.meta.stringToEnum(@import("../ui/session_client.zig").Failure, name) orelse .other;
+fn failureFromName(name: []const u8) Failure {
+    return std.meta.stringToEnum(Failure, name) orelse .other;
 }
 
 /// Strict terminal decoding: required status/usage/counts are validated so a
@@ -1405,7 +1406,7 @@ fn decodeTerminalChecked(object: std.json.ObjectMap) !r.Terminal {
     const status = try requireEnum(r.Status, object, "status");
     const detail: ?anyerror = if (status == .success) null else blk: {
         const name = try requireText(object, "failure");
-        break :blk @import("../ui/session_client.zig").Failure.toError(failureFromName(name));
+        break :blk Failure.toError(failureFromName(name));
     };
     const totals = try requireObject(object, "usage");
     const usage: r.UsageTotals = .{

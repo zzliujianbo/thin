@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     const ssh_include = b.option([]const u8, "ssh-include", "Directory containing libssh/ headers");
     const ssh_library = b.option([]const u8, "ssh-library", "Absolute libssh shared-library path (otherwise link system ssh)");
 
-    // 可供其他前端直接导入；不链接TTY/libc宽度/Markdown C parser。
+    // 可供其他前端直接导入；不链接 TTY 或 libc 宽度实现。
     const presentation = b.addModule("presentation", .{
         .root_source_file = b.path("src/presentation.zig"),
         .target = target,
@@ -42,7 +42,6 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    addMarkdown(b, exe.root_module);
     addSsh(b, exe.root_module, ssh_include, ssh_library);
     b.installArtifact(exe);
 
@@ -62,11 +61,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    addMarkdown(b, unit.root_module);
     addSsh(b, unit.root_module, ssh_include, ssh_library);
-    // Test-only parser copy with allocation injection; never linked into thin.
-    unit.root_module.addCSourceFile(.{ .file = b.path("src/tests/md4c_fault_test.c"), .flags = &.{"-std=c11"} });
-    unit.root_module.addCSourceFile(.{ .file = b.path("src/tests/md4c_stream_blocks_test.c"), .flags = &.{"-std=c11"} });
     const run_unit = b.addRunArtifact(unit);
     b.step("test-unit", "Run product unit tests without network or credentials").dependOn(&run_unit.step);
 
@@ -308,12 +303,4 @@ fn addSsh(b: *std.Build, module: *std.Build.Module, include: ?[]const u8, librar
         module.addCSourceFile(.{ .file = b.path(b.fmt("src/daemon/{s}", .{file})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     if (library) |path| module.addObjectFile(.{ .cwd_relative = path }) else module.linkSystemLibrary("ssh", .{});
-}
-
-/// Vendored CommonMark/GFM parser: builds offline, no system package/runtime
-/// library requirement. Zig code keeps using the native backend; C uses zig cc.
-fn addMarkdown(b: *std.Build, module: *std.Build.Module) void {
-    for ([_][]const u8{ "md4c.c", "entity.c", "abi.c" }) |file| {
-        module.addCSourceFile(.{ .file = b.path(b.fmt("src/vendor/md4c/{s}", .{file})), .flags = &.{"-std=c11"} });
-    }
 }

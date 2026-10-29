@@ -135,17 +135,59 @@ fn cluster(s: []const u8, start: usize, column: usize, styled: bool) Cluster {
     return .{ .end = end, .width = state.width };
 }
 
-/// 计算字符串的显示列数。TAB 的宽度依赖当前列位置，因此逐簇累加。
+/// 计算纯文本的显示列数。TAB 的宽度依赖当前列位置。
 pub fn width(s: []const u8) usize {
+    return accumulateWidth(s, false);
+}
+
+/// Renderer-owned SGR sequences are transparent to display width.
+pub fn styledWidth(bytes: []const u8) usize {
+    return accumulateWidth(bytes, true);
+}
+
+fn accumulateWidth(bytes: []const u8, styled: bool) usize {
     var i: usize = 0;
     var col: usize = 0;
-    while (i < s.len) {
-        // 逐簇累加列宽；TAB 宽度取决于当前 col。
-        const c = nextCluster(s, i, col);
+    while (i < bytes.len) {
+        const c = if (styled) nextStyledCluster(bytes, i, col) else nextCluster(bytes, i, col);
         col += c.width;
         i = c.end;
     }
     return col;
+}
+
+/// Byte length of the longest whole-cluster plain-text prefix fitting columns.
+/// Zero-width clusters may fit even when columns is zero.
+pub fn fitBytes(bytes: []const u8, columns: usize) usize {
+    var end: usize = 0;
+    var col: usize = 0;
+    while (end < bytes.len) {
+        const c = nextCluster(bytes, end, col);
+        if (c.width > columns - col) break;
+        col += c.width;
+        end = c.end;
+    }
+    return end;
+}
+
+test "fitBytes and styledWidth respect cluster boundaries and plain text" {
+    try initLocale();
+    const cases = [_][]const u8{ "中", "😀", "👩‍💻", "é" };
+    for (cases) |s| {
+        const w = width(s);
+        try std.testing.expect(w > 0);
+        try std.testing.expectEqual(@as(usize, 0), fitBytes(s, w - 1));
+        try std.testing.expectEqual(s.len, fitBytes(s, w));
+    }
+    try std.testing.expectEqual("中".len, fitBytes("中x", 2));
+    try std.testing.expectEqual(@as(usize, 0), fitBytes("中", 0));
+    try std.testing.expectEqual("\n".len, fitBytes("\n中", 0));
+    try std.testing.expectEqual(@as(usize, 1), fitBytes("a\tb", 3));
+    try std.testing.expectEqual(@as(usize, 2), fitBytes("a\tb", 4));
+    const styled = "\x1b[31m中\x1b[0m\té";
+    try std.testing.expectEqual(@as(usize, 5), styledWidth(styled));
+    try std.testing.expect(width(styled) > styledWidth(styled));
+    try std.testing.expectEqual(@as(usize, 1), fitBytes("\x1b[31m", 1));
 }
 
 test "printable ASCII width and cluster shortcuts retain ZWJ joins" {

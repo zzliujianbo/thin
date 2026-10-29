@@ -567,9 +567,8 @@ pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge
     var ui = Ui{ .allocator = a, .io = io, .connection = connection, .bridge = bridge, .cancel = cancel, .terminal = &terminal, .editor = .{ .allocator = a }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" } };
     defer ui.deinit();
 
-    // Initial entry owns exactly the composer at the terminal's current row:
-    // no startup banner, no blank-screen padding and no implied bottom. Explicit
-    // history restore, real notices/errors and real output grow from there.
+    // Initial entry anchors the composer at the physical bottom without an
+    // alternate screen or replaying pre-existing terminal history.
     if (connection.initial_history_fn) |history| try ui.restoreHistory(history(connection.context));
     // Remote attach may already own a running task; adopt its epoch before the
     // first frame so a stale approval or queue send cannot cross sessions.
@@ -2422,8 +2421,8 @@ const Ui = struct {
         const label = try presentation.commandText(a, caption, .pending);
         defer a.free(label);
         const generating = !entry.ready and entry.write_progress != null and entry.caption.kind == .write;
-        // Generation is a muted pulse with provisional values, never execution
-        // time. Ready/approval rows stay static; tool_started owns warm timing.
+        // Generating and approval rows remain muted and static, without an
+        // execution time; tool_started owns warm icon timing.
         return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .write_marks = if (caption.write_marks) |marks| marks.shifted(activity.icon(caption.kind).len + 1) else null, .generating = generating }}, columns, null, if (generating) self.clock_ms else null);
     }
 
@@ -5766,7 +5765,7 @@ const Ui = struct {
             if (record.kind != .reasoning and !record.output) break true;
         } else false;
         const release_idle = self.idleBreaksDrawable() and !pending_transcript and !self.abandon_tail and
-            self.tail_snapshot != null and self.tail_height != 0 and self.tail_composer_rows == 1 and self.tail_cursor_rows_up == 0 and
+            self.tail_snapshot != null and self.tail_bottom and self.tail_height != 0 and self.tail_composer_rows == 1 and self.tail_cursor_rows_up == 0 and
             self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows;
         const break_count: u16 = if (release_idle) @min(256, self.idle_breaks) else 0;
 
@@ -5793,12 +5792,10 @@ const Ui = struct {
                 try writer.writeAll("\r\n");
             }
         } else if (self.abandon_tail or (self.tail_height != 0 and
-            (self.tail_size.columns != self.size.columns or self.tail_size.rows != self.size.rows)))
+            (!self.tail_bottom or self.tail_size.columns != self.size.columns or self.tail_size.rows != self.size.rows)))
         {
-            // Unknown geometry owns no coordinates. Continue naturally from the
-            // cursor's current row only: never force the physical bottom, clear
-            // the screen, fill blank rows, or attempt an old-coordinate reclaim.
-            try writer.writeAll("\r\n");
+            // Unknown geometry owns no old coordinates. The fresh frame below
+            // establishes a new bottom anchor without reclaiming the old tail.
         } else if (self.tail_height != 0) {
             const top_distance = (self.tail_height - 1) -| self.tail_cursor_rows_up;
             if (top_distance != 0) try writer.print("\x1b[{d}A", .{top_distance});
@@ -5809,7 +5806,7 @@ const Ui = struct {
         }
 
         self.frame_clear_end = out.written().len;
-        const history_valid = !self.abandon_tail and self.tail_size.columns == self.size.columns and
+        const history_valid = !self.abandon_tail and self.tail_bottom and self.tail_size.columns == self.size.columns and
             self.tail_size.rows == self.size.rows and self.menu_history != null;
         var above: []const []const u8 = if (history_valid) self.menu_history.?.above else &.{};
         var borrowed: []const []const u8 = if (history_valid and !release_idle) self.menu_history.?.borrowed else &.{};
@@ -6035,7 +6032,10 @@ const Ui = struct {
         const popup_requested = self.stop_open or self.settings_open or self.provider_open or
             self.model_picker != null or (!release_idle and self.commandMenuVisible()) or
             (self.permission == null and queue_snapshot.preview_count != 0);
-        const body_present = lines.items.len != 0 or borrowed.len != 0 or transcript_rows != 0 or above.len != 0 or
+        const above_content = for (above) |line| {
+            if (!std.mem.eql(u8, line, "\x1b[0m\x1b[K")) break true;
+        } else false;
+        const body_present = lines.items.len != 0 or borrowed.len != 0 or transcript_rows != 0 or above_content or
             self.permission != null or self.secret_mode or thinking != null or popup_requested;
         const separator: usize = @intFromBool(!compact and body_present);
         const footer_rows: usize = if (compact) 1 else composer_rows + separator + @as(usize, @intFromBool(hint_line.len != 0));
@@ -6132,14 +6132,13 @@ const Ui = struct {
         const wanted_body = if (self.stop_open) 0 else if (self.permission != null)
             @min(body_limit, 2 + @max(1, approval_lines.lines.len))
         else if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (show_thinking) @min(thinking_gap + @min(3, thinking_lines.len), content_body_limit) else @min(borrowed.len + lines.items.len, content_body_limit);
-        // The owned footprint is exactly the rows this frame writes: it has no
-        // full-screen floor, no blank-screen padding and implies no physical
-        // bottom. Real body/popup rows grow it, closing popups contract it.
         const wanted_rows = @min(self.size.rows, footer_rows + popup_lines.len + popup_gap + wanted_body);
-        // The overlay keeps this frame's actual wanted footprint. Only known
-        // ACKed rows may fund upward borrowing; any remainder grows naturally
-        // instead of inventing rows or suppressing the reasoning window.
-        const rows = wanted_rows;
+        // Reuse the ACKed footprint when content contracts. This keeps the
+        // composer's last row at the physical bottom without inventing a
+        // full-screen tail or evicting already committed transcript rows.
+        const anchored = !release_idle and !self.abandon_tail and self.tail_bottom and
+            self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows;
+        const rows = @min(self.size.rows, @max(wanted_rows, if (anchored) self.tail_height -| transcript_rows else 0));
         // Only a popup or approval grows UP into exact ACKed transcript rows,
         // without pushing duplicate content into native scrollback. Keep those
         // restoration rows when returning to the normal live tail. Reasoning
@@ -6177,8 +6176,15 @@ const Ui = struct {
         // Record tail indices were captured before any borrowed rows were
         // prepended to the mutable tail; keep the coordinate shift explicit.
         const tail_row_shift: usize = if (borrowed.len != 0) borrowed.len else 0;
+        const needs_anchor = !release_idle and !anchored;
         var next_above: std.ArrayList([]const u8) = .empty;
-        try next_above.appendSlice(a, above);
+        // The one-time native-space establishment below creates a completely
+        // blank viewport. Only rows above this frame's actual transcript/tail
+        // can be borrowed later, and they become authoritative only on ACK.
+        if (needs_anchor) {
+            const blank_count = @min(200, self.size.rows -| @min(self.size.rows, transcript_rows + rows));
+            for (0..blank_count) |_| try next_above.append(a, "\x1b[0m\x1b[K");
+        } else try next_above.appendSlice(a, above);
         if (release_idle) {
             const old_rows = self.tail_snapshot.?.rows;
             try next_above.appendSlice(a, old_rows[0 .. old_rows.len - 1]);
@@ -6188,17 +6194,36 @@ const Ui = struct {
             var split = std.mem.splitSequence(u8, out.written()[self.frame_clear_end..], "\r\n");
             for (0..transcript_rows) |_| try next_above.append(a, split.next() orelse return error.InvalidTailFrame);
         }
-        const above_count = @min(next_above.items.len, self.size.rows -| rows);
+        const above_count = @min(@min(next_above.items.len, self.size.rows -| rows), 200 -| borrowed.len);
         var next_history: ?tail_frame.MenuHistory = try tail_frame.MenuHistory.capture(self.allocator, next_above.items[next_above.items.len - above_count ..], borrowed);
         errdefer if (next_history) |*history| history.deinit();
+
+        // Establish a bottom anchor only when no complete same-geometry frame
+        // proves one. Move to the bottom without clearing or replaying history,
+        // create one fully owned blank viewport by native scrolling, then start
+        // the actual transcript/tail at its bottom-relative origin. Resize alone
+        // never calls draw; the next real frame performs this bounded establishment.
+        if (needs_anchor) {
+            const reserve = @min(self.size.rows -| 1, (transcript_rows + rows) -| 1);
+            const prefix_len = (terminal_module.sync_begin ++ "\x1b[?25l\r").len;
+            var rebuilt: std.Io.Writer.Allocating = .init(a);
+            try rebuilt.writer.writeAll(out.written()[0..prefix_len]);
+            try rebuilt.writer.print("\x1b[{d}B\r\n", .{self.size.rows});
+            for (0..self.size.rows -| 1) |_| try rebuilt.writer.writeAll("\r\n");
+            if (reserve != 0) try rebuilt.writer.print("\x1b[{d}A", .{reserve});
+            try rebuilt.writer.writeAll("\r");
+            const inserted = rebuilt.written().len - prefix_len;
+            try rebuilt.writer.writeAll(out.written()[prefix_len..]);
+            out = rebuilt;
+            self.frame_clear_end += inserted;
+        }
 
         // Build the complete candidate tail before choosing full or sparse output.
         // Its bytes also provide recovery if resize interrupts a sparse frame.
         // Rows this frame returns belong to the previous ACKed footprint only:
         // a smaller floating footprint is contracted after the tail, at the same
         // width and geometry. Differential frames never leave rows behind.
-        const reclaimable = !release_idle and !self.abandon_tail and
-            self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows;
+        const reclaimable = anchored;
         const vacated = if (reclaimable) (self.tail_height + borrow_count) -| (transcript_rows + rows) else 0;
         writer = &tail_out.writer;
         var cursor_offset: usize = 0;
@@ -6406,7 +6431,7 @@ const Ui = struct {
         const snapshot_allowed = self.permission == null and self.model_picker == null and !self.provider_open and !self.settings_open and !menu_visible and !self.secret_mode and !self.secret_quarantine;
         var candidate = if (snapshot_allowed) try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset) else null;
         errdefer if (candidate) |*snapshot| snapshot.deinit();
-        const can_diff = !release_idle and !self.abandon_tail and snapshot_allowed and
+        const can_diff = anchored and snapshot_allowed and
             self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows and
             self.tail_snapshot != null and candidate != null;
         const growing = can_diff and !canonical_output and transcript_rows != 0 and
@@ -6453,7 +6478,7 @@ const Ui = struct {
         self.frame_cursor_rows_up = cursor_rows_up;
         self.frame_composer_rows = rendered_composer_rows;
         self.frame_size = self.size;
-        self.frame_bottom = rows == self.size.rows;
+        self.frame_bottom = true;
         self.frame_fresh = true;
         self.frame_changed = self.display_changed;
         self.display_changed = false;
@@ -6689,6 +6714,46 @@ fn rowStartingWith(screen: *const @import("../tests/regular_screen.zig").Screen,
     return error.MissingRowPrefix;
 }
 
+test "bottom composer stays anchored across draft and menu frames" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.draw();
+    try std.testing.expect(ui.menu_history == null and !ui.tail_bottom);
+    try std.testing.expectEqual(screen.rows - ui.frame_height, ui.frame_menu_history.?.above.len);
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(screen.rows - ui.tail_height, ui.menu_history.?.above.len);
+    try std.testing.expectEqual(screen.rows - 1, screen.row + ui.tail_cursor_rows_up);
+    const history_before_menu = screen.history_len;
+    try ui.parser.feed("/", sink);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(screen.rows - 1, screen.row + ui.tail_cursor_rows_up);
+    try std.testing.expectEqual(history_before_menu, screen.history_len);
+    try Ui.key(&ui, .escape);
+    try Ui.key(&ui, .clear);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(screen.rows - 1, screen.row + ui.tail_cursor_rows_up);
+    try ui.parser.feed("a long draft that wraps across the composer and stays fixed on the bottom row of the terminal", sink);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(screen.rows - 1, screen.row + ui.tail_cursor_rows_up);
+    try Ui.key(&ui, .clear);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(screen.rows - 1, screen.row + ui.tail_cursor_rows_up);
+}
+
 test "idle Enter releases exactly one native row and redraw keeps the live draft" {
     for ([_]usize{ 80, 16 }) |columns| {
         var cancel: p.Cancellation = .{};
@@ -6898,7 +6963,7 @@ test "rendered unacknowledged body window applies admission pressure" {
     // Parsing is sliced: the first window is bounded and the remainder is still
     // queued, which is exactly the admission-pressure signal.
     try std.testing.expect(body.pendingBytes() != 0);
-    try std.testing.expect(body.render.source_len <= 4 * 1024 + 64 * 1024);
+    try std.testing.expect(body.stats.max_window_bytes <= 4 * 1024 + 64 * 1024 + 2048);
     try std.testing.expectEqual(@as(usize, 128 * 1024), body.windowBytes());
     try std.testing.expect(ui.displayBackpressured());
     body.abort();
@@ -7141,14 +7206,12 @@ test "idle Enter acknowledged prompts survive a command popup without duplicatio
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(old_history, screen.history_len);
     try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
-    // Releasing this restored tail keeps every released prompt exactly once.
-    // A floating composer that has not reached the terminal bottom advances
-    // inside its own rows instead of fabricating native history.
+    // Releasing this restored bottom-anchored tail keeps every prompt once.
     try Ui.key(&ui, .enter);
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    try std.testing.expectEqual(old_history, screen.history_len);
+    try std.testing.expectEqual(old_history + 1, screen.history_len);
     try std.testing.expectEqual(@as(usize, 5), screen.count("?%>"));
     try ui.parser.feed("/", sink);
     try ui.draw();
@@ -7523,8 +7586,8 @@ test "regular transcript writes committed rows above a natural composer tail wit
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     // One released user row above the gap+draft body and the hinted composer.
-    try std.testing.expectEqual(@as(usize, 5), screen.row);
-    try std.testing.expect(std.mem.find(u8, &screen.grid[0], "unique committed user") != null);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[screen.rows - 1 - ui.frame_height], "unique committed user") != null);
     try std.testing.expect(!ui.records.items[0].output);
     try std.testing.expectEqual(@as(usize, 5), ui.frame_height); // One committed user row, no full-screen padding.
     testAcknowledgeFullFrame(&ui);
@@ -7537,11 +7600,11 @@ test "regular transcript writes committed rows above a natural composer tail wit
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") != null);
     try std.testing.expectEqual(@as(usize, 3), ui.frame_height); // Leading gap + canonical body, no title.
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 5), screen.row);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
     try ui.draw();
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 5), screen.row);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     try std.testing.expectEqual(@as(usize, 1), screen.count("unique canonical reply"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") == null);
     try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\x1b[2A"));
@@ -7618,12 +7681,9 @@ test "growing a compact live tail keeps replaceable drafts out of scrollback" {
         try std.testing.expectEqual(@as(usize, @intFromBool(same_final)), screen.count("growth-draft-marker"));
         try std.testing.expectEqual(@as(usize, @intFromBool(!same_final)), screen.count("different-final-marker"));
         try std.testing.expectEqual(@as(usize, 0), screen.count("second-draft-line"));
-        // The committed row replaces the draft and releases rows in place. The
-        // old draft contributed gap + two rows while the final contributes
-        // gap + one row, and the three footer rows are unchanged, so this frame
-        // contracts exactly ONE row from the ACKed draft cursor.
-        try std.testing.expectEqual(draft_row - 1, screen.row);
-        try std.testing.expectEqual(@as(usize, 3), ui.tail_height);
+        // The released rows plus reused tail preserve the physical bottom.
+        try std.testing.expectEqual(draft_row, screen.row);
+        try std.testing.expectEqual(@as(usize, 4), ui.tail_height);
     }
 }
 
@@ -7659,19 +7719,20 @@ test "user thinking streaming prefixes and revised replies keep explicit gaps" {
         try expectTranscriptGap(&screen, "user-row-end", "think-first");
         for ([_][]const u8{ "think-first", "think-second", "think-last" }) |marker| try std.testing.expect(screen.visible(marker));
         try std.testing.expect(!screen.visible("old-think"));
-        // Two released user rows plus a gap row and three reasoning rows, then
-        // the separator, the fixture notice and the composer.
-        try std.testing.expectEqual(@as(usize, 8), screen.row);
+        // Two released user rows and the live reasoning stay above the footer.
+        try std.testing.expectEqual(screen.rows - 1, screen.row);
         testAcknowledgeFullFrame(&ui);
         try ui.appendDraft(.reasoning, "\nthink-new\nthink-new-last");
         try ui.draw();
         try screen.replay(ui.frame);
         try expectTranscriptGap(&screen, "user-row-end", "think-last");
+        try std.testing.expectEqual(screen.rows - 1, screen.row);
         testAcknowledgeFullFrame(&ui);
         try ui.appendDraft(.assistant, "live-start\nlive-end");
         try ui.draw();
         try screen.replay(ui.frame);
         try expectTranscriptGap(&screen, "user-row-end", "live-start");
+        try std.testing.expectEqual(screen.rows - 1, screen.row);
         try std.testing.expectEqual(@as(usize, 0), screen.count("think-"));
         try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Streaming") == null);
         try std.testing.expect(std.mem.indexOf(u8, ui.frame, "History preview") == null);
@@ -7708,7 +7769,6 @@ test "user thinking streaming prefixes and revised replies keep explicit gaps" {
         testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(staged, ui.tail_height);
         // First row owned by the ACKed tail: the revision frame starts here.
-        const tail_origin = screen.row - (ui.tail_height - 1);
         try ui.replaceCommitted(&.{.{ .text = "formal-final" }}, false, true);
         try ui.draw();
         try screen.replay(ui.frame);
@@ -7716,10 +7776,8 @@ test "user thinking streaming prefixes and revised replies keep explicit gaps" {
         try std.testing.expectEqual(@as(usize, 1), screen.count("formal-final"));
         try std.testing.expect(screen.count("live-line-") > 0);
         try std.testing.expectEqual(@as(usize, 1), screen.count("user-row-end"));
-        // The revision emits exactly THREE rows from that origin (revision
-        // notice, gap, final body) below the borrowed tail start, then paints its
-        // own footer tail, so the cursor is origin + 3 + frame_height - 1.
-        try std.testing.expectEqual(tail_origin + 3 + ui.frame_height - 1, screen.row);
+        // The revision and its footer remain anchored at the physical bottom.
+        try std.testing.expectEqual(screen.rows - 1, screen.row);
         testAcknowledgeFullFrame(&ui);
     }
 }
@@ -7924,13 +7982,13 @@ test "idle exit reclaims only acknowledged blank tail and preserves startup and 
     try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    try std.testing.expectEqual(@as(usize, 6), screen.row);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     try std.testing.expectEqual(@as(usize, 3), ui.tail_height);
     try std.testing.expect(try ui.idleExitBytes(&writer));
     try screen.replay(writer.buffered());
     try screen.replay("\r\nshell-next");
     try std.testing.expectEqual(@as(usize, 0), screen.count("Session ID:"));
-    try std.testing.expect(screen.row <= 6);
+    try std.testing.expectEqual(screen.rows - ui.tail_height + 1, screen.row);
     for ([_][]const u8{ "shell-kept", "thin fixture-version", "/fixture", "fixture UTC", "shell-next" }) |marker|
         try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
 
@@ -8026,7 +8084,7 @@ test "thinking scrolls in three rows and body replaces it without retaining reas
     try std.testing.expect(!screen.visible("think-one"));
     for ([_][]const u8{ "think-two", "think-three", "think-four" }) |marker| try std.testing.expect(screen.visible(marker));
     // Three reasoning rows above the separator, the fixture notice and the composer.
-    try std.testing.expectEqual(@as(usize, 5), screen.row);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     try std.testing.expectEqual(@as(usize, 6), ui.frame_height);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(!ui.records.items[0].output);
@@ -8440,7 +8498,7 @@ test "bounded tool window keeps the first actual execution visible in a full bat
     ui.mode = .calling_model;
     const screen = try a.create(@import("../tests/regular_screen.zig").Screen);
     defer a.destroy(screen);
-    screen.* = .{};
+    screen.* = .{ .rows = 10 };
     try emitToolUi(&ui, .{ .tool_views = .{ .generation = 31, .phase = .begin } });
     for (0..64) |i| try emitToolUi(&ui, .{ .tool_view = .{
         .key = .{ .generation = 31, .index = i },
@@ -8451,6 +8509,7 @@ test "bounded tool window keeps the first actual execution visible in a full bat
     try emitToolUi(&ui, .{ .tool_views = .{ .generation = 31, .phase = .commit } });
     try emitToolUi(&ui, .{ .tool_started = .{ .id = 1, .name = "bash", .display_key = .{ .generation = 31, .index = 0 } } });
     try replayToolFrame(&ui, screen);
+    try std.testing.expectEqual(screen.rows - 1, screen.row + ui.tail_cursor_rows_up);
     try std.testing.expect(screen.visible("FIRST_ACTIVE_TOOL"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("FIRST_ACTIVE_TOOL"));
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
@@ -8502,7 +8561,7 @@ test "raw write deltas alone never display JSON or invent execution" {
             try std.testing.expect(std.mem.find(u8, ui.frame, "preview.txt") == null);
         } else if (index == 1) {
             try std.testing.expect(ui.active_tool != null);
-            try std.testing.expect(std.mem.find(u8, ui.frame, theme.command_pulse[0] ++ "⠋" ++ theme.muted ++ " preview.txt") != null);
+            try std.testing.expect(std.mem.find(u8, ui.frame, theme.tool_icon_pulse[0] ++ "w" ++ theme.muted ++ " preview.txt") != null);
             try std.testing.expect(std.mem.find(u8, ui.frame, "+3") == null);
         } else {
             try std.testing.expect(ui.active_tool == null);
@@ -8543,7 +8602,10 @@ test "tool animation is transient and raw tool JSON never enters displayed recor
         try ui.draw();
         try std.testing.expect(std.mem.find(u8, ui.frame, activity.spinner(0)) != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, if (std.mem.eql(u8, name, "bash")) "date" else if (std.mem.eql(u8, name, "memory")) "read core" else "src/example.zig") != null);
-        try std.testing.expect(std.mem.find(u8, ui.frame, theme.command_pulse[0] ++ "⠋" ++ theme.muted) != null);
+        const icon = if (std.mem.eql(u8, name, "bash")) ">" else if (std.mem.eql(u8, name, "memory")) "m" else if (std.mem.eql(u8, name, "read_file")) "r" else "w";
+        const tool_prefix = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}", .{ theme.toolIconColor(0), icon, theme.muted });
+        defer std.testing.allocator.free(tool_prefix);
+        try std.testing.expect(std.mem.find(u8, ui.frame, tool_prefix) != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "#7") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "Running memory") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "Running bash") == null);
@@ -8589,6 +8651,7 @@ test "first pending tool follows user gap then tools stay contiguous" {
         try ui.draw();
         try screen.replay(ui.frame);
         try expectTranscriptGap(&screen, "tool-user-end", "target-one");
+        try std.testing.expectEqual(screen.rows - 1, screen.row);
         testAcknowledgeFullFrame(&ui);
         try ui.toolCompleted(ui.active_tool.?.caption, .{ .text = "{}" });
         ui.clearActiveTool();
@@ -8609,7 +8672,7 @@ test "first pending tool follows user gap then tools stay contiguous" {
         try std.testing.expect(first_row != null and second_row != null);
         try std.testing.expectEqual(first_row.? + 1, second_row.?);
         // Two released tool rows above the one-row tool body and hinted footer.
-        try std.testing.expectEqual(@as(usize, 6), screen.row);
+        try std.testing.expectEqual(screen.rows - 1, screen.row);
         testAcknowledgeFullFrame(&ui);
     }
 }
@@ -8649,7 +8712,7 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     }
     try std.testing.expect(failed_row != null and pending_row != null);
     try std.testing.expectEqual(failed_row.? + 1, pending_row.?);
-    try std.testing.expectEqual(@as(usize, 4), screen.row);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
     try host.emit_fn(host.context, .{ .tool_result = .{ .id = 2, .name = "bash", .result = .{ .text = "hidden-output-json" } } }, &cancel);
     item = bridge.pop().?;
@@ -8761,8 +8824,8 @@ test "file captions are contiguous but separated from final prose and percent co
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expect(!screen.visible("Final answer") and screen.visible("final-body-marker"));
-    for (screen.grid[1]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
-    try std.testing.expectEqual(@as(usize, 5), screen.row);
+    try expectTranscriptGap(&screen, "src/main.zig", "final-body-marker");
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
     try ui.draw();
     try screen.replay(ui.frame);
@@ -8982,7 +9045,7 @@ test "one-pass transcript separators erase acknowledged approval preview before 
     try std.testing.expectEqual(@as(usize, 1), screen.count("completed-tool-result"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("next-user-record"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("short-canonical-record"));
-    try std.testing.expectEqual(@as(usize, 9), screen.row);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
 }
 
 test "long approval Escape restores acknowledged conversation without blank screen or replay" {
@@ -9494,7 +9557,7 @@ test "tail snapshots publish only on full ACK and own bytes after record invalid
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ui.frame, "\x1b[K"));
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("stable-body-A-extended"));
-    try std.testing.expectEqual(@as(usize, 3), screen.row);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
 }
 
@@ -9561,8 +9624,8 @@ test "resize alone never draws and the next real input draws once at the new siz
         try std.testing.expect(!ui.drawReady() and !ui.dirty);
         try std.testing.expect(ui.frame.len == 0 and ui.resize_rescue.len == 0);
     }
-    // The next real input is ordinary work: one fresh frame at the new width,
-    // starting from the cursor's natural next row and replaying nothing.
+    // The next real input establishes one fresh bottom-anchored frame at the
+    // new width without replaying history.
     try Ui.key(&ui, .{ .text = .{ .value = "!", .pasted = false } });
     try std.testing.expect(ui.drawReady() and !ui.resize_waiting);
     try ui.draw();
@@ -9572,7 +9635,7 @@ test "resize alone never draws and the next real input draws once at the new siz
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[999B") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[0J") == null);
-    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\r\n"));
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r"));
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.tail_snapshot != null);
@@ -9676,9 +9739,9 @@ test "resize requeues unfinished content but discards animation frames without p
             if (changed) {
                 try ui.draw();
                 try std.testing.expect(std.mem.indexOf(u8, ui.frame, "new resize content") != null);
-                // Continues from the cursor's own row; never a forced bottom move.
+                // A real update establishes a bounded new bottom anchor.
                 try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[999B") == null);
-                try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\r\n"));
+                try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\x1b[12B"));
                 testAcknowledgeFullFrame(&ui);
             }
         }
@@ -10016,7 +10079,7 @@ test "sequential tool records from different frames have no gaps then final pros
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
-    for ([_][]const u8{ "one.txt", "two.txt", "three.txt" }, 0..) |path, i| {
+    for ([_][]const u8{ "one.txt", "two.txt", "three.txt" }) |path| {
         const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
         defer std.testing.allocator.free(args);
         const call = try shared.tools.Call.init(std.testing.allocator, "read_file", args);
@@ -10026,14 +10089,20 @@ test "sequential tool records from different frames have no gaps then final pros
         try ui.toolCompleted(caption, .{ .text = "hidden-result", .file_stats = .{ .read = 1 } });
         try ui.draw();
         try screen.replay(ui.frame);
-        try std.testing.expect(std.mem.find(u8, &screen.grid[i], path) != null);
+        try std.testing.expectEqual(@as(usize, 1), screen.count(path));
+        try std.testing.expect(screen.visible(path));
+        try std.testing.expectEqual(screen.rows - 1, screen.row);
         testAcknowledgeFullFrame(&ui);
     }
     try ui.replaceCommitted(&.{.{ .text = "answer-without-heading" }}, false, true);
     try ui.draw();
     try screen.replay(ui.frame);
-    for (screen.grid[3]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
-    try std.testing.expect(std.mem.find(u8, &screen.grid[4], "answer-without-heading") != null);
+    const first = for (screen.grid, 0..) |line, row| {
+        if (std.mem.find(u8, &line, "one.txt") != null) break row;
+    } else return error.MissingRowPrefix;
+    try std.testing.expect(std.mem.find(u8, &screen.grid[first + 1], "two.txt") != null);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[first + 2], "three.txt") != null);
+    try expectTranscriptGap(&screen, "three.txt", "answer-without-heading");
     try std.testing.expectEqual(@as(usize, 0), screen.count("Final answer"));
     testAcknowledgeFullFrame(&ui);
     try ui.draw();
@@ -10212,11 +10281,10 @@ test "single composer hides statistics and completion and uses flow and exact br
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("visible-body"));
-    // No full-screen padding: only the actual body, separator, notice and
-    // composer rows are written from the terminal's current row.
-    for (screen.grid[2]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
-    try std.testing.expect(std.mem.find(u8, &screen.grid[3], "(fixture) ?%~ typed-default-color") != null);
-    try std.testing.expectEqual(@as(usize, 3), screen.row);
+    // The actual body and footer use only their owned bottom-anchored rows.
+    for (screen.grid[screen.rows - 2]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[screen.rows - 1], "(fixture) ?%~ typed-default-color") != null);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
     ui.clock_ms = 680;
     try ui.draw();
@@ -10251,7 +10319,7 @@ test "flow model prefix wraps long editor suffix without changing raw cursor byt
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     // The cursor is on the first wrapped composer row, not the frame's last row.
-    try std.testing.expectEqual(ui.frame_height - 1 - ui.frame_cursor_rows_up, screen.row);
+    try std.testing.expectEqual(screen.rows - 1 - ui.frame_cursor_rows_up, screen.row);
     const first_row = screen.row - first_composer.layout.cursor_row;
     try std.testing.expect(std.mem.startsWith(u8, &screen.grid[first_row], "(fixture) ?%~ x"));
     try std.testing.expectEqual(text.width(first_composer.decoration.plain) + first_composer.layout.cursor_column, screen.col);
@@ -10270,7 +10338,7 @@ test "flow model prefix wraps long editor suffix without changing raw cursor byt
     try ui.draw();
     try screen.replay(ui.frame);
     // The composer is the frame's last block: its final row is the frame row.
-    try std.testing.expectEqual(ui.frame_height - 1 - (last_composer.layout.lines.len - 1 - last_composer.layout.cursor_row), screen.row);
+    try std.testing.expectEqual(screen.rows - 1 - (last_composer.layout.lines.len - 1 - last_composer.layout.cursor_row), screen.row);
     try std.testing.expectEqual(text.width(last_composer.decoration.plain) + last_composer.layout.cursor_column, screen.col);
     try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
     testAcknowledgeFullFrame(&ui);
@@ -10302,7 +10370,7 @@ test "resize abandons unknown rows and old completed approval cannot authorize" 
     try std.testing.expect(!ui.drawReady() and ui.frame.len == 0);
     ui.requestDraw(); // Genuine update, not a timer or a geometry repair.
     try ui.draw();
-    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\r\n"));
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\x1b[24B"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[999B") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[6A") == null);
@@ -10727,12 +10795,11 @@ test "editor tabs expand before clipping and cursor placement but submit unchang
         const prepared = try ui.prepareComposer(arena.allocator(), ui.connection.current(), ui.size.columns -| 1);
         try ui.draw();
         try std.testing.expect(std.mem.findScalar(u8, ui.frame, '\t') == null);
-        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 12, .rows = 7 };
         try screen.replay(ui.frame);
-        // The configured fixture has no notice, so the composer is the whole tail
-        // and it sits exactly on its own layout rows.
+        // The configured fixture has no notice, so the composer is the whole tail.
         try std.testing.expectEqual(prepared.layout.lines.len, ui.frame_height);
-        try std.testing.expectEqual(prepared.layout.cursor_row, screen.row);
+        try std.testing.expectEqual(screen.rows - prepared.layout.lines.len + prepared.layout.cursor_row, screen.row);
         try std.testing.expectEqual(text.width(prepared.decoration.plain) + prepared.layout.cursor_column, screen.col);
         try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);
         discardFixtureFrame(&ui);
@@ -12322,7 +12389,7 @@ test "wrapped composer cursor is ACK owned across sparse redraws" {
     // The composer occupies the tail; the notice sits directly above it and no
     // blank screen rows are written below the last composer row.
     try std.testing.expectEqual(ui.frame_composer_rows + 1, ui.frame_height);
-    try std.testing.expectEqual(ui.frame_height - 1, screen.row);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
     const rows = ui.tail_composer_rows;
     ui.editor.cursor = 0;
@@ -12331,7 +12398,7 @@ test "wrapped composer cursor is ACK owned across sparse redraws" {
     try std.testing.expect(ui.frame_cursor_rows_up > 0);
     try screen.replay(ui.frame);
     const up = ui.frame_cursor_rows_up;
-    try std.testing.expectEqual(rows - up, screen.row);
+    try std.testing.expectEqual(screen.rows - 1 - up, screen.row);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(up, ui.tail_cursor_rows_up);
     try std.testing.expectEqual(rows, ui.tail_composer_rows);
@@ -12339,13 +12406,13 @@ test "wrapped composer cursor is ACK owned across sparse redraws" {
     try ui.draw();
     try std.testing.expect(ui.frame_sparse);
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(ui.frame_height - 1, screen.row);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     try std.testing.expectEqual(@as(usize, 1), screen.count("(fixture)"));
     try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);
     testAcknowledgeFullFrame(&ui);
 }
 
-test "contraction cleans the last written row before a multiline cursor suffix" {
+test "closing approval reuses its footprint without erasing a multiline composer" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -12364,12 +12431,10 @@ test "contraction cleans the last written row before a multiline cursor suffix" 
     ui.clearPermission();
     try ui.draw();
     const after = ui.frame_height;
-    try std.testing.expect(before > after); // a real contraction
+    try std.testing.expectEqual(before, after); // Reused owned rows keep the footer anchored.
     try std.testing.expect(ui.frame_composer_rows > 1);
     try std.testing.expect(ui.frame_cursor_rows_up > 0); // cursor on the first composer line
     const suffix = ui.frame_tail_snapshot.?.cursor_suffix;
-    // Cleanup is now the suffix prefix, from the last written row.
-    try std.testing.expect(std.mem.startsWith(u8, suffix, "\r\x1b[1B\x1b[0K"));
     try std.testing.expect(std.mem.indexOfScalar(u8, suffix, '\n') == null);
     try std.testing.expect(std.mem.indexOf(u8, suffix, "\x1b[M") == null);
     try screen.replay(ui.frame);
@@ -12390,7 +12455,7 @@ test "contraction cleans the last written row before a multiline cursor suffix" 
         try joined.appendSlice(std.testing.allocator, visible);
     }
     try std.testing.expectEqualStrings(ui.editor.bytes.items, joined.items);
-    try std.testing.expectEqual(after - 1 - ui.frame_cursor_rows_up, screen.row);
+    try std.testing.expectEqual(screen.rows - 1 - ui.frame_cursor_rows_up, screen.row);
     testAcknowledgeFullFrame(&ui);
 }
 
@@ -12777,8 +12842,8 @@ test "effort confirmation expires after two seconds and repeated switches restar
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(screen.visible("fixture-old) high"));
     try std.testing.expectEqualDeep(context, ui.display.context);
-    // The composer and its real notice are the whole floating tail.
-    try std.testing.expectEqual(@as(usize, 1), screen.row);
+    // The composer and its real notice occupy a short bottom tail.
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     try std.testing.expectEqual(@as(usize, 2), ui.frame_height);
     try std.testing.expectEqual(text.width("(fixture-old) high> "), screen.col);
 
@@ -12809,7 +12874,7 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(screen.visible("fixture-old) 6.1%"));
-    try std.testing.expectEqual(@as(usize, 1), screen.row);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     ui.cycleEffort();
     try std.testing.expect(ui.effort_flash == null);
     fixture.fail = false;
@@ -13098,6 +13163,7 @@ test "popup close restores every visible transcript row for root provider and mo
                 const menu_borrowed = ui.frame_menu_history.?.borrowed.len;
                 try screen.replay(ui.frame);
                 testAcknowledgeFullFrame(&ui);
+                try std.testing.expectEqual(screen.rows - 1, screen.row + ui.tail_cursor_rows_up);
                 // Locate the actual first candidate, not merely missing labels.
                 var first: ?usize = null;
                 for (screen.grid, 0..) |line, i| {
@@ -13119,6 +13185,7 @@ test "popup close restores every visible transcript row for root provider and mo
                 const close_borrowed = ui.frame_menu_history.?.borrowed.len;
                 try screen.replay(ui.frame);
                 testAcknowledgeFullFrame(&ui);
+                try std.testing.expectEqual(screen.rows - 1, screen.row + ui.tail_cursor_rows_up);
                 for (before[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2], 0..) |old, restored, row| {
                     if (!std.mem.eql(u8, &old, &restored)) {
                         std.debug.print("popup restore history={d} size={d}x{d} command={s} row={d}\ninitial height={d} tail_start={d} above={d} borrowed={d}; menu height={d} borrow_count={d} above={d} borrowed={d}; close height={d} above={d} borrowed={d}\n", .{
@@ -13174,9 +13241,9 @@ test "popup close restores every visible transcript row for root provider and mo
                 try ui.draw();
                 try screen.replay(ui.frame);
                 testAcknowledgeFullFrame(&ui);
-                // A width ABA revokes every physical coordinate. The next frame
-                // continues from the cursor's natural row instead of reclaiming
-                // stale rows, and no completed record text is regenerated.
+                // A width ABA revokes every physical coordinate. The next fresh
+                // frame establishes a bottom anchor without reclaiming stale rows
+                // or regenerating completed record text.
                 ui.resize(.{ .columns = dimensions.columns - 1, .rows = dimensions.rows });
                 ui.resize(dimensions);
                 try std.testing.expect(ui.tail_snapshot == null and ui.abandon_tail and !ui.tail_bottom);
@@ -13190,7 +13257,8 @@ test "popup close restores every visible transcript row for root provider and mo
                 try std.testing.expect(std.mem.find(u8, ui.frame[0..ui.frame_clear_end], "\x1b[999B") == null);
                 try std.testing.expect(std.mem.find(u8, ui.frame[0..ui.frame_clear_end], "\x1b[2J") == null);
                 try std.testing.expect(std.mem.find(u8, ui.frame[0..ui.frame_clear_end], "\x1b[0J") == null);
-                try std.testing.expect(std.mem.endsWith(u8, ui.frame[0..ui.frame_clear_end], "\r\n"));
+                try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r"));
+                try std.testing.expect(std.mem.find(u8, ui.frame[0..ui.frame_clear_end], "\x1b[2J") == null);
                 try std.testing.expect(std.mem.find(u8, ui.frame, "row-0") == null);
                 try screen.replay(ui.frame);
                 testAcknowledgeFullFrame(&ui);
@@ -13214,7 +13282,7 @@ test "popup close restores every visible transcript row for root provider and mo
                 // claim: locate it from the real cursor and tail geometry instead
                 // of scanning the whole grid, and require no candidate inside it.
                 const tail_bottom = screen.row + ui.tail_cursor_rows_up;
-                try std.testing.expect(ui.tail_height != 0 and tail_bottom < screen.rows);
+                try std.testing.expect(ui.tail_height != 0 and tail_bottom == screen.rows - 1);
                 try std.testing.expect(tail_bottom + 1 >= ui.tail_height);
                 const tail_top = tail_bottom + 1 - ui.tail_height;
                 try std.testing.expect(tail_top <= screen.row);
@@ -13266,6 +13334,10 @@ test "popup close restores every visible transcript row for root provider and mo
                 try ui.draw();
                 try screen.replay(ui.frame);
                 testAcknowledgeFullFrame(&ui);
+                try std.testing.expect(ui.tail_bottom and ui.tail_height != 0);
+                try std.testing.expectEqual(resized.rows - 1, screen.row + ui.tail_cursor_rows_up);
+                try std.testing.expectEqual(resized, ui.tail_size);
+                const resized_menu_height = ui.tail_height;
                 try ui.parser.feed("\x1b", sink);
                 try ui.parser.expireEscape(sink);
                 try ui.parser.feed("\x15", sink);
@@ -13282,7 +13354,33 @@ test "popup close restores every visible transcript row for root provider and mo
                     try std.testing.expect(screen.count(value) <= 1);
                 }
                 try std.testing.expect(screen.count("new-row") <= 1);
-                try std.testing.expect(ui.tail_height <= @as(usize, 3));
+                // The ACKed overlay footprint remains owned after an empty close;
+                // only its current composer row and legitimate footer hint may contain text.
+                try std.testing.expectEqual(resized_menu_height, ui.tail_height);
+                try std.testing.expect(ui.tail_snapshot != null);
+                try std.testing.expectEqual(resized, ui.tail_size);
+                const resized_bottom = screen.row + ui.tail_cursor_rows_up;
+                try std.testing.expectEqual(resized.rows - 1, resized_bottom);
+                try std.testing.expect(resized_bottom + 1 >= ui.tail_height);
+                const resized_top = resized_bottom + 1 - ui.tail_height;
+                try std.testing.expect(screen.row >= resized_top and screen.row <= resized_bottom);
+                try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                const expected_hint = try ui.footerHint(arena.allocator(), ui.connection.current());
+                try std.testing.expect(expected_hint.len != 0);
+                try std.testing.expect(std.mem.indexOfScalar(u8, expected_hint, '\n') == null);
+                try std.testing.expectEqual(@as(usize, 1), ui.tail_composer_rows);
+                const cols = @max(1, resized.columns - 1);
+                const expected_hint_prefix = expected_hint[0..text.fitBytes(expected_hint, cols)];
+                for (resized_top..resized_bottom + 1) |owned| {
+                    if (owned == screen.row) continue;
+                    if (expected_hint.len != 0 and owned == resized_bottom - 1) {
+                        try std.testing.expectEqualStrings(std.mem.trim(u8, expected_hint_prefix, " "), std.mem.trim(u8, &screen.grid[owned], " "));
+                    } else {
+                        try std.testing.expectEqualStrings("", std.mem.trim(u8, &screen.grid[owned], " "));
+                    }
+                }
             }
         }
     }
@@ -13319,15 +13417,17 @@ test "reasoning window grows below the committed user row and never borrows it" 
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 80, .rows = 24 };
-    // A small floating tail: the committed user row is the only row above it.
+    // A small bottom-anchored tail: the committed user row is directly above it.
     _ = try ui.add(.user, "stream-task");
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
     const tail_before = ui.tail_height;
     try std.testing.expect(tail_before != 0 and tail_before < 6);
-    try std.testing.expectEqual(@as(usize, 1), ui.menu_history.?.above.len);
+    try std.testing.expectEqual(screen.rows - ui.tail_height, ui.menu_history.?.above.len);
+    try std.testing.expect(std.mem.indexOf(u8, ui.menu_history.?.above[ui.menu_history.?.above.len - 1], "stream-task") != null);
     try std.testing.expectEqual(@as(usize, 1), screen.count("stream-task"));
+    const history_before = screen.history_len;
     try ui.appendDraft(.reasoning, "think-one\nthink-two\nthink-three\nthink-four");
     try ui.draw();
     try screen.replay(ui.frame);
@@ -13339,7 +13439,9 @@ test "reasoning window grows below the committed user row and never borrows it" 
         try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
     try std.testing.expectEqual(@as(usize, 1), screen.count("stream-task"));
     try expectTranscriptGap(&screen, "stream-task", "think-two");
-    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    try std.testing.expect(screen.visible("stream-task"));
+    try std.testing.expectEqual(history_before + 4, screen.history_len);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 0), ui.menu_history.?.borrowed.len);
     const window_rows = ui.tail_height;
@@ -13353,7 +13455,7 @@ test "reasoning window grows below the committed user row and never borrows it" 
         try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
     try std.testing.expectEqual(@as(usize, 1), screen.count("stream-task"));
     try expectTranscriptGap(&screen, "stream-task", "think-four");
-    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    try std.testing.expectEqual(history_before + 4, screen.history_len);
     testAcknowledgeFullFrame(&ui);
     // The canonical answer replaces the window; the user row is not replayed.
     try ui.appendDraft(.assistant, "final-answer");
@@ -13390,8 +13492,10 @@ test "busy stop modal during reasoning restores the borrowed user row and window
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    try std.testing.expectEqual(@as(usize, 1), ui.menu_history.?.borrowed.len);
+    try std.testing.expect(ui.menu_history.?.borrowed.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, ui.menu_history.?.borrowed[ui.menu_history.?.borrowed.len - 1], "stream-task") != null);
     try std.testing.expectEqual(@as(usize, 0), screen.count("stream-task"));
+    const modal_history = screen.history_len;
     // Closing the modal must not keep ignoring that borrowed prefix: the user
     // row returns to its original row before the window resumes.
     try Ui.key(&ui, .escape);
@@ -13400,10 +13504,11 @@ test "busy stop modal during reasoning restores the borrowed user row and window
     try screen.replay(ui.frame);
     try std.testing.expectEqual(@as(usize, 1), screen.count("stream-task"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "think-") == null);
-    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    try std.testing.expectEqual(modal_history, screen.history_len);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 0), ui.menu_history.?.borrowed.len);
-    try std.testing.expectEqual(tail_before, ui.tail_height);
+    try std.testing.expect(ui.tail_height >= tail_before);
+    const restored_height = ui.tail_height;
     // The next frame updates the same three-row window below that row.
     try ui.draw();
     try screen.replay(ui.frame);
@@ -13412,7 +13517,9 @@ test "busy stop modal during reasoning restores the borrowed user row and window
     for ([_][]const u8{ "stream-task", "think-two", "think-three", "think-four" }) |marker|
         try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
     try expectTranscriptGap(&screen, "stream-task", "think-two");
-    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    try std.testing.expect(screen.visible("stream-task"));
+    try std.testing.expectEqual(modal_history + (ui.frame_height -| restored_height), screen.history_len);
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
 }
 
@@ -13473,15 +13580,14 @@ test "resized reasoning frame revokes the old ACK without autonomous recovery" {
     try std.testing.expect(!ui.drawReady() and !ui.dirty and ui.frame.len == 0);
     try std.testing.expect(ui.tail_snapshot == null and !ui.tail_bottom and ui.abandon_tail);
     try std.testing.expectEqual(@as(usize, 18), ui.size.rows);
-    // The next genuine update draws once at the new geometry. It continues from
-    // the cursor's own row: no physical-bottom move, no whole-screen clear, no
-    // blank fill, and no attempt to reclaim old coordinates.
+    // The next genuine update establishes a bounded bottom anchor without
+    // clearing the screen or reclaiming old coordinates.
     ui.requestDraw();
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[999B") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[0J") == null);
-    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\r\n"));
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\x1b[18B"));
     // The bounded reasoning window carries its visible rows only; completed
     // canonical rows are neither reflowed nor replayed at the new width.
     try std.testing.expectEqual(reasoning_footprint, ui.frame_height);
@@ -15960,7 +16066,85 @@ test "reasoning stale geometry and reset ABA never acknowledge old fences" {
     try std.testing.expectEqual(generation, ui.delivery_fences.items[0].generation);
 }
 
-test "zero-row reference metadata requires a complete fresh unobscured commit" {
+test "empty heading EOF metadata requires a complete fresh unobscured frame" {
+    for (0..4) |scenario| {
+        var fake = FakeRemote{};
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = remoteUi(&fake, &bridge, &cancel);
+        defer ui.deinit();
+        fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "# " });
+        fake.item.?.delivery_epoch = 9;
+        fake.item.?.delivery_sequence = 1;
+        try ui.pumpRemote();
+        const index = ui.draft.?;
+        const body = ui.records.items[index].stream.?;
+        try body.finish(); // Known EOF, while retaining the draft's flow ownership.
+        if (scenario == 2) ui.permission = .{ .id = 7, .description = try ui.allocator.dupe(u8, "approval"), .clipped = false, .pasted = false, .epoch = 9 };
+        try ui.draw();
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].lines.len);
+        try std.testing.expectEqual(@as(usize, 1), ui.frame_records.len);
+        try std.testing.expectEqual(scenario != 2, ui.frame_records[0].metadata_staged);
+        try std.testing.expectEqual(@as(usize, 0), ui.frame_records[0].stream_rows);
+        try std.testing.expect(body.hasMetadataProgress());
+        try std.testing.expect(!body.isDrained());
+        try std.testing.expectEqual(@as(usize, 0), body.base);
+        try std.testing.expectEqual(@as(usize, 2), body.windowBytes());
+        try std.testing.expectEqualStrings("# ", body.source.items);
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
+        try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+        try std.testing.expect(ui.frame.len > 1);
+        if (scenario == 0) {
+            ui.frame_offset = ui.frame.len - 1;
+            ui.finishFrame();
+            try std.testing.expect(body.hasMetadataProgress());
+            try std.testing.expect(!body.isDrained());
+            try std.testing.expectEqual(@as(usize, 0), body.base);
+            try std.testing.expectEqual(@as(usize, 2), body.windowBytes());
+            try std.testing.expectEqualStrings("# ", body.source.items);
+            try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
+            try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+        } else if (scenario == 1) {
+            ui.frame_fresh = false;
+        } else if (scenario == 3) {
+            ui.resize(.{ .columns = 79, .rows = 24 });
+            ui.resize(.{ .columns = 80, .rows = 24 });
+            try std.testing.expectEqual(@as(usize, 0), ui.frame.len);
+        }
+        if (scenario != 3) {
+            ui.frame_offset = ui.frame.len;
+            ui.finishFrame();
+        }
+        if (scenario != 0) {
+            try std.testing.expect(!body.hasMetadataProgress());
+            try std.testing.expectEqual(@as(usize, 0), body.base);
+            try std.testing.expect(!body.isDrained());
+            try std.testing.expectEqual(@as(usize, 2), body.windowBytes());
+            try std.testing.expectEqualStrings("# ", body.source.items);
+            try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
+            try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+            if (scenario == 2) ui.clearPermission();
+            if (scenario == 3) ui.requestDraw();
+            try ui.draw();
+            try std.testing.expect(body.hasMetadataProgress());
+            try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].lines.len);
+            try std.testing.expect(ui.frame_records[0].metadata_staged);
+            ui.frame_offset = ui.frame.len;
+            ui.finishFrame();
+        }
+        try std.testing.expect(!body.hasMetadataProgress());
+        try std.testing.expect(body.isDrained());
+        try std.testing.expectEqual(@as(usize, 2), body.base);
+        try std.testing.expectEqual(@as(usize, 0), body.windowBytes());
+        try std.testing.expectEqualStrings("", body.source.items);
+        try std.testing.expectEqual(@as(usize, 2), ui.records.items[index].delivery_visible);
+        try std.testing.expectEqual(@as(usize, 1), fake.ack_count);
+        try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+    }
+}
+
+test "literal reference definition requires a complete fresh unobscured frame" {
     for (0..3) |scenario| {
         var fake = FakeRemote{};
         var cancel: p.Cancellation = .{};
@@ -15977,7 +16161,7 @@ test "zero-row reference metadata requires a complete fresh unobscured commit" {
         const body = ui.records.items[index].stream.?;
         if (scenario == 2) ui.permission = .{ .id = 7, .description = try ui.allocator.dupe(u8, "approval"), .clipped = false, .pasted = false, .epoch = 9 };
         try ui.draw();
-        try std.testing.expectEqual(@as(usize, 0), body.visibleRows().len);
+        if (scenario != 2) try std.testing.expect(std.mem.indexOf(u8, ui.frame, "[r]: https://example.org/one") != null);
         try std.testing.expectEqual(@as(usize, 0), body.base);
         try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
         if (scenario == 0) {
@@ -15985,7 +16169,6 @@ test "zero-row reference metadata requires a complete fresh unobscured commit" {
             ui.frame_offset = ui.frame.len - 1;
             ui.finishFrame();
             try std.testing.expectEqual(@as(usize, 0), body.base);
-            try std.testing.expect(body.references == null);
             try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
         } else if (scenario == 1) ui.frame_fresh = false;
         ui.frame_offset = ui.frame.len;
@@ -15993,34 +16176,27 @@ test "zero-row reference metadata requires a complete fresh unobscured commit" {
         if (scenario != 0) {
             try std.testing.expectEqual(@as(usize, 0), body.base);
             try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
-            try std.testing.expect(body.references == null);
             try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
             if (scenario == 2) ui.clearPermission();
             try ui.draw();
             ui.frame_offset = ui.frame.len;
             ui.finishFrame();
         }
-        try std.testing.expectEqual(definition.len, body.base);
-        try std.testing.expectEqual(definition.len, ui.records.items[index].delivery_visible);
+        try std.testing.expect(ui.records.items[index].delivery_visible != 0);
         try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
-        try std.testing.expect(body.references != null);
         fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "later [two][r]\n" });
         fake.item.?.delivery_epoch = 9;
         fake.item.?.delivery_sequence = 2;
         try ui.pumpRemote();
         try ui.draw();
-        var found = false;
-        for (body.visibleRows()) |row| if (std.mem.indexOf(u8, row.text, "https://example.org/one") != null) {
-            found = true;
-        };
-        try std.testing.expect(found);
+        try std.testing.expect(std.mem.indexOf(u8, ui.frame, "[two][r]") != null);
         ui.frame_offset = ui.frame.len;
         ui.finishFrame();
         try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);
     }
 }
 
-test "unresolved zero-cut reference waits without redraw or source acknowledgement" {
+test "reference-looking syntax remains literal rather than resolving a link" {
     var fake = FakeRemote{};
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -16032,30 +16208,17 @@ test "unresolved zero-cut reference waits without redraw or source acknowledgeme
     fake.item.?.delivery_epoch = 9;
     fake.item.?.delivery_sequence = 1;
     try ui.pumpRemote();
-    const index = ui.draft.?;
-    const body = ui.records.items[index].stream.?;
     try ui.draw();
-    try std.testing.expectEqual(@as(usize, 0), body.visibleRows().len);
-    try std.testing.expect(!body.hasMetadataProgress());
-    ui.dirty = false;
+    try std.testing.expect(std.mem.indexOf(u8, ui.frame, "[ref]: https://example.org/url") != null);
     ui.frame_offset = ui.frame.len;
     ui.finishFrame();
-    try std.testing.expect(!ui.dirty);
-    try std.testing.expectEqual(@as(usize, 0), body.base);
-    try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
-    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
-    try std.testing.expectEqual(@as(usize, candidate.len), body.windowBytes());
-    try std.testing.expect(body.references == null);
+    try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
     fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "  \"title\"\n\n[link][ref]\n" });
     fake.item.?.delivery_epoch = 9;
     fake.item.?.delivery_sequence = 2;
     try ui.pumpRemote();
     try ui.draw();
-    var found = false;
-    for (body.visibleRows()) |row| if (std.mem.indexOf(u8, row.text, "https://example.org/url") != null) {
-        found = true;
-    };
-    try std.testing.expect(found);
+    try std.testing.expect(std.mem.indexOf(u8, ui.frame, "[link][ref]") != null);
     ui.frame_offset = ui.frame.len;
     ui.finishFrame();
     try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);

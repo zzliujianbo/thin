@@ -187,18 +187,12 @@ def run(app, wrap=False, local_command=False):
                 return tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()
 
             def visible(width, height, marker=''):
-                """Composer at the real cursor row, never a pinned physical bottom.
-
-                The first frame floats at the terminal's existing cursor row, so
-                the live tail owns that row and the bounded composer rows above
-                it. The window follows the real cursor; the last physical rows
-                are ours only when the client reflowed the tail there.
-                """
+                """An end-position composer is anchored to the physical bottom."""
                 state = pane_state(width, height)
                 if state is None:
                     return False
                 y, _x, flag, dead = state
-                if flag != 1 or dead != 0 or not 0 <= y < height:
+                if flag != 1 or dead != 0 or y != height - 1:
                     return False
                 lines = lines_now()
                 if len(lines) != height:
@@ -256,16 +250,15 @@ def run(app, wrap=False, local_command=False):
                 The observation is the current editor region at the real cursor,
                 not scrollback or pixels reflowed by the client: the typed Q must
                 appear there and disappear again with the preserved draft still
-                ending there. Bottom pinning and application-side reflow of older
-                rows are not required.
+                ending on the physical bottom. Older rows are not replayed.
                 """
                 tm('send-keys', '-t', 'owned:0.0', '-l', 'Q')
-                wait(lambda: (composer(width, height) or '').endswith(marker + 'Q'), f'fresh {width}x{height} editor did not echo the typed cell')
+                wait(lambda: (composer(width, height) or '').endswith(marker + 'Q') and caret()[0] == height - 1, f'fresh {width}x{height} editor did not echo the typed cell at bottom')
                 tm('send-keys', '-t', 'owned:0.0', 'BSpace')
 
                 def restored():
                     text = composer(width, height)
-                    return text is not None and text.endswith(marker) and 'Q' not in text
+                    return text is not None and text.endswith(marker) and 'Q' not in text and caret()[0] == height - 1
 
                 wait(restored, f'fresh {width}x{height} frame after BSpace lost the draft')
 
@@ -355,8 +348,8 @@ def run(app, wrap=False, local_command=False):
                     print(f'PASS composer-wrap: seed={"local-command" if local_command else "loopback"}, visible multiline input, visual rows, exact-origin history/draft restore, bounded Unicode viewport')
                 # Passive resize stage: the client owns reflow of already displayed
                 # cells. Thin takes the new dimensions, drops old-frame authority
-                # and resumes on real input; no automatic repair, no bottom
-                # pinning and no application reflow of older rows is required.
+                # and resumes on real input; no automatic repair or application
+                # reflow of older rows is required. Fresh frames pin the editor.
                 marker = '-UNICODE-END' if wrap else '世界-END'
                 for width, height in ((80, 40), (80, 8), (80, 24), (40, 24), (80, 24)):
                     passive_resize(width, height)

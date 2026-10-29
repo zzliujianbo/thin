@@ -116,12 +116,9 @@ pub const Terminal = struct {
     }
 
     fn enterDisplay(self: *Terminal) !void {
-        // Bounded lifetime: only the entry control sequence. Startup MUST NOT
-        // move the cursor or erase any row, so shell history above the seeded
-        // cursor stays exactly where the user left it. The live tail owns all
-        // later geometry on top of that cursor; scrolling is never synthesized
-        // here (rows*CRLF + CUU would scroll the whole screen and defeat the
-        // floating frame).
+        // Entry handles terminal controls only and does not own geometry.
+        // The TUI's real fresh frame performs a bounded native scroll to anchor
+        // the tail at the bottom; never clear the screen or replay history here.
         // 进入序列的写入次数有上限（50），避免被背压无限阻塞。
         if (!self.writeBounded(enter, 50)) return error.TerminalSetupFailed;
     }

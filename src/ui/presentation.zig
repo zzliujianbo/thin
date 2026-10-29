@@ -39,7 +39,9 @@ fn boundedLine(a: std.mem.Allocator, bytes: []const u8, columns: usize, source_c
             at = cluster.end;
         }
     }
-    const clipped = source_clipped or prefix.truncated or text.width(safe) > columns;
+    // The same whole-cluster fit that bounds the row also decides whether the
+    // ellipsis is needed; a byte cap or a cut source is still clipping metadata.
+    const clipped = source_clipped or prefix.truncated or text.fitBytes(safe, columns) != safe.len;
     const room = columns -| @min(columns, @as(usize, if (clipped) 3 else 0));
     const byte_room = max_bytes -| @as(usize, if (clipped) 3 else 0);
     var end: usize = 0;
@@ -169,14 +171,14 @@ fn outcomeColor(outcome: Outcome) []const u8 {
 
 fn prefixColor(outcome: Outcome) []const u8 {
     return switch (outcome) {
-        .pending => "", // Before execution: neutral; active animation is separate.
+        .pending => "", // Before execution: neutral; the running icon breathes on its own.
         .success => theme.success,
         .failed => theme.failure,
         .canceled => theme.caution,
     };
 }
 
-/// Composer and tool indicators share the same palette and pulse clock.
+/// Composer busy marker palette; tool rows breathe with `theme.toolIconColor`.
 fn activeIndicatorColor(now_ms: u64) []const u8 {
     return theme.command_pulse[shared.activity.commandStep(now_ms)];
 }
@@ -201,8 +203,8 @@ pub fn commandColumns(columns: usize) usize {
 
 /// `duration_ms` is the measured wall-clock execution time of this row. It is
 /// rendered last, in muted color, so it survives label clipping and never
-/// competes with the outcome color or diff marks. `active_time_ms` remains the
-/// animation clock only; the two are deliberately independent.
+/// competes with the outcome color or diff marks. `active_time_ms` is the icon
+/// breathing clock only; the two are deliberately independent.
 pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, duration_ms: ?u64, active_time_ms: ?u64) ![]const u8 {
     // Detail stays <=512 bytes; allow its prefix and bounded observed counts
     // without sanitizing/truncating the same path a second time at512 bytes.
@@ -228,10 +230,13 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         const prefix_end = if (begin < end) @min(text.nextCluster(safe, begin, 0).end, end) else begin;
         // Never turn clipped ellipsis bytes into a phantom running tool icon.
         const has_prefix = begin == span.start and begin < body.len and std.mem.eql(u8, safe[begin..prefix_end], body[begin..text.nextCluster(body, begin, 0).end]);
+        // An executing call keeps its own icon: only its brightness breathes, so
+        // glyph, column and cell width match the finished row exactly. A row that
+        // is still generating arguments (or awaiting approval) is not executing,
+        // so it stays neutral and static instead of claiming a running call.
         if (span.outcome == .pending and active_time_ms != null and has_prefix) {
-            const now_ms = active_time_ms.?;
-            const indicator = if (span.generating) theme.muted else activeIndicatorColor(now_ms);
-            try out.writer.print("{s}{s}{s}", .{ indicator, activity.spinner(now_ms), theme.muted });
+            const indicator = if (span.generating) theme.muted else theme.toolIconColor(active_time_ms.?);
+            try out.writer.print("{s}{s}{s}", .{ indicator, safe[begin..prefix_end], theme.muted });
             if (span.generating and span.write_marks != null) {
                 var cursor = prefix_end;
                 const marks = span.write_marks.?;
@@ -605,10 +610,13 @@ test "provisional write counts are explicit typed preview and generation stays m
     const span: CommandSpan = .{ .start = 0, .end = body.len, .outcome = .pending, .write_marks = known.write_marks.?.shifted(2), .generating = true };
     const first = try commandLine(a, body, &.{span}, 80, null, 0);
     defer a.free(first);
-    const second = try commandLine(a, body, &.{span}, 80, null, 80);
+    const second = try commandLine(a, body, &.{span}, 80, null, 900);
     defer a.free(second);
-    try std.testing.expect(!std.mem.eql(u8, first, second));
-    try std.testing.expect(std.mem.indexOf(u8, first, theme.command_pulse[0]) == null);
+    // Generation is not execution: the icon stays in place, neutral and static,
+    // and no running brightness may claim the call has started.
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.startsWith(u8, first, theme.muted ++ "w" ++ theme.muted ++ " preview.zig"));
+    for (theme.tool_icon_pulse) |tone| try std.testing.expect(std.mem.indexOf(u8, first, tone) == null);
     try std.testing.expect(std.mem.indexOf(u8, first, theme.diff_added ++ "+12") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, theme.diff_removed ++ "-3") != null);
     const unknown = try provisionalWrite(a, value, .{});
@@ -825,7 +833,7 @@ test "model keeps effort and TPS waves while context percent has static occupanc
     }
 }
 
-test "composer busy indicator shares tool pulse including narrow widths without color bleed" {
+test "composer busy marker keeps its own braille pulse while tool rows breathe separately" {
     try text.initLocale();
     const a = std.testing.allocator;
     for ([_]u64{ 0, 79, 80, 119, 120, 239, 960, std.math.maxInt(u64) }) |now| {
@@ -833,7 +841,7 @@ test "composer busy indicator shares tool pulse including narrow widths without 
         const icon = activity.spinner(now);
         const ending = try std.fmt.allocPrint(a, "{s}{s}{s} ", .{ color, icon, theme.reset });
         defer a.free(ending);
-        const tool_prefix = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ color, icon, theme.muted });
+        const tool_prefix = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ theme.toolIconColor(now), ">", theme.muted });
         defer a.free(tool_prefix);
         const tool = try commandLine(a, "> target", &.{.{ .start = 0, .end = 8, .outcome = .pending }}, 80, null, now);
         defer a.free(tool);
@@ -848,7 +856,7 @@ test "composer busy indicator shares tool pulse including narrow widths without 
     }
 }
 
-test "all four tool prefixes rotate80ms while preserving independent120ms warm pulse" {
+test "all four tool icons breathe warm while glyph, column and width stay fixed" {
     try text.initLocale();
     const a = std.testing.allocator;
     for ([_]activity.Tool{ .bash, .read, .write, .memory }) |kind| {
@@ -856,10 +864,10 @@ test "all four tool prefixes rotate80ms while preserving independent120ms warm p
         const body = try commandText(a, value, .pending);
         defer a.free(body);
         const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }};
-        for ([_]u64{ 0, 80, 120 }) |time| {
+        for ([_]u64{ 0, 80, 180, 360 }) |time| {
             const line = try commandLine(a, body, spans, 100, null, time);
             defer a.free(line);
-            const prefix = try std.fmt.allocPrint(a, "{s}{s}{s} operation target{s}", .{ theme.command_pulse[shared.activity.commandStep(time)], activity.spinner(time), theme.muted, theme.reset });
+            const prefix = try std.fmt.allocPrint(a, "{s}{s}{s} operation target{s}", .{ theme.toolIconColor(time), activity.icon(kind), theme.muted, theme.reset });
             defer a.free(prefix);
             try std.testing.expectEqualStrings(prefix, line);
         }
@@ -939,28 +947,97 @@ test "command duration stays last and inside the row width for every outcome" {
     }
 }
 
-test "only pending command prefix pulses and completed spans remain static and clipped safely" {
+test "only the executing tool icon breathes while completed spans stay static and clipped safely" {
     const a = std.testing.allocator;
     const body = "> sleep 1";
     const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }};
     const first = try commandLine(a, body, spans, 79, null, 0);
     defer a.free(first);
-    const second = try commandLine(a, body, spans, 79, null, 120);
+    const second = try commandLine(a, body, spans, 79, null, 180);
     defer a.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
-    try std.testing.expect(std.mem.find(u8, first, theme.command_pulse[0] ++ "⠋" ++ theme.muted ++ " sleep 1") != null);
-    for ([_]Outcome{ .success, .failed, .canceled }) |outcome| {
-        const complete = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }};
-        const one = try commandLine(a, body, complete, 79, null, 0);
-        defer a.free(one);
-        const two = try commandLine(a, body, complete, 79, null, 1);
-        defer a.free(two);
-        try std.testing.expectEqualStrings(one, two);
-    }
+    try std.testing.expect(std.mem.find(u8, first, theme.tool_icon_pulse[0] ++ ">" ++ theme.muted ++ " sleep 1") != null);
+    // A clip that eats the icon cannot fabricate one: no prefix, no breathing.
     const narrow = try commandLine(a, "r long-path", &.{CommandSpan{ .start = 0, .end = "r long-path".len, .outcome = .pending }}, 4, null, 1);
     defer a.free(narrow);
     try std.testing.expect(std.unicode.utf8ValidateSlice(narrow));
     try std.testing.expectEqualStrings(theme.muted ++ "..." ++ theme.reset, narrow);
+    for ([_]Outcome{ .success, .failed, .canceled }) |outcome| {
+        const complete = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }};
+        const one = try commandLine(a, body, complete, 79, null, 0);
+        defer a.free(one);
+        const two = try commandLine(a, body, complete, 79, null, 180);
+        defer a.free(two);
+        try std.testing.expectEqualStrings(one, two);
+    }
+}
+
+/// Test-only: the visible text of a rendered row, with renderer-owned SGR removed.
+fn visibleRow(a: std.mem.Allocator, styled: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    var at: usize = 0;
+    while (at < styled.len) {
+        if (styled[at] != '\x1b') {
+            try out.writer.writeByte(styled[at]);
+            at += 1;
+            continue;
+        }
+        at = (std.mem.findScalarPos(u8, styled, at, 'm') orelse return error.UnterminatedSgr) + 1;
+    }
+    return a.dupe(u8, out.written());
+}
+
+test "executing icon keeps one glyph and column across phases while only brightness moves" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    const times = [_]u64{ 0, 179, 180, 360, 540, 720, 900, 1080, std.math.maxInt(u64) };
+    for ([_]activity.Tool{ .bash, .read, .write, .memory, .subagent, .other }) |kind| {
+        const value: Caption = .{ .kind = kind, .label = "operation 中文 target" };
+        const body = try commandText(a, value, .pending);
+        defer a.free(body);
+        const icon = body[0..activity.icon(kind).len];
+        const done = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .success }}, 80, 250, 900);
+        defer a.free(done);
+        const done_visible = try visibleRow(a, done);
+        defer a.free(done_visible);
+        var tones: [theme.tool_icon_pulse.len][]const u8 = undefined;
+        var tone_count: usize = 0;
+        for (times) |now| {
+            const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .pending }}, 80, 250, now);
+            defer a.free(line);
+            const tone = theme.toolIconColor(now);
+            // Only brightness moves: same glyph bytes, same column, same width.
+            try std.testing.expectEqualStrings(tone, line[0..tone.len]);
+            try std.testing.expectEqualStrings(icon, line[tone.len .. tone.len + icon.len]);
+            try std.testing.expect(std.mem.startsWith(u8, line[tone.len + icon.len ..], theme.muted));
+            const visible = try visibleRow(a, line);
+            defer a.free(visible);
+            // Stripping SGR leaves exactly the finished row's text: same icon,
+            // same column, same caption and the same measured timer suffix.
+            try std.testing.expectEqualStrings(done_visible, visible);
+            try std.testing.expectEqual(text.styledWidth(done), text.styledWidth(line));
+            var known = false;
+            for (tones[0..tone_count]) |seen| known = known or std.mem.eql(u8, seen, tone);
+            if (!known) {
+                tones[tone_count] = tone;
+                tone_count += 1;
+            }
+        }
+        // A finite warm ramp, never a running character or a blinking cell.
+        try std.testing.expect(tone_count >= 4);
+        try std.testing.expect(std.mem.indexOf(u8, body, "⠋") == null);
+        // Generation is not execution: the same icon stays put but neutral and
+        // static, and it never borrows a running brightness or a timer.
+        for ([_]u64{ 0, 180, 900, std.math.maxInt(u64) }) |now| {
+            const generating = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .pending, .generating = true }}, 80, null, now);
+            defer a.free(generating);
+            const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ theme.muted, icon, theme.muted, body[icon.len..], theme.reset });
+            defer a.free(expected);
+            try std.testing.expectEqualStrings(expected, generating);
+            for (theme.tool_icon_pulse) |tone| try std.testing.expect(std.mem.indexOf(u8, generating, tone) == null);
+        }
+    }
 }
 
 test "long byte capped paths use complete clusters and only ascii truncation dots" {

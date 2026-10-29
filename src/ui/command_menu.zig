@@ -106,15 +106,8 @@ pub fn rows(a: std.mem.Allocator, matches: Matches, selected: usize, columns: us
 /// Width-clipped single line without terminal escape sequences.
 fn singleLine(a: std.mem.Allocator, raw: []const u8, columns: usize) ![]const u8 {
     if (columns == 0) return a.dupe(u8, "");
-    var width: usize = 0;
-    var end: usize = 0;
-    while (end < raw.len) {
-        const cluster = text.nextCluster(raw, end, 0);
-        if (width + cluster.width > columns) break;
-        width += cluster.width;
-        end = cluster.end;
-    }
-    return a.dupe(u8, raw[0..end]);
+    // Rows are built from static single-line command metadata (no tabs).
+    return a.dupe(u8, raw[0..text.fitBytes(raw, columns)]);
 }
 
 pub const Menu = struct {

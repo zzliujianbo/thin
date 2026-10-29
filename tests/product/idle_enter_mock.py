@@ -2,9 +2,8 @@
 """Owned PTY + loopback-only idle Enter acceptance. No installed packages.
 Build interface: python3 tests/product/idle_enter_mock.py /absolute/path/to/thin
 The child HOME/project/config are generated here; Memory is explicitly off.
-The PTY starts on 23 owned shell rows, so the floating tail's first composer is on
-the physical bottom; only then does an empty Enter advance native scrollback, and
-only then does the exact-three-native-rows oracle mean what it asserts.
+The PTY starts at the top of an empty screen; the initial complete frame must
+place the composer at the physical bottom before the native-row oracle starts.
 Resize is passive here: dimensions change, old frame authority is dropped and the
 application must not repaint on size alone. The next real edit draws the fresh
 frame at the new width.
@@ -66,18 +65,6 @@ def cells(raw):
                for ch in CSI.sub(b'', raw).decode('utf-8'))
 
 
-def seed_rows(rows=ROWS):
-    """Owned, nonblank fixture rows that leave the cursor on the physical bottom.
-
-    The live tail floats at the terminal's existing cursor row, so an empty
-    Enter only advances native scrollback from the physical bottom. These short
-    shell-sentinel rows are written to the owned slave PTY before the child
-    starts and reach the screen through the ordinary capture path; they are
-    fixture setup, never product blank padding.
-    """
-    return b''.join(b'IDLE-SEED-%02d\r\n' % number for number in range(1, rows))
-
-
 class Screen:
     """Bounded VT subset, with streamed CSI parsing (not a reflow emulator)."""
     def __init__(self, columns):
@@ -136,13 +123,11 @@ class Screen:
     def idle(self):
         """True only on the cursor row of a settled, empty composer.
 
-        The live tail floats at the terminal's existing cursor row, so it owns
-        that row and not necessarily the physical bottom: read the cursor, never
-        `grid[-1]`. A stale completed prompt further up, a transcript row that
+        A stale completed prompt further up, a transcript row that
         merely ends with `>`, a modal editor line (Search>/Settings>/
         Address>/Provider>/API key>) and the busy spinner are all rejected.
         """
-        if not 0 <= self.row < len(self.grid):
+        if self.row != len(self.grid) - 1:
             return False
         column = min(max(self.col, 0), self.columns)
         line = ''.join(self.grid[self.row])
@@ -230,13 +215,6 @@ def run(app, width, batched):
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, width, 0, 0))
         original = termios.tcgetattr(slave)
         original_flags = fcntl.fcntl(slave, fcntl.F_GETFL)
-        # Physical-bottom precondition for the native-row oracle below. The live
-        # tail floats at the terminal's existing cursor row, so an empty Enter
-        # can only advance native scrollback once that row is the real bottom.
-        # These owned shell rows are emitted through the slave PTY, so the
-        # ordinary capture path below parses exactly the bytes the kernel
-        # delivered. Fixture setup only; never product blank padding.
-        os.write(slave, seed_rows())
 
         def child_setup():
             os.setsid()
@@ -308,8 +286,7 @@ def run(app, width, batched):
 
         try:
             pump_until(lambda: settled() and screen.prompts() == 1)
-            assert b'IDLE-SEED-01' in capture, 'fixture seed rows never reached the owned parser'
-            assert screen.row == len(screen.grid) - 1, 'fixture precondition: ready composer is not on the physical bottom row'
+            assert screen.row == len(screen.grid) - 1, 'initial composer is not on the physical bottom row'
             # Baseline only after the ACKed ready composer: earlier seed/startup
             # scrolls must not be counted as idle Enter rows.
             before = len(screen.history)
@@ -343,8 +320,8 @@ def run(app, width, batched):
             pump_until(lambda: len(capture) > mark and capture.endswith(ACK))
             assert screen.prompts() == 4, 'menu restoration duplicated or overwrote old prompts'
             assert not Service.requests
-            # Paste whitespace is not an intentional empty Enter. A floating tail
-            # also scrolls for unrelated reasons (the menu above), so this guard is
+            # Paste whitespace is not an intentional empty Enter. The tail can
+            # scroll for unrelated reasons (the menu above), so this guard is
             # scoped to the paste itself: total prompt rows (visible + native) must
             # not grow, and nothing may be released into native scrollback after
             # the snapshot. Unrelated native row movement stays permitted.

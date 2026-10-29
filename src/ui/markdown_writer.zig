@@ -521,14 +521,7 @@ pub const Writer = struct {
 };
 
 pub fn displayWidth(s: []const u8) usize {
-    var i: usize = 0;
-    var width: usize = 0;
-    while (i < s.len) {
-        const c = text.nextStyledCluster(s, i, width);
-        width += c.width;
-        i = c.end;
-    }
-    return width;
+    return text.styledWidth(s);
 }
 
 test "colored rows preserve width, card background and ANSI ownership" {

@@ -32,7 +32,7 @@ const std = @import("std");
 const text = @import("text.zig");
 const output = @import("markdown_writer.zig");
 const display = @import("../util/display_text.zig");
-const decode = display.decode;
+const Decoder = @import("../util/stream_text.zig").Decoder;
 const Writer = output.Writer;
 const Allocator = std.mem.Allocator;
 
@@ -69,20 +69,6 @@ const Row = struct { bytes: []const u8, src_start: usize };
 
 fn clampColumns(columns: usize) usize {
     return std.math.clamp(columns, 1, 512);
-}
-
-fn encodeScalar(cp: u21, buf: *[4]u8) []const u8 {
-    const safe: u21 = if (cp > 0x10ffff or (cp >= 0xd800 and cp <= 0xdfff)) 0xfffd else cp;
-    const n = std.unicode.utf8Encode(safe, buf) catch {
-        buf.* = .{ 0xef, 0xbf, 0xbd, 0 };
-        return buf[0..3];
-    };
-    return buf[0..n];
-}
-
-fn continuations(bytes: []const u8) bool {
-    for (bytes) |b| if (b & 0xc0 != 0x80) return false;
-    return true;
 }
 
 pub const Tail = struct {
@@ -192,46 +178,17 @@ pub const Tail = struct {
             self.dropped += raw.len;
             return;
         }
+        // Work one byte at a time so a sticky display limit can count the
+        // unprocessed suffix. Preserve externally observed carry fields.
+        var decoder = self.decoderSnapshot();
         var i: usize = 0;
-        if (self.held_cr or self.carry_len != 0) i = try self.resolve(raw);
-        while (i < raw.len and self.limited_by == .none) {
-            const byte = raw[i];
-            if (byte < 0x80) {
-                if (byte == 13) {
-                    if (i + 1 == raw.len) {
-                        self.held_cr = true;
-                        i = raw.len;
-                        break;
-                    }
-                    if (raw[i + 1] == 10) {
-                        i += 1;
-                        continue;
-                    }
-                    try self.feed(0xfffd);
-                } else try self.feed(display.displayCodepoint(byte));
-                i += 1;
-                continue;
-            }
-            const need: usize = std.unicode.utf8ByteSequenceLength(byte) catch 0;
-            if (need == 0) {
-                try self.feed(0xfffd);
-                i += 1;
-                continue;
-            }
-            if (need > raw.len - i) {
-                if (!continuations(raw[i + 1 ..])) {
-                    try self.feed(0xfffd);
-                    i += 1;
-                    continue;
-                }
-                self.carry_len = raw.len - i;
-                @memcpy(self.carry[0..self.carry_len], raw[i..]);
-                i = raw.len;
-                break;
-            }
-            const r = decode(raw, i);
-            try self.feed(display.displayCodepoint(r.cp));
-            i = r.end;
+        while (i < raw.len and self.limited_by == .none) : (i += 1) {
+            var next = decoder;
+            // A failed writer may have partially advanced, so the Tail freezes;
+            // never publish a partially advanced decoder on failure.
+            try next.feed(raw[i .. i + 1], self, emitTail);
+            decoder = next;
+            self.setDecoder(decoder);
         }
         if (i < raw.len) self.dropped += raw.len - i;
         self.enforce();
@@ -252,8 +209,8 @@ pub const Tail = struct {
         // display.sanitize treats the stream so far. Feed that only into the
         // throwaway clone; the live carry stays untouched so a later LF or a
         // UTF8 completion replaces just this mutable preview.
-        if (self.carry_len != 0) for (0..self.carry_len) |_| try preview.emit("\u{fffd}");
-        if (self.held_cr) try preview.emit("\u{fffd}");
+        var decoder = self.decoderSnapshot();
+        try decoder.finish(&preview, emitPreview);
         try preview.finish();
         const preview_rows = preview.lines.items;
         const retained = self.rows.items[self.first..];
@@ -320,54 +277,22 @@ pub const Tail = struct {
         self.rows_dirty = true;
     }
 
-    /// Resolve held bytes against the new chunk; returns the consumed prefix.
-    fn resolve(self: *Tail, raw: []const u8) !usize {
-        var i: usize = 0;
-        if (self.held_cr) {
-            // An empty chunk cannot decide CRLF: keep holding.
-            if (raw.len == 0) return 0;
-            self.held_cr = false;
-            if (raw[0] == 10) {
-                try self.feed(10);
-                return 1;
-            }
-            try self.feed(0xfffd);
-            return 0;
-        }
-        const need: usize = std.unicode.utf8ByteSequenceLength(self.carry[0]) catch 2;
-        var buf: [4]u8 = undefined;
-        var n = self.carry_len;
-        @memcpy(buf[0..n], self.carry[0..n]);
-        self.carry_len = 0;
-        while (n < need and i < raw.len and raw[i] & 0xc0 == 0x80) : (i += 1) {
-            buf[n] = raw[i];
-            n += 1;
-        }
-        if (n < need and i == raw.len) {
-            // Still incomplete: keep waiting, bounded by one scalar prefix.
-            self.carry_len = n;
-            @memcpy(self.carry[0..n], buf[0..n]);
-            return i;
-        }
-        if (n < need) {
-            // Trailing byte is not a continuation: per-byte replacement, the
-            // same fallback decode() takes for an invalid sequence.
-            for (buf[0..n]) |_| try self.feed(0xfffd);
-            return i;
-        }
-        const r = decode(buf[0..need], 0);
-        if (r.end != need) {
-            for (buf[0..need]) |_| try self.feed(0xfffd);
-            return i;
-        }
-        try self.feed(display.displayCodepoint(r.cp));
-        return i;
+    fn decoderSnapshot(self: *const Tail) Decoder {
+        return .{ .carry = self.carry, .carry_len = self.carry_len, .held_cr = self.held_cr };
     }
 
-    fn feed(self: *Tail, cp: u21) !void {
+    fn setDecoder(self: *Tail, d: Decoder) void {
+        self.carry = d.carry;
+        self.carry_len = d.carry_len;
+        self.held_cr = d.held_cr;
+    }
+
+    fn emitPreview(writer: *Writer, bytes: []const u8) !void {
+        try writer.emit(bytes);
+    }
+
+    fn emitTail(self: *Tail, bytes: []const u8) !void {
         if (self.limited_by != .none) return;
-        var buf: [4]u8 = undefined;
-        const bytes = encodeScalar(cp, &buf);
         const before = self.source.items.len;
         self.source.appendSlice(self.a, bytes) catch |err| {
             self.limited_by = .memory;
