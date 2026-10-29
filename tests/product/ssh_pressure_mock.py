@@ -10,11 +10,13 @@ import tempfile
 import threading
 import time
 
-from daemon_mock import Case, Child, wait_daemon_socket, wait_checkpoint, text_answer, stop_daemon
-from ssh_mock import SshChild, run
+from daemon_mock import (Case, Child, wait_daemon_socket, wait_checkpoint, text_answer,
+                         stop_daemon, assert_screen_idle_contract)
+from ssh_mock import SshChild, run, settled
 
 
 def check(app):
+    assert_screen_idle_contract()
     root = Path(tempfile.mkdtemp(prefix='thin-ssh-pressure-'))
     root.chmod(0o700)
     case = Case(app, root, 'd')
@@ -62,9 +64,9 @@ def check(app):
               '-o','ConnectTimeout=5','-o','LogLevel=ERROR','-tt','-i',str(key),'-p',str(port),'thin@127.0.0.1']
         client=SshChild('/usr/bin/ssh',argv,ws.home,env,'task-client',ws.logs,True,100,30)
         case.children.append(client)
-        client.pump_until(lambda:client.idle_after(0,b'thin '),'SSH ready',20)
+        client.pump_until(lambda:settled(client),'SSH ready',20)
         mark=client.mark();client.send_line('/cd '+str(ws.project_a))
-        client.pump_until(lambda:client.idle_after(mark),'select project',20)
+        client.pump_until(lambda:settled(client, mark, b'Launcher directory:'),'select project',20)
         client.send_line(prompt)
         case.wait_prompt(prompt)
         assert case.model.count()==1
@@ -97,7 +99,7 @@ def check(app):
         # Resource refusal must recover, not merely keep a broken listener alive.
         recovered=SshChild('/usr/bin/ssh',argv,ws.home,env,'recovered-client',ws.logs,True,100,30)
         case.children.append(recovered)
-        recovered.pump_until(lambda:recovered.idle_after(0,b'thin '),'SSH admission recovered',20,case.model.check)
+        recovered.pump_until(lambda:settled(recovered),'SSH admission recovered',20,case.model.check)
         recovered.send_line('/exit')
         assert recovered.wait_exit('recovered connection exit',20)==0
         assert case.model.count()==1

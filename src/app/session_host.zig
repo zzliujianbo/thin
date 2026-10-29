@@ -9,9 +9,9 @@
 //! - Every Session/App/Runtime/Inbox call happens on the host owner thread
 //!   (the worker main loop). `dispatch` is called only from that thread.
 //! - The Runtime producer thread only talks to the Bridge (existing contract).
-//! - `pump` drains the Bridge on the owner thread, so a slow or absent viewer
-//!   never backpressures the Runtime. Nothing in an IPC handler reads
-//!   `runtime.messages()` or other live Runtime slices.
+//! - `pump` admits Bridge items only while bounded unacknowledged live
+//!   retention has room. The owner continues polling controls while a slow or
+//!   absent viewer backpressures the Runtime. IPC never reads live slices.
 //! - Connection EOF calls `disconnected`, which only revokes the controller
 //!   epoch/view. It never cancels the task and never closes the Bridge.
 //!
@@ -79,6 +79,9 @@ const Ring = struct {
     bytes: usize = 0,
     max_count: usize = max_count_default,
     budget: usize = 2 * 1024 * 1024,
+    /// Only actual eviction establishes a gap: history-only sequence positions
+    /// need not appear in this ring at all.
+    evicted_through: u64 = 0,
 
     fn deinit(self: *Ring) void {
         for (self.items.items) |entry| self.allocator.free(entry.json);
@@ -87,11 +90,12 @@ const Ring = struct {
     }
 
     fn push(self: *Ring, seq: u64, json: []u8) !void {
-        errdefer self.allocator.free(json);
+        // The caller retains ownership unless append succeeds.
         try self.items.append(self.allocator, .{ .seq = seq, .json = json });
         self.bytes +|= json.len;
         while (self.items.items.len > 1 and (self.items.items.len > self.max_count or self.bytes > self.budget)) {
             const oldest = self.items.orderedRemove(0);
+            self.evicted_through = oldest.seq;
             self.bytes -= oldest.json.len;
             self.allocator.free(oldest.json);
         }
@@ -107,6 +111,188 @@ const Ring = struct {
         return self.items.items[self.items.items.len - 1].seq;
     }
 };
+
+/// Bounded unacknowledged live-event storage. Unlike the history Ring, this
+/// never evicts to make space. Ownership transfers only on successful push.
+/// `reclaimed_through` is a stream watermark and may include positions that
+/// were occupied by history-only rows rather than live entries.
+const LiveRing = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(Entry) = .empty,
+    bytes: usize = 0,
+    max_count: usize = 1024,
+    budget: usize = 2 * 1024 * 1024,
+    /// Contiguous retirement watermark: every position up to here is proven.
+    reclaimed_through: u64 = 0,
+    /// Highest position any proven range retired. It may be ahead of
+    /// `reclaimed_through` while an earlier independently shown event is still
+    /// unproven; the retained entries are exactly those holes.
+    highest_acknowledged: u64 = 0,
+
+    fn deinit(self: *LiveRing) void {
+        for (self.items.items) |entry| self.allocator.free(entry.json);
+        self.items.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn canFit(self: *const LiveRing, len: usize) bool {
+        return self.items.items.len < self.max_count and len <= self.budget and self.bytes <= self.budget - len;
+    }
+
+    fn oldestSeq(self: *const LiveRing) ?u64 {
+        return if (self.items.items.len == 0) null else self.items.items[0].seq;
+    }
+
+    fn newestSeq(self: *const LiveRing) ?u64 {
+        return if (self.items.items.len == 0) null else self.items.items[self.items.items.len - 1].seq;
+    }
+
+    fn contains(self: *const LiveRing, seq: u64) bool {
+        for (self.items.items) |entry| {
+            if (entry.seq == seq) return true;
+            if (entry.seq > seq) break;
+        }
+        return false;
+    }
+
+    fn push(self: *LiveRing, seq: u64, json: []u8) !void {
+        if (seq <= self.reclaimed_through or (self.items.items.len != 0 and seq <= self.items.items[self.items.items.len - 1].seq)) return error.InvalidSequence;
+        if (!self.canFit(json.len)) return error.RingFull;
+        try self.items.append(self.allocator, .{ .seq = seq, .json = json });
+        self.bytes += json.len;
+    }
+
+    /// Validate controller authority and the published high watermark before
+    /// reclamation. Older acknowledgements are harmless retransmissions.
+    fn acknowledge(self: *LiveRing, active_epoch: u64, epoch: u64, through: u64, high: u64) !void {
+        return self.acknowledgeRange(active_epoch, epoch, 0, through, high);
+    }
+
+    /// Selective full-display proof. `first == 0` is the prefix `[0, last]`;
+    /// otherwise exactly the inclusive interval is retired. Only positions
+    /// inside the proven interval are removed, so an earlier unshown event is
+    /// never covered by a later one. Retained entries are the holes.
+    fn acknowledgeRange(self: *LiveRing, active_epoch: u64, epoch: u64, first: u64, last: u64, high: u64) !void {
+        if (epoch == 0 or epoch != active_epoch) return error.StaleControl;
+        if (first != 0 and first > last) return error.InvalidInput;
+        if (last > high) return error.InvalidSequence;
+        if (last == 0) return;
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            const seq = self.items.items[index].seq;
+            const inside = if (first == 0) seq <= last else seq >= first and seq <= last;
+            if (!inside) {
+                index += 1;
+                continue;
+            }
+            const entry = self.items.orderedRemove(index);
+            self.bytes -= entry.json.len;
+            self.allocator.free(entry.json);
+        }
+        if (last > self.highest_acknowledged) self.highest_acknowledged = last;
+        // Contiguous retirement may only advance up to the oldest retained
+        // position; a remaining hole keeps the exact-recovery cursor below it.
+        const oldest = self.oldestSeq();
+        const contiguous = if (oldest) |seq| @min(self.highest_acknowledged, seq -| 1) else self.highest_acknowledged;
+        if (contiguous > self.reclaimed_through) self.reclaimed_through = contiguous;
+    }
+};
+
+test "live ring retains bounded events until explicitly reclaimed" {
+    const a = std.testing.allocator;
+    var ring = LiveRing{ .allocator = a, .max_count = 2, .budget = 4 };
+    defer ring.deinit();
+    try ring.push(1, try a.dupe(u8, "ab"));
+    try ring.push(3, try a.dupe(u8, "cd"));
+    const pending = try a.dupe(u8, "e");
+    try std.testing.expectError(error.RingFull, ring.push(4, pending));
+    try std.testing.expectEqual(@as(usize, 2), ring.items.items.len);
+    try std.testing.expectEqualStrings("ab", ring.items.items[0].json);
+    try ring.acknowledgeRange(2, 2, 0, 2, 4);
+    try std.testing.expectEqual(@as(u64, 2), ring.reclaimed_through);
+    try ring.push(4, pending);
+    try ring.acknowledgeRange(2, 2, 0, 4, 4);
+    try std.testing.expectEqual(@as(usize, 0), ring.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ring.bytes);
+}
+
+test "live ring acknowledgement validates authority and future watermark" {
+    const a = std.testing.allocator;
+    var ring = LiveRing{ .allocator = a };
+    defer ring.deinit();
+    try ring.push(3, try a.dupe(u8, "a"));
+    try ring.push(5, try a.dupe(u8, "b"));
+    try std.testing.expectError(error.StaleControl, ring.acknowledge(2, 1, 3, 5));
+    try std.testing.expectError(error.InvalidSequence, ring.acknowledge(2, 2, 6, 5));
+    try std.testing.expectEqual(@as(usize, 2), ring.items.items.len);
+    try ring.acknowledge(2, 2, 3, 5);
+    try ring.acknowledge(2, 2, 2, 5);
+    try std.testing.expectEqual(@as(u64, 3), ring.reclaimed_through);
+    try std.testing.expectEqual(@as(u64, 5), ring.items.items[0].seq);
+}
+
+test "live ring retires only proven ranges and keeps an earlier hole" {
+    const a = std.testing.allocator;
+    var ring = LiveRing{ .allocator = a, .max_count = 5 };
+    defer ring.deinit();
+    for (1..6) |seq| try ring.push(seq, try a.dupe(u8, "e"));
+    try std.testing.expectError(error.StaleControl, ring.acknowledgeRange(2, 1, 2, 3, 5));
+    try std.testing.expectError(error.InvalidInput, ring.acknowledgeRange(2, 2, 4, 3, 5));
+    try std.testing.expectError(error.InvalidSequence, ring.acknowledgeRange(2, 2, 2, 6, 5));
+    try ring.acknowledgeRange(2, 2, 2, 3, 5);
+    try std.testing.expectEqual(@as(u64, 3), ring.highest_acknowledged);
+    // Position 1 is still unproven, so the exact-recovery cursor may not move.
+    try std.testing.expectEqual(@as(u64, 0), ring.reclaimed_through);
+    try std.testing.expectEqual(@as(usize, 3), ring.items.items.len);
+    try std.testing.expectEqual(@as(u64, 1), ring.items.items[0].seq);
+    // A retained hole does not consume the admission bound.
+    try ring.push(6, try a.dupe(u8, "e"));
+    try ring.acknowledgeRange(2, 2, 1, 1, 6);
+    try std.testing.expectEqual(@as(u64, 3), ring.reclaimed_through);
+    // A later proven range can never leap the hole.
+    try ring.acknowledgeRange(2, 2, 6, 6, 6);
+    try std.testing.expectEqual(@as(u64, 3), ring.reclaimed_through);
+    try std.testing.expectEqual(@as(u64, 6), ring.highest_acknowledged);
+    try std.testing.expectEqual(@as(usize, 2), ring.items.items.len);
+    // Filling the hole advances the contiguous watermark; duplicates are
+    // idempotent and never retire a missing position twice.
+    try ring.acknowledgeRange(2, 2, 4, 5, 6);
+    try std.testing.expectEqual(@as(u64, 6), ring.reclaimed_through);
+    try std.testing.expectEqual(@as(usize, 0), ring.items.items.len);
+    try ring.acknowledgeRange(2, 2, 2, 6, 6);
+    try std.testing.expectEqual(@as(u64, 6), ring.reclaimed_through);
+    try std.testing.expectEqual(@as(usize, 0), ring.items.items.len);
+}
+
+test "live ring retains caller ownership on allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var ring = LiveRing{ .allocator = failing.allocator() };
+    defer ring.deinit();
+    // Allocate the fixture outside the fault allocator so its first call is
+    // the ring's append; ownership remains with the caller on failure.
+    const json = try std.testing.allocator.dupe(u8, "owned");
+    defer std.testing.allocator.free(json);
+    try std.testing.expectError(error.OutOfMemory, ring.push(1, json));
+    try std.testing.expectEqualStrings("owned", json);
+    try std.testing.expectEqual(@as(usize, 0), ring.bytes);
+}
+
+test "ring push retains caller ownership when allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var ring = Ring{ .allocator = failing.allocator() };
+    defer ring.deinit();
+    const json = try std.testing.allocator.dupe(u8, "owned");
+    defer std.testing.allocator.free(json);
+    try std.testing.expectError(error.OutOfMemory, ring.push(1, json));
+    try std.testing.expectEqualStrings("owned", json);
+    try std.testing.expectEqual(@as(usize, 0), ring.items.items.len);
+}
+
+/// One exact draft boundary: the cumulative text/reasoning length after the
+/// event at `seq`. Marks belong only to the current uncommitted run.
+const DraftMark = struct { seq: u64, text: usize, reasoning: usize };
+const DraftCut = struct { text: usize, reasoning: usize };
+const max_draft_marks: usize = 2048;
 
 /// Bounded streaming text accumulator for the in-progress assistant draft.
 const Draft = struct {
@@ -147,6 +333,7 @@ const Draft = struct {
 const Task = struct {
     job: *task.Job,
     future: std.Io.Future(void),
+    joined: bool = false,
     id: u64,
     kind: protocol.TaskKind,
     /// Owned prompt; `job.prompt` borrows it and it outlives the join.
@@ -174,8 +361,13 @@ const max_tool_description: usize = bridge_mod.item_budget;
 const Controller = struct {
     epoch: u64,
     connection: u64,
+    delivered: u64 = 0,
     /// The pending approval id displayed to this controller, if any.
     permission: ?u64 = null,
+    /// Highest canonical position this controller's own direct submit already
+    /// rendered locally. History-only rows at or below it are never echoed back
+    /// to the same viewer; a later controller starts at zero and sees them.
+    suppressed_history_through: u64 = 0,
 };
 
 /// Decision result of one dispatch call: the encoded frame plus nothing else.
@@ -201,9 +393,19 @@ pub const SessionHost = struct {
     context: ?r.ContextSnapshot = null,
     partial_text: Draft,
     partial_reasoning: Draft,
+    /// Cumulative draft lengths after each text/reasoning event of the current
+    /// (uncommitted) run, ordered by position. A fresh-viewer baseline uses
+    /// this to cut its synthetic draft exactly at the ordered cutoff, so
+    /// retained live deltas are not duplicated and retired ones are not lost.
+    draft_marks: std.ArrayList(DraftMark) = .empty,
+    /// False once a mark was dropped: the exact cut is unknown, so the baseline
+    /// omits the draft and reports shortened history instead of guessing.
+    draft_marks_exact: bool = true,
 
-    events: Ring,
+    events: LiveRing,
     history: Ring,
+    pending_event: ?struct { item: bridge_mod.Item, json: []u8 } = null,
+    pending_terminal: ?struct { terminal: r.Terminal, json: []u8 } = null,
     next_seq: u64 = 1,
     /// Display-only identity for canonical user rows; never authority.
     next_user_id: u64 = 0,
@@ -229,6 +431,8 @@ pub const SessionHost = struct {
     saved_on_shutdown: bool = false,
     fatal: ?anyerror = null,
     reset_failed: ?anyerror = null,
+    /// Owner-only non-event changes, consumed by read-only subscriptions.
+    view_revision: u64 = 0,
 
     pub fn init(a: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, options: Options) !*SessionHost {
         if (!ids.valid(options.id)) return error.InvalidArguments;
@@ -330,10 +534,34 @@ pub const SessionHost = struct {
     /// the owner thread; never allocates for task bookkeeping.
     pub fn pump(self: *SessionHost, now_ms: u64) void {
         _ = now_ms;
-        while (self.bridge.pop()) |item| {
-            var owned = item;
-            defer owned.deinit();
-            self.observe(owned.event, owned.display_truncated, owned.canonical_complete);
+        while (true) {
+            if (self.pending_event == null) {
+                const item = self.bridge.pop() orelse break;
+                const meta = protocol.EventMeta{ .epoch = 0, .truncated = item.display_truncated, .canonical_complete = item.canonical_complete };
+                const json = protocol.encodeEventMeta(self.allocator, item.event, meta) catch |err| {
+                    var owned = item;
+                    owned.deinit();
+                    self.fatal = err;
+                    return;
+                };
+                self.pending_event = .{ .item = item, .json = json };
+            }
+            const pending = &self.pending_event.?;
+            if (!self.events.canFit(pending.json.len)) {
+                // A canceled/completed producer can be joined without draining
+                // or discarding its still-unacknowledged display events.
+                if (self.task) |*owned| if (!owned.joined and owned.job.done.load(.acquire)) {
+                    owned.future.await(self.io);
+                    owned.joined = true;
+                };
+                return;
+            }
+            self.commitObserved(pending.item.event, pending.item.display_truncated, pending.item.canonical_complete, pending.json) catch |err| {
+                self.fatal = err;
+                return;
+            };
+            pending.item.deinit();
+            self.pending_event = null;
         }
         self.reapTask();
         self.dispatchNext();
@@ -345,7 +573,8 @@ pub const SessionHost = struct {
     /// silently dropped or replayed. Remote clients never launch jobs.
     fn dispatchNext(self: *SessionHost) void {
         if (self.closing or self.fatal != null) return;
-        if (self.task != null) return;
+        if (self.task != null or self.pending_event != null or self.pending_terminal != null) return;
+        if (!self.events.canFit(protocol.max_text * 3 + 8192)) return;
         if (self.session.app == null or self.session.read_only) return;
         if (self.session.app) |app| if (app.runtime.busy.load(.acquire) or app.runtime.poisoned) return;
         const lease = self.inbox.claimNext() orelse return;
@@ -387,12 +616,14 @@ pub const SessionHost = struct {
     /// Directly submitted text was already shown by the submitting frontend, so
     /// it is recorded in canonical history only: no event echo, no duplicate UI
     /// row. Runtime does not emit user_committed for the initial append.
-    fn noteSubmittedUser(self: *SessionHost, text: []const u8) void {
+    fn noteSubmittedUser(self: *SessionHost, text: []const u8) u64 {
         self.next_user_id +%= 1;
         if (self.next_user_id == 0) self.next_user_id = 1;
         const meta = protocol.EventMeta{ .epoch = 0, .truncated = false, .canonical_complete = true };
         const event: r.Event = .{ .user_committed = .{ .id = self.next_user_id, .text = text } };
-        self.pushHistory(self.takeSeq(), event, meta);
+        const seq = self.takeSeq();
+        self.pushHistory(seq, event, meta);
+        return seq;
     }
 
     fn pushHistory(self: *SessionHost, seq: u64, event: r.Event, meta: protocol.EventMeta) void {
@@ -407,6 +638,74 @@ pub const SessionHost = struct {
     }
 
     fn observe(self: *SessionHost, event: r.Event, display_truncated: bool, canonical_complete: bool) void {
+        const meta = protocol.EventMeta{ .epoch = 0, .truncated = display_truncated, .canonical_complete = canonical_complete };
+        const encoded = protocol.encodeEventMeta(self.allocator, event, meta) catch |err| {
+            self.fatal = err;
+            return;
+        };
+        self.commitObserved(event, display_truncated, canonical_complete, encoded) catch |err| {
+            self.allocator.free(encoded);
+            self.fatal = err;
+        };
+    }
+
+    /// Exact draft boundary for the ordered cutoff. See `DraftMark`.
+    fn recordDraftMark(self: *SessionHost, seq: u64) void {
+        if (self.draft_marks.items.len >= max_draft_marks) {
+            // The cut can no longer be derived for every future cutoff. Keep the
+            // draft out of baselines and report shortened history instead of
+            // duplicating or reordering retained live bytes.
+            self.draft_marks_exact = false;
+            self.draft_marks.clearRetainingCapacity();
+        }
+        self.draft_marks.append(self.allocator, .{
+            .seq = seq,
+            .text = self.partial_text.buf.items.len,
+            .reasoning = self.partial_reasoning.buf.items.len,
+        }) catch {
+            self.draft_marks_exact = false;
+            self.draft_marks.clearRetainingCapacity();
+        };
+    }
+
+    fn resetDraftMarks(self: *SessionHost) void {
+        self.draft_marks.clearRetainingCapacity();
+        self.draft_marks_exact = true;
+    }
+
+    /// Keep one floor mark at or below the contiguous watermark plus every mark
+    /// above it; a baseline can only cut at or after that floor.
+    fn pruneDraftMarks(self: *SessionHost) void {
+        while (self.draft_marks.items.len >= 2 and self.draft_marks.items[1].seq <= self.events.reclaimed_through) {
+            _ = self.draft_marks.orderedRemove(0);
+        }
+    }
+
+    /// Cumulative draft lengths at `cutoff`, or null when an overflow made the
+    /// exact boundary unknown.
+    fn draftCut(self: *const SessionHost, cutoff: u64) ?DraftCut {
+        if (!self.draft_marks_exact) return null;
+        var text: usize = 0;
+        var reasoning: usize = 0;
+        for (self.draft_marks.items) |mark| {
+            if (mark.seq > cutoff) break;
+            text = mark.text;
+            reasoning = mark.reasoning;
+        }
+        return .{ .text = text, .reasoning = reasoning };
+    }
+
+    fn commitObserved(self: *SessionHost, event: r.Event, display_truncated: bool, canonical_complete: bool, encoded: []u8) !void {
+        const seq = self.next_seq;
+        try self.events.push(seq, encoded);
+        _ = self.takeSeq();
+        // Body deltas already travel on the ordered event stream. Re-encoding
+        // an otherwise unchanged snapshot after every chunk creates barriers
+        // between appendable text runs and adds needless work at both ends.
+        switch (event) {
+            .text, .reasoning => {},
+            else => self.view_revision +%= 1,
+        }
         switch (event) {
             .state => |phase| self.phase = phase,
             .context_snapshot => |snapshot| self.context = snapshot,
@@ -432,6 +731,11 @@ pub const SessionHost = struct {
             },
             else => {},
         }
+        switch (event) {
+            .text, .reasoning => self.recordDraftMark(seq),
+            .assistant_committed, .tool_started, .finished => self.resetDraftMarks(),
+            else => {},
+        }
 
         // Stored events carry no controller epoch: the page decides which view
         // epoch an event is displayed under. Replaying old history after a
@@ -440,16 +744,6 @@ pub const SessionHost = struct {
             .epoch = 0,
             .truncated = display_truncated,
             .canonical_complete = canonical_complete,
-        };
-        const seq = self.takeSeq();
-        const encoded = protocol.encodeEventMeta(self.allocator, event, meta) catch |err| {
-            self.fatal = err;
-            return;
-        };
-        self.events.push(seq, encoded) catch |err| {
-            self.allocator.free(encoded);
-            self.fatal = err;
-            return;
         };
         if (canonicalForHistory(event)) {
             // A cut canonical array (block limit) stays marked incomplete, so
@@ -506,13 +800,34 @@ pub const SessionHost = struct {
         const owned = &self.task.?;
         if (!owned.job.done.load(.acquire)) return;
 
-        owned.future.await(self.io);
-        const terminal = self.bridge.takeTerminal() orelse (owned.job.result() catch |err| r.Terminal{ .status = .failed, .detail = err });
+        if (self.pending_terminal == null) {
+            if (!owned.joined) {
+                owned.future.await(self.io);
+                owned.joined = true;
+            }
+            const terminal = self.bridge.takeTerminal() orelse (owned.job.result() catch |err| r.Terminal{ .status = .failed, .detail = err });
+            const json = protocol.encodeEventMeta(self.allocator, .{ .finished = terminal }, .{}) catch |err| {
+                self.fatal = err;
+                return;
+            };
+            self.pending_terminal = .{ .terminal = terminal, .json = json };
+        }
+        const pending = self.pending_terminal.?;
+        if (!self.events.canFit(pending.json.len)) return;
+        const seq = self.next_seq;
+        self.events.push(seq, pending.json) catch |err| {
+            self.fatal = err;
+            return;
+        };
+        _ = self.takeSeq();
+        self.pending_terminal = null;
+        const terminal = pending.terminal;
         self.last_terminal = terminal;
         self.phase = null;
         self.clearPending();
         self.partial_text.reset();
         self.partial_reasoning.reset();
+        self.resetDraftMarks();
         if (terminal.status != .success) self.inbox.pause();
         if (terminal.detail) |detail| if (detail == error.CleanupFailed) {
             self.fatal = error.CleanupFailed;
@@ -522,22 +837,11 @@ pub const SessionHost = struct {
         };
 
         const meta = protocol.EventMeta{ .epoch = 0, .truncated = false, .canonical_complete = true };
-        const seq = self.takeSeq();
-        const encoded: ?[]u8 = protocol.encodeEventMeta(self.allocator, .{ .finished = terminal }, meta) catch |err| blk: {
+        const copy = protocol.encodeEventMeta(self.allocator, .{ .finished = terminal }, meta) catch null;
+        if (copy) |history_bytes| self.history.push(seq, history_bytes) catch |err| {
+            self.allocator.free(history_bytes);
             self.fatal = err;
-            break :blk null;
         };
-        if (encoded) |bytes| {
-            self.events.push(seq, bytes) catch |err| {
-                self.allocator.free(bytes);
-                self.fatal = err;
-            };
-            const copy = protocol.encodeEventMeta(self.allocator, .{ .finished = terminal }, meta) catch null;
-            if (copy) |history_bytes| self.history.push(seq, history_bytes) catch |err| {
-                self.allocator.free(history_bytes);
-                self.fatal = err;
-            };
-        }
 
         self.allocator.free(owned.prompt);
         self.allocator.destroy(owned.job);
@@ -598,22 +902,11 @@ pub const SessionHost = struct {
             return false;
         };
         bytes.* +|= encoded.len;
-        self.events.push(seq, encoded) catch |err| {
+        self.history.push(seq, encoded) catch |err| {
             self.allocator.free(encoded);
             self.fatal = err;
             return false;
         };
-        if (canonicalForHistory(event)) {
-            const copy = protocol.encodeEventMeta(self.allocator, event, meta) catch |err| {
-                self.fatal = err;
-                return false;
-            };
-            self.history.push(seq, copy) catch |err| {
-                self.allocator.free(copy);
-                self.fatal = err;
-                return false;
-            };
-        }
         seeded.* += 1;
         return true;
     }
@@ -668,7 +961,7 @@ pub const SessionHost = struct {
     // -----------------------------------------------------------------------
 
     fn ensureIdle(self: *SessionHost) !void {
-        if (self.task != null) return error.Busy;
+        if (self.task != null or self.pending_event != null or self.pending_terminal != null) return error.Busy;
         if (self.session.app) |app| if (app.runtime.busy.load(.acquire)) return error.Busy;
         if (self.reset_failed != null) return error.Busy;
     }
@@ -711,7 +1004,7 @@ pub const SessionHost = struct {
         if (self.closing) return;
         if (self.task) |*owned| {
             self.cancel.cancel();
-            owned.future.await(self.io);
+            if (!owned.joined) owned.future.await(self.io);
             _ = self.bridge.takeTerminal();
             self.allocator.free(owned.prompt);
             self.allocator.destroy(owned.job);
@@ -724,6 +1017,7 @@ pub const SessionHost = struct {
         if (self.session.app) |app| app.background.deinit();
         // Join guarantees no producer remains; only now is Bridge.close safe.
         self.clearPending();
+        self.releasePendingDelivery();
         self.bridge.close();
         var display_error: ?anyerror = null;
         while (self.bridge.pop()) |item| {
@@ -738,21 +1032,35 @@ pub const SessionHost = struct {
         self.closing = true;
     }
 
+    fn releasePendingDelivery(self: *SessionHost) void {
+        if (self.pending_event) |*pending| {
+            self.allocator.free(pending.json);
+            pending.item.deinit();
+            self.pending_event = null;
+        }
+        if (self.pending_terminal) |pending| {
+            self.allocator.free(pending.json);
+            self.pending_terminal = null;
+        }
+    }
+
     /// The owner thread released every worker: destroy in shutdown order.
     pub fn deinit(self: *SessionHost) void {
         const a = self.allocator;
         if (self.task) |*owned| {
             self.cancel.cancel();
-            owned.future.await(self.io);
+            if (!owned.joined) owned.future.await(self.io);
             a.free(owned.prompt);
             a.destroy(owned.job);
             self.task = null;
         }
         self.clearPending();
+        self.releasePendingDelivery();
         self.bridge.deinit();
         self.inbox.deinit();
         self.partial_text.deinit();
         self.partial_reasoning.deinit();
+        self.draft_marks.deinit(self.allocator);
         self.events.deinit();
         self.history.deinit();
         self.session.deinit();
@@ -770,12 +1078,17 @@ pub const SessionHost = struct {
     pub fn dispatch(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64, owner_authorized: bool) ![]u8 {
         // Drain first so a reply reflects the current display state.
         self.pump(self.now());
+        switch (request.op) {
+            .hello, .snapshot, .events, .history, .settings, .ping, .watch, .ack => {},
+            else => self.view_revision +%= 1,
+        }
         return switch (request.op) {
             .hello => self.replyHello(a, request.id),
             .snapshot => self.replySnapshot(a, request, connection_id),
             .attach => self.handleAttach(a, request, connection_id),
             .detach => self.handleDetach(a, request, connection_id),
             .events => self.handleEvents(a, request, connection_id),
+            .ack => self.handleAck(a, request, connection_id),
             .history => self.replyHistory(a, request),
             .submit => self.handleSubmit(a, request, connection_id),
             .cancel => self.handleCancel(a, request, connection_id),
@@ -801,7 +1114,7 @@ pub const SessionHost = struct {
             .close => self.handleClose(a, request, connection_id),
             .shutdown => self.handleShutdown(a, request, owner_authorized),
             .ping => self.replyPing(a, request.id),
-            .create, .list => errorReply(a, request.id, error.Unsupported),
+            .create, .list, .watch => errorReply(a, request.id, error.Unsupported),
         };
     }
 
@@ -824,6 +1137,7 @@ pub const SessionHost = struct {
         try out.field("owner", @tagName(self.owner));
         try out.field("pid", std.os.linux.getpid());
         try out.field("protocol", protocol.version);
+        try out.field("watch", true);
         return replyFrame(&out);
     }
 
@@ -877,7 +1191,7 @@ pub const SessionHost = struct {
             .provider = if (state.provider) |provider| provider.slug() else null,
             .logging = self.session.logging,
             .read_only = self.session.read_only,
-            .truncated = self.fatal != null or self.reset_failed != null or self.events.oldestSeq() != null and self.events.oldestSeq().? > 1,
+            .truncated = self.fatal != null or self.reset_failed != null or self.history.evicted_through != 0 or self.partial_text.truncated or self.partial_reasoning.truncated,
         };
     }
 
@@ -889,6 +1203,7 @@ pub const SessionHost = struct {
         var out = protocol.Out.init(a);
         defer out.deinit();
         try out.ok(request.id);
+        try out.field("through", self.next_seq -| 1);
         // Both stores live in this frame and stay valid through encoding: one
         // Inbox snapshot supplies the counts, the revision and the preview text.
         const queue = self.inbox.snapshot();
@@ -922,7 +1237,7 @@ pub const SessionHost = struct {
         if (self.controller != null) self.inbox.pauseClaims(false);
         self.epoch_seq +%= 1;
         if (self.epoch_seq == 0) self.epoch_seq = 1;
-        self.controller = .{ .epoch = self.epoch_seq, .connection = connection_id, .permission = self.pending_permission };
+        self.controller = .{ .epoch = self.epoch_seq, .connection = connection_id, .permission = self.pending_permission, .delivered = self.events.reclaimed_through };
         var out = protocol.Out.init(a);
         defer out.deinit();
         try out.ok(request.id);
@@ -944,6 +1259,208 @@ pub const SessionHost = struct {
         return replyFrame(&out);
     }
 
+    pub const WatchStamp = struct {
+        sequence: u64,
+        revision: u64,
+        queue_revision: u64,
+        task: u64,
+
+        pub fn eql(left: WatchStamp, right: WatchStamp) bool {
+            // sequence is a coverage watermark, not a snapshot invalidation.
+            return left.revision == right.revision and
+                left.queue_revision == right.queue_revision and left.task == right.task;
+        }
+    };
+
+    /// A stream is a view of an EXISTING controller, never a way to acquire it.
+    /// The worker must additionally bind the stream's kernel peer PID to the
+    /// returned live control connection before exposing any controller state.
+    pub fn watchOwner(self: *const SessionHost, epoch: u64) !u64 {
+        const controller = self.controller orelse return error.StaleControl;
+        if (epoch == 0 or controller.epoch != epoch) return error.StaleControl;
+        return controller.connection;
+    }
+
+    pub fn watchResume(self: *const SessionHost, epoch: u64, cursor: ?u64) !u64 {
+        _ = try self.watchOwner(epoch);
+        const controller = self.controller.?;
+        const since = cursor orelse self.events.reclaimed_through;
+        if (since < self.events.reclaimed_through or since > controller.delivered) return error.InvalidSequence;
+        return since;
+    }
+
+    /// Called only after the worker successfully queues the complete page.
+    pub fn watchOffered(self: *SessionHost, epoch: u64, through: u64) !void {
+        _ = try self.watchOwner(epoch);
+        if (through > self.next_seq -| 1) return error.InvalidSequence;
+        self.controller.?.delivered = @max(self.controller.?.delivered, through);
+    }
+
+    fn handleAck(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
+        const epoch = request.u64Field("epoch") catch return errorReply(a, request.id, error.BadRequest);
+        const sequence = request.u64Field("sequence") catch return errorReply(a, request.id, error.BadRequest);
+        const first = request.optionalU64("first") catch return errorReply(a, request.id, error.BadRequest);
+        self.requireControl(connection_id, epoch) catch |err| return errorReply(a, request.id, err);
+        const outcome = self.watchAcknowledgeRange(epoch, first orelse 0, sequence) catch |err| return errorReply(a, request.id, err);
+        var out = protocol.Out.init(a);
+        defer out.deinit();
+        try out.ok(request.id);
+        try out.field("first", outcome.first);
+        try out.field("sequence", outcome.sequence);
+        try out.field("through", outcome.through);
+        return replyFrame(&out);
+    }
+
+    pub const AckOutcome = struct { first: u64, sequence: u64, through: u64 };
+
+    /// The only way a display position is retired. The worker calls this after
+    /// it has validated that the frame arrived on a watch connection still
+    /// bound to the live controller epoch and to the controller's kernel peer.
+    /// The epoch re-check here is what makes a takeover invalidate ACKs from the
+    /// replaced view; no new socket or credential stands in for that binding.
+    /// Only positions inside the accepted range are removed; a retained hole
+    /// keeps `through` behind it.
+    pub fn watchAcknowledgeRange(self: *SessionHost, epoch: u64, first: u64, last: u64) !AckOutcome {
+        _ = try self.watchOwner(epoch);
+        try self.events.acknowledgeRange(epoch, epoch, first, last, self.controller.?.delivered);
+        self.pruneDraftMarks();
+        return .{ .first = first, .sequence = last, .through = self.events.reclaimed_through };
+    }
+
+    /// Cumulative prefix proof retained for existing viewers.
+    pub fn watchAcknowledge(self: *SessionHost, epoch: u64, sequence: u64) !u64 {
+        return (try self.watchAcknowledgeRange(epoch, 0, sequence)).through;
+    }
+
+    pub fn watchStamp(self: *SessionHost) WatchStamp {
+        const queue = self.inbox.snapshot();
+        return .{
+            .sequence = self.next_seq -| 1,
+            .revision = self.view_revision,
+            .queue_revision = queue.revision,
+            .task = if (self.task) |task_| task_.id else 0,
+        };
+    }
+
+    /// No pumping/await between these two encoders at subscription admission:
+    /// snapshot and baseline then describe the same display watermark. Each is
+    /// independently bounded by max_response (not an oversized nested frame).
+    pub fn watchSnapshot(self: *SessionHost, a: std.mem.Allocator, id: u64, epoch: u64) ![]u8 {
+        const control_id = try self.watchOwner(epoch);
+        var out = protocol.Out.init(a);
+        defer out.deinit();
+        try out.ok(id);
+        try out.field("stream", "snapshot");
+        try out.field("epoch", epoch);
+        try out.field("through", self.next_seq -| 1);
+        const queue = self.inbox.snapshot();
+        var previews: [protocol.max_previews]protocol.QueuePreview = undefined;
+        try protocol.encodeSnapshot(&out, self.snapshotFor(control_id, &queue, &previews));
+        return replyFrame(&out);
+    }
+
+    pub fn watchBaseline(self: *SessionHost, a: std.mem.Allocator, id: u64, epoch: u64) ![]u8 {
+        _ = try self.watchOwner(epoch);
+        return self.historyFrame(a, id, protocol.max_history, epoch);
+    }
+
+    pub const WatchPage = struct { frame: []u8, through: u64 };
+
+    /// Ordered union of retained live entries and canonical history rows in
+    /// `(since, high]`. A shared position is emitted once, preferring the live
+    /// entry. History-only positions (direct submits, canonical rows already
+    /// ACKed out of the ring) therefore arrive in exact sequence order instead
+    /// of being appended after later live deltas. Positions that exist nowhere
+    /// any more are reported as incomplete rather than silently claimed as
+    /// exact recovery. `first`/`sequence` of each entry is its absolute stream
+    /// position, so the caller's monotonic cursor stays truthful.
+    pub fn watchEvents(self: *SessionHost, a: std.mem.Allocator, id: u64, epoch: u64, since: u64) !?WatchPage {
+        const control_id = try self.watchOwner(epoch);
+        const high = self.next_seq -| 1;
+        if (since > high or since < self.events.reclaimed_through) return error.StreamGap;
+        if (since == high) return null;
+        var out = protocol.Out.init(a);
+        defer out.deinit();
+        try out.ok(id);
+        try out.field("stream", "events");
+        try out.field("epoch", epoch);
+        try out.field("from", since);
+        try out.beginArray("events");
+        const suppressed: u64 = if (self.controller) |controller|
+            (if (controller.connection == control_id) controller.suppressed_history_through else 0)
+        else
+            0;
+        var count: usize = 0;
+        var through = since;
+        var more = false;
+        var incomplete = false;
+        // Last position that was delivered or intentionally suppressed for this
+        // viewer. A jump means content is gone (shortened context).
+        var covered = since;
+        const lives = self.events.items.items;
+        var live_index: usize = 0;
+        while (live_index < lives.len and lives[live_index].seq <= since) live_index += 1;
+        const rows = self.history.items.items;
+        var row_index: usize = 0;
+        while (row_index < rows.len and rows[row_index].seq <= since) row_index += 1;
+        const budget = if (protocol.max_response > response_reserve) protocol.max_response - response_reserve else 0;
+        scan: while (true) {
+            const live_seq: ?u64 = if (live_index < lives.len) lives[live_index].seq else null;
+            while (row_index < rows.len and rows[row_index].seq <= covered) row_index += 1;
+            const row_seq: ?u64 = if (row_index < rows.len) rows[row_index].seq else null;
+            // A history-only row this controller submitted itself was already
+            // rendered locally; consume its position without echoing it.
+            if (row_seq) |position| {
+                if (live_seq == null or position < live_seq.?) {
+                    if (position <= suppressed) {
+                        // Locally rendered by this viewer; its position is
+                        // covered but nothing is echoed back.
+                        if (position > covered + 1) incomplete = true;
+                        covered = position;
+                        row_index += 1;
+                        continue;
+                    }
+                    if (position > covered + 1) incomplete = true;
+                    const wire = try std.fmt.allocPrint(a, "{s},\"seq\":{d}}}", .{ rows[row_index].json[0 .. rows[row_index].json.len - 1], position });
+                    defer a.free(wire);
+                    if (count == protocol.max_events or out.buf.items.len + wire.len + 32 > budget) {
+                        more = true;
+                        break :scan;
+                    }
+                    try out.element(wire);
+                    through = position;
+                    covered = position;
+                    count += 1;
+                    row_index += 1;
+                    continue;
+                }
+            }
+            const position = live_seq orelse break;
+            if (position > covered + 1) incomplete = true;
+            const wire = try std.fmt.allocPrint(a, "{s},\"seq\":{d}}}", .{ lives[live_index].json[0 .. lives[live_index].json.len - 1], position });
+            defer a.free(wire);
+            if (count == protocol.max_events or out.buf.items.len + wire.len + 32 > budget) {
+                more = true;
+                break :scan;
+            }
+            try out.element(wire);
+            through = position;
+            covered = position;
+            count += 1;
+            live_index += 1;
+            if (row_seq != null and row_seq.? == position) row_index += 1;
+        }
+        if (more and count == 0) return error.FrameTooLarge;
+        if (!more) {
+            through = high;
+            if (through > covered) incomplete = true;
+        }
+        try out.endArray();
+        try out.field("through", through);
+        try out.field("incomplete", incomplete);
+        return .{ .frame = try replyFrame(&out), .through = through };
+    }
+
     /// Reserved space for JSON framing, field names and the error path.
     const response_reserve: usize = 16 * 1024;
 
@@ -952,23 +1469,15 @@ pub const SessionHost = struct {
         const since = request.u64Field("since") catch return errorReply(a, request.id, error.BadRequest);
         const requested_max = request.optionalU64("max") catch null;
         const maximum: usize = @intCast(@min(requested_max orelse @as(u64, protocol.max_events), @as(u64, protocol.max_events)));
-        const requested_wait = request.optionalU64("wait_ms") catch null;
-        const wait_ms: u32 = @intCast(@min(requested_wait orelse 0, 20));
-
-        // Short cooperative wait: dispatch runs on the owner thread, so long
-        // polling would starve other connections. Clients simply poll again.
-        var waited: u32 = 0;
-        while (waited < wait_ms) : (waited += 5) {
-            if (self.events.newestSeq()) |newest| if (newest > since) break;
-            std.Io.sleep(self.io, .fromMilliseconds(5), .awake) catch break;
-            self.pump(self.now());
-        }
+        // Legacy polling remains an immediate bounded read. A wait_ms ceiling
+        // is not a minimum delay; waiting for output belongs to the dedicated
+        // watch socket, never a sleep inside the shared owner dispatch loop.
 
         var out = protocol.Out.init(a);
         defer out.deinit();
         try out.ok(request.id);
         const oldest = self.events.oldestSeq();
-        const reset = if (oldest) |value| since != 0 and since + 1 < value else false;
+        const reset = since != 0 and since < self.events.reclaimed_through;
         try out.field("reset", reset);
         try out.beginArray("events");
         const budget = if (protocol.max_response > response_reserve) protocol.max_response - response_reserve else 0;
@@ -1009,7 +1518,11 @@ pub const SessionHost = struct {
     fn replyHistory(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request) ![]u8 {
         const requested = request.optionalU64("limit") catch null;
         const limit: usize = @intCast(@min(requested orelse @as(u64, protocol.max_history), @as(u64, protocol.max_history)));
-        const base: u64 = if (self.next_seq == 0) 0 else self.next_seq - 1;
+        return self.historyFrame(a, request.id, limit, null);
+    }
+
+    fn historyFrame(self: *SessionHost, a: std.mem.Allocator, id: u64, limit: usize, stream_epoch: ?u64) ![]u8 {
+        const base: u64 = if (stream_epoch != null) self.events.reclaimed_through else self.next_seq -| 1;
 
         // Encode the current-state rows first: they must always fit, so their
         // exact size reserves space before the canonical window is chosen.
@@ -1019,8 +1532,15 @@ pub const SessionHost = struct {
         var synthetic_bytes: usize = 0;
         {
             var scratch = SyntheticWriter{ .host = self, .a = a, .list = &synthetic, .count = &synthetic_count, .bytes = &synthetic_bytes };
-            scratch.add(.{ .text = self.partial_text.buf.items }, self.partial_text.buf.items.len != 0);
-            scratch.add(.{ .reasoning = self.partial_reasoning.buf.items }, self.partial_reasoning.buf.items.len != 0);
+            // A streaming baseline is the ordered cutoff `base`; any live delta
+            // after it is delivered by the merged events page, so the synthetic
+            // draft must hold exactly the bytes retired at or before `base`.
+            const cut: DraftCut = if (stream_epoch != null) self.draftCut(base) orelse DraftCut{ .text = 0, .reasoning = 0 } else .{
+                .text = self.partial_text.buf.items.len,
+                .reasoning = self.partial_reasoning.buf.items.len,
+            };
+            if (cut.text != 0) scratch.addWith(.{ .text = self.partial_text.buf.items[0..cut.text] }, true, self.partial_text.truncated);
+            if (cut.reasoning != 0) scratch.addWith(.{ .reasoning = self.partial_reasoning.buf.items[0..cut.reasoning] }, true, self.partial_reasoning.truncated);
             if (self.phase) |phase| scratch.add(.{ .state = phase }, true);
             if (self.context) |context| scratch.add(.{ .context_snapshot = context }, true);
             // Replay the real owned approval detail, never an empty placeholder.
@@ -1043,7 +1563,14 @@ pub const SessionHost = struct {
             0;
         const entries = self.history.items.items;
         var used: usize = 0;
-        var start: usize = entries.len;
+        var end = entries.len;
+        if (stream_epoch != null) {
+            // Only positions at or below the ordered cutoff belong to the
+            // baseline: later canonical/history-only rows are delivered by the
+            // merged events pages in exact sequence order.
+            while (end > 0 and entries[end - 1].seq > base) end -= 1;
+        }
+        var start: usize = end;
         var taken: usize = 0;
         while (start > 0 and taken < limit) {
             const entry = entries[start - 1];
@@ -1052,15 +1579,24 @@ pub const SessionHost = struct {
             start -= 1;
             taken += 1;
         }
-        const truncated = start != 0 or taken == 0 and entries.len != 0 or (self.events.oldestSeq() orelse 1) > 1;
+        const draft_shortened = stream_epoch != null and self.draftCut(base) == null;
+        const truncated = start != 0 or self.history.evicted_through != 0 or
+            self.partial_text.truncated or self.partial_reasoning.truncated or draft_shortened;
 
         var out = protocol.Out.init(a);
         defer out.deinit();
-        try out.ok(request.id);
+        try out.ok(id);
+        if (stream_epoch) |epoch| {
+            try out.field("stream", "baseline");
+            try out.field("epoch", epoch);
+            try out.field("through", base);
+        }
         try out.field("base", base);
         try out.beginArray("entries");
         // Canonical blocks first, oldest to newest.
-        for (entries[start..]) |entry| try out.element(entry.json);
+        for (entries[start..end]) |entry| {
+            try out.element(entry.json);
+        }
         // Then the current in-progress state at `base`. These are synthetic and
         // are never inserted into the event ring, so events(since=base) cannot
         // duplicate them.
@@ -1129,11 +1665,19 @@ pub const SessionHost = struct {
         self.recordReceipt(receipt_id, kind, digest, true, accepted);
         // Direct input is shown by the submitting frontend already; only the
         // canonical history row is added (Runtime emits no user event for it).
-        if (kind == .prompt) self.noteSubmittedUser(text);
+        // The same viewer's ordered pages must not echo it back, while a new
+        // controller still receives the canonical row in sequence order.
+        if (kind == .prompt) {
+            const seq = self.noteSubmittedUser(text);
+            if (self.controller) |*controller| {
+                if (controller.connection == connection_id) controller.suppressed_history_through = @max(controller.suppressed_history_through, seq);
+            }
+        }
         var out = protocol.Out.init(a);
         defer out.deinit();
         try out.ok(request.id);
         try out.field("accepted", true);
+        try out.field("through", self.next_seq -| 1);
         try out.field("task", accepted);
         try out.field("duplicate", false);
         return replyFrame(&out);
@@ -1654,6 +2198,257 @@ fn dispatchJson(host: *SessionHost, a: std.mem.Allocator, json: []const u8, conn
     return host.dispatch(a, &request, connection, true);
 }
 
+test "watch coverage, bounded admission and epoch bound acknowledgements" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buffer);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", path_buffer[0..n]);
+    const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .logging = false, .owner = .foreground });
+    defer host.deinit();
+    try std.testing.expectError(error.StaleControl, host.watchOwner(1));
+    const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\"}", 7);
+    defer a.free(attached);
+    try std.testing.expectEqual(@as(u64, 7), try host.watchOwner(1));
+    _ = host.noteSubmittedUser("first canonical input");
+    const high = host.watchStamp().sequence;
+    const snapshot = try host.watchSnapshot(a, 9, 1);
+    defer a.free(snapshot);
+    const baseline = try host.watchBaseline(a, 9, 1);
+    defer a.free(baseline);
+    var snap_doc = try std.json.parseFromSlice(std.json.Value, a, snapshot, .{});
+    defer snap_doc.deinit();
+    var base_doc = try std.json.parseFromSlice(std.json.Value, a, baseline, .{});
+    defer base_doc.deinit();
+    try std.testing.expectEqual(@as(i64, @intCast(high)), snap_doc.value.object.get("through").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), base_doc.value.object.get("through").?.integer);
+    try std.testing.expectEqualStrings("baseline", base_doc.value.object.get("stream").?.string);
+    const before_text = host.watchStamp();
+    host.observe(.{ .text = "after baseline" }, false, true);
+    try std.testing.expect(before_text.eql(host.watchStamp()));
+    const page = (try host.watchEvents(a, 9, 1, high)).?;
+    defer a.free(page.frame);
+    try std.testing.expectEqual(high + 1, page.through);
+    try std.testing.expect(std.mem.indexOf(u8, baseline, "after baseline") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page.frame, "after baseline") != null);
+    // History-only positions are covered, not diagnosed as missing events.
+    _ = host.noteSubmittedUser("second canonical input");
+    host.observe(.{ .text = "second live delta" }, false, true);
+    const next = (try host.watchEvents(a, 9, 1, page.through)).?;
+    defer a.free(next.frame);
+    var next_doc = try std.json.parseFromSlice(std.json.Value, a, next.frame, .{});
+    defer next_doc.deinit();
+    // The ordered union puts the history-only direct submit at position 3
+    // before the live delta at position 4 instead of appending it later.
+    const next_events = next_doc.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), next_events.len);
+    try std.testing.expectEqual(@as(i64, 3), next_events[0].object.get("seq").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, next_events[0].object.get("v").?.string, "second canonical input") != null);
+    try std.testing.expectEqual(@as(i64, 4), next_events[1].object.get("seq").?.integer);
+    try std.testing.expectEqual(false, next_doc.value.object.get("incomplete").?.bool);
+    try std.testing.expectEqual(high + 3, next.through);
+    try std.testing.expect((try host.watchEvents(a, 9, 1, next.through)) == null);
+    host.events.max_count = 2;
+    const producer = host.bridge.host();
+    try producer.emit_fn(producer.context, .{ .text = "held中" }, &host.cancel);
+    host.pump(0);
+    try std.testing.expect(host.pending_event != null);
+    try std.testing.expectEqual(@as(usize, 2), host.events.items.items.len);
+    try std.testing.expectEqual(high + 3, host.watchStamp().sequence);
+    try host.watchOffered(1, next.through);
+    const future = try dispatchJson(host, a, "{\"v\":2,\"id\":4,\"op\":\"ack\",\"epoch\":1,\"sequence\":999}", 7);
+    defer a.free(future);
+    try std.testing.expect(std.mem.indexOf(u8, future, "invalid_input") != null);
+    const stale = try dispatchJson(host, a, "{\"v\":2,\"id\":5,\"op\":\"ack\",\"epoch\":2,\"sequence\":1}", 7);
+    defer a.free(stale);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
+    const ack = try dispatchJson(host, a, "{\"v\":2,\"id\":6,\"op\":\"ack\",\"epoch\":1,\"sequence\":2}", 7);
+    defer a.free(ack);
+    try std.testing.expect(std.mem.indexOf(u8, ack, "\"ok\":true") != null);
+    host.pump(0);
+    try std.testing.expect(host.pending_event == null);
+    try std.testing.expectEqual(high + 4, host.watchStamp().sequence);
+    try std.testing.expectEqualStrings("held中", host.partial_text.buf.items["after baselinesecond live delta".len..]);
+    try std.testing.expectEqual(@as(u64, 2), try host.watchResume(1, 2));
+    try std.testing.expectError(error.InvalidSequence, host.watchResume(1, 999));
+    const resumed_page = (try host.watchEvents(a, 9, 1, 2)).?;
+    defer a.free(resumed_page.frame);
+    try std.testing.expect(std.mem.indexOf(u8, resumed_page.frame, "held中") != null);
+    try host.watchOffered(1, resumed_page.through);
+    const ack_all = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":7,\"op\":\"ack\",\"epoch\":1,\"sequence\":{d}}}", .{resumed_page.through});
+    defer a.free(ack_all);
+    const ack_result = try dispatchJson(host, a, ack_all, 7);
+    defer a.free(ack_result);
+    try std.testing.expect(std.mem.indexOf(u8, ack_result, "\"ok\":true") != null);
+    const before_state = host.watchStamp();
+    host.observe(.{ .state = .calling_model }, false, true);
+    try std.testing.expect(!before_state.eql(host.watchStamp()));
+    const takeover = try dispatchJson(host, a, "{\"v\":2,\"id\":2,\"op\":\"attach\",\"takeover\":true}", 8);
+    defer a.free(takeover);
+    try std.testing.expectError(error.StaleControl, host.watchEvents(a, 9, 1, next.through));
+    try std.testing.expectEqual(@as(u64, 8), try host.watchOwner(2));
+}
+
+test "fresh baseline and live pages form one ordered union without duplicate draft bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buffer);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", path_buffer[0..n]);
+    const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .logging = false, .owner = .foreground });
+    defer host.deinit();
+    const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\"}", 7);
+    defer a.free(attached);
+
+    _ = host.noteSubmittedUser("hello");
+    host.observe(.{ .text = "中" }, false, true);
+    host.observe(.{ .text = "🙂" }, false, true);
+    try std.testing.expectEqual(@as(u64, 3), host.watchStamp().sequence);
+
+    // Nothing is acknowledged: the cutoff is 0, so no history row and no draft
+    // byte belongs to the baseline; every position follows in order.
+    {
+        const frame = try host.watchBaseline(a, 5, 1);
+        defer a.free(frame);
+        var doc = try std.json.parseFromSlice(std.json.Value, a, frame, .{});
+        defer doc.deinit();
+        try std.testing.expectEqual(@as(usize, 0), doc.value.object.get("entries").?.array.items.len);
+        try std.testing.expectEqual(false, doc.value.object.get("truncated").?.bool);
+        try std.testing.expectEqual(@as(i64, 0), doc.value.object.get("through").?.integer);
+    }
+    {
+        const page = (try host.watchEvents(a, 5, 1, 0)).?;
+        defer a.free(page.frame);
+        var doc = try std.json.parseFromSlice(std.json.Value, a, page.frame, .{});
+        defer doc.deinit();
+        const events = doc.value.object.get("events").?.array.items;
+        try std.testing.expectEqual(@as(usize, 3), events.len);
+        try std.testing.expectEqual(@as(i64, 1), events[0].object.get("seq").?.integer);
+        try std.testing.expectEqualStrings("hello", events[0].object.get("v").?.string);
+        try std.testing.expectEqual(@as(i64, 2), events[1].object.get("seq").?.integer);
+        try std.testing.expectEqualStrings("中", events[1].object.get("v").?.string);
+        try std.testing.expectEqual(@as(i64, 3), events[2].object.get("seq").?.integer);
+        try std.testing.expectEqualStrings("🙂", events[2].object.get("v").?.string);
+        try std.testing.expectEqual(false, doc.value.object.get("incomplete").?.bool);
+    }
+    try host.watchOffered(1, 3);
+    // Retire only the history-only direct submit: the ordered cutoff is 1 even
+    // though the live text is still retained.
+    _ = try host.watchAcknowledgeRange(1, 1, 1);
+    try std.testing.expectEqual(@as(u64, 1), host.events.reclaimed_through);
+    {
+        const frame = try host.watchBaseline(a, 6, 1);
+        defer a.free(frame);
+        var doc = try std.json.parseFromSlice(std.json.Value, a, frame, .{});
+        defer doc.deinit();
+        const entries = doc.value.object.get("entries").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expectEqualStrings("hello", entries[0].object.get("v").?.string);
+        try std.testing.expectEqual(false, doc.value.object.get("truncated").?.bool);
+        try std.testing.expectEqual(@as(i64, 1), doc.value.object.get("through").?.integer);
+    }
+    {
+        const page = (try host.watchEvents(a, 6, 1, 1)).?;
+        defer a.free(page.frame);
+        var doc = try std.json.parseFromSlice(std.json.Value, a, page.frame, .{});
+        defer doc.deinit();
+        const events = doc.value.object.get("events").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), events.len);
+        try std.testing.expectEqual(@as(i64, 2), events[0].object.get("seq").?.integer);
+        try std.testing.expectEqual(@as(i64, 3), events[1].object.get("seq").?.integer);
+        try std.testing.expectEqual(false, doc.value.object.get("incomplete").?.bool);
+    }
+    // Retiring the first live text delta moves the cutoff to 2; the baseline
+    // then carries exactly the retired draft prefix "中" (UTF-8 safe) and the
+    // retained "🙂" follows as an ordered page.
+    _ = try host.watchAcknowledgeRange(1, 2, 2);
+    try std.testing.expectEqual(@as(u64, 2), host.events.reclaimed_through);
+    {
+        const frame = try host.watchBaseline(a, 7, 1);
+        defer a.free(frame);
+        var doc = try std.json.parseFromSlice(std.json.Value, a, frame, .{});
+        defer doc.deinit();
+        const entries = doc.value.object.get("entries").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), entries.len);
+        try std.testing.expectEqualStrings("hello", entries[0].object.get("v").?.string);
+        try std.testing.expectEqualStrings("中", entries[1].object.get("v").?.string);
+        try std.testing.expectEqual(false, doc.value.object.get("truncated").?.bool);
+    }
+    {
+        const page = (try host.watchEvents(a, 7, 1, 2)).?;
+        defer a.free(page.frame);
+        var doc = try std.json.parseFromSlice(std.json.Value, a, page.frame, .{});
+        defer doc.deinit();
+        const events = doc.value.object.get("events").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), events.len);
+        try std.testing.expectEqual(@as(i64, 3), events[0].object.get("seq").?.integer);
+        try std.testing.expectEqualStrings("🙂", events[0].object.get("v").?.string);
+        try std.testing.expectEqual(false, doc.value.object.get("incomplete").?.bool);
+    }
+    // The SAME viewer resumes from its own admitted cursor, not the server's
+    // contiguous reclaimed watermark.
+    try std.testing.expectEqual(@as(u64, 3), try host.watchResume(1, 3));
+    try std.testing.expect((try host.watchEvents(a, 7, 1, 3)) == null);
+
+    // This controller rendered its own direct submit locally; the ordered pages
+    // consume its position without echoing the row back.
+    _ = host.noteSubmittedUser("again");
+    try std.testing.expectEqual(@as(u64, 4), host.watchStamp().sequence);
+    host.controller.?.suppressed_history_through = 4;
+    {
+        const page = (try host.watchEvents(a, 8, 1, 2)).?;
+        defer a.free(page.frame);
+        var doc = try std.json.parseFromSlice(std.json.Value, a, page.frame, .{});
+        defer doc.deinit();
+        const events = doc.value.object.get("events").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), events.len);
+        try std.testing.expectEqual(@as(i64, 3), events[0].object.get("seq").?.integer);
+        try std.testing.expect(std.mem.indexOf(u8, page.frame, "again") == null);
+        try std.testing.expectEqual(false, doc.value.object.get("incomplete").?.bool);
+    }
+    // A replacement controller has no local echo to suppress: its baseline and
+    // pages carry the canonical row in sequence order.
+    const takeover = try dispatchJson(host, a, "{\"v\":2,\"id\":2,\"op\":\"attach\",\"takeover\":true}", 8);
+    defer a.free(takeover);
+    try std.testing.expectEqual(@as(u64, 0), host.controller.?.suppressed_history_through);
+    {
+        const page = (try host.watchEvents(a, 9, 2, 2)).?;
+        defer a.free(page.frame);
+        var doc = try std.json.parseFromSlice(std.json.Value, a, page.frame, .{});
+        defer doc.deinit();
+        const events = doc.value.object.get("events").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), events.len);
+        try std.testing.expectEqual(@as(i64, 3), events[0].object.get("seq").?.integer);
+        try std.testing.expectEqual(@as(i64, 4), events[1].object.get("seq").?.integer);
+        try std.testing.expectEqualStrings("again", events[1].object.get("v").?.string);
+        try std.testing.expectEqual(false, doc.value.object.get("incomplete").?.bool);
+    }
+    // A position that exists nowhere any more is surfaced, never claimed exact.
+    host.observe(.{ .state = .calling_model }, false, true);
+    try std.testing.expectEqual(@as(u64, 5), host.watchStamp().sequence);
+    try host.watchOffered(2, 5);
+    _ = try host.watchAcknowledgeRange(2, 5, 5);
+    try std.testing.expectEqual(@as(u64, 2), host.events.reclaimed_through);
+    {
+        const page = (try host.watchEvents(a, 10, 2, 2)).?;
+        defer a.free(page.frame);
+        var doc = try std.json.parseFromSlice(std.json.Value, a, page.frame, .{});
+        defer doc.deinit();
+        // seq3 is retained, seq5 was selectively retired and has no history row,
+        // so the page covers 3..5 but cannot claim the missing 5.
+        try std.testing.expectEqual(true, doc.value.object.get("incomplete").?.bool);
+        try std.testing.expectEqual(@as(i64, 3), doc.value.object.get("events").?.array.items[0].object.get("seq").?.integer);
+    }
+}
+
 test "host lifecycle: attach snapshot settings queue and rejection paths" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -1673,20 +2468,22 @@ test "host lifecycle: attach snapshot settings queue and rejection paths" {
     defer host.deinit();
 
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":1,\"op\":\"hello\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"hello\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
-        try std.testing.expect(std.mem.indexOf(u8, frame, "\"protocol\":1") != null);
+        var hello = try std.json.parseFromSlice(std.json.Value, a, frame, .{});
+        defer hello.deinit();
+        try std.testing.expectEqual(@as(i64, protocol.version), hello.value.object.get("protocol").?.integer);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"owner\":\"foreground\"") != null);
     }
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":2,\"op\":\"snapshot\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":2,\"op\":\"snapshot\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"busy\":false") != null);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"read_only\":false") != null);
     }
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":3,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":3,\"op\":\"settings\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"effort\":null") != null);
@@ -1695,39 +2492,39 @@ test "host lifecycle: attach snapshot settings queue and rejection paths" {
     }
     // Attach assigns an epoch bound to this connection.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":4,\"op\":\"attach\",\"write\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":4,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"epoch\":1") != null);
     }
     // A second controller is refused without takeover.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":5,\"op\":\"attach\",\"write\":true}", 8);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":5,\"op\":\"attach\",\"write\":true}", 8);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
         try std.testing.expect(std.mem.indexOf(u8, frame, "busy") != null);
     }
     // Another connection cannot act with the first connection's epoch.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":6,\"op\":\"submit\",\"epoch\":1,\"req\":10,\"kind\":\"prompt\",\"text\":\"hi\"}", 8);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":6,\"op\":\"submit\",\"epoch\":1,\"req\":10,\"kind\":\"prompt\",\"text\":\"hi\"}", 8);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "stale_control") != null);
     }
     // Queue enqueue/withdraw uses its own field name and is connection bound.
     var queued_id: u64 = 0;
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":7,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"steering\",\"text\":\"more\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":7,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"steering\",\"text\":\"more\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         const at = std.mem.indexOf(u8, frame, "\"queue\":").?;
         queued_id = try std.fmt.parseInt(u64, frame[at + 8 .. std.mem.indexOfScalarPos(u8, frame, at, '}').?], 10);
     }
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":8,\"op\":\"withdraw\",\"epoch\":1,\"queue_id\":9,\"text\":\"x\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":8,\"op\":\"withdraw\",\"epoch\":1,\"queue_id\":9,\"text\":\"x\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
     }
     {
-        const buf = try std.fmt.allocPrint(a, "{{\"v\":1,\"id\":9,\"op\":\"withdraw\",\"epoch\":1,\"queue_id\":{d}}}", .{queued_id});
+        const buf = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":9,\"op\":\"withdraw\",\"epoch\":1,\"queue_id\":{d}}}", .{queued_id});
         defer a.free(buf);
         const frame = try dispatchJson(host, a, buf, 7);
         defer a.free(frame);
@@ -1735,13 +2532,13 @@ test "host lifecycle: attach snapshot settings queue and rejection paths" {
     }
     // Approvals for an id that is not pending are rejected by the Bridge.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":10,\"op\":\"approve\",\"epoch\":1,\"permission_id\":3,\"allow\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":10,\"op\":\"approve\",\"epoch\":1,\"permission_id\":3,\"allow\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "permission_expired") != null);
     }
     // History base is the last represented sequence and includes current state.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":11,\"op\":\"history\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":11,\"op\":\"history\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"entries\":[") != null);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"base\":") != null);
@@ -1749,7 +2546,7 @@ test "host lifecycle: attach snapshot settings queue and rejection paths" {
     // Disconnect revokes the controller but keeps the host usable.
     host.disconnected(7);
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":12,\"op\":\"attach\",\"write\":true}", 8);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":12,\"op\":\"attach\",\"write\":true}", 8);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"epoch\":2") != null);
     }
@@ -1807,13 +2604,13 @@ test "confirming barrier is controller-bound and released with its view" {
     const host = try SessionHost.init(a, io, &env, .{ .project = project, .id = id, .logging = false, .owner = .foreground });
     defer host.deinit();
 
-    const first = try dispatchJson(host, a, "{\"v\":1,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+    const first = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
     defer a.free(first);
     try std.testing.expect(std.mem.indexOf(u8, first, "\"epoch\":1") != null);
     const base_rev = host.inbox.snapshot().revision;
 
     // Pausing claims moves the real revision and the reply already carries it.
-    const paused = try dispatchJson(host, a, "{\"v\":1,\"id\":2,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
+    const paused = try dispatchJson(host, a, "{\"v\":2,\"id\":2,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
     defer a.free(paused);
     try std.testing.expect(std.mem.indexOf(u8, paused, "\"ok\":true") != null);
     try std.testing.expect(host.inbox.snapshot().confirming);
@@ -1822,43 +2619,43 @@ test "confirming barrier is controller-bound and released with its view" {
     try std.testing.expectEqual(paused_rev, host.inbox.snapshot().revision);
 
     // A foreign socket and a stale epoch can neither read nor release it.
-    const foreign = try dispatchJson(host, a, "{\"v\":1,\"id\":3,\"op\":\"confirming\",\"epoch\":1,\"active\":false}", 8);
+    const foreign = try dispatchJson(host, a, "{\"v\":2,\"id\":3,\"op\":\"confirming\",\"epoch\":1,\"active\":false}", 8);
     defer a.free(foreign);
     try std.testing.expect(std.mem.indexOf(u8, foreign, "stale_control") != null);
-    const stale = try dispatchJson(host, a, "{\"v\":1,\"id\":4,\"op\":\"confirming\",\"epoch\":9,\"active\":false}", 7);
+    const stale = try dispatchJson(host, a, "{\"v\":2,\"id\":4,\"op\":\"confirming\",\"epoch\":9,\"active\":false}", 7);
     defer a.free(stale);
     try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
     try std.testing.expect(host.inbox.snapshot().confirming);
     try std.testing.expectEqual(paused_rev, host.inbox.snapshot().revision);
 
     // A refused takeover leaves the owner's barrier alone.
-    const refused = try dispatchJson(host, a, "{\"v\":1,\"id\":5,\"op\":\"attach\",\"write\":true}", 8);
+    const refused = try dispatchJson(host, a, "{\"v\":2,\"id\":5,\"op\":\"attach\",\"write\":true}", 8);
     defer a.free(refused);
     try std.testing.expect(std.mem.indexOf(u8, refused, "busy") != null);
     try std.testing.expect(host.inbox.snapshot().confirming);
 
     // An explicit resume is real: the flag drops and the revision moves again.
-    const resumed = try dispatchJson(host, a, "{\"v\":1,\"id\":6,\"op\":\"confirming\",\"epoch\":1,\"active\":false}", 7);
+    const resumed = try dispatchJson(host, a, "{\"v\":2,\"id\":6,\"op\":\"confirming\",\"epoch\":1,\"active\":false}", 7);
     defer a.free(resumed);
     try std.testing.expect(!host.inbox.snapshot().confirming);
     try std.testing.expect((try snapshotRevision(a, resumed)) != paused_rev);
 
     // A granted takeover retires the previous owner's barrier.
-    const again = try dispatchJson(host, a, "{\"v\":1,\"id\":7,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
+    const again = try dispatchJson(host, a, "{\"v\":2,\"id\":7,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
     defer a.free(again);
     try std.testing.expect(host.inbox.snapshot().confirming);
-    const takeover = try dispatchJson(host, a, "{\"v\":1,\"id\":8,\"op\":\"attach\",\"write\":true,\"takeover\":true}", 8);
+    const takeover = try dispatchJson(host, a, "{\"v\":2,\"id\":8,\"op\":\"attach\",\"write\":true,\"takeover\":true}", 8);
     defer a.free(takeover);
     try std.testing.expect(std.mem.indexOf(u8, takeover, "\"epoch\":2") != null);
     try std.testing.expect(!host.inbox.snapshot().confirming);
     // The old socket's epoch is dead, so it cannot re-open the barrier.
-    const old = try dispatchJson(host, a, "{\"v\":1,\"id\":9,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
+    const old = try dispatchJson(host, a, "{\"v\":2,\"id\":9,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
     defer a.free(old);
     try std.testing.expect(std.mem.indexOf(u8, old, "stale_control") != null);
     try std.testing.expect(!host.inbox.snapshot().confirming);
 
     // EOF releases the controlling socket only; a non-owner EOF changes nothing.
-    const paused_new = try dispatchJson(host, a, "{\"v\":1,\"id\":10,\"op\":\"confirming\",\"epoch\":2,\"active\":true}", 8);
+    const paused_new = try dispatchJson(host, a, "{\"v\":2,\"id\":10,\"op\":\"confirming\",\"epoch\":2,\"active\":true}", 8);
     defer a.free(paused_new);
     try std.testing.expect(host.inbox.snapshot().confirming);
     host.disconnected(7);
@@ -1867,15 +2664,15 @@ test "confirming barrier is controller-bound and released with its view" {
     try std.testing.expect(!host.inbox.snapshot().confirming);
 
     // A stale detach does not release; the live epoch does.
-    const third = try dispatchJson(host, a, "{\"v\":1,\"id\":11,\"op\":\"attach\",\"write\":true}", 9);
+    const third = try dispatchJson(host, a, "{\"v\":2,\"id\":11,\"op\":\"attach\",\"write\":true}", 9);
     defer a.free(third);
     try std.testing.expect(std.mem.indexOf(u8, third, "\"epoch\":3") != null);
-    const paused_third = try dispatchJson(host, a, "{\"v\":1,\"id\":12,\"op\":\"confirming\",\"epoch\":3,\"active\":true}", 9);
+    const paused_third = try dispatchJson(host, a, "{\"v\":2,\"id\":12,\"op\":\"confirming\",\"epoch\":3,\"active\":true}", 9);
     defer a.free(paused_third);
-    const stale_detach = try dispatchJson(host, a, "{\"v\":1,\"id\":13,\"op\":\"detach\",\"epoch\":3}", 7);
+    const stale_detach = try dispatchJson(host, a, "{\"v\":2,\"id\":13,\"op\":\"detach\",\"epoch\":3}", 7);
     defer a.free(stale_detach);
     try std.testing.expect(host.inbox.snapshot().confirming);
-    const detach = try dispatchJson(host, a, "{\"v\":1,\"id\":14,\"op\":\"detach\",\"epoch\":3}", 9);
+    const detach = try dispatchJson(host, a, "{\"v\":2,\"id\":14,\"op\":\"detach\",\"epoch\":3}", 9);
     defer a.free(detach);
     try std.testing.expect(!host.inbox.snapshot().confirming);
 
@@ -1907,7 +2704,7 @@ test "history reply is valid JSON with truncated outside the entries array" {
     host.seedHistory(&messages);
     try std.testing.expect(host.history.items.items.len == 2);
 
-    const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":21,\"op\":\"history\",\"limit\":4}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":21,\"op\":\"history\",\"limit\":4}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
@@ -1966,7 +2763,7 @@ test "bridge display metadata is stored and the approval detail survives reconne
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"epoch\":0") != null);
 
     host.setPending(9, "bash", "rm -rf /var/tmp/x", false);
-    const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":22,\"op\":\"history\"}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":22,\"op\":\"history\"}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
@@ -2014,7 +2811,7 @@ test "long approval detail survives reconnect whole and stays approvable" {
     try std.testing.expectEqual(command.len, host.pending_desc.?.len);
 
     // A reconnected viewer sees the whole command and no clipping marker.
-    const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":80,\"op\":\"history\"}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":80,\"op\":\"history\"}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
@@ -2030,9 +2827,9 @@ test "long approval detail survives reconnect whole and stays approvable" {
     try std.testing.expect(seen);
 
     // Offline approval of an untruncated dangerous request still works.
-    const attach = try dispatchJson(host, a, "{\"v\":1,\"id\":81,\"op\":\"attach\",\"write\":true}", 1);
+    const attach = try dispatchJson(host, a, "{\"v\":2,\"id\":81,\"op\":\"attach\",\"write\":true}", 1);
     defer a.free(attach);
-    const granted = try dispatchJson(host, a, "{\"v\":1,\"id\":82,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":true}", 1);
+    const granted = try dispatchJson(host, a, "{\"v\":2,\"id\":82,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":true}", 1);
     defer a.free(granted);
     try std.testing.expect(std.mem.indexOf(u8, granted, "\"ok\":true") != null);
 }
@@ -2067,7 +2864,7 @@ test "a clipped approval detail is never silently allowed" {
     try std.testing.expectEqual(bridge_mod.item_budget - "bash".len, host.pending_desc.?.len);
 
     // The rebuilt row carries the clipping flag instead of looking complete.
-    const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":90,\"op\":\"history\"}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":90,\"op\":\"history\"}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
@@ -2080,14 +2877,14 @@ test "a clipped approval detail is never silently allowed" {
     }
     try std.testing.expect(seen);
 
-    const attach = try dispatchJson(host, a, "{\"v\":1,\"id\":91,\"op\":\"attach\",\"write\":true}", 1);
+    const attach = try dispatchJson(host, a, "{\"v\":2,\"id\":91,\"op\":\"attach\",\"write\":true}", 1);
     defer a.free(attach);
     // Allowing what the viewer cannot fully see is refused, not applied.
-    const refused = try dispatchJson(host, a, "{\"v\":1,\"id\":92,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":true}", 1);
+    const refused = try dispatchJson(host, a, "{\"v\":2,\"id\":92,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":true}", 1);
     defer a.free(refused);
     try std.testing.expect(std.mem.indexOf(u8, refused, "input_too_large") != null);
     // Nothing was answered: a deny for the same id is still a live decision.
-    const denied = try dispatchJson(host, a, "{\"v\":1,\"id\":93,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":false}", 1);
+    const denied = try dispatchJson(host, a, "{\"v\":2,\"id\":93,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":false}", 1);
     defer a.free(denied);
     try std.testing.expect(std.mem.indexOf(u8, denied, "\"ok\":true") != null);
 }
@@ -2110,10 +2907,10 @@ test "submit receipt nonce is bound to kind and exact content" {
 
     // Attach a controller epoch on connection 1.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":30,\"op\":\"attach\",\"write\":true}", 1);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":30,\"op\":\"attach\",\"write\":true}", 1);
         defer a.free(frame);
     }
-    const zero = try dispatchJson(host, a, "{\"v\":1,\"id\":35,\"op\":\"submit\",\"epoch\":1,\"req\":0,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
+    const zero = try dispatchJson(host, a, "{\"v\":2,\"id\":35,\"op\":\"submit\",\"epoch\":1,\"req\":0,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
     defer a.free(zero);
     var parsed_zero = try parseJson(a, zero);
     defer parsed_zero.deinit();
@@ -2122,12 +2919,12 @@ test "submit receipt nonce is bound to kind and exact content" {
     try std.testing.expectEqual(@as(usize, 0), host.receipt_next);
     try std.testing.expect(host.task == null);
 
-    const first = try dispatchJson(host, a, "{\"v\":1,\"id\":31,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
+    const first = try dispatchJson(host, a, "{\"v\":2,\"id\":31,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
     defer a.free(first);
     // No credentials: the task is rejected but the rejection is recorded.
     try std.testing.expect(std.mem.indexOf(u8, first, "\"ok\":false") != null);
 
-    const replay = try dispatchJson(host, a, "{\"v\":1,\"id\":32,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
+    const replay = try dispatchJson(host, a, "{\"v\":2,\"id\":32,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
     defer a.free(replay);
     var parsed_replay = try parseJson(a, replay);
     defer parsed_replay.deinit();
@@ -2136,10 +2933,10 @@ test "submit receipt nonce is bound to kind and exact content" {
     try std.testing.expect(parsed_replay.value.object.get("duplicate").?.bool);
 
     // Same nonce, different content/kind: rejected instead of "already accepted".
-    const other_text = try dispatchJson(host, a, "{\"v\":1,\"id\":33,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"beta\"}", 1);
+    const other_text = try dispatchJson(host, a, "{\"v\":2,\"id\":33,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"beta\"}", 1);
     defer a.free(other_text);
     try std.testing.expect(std.mem.indexOf(u8, other_text, "invalid_input") != null);
-    const other_kind = try dispatchJson(host, a, "{\"v\":1,\"id\":34,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"compact\",\"text\":\"alpha\"}", 1);
+    const other_kind = try dispatchJson(host, a, "{\"v\":2,\"id\":34,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"compact\",\"text\":\"alpha\"}", 1);
     defer a.free(other_kind);
     try std.testing.expect(std.mem.indexOf(u8, other_kind, "invalid_input") != null);
 }
@@ -2160,7 +2957,8 @@ test "history and event replies are clipped by encoded bytes not ring capacity" 
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
     defer host.deinit();
 
-    // Canonical rows of ~60 KiB each; the ring keeps several MiB in total.
+    // This fixture isolates per-frame clipping from the live-retention bound.
+    host.events.budget = 4 * 1024 * 1024;
     const chunk = try a.alloc(u8, 60 * 1024);
     defer a.free(chunk);
     @memset(chunk, 'a');
@@ -2171,14 +2969,14 @@ test "history and event replies are clipped by encoded bytes not ring capacity" 
         try host.events.push(host.takeSeq(), text_json);
     }
 
-    const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":40,\"op\":\"history\",\"limit\":32}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":40,\"op\":\"history\",\"limit\":32}", 1);
     defer a.free(frame);
     try std.testing.expect(frame.len <= protocol.max_response);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("truncated").?.bool);
 
-    const events = try dispatchJson(host, a, "{\"v\":1,\"id\":41,\"op\":\"events\",\"since\":0,\"max\":32}", 1);
+    const events = try dispatchJson(host, a, "{\"v\":2,\"id\":41,\"op\":\"events\",\"since\":0,\"max\":32}", 1);
     defer a.free(events);
     try std.testing.expect(events.len <= protocol.max_response);
     var events_parsed = try parseJson(a, events);
@@ -2203,7 +3001,7 @@ test "direct input is history-only while queued input is rendered exactly once" 
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
     defer host.deinit();
 
-    host.noteSubmittedUser("direct prompt");
+    _ = host.noteSubmittedUser("direct prompt");
     host.noteQueuedUser(11, "queued follow-up");
 
     // The direct prompt is canonical history but was never echoed as an event.
@@ -2222,7 +3020,7 @@ test "direct input is history-only while queued input is rendered exactly once" 
     };
     try std.testing.expectEqual(@as(usize, 1), queued_events);
 
-    const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":50,\"op\":\"history\",\"limit\":8}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":50,\"op\":\"history\",\"limit\":8}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
@@ -2257,9 +3055,9 @@ test "accepted queue entries are kept and paused when no runtime can start them"
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
     defer host.deinit();
 
-    const attach = try dispatchJson(host, a, "{\"v\":1,\"id\":60,\"op\":\"attach\",\"write\":true}", 1);
+    const attach = try dispatchJson(host, a, "{\"v\":2,\"id\":60,\"op\":\"attach\",\"write\":true}", 1);
     defer a.free(attach);
-    const queued = try dispatchJson(host, a, "{\"v\":1,\"id\":61,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"follow_up\",\"text\":\"next step\"}", 1);
+    const queued = try dispatchJson(host, a, "{\"v\":2,\"id\":61,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"follow_up\",\"text\":\"next step\"}", 1);
     defer a.free(queued);
     try std.testing.expect(std.mem.indexOf(u8, queued, "\"ok\":true") != null);
     try std.testing.expectEqual(@as(usize, 1), host.inbox.snapshot().follow_up);
@@ -2270,7 +3068,7 @@ test "accepted queue entries are kept and paused when no runtime can start them"
     try std.testing.expect(host.task == null);
 
     // An explicit resume while still unavailable also keeps the message.
-    const resumed = try dispatchJson(host, a, "{\"v\":1,\"id\":62,\"op\":\"queue_resume\",\"epoch\":1}", 1);
+    const resumed = try dispatchJson(host, a, "{\"v\":2,\"id\":62,\"op\":\"queue_resume\",\"epoch\":1}", 1);
     defer a.free(resumed);
     host.pump(0);
     try std.testing.expectEqual(@as(usize, 1), host.inbox.snapshot().follow_up);
@@ -2303,7 +3101,7 @@ test "snapshot reply encodes caller-owned queued previews consistently" {
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
     defer host.deinit();
 
-    const attach = try dispatchJson(host, a, "{\"v\":1,\"id\":80,\"op\":\"attach\",\"write\":true}", 1);
+    const attach = try dispatchJson(host, a, "{\"v\":2,\"id\":80,\"op\":\"attach\",\"write\":true}", 1);
     defer a.free(attach);
     var attach_parsed = try parseJson(a, attach);
     defer attach_parsed.deinit();
@@ -2311,8 +3109,8 @@ test "snapshot reply encodes caller-owned queued previews consistently" {
 
     const expected = [_][]const u8{ "第一条 \"引号\" 预览", "第二条 中文 \"quotes\" 预览" };
     const enqueued = [_][]const u8{
-        "{\"v\":1,\"id\":81,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"steering\",\"text\":\"第一条 \\\"引号\\\" 预览\"}",
-        "{\"v\":1,\"id\":82,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"follow_up\",\"text\":\"第二条 中文 \\\"quotes\\\" 预览\"}",
+        "{\"v\":2,\"id\":81,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"steering\",\"text\":\"第一条 \\\"引号\\\" 预览\"}",
+        "{\"v\":2,\"id\":82,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"follow_up\",\"text\":\"第二条 中文 \\\"quotes\\\" 预览\"}",
     };
     for (enqueued) |request| {
         const reply = try dispatchJson(host, a, request, 1);
@@ -2327,8 +3125,8 @@ test "snapshot reply encodes caller-owned queued previews consistently" {
         // Stack churn between rounds: sibling replies reuse the frames that held
         // the previous projection. Only caller-owned storage survives this.
         const churn_requests = [_][]const u8{
-            "{\"v\":1,\"id\":83,\"op\":\"history\",\"limit\":8}",
-            "{\"v\":1,\"id\":84,\"op\":\"events\",\"since\":0,\"max\":8}",
+            "{\"v\":2,\"id\":83,\"op\":\"history\",\"limit\":8}",
+            "{\"v\":2,\"id\":84,\"op\":\"events\",\"since\":0,\"max\":8}",
         };
         for (churn_requests) |request| {
             const churn = try dispatchJson(host, a, request, 1);
@@ -2337,7 +3135,7 @@ test "snapshot reply encodes caller-owned queued previews consistently" {
             a.free(churn);
         }
 
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":90,\"op\":\"snapshot\"}", 1);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":90,\"op\":\"snapshot\"}", 1);
         var parsed = try parseJson(a, frame);
         a.free(frame);
         defer parsed.deinit();
@@ -2430,7 +3228,7 @@ test "snapshot receipt query is read-only and reports known accepted rejected un
         .{ .id = 777, .known = false, .accepted = false, .task = 0 },
     };
     for (cases) |case| {
-        const request = try std.fmt.allocPrint(a, "{{\"v\":1,\"id\":70,\"op\":\"snapshot\",\"receipt\":{d}}}", .{case.id});
+        const request = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":70,\"op\":\"snapshot\",\"receipt\":{d}}}", .{case.id});
         defer a.free(request);
         const frame = try dispatchJson(host, a, request, 1);
         defer a.free(frame);
@@ -2447,7 +3245,7 @@ test "snapshot receipt query is read-only and reports known accepted rejected un
     }
 
     // A malformed nonce is rejected; it never starts work either.
-    const bad = try dispatchJson(host, a, "{\"v\":1,\"id\":71,\"op\":\"snapshot\",\"receipt\":\"abc\"}", 1);
+    const bad = try dispatchJson(host, a, "{\"v\":2,\"id\":71,\"op\":\"snapshot\",\"receipt\":\"abc\"}", 1);
     defer a.free(bad);
     try std.testing.expect(std.mem.indexOf(u8, bad, "\"ok\":false") != null);
     try std.testing.expect(host.task == null);
@@ -2526,7 +3324,7 @@ test "settings reply publishes the configured cleanup budgets" {
         }
         host.connection.current_fn = FakeLimitsView.current;
         host.connection.context = &fake;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":30,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":30,\"op\":\"settings\"}", 7);
         defer a.free(frame);
         try std.testing.expect(try settingsFieldIs(frame, "cleanup_grace_ms", 4_000));
         try std.testing.expect(try settingsFieldIs(frame, "cleanup_timeout_ms", 12_000));
@@ -2542,7 +3340,7 @@ test "settings reply publishes the configured cleanup budgets" {
         const defaults: cfg.Limits = .{};
         try std.testing.expectEqual(@as(u32, 1_000), defaults.cleanup_grace_ms);
         try std.testing.expectEqual(@as(u32, 5_000), defaults.cleanup_timeout_ms);
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":31,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":31,\"op\":\"settings\"}", 7);
         defer a.free(frame);
         try std.testing.expect(try settingsFieldIs(frame, "cleanup_grace_ms", 1_000));
         try std.testing.expect(try settingsFieldIs(frame, "cleanup_timeout_ms", 5_000));
@@ -2569,13 +3367,13 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     defer host.deinit();
 
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":40,\"op\":\"attach\",\"write\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":40,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"epoch\":1") != null);
     }
     // The same owner and socket attach again: this is a real new epoch.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":41,\"op\":\"attach\",\"write\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":41,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"epoch\":2") != null);
     }
@@ -2586,7 +3384,7 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     {
         host.connection.setting_fn = SettingSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":42,\"op\":\"setting\",\"epoch\":1,\"key\":\"low_price_input\",\"value\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":42,\"op\":\"setting\",\"epoch\":1,\"key\":\"low_price_input\",\"value\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "stale_control") != null);
         try std.testing.expectEqual(@as(usize, 0), sink.calls);
@@ -2595,7 +3393,7 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     {
         host.connection.setting_fn = SettingSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":43,\"op\":\"setting\",\"epoch\":2,\"key\":\"low_price_input\",\"value\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":43,\"op\":\"setting\",\"epoch\":2,\"key\":\"low_price_input\",\"value\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") == null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -2606,7 +3404,7 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     {
         host.connection.setting_fn = SettingSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":44,\"op\":\"setting\",\"epoch\":2,\"key\":\"low_price_input\",\"value\":false}", 8);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":44,\"op\":\"setting\",\"epoch\":2,\"key\":\"low_price_input\",\"value\":false}", 8);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "stale_control") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -2615,7 +3413,7 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     {
         host.connection.setting_fn = SettingSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":45,\"op\":\"setting\",\"key\":\"low_price_input\",\"value\":false}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":45,\"op\":\"setting\",\"key\":\"low_price_input\",\"value\":false}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -2720,7 +3518,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     defer host.deinit();
 
     {
-        const attached = try dispatchJson(host, a, "{\"v\":1,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+        const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(attached);
         try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
     }
@@ -2733,7 +3531,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     {
         host.connection.proxy_fn = ProxySink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":2,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"opencode-go/deepseek-v3\",\"enabled\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":2,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"opencode-go/deepseek-v3\",\"enabled\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -2744,7 +3542,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     {
         host.connection.proxy_fn = ProxySink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":3,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"opencode-go/deepseek-v3\",\"enabled\":false}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":3,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"opencode-go/deepseek-v3\",\"enabled\":false}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         try std.testing.expectEqual(@as(usize, 2), sink.calls);
@@ -2756,27 +3554,27 @@ test "proxy mutations require the live epoch and one exact model id" {
     // A stale epoch and a foreign socket both fail with stale_control; a
     // missing epoch is a bad request. None of them reaches the callback.
     {
-        const stale = try dispatchJson(host, a, "{\"v\":1,\"id\":4,\"op\":\"proxy_model\",\"epoch\":9,\"name\":\"p/m\",\"enabled\":true}", 7);
+        const stale = try dispatchJson(host, a, "{\"v\":2,\"id\":4,\"op\":\"proxy_model\",\"epoch\":9,\"name\":\"p/m\",\"enabled\":true}", 7);
         defer a.free(stale);
         try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
     }
     {
-        const foreign = try dispatchJson(host, a, "{\"v\":1,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 8);
+        const foreign = try dispatchJson(host, a, "{\"v\":2,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 8);
         defer a.free(foreign);
         try std.testing.expect(std.mem.indexOf(u8, foreign, "stale_control") != null);
     }
     {
-        const bare = try dispatchJson(host, a, "{\"v\":1,\"id\":6,\"op\":\"proxy_model\",\"name\":\"p/m\",\"enabled\":true}", 7);
+        const bare = try dispatchJson(host, a, "{\"v\":2,\"id\":6,\"op\":\"proxy_model\",\"name\":\"p/m\",\"enabled\":true}", 7);
         defer a.free(bare);
         try std.testing.expect(std.mem.indexOf(u8, bare, "\"ok\":false") != null);
     }
     try std.testing.expectEqual(@as(usize, 2), sink.calls);
     // Loose parameter shapes are rejected instead of defaulted.
     for ([_][]const u8{
-        "{\"v\":1,\"id\":7,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}",
-        "{\"v\":1,\"id\":8,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}",
-        "{\"v\":1,\"id\":9,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"\",\"enabled\":true}",
-        "{\"v\":1,\"id\":10,\"op\":\"proxy_model\",\"epoch\":1,\"enabled\":true}",
+        "{\"v\":2,\"id\":7,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}",
+        "{\"v\":2,\"id\":8,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}",
+        "{\"v\":2,\"id\":9,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"\",\"enabled\":true}",
+        "{\"v\":2,\"id\":10,\"op\":\"proxy_model\",\"epoch\":1,\"enabled\":true}",
     }) |json| {
         const frame = try dispatchJson(host, a, json, 7);
         defer a.free(frame);
@@ -2787,7 +3585,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     {
         host.reset_failed = error.ResetFailed;
         defer host.reset_failed = null;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":11,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":11,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "busy") != null);
         try std.testing.expectEqual(@as(usize, 2), sink.calls);
@@ -2796,7 +3594,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     {
         host.connection.proxy_fn = null;
         defer host.connection.proxy_fn = ProxySink.set;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":12,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":12,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "unsupported") != null);
         try std.testing.expectEqual(@as(usize, 2), sink.calls);
@@ -2819,7 +3617,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
     defer host.deinit();
     {
-        const attached = try dispatchJson(host, a, "{\"v\":1,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+        const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(attached);
         try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
     }
@@ -2849,7 +3647,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
         host.connection.context = &proxy;
         host.connection.proxy_address_fn = ProxyViewSink.set;
         defer host.refreshConnection();
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":2,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"[2001:db8::1]:8080\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":2,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"[2001:db8::1]:8080\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -2861,7 +3659,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     {
         host.connection.proxy_address_fn = ProxyAddressSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":3,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":3,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         try std.testing.expectEqual(@as(usize, 2), sink.calls);
@@ -2872,14 +3670,14 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     host.connection.proxy_address_fn = ProxyAddressSink.set;
     host.connection.context = &sink;
     for ([_][]const u8{
-        "{\"v\":1,\"id\":4,\"op\":\"proxy_address\",\"epoch\":1}",
-        "{\"v\":1,\"id\":5,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
-        "{\"v\":1,\"id\":6,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
-        "{\"v\":1,\"id\":7,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"2001:db8::1\"}",
-        "{\"v\":1,\"id\":8,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:0\"}",
-        "{\"v\":1,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:70000\"}",
-        "{\"v\":1,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"user@host:8080\"}",
-        "{\"v\":1,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"http://host:8080\"}",
+        "{\"v\":2,\"id\":4,\"op\":\"proxy_address\",\"epoch\":1}",
+        "{\"v\":2,\"id\":5,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
+        "{\"v\":2,\"id\":6,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
+        "{\"v\":2,\"id\":7,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"2001:db8::1\"}",
+        "{\"v\":2,\"id\":8,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:0\"}",
+        "{\"v\":2,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:70000\"}",
+        "{\"v\":2,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"user@host:8080\"}",
+        "{\"v\":2,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"http://host:8080\"}",
     }) |json| {
         const frame = try dispatchJson(host, a, json, 7);
         defer a.free(frame);
@@ -2890,7 +3688,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     {
         var long_value: [cfg.max_proxy_endpoint_bytes + 1]u8 = undefined;
         @memset(&long_value, 'a');
-        const too_long = try std.fmt.allocPrint(a, "{{\"v\":1,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"{s}\"}}", .{long_value[0..]});
+        const too_long = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"{s}\"}}", .{long_value[0..]});
         defer a.free(too_long);
         const frame = try dispatchJson(host, a, too_long, 7);
         defer a.free(frame);
@@ -2900,19 +3698,19 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
 
     // Socket and epoch binding, then the idle guard: none reach the callback.
     {
-        const stale = try dispatchJson(host, a, "{\"v\":1,\"id\":13,\"op\":\"proxy_address\",\"epoch\":9,\"value\":\"host:8080\"}", 7);
+        const stale = try dispatchJson(host, a, "{\"v\":2,\"id\":13,\"op\":\"proxy_address\",\"epoch\":9,\"value\":\"host:8080\"}", 7);
         defer a.free(stale);
         try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
     }
     {
-        const foreign = try dispatchJson(host, a, "{\"v\":1,\"id\":14,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 8);
+        const foreign = try dispatchJson(host, a, "{\"v\":2,\"id\":14,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 8);
         defer a.free(foreign);
         try std.testing.expect(std.mem.indexOf(u8, foreign, "stale_control") != null);
     }
     {
         host.reset_failed = error.ResetFailed;
         defer host.reset_failed = null;
-        const busy = try dispatchJson(host, a, "{\"v\":1,\"id\":15,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
+        const busy = try dispatchJson(host, a, "{\"v\":2,\"id\":15,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
         defer a.free(busy);
         try std.testing.expect(std.mem.indexOf(u8, busy, "busy") != null);
     }
@@ -2939,7 +3737,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
         sink.fail = true;
         defer sink.fail = false;
         defer host.refreshConnection();
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":16,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":16,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
         try std.testing.expectEqual(@as(usize, 3), sink.calls);
@@ -2950,7 +3748,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     {
         host.connection.context = session_ctx;
         host.connection.proxy_address_fn = null;
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":17,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":17,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "unsupported") != null);
         try std.testing.expectEqual(@as(usize, 3), sink.calls);
@@ -2989,7 +3787,7 @@ test "settings reply publishes the proxy allowlist without addresses or secrets"
             host.connection.current_fn = fake.prev_fn;
             host.connection.context = fake.prev_context;
         }
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":20,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":20,\"op\":\"settings\"}", 7);
         defer a.free(frame);
         var doc = try parseWholeReply(a, frame);
         defer doc.deinit();
@@ -3026,7 +3824,7 @@ test "settings reply publishes the proxy allowlist without addresses or secrets"
             host.connection.current_fn = fake.prev_fn;
             host.connection.context = fake.prev_context;
         }
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":21,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":21,\"op\":\"settings\"}", 7);
         defer a.free(frame);
         var doc = try parseWholeReply(a, frame);
         defer doc.deinit();
@@ -3037,7 +3835,7 @@ test "settings reply publishes the proxy allowlist without addresses or secrets"
 
     // The real projection stays unconfigured with a real empty array.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":22,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":22,\"op\":\"settings\"}", 7);
         defer a.free(frame);
         var doc = try parseWholeReply(a, frame);
         defer doc.deinit();
@@ -3121,7 +3919,7 @@ test "settings reply is one parseable JSON object with complete array elements" 
     host.connection.current_fn = FakeCatalogView.current;
     host.connection.context = &fake;
 
-    const frame = try dispatchJson(host, a, "{\"v\":1,\"id\":50,\"op\":\"settings\"}", 7);
+    const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":50,\"op\":\"settings\"}", 7);
     defer a.free(frame);
 
     var doc = try parseWholeReply(a, frame);

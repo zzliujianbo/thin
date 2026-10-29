@@ -733,7 +733,7 @@ fn freeSlot(slots: *[max_connections]?Slot) ?usize {
 /// own connection id, so the host's controller bookkeeping stays authoritative;
 /// the value is never handed to an external caller.
 fn attachSetupHost(a: std.mem.Allocator, host: *session_host.SessionHost, connection_id: u64) !u64 {
-    var request = try protocol.parseRequest(a, "{\"v\":1,\"id\":1,\"op\":\"attach\",\"write\":true}");
+    var request = try protocol.parseRequest(a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}");
     defer request.deinit();
     const frame = try host.dispatch(a, &request, connection_id, false);
     defer a.free(frame);
@@ -821,7 +821,7 @@ fn controlRoundTrip(supervisor: *Supervisor, client: *unix.Connection, frame: []
 }
 
 fn setupOpFrame(allocator: std.mem.Allocator, id: u64, op: []const u8, body: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{{\"v\":1,\"id\":{d},\"op\":\"{s}\"{s}}}", .{ id, op, body });
+    return std.fmt.allocPrint(allocator, "{{\"v\":{d},\"id\":{d},\"op\":\"{s}\"{s}}}", .{ protocol.version, id, op, body });
 }
 
 test "supervisor keeps one private setup host per socket without registering a session" {

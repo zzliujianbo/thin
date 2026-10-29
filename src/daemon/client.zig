@@ -31,12 +31,56 @@ const protocol = @import("protocol.zig");
 const registry = @import("registry.zig");
 const spawn = @import("spawn.zig");
 const unix = @import("unix.zig");
+const StreamReceiver = @import("stream_receiver.zig").Receiver;
+const remote_action = @import("../ui/remote_action.zig");
 
 const Io = std.Io;
 const Registry = registry.Registry;
 const Workers = spawn.Workers;
 /// Wire protocol id type used by `core/config.Model.protocol`.
 const ProtocolKind = @TypeOf(@as(core_config.Model, undefined).protocol);
+
+/// Compare owned public settings, excluding only the envelope id and the
+/// independently published runtime observation. Depth exhaustion is changed.
+fn publicSettingsEqual(left: std.json.Value, right: std.json.Value, depth: usize) bool {
+    if (depth > 64 or std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .null => true,
+        .bool => |v| v == right.bool,
+        .integer => |v| v == right.integer,
+        .float => |v| v == right.float,
+        .number_string => |v| std.mem.eql(u8, v, right.number_string),
+        .string => |v| std.mem.eql(u8, v, right.string),
+        .array => |v| blk: {
+            const other = right.array.items;
+            if (v.items.len != other.len) break :blk false;
+            for (v.items, other) |item, matching| {
+                if (!publicSettingsEqual(item, matching, depth + 1)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |v| blk: {
+            const other = right.object;
+            var count: usize = 0;
+            var it = v.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (depth == 0 and (std.mem.eql(u8, key, "id") or std.mem.eql(u8, key, "context"))) continue;
+                count += 1;
+                const matching = other.get(key) orelse break :blk false;
+                if (!publicSettingsEqual(entry.value_ptr.*, matching, depth + 1)) break :blk false;
+            }
+            var other_count: usize = 0;
+            var other_it = other.iterator();
+            while (other_it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (depth == 0 and (std.mem.eql(u8, key, "id") or std.mem.eql(u8, key, "context"))) continue;
+                other_count += 1;
+            }
+            break :blk count == other_count;
+        },
+    };
+}
 
 /// Bounded wait budgets. All of them are finite: there is no infinite wait.
 const join_timeout_ms: u32 = 5_000;
@@ -70,7 +114,7 @@ const ReceiptQuery = union(enum) { accepted: u64, rejected, unknown };
 /// Outcome of one candidate attach. Only `gone` proves there is no owner left;
 /// `unknown` (timeout, permission, identity, protocol) must never authorize a
 /// second writer for the same history.
-const AttachStage = enum { attached, busy, unknown, gone };
+const AttachStage = enum { attached, busy, unknown, gone, outdated };
 
 /// Which stage a failed dial reached. Only a provably absent listener may
 /// authorize a resume.
@@ -374,10 +418,27 @@ pub const Client = struct {
 
     /// Worker session connection, or null while launcher-only/detached.
     conn: ?unix.Connection = null,
+    /// The receive task owns a distinct read-only subscription fd. UI-side
+    /// projection only consumes complete locally queued frames.
+    stream: ?*StreamReceiver = null,
+    stream_snapshot: ?[]u8 = null,
+    resume_snapshot_pending: bool = false,
+    stream_retry_after: i64 = 0,
+    stream_expected: bool = false,
+    cache_floor: u64 = 0,
     control: ?unix.Connection = null,
     session: ?ids.Id = null,
     epoch: u64 = 0,
     next_req: u64 = 0,
+    /// Set only while a communication owner task has exclusive access.
+    wait_cancel: ?*const p.Cancellation = null,
+    wait_progress_context: ?*anyopaque = null,
+    wait_progress_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    in_wait_progress: bool = false,
+    stream_recovery_pending: bool = false,
+    publication_revision: u64 = 0,
+    configuration_revision: u64 = 0,
+    stream_publication_revision: u64 = 0,
 
     /// One submission that may or may not have been accepted. Kept across a
     /// transport failure so an explicit re-submit reuses the same receipt.
@@ -395,6 +456,7 @@ pub const Client = struct {
     cursor: u64 = 0,
     need_history: bool = false,
     dirty: bool = true,
+    initial_settings_loading: bool = false,
     poll_error: ?anyerror = null,
 
     /// Published projections with a stable address for the VTable.
@@ -456,6 +518,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        self.closeStream();
         self.closeControl();
         self.clearPending();
         if (self.conn) |*conn| conn.close();
@@ -513,7 +576,16 @@ pub const Client = struct {
     // -- transport ---------------------------------------------------------
 
     fn waitFor(self: *Client, timeout_ms: u32) unix.Wait {
-        return .{ .io = self.io, .timeout_ms = timeout_ms };
+        return .{ .io = self.io, .timeout_ms = timeout_ms, .cancel = self.wait_cancel, .progress_context = self, .progress_fn = progressWait };
+    }
+
+    fn progressWait(raw: ?*anyopaque) !void {
+        const self: *Client = @ptrCast(@alignCast(raw orelse return));
+        if (self.in_wait_progress) return;
+        const progress = self.wait_progress_fn orelse return;
+        self.in_wait_progress = true;
+        defer self.in_wait_progress = false;
+        try progress(self.wait_progress_context);
     }
 
     fn allocRequestId(self: *Client) u64 {
@@ -640,6 +712,8 @@ pub const Client = struct {
 
     /// Drop the view without sending anything: the worker keeps running.
     fn loseView(self: *Client) void {
+        self.closeStream();
+        self.stream_expected = false;
         self.clearPending();
         if (self.conn) |*conn| conn.close();
         self.conn = null;
@@ -658,6 +732,15 @@ pub const Client = struct {
         self.rebuild();
     }
 
+    fn closeStream(self: *Client) void {
+        self.stream_recovery_pending = false;
+        if (self.stream) |stream| stream.deinit();
+        self.stream = null;
+        if (self.stream_snapshot) |bytes| self.a.free(bytes);
+        self.stream_snapshot = null;
+        self.resume_snapshot_pending = false;
+    }
+
     fn closeControl(self: *Client) void {
         if (self.control) |*conn| conn.close();
         self.control = null;
@@ -671,6 +754,7 @@ pub const Client = struct {
     // -- published projection ---------------------------------------------
 
     fn rebuild(self: *Client) void {
+        self.publication_revision +%= 1;
         const slot = self.arena_index ^ 1;
         _ = self.arenas[slot].reset(.retain_capacity);
         const arena = self.arenas[slot].allocator();
@@ -699,14 +783,14 @@ pub const Client = struct {
             // worker transport, or a launcher that can still get one. A revoked
             // foreground/attach view starts its own worker on the next explicit
             // submit; only --connect needs a live control socket for that.
-            .available = self.conn != null or switch (self.mode) {
+            .available = !self.initial_settings_loading and !self.stream_recovery_pending and !(self.stream_expected and self.need_history) and (self.conn != null or switch (self.mode) {
                 .foreground, .attach => true,
                 .connect => self.control != null,
                 else => false,
-            },
+            }),
             // Attachment is still only a worker connection with a control epoch.
             .attached = self.conn != null and self.epoch != 0,
-            .busy = cache.valid and cache.busy,
+            .busy = (cache.valid and cache.busy) or (self.need_history and self.snap.busy),
             .mode = if (cache.valid) cache.phase else null,
             .task_kind = if (cache.valid) cache.kind else .prompt,
             .session_id = self.session,
@@ -731,7 +815,7 @@ pub const Client = struct {
         const cache = &self.cache;
         var state: tui.Connection.State = baseState();
         state.available = cfg.available and (self.conn != null or self.control != null);
-        state.busy = cache.valid and cache.busy;
+        state.busy = (cache.valid and cache.busy) or (self.need_history and self.snap.busy);
         state.session_label = if (cache.valid and cache.label_len != 0) try arena.dupe(u8, cache.label[0..cache.label_len]) else null;
         state.launcher_dir = try arena.dupe(u8, self.launcher);
         state.control_epoch = self.epoch;
@@ -739,7 +823,9 @@ pub const Client = struct {
         state.model = try arena.dupe(u8, cfg.model);
         state.session_id = self.session;
         state.models = try cloneModels(arena, cfg.models);
-        state.model_providers = try arena.dupe(picker_module.Provider, cfg.providers);
+        const providers = try arena.dupe(picker_module.Provider, cfg.providers);
+        for (providers) |*provider| provider.name = try arena.dupe(u8, provider.name);
+        state.model_providers = providers;
         state.model_context_official = try arena.dupe(bool, cfg.context_official);
         state.model_disabled = try arena.dupe(bool, cfg.disabled);
         state.selection_name = if (cfg.selection.len != 0) try arena.dupe(u8, cfg.selection) else null;
@@ -785,8 +871,105 @@ pub const Client = struct {
             copy[index] = model;
             copy[index].name = try arena.dupe(u8, model.name);
             copy[index].reasoning_effort = if (model.reasoning_effort) |value| try arena.dupe(u8, value) else null;
+            if (copy[index].reasoning) |*reasoning| {
+                inline for (.{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |name| {
+                    if (@field(reasoning.map, name)) |value| @field(reasoning.map, name) = try arena.dupe(u8, value);
+                }
+            }
         }
         return copy;
+    }
+
+    /// Immutable, independently owned publication. Unlike the legacy borrowed
+    /// double arena, this may be transferred to another thread and freed there.
+    pub const Projection = struct {
+        configuration_revision: u64 = 0,
+        a: std.mem.Allocator,
+        arena: std.heap.ArenaAllocator,
+        state: tui.Connection.State,
+        snapshot: session_client.Snapshot,
+
+        pub fn deinit(self: *Projection) void {
+            const a = self.a;
+            self.arena.deinit();
+            a.destroy(self);
+        }
+    };
+
+    pub fn exportProjection(self: *Client) !*Projection {
+        const view = try self.a.create(Projection);
+        errdefer self.a.destroy(view);
+        view.* = .{ .configuration_revision = self.configuration_revision, .a = self.a, .arena = .init(self.a), .state = undefined, .snapshot = undefined };
+        errdefer view.arena.deinit();
+        view.state = try self.buildState(view.arena.allocator());
+        view.snapshot = try self.buildSnapshot(view.arena.allocator());
+        return view;
+    }
+
+    /// Sole-owner asynchronous command execution. Only the communication task
+    /// calls this; the UI receives a ticket first and this result later.
+    pub fn perform(self: *Client, epoch: u64, action: remote_action.Action) !remote_action.Value {
+        if (epoch != self.epoch) return error.StaleControl;
+        switch (action) {
+            .submit => |v| try submitFn(self, epoch, v.kind, v.text),
+            .cancel => try cancelFn(self, epoch),
+            .cancel_clear => |revision| try cancelClearFn(self, epoch, revision),
+            .confirming => |active| try setConfirmingFn(self, epoch, active),
+            .approve => |v| try approveFn(self, epoch, v.id, v.decision),
+            .enqueue => |v| try enqueueFn(self, epoch, v.kind, v.text),
+            .withdraw => |id| return .{ .withdrawn = try withdrawFn(self, self.a, epoch, id) },
+            .queue_resume => try queueResumeFn(self, epoch),
+            .manage => |command| return .{ .managed = try manageFn(self, self.a, command) },
+            .configure => |v| if (v.provider) |provider| try configureProviderFn(self, provider, v.key) else try configureFn(self, v.key),
+            .model => |name| try selectModelFn(self, name),
+            .effort => |effort| try setEffortFn(self, effort),
+            .cycle_effort => return .{ .effort = try cycleEffortFn(self) },
+            .preference => |v| try preferenceFn(self, v.key, v.value),
+            .setting => |v| try settingFn(self, switch (v.key) {
+                .low_price_input => .low_price_input,
+                .decision_enabled => .decision_enabled,
+            }, v.value),
+            .decision => |choice| try decisionFn(self, choice),
+            .image => |choice| try imageFn(self, choice),
+            .proxy => |v| try proxyFn(self, v.model, v.enabled),
+            .proxy_address => |address| try proxyAddressFn(self, address),
+            .refresh_models => try refreshModelsFn(self),
+            .poll_metadata => |wait| return .{ .changed = pollModelsFn(self, wait) },
+        }
+        return .none;
+    }
+
+    /// Nonblocking UI admission of one already-displayed inclusive range
+    /// (`first == 0` is the prefix `[0, last]`). No socket I/O happens on the
+    /// calling thread; the receiver coalesces and writes the frame. While the
+    /// subscription is missing this reports Unavailable so the caller keeps its
+    /// exact proof for retry instead of pretending it was acknowledged.
+    pub fn admitAckRange(self: *Client, epoch: u64, first: u64, last: u64) !void {
+        if (last == 0) return;
+        if (first != 0 and first > last) return error.InvalidInput;
+        if (epoch == 0 or epoch != self.epoch) return error.StaleControl;
+        const stream = self.stream orelse return error.Unavailable;
+        try stream.acknowledgeRange(epoch, first, last);
+    }
+
+    /// Cumulative prefix admission retained for existing callers.
+    pub fn admitAck(self: *Client, epoch: u64, sequence: u64) !void {
+        return self.admitAckRange(epoch, 0, sequence);
+    }
+
+    /// Local pending events are transferred before any next stream frame is
+    /// consumed. With a real subscription this never polls the worker socket.
+    pub fn nextDisplay(self: *Client) !?session_client.Item {
+        if (self.in_wait_progress) {
+            // Never issue a nested control RPC while a reply owns that socket.
+            if (self.pending.items.len == 0 and self.stream != null) try self.pumpStream();
+            return if (self.pending.items.len != 0) self.pending.orderedRemove(0) else null;
+        }
+        return pollFn(self, self.a);
+    }
+
+    pub fn dropDisplayView(self: *Client) void {
+        self.loseView();
     }
 
     // -- owner refresh -----------------------------------------------------
@@ -895,9 +1078,16 @@ pub const Client = struct {
             return;
         }
         self.cache = cache;
+        if (resp.uint("through")) |through| self.cache_floor = @max(self.cache_floor, through);
     }
 
     fn refreshSettings(self: *Client) void {
+        // Progress may consume the initial subscription baseline while this
+        // reply is pending. Baseline availability must not advertise Ready
+        // using the old/default settings. Ordinary metadata refreshes do not
+        // interrupt an already initialized view.
+        self.initial_settings_loading = self.need_history;
+        defer self.initial_settings_loading = false;
         var req = (self.trySettingsRequest(.settings) catch |err| {
             switch (err) {
                 error.Unsupported, error.ProtocolError, error.RemoteFailure => return,
@@ -989,8 +1179,13 @@ pub const Client = struct {
         try parseModels(self.a, &next, read.field(view, "image_models"), .image_models);
         try parseProviders(self.a, &next, read.field(view, "providers"));
 
+        const changed = if (self.pubcfg.doc) |old_doc|
+            !publicSettingsEqual(old_doc.value, next.doc.?.value, 0)
+        else
+            true;
         const stale = self.pubcfg;
         self.pubcfg = next;
+        if (changed) self.configuration_revision +%= 1;
         self.freePubValue(stale);
     }
 
@@ -1023,6 +1218,14 @@ pub const Client = struct {
         if (self.dirty) {
             self.dirty = false;
             self.refreshSettings();
+            self.rebuild();
+        }
+        if (self.stream_expected) {
+            self.pumpStream() catch |err| {
+                self.loseView();
+                self.poll_error = err;
+            };
+            return;
         }
         self.refreshSnapshot();
         self.rebuild();
@@ -1039,6 +1242,131 @@ pub const Client = struct {
         };
     }
 
+    /// Local queue consumption only. The receiver continues socket reads even
+    /// while the TUI is drawing or waiting for a separate control RPC.
+    fn pumpStream(self: *Client) !void {
+        if (self.stream_recovery_pending) {
+            if (self.in_wait_progress) return;
+            self.stream_recovery_pending = false;
+            try self.recoverStream();
+            return;
+        }
+        const stream = self.stream orelse return error.Unavailable;
+        const bytes = (stream.pop() catch |err| {
+            if (err == error.OutOfMemory) return err;
+            if (self.in_wait_progress) {
+                self.stream_recovery_pending = true;
+                self.rebuild();
+                return;
+            }
+            try self.recoverStream();
+            return;
+        }) orelse return;
+        defer self.a.free(bytes);
+        var response = try parseObject(self.a, bytes);
+        defer response.deinit();
+        if (try validateEnvelope(&response, 1) != .ok) return error.ProtocolError;
+        if (response.uint("epoch") != self.epoch) return error.StaleControl;
+        const kind = response.text("stream") orelse return error.ProtocolError;
+        const through = response.uint("through") orelse return error.ProtocolError;
+        if (std.mem.eql(u8, kind, "snapshot")) {
+            const state = switch (response.field("snapshot") orelse return error.ProtocolError) {
+                .object => |value| value,
+                else => return error.ProtocolError,
+            };
+            if (valueU64(state.get("epoch") orelse return error.ProtocolError) != self.epoch) return error.StaleControl;
+            if (self.resume_snapshot_pending) {
+                // A reconnect snapshot can be ahead of already-owned events;
+                // never publish it before their ordered stream pages.
+                self.resume_snapshot_pending = false;
+                return;
+            }
+            if (self.need_history) {
+                if (self.stream_snapshot != null) return error.ProtocolError;
+                self.stream_snapshot = try self.a.dupe(u8, bytes);
+                return;
+            }
+            if (through != self.cursor) return error.ProtocolError;
+            if (through < self.cache_floor) return;
+            try self.adoptSnapshot(&response);
+            self.stream_publication_revision +%= 1;
+            self.rebuild();
+            return;
+        }
+        if (std.mem.eql(u8, kind, "baseline")) {
+            if (!self.need_history) return error.ProtocolError;
+            const snapshot_bytes = self.stream_snapshot orelse return error.ProtocolError;
+            var snapshot = try parseObject(self.a, snapshot_bytes);
+            defer snapshot.deinit();
+            const snapshot_through = snapshot.uint("through") orelse return error.ProtocolError;
+            if (snapshot_through < through or response.uint("base") != through) return error.ProtocolError;
+            try self.adoptHistory(&response, true);
+            // The snapshot is the CURRENT state projection, not ordered content:
+            // it may be ahead of the baseline cutoff while retained live deltas
+            // follow through the ordered event pages. It must never move the
+            // cursor, so adopting it here cannot skip a retained entry.
+            if (snapshot_through >= through and snapshot_through >= self.cache_floor) try self.adoptSnapshot(&snapshot);
+            self.a.free(snapshot_bytes);
+            self.stream_snapshot = null;
+            self.need_history = false;
+            self.stream_publication_revision +%= 1;
+            self.rebuild();
+            return;
+        }
+        if (!std.mem.eql(u8, kind, "events") or self.need_history or response.uint("from") != self.cursor or through <= self.cursor) return error.ProtocolError;
+        const entries = switch (response.field("events") orelse return error.ProtocolError) {
+            .array => |array| array,
+            else => return error.ProtocolError,
+        };
+        if (entries.items.len > protocol.max_events or self.pending.items.len != 0) return error.ProtocolError;
+        errdefer self.clearPending();
+        var previous = self.cursor;
+        for (entries.items) |entry| {
+            const object = switch (entry) {
+                .object => |value| value,
+                else => return error.ProtocolError,
+            };
+            const sequence = valueU64(object.get("seq") orelse return error.ProtocolError) orelse return error.ProtocolError;
+            if (sequence <= previous or sequence > through) return error.ProtocolError;
+            try self.pushEventMode(entry, true);
+            const item = &self.pending.items[self.pending.items.len - 1];
+            item.delivery_epoch = self.epoch;
+            item.delivery_sequence = sequence;
+            // One raw wire event is exactly one position; coalescing later
+            // widens this span instead of forgetting the older position.
+            item.delivery_first_sequence = sequence;
+            previous = sequence;
+        }
+        if (response.flag("incomplete", false)) self.pubcfg.notice = "Some earlier live events are unavailable; display continues.";
+        self.cursor = through;
+    }
+
+    /// A drained dead stream can rebuild its display baseline, never resubmit
+    /// inference. Persistent failure is paced; a saturated queue is drained
+    /// first, so it cannot trigger an eager reconnect loop.
+    fn recoverStream(self: *Client) !void {
+        const now = Io.Clock.awake.now(self.io).toMilliseconds();
+        if (now < self.stream_retry_after) return;
+        self.stream_retry_after = @intCast(@min(now + 1000, std.math.maxInt(i64)));
+        const old = self.stream orelse return;
+        self.stream = null;
+        const need_baseline = self.need_history;
+        self.rebuild();
+        defer old.deinit();
+        if (self.stream_snapshot) |bytes| self.a.free(bytes);
+        self.stream_snapshot = null;
+        // Revocation is read from the real control socket, not guessed from an
+        // event EOF. This never changes task ownership or sends submit again.
+        self.refreshSnapshot();
+        if (self.conn == null or self.epoch == 0) return;
+        // Unconfirmed ranges belong to the SAME viewer and epoch: carry them to
+        // the replacement connection instead of losing already-shown positions.
+        const carried = old.takeRanges();
+        self.stream = try StreamReceiver.startResumed(self.a, self.io, old.endpoint, self.uid, self.epoch, if (need_baseline) null else self.cursor);
+        try self.stream.?.adoptRanges(carried);
+        self.resume_snapshot_pending = !need_baseline;
+    }
+
     fn pageEpoch(self: *Client, resp: *const Response) ?u64 {
         const epoch = resp.uint("epoch") orelse return null;
         if (epoch == 0 or self.epoch == 0) return null;
@@ -1051,13 +1379,18 @@ pub const Client = struct {
         try req.put("limit", max_history);
         var resp = try req.exchange(poll_timeout_ms);
         defer resp.deinit();
+        try self.adoptHistory(&resp, false);
+    }
+
+    fn adoptHistory(self: *Client, resp: *const Response, strict: bool) !void {
         const base = resp.uint("base") orelse return error.ProtocolError;
+        if (resp.flag("truncated", false)) self.pubcfg.notice = "History is incomplete; retained live events follow.";
         const entries = switch (resp.field("entries") orelse return error.ProtocolError) {
             .array => |array| array,
             else => return error.ProtocolError,
         };
         // A page from another control epoch is stale: drop it completely.
-        const page = self.pageEpoch(&resp);
+        const page = self.pageEpoch(resp);
         if (page) |epoch| if (epoch == 0) return;
         // The page replaces the queue: an entry that fails after earlier ones
         // were decoded must not publish a partial replay, so the previous
@@ -1074,12 +1407,14 @@ pub const Client = struct {
         // nothing: the UI already resets on the epoch switch, so no synthetic
         // content event is fabricated.
         const before = self.pending.items.len;
-        for (entries.items) |entry| try self.pushEvent(entry);
+        if (strict and entries.items.len > max_pending) return error.ProtocolError;
+        for (entries.items) |entry| try self.pushEventMode(entry, strict);
         if (self.pending.items.len == before) return;
         for (0..self.pending.items.len - before) |offset| {
             const item = &self.pending.items[before + offset];
             item.history_replay = true;
             item.history_reset = offset == 0;
+            item.history_display_reset = offset == 0 and strict and base >= self.cache_floor;
         }
     }
 
@@ -1112,7 +1447,11 @@ pub const Client = struct {
 
     /// Decode one encoded display event into an independent owned item.
     fn pushEvent(self: *Client, entry: std.json.Value) !void {
-        if (self.pending.items.len >= max_pending) return;
+        return self.pushEventMode(entry, false);
+    }
+
+    fn pushEventMode(self: *Client, entry: std.json.Value, strict: bool) !void {
+        if (self.pending.items.len >= max_pending) return if (strict) error.QueueFull else {};
         var owned_bytes: ?[]u8 = null;
         defer if (owned_bytes) |bytes| self.a.free(bytes);
         const json = switch (entry) {
@@ -1124,11 +1463,14 @@ pub const Client = struct {
             else => return error.ProtocolError,
         };
         if (json.len == 0 or json.len > protocol.max_response) return error.ProtocolError;
-        var decoded = protocol.decodeEvent(self.a, json) catch return;
+        var decoded = protocol.decodeEvent(self.a, json) catch |err| {
+            if (strict) return err;
+            return;
+        };
         defer decoded.deinit();
         // A wire epoch is authority-bearing: it must match the controller epoch
         // this view holds, otherwise the event belongs to a replaced console.
-        const epoch = itemEpoch(self.epoch, &decoded) orelse return;
+        const epoch = itemEpoch(self.epoch, &decoded) orelse return if (strict) error.StaleControl else {};
         var item = try session_client.ownEvent(self.a, epoch, decoded.event);
         errdefer item.deinit();
         mergeFlags(&item, &decoded);
@@ -1145,6 +1487,21 @@ pub const Client = struct {
         return &fromContext(context).snap;
     }
 
+    fn bufferedFn(context: *anyopaque) bool {
+        const self = fromContext(context);
+        return self.pending.items.len != 0 or if (self.stream) |stream| stream.buffered() else false;
+    }
+
+    /// Direct (non-Communication) adapter admission: the same coalesced
+    /// watermark path, never a synchronous control RPC.
+    fn acknowledgeFn(context: *anyopaque, epoch: u64, sequence: u64) anyerror!void {
+        return fromContext(context).admitAck(epoch, sequence);
+    }
+
+    fn acknowledgeRangeFn(context: *anyopaque, epoch: u64, first: u64, last: u64) anyerror!void {
+        return fromContext(context).admitAckRange(epoch, first, last);
+    }
+
     fn pollFn(context: *anyopaque, a: std.mem.Allocator) anyerror!?session_client.Item {
         _ = a;
         const self = fromContext(context);
@@ -1156,7 +1513,7 @@ pub const Client = struct {
             // Remove before refreshing: a refresh may drop the view and clear the
             // queue, which must never free the item this poll returns.
             const item = self.pending.orderedRemove(0);
-            if (item.event == .finished) {
+            if (item.event == .finished and !self.stream_expected) {
                 // A finished event only says one task ended; a follow-up may
                 // already run. Use the owner's current state, never a guess.
                 self.refreshSnapshot();
@@ -1248,6 +1605,7 @@ pub const Client = struct {
         self.suppress = .{ .digest = digest, .armed = true };
         self.cache.busy = true;
         self.cache.task = resp.uint("task") orelse self.cache.task;
+        self.cache_floor = @max(self.cache_floor, resp.uint("through") orelse 0);
         self.cache.kind = kind;
         self.dirty = true;
         self.rebuild();
@@ -1425,7 +1783,7 @@ pub const Client = struct {
     /// One candidate worker view, opened but not yet shown. Nothing in the live
     /// projection changes until `adoptView`, so a refused/unknown attach keeps
     /// the session already on screen.
-    const Candidate = struct { conn: unix.Connection, session: ?ids.Id, epoch: u64 };
+    const Candidate = struct { conn: unix.Connection, session: ?ids.Id, epoch: u64, stream: ?*StreamReceiver = null };
 
     /// Send one request over an explicitly supplied connection. A failure drops
     /// only that candidate; unlike the live path it never calls `loseView`.
@@ -1465,8 +1823,21 @@ pub const Client = struct {
             var req = try self.request(.hello);
             defer req.deinit();
             try req.put("view", "controller");
-            var resp = try self.exchangeOn(&conn, &req, join_timeout_ms);
+            var resp = self.exchangeOn(&conn, &req, join_timeout_ms) catch |err| return switch (err) {
+                // The dial succeeded but the peer did not complete this exact
+                // IPC greeting. A v1 worker rejects the v2 frame (and a v1 reply
+                // fails the v2 envelope), so this is fail-closed: no attach, no
+                // session adoption, no cursor and no display claim. Nothing is
+                // restarted, migrated or killed to make it compatible.
+                error.ProtocolError, error.Transport => error.ProtocolMismatch,
+                else => err,
+            };
             defer resp.deinit();
+            // A compatible worker must announce this exact IPC version and the
+            // watch capability the lossless selective-ACK protocol depends on.
+            // This is checked BEFORE any controller claim or display adoption.
+            if (resp.uint("protocol") != protocol.version) return error.ProtocolMismatch;
+            if (!resp.flag("watch", false)) return error.ProtocolMismatch;
             // The greeting carries the authoritative session identity for this
             // view, even when the caller already knows the endpoint.
             const raw = resp.text("session") orelse return error.ProtocolError;
@@ -1489,12 +1860,18 @@ pub const Client = struct {
             epoch = resp.uint("epoch") orelse return error.ProtocolError;
             if (epoch == 0) return error.ProtocolError;
         }
-        return .{ .conn = conn, .session = session, .epoch = epoch };
+        const stream = try StreamReceiver.start(self.a, self.io, endpoint, self.uid, epoch);
+        return .{ .conn = conn, .session = session, .epoch = epoch, .stream = stream };
     }
 
     /// Commit one candidate: only now is the previous view released. Its socket
     /// EOF is what revokes the old controller epoch on the owner side.
     fn adoptView(self: *Client, view: *Candidate, fallback: ?ids.Id) void {
+        self.closeStream();
+        self.stream = view.stream;
+        self.stream_expected = view.stream != null;
+        self.cache_floor = 0;
+        view.stream = null;
         self.clearPending();
         if (self.conn) |*previous| previous.close();
         self.conn = view.conn;
@@ -1513,7 +1890,7 @@ pub const Client = struct {
     /// transport failure (the old view was already untouched).
     fn joinWorker(self: *Client, endpoint: []const u8, id: ?ids.Id, takeover: bool) !void {
         var view = self.openController(endpoint, id, takeover) catch |err| return switch (err) {
-            error.Busy, error.StaleControl, error.SessionNotFound => err,
+            error.Busy, error.StaleControl, error.SessionNotFound, error.ProtocolMismatch => err,
             else => transport(err),
         };
         self.adoptView(&view, id);
@@ -1525,6 +1902,7 @@ pub const Client = struct {
         var view = self.openController(endpoint, id, takeover) catch |err| return switch (err) {
             error.Busy, error.StaleControl => .busy,
             error.FileNotFound, error.ConnectionRefused, error.NotDir => .gone,
+            error.ProtocolMismatch => .outdated,
             else => .unknown,
         };
         self.adoptView(&view, id);
@@ -1627,11 +2005,24 @@ pub const Client = struct {
         const dir = try self.runtimeDirectory();
         const path = try dir.join(self.a, control_socket);
         defer self.a.free(path);
-        var conn = unix.connect(self.a, path, self.uid, self.waitFor(quick_timeout_ms)) catch |err| {
+        const conn = unix.connect(self.a, path, self.uid, self.waitFor(quick_timeout_ms)) catch |err| {
             return transport(err);
         };
-        errdefer conn.close();
         self.control = conn;
+        // From here the stored connection owns the descriptor exactly once.
+        errdefer self.closeControl();
+        // The daemon socket is part of the same IPC version. A v1 daemon rejects
+        // this v2 greeting (or answers a v1 envelope), so it is refused here
+        // before any create/list/attach command is sent.
+        var hello = try self.request(.hello);
+        defer hello.deinit();
+        var greeting = self.controlExchange(&hello, quick_timeout_ms) catch |err| return switch (err) {
+            error.OutOfMemory, error.Canceled => err,
+            else => error.ProtocolMismatch,
+        };
+        defer greeting.deinit();
+        if (greeting.uint("protocol") != protocol.version) return error.ProtocolMismatch;
+        if (!greeting.flag("daemon", false)) return error.ProtocolMismatch;
     }
 
     fn worksFromDaemon(self: *const Client) bool {
@@ -1882,6 +2273,9 @@ pub const Client = struct {
             // Timeout, permission, identity or protocol: the owner is merely
             // unreachable, so no second writer may start.
             .unknown => return error.Unavailable,
+            // A live endpoint speaking another IPC version is a sanitized,
+            // explicit refusal: never a resume, migration or implicit restart.
+            .outdated => return error.ProtocolMismatch,
             .gone => {},
         }
         if (!hasCheckpoint(self.a, self.io, found.project, id)) return error.SessionNotFound;
@@ -2273,6 +2667,7 @@ pub const Client = struct {
         defer greeting.deinit();
         const peer_pid: ?u64 = @intCast(conn.peer.pid);
         if (greeting.uint("pid") != peer_pid) return null;
+        if (greeting.uint("protocol") != protocol.version) return null;
         const announced = greeting.text("session") orelse return null;
         if (!std.mem.eql(u8, announced, &id)) return null;
         var req = self.request(.shutdown) catch return null;
@@ -2323,6 +2718,9 @@ const table = session_client.VTable{
     .snapshot_fn = Client.snapshotFn,
     .submit_fn = Client.submitFn,
     .poll_fn = Client.pollFn,
+    .buffered_fn = Client.bufferedFn,
+    .acknowledge_fn = Client.acknowledgeFn,
+    .acknowledge_range_fn = Client.acknowledgeRangeFn,
     .cancel_fn = Client.cancelFn,
     .cancel_clear_fn = Client.cancelClearFn,
     .set_confirming_fn = Client.setConfirmingFn,
@@ -2664,7 +3062,11 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
     var bridge = bridge_module.Bridge.init(a, io, &cancel);
     defer bridge.deinit();
 
-    const code = try tui.run(a, io, client.connection(), &bridge, &cancel);
+    const code = blk: {
+        const frontend = try @import("frontend.zig").Frontend.start(client);
+        defer frontend.deinit(); // Join before foreground shutdown or Client teardown.
+        break :blk try tui.run(a, io, frontend.connection(), &bridge, &cancel);
+    };
 
     if (client.ownsAnyWorker()) {
         // Foreground or a locally restored history: cancel/join/save and stop
@@ -2765,6 +3167,667 @@ fn pairOf(a: std.mem.Allocator) !Pair {
     client.conn = unix.Connection.init(a, fds[0], peer);
     client.epoch = 5;
     return .{ .client = client, .server = unix.Connection.init(a, fds[1], peer) };
+}
+
+test "communication delivers real stream frames during a delayed control reply and joins promptly" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path);
+    var directory = try unix.Directory.resolveUnder(a, path[0..n], "rt", @intCast(std.c.getuid()));
+    defer directory.deinit();
+    var listener = try unix.Listener.bind(a, &directory, "watch.sock", .{});
+    defer listener.deinit();
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    pair.client.stream = try StreamReceiver.start(a, io, listener.path, pair.client.uid, 5);
+    pair.client.stream_expected = true;
+    pair.client.need_history = true;
+    pair.client.dirty = false; // This fixture tests control waiting, not initial settings refresh.
+    var frontend: ?*@import("frontend.zig").Frontend = try @import("frontend.zig").Frontend.start(pair.client);
+    defer if (frontend) |live| live.deinit();
+    const connection = frontend.?.connection();
+    const actions = connection.async_actions.?;
+    const ticket = try actions.start(5, .cancel);
+    var stream = try listener.accept(.{ .io = io, .timeout_ms = 2000 });
+    defer stream.close();
+    const watch_bytes = (try stream.readFrame(.{ .io = io, .timeout_ms = 2000 })).?;
+    defer a.free(watch_bytes);
+    var watch = try protocol.parseRequest(a, watch_bytes);
+    defer watch.deinit();
+    try testing.expectEqual(protocol.Op.watch, watch.op);
+
+    // No response is sent yet. Depending on scheduling, the first control RPC
+    // is either the eager metadata probe or our cancel; both must leave stream
+    // parsing/publication and UI-local callbacks responsive.
+    const request_bytes = (try pair.server.readFrame(.{ .io = io, .timeout_ms = 2000 })).?;
+    defer a.free(request_bytes);
+    var request_ = try protocol.parseRequest(a, request_bytes);
+    defer request_.deinit();
+    try testing.expect(request_.op == .cancel or request_.op == .poll_metadata);
+    try stream.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"snapshot\",\"through\":0,\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"phase\":\"calling_model\",\"task\":1}}", .{ .io = io, .timeout_ms = 2000 });
+    try stream.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2000 });
+    const event_bytes = try protocol.encodeEvent(a, .{ .text = "delayed-control-live-body" });
+    defer a.free(event_bytes);
+    // Mandatory wire sequence: the page entry carries the owner's position.
+    const sequenced = try std.fmt.allocPrint(a, "{s},\"seq\":1}}", .{event_bytes[0 .. event_bytes.len - 1]});
+    defer a.free(sequenced);
+    const page = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":1,\"events\":[{s}]}}", .{sequenced});
+    defer a.free(page);
+    try stream.writeFrame(page, .{ .io = io, .timeout_ms = 2000 });
+    const deadline = std.Io.Clock.awake.now(io);
+    var received = false;
+    while (deadline.untilNow(io, .awake).toMilliseconds() < 1500) {
+        const before = std.Io.Clock.awake.now(io);
+        if (try connection.session_client.?.poll(a)) |owned| {
+            var item = owned;
+            defer item.deinit();
+            try testing.expectEqualStrings("delayed-control-live-body", item.event.text);
+            received = true;
+        }
+        try testing.expect(before.untilNow(io, .awake).toMilliseconds() < 200);
+        if (received) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expect(received); // This assertion precedes the delayed reply.
+    try testing.expect(actions.poll() == null); // Admission was not success.
+    try expectNoFrameOn(&pair.server); // Stream progress issued no nested RPC.
+    try pair.reply(request_.id, "\"changed\":false");
+    if (request_.op == .poll_metadata) {
+        const cancel_bytes = (try pair.server.readFrame(.{ .io = io, .timeout_ms = 2000 })).?;
+        defer a.free(cancel_bytes);
+        var command = try protocol.parseRequest(a, cancel_bytes);
+        defer command.deinit();
+        try testing.expectEqual(protocol.Op.cancel, command.op);
+        try pair.reply(command.id, "\"accepted\":true");
+    }
+    const completed_at = std.Io.Clock.awake.now(io);
+    var completed = false;
+    while (completed_at.untilNow(io, .awake).toMilliseconds() < 2000) {
+        if (actions.poll()) |owned| {
+            var result = owned;
+            defer result.deinit();
+            try testing.expectEqual(ticket, result.request.ticket);
+            try testing.expect(result.failure == null);
+            completed = true;
+            break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expect(completed);
+    const stopped_at = std.Io.Clock.awake.now(io);
+    frontend.?.deinit();
+    frontend = null;
+    try testing.expect(stopped_at.untilNow(io, .awake).toMilliseconds() < 1000);
+}
+
+/// Serve control frames until the client really asks for a snapshot. The
+/// communication task may interleave its own metadata probe. A real cancel
+/// marks settings dirty, so exactly one settings refresh precedes recovery.
+/// Every other op is a failure of this fixture, never something to ignore.
+fn serveControlUntilSnapshot(pair: *Pair, a: std.mem.Allocator) !void {
+    const io = testing.io;
+    var saw_settings = false;
+    for (0..8) |_| {
+        const bytes = (try pair.server.readFrame(.{ .io = io, .timeout_ms = 2000 })) orelse return error.TestUnexpectedResult;
+        defer a.free(bytes);
+        var request = try protocol.parseRequest(a, bytes);
+        defer request.deinit();
+        switch (request.op) {
+            .snapshot => {
+                try testing.expect(saw_settings);
+                try pair.reply(request.id, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true}");
+                return;
+            },
+            .settings => {
+                try testing.expect(!saw_settings);
+                try testing.expectEqual(@as(u64, 5), try request.u64Field("epoch"));
+                saw_settings = true;
+                try pair.reply(request.id, "\"available\":true,\"model\":\"m3\"");
+            },
+            .poll_metadata => try pair.reply(request.id, "\"changed\":false"),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Serve control frames until the client really sends a cancel. The
+/// communication task may interleave its own metadata probe.
+fn serveControlUntilCancel(pair: *Pair, a: std.mem.Allocator) !void {
+    const io = testing.io;
+    for (0..8) |_| {
+        const bytes = (try pair.server.readFrame(.{ .io = io, .timeout_ms = 2_000 })) orelse return error.TestUnexpectedResult;
+        defer a.free(bytes);
+        var request = try protocol.parseRequest(a, bytes);
+        defer request.deinit();
+        switch (request.op) {
+            .cancel => {
+                try pair.reply(request.id, "\"accepted\":true");
+                return;
+            },
+            .poll_metadata => try pair.reply(request.id, "\"changed\":false"),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Read one watch frame exactly. The receiver keeps reading while a page is
+/// ACKed, so pages and ACK replies must be identified by content.
+const WatchFrame = union(enum) { snapshot, baseline, events: u64, ack: struct { id: u64, first: u64, sequence: u64 } };
+
+fn readWatchFrame(conn: *unix.Connection, a: std.mem.Allocator) !WatchFrame {
+    const raw = (try conn.readFrame(.{ .io = testing.io, .timeout_ms = 2_000 })) orelse return error.TestUnexpectedResult;
+    defer a.free(raw);
+    var document = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer document.deinit();
+    const object = switch (document.value) {
+        .object => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    if (object.get("op")) |op| {
+        if (!std.mem.eql(u8, switch (op) {
+            .string => |name| name,
+            else => return error.TestUnexpectedResult,
+        }, "ack")) return error.TestUnexpectedResult;
+        const id = switch (object.get("id").?) {
+            .integer => |value| @as(u64, @intCast(value)),
+            else => return error.TestUnexpectedResult,
+        };
+        const sequence = switch (object.get("sequence").?) {
+            .integer => |value| @as(u64, @intCast(value)),
+            else => return error.TestUnexpectedResult,
+        };
+        const first = if (object.get("first")) |value| switch (value) {
+            .integer => |number| @as(u64, @intCast(number)),
+            else => return error.TestUnexpectedResult,
+        } else 0;
+        return .{ .ack = .{ .id = id, .first = first, .sequence = sequence } };
+    }
+    const stream = object.get("stream") orelse return error.TestUnexpectedResult;
+    const name = switch (stream) {
+        .string => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    if (std.mem.eql(u8, name, "snapshot")) return .snapshot;
+    if (std.mem.eql(u8, name, "baseline")) return .baseline;
+    const through = switch (object.get("through") orelse return error.TestUnexpectedResult) {
+        .integer => |value| @as(u64, @intCast(value)),
+        else => return error.TestUnexpectedResult,
+    };
+    return .{ .events = through };
+}
+
+fn ackReply(conn: *unix.Connection, a: std.mem.Allocator, id: u64, epoch: u64, first: u64, sequence: u64, through: u64, ok: bool) !void {
+    const bytes = if (ok)
+        try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"ack\":true,\"epoch\":{d},\"first\":{d},\"sequence\":{d},\"through\":{d}}}", .{ protocol.version, id, epoch, first, sequence, through })
+    else
+        try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":false,\"err\":\"invalid_input\",\"ack\":true}}", .{ protocol.version, id });
+    defer a.free(bytes);
+    try conn.writeFrame(bytes, .{ .io = testing.io, .timeout_ms = 2_000 });
+}
+
+fn readyPage(a: std.mem.Allocator, from: u64, through: u64, entries: []const u64, text: []const u8) ![]u8 {
+    var out = protocol.Out.init(a);
+    defer out.deinit();
+    try out.ok(1);
+    try out.field("epoch", @as(u64, 5));
+    try out.field("stream", "events");
+    try out.field("from", from);
+    try out.beginArray("events");
+    for (entries) |sequence| {
+        const element = try std.fmt.allocPrint(a, "{{\"t\":\"text\",\"v\":\"{s}\",\"seq\":{d}}}", .{ text, sequence });
+        defer a.free(element);
+        try out.element(element);
+    }
+    try out.endArray();
+    try out.field("through", through);
+    return out.finish();
+}
+
+test "frontend ACK rides the bound watch socket, coalesces and resumes without a baseline reset" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path);
+    var dir = try unix.Directory.resolveUnder(a, path[0..n], "ackloop", @intCast(std.c.getuid()));
+    defer dir.deinit();
+    var listener = try unix.Listener.bind(a, &dir, "watch.sock", .{});
+    defer listener.deinit();
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+    client.stream = try StreamReceiver.start(a, io, listener.path, client.uid, 5);
+    client.stream_expected = true;
+    client.need_history = true;
+    client.dirty = false;
+    var frontend: ?*@import("frontend.zig").Frontend = try @import("frontend.zig").Frontend.start(client);
+    defer if (frontend) |live| live.deinit();
+    const connection = frontend.?.connection();
+    const ui = connection.session_client.?;
+
+    // Fresh viewer: no resume cursor, snapshot then baseline for the same
+    // display watermark.
+    var watch = try listener.accept(.{ .io = io, .timeout_ms = 2_000 });
+    const raw_watch = (try watch.readFrame(.{ .io = io, .timeout_ms = 2_000 })).?;
+    defer a.free(raw_watch);
+    var watch_request = try protocol.parseRequest(a, raw_watch);
+    defer watch_request.deinit();
+    try testing.expectEqual(protocol.Op.watch, watch_request.op);
+    try testing.expect((try watch_request.optionalU64("since")) == null);
+    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
+
+    const first_page = try readyPage(a, 0, 1, &.{1}, "a");
+    defer a.free(first_page);
+    try watch.writeFrame(first_page, .{ .io = io, .timeout_ms = 2_000 });
+
+    // Poll through the real Frontend and acknowledge through the vtable: the
+    // UI thread only admits; the receiver performs the wire write.
+    var first: ?session_client.Item = null;
+    const first_deadline = std.Io.Clock.awake.now(io);
+    while (first_deadline.untilNow(io, .awake).toMilliseconds() < 2_000) {
+        if (try ui.poll(a)) |item| {
+            first = item;
+            break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    defer if (first) |*item| item.deinit();
+    try testing.expectEqualStrings("a", first.?.event.text);
+    try testing.expectEqual(@as(u64, 1), first.?.delivery_sequence);
+    try testing.expectEqual(@as(u64, 5), first.?.delivery_epoch);
+    // A non-live watermark is a no-op; a superseded epoch is refused instead of
+    // being recorded against this stream.
+    try ui.acknowledge(5, 0);
+    try testing.expectError(error.StaleControl, ui.acknowledge(4, 1));
+    try ui.acknowledge(5, 1);
+    const first_ack = (try readWatchFrame(&watch, a)).ack;
+    try testing.expectEqual(@as(u64, 1), first_ack.sequence);
+    try ackReply(&watch, a, first_ack.id, 5, first_ack.first, first_ack.sequence, 1, true);
+    const confirm_deadline = std.Io.Clock.awake.now(io);
+    while (confirm_deadline.untilNow(io, .awake).toMilliseconds() < 2_000) {
+        if (client.stream.?.ackState().confirmed_through == 1) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(u64, 1), client.stream.?.ackState().confirmed_through);
+
+    // Two newer admissions while one ACK is outstanding collapse to the latest:
+    // no per-event FIFO reaches the owner.
+    // UTF-8 plus a CR-bearing delta: the CR boundary must stay a separate
+    // unacknowledged item across the reconnect, never absorbed into the other.
+    const second_page = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":1,\"through\":3,\"events\":[{{\"t\":\"text\",\"v\":\"中\",\"seq\":2}},{{\"t\":\"text\",\"v\":\"\\r\",\"seq\":3}}]}}", .{});
+    defer a.free(second_page);
+    try watch.writeFrame(second_page, .{ .io = io, .timeout_ms = 2_000 });
+    var received: usize = 0;
+    const second_deadline = std.Io.Clock.awake.now(io);
+    while (second_deadline.untilNow(io, .awake).toMilliseconds() < 2_000 and received < 2) {
+        if (try ui.poll(a)) |item| {
+            var owned = item;
+            defer owned.deinit();
+            received += 1;
+            try testing.expectEqual(@as(u64, @intCast(received + 1)), owned.delivery_sequence);
+            try testing.expectEqual(owned.delivery_sequence, owned.delivery_first_sequence);
+            try testing.expect(!owned.history_replay and !owned.history_reset);
+            if (received == 1) {
+                try testing.expectEqualStrings("中", owned.event.text);
+            } else {
+                try testing.expectEqualStrings("\r", owned.event.text);
+            }
+        } else try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(usize, 2), received);
+    try ui.acknowledge(5, 3);
+    const pending_ack = (try readWatchFrame(&watch, a)).ack;
+    try testing.expectEqual(@as(u64, 3), pending_ack.sequence);
+    // A later independent range is admitted but stays queued behind the one
+    // outstanding frame; it is never widened into a cumulative watermark.
+    try ui.acknowledgeRange(5, 20, 30);
+    var quiet = [_]std.c.pollfd{.{ .fd = watch.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
+    // A cancel is serviced while one ACK is outstanding and another range is
+    // queued: the watch duplex never owns or pauses the control connection.
+    const ticket = try connection.async_actions.?.start(5, .cancel);
+    try serveControlUntilCancel(&pair, a);
+    const cancel_deadline = std.Io.Clock.awake.now(io);
+    var canceled = false;
+    while (cancel_deadline.untilNow(io, .awake).toMilliseconds() < 2_000) {
+        if (connection.async_actions.?.poll()) |completion| {
+            var owned = completion;
+            defer owned.deinit();
+            try testing.expectEqual(ticket, owned.request.ticket);
+            try testing.expect(owned.failure == null);
+            canceled = true;
+            break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expect(canceled);
+    // The pending proofs are untouched by the control operation.
+    try testing.expectEqual(@as(usize, 2), client.stream.?.ackState().pending);
+    // The unconfirmed proof survives a socket failure.
+    watch.close();
+
+    // The stream dies; recovery reads the control socket (never resubmits) and
+    // resumes the SAME viewer from its own cursor.
+    try serveControlUntilSnapshot(&pair, a);
+    var resumed = try listener.accept(.{ .io = io, .timeout_ms = 2_000 });
+    defer resumed.close();
+    const raw_resume = (try resumed.readFrame(.{ .io = io, .timeout_ms = 2_000 })).?;
+    defer a.free(raw_resume);
+    var request = try protocol.parseRequest(a, raw_resume);
+    defer request.deinit();
+    try testing.expectEqual(protocol.Op.watch, request.op);
+    try testing.expectEqual(@as(u64, 3), try request.u64Field("since"));
+    // ... and its pending prefix is resent idempotently on the new connection,
+    // followed by the exact selective range that was still queued.
+    const resent = (try readWatchFrame(&resumed, a)).ack;
+    try testing.expectEqual(@as(u64, 0), resent.first);
+    try testing.expectEqual(@as(u64, 3), resent.sequence);
+    try ackReply(&resumed, a, resent.id, 5, resent.first, resent.sequence, 3, true);
+    const selective = (try readWatchFrame(&resumed, a)).ack;
+    try testing.expectEqual(@as(u64, 20), selective.first);
+    try testing.expectEqual(@as(u64, 30), selective.sequence);
+    try ackReply(&resumed, a, selective.id, 5, selective.first, selective.sequence, 3, true);
+    const settled = std.Io.Clock.awake.now(io);
+    while (settled.untilNow(io, .awake).toMilliseconds() < 2_000) {
+        if (client.stream.?.ackState().pending == 0) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(usize, 0), client.stream.?.ackState().pending);
+
+    // Same viewer: snapshot at the cursor is redundant, the delta continues the
+    // owned stream with no synthetic history reset and no duplicate.
+    try resumed.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":3,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true}}", .{ .io = io, .timeout_ms = 2_000 });
+    const delta = try readyPage(a, 3, 4, &.{4}, "d");
+    defer a.free(delta);
+    try resumed.writeFrame(delta, .{ .io = io, .timeout_ms = 2_000 });
+    var last: ?session_client.Item = null;
+    const last_deadline = std.Io.Clock.awake.now(io);
+    while (last_deadline.untilNow(io, .awake).toMilliseconds() < 2_000) {
+        if (try ui.poll(a)) |item| {
+            last = item;
+            break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    defer if (last) |*item| item.deinit();
+    try testing.expectEqualStrings("d", last.?.event.text);
+    try testing.expectEqual(@as(u64, 4), last.?.delivery_sequence);
+    try testing.expect(!last.?.history_replay and !last.?.history_reset);
+    try testing.expectEqual(@as(u64, 4), client.cursor);
+}
+
+test "new viewer baseline rows precede ordered pages and gaps are surfaced" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path);
+    var dir = try unix.Directory.resolveUnder(a, path[0..n], "baseline", @intCast(std.c.getuid()));
+    defer dir.deinit();
+    var listener = try unix.Listener.bind(a, &dir, "watch.sock", .{});
+    defer listener.deinit();
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+    client.stream = try StreamReceiver.start(a, io, listener.path, client.uid, 5);
+    client.stream_expected = true;
+    client.need_history = true;
+    client.dirty = false;
+    var frontend: ?*@import("frontend.zig").Frontend = try @import("frontend.zig").Frontend.start(client);
+    defer if (frontend) |live| live.deinit();
+    const connection = frontend.?.connection();
+    const ui = connection.session_client.?;
+
+    var watch = try listener.accept(.{ .io = io, .timeout_ms = 2_000 });
+    defer watch.close();
+    const raw_watch = (try watch.readFrame(.{ .io = io, .timeout_ms = 2_000 })).?;
+    defer a.free(raw_watch);
+    var watch_request = try protocol.parseRequest(a, raw_watch);
+    defer watch_request.deinit();
+    try testing.expectEqual(protocol.Op.watch, watch_request.op);
+    const hello = try protocol.encodeEvent(a, .{ .user_committed = .{ .id = 1, .text = "hello" } });
+    defer a.free(hello);
+    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":5,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true}}", .{ .io = io, .timeout_ms = 2_000 });
+    const baseline = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":2,\"through\":2,\"truncated\":false,\"entries\":[{s}]}}", .{hello});
+    defer a.free(baseline);
+    try watch.writeFrame(baseline, .{ .io = io, .timeout_ms = 2_000 });
+
+    var first: ?session_client.Item = null;
+    const baseline_deadline = std.Io.Clock.awake.now(io);
+    while (baseline_deadline.untilNow(io, .awake).toMilliseconds() < 2_000) {
+        if (try ui.poll(a)) |item| {
+            first = item;
+            break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    defer if (first) |*item| item.deinit();
+    try testing.expect(first.?.history_replay and first.?.history_reset);
+    try testing.expectEqualStrings("hello", first.?.event.user_committed.text);
+    try testing.expectEqual(@as(u64, 0), first.?.delivery_sequence);
+
+    // Positions 4 and 5 follow the baseline cutoff; position 3 is gone (a
+    // selectively retired control event), so the page must say so.
+    const page = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":2,\"through\":5,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"A\",\"seq\":4}},{{\"t\":\"user\",\"id\":2,\"v\":\"again\",\"seq\":5}}]}}", .{});
+    defer a.free(page);
+    try watch.writeFrame(page, .{ .io = io, .timeout_ms = 2_000 });
+    var received: usize = 0;
+    const page_deadline = std.Io.Clock.awake.now(io);
+    while (page_deadline.untilNow(io, .awake).toMilliseconds() < 2_000 and received < 2) {
+        if (try ui.poll(a)) |item| {
+            var owned = item;
+            defer owned.deinit();
+            received += 1;
+            if (received == 1) {
+                try testing.expectEqualStrings("A", owned.event.text);
+                try testing.expectEqual(@as(u64, 4), owned.delivery_sequence);
+                try testing.expectEqual(@as(u64, 4), owned.delivery_first_sequence);
+                try testing.expect(!owned.history_replay);
+            } else {
+                try testing.expectEqualStrings("again", owned.event.user_committed.text);
+                try testing.expectEqual(@as(u64, 5), owned.delivery_sequence);
+                try testing.expectEqual(@as(u64, 5), owned.delivery_first_sequence);
+            }
+        } else try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(usize, 2), received);
+    try testing.expectEqual(@as(u64, 5), client.cursor);
+    try testing.expect(std.mem.indexOf(u8, client.pubcfg.notice orelse "", "unavailable") != null);
+}
+
+test "coalesced live span is acknowledged as one exact first/last range" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path);
+    var dir = try unix.Directory.resolveUnder(a, path[0..n], "span", @intCast(std.c.getuid()));
+    defer dir.deinit();
+    var listener = try unix.Listener.bind(a, &dir, "watch.sock", .{});
+    defer listener.deinit();
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+    client.stream = try StreamReceiver.start(a, io, listener.path, client.uid, 5);
+    client.stream_expected = true;
+    client.need_history = true;
+    client.dirty = false;
+    var frontend: ?*@import("frontend.zig").Frontend = try @import("frontend.zig").Frontend.start(client);
+    defer if (frontend) |live| live.deinit();
+    const connection = frontend.?.connection();
+    const ui = connection.session_client.?;
+
+    var watch = try listener.accept(.{ .io = io, .timeout_ms = 2_000 });
+    defer watch.close();
+    const raw_watch = (try watch.readFrame(.{ .io = io, .timeout_ms = 2_000 })).?;
+    defer a.free(raw_watch);
+    var watch_request = try protocol.parseRequest(a, raw_watch);
+    defer watch_request.deinit();
+    try testing.expectEqual(protocol.Op.watch, watch_request.op);
+    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
+    // Three consecutive raw deltas (positions 4..6) that the display queue
+    // coalesces into one payload. Earlier positions were already shortened.
+    const page = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":6,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"a\",\"seq\":4}},{{\"t\":\"text\",\"v\":\"b\",\"seq\":5}},{{\"t\":\"text\",\"v\":\"c\",\"seq\":6}}]}}", .{});
+    defer a.free(page);
+    try watch.writeFrame(page, .{ .io = io, .timeout_ms = 2_000 });
+
+    // Wait until every decoded item reached the display queue, where the three
+    // payloads coalesce into one item carrying the full raw interval.
+    const merged_deadline = std.Io.Clock.awake.now(io);
+    while (merged_deadline.untilNow(io, .awake).toMilliseconds() < 2_000) {
+        if (client.pending.items.len == 0 and client.cursor == 6) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(usize, 0), client.pending.items.len);
+    try testing.expectEqual(@as(u64, 6), client.cursor);
+    var merged: ?session_client.Item = null;
+    const poll_deadline = std.Io.Clock.awake.now(io);
+    while (poll_deadline.untilNow(io, .awake).toMilliseconds() < 2_000) {
+        if (try ui.poll(a)) |item| {
+            merged = item;
+            break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    defer if (merged) |*item| item.deinit();
+    try testing.expectEqualStrings("abc", merged.?.event.text);
+    try testing.expect(std.mem.indexOf(u8, client.pubcfg.notice orelse "", "unavailable") != null);
+    try testing.expectEqual(@as(u64, 4), merged.?.delivery_first_sequence);
+    try testing.expectEqual(@as(u64, 6), merged.?.delivery_sequence);
+    // The whole span is proven, not only position 6; the receiver writes one
+    // exact range frame and no intermediate positions stay phantom.
+    try ui.acknowledgeRange(5, merged.?.delivery_first_sequence, merged.?.delivery_sequence);
+    const span = (try readWatchFrame(&watch, a)).ack;
+    try testing.expectEqual(@as(u64, 4), span.first);
+    try testing.expectEqual(@as(u64, 6), span.sequence);
+    try ackReply(&watch, a, span.id, 5, span.first, span.sequence, 3, true);
+    const settled = std.Io.Clock.awake.now(io);
+    while (settled.untilNow(io, .awake).toMilliseconds() < 2_000) {
+        if (client.stream.?.ackState().pending == 0) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(usize, 0), client.stream.?.ackState().pending);
+    try testing.expectEqual(@as(u64, 3), client.stream.?.ackState().confirmed_through);
+    var quiet = [_]std.c.pollfd{.{ .fd = watch.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
+}
+
+/// Fake worker for the protocol-mismatch regression. The first connection
+/// answers like a v1 worker (a v1 envelope), the second closes without replying
+/// (a v1 worker's actual parse behaviour), the third is an exact v2 worker and
+/// proves the compatible path still adopts normally. `saw_v2` proves the client
+/// really sent v2 greetings, since `parseRequest` only accepts this version.
+fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, saw_v2: *std.atomic.Value(bool), id: ids.Id) void {
+    const wait: unix.Wait = .{ .io = io, .timeout_ms = 4_000 };
+    for (0..3) |attempt| {
+        var conn = listener.accept(wait) catch return;
+        defer conn.close();
+        const raw = (conn.readFrame(wait) catch return) orelse return;
+        defer a.free(raw);
+        var request = protocol.parseRequest(a, raw) catch return;
+        defer request.deinit();
+        if (request.op != .hello) return;
+        saw_v2.store(true, .release);
+        if (attempt == 1) continue; // Close the second greeting unanswered.
+        const reply = if (attempt == 0)
+            std.fmt.allocPrint(a, "{{\"v\":1,\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":1,\"protocol\":1,\"watch\":true}}", .{ request.id, id[0..] }) catch return
+        else
+            std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":1,\"protocol\":{d},\"watch\":true}}", .{ protocol.version, request.id, id[0..], protocol.version }) catch return;
+        defer a.free(reply);
+        conn.writeFrame(reply, wait) catch return;
+        if (attempt != 2) continue;
+        // Compatible worker: answer exactly one attach, then accept the stream
+        // subscription and close it. Adoption already happened by then.
+        const attach_raw = (conn.readFrame(wait) catch return) orelse return;
+        defer a.free(attach_raw);
+        var attach = protocol.parseRequest(a, attach_raw) catch return;
+        defer attach.deinit();
+        if (attach.op != .attach) return;
+        const attached = std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"epoch\":7}}", .{ protocol.version, attach.id }) catch return;
+        defer a.free(attached);
+        conn.writeFrame(attached, wait) catch return;
+        var stream = listener.accept(wait) catch return;
+        defer stream.close();
+        const watch_raw = (stream.readFrame(wait) catch return) orelse return;
+        defer a.free(watch_raw);
+        var watch = protocol.parseRequest(a, watch_raw) catch return;
+        defer watch.deinit();
+    }
+}
+
+test "a v1 worker handshake is refused, while an exact v2 worker is adopted" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path);
+    var dir = try unix.Directory.resolveUnder(a, path[0..n], "v1peer", @intCast(std.c.getuid()));
+    defer dir.deinit();
+    var listener = try unix.Listener.bind(a, &dir, "worker.sock", .{});
+    defer listener.deinit();
+    const id = try ids.generate(io);
+    var saw_v2 = std.atomic.Value(bool).init(false);
+    var peer = try std.Io.concurrent(io, protocolVersionPeer, .{ a, io, &listener, &saw_v2, id });
+    var peer_pending = true;
+    defer if (peer_pending) peer.cancel(io);
+    {
+        const client = try Client.init(a, io, null, .foreground, path[0..n], path[0..n]);
+        defer client.deinit();
+
+        // A v1 envelope for the v2 greeting: explicit, sanitized refusal.
+        try testing.expectEqual(AttachStage.outdated, client.attachEndpoint(listener.path, id, false));
+        try testing.expect(client.conn == null and client.session == null);
+        try testing.expectEqual(@as(u64, 0), client.epoch);
+        try testing.expect(client.stream == null);
+        try testing.expectEqualStrings(
+            "Session worker speaks an incompatible Thin protocol version; restart Thin to start a compatible worker",
+            session_client.describe(error.ProtocolMismatch),
+        );
+        // A v1 worker that simply rejects and closes the v2 frame is the same
+        // fail-closed class: no adoption and no automatic restart or kill.
+        try testing.expectEqual(AttachStage.outdated, client.attachEndpoint(listener.path, id, false));
+        try testing.expect(client.conn == null and client.session == null and client.epoch == 0);
+        // The compatible path is unchanged: exact v2 greeting, session identity,
+        // watch capability and attach epoch are accepted together.
+        try testing.expectEqual(AttachStage.attached, client.attachEndpoint(listener.path, id, false));
+        try testing.expect(client.conn != null and client.stream != null);
+        try testing.expectEqual(@as(u64, 7), client.epoch);
+        try testing.expectEqual(id, client.session.?);
+    }
+    // The block's deferred client.deinit() joins the subscription before the
+    // peer task is awaited, so the fake worker never outlives its sockets.
+    peer.await(io);
+    peer_pending = false;
+    try testing.expect(saw_v2.load(.acquire));
+}
+
+test "buffered event readiness and draining never fetch a new socket page" {
+    var pair = try pairOf(testing.allocator);
+    defer pair.deinit();
+    const client = pair.client;
+    try testing.expect(!Client.bufferedFn(client));
+    {
+        var event = try session_client.ownEvent(testing.allocator, 5, .{ .text = "already decoded" });
+        errdefer event.deinit();
+        try client.pending.append(testing.allocator, event);
+    }
+    try testing.expect(Client.bufferedFn(client));
+    var received = (try Client.pollFn(client, testing.allocator)).?;
+    defer received.deinit();
+    try testing.expectEqualStrings("already decoded", received.event.text);
+    try testing.expect(!Client.bufferedFn(client));
+    try expectNoFrame(&pair);
 }
 
 /// One real written submit frame: its sequential envelope id and receipt nonce.
@@ -2977,6 +4040,89 @@ test "worker settings callbacks carry the control epoch" {
     try std.testing.expect(client.state.available);
 }
 
+test "initial settings keep baseline readiness gated until the reply returns" {
+    var pair = try pairOf(testing.allocator);
+    defer pair.deinit();
+    const client = pair.client;
+    client.need_history = true;
+    client.initial_settings_loading = true;
+    // A progress callback has now consumed the baseline, but the settings
+    // reply which owns the control socket is still outstanding.
+    client.need_history = false;
+    client.rebuild();
+    try testing.expect(!client.snap.available);
+    client.initial_settings_loading = false;
+    client.rebuild();
+    try testing.expect(client.snap.available);
+}
+
+fn adoptTestSettings(client: *Client, json: []const u8) !void {
+    var doc = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer doc.deinit();
+    try client.adoptSettings(doc.value.object);
+}
+
+test "settings configuration revision ignores only root envelope and context" {
+    var pair = try pairOf(testing.allocator);
+    defer pair.deinit();
+    const client = pair.client;
+    try adoptTestSettings(client, "{\"id\":1,\"model\":\"m1\",\"effort\":\"high\",\"context\":{\"tokens\":1,\"known\":true,\"limit\":10},\"models\":[{\"name\":\"m1\",\"protocol\":\"chat\",\"context_tokens\":32768}]}");
+    try testing.expectEqual(@as(u64, 1), client.configuration_revision);
+    try testing.expectEqual(@as(usize, 1), client.pubcfg.models.len);
+    try testing.expectEqualStrings("m1", client.pubcfg.models[0].name);
+    try adoptTestSettings(client, "{\"models\":[{\"context_tokens\":32768,\"protocol\":\"chat\",\"name\":\"m1\"}],\"context\":{\"limit\":10,\"known\":true,\"tokens\":1},\"effort\":\"high\",\"model\":\"m1\",\"id\":2}");
+    try testing.expectEqual(@as(u64, 1), client.configuration_revision);
+    try adoptTestSettings(client, "{\"id\":3,\"model\":\"m1\",\"effort\":\"high\",\"context\":{\"tokens\":5,\"known\":false,\"limit\":20},\"models\":[{\"name\":\"m1\",\"protocol\":\"chat\",\"context_tokens\":32768}]}");
+    try testing.expectEqual(@as(u64, 1), client.configuration_revision);
+    const context = client.pubcfg.doc.?.value.object.get("context").?.object;
+    try testing.expectEqual(@as(i64, 5), context.get("tokens").?.integer);
+    try testing.expect(!context.get("known").?.bool);
+    try testing.expectEqual(@as(i64, 20), context.get("limit").?.integer);
+    client.rebuild();
+
+    const changes = [_][]const u8{
+        "{\"model\":\"m2\",\"effort\":\"high\",\"models\":[{\"name\":\"m1\",\"protocol\":\"chat\",\"context_tokens\":32768}]}",
+        "{\"model\":\"m2\",\"effort\":\"low\",\"models\":[{\"name\":\"m1\",\"protocol\":\"chat\",\"context_tokens\":32768}]}",
+        "{\"model\":\"m2\",\"effort\":\"low\",\"settings_notice\":\"a\",\"models\":[{\"name\":\"m1\",\"protocol\":\"chat\",\"context_tokens\":32768}]}",
+        "{\"model\":\"m2\",\"effort\":\"low\",\"settings_notice\":\"a\",\"metadata_notice\":\"b\",\"models\":[{\"name\":\"m1\",\"protocol\":\"chat\",\"context_tokens\":32768}]}",
+        "{\"model\":\"m2\",\"effort\":\"low\",\"settings_notice\":\"a\",\"metadata_notice\":\"b\",\"limits\":{\"command_timeout_ms\":42},\"models\":[{\"name\":\"m1\",\"protocol\":\"chat\",\"context_tokens\":32768}]}",
+        "{\"model\":\"m2\",\"effort\":\"low\",\"settings_notice\":\"a\",\"metadata_notice\":\"b\",\"limits\":{\"command_timeout_ms\":42},\"models\":[{\"name\":\"m3\",\"protocol\":\"chat\",\"context_tokens\":32768}]}",
+    };
+    for (changes, 0..) |json, i| {
+        try adoptTestSettings(client, json);
+        try testing.expectEqual(@as(u64, @intCast(i + 2)), client.configuration_revision);
+        try adoptTestSettings(client, json);
+        try testing.expectEqual(@as(u64, @intCast(i + 2)), client.configuration_revision);
+        if (i == 4) try testing.expectEqual(@as(u32, 42), client.pubcfg.limits.command_timeout_ms);
+    }
+    try testing.expectEqual(@as(usize, 1), client.pubcfg.models.len);
+    try testing.expectEqualStrings("m3", client.pubcfg.models[0].name);
+}
+
+test "public settings equality respects nested fields arrays and depth bound" {
+    const cases = [_][2][]const u8{
+        .{ "{\"x\":{\"id\":1}}", "{\"x\":{\"id\":2}}" },
+        .{ "{\"x\":{\"context\":1}}", "{\"x\":{\"context\":2}}" },
+        .{ "{\"x\":[1,2]}", "{\"x\":[2,1]}" },
+        .{ "{\"x\":1}", "{\"x\":1.0}" },
+        .{ "{\"initial_context\":1}", "{\"initial_context\":2}" },
+    };
+    for (cases) |case| {
+        var a = try std.json.parseFromSlice(std.json.Value, testing.allocator, case[0], .{});
+        defer a.deinit();
+        var b = try std.json.parseFromSlice(std.json.Value, testing.allocator, case[1], .{});
+        defer b.deinit();
+        try testing.expect(!publicSettingsEqual(a.value, b.value, 0));
+    }
+    var nested: [131]u8 = undefined;
+    @memset(nested[0..65], '[');
+    nested[65] = '0';
+    @memset(nested[66..], ']');
+    var deep = try std.json.parseFromSlice(std.json.Value, testing.allocator, &nested, .{});
+    defer deep.deinit();
+    try testing.expect(!publicSettingsEqual(deep.value, deep.value, 0));
+}
+
 test "snapshot and settings project into the UI state without pointers" {
     const a = testing.allocator;
     var pair = try pairOf(a);
@@ -3086,7 +4232,7 @@ test "real host settings reply projects providers flags price states and pending
     host.connection.context = &view;
 
     // The real owner frame, not a hand-written fixture object.
-    var request = try protocol.parseRequest(a, "{\"v\":1,\"id\":60,\"op\":\"settings\"}");
+    var request = try protocol.parseRequest(a, "{\"v\":2,\"id\":60,\"op\":\"settings\"}");
     defer request.deinit();
     const frame = try host.dispatch(a, &request, 7, true);
     defer a.free(frame);
@@ -3521,7 +4667,7 @@ test "approve and withdraw carry their own payload ids" {
     try std.testing.expectEqualStrings("approve", approve_doc.value.object.get("op").?.string);
     try std.testing.expectEqual(@as(i64, 77), approve_doc.value.object.get("permission_id").?.integer);
     try std.testing.expect(approve_doc.value.object.get("id").?.integer != 77);
-    try std.testing.expectEqual(@as(i64, 1), approve_doc.value.object.get("v").?.integer);
+    try std.testing.expectEqual(@as(i64, protocol.version), approve_doc.value.object.get("v").?.integer);
 
     var withdraw = try client.request(.withdraw);
     defer withdraw.deinit();
@@ -3532,6 +4678,7 @@ test "approve and withdraw carry their own payload ids" {
     var withdraw_doc = try std.json.parseFromSlice(std.json.Value, a, withdraw_bytes, .{});
     defer withdraw_doc.deinit();
     try std.testing.expectEqual(@as(i64, 12), withdraw_doc.value.object.get("queue_id").?.integer);
+    try std.testing.expectEqual(@as(i64, protocol.version), withdraw_doc.value.object.get("v").?.integer);
 
     // A reply carrying its own text still round-trips through withdraw.
     try pair.reply(3, "\"text\":\"queued text\"");
@@ -3557,7 +4704,7 @@ test "version and id are checked before ok/err, then the view is dropped" {
     // A wrong id cannot be attributed to this request, so `ok` is irrelevant:
     // the frame is rejected as protocol error and the view is dropped.
     const wait = unix.Wait{ .io = std.testing.io, .timeout_ms = 5_000 };
-    try pair.server.writeFrame("{\"v\":1,\"id\":9,\"ok\":false,\"err\":\"busy\"}", wait);
+    try pair.server.writeFrame("{\"v\":2,\"id\":9,\"ok\":false,\"err\":\"busy\"}", wait);
     try std.testing.expectError(error.ProtocolError, client.readResponse(2, quick_timeout_ms));
     try std.testing.expect(client.conn == null);
     try std.testing.expectEqual(@as(u64, 0), client.epoch);

@@ -13,6 +13,7 @@ extern "c" fn thin_ssh_active() c_int;
 extern "c" fn thin_ssh_read([*]u8, usize) isize;
 extern "c" fn thin_ssh_write([*]const u8, usize) isize;
 extern "c" fn thin_ssh_wait(c_int, c_int) c_int;
+extern "c" fn thin_ssh_notification_fd(c_int) c_int;
 extern "c" fn thin_ssh_size(*c_uint, *c_uint) void;
 
 // openat 以 AT_FDCWD(-100) 打开 /dev/tty；flags: 2=O_RDWR, 0x100=O_NOCTTY(不成为控制终端), 0x80000=O_CLOEXEC。
@@ -65,6 +66,7 @@ pub const Terminal = struct {
     active: bool = true,
     restored: bool = false,
     remote: bool = false,
+    notification_fd: c_int = -1,
 
     /// 打开控制终端 /dev/tty。要求 stdin/stdout 均为 tty，且当前进程位于前台进程组，否则后台写终端会被 SIGTTOU 挂起。
     pub fn open() !Terminal {
@@ -114,21 +116,14 @@ pub const Terminal = struct {
     }
 
     fn enterDisplay(self: *Terminal) !void {
+        // Bounded lifetime: only the entry control sequence. Startup MUST NOT
+        // move the cursor or erase any row, so shell history above the seeded
+        // cursor stays exactly where the user left it. The live tail owns all
+        // later geometry on top of that cursor; scrolling is never synthesized
+        // here (rows*CRLF + CUU would scroll the whole screen and defeat the
+        // floating frame).
         // 进入序列的写入次数有上限（50），避免被背压无限阻塞。
         if (!self.writeBounded(enter, 50)) return error.TerminalSetupFailed;
-        // Push earlier terminal output into scrollback, without clearing it or
-        // entering an alternate buffer. Relative movement then starts our owned
-        // blank area at the top; the composer will stay on the bottom row.
-        const rows = self.size().rows;
-        var start: [432]u8 = undefined; // At most 200 CRLFs plus relative CUU.
-        for (0..rows) |i| {
-            start[2 * i] = '\r';
-            start[2 * i + 1] = '\n';
-        }
-        const suffix = try std.fmt.bufPrint(start[rows * 2 ..], "\x1b[{d}A\r", .{rows -| 1});
-        // CSI 0 A means one row, so a one-row terminal needs no movement.
-        const length = if (rows > 1) rows * 2 + suffix.len else rows * 2;
-        if (!self.writeBounded(start[0..length], 50)) return error.TerminalSetupFailed;
     }
 
     /// 查询终端尺寸。ioctl 失败或尺寸为 0 时回退为 80x24；上限为 512x200，防止异常尺寸撑爆缓冲。
@@ -174,6 +169,14 @@ pub const Terminal = struct {
         };
     }
 
+    /// Register/unregister on the terminal owner thread. The producer must keep
+    /// this fd alive until removal; only its queue consumer drains it.
+    pub fn setNotification(self: *Terminal, fd: c_int) !void {
+        if (self.notification_fd == fd) return;
+        if (self.remote and thin_ssh_notification_fd(fd) != 0) return error.TerminalSetupFailed;
+        self.notification_fd = fd;
+    }
+
     /// 用 poll 等待终端可读（want_write 时等待可写），最多等待 ms 毫秒。
     pub fn wait(self: Terminal, want_write: bool, ms: c_int) !void {
         if (self.remote) {
@@ -181,8 +184,11 @@ pub const Terminal = struct {
             return;
         }
         // POLLIN(1) 始终监听；want_write 时额外监听 POLLOUT(4)。
-        var descriptors = [_]c.pollfd{.{ .fd = self.fd, .events = @as(c_short, 1) | (if (want_write) @as(c_short, 4) else 0), .revents = 0 }};
-        const result = c.poll(&descriptors, 1, ms);
+        var descriptors = [_]c.pollfd{
+            .{ .fd = self.fd, .events = @as(c_short, 1) | (if (want_write) @as(c_short, 4) else 0), .revents = 0 },
+            .{ .fd = self.notification_fd, .events = 1, .revents = 0 },
+        };
+        const result = c.poll(&descriptors, descriptors.len, ms);
         if (result < 0 and c._errno().* != 4) return error.TerminalDisconnected;
         // revents 中 8=POLLERR、16=POLLHUP、32=POLLNVAL，任一出现即视为断开。
         if (result > 0 and descriptors[0].revents & (8 | 16 | 32) != 0) return error.TerminalDisconnected;
@@ -259,6 +265,7 @@ pub const Terminal = struct {
 
     /// 恢复终端状态；owned 为 true 时同时关闭 fd。可重复调用。
     pub fn deinit(self: *Terminal) void {
+        self.setNotification(-1) catch {};
         _ = self.restore();
         if (self.owned) {
             _ = c.close(self.fd);
@@ -401,34 +408,100 @@ test "failed restoration never becomes success or allows exit identity output" {
     try std.testing.expectError(error.TerminalNotRestored, terminal.writeAfterRestore("must not print"));
 }
 
-test "initial terminal scrolls prior output into history and starts at top" {
-    const regular = @import("../tests/regular_screen.zig");
+/// Owned-PTY capture of exactly what mode entry writes. The entry bytes are
+/// read before restoration appends its own leave sequence.
+fn captureStartup(output: []u8, columns: u16, screen_rows: u16) ![]const u8 {
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
     defer _ = c.close(master);
     defer _ = c.close(slave);
-    _ = c.fcntl(master, 4, c.fcntl(master, 3) | nonblock);
     var dimensions = std.mem.zeroes(c.winsize);
-    dimensions.col = 80;
-    dimensions.row = 24;
+    dimensions.col = columns;
+    dimensions.row = screen_rows;
     try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &dimensions));
-    const previous = regular.prior ++ "\r\n";
-    try std.testing.expectEqual(@as(isize, previous.len), c.write(slave, previous.ptr, previous.len));
+    try std.testing.expect(c.fcntl(master, 4, c.fcntl(master, 3) | nonblock) >= 0);
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
-    var buffer: [2048]u8 = undefined;
+    return try drainMaster(master, output);
+}
+
+fn drainMaster(master: c_int, output: []u8) ![]const u8 {
     var used: usize = 0;
-    while (used < buffer.len) {
-        const n = c.read(master, buffer[used..].ptr, buffer.len - used);
-        if (n <= 0) break;
-        used += @intCast(n);
+    while (used < output.len) {
+        const n = c.read(master, output[used..].ptr, output.len - used);
+        if (n > 0) {
+            used += @intCast(n);
+            continue;
+        }
+        // Empty nonblocking queue is EAGAIN; anything else is a real PTY fault.
+        if (n < 0) try std.testing.expectEqual(@as(c_int, 11), c._errno().*);
+        var descriptor = [_]c.pollfd{.{ .fd = master, .events = 1, .revents = 0 }};
+        if (c.poll(&descriptor, 1, 20) <= 0) break;
     }
-    var screen: regular.Screen = .{};
-    try screen.replay(buffer[0..used]);
-    try std.testing.expectEqual(@as(usize, 0), screen.row);
-    try std.testing.expect(!screen.visible(regular.prior));
-    try std.testing.expectEqual(@as(usize, 1), screen.count(regular.prior));
+    return output[0..used];
+}
+
+/// Startup is exactly the entry control sequence: no CR/LF, no relative cursor
+/// movement and no erasure. The entry sequence may itself carry SGR/private modes.
+fn expectEntryOnly(bytes: []const u8) !void {
+    try std.testing.expectEqualStrings(enter, bytes);
+    try std.testing.expect(std.mem.indexOfScalar(u8, bytes, '\r') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, bytes, '\n') == null);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, i, "\x1b[")) |at| {
+        i = at + 2;
+        while (i < bytes.len and !(bytes[i] >= 0x40 and bytes[i] <= 0x7e)) i += 1;
+        if (i == bytes.len) return error.IncompleteEscape;
+        switch (bytes[i]) {
+            'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J', 'K', 'L', 'M', 'P', 'S', 'T', 'f' => return error.CursorGeometrySequence,
+            else => i += 1,
+        }
+    }
+}
+
+// Removing geometric prefill must be proven at every terminal size, including
+// the one-row and 200-row clamps of `size()`.
+test "mode entry emits only the bounded enter sequence on owned PTYs" {
+    var captured: [64]u8 = undefined;
+    for ([_]u16{ 1, 2, 24, 200 }) |rows| {
+        const startup = try captureStartup(&captured, 80, rows);
+        try expectEntryOnly(startup);
+    }
+}
+
+// Shell history stays where the user left it: startup neither moves the seeded
+// cursor nor rewrites/erases rows above it (middle, bottom, bottom with a
+// pending wrap). The old rows*CRLF+CUU prefill scrolled all of these away.
+test "mode entry preserves seeded cursor and prior rows at middle and bottom" {
+    const regular = @import("../tests/regular_screen.zig");
+    var captured: [64]u8 = undefined;
+    const startup = try captureStartup(&captured, 80, 24);
+    try expectEntryOnly(startup);
+    const Seed = struct { row: usize, col: usize, wrap: bool };
+    for ([_]Seed{
+        .{ .row = 11, .col = 0, .wrap = false },
+        .{ .row = 12, .col = 7, .wrap = false },
+        .{ .row = 23, .col = 79, .wrap = true },
+    }) |seed| {
+        var screen: regular.Screen = .{};
+        try screen.replay(regular.prior ++ "\r\nfirst-row\r\nsecond-row\r\nthird-row");
+        screen.row = seed.row;
+        screen.col = seed.col;
+        screen.wrap = seed.wrap;
+        const history = screen.history_len;
+        const grid = screen.grid;
+        try screen.replay(startup);
+        try std.testing.expectEqual(seed.row, screen.row);
+        try std.testing.expectEqual(seed.col, screen.col);
+        try std.testing.expectEqual(seed.wrap, screen.wrap);
+        try std.testing.expectEqual(history, screen.history_len);
+        for (0..grid.len) |row_index|
+            try std.testing.expectEqualSlices(u8, &grid[row_index], &screen.grid[row_index]);
+        try std.testing.expectEqual(@as(usize, 1), screen.count(regular.prior));
+        for ([_][]const u8{ "first-row", "second-row", "third-row" }) |row|
+            try std.testing.expectEqual(@as(usize, 1), screen.count(row));
+    }
 }
 
 // 测试：输出缓冲被写满（背压）时仍保持非阻塞，恢复后属性仍然正确。

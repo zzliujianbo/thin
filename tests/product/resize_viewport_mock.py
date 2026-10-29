@@ -3,6 +3,10 @@
 python3 tests/product/resize_viewport_mock.py /absolute/path/to/thin [--wrap|--local-command]
 Uses only an owned foreground tmux server/socket, HOME/project and loopback.
 Checks visible cells/cursor, not pixels or every physical terminal emulator.
+Resize is passive by contract: the tmux/SSH client owns reflow of already
+displayed cells, so this fixture no longer waits for an automatic viewport
+restoration. It requires no repaint on size alone and then a fresh frame at the
+new dimensions, with the draft preserved, on the next real edit.
 """
 import http.server
 import json
@@ -14,6 +18,82 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
+
+
+def _cell_width(character):
+    if unicodedata.combining(character):
+        return 0
+    return 2 if unicodedata.east_asian_width(character) in ('W', 'F') else 1
+
+
+def _take_cells(text, columns):
+    """Prefix of `text` whose rendered width fits `columns` terminal cells."""
+    if columns <= 0:
+        return ''
+    width = 0
+    for index, character in enumerate(text):
+        step = _cell_width(character)
+        if width + step > columns:
+            return text[:index]
+        width += step
+    return text
+
+
+def _logical_editor(rows, caret_column):
+    """One logical composer line from visible soft-wrapped rows.
+
+    The first row carries the ASCII `%> ` decoration and later rows repeat that
+    width as indentation, so the divider is removed instead of being read as
+    draft text. The last row is cut at the real caret cell before extraction:
+    cells to its right are terminal padding or stale cells, never draft. Rows
+    are joined without a newline because this fixture's draft has no hard line
+    breaks, and trailing padding is dropped.
+    """
+    first = rows[0]
+    marker = first.find('%>')
+    if marker < 0:
+        return None
+    decoration = marker + 3
+    if not first[:decoration].isascii():
+        return None
+    parts = []
+    for index, raw in enumerate(rows):
+        if index == len(rows) - 1:
+            # A soft wrap that exactly fills its row captures the empty caret
+            # row as ''. It belongs to the editor, adds no input characters and
+            # must not discard the preceding rows; only that exact blank shape
+            # at the decoration column is accepted.
+            if not raw.strip() and caret_column == decoration:
+                continue
+            line = _take_cells(raw, caret_column)
+        else:
+            line = raw
+        if len(line) < decoration or (index != 0 and line[:decoration].strip()):
+            return None
+        parts.append(line[decoration:].rstrip(' '))
+    return ''.join(parts)
+
+
+def _check_editor_helper():
+    prefix = '(fixture-model) ?%> '
+    pad = ' ' * len(prefix)
+    assert _take_cells('世界🙂abc', 3) == '世' and _take_cells('世界🙂abc', 6) == '世界🙂'
+    assert _logical_editor([prefix + 'abc', pad + 'def'], len(pad) + 3) == 'abcdef'
+    assert _logical_editor([prefix + '世界-', pad + 'END'], len(pad) + 3) == '世界-END'
+    typed = _logical_editor([prefix + '世界-', pad + 'ENDQ'], len(pad) + 4)
+    assert typed.endswith('世界-END' + 'Q'), typed
+    restored = _logical_editor([prefix + '世界-', pad + 'END'], len(pad) + 3)
+    assert restored.endswith('世界-END') and 'Q' not in restored, restored
+    assert _logical_editor([prefix + '世界-', pad + 'END' + 'X'], len(pad) + 3) == '世界-END'
+    assert _logical_editor([prefix + '世界-', pad + 'END'], len(pad) + 1) == '世界-E'
+    assert _logical_editor([prefix + '世界🙂', pad + 'x'], len(pad) + 7) == '世界🙂x'
+    # Exactly-full wrap: the captured caret row is blank, not indented.
+    assert _logical_editor([prefix + 'ENDQ', ''], len(prefix)) == 'ENDQ'
+    assert _logical_editor([prefix + 'ENDQ', pad], len(pad)) == 'ENDQ'
+    assert _logical_editor([prefix + 'ENDQ', ''], len(prefix) - 1) is None
+    assert _logical_editor([prefix + 'ENDQ', ''], len(prefix) + 1) is None
+    assert _logical_editor([prefix + 'ENDQ', 'X'], len(prefix)) is None
 
 
 class OwnedService(http.server.BaseHTTPRequestHandler):
@@ -94,28 +174,108 @@ def run(app, wrap=False, local_command=False):
                     assert time.monotonic() < end, message
                     time.sleep(.02)
 
-            def visible(width, height, marker=''):
-                state = tm('display-message', '-p', '-t', 'owned:0.0', '#{pane_width} #{pane_height} #{cursor_y} #{cursor_flag} #{pane_dead}').split()
-                if state != [str(width), str(height), str(height - 1), '1', '0']:
-                    return False
-                lines = tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()
-                tail = lines[-8:]
-                return len(lines) == height and any('%>' in line for line in tail) and marker in '\n'.join(tail) and sum('%>' in line for line in lines) == 1
+            def caret():
+                return tuple(map(int, tm('display-message', '-p', '-t', 'owned:0.0', '#{cursor_y} #{cursor_x}').split()))
 
+            def pane_state(width, height):
+                values = tm('display-message', '-p', '-t', 'owned:0.0', '#{pane_width} #{pane_height} #{cursor_y} #{cursor_x} #{cursor_flag} #{pane_dead}').split()
+                if values[:2] != [str(width), str(height)]:
+                    return None
+                return tuple(map(int, values[2:]))
+
+            def lines_now():
+                return tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()
+
+            def visible(width, height, marker=''):
+                """Composer at the real cursor row, never a pinned physical bottom.
+
+                The first frame floats at the terminal's existing cursor row, so
+                the live tail owns that row and the bounded composer rows above
+                it. The window follows the real cursor; the last physical rows
+                are ours only when the client reflowed the tail there.
+                """
+                state = pane_state(width, height)
+                if state is None:
+                    return False
+                y, _x, flag, dead = state
+                if flag != 1 or dead != 0 or not 0 <= y < height:
+                    return False
+                lines = lines_now()
+                if len(lines) != height:
+                    return False
+                near = '\n'.join(lines[max(0, y - 8):y + 1])
+                return '%>' in near and marker in near and sum('%>' in line for line in lines) == 1
+
+            def dimensions(width, height):
+                return tm('display-message', '-p', '-t', 'owned:0.0', '#{pane_width} #{pane_height}').split() == [str(width), str(height)]
+
+            def quiet(interval=.22):
+                # Longer than the removed 150ms repair debounce: a resize alone
+                # must not redraw, fill or replay anything.
+                before = tm('capture-pane', '-p', '-t', 'owned:0.0')
+                time.sleep(interval)
+                return before == tm('capture-pane', '-p', '-t', 'owned:0.0')
+
+            def passive_resize(width, height):
+                tm('resize-window', '-t', 'owned:0', '-x', str(width), '-y', str(height))
+                wait(lambda: dimensions(width, height), f'resize {width}x{height} not delivered')
+                # Exactly one quiescence interval: retrying would hide a one-time
+                # repaint behind the following quiet window.
+                assert quiet(), f'resize-only {width}x{height} repainted instead of staying passive'
+
+            def composer(width, height):
+                """Current logical editor line, located from the real cursor.
+
+                Scrollback is excluded and so are stale composer rows left above
+                by an earlier geometry: the client owns reflow of already
+                displayed cells, so the nearest `%>` row at or above the cursor is
+                the live editor. Its visible rows are soft wraps of one logical
+                line, so the ASCII decoration/continuation indent is removed and
+                the caret cell bounds the last row instead of terminal padding.
+                """
+                state = pane_state(width, height)
+                if state is None:
+                    return None
+                y, _x, flag, dead = state
+                if flag != 1 or dead != 0 or not 0 <= y < height:
+                    return None
+                cursor_y, cursor_x = caret()
+                if cursor_y != y:
+                    return None
+                lines = lines_now()
+                if len(lines) != height:
+                    return None
+                rows = [index for index, line in enumerate(lines) if '%>' in line and index <= y]
+                if not rows or y - rows[-1] > 7:
+                    return None
+                return _logical_editor(lines[rows[-1]:y + 1], cursor_x)
+
+            def resume(width, height, marker):
+                """A real edit after resize draws the frame at the new size.
+
+                The observation is the current editor region at the real cursor,
+                not scrollback or pixels reflowed by the client: the typed Q must
+                appear there and disappear again with the preserved draft still
+                ending there. Bottom pinning and application-side reflow of older
+                rows are not required.
+                """
+                tm('send-keys', '-t', 'owned:0.0', '-l', 'Q')
+                wait(lambda: (composer(width, height) or '').endswith(marker + 'Q'), f'fresh {width}x{height} editor did not echo the typed cell')
+                tm('send-keys', '-t', 'owned:0.0', 'BSpace')
+
+                def restored():
+                    text = composer(width, height)
+                    return text is not None and text.endswith(marker) and 'Q' not in text
+
+                wait(restored, f'fresh {width}x{height} frame after BSpace lost the draft')
+
+            _check_editor_helper()
             try:
                 wait(lambda: (root / 'sock').exists(), 'owned emulator startup timed out')
                 tm('new-session', '-d', '-s', 'owned', '-x', '80', '-y', '24', '-c', str(project), shlex.join([app, '--no-log', '--no-model-auto-refresh']))
-                wait(lambda: visible(80, 24), 'initial composer not visible at viewport bottom')
-                # Growing height is intentional: raw-byte silence can leave a
-                # perfectly valid old composer stranded above an empty bottom.
-                for width, height in ((80, 40), (80, 8), (80, 24), (40, 24), (80, 24)):
-                    tm('resize-window', '-t', 'owned:0', '-x', str(width), '-y', str(height))
-                    wait(lambda: visible(width, height), 'idle viewport did not recover without input')
+                wait(lambda: visible(80, 24), 'initial composer frame not visible at 80x24')
                 tm('send-keys', '-t', 'owned:0.0', '-l', 'long-viewport-draft-abcdefghijklmnopqrstuvwxyz-世界-END')
                 wait(lambda: visible(80, 24, '世界-END'), 'wide-character draft missing')
-                for width, height in ((40, 8), (100, 40), (80, 24)):
-                    tm('resize-window', '-t', 'owned:0', '-x', str(width), '-y', str(height))
-                    wait(lambda: visible(width, height, 'END'), 'draft viewport did not recover without input')
                 if wrap:
                     history_seed = '!true' if local_command else 'wrap-history-seed'
                     if not local_command:
@@ -131,9 +291,9 @@ def run(app, wrap=False, local_command=False):
                         grid = tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()
                         empty = all(not line.split('%>', 1)[1].strip() for line in grid if '%>' in line)
                         # A completed command row may legitimately move into
-                        # native scrollback while the fresh composer stays at
-                        # the viewport bottom. Completion is not synonymous
-                        # with retaining that row in the current 24-cell grid.
+                        # native scrollback while the fresh composer stays on the
+                        # live cursor row. Completion is not synonymous with
+                        # retaining that row in the current grid.
                         transcript = tm('capture-pane', '-p', '-S', '-200', '-t', 'owned:0.0').splitlines()
                         marker = '> true' if local_command else 'wrap-history-ready'
                         return empty and any(marker in line for line in transcript)
@@ -144,20 +304,18 @@ def run(app, wrap=False, local_command=False):
                     tm('send-keys', '-t', 'owned:0.0', 'C-u')
                     tm('send-keys', '-t', 'owned:0.0', '-l', value)
                     wait(lambda: visible(80, 24, '-WRAP-END'), 'wrapped input end missing')
-                    lines = tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()
-                    assert next(i for i, line in enumerate(lines) if '%>' in line) < 23, 'long input did not wrap'
-
-                    def caret():
-                        return tuple(map(int, tm('display-message', '-p', '-t', 'owned:0.0', '#{cursor_y} #{cursor_x}').split()))
-
+                    lines = lines_now()
+                    prompt_row = next(i for i, line in enumerate(lines) if '%>' in line)
+                    assert prompt_row < caret()[0], 'long input did not wrap'
                     ended = caret()
                     tm('send-keys', '-t', 'owned:0.0', 'Up')
                     wait(lambda: caret() == (ended[0] - 1, ended[1]), 'Up did not move to the previous visual input row')
                     tm('send-keys', '-t', 'owned:0.0', 'Down')
                     wait(lambda: caret() == ended, 'Down did not restore the visual input row/column')
-                    after_arrows = tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()
+                    after_arrows = lines_now()
                     assert sum('%>' in line for line in after_arrows) == 1, 'visual arrows duplicated the composer'
-                    assert any('-WRAP-END' in line for line in after_arrows[-8:]), 'visual arrows replaced or clipped the draft'
+                    draft_row = caret()[0]
+                    assert any('-WRAP-END' in line for line in after_arrows[max(0, draft_row - 8):draft_row + 1]), 'visual arrows replaced or clipped the draft'
 
                     def at_start():
                         lines = tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()
@@ -185,13 +343,26 @@ def run(app, wrap=False, local_command=False):
                     tm('send-keys', '-t', 'owned:0.0', 'C-u')
                     tm('send-keys', '-t', 'owned:0.0', '-l', 'large-' + '世界🙂abcdefghij' * 100 + '-UNICODE-END')
                     wait(lambda: visible(80, 24, '-UNICODE-END'), 'bounded Unicode viewport end missing')
-                    lines = tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()
-                    assert next(i for i, line in enumerate(lines) if '%>' in line) >= 16, 'composer exceeded eight-row viewport'
+                    lines = lines_now()
+                    prompt_row = next(i for i, line in enumerate(lines) if '%>' in line)
+                    # Eight rendered composer rows, measured from the real cursor
+                    # row instead of an assumed physical bottom.
+                    assert 0 <= caret()[0] - prompt_row <= 7, 'composer exceeded eight-row viewport'
                     tm('send-keys', '-t', 'owned:0.0', 'Home')
                     wait(at_start, 'bounded viewport did not follow Home')
                     tm('send-keys', '-t', 'owned:0.0', 'End')
                     wait(lambda: visible(80, 24, '-UNICODE-END'), 'bounded viewport did not follow End')
                     print(f'PASS composer-wrap: seed={"local-command" if local_command else "loopback"}, visible multiline input, visual rows, exact-origin history/draft restore, bounded Unicode viewport')
+                # Passive resize stage: the client owns reflow of already displayed
+                # cells. Thin takes the new dimensions, drops old-frame authority
+                # and resumes on real input; no automatic repair, no bottom
+                # pinning and no application reflow of older rows is required.
+                marker = '-UNICODE-END' if wrap else '世界-END'
+                for width, height in ((80, 40), (80, 8), (80, 24), (40, 24), (80, 24)):
+                    passive_resize(width, height)
+                for width, height in ((40, 8), (100, 40), (80, 24)):
+                    passive_resize(width, height)
+                    resume(width, height, marker)
                 expected_requests = 1 if wrap and not local_command else 0
                 assert OwnedService.requests == expected_requests, 'unexpected resize/draft/helper HTTP'
                 assert OwnedService.failed is None, f'owned loopback assertion failed: {OwnedService.failed}'
@@ -215,7 +386,7 @@ def run(app, wrap=False, local_command=False):
                         return False
 
                 wait(exited_cleanly, 'application did not exit cleanly')
-                print('PASS resize-viewport: visible idle/draft composer pinned at bottom after height/width/ABA, Unicode retained, cursor visible, HTTP=0, clean exit')
+                print(f'PASS resize-viewport: passive height/width/ABA without repaint, fresh frame at new dimensions on real input, draft retained, cursor visible, HTTP={OwnedService.requests}, clean exit')
             finally:
                 if server.poll() is None:
                     subprocess.run(base + ['kill-server'], env=env, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

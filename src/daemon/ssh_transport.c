@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <errno.h>
+#include <poll.h>
 
 #define QUEUE_CAP 65536u
 #define IO_CHUNK 16384u
@@ -24,6 +25,7 @@
 #define FINISH_MS 500
 static struct {
     int attempted, active, dead, eof, authenticated, pty, shell, keydir;
+    int notification_registered, notification_fd;
     unsigned columns, rows;
     char home[4096];
     ssh_bind bind;
@@ -126,6 +128,10 @@ void thin_ssh_close(void) {
     g.active=0;
     if(g.channel) { ssh_channel_free(g.channel);g.channel=NULL; }
     if(g.event) {
+        if(g.notification_registered) {
+            (void)ssh_event_remove_fd(g.event,g.notification_fd);
+            g.notification_registered=0;
+        }
         if(g.session) (void)ssh_event_remove_session(g.event,g.session);
         ssh_event_free(g.event);g.event=NULL;
     }
@@ -229,6 +235,23 @@ ptrdiff_t thin_ssh_read(void *out,size_t length) {
     int rc=ssh_channel_read_nonblocking(g.channel,out,(uint32_t)length,0);
     if(rc>0) return rc;
     if(rc==SSH_ERROR || (rc!=SSH_AGAIN && (g.eof || ssh_channel_is_eof(g.channel) || !ssh_is_connected(g.session)))) return -1;
+    return 0;
+}
+static int notification_ready(int fd,int revents,void *data) {
+    (void)fd;(void)revents;(void)data;
+    /* Wake only. The TUI consumes the queue and drains its eventfd, never this
+     * libssh callback. All registration/removal remains on the SSH owner. */
+    return 0;
+}
+int thin_ssh_notification_fd(int fd) {
+    if(!g.active || !g.event) return -1;
+    if(g.notification_registered) {
+        if(ssh_event_remove_fd(g.event,g.notification_fd)!=SSH_OK) return -1;
+        g.notification_registered=0;
+    }
+    if(fd<0) return 0;
+    if(ssh_event_add_fd(g.event,fd,POLLIN,notification_ready,NULL)!=SSH_OK) return -1;
+    g.notification_fd=fd;g.notification_registered=1;
     return 0;
 }
 int thin_ssh_wait(int want_write,int ms) {

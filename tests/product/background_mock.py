@@ -50,6 +50,18 @@ SYNC_BEGIN = b'\x1b[?2026h'
 FRAME_END = b'\x1b[?2026l' + ACK
 CSI = re.compile(rb'\x1b\[([0-9;?]*)([@-~])')
 
+# Real idle composer decorations, as rendered by src/ui/presentation.zig's
+# `prompt()`: `> ` with no model selected, and `(model) 0.0%> ` /
+# `(model) L1.6%> ` / `(model) high> ` once one is. The slot in front of the
+# marker is a transient effort-confirmation level name or the retained context
+# (`?%`, `>100%`, `N.N%`), optionally prefixed by the low-price `L`. The busy
+# marker replaces the `>` with the non-ASCII activity spinner, which this bounded
+# VT subset never stores, so a busy composer can never reach the same shape.
+_VALUE_SLOT = (r'(?:L?(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
+               r'xhigh|max|\?))')
+_IDLE_COMPOSER = re.compile(
+    r'^(?:> |(?:\([^)]*\) )?' + _VALUE_SLOT + r'> )$')
+
 
 class Screen:
     """Bounded VT subset used to read the real composer/footer state."""
@@ -112,13 +124,21 @@ class Screen:
         return [''.join(row).rstrip() for row in self.grid[-rows:]]
 
     def idle(self):
-        """True only on a settled idle composer row.
+        """True only on the cursor row of a settled, empty composer.
 
-        The plain idle prompt ends with `> ` (presentation.prompt); the busy
-        row ends with the activity spinner, which is not ASCII, so a busy
-        footer can never satisfy this after ESC stripping.
+        The live tail floats at the terminal's existing cursor row, so it owns
+        that row and not necessarily the physical bottom: read the cursor, never
+        `grid[-1]`. A stale completed prompt further up, a transcript row that
+        merely ends with `>`, a modal editor line (Search>/Settings>/
+        Address>/Provider>/API key>) and the busy spinner are all rejected.
         """
-        return ''.join(self.grid[-1]).rstrip().endswith('>')
+        if not 0 <= self.row < len(self.grid):
+            return False
+        column = min(max(self.col, 0), self.columns)
+        line = ''.join(self.grid[self.row])
+        if line[column:].strip():
+            return False  # Editor text follows the decoration: not empty.
+        return _IDLE_COMPOSER.match(line[:column]) is not None
 
 KEY = 'owned-loopback-background-fixture-key'
 MODEL = 'fixture-model'

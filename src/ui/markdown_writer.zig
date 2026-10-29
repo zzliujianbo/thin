@@ -10,6 +10,26 @@ pub const Error = Allocator.Error || error{ MarkdownRenderLimit, MarkdownCellOve
 pub const Tone = enum { normal, heading, strong, code, inline_code, quote, link, link_url, rule, border, muted, thinking, table_header, user };
 pub const Style = struct { tone: Tone = .normal, bold: bool = false, italic: bool = false, strike: bool = false, underline: bool = false };
 
+/// Optional completion sink, default off. When set, a finished row is handed to
+/// the sink instead of being appended to `Writer.lines`, so a long stream does
+/// not accumulate rows. OWNERSHIP: on success the sink owns `row`; on failure
+/// the WRITER still owns it and frees it, so a sink must never free a row whose
+/// callback returned an error (and must not free before its own bookkeeping
+/// succeeded). `src_start` is the emit-stream offset of the first source byte
+/// displayed on that row (0 for synthetic-only rows). The callback must never
+/// reenter the writer.
+pub const RowSink = struct {
+    context: *anyopaque,
+    onRow: *const fn (context: *anyopaque, row: []const u8, src_start: usize, prefix: []const u8) Error!void,
+};
+
+/// Temporary translation for ONE emit: bytes [start,end) of the parser source
+/// produced `emit`-stream bytes. `exact` means the emitted bytes are a
+/// byte-for-byte copy of that source span (no entities/escapes/replacements),
+/// so wrapped rows can be attributed per scalar. Non-exact spans are attributed
+/// atomically to the first scalar of the emit.
+pub const SourceMap = struct { start: usize, end: usize, exact: bool, generated: bool = false };
+
 pub const Budget = struct {
     bytes: usize = 0,
     lines: usize = 0,
@@ -54,9 +74,60 @@ pub const Writer = struct {
     pending_prefix_start: ?usize = null,
     row_body: bool = false,
     row_prefix: []const u8 = "",
+    /// Completed-row sink; see RowSink. Default off keeps the old behavior.
+    sink: ?RowSink = null,
+    /// Number of rows successfully delivered or retained.
+    completed_rows: usize = 0,
+    /// Bytes of emit/emitStyled source consumed so far (emit-stream position).
+    pos: usize = 0,
+    /// Emit-stream offset of the first source byte on the current physical row.
+    row_src_start: usize = 0,
+    /// Emit-stream offset associated with the pending cluster's first byte.
+    /// Prefix staging reports the position of the glyph that owns the row.
+    pending_src_start: usize = 0,
+    /// Provenance of the current physical row in PARSER-SOURCE coordinates,
+    /// deliberately independent of `pos` (emit-stream bytes). A renderer marks
+    /// source spans before emitting transformed text; synthetic bytes (table
+    /// borders, list markers, math delimiters, owned attribute copies) are not
+    /// marked, so a row with no mark is synthetic. Reset after each finished
+    /// row; a wrapped row keeps only the span of the glyphs it actually owns.
+    origin_start: usize = std.math.maxInt(usize),
+    origin_end: usize = 0,
+    origin_synthetic: bool = true,
+    generated_start: usize = std.math.maxInt(usize),
+    generated_end: usize = 0,
+    map: ?SourceMap = null,
+    /// Parser-source origin of the glyph currently staged in `pending`.
+    pending_origin_start: usize = 0,
+    pending_origin_end: usize = 0,
+    pending_origin_synthetic: bool = true,
+    pending_generated_start: usize = std.math.maxInt(usize),
+    pending_generated_end: usize = 0,
 
     pub fn hasContent(self: *const Writer) bool {
         return self.row_started or self.cluster != null or self.col != 0 or self.line.items.len != 0;
+    }
+
+    /// Record a source span for the current row. min/max accumulation keeps a
+    /// wrapped row's provenance conservative; it never invents a source byte.
+    pub fn markSource(self: *Writer, start: usize, end: usize) void {
+        if (end <= start) return;
+        self.origin_start = @min(self.origin_start, start);
+        self.origin_end = @max(self.origin_end, end);
+        self.origin_synthetic = false;
+    }
+
+    /// Emit bytes that are a transformed view of `[start,end)` parser source.
+    pub fn emitSourced(self: *Writer, s: []const u8, start: usize, end: usize, exact: bool) !void {
+        const prior = self.map;
+        self.map = .{ .start = start, .end = end, .exact = exact };
+        defer self.map = prior;
+        try self.emit(s);
+    }
+
+    /// Emit bytes that have no parser-source origin (renderer-generated).
+    pub fn emitSynthetic(self: *Writer, s: []const u8) !void {
+        try self.emit(s);
     }
 
     pub fn dropPending(self: *Writer) void {
@@ -132,7 +203,7 @@ pub const Writer = struct {
 
     /// Stage a decoded glyph. SGR is never passed to ClusterState. Each glyph
     /// is decoded once, accepted once, and copied at most twice (stage/commit).
-    fn stage(self: *Writer, cp: u21, raw: []const u8, prefix_at: ?usize, bullet: bool, capacity: ?usize) !bool {
+    fn stage(self: *Writer, cp: u21, raw: []const u8, prefix_at: ?usize, bullet: bool, capacity: ?usize, origin: ?SourceMap) !bool {
         if (self.cluster) |state| {
             var next = state;
             if (next.accept(cp)) {
@@ -142,6 +213,19 @@ pub const Writer = struct {
                 };
                 try self.put(&self.pending, raw);
                 self.cluster = next;
+                if (origin) |o| {
+                    if (o.generated) {
+                        self.pending_generated_start = @min(self.pending_generated_start, o.start);
+                        self.pending_generated_end = @max(self.pending_generated_end, o.end);
+                    } else if (self.pending_origin_synthetic) {
+                        self.pending_origin_start = o.start;
+                        self.pending_origin_end = o.end;
+                        self.pending_origin_synthetic = false;
+                    } else {
+                        self.pending_origin_start = @min(self.pending_origin_start, o.start);
+                        self.pending_origin_end = @max(self.pending_origin_end, o.end);
+                    }
+                }
                 if (prefix_at == null) self.pending_body = true;
                 return true;
             }
@@ -160,6 +244,20 @@ pub const Writer = struct {
         self.initial_bullet = bullet;
         self.pending_prefix_start = prefix_at;
         self.pending_body = prefix_at == null;
+        self.pending_src_start = self.pos;
+        self.pending_origin_synthetic = true;
+        self.pending_generated_start = std.math.maxInt(usize);
+        self.pending_generated_end = 0;
+        if (origin) |o| {
+            if (o.generated) {
+                self.pending_generated_start = o.start;
+                self.pending_generated_end = o.end;
+            } else {
+                self.pending_origin_synthetic = false;
+                self.pending_origin_start = o.start;
+                self.pending_origin_end = o.end;
+            }
+        }
         // Set state before allocation: discardLine/deinit can always recover.
         self.cluster = state;
         if (bullet and self.ansi) try self.put(&self.pending, theme.bullet);
@@ -173,6 +271,7 @@ pub const Writer = struct {
     fn startReserved(self: *Writer, reserve: usize, replay: ?[]const u8) !void {
         if (self.row_started) return;
         self.row_started = true;
+        self.row_src_start = self.pos;
         const prefix = replay orelse self.prefix;
         self.row_prefix = prefix;
         var bullet_start: ?usize = null;
@@ -194,7 +293,7 @@ pub const Writer = struct {
         while (i < prefix.len) {
             const r = decode(prefix, i);
             if (r.cp == 10 or r.cp == 9) break;
-            if (!try self.stage(r.cp, prefix[i..r.end], i, if (bullet_start) |b| i >= b else false, cap)) break;
+            if (!try self.stage(r.cp, prefix[i..r.end], i, if (bullet_start) |b| i >= b else false, cap, null)) break;
             i = r.end;
         }
         // Reset bullet color without introducing a cluster boundary.
@@ -211,10 +310,25 @@ pub const Writer = struct {
         const first_bullet = self.initial_bullet;
         const body = self.pending_body;
         const prefix_start = self.pending_prefix_start;
+        const source = self.pending_src_start;
+        const glyph_origin_start = self.pending_origin_start;
+        const glyph_origin_end = self.pending_origin_end;
+        const glyph_synthetic = self.pending_origin_synthetic;
+        const generated_start = self.pending_generated_start;
+        const generated_end = self.pending_generated_end;
         self.cluster = null;
         self.pending_body = false;
         self.pending_prefix_start = null;
-        defer payload.deinit(self.a);
+        defer {
+            // Ordinary flushes used to allocate/free staging storage for every
+            // glyph on every redraw. Keep it for the next cluster. Wrapping
+            // can recursively stage a prefix; that buffer has independent
+            // ownership and wins if it exists, including failure paths.
+            if (self.pending.capacity == 0) {
+                payload.clearRetainingCapacity();
+                self.pending = payload;
+            } else payload.deinit(self.a);
+        }
         var moved = false;
         const needed = if (state.width == 0 and self.col == 0) 1 else state.width;
         if (wrap and needed > self.columns -| self.col and self.col != 0) {
@@ -230,8 +344,16 @@ pub const Writer = struct {
                 try self.finishRow();
                 try self.startReserved(@max(1, state.width), null);
             }
+            // The moved cluster carries its own source span onto the new row:
+            // the previous row's origin reset must not swallow it.
+            self.row_src_start = source;
             try self.flushPending(false);
             moved = true;
+        }
+        if (!glyph_synthetic) self.markSource(glyph_origin_start, glyph_origin_end);
+        if (generated_end > generated_start) {
+            self.generated_start = @min(self.generated_start, generated_start);
+            self.generated_end = @max(self.generated_end, generated_end);
         }
         if (moved) {
             try self.styleInto(&self.line, first_style);
@@ -265,13 +387,21 @@ pub const Writer = struct {
             }
             try self.append(theme.reset);
         }
+        const start = if (self.row_started) self.row_src_start else self.pos;
+        const row_prefix = self.row_prefix;
         const owned = try self.line.toOwnedSlice(self.a);
         errdefer self.a.free(owned);
-        try self.lines.append(self.a, owned);
+        if (self.sink) |sink| try sink.onRow(sink.context, owned, start, row_prefix) else try self.lines.append(self.a, owned);
+        self.completed_rows +|= 1;
         self.col = 0;
         self.row_started = false;
         self.row_body = false;
         self.row_prefix = "";
+        self.origin_start = std.math.maxInt(usize);
+        self.origin_end = 0;
+        self.origin_synthetic = true;
+        self.generated_start = std.math.maxInt(usize);
+        self.generated_end = 0;
     }
 
     pub fn finish(self: *Writer) !void {
@@ -283,7 +413,7 @@ pub const Writer = struct {
         if (self.hasContent()) try self.finish();
     }
 
-    fn tab(self: *Writer) !void {
+    fn tab(self: *Writer, origin: ?SourceMap) !void {
         try self.flushPending(true);
         try self.startReserved(1, null);
         try self.flushPending(true);
@@ -302,6 +432,7 @@ pub const Writer = struct {
             try self.flushPending(false);
             n = 4 - self.col % 4;
         }
+        if (origin) |o| self.markSource(o.start, o.end);
         if (n > self.columns -| self.col) {
             try self.byte('?');
             self.col += 1;
@@ -312,20 +443,63 @@ pub const Writer = struct {
         self.row_body = true;
     }
 
-    pub fn emit(self: *Writer, s: []const u8) !void {
-        if (self.budget) |budget| try budget.step(s.len);
+    /// Processes whole UTF-8 scalars only. A scalar may exceed the byte budget
+    /// by at most three bytes; LF or tab may complete two rows, exceeding the
+    /// row budget by at most one. A zero budget makes no changes. Exhaustion
+    /// is not EOF and does not flush the pending cluster.
+    pub fn emitBounded(self: *Writer, s: []const u8, byte_budget: usize, row_budget: usize) !usize {
+        const initial_rows = self.completed_rows;
         var i: usize = 0;
-        while (i < s.len) {
+        while (i < s.len and i < byte_budget and self.completed_rows -| initial_rows < row_budget) {
             const r = decode(s, i);
+            if (self.budget) |budget| {
+                if (r.end - i > budget.max_work -| budget.work) break;
+                try budget.step(r.end - i);
+            }
+            const origin: ?SourceMap = if (self.map) |map| blk: {
+                if (map.exact and map.end >= map.start and map.end - map.start == s.len)
+                    break :blk .{ .start = map.start + i, .end = map.start + r.end, .exact = true, .generated = map.generated };
+                break :blk map;
+            } else null;
             if (r.cp == 10) {
-                try self.finish();
+                if (self.ansi and self.base == .user and !self.row_started) try self.startReserved(1, null);
+                try self.flushPending(true);
+                if (origin) |o| self.markSource(o.start, o.end);
+                try self.finishRow();
             } else if (r.cp == 9) {
-                try self.tab();
+                try self.tab(origin);
             } else {
                 try self.startReserved(1, null);
-                _ = try self.stage(r.cp, s[i..r.end], null, false, null);
+                _ = try self.stage(r.cp, s[i..r.end], null, false, null, origin);
             }
+            self.pos += r.end - i;
             i = r.end;
+        }
+        return i;
+    }
+
+    /// The source interval describes the entire supplied slice, not the
+    /// budget-limited portion. For an exact continuation advance `start` by
+    /// the returned byte count; for an atomic mapping retain the same span.
+    pub fn emitSourcedBounded(self: *Writer, s: []const u8, start: usize, end: usize, exact: bool, byte_budget: usize, row_budget: usize) !usize {
+        const prior = self.map;
+        self.map = .{ .start = start, .end = end, .exact = exact };
+        defer self.map = prior;
+        return self.emitBounded(s, byte_budget, row_budget);
+    }
+
+    /// Unbounded convenience wrapper. Budget exhaustion is surfaced as an error
+    /// only after bounded progress: bytes already consumed stay staged and are
+    /// never silently dropped.
+    pub fn emit(self: *Writer, s: []const u8) !void {
+        var i: usize = 0;
+        while (i < s.len) {
+            const n = try self.emitBounded(s[i..], std.math.maxInt(usize), std.math.maxInt(usize));
+            if (n == 0) {
+                if (self.budget) |budget| try budget.step(1);
+                return error.MarkdownRenderLimit;
+            }
+            i += n;
         }
     }
 
@@ -341,6 +515,7 @@ pub const Writer = struct {
         try self.append(s);
         self.col += width;
         self.row_body = self.row_body or s.len != 0;
+        self.pos += s.len;
         try self.sgr();
     }
 };
@@ -526,7 +701,12 @@ test "budget charges staged bytes once and bounds work lines and SGR" {
     var w: Writer = .{ .a = std.testing.allocator, .columns = 10, .ansi = false, .budget = &work };
     defer w.deinit();
     try std.testing.expectError(error.MarkdownRenderLimit, w.emit("long"));
-    try std.testing.expect(!w.hasContent());
+    // Bounded progress is kept, never half-dropped.
+    try std.testing.expectEqual(@as(usize, 3), work.work);
+    try std.testing.expect(w.hasContent());
+    try w.finish();
+    try std.testing.expectEqual(@as(usize, 1), w.lines.items.len);
+    try std.testing.expectEqualStrings("lon", w.lines.items[0]);
     var bytes: Budget = .{ .max_bytes = 3 };
     var b: Writer = .{ .a = std.testing.allocator, .columns = 10, .ansi = false, .budget = &bytes };
     defer b.deinit();
@@ -619,6 +799,24 @@ fn allocationScenario(a: Allocator) !void {
     try w.finish();
 }
 
+test "ordinary text reuses cluster storage instead of allocating per glyph" {
+    try text.initLocale();
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    {
+        var writer: Writer = .{ .a = counted.allocator(), .columns = 512, .ansi = false };
+        defer writer.deinit();
+        const source: [4096]u8 = @splat('a');
+        try writer.emit(&source);
+        try writer.finish();
+        try std.testing.expectEqual(@as(usize, 8), writer.lines.items.len);
+        for (writer.lines.items) |line| try std.testing.expectEqualSlices(u8, source[0..512], line);
+        // Capacity growth and eight owned rows are allowed; 4096 independent
+        // staging allocations are not. Independent of in-place resize success.
+        try std.testing.expect(counted.allocations < 128);
+    }
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+}
+
 test "allocation failures release detached clusters and owned finished rows" {
     try text.initLocale();
     // SafeAllocator may extend the last bucket allocation in place depending
@@ -628,4 +826,216 @@ test "allocation failures release detached clusters and owned finished rows" {
     var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(backing.allocator(), allocationScenario, .{});
     try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+}
+
+const SinkProbe = struct {
+    const Row = struct { bytes: []const u8, start: usize };
+    a: Allocator,
+    rows: std.ArrayList(Row) = .empty,
+
+    fn onRow(context: *anyopaque, row: []const u8, src_start: usize, _: []const u8) Error!void {
+        const self: *SinkProbe = @ptrCast(@alignCast(context));
+        // Book-keeping first: on failure the writer still owns and frees `row`.
+        try self.rows.append(self.a, .{ .bytes = row, .start = src_start });
+    }
+
+    fn sink(self: *SinkProbe) RowSink {
+        return .{ .context = self, .onRow = onRow };
+    }
+
+    fn deinit(self: *SinkProbe) void {
+        for (self.rows.items) |row| self.a.free(row.bytes);
+        self.rows.deinit(self.a);
+    }
+};
+
+test "row sink is opt-in and reports exact emit-stream row starts" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    // Default off: rows keep accumulating in `lines` as before.
+    var plain: Writer = .{ .a = a, .columns = 4, .ansi = false };
+    defer plain.deinit();
+    try plain.emit("abcdef");
+    try plain.finish();
+    try std.testing.expect(plain.sink == null);
+    try std.testing.expectEqual(@as(usize, 2), plain.lines.items.len);
+
+    var probe: SinkProbe = .{ .a = a };
+    defer probe.deinit();
+    var w: Writer = .{ .a = a, .columns = 4, .ansi = false, .sink = probe.sink() };
+    defer w.deinit();
+    try w.emit("ab");
+    try std.testing.expectEqual(@as(usize, 0), w.lines.items.len);
+    try w.emit("cd");
+    try w.emit("\nefg");
+    try w.finish();
+    try std.testing.expectEqual(@as(usize, 0), w.lines.items.len);
+    try std.testing.expectEqual(@as(usize, 2), probe.rows.items.len);
+    try std.testing.expectEqualStrings("abcd", probe.rows.items[0].bytes);
+    try std.testing.expectEqual(@as(usize, 0), probe.rows.items[0].start);
+    try std.testing.expectEqualStrings("efg", probe.rows.items[1].bytes);
+    try std.testing.expectEqual(@as(usize, 5), probe.rows.items[1].start);
+
+    // A cluster moved onto a new row carries its own source span with it.
+    var wrapped: SinkProbe = .{ .a = a };
+    defer wrapped.deinit();
+    var v: Writer = .{ .a = a, .columns = 2, .ansi = false, .sink = wrapped.sink() };
+    defer v.deinit();
+    try v.emit("ab");
+    try v.emit("\u{2764}");
+    try v.emit("\u{fe0f}");
+    try v.finish();
+    try std.testing.expectEqual(@as(usize, 2), wrapped.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 0), wrapped.rows.items[0].start);
+    try std.testing.expectEqual(@as(usize, 2), wrapped.rows.items[1].start);
+    try std.testing.expectEqualStrings("\u{2764}\u{fe0f}", wrapped.rows.items[1].bytes);
+}
+
+test "tab and newline row starts stay exact through wraps" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    var probe: SinkProbe = .{ .a = a };
+    defer probe.deinit();
+    var w: Writer = .{ .a = a, .columns = 4, .ansi = false, .sink = probe.sink() };
+    defer w.deinit();
+    try w.emit("ab\tcd\n\tef");
+    try w.finish();
+    const rows = [_][]const u8{ "ab  ", "cd", "    ", "ef" };
+    const starts = [_]usize{ 0, 3, 6, 7 };
+    try std.testing.expectEqual(@as(usize, rows.len), probe.rows.items.len);
+    for (rows, starts, probe.rows.items) |text_row, start, row| {
+        try std.testing.expectEqualStrings(text_row, row.bytes);
+        try std.testing.expectEqual(start, row.start);
+    }
+}
+
+const RejectProbe = struct {
+    attempts: usize = 0,
+    fn onRow(context: *anyopaque, _: []const u8, _: usize, _: []const u8) Error!void {
+        const self: *RejectProbe = @ptrCast(@alignCast(context));
+        self.attempts += 1;
+        // Deliberately does NOT free: the writer owns a refused row.
+        return error.MarkdownRenderLimit;
+    }
+};
+
+test "bounded emission matches unlimited across scalar and row budgets" {
+    try text.initLocale();
+    const input = "abcd中文👩‍💻é\txy\nlong text 中文\tend";
+    for ([_]bool{ false, true }) |ansi| {
+        var reference: Writer = .{ .a = std.testing.allocator, .columns = 5, .ansi = ansi, .prefix = "> ", .continuation = "> " };
+        defer reference.deinit();
+        try reference.emit(input);
+        try reference.finish();
+        for ([_]usize{ 1, 2, 5, 17 }) |bytes| {
+            var w: Writer = .{ .a = std.testing.allocator, .columns = 5, .ansi = ansi, .prefix = "> ", .continuation = "> " };
+            defer w.deinit();
+            try std.testing.expectEqual(@as(usize, 0), try w.emitBounded(input, 0, 1));
+            try std.testing.expectEqual(@as(usize, 0), try w.emitBounded(input, 1, 0));
+            try std.testing.expect(!w.hasContent());
+            var offset: usize = 0;
+            while (offset < input.len) {
+                const before = w.completed_rows;
+                const n = try w.emitBounded(input[offset..], bytes, 1);
+                try std.testing.expect(n > 0 and n <= bytes + 3);
+                try std.testing.expect(w.completed_rows - before <= 2);
+                offset += n;
+            }
+            try w.finish();
+            try std.testing.expectEqual(reference.lines.items.len, w.lines.items.len);
+            for (reference.lines.items, w.lines.items) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+        }
+    }
+}
+
+test "bounded giant single emit makes bounded progress" {
+    try text.initLocale();
+    const input = try std.testing.allocator.alloc(u8, 65536);
+    defer std.testing.allocator.free(input);
+    @memset(input, 'x');
+    var full: Writer = .{ .a = std.testing.allocator, .columns = 12, .ansi = true };
+    defer full.deinit();
+    try full.emit(input);
+    try full.finish();
+    var chunked: Writer = .{ .a = std.testing.allocator, .columns = 12, .ansi = true };
+    defer chunked.deinit();
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const before = chunked.completed_rows;
+        const n = try chunked.emitBounded(input[offset..], 97, 2);
+        try std.testing.expect(n > 0 and n <= 100);
+        try std.testing.expect(chunked.completed_rows - before <= 3);
+        offset += n;
+    }
+    try chunked.finish();
+    try std.testing.expectEqual(full.lines.items.len, chunked.lines.items.len);
+    for (full.lines.items, chunked.lines.items) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+}
+
+const OriginProbe = struct {
+    writer: *Writer,
+    starts: [8]usize = undefined,
+    ends: [8]usize = undefined,
+    count: usize = 0,
+    fn onRow(context: *anyopaque, row: []const u8, _: usize, _: []const u8) Error!void {
+        const self: *OriginProbe = @ptrCast(@alignCast(context));
+        self.starts[self.count] = self.writer.origin_start;
+        self.ends[self.count] = self.writer.origin_end;
+        self.count += 1;
+        self.writer.a.free(row);
+    }
+};
+
+test "bounded source spans belong to the row containing their glyph" {
+    try text.initLocale();
+    var w: Writer = .{ .a = std.testing.allocator, .columns = 1, .ansi = false };
+    defer w.deinit();
+    var probe: OriginProbe = .{ .writer = &w };
+    w.sink = .{ .context = &probe, .onRow = OriginProbe.onRow };
+    try std.testing.expectEqual(@as(usize, 1), try w.emitSourcedBounded("ab", 10, 12, true, 1, 1));
+    try std.testing.expectEqual(@as(usize, 1), try w.emitSourcedBounded("b", 11, 12, true, 1, 1));
+    try w.finish();
+    try std.testing.expectEqual(@as(usize, 2), probe.count);
+    try std.testing.expectEqual(@as(usize, 10), probe.starts[0]);
+    try std.testing.expectEqual(@as(usize, 11), probe.ends[0]);
+    try std.testing.expectEqual(@as(usize, 11), probe.starts[1]);
+    try std.testing.expectEqual(@as(usize, 12), probe.ends[1]);
+}
+
+test "bounded atomic source remains atomic across slices" {
+    try text.initLocale();
+    var w: Writer = .{ .a = std.testing.allocator, .columns = 1, .ansi = false };
+    defer w.deinit();
+    var probe: OriginProbe = .{ .writer = &w };
+    w.sink = .{ .context = &probe, .onRow = OriginProbe.onRow };
+    try std.testing.expectEqual(@as(usize, 1), try w.emitSourcedBounded("ab", 20, 25, false, 1, 1));
+    try std.testing.expectEqual(@as(usize, 1), try w.emitSourcedBounded("b", 20, 25, false, 1, 1));
+    try w.finish();
+    for (0..probe.count) |i| {
+        try std.testing.expectEqual(@as(usize, 20), probe.starts[i]);
+        try std.testing.expectEqual(@as(usize, 25), probe.ends[i]);
+    }
+}
+
+test "a rejected sink row is freed exactly once by the writer" {
+    try text.initLocale();
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe: RejectProbe = .{};
+    {
+        var w: Writer = .{
+            .a = counted.allocator(),
+            .columns = 4,
+            .ansi = true,
+            .sink = .{ .context = &probe, .onRow = RejectProbe.onRow },
+        };
+        defer w.deinit();
+        try w.emit("abcd");
+        try std.testing.expectEqual(@as(usize, 0), probe.attempts);
+        // The row completes only at the row terminator, where the sink refuses.
+        try std.testing.expectError(error.MarkdownRenderLimit, w.emit("\n"));
+        try std.testing.expectEqual(@as(usize, 1), probe.attempts);
+        try std.testing.expectEqual(@as(usize, 0), w.lines.items.len);
+    }
+    // Freed by the writer, never by the sink: no leak and no double free.
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
 }

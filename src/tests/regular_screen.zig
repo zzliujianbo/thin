@@ -1,4 +1,4 @@
-//! Bounded, fixed 80x24 VT subset for offline regular-terminal acceptance.
+//! Bounded VT subset (up to 160x24, default 80x24) for offline acceptance.
 //! Not a terminal emulator: no resize/reflow claim. Non-ASCII glyphs occupy
 //! cells but assertions deliberately use ASCII markers only.
 const std = @import("std");
@@ -48,7 +48,7 @@ pub fn rejectFullscreen(bytes: []const u8) !void {
 }
 
 pub const Screen = struct {
-    const width = 80;
+    const width = 160;
     const height = 24;
     const Line = [width]u8;
     grid: [height]Line = @splat(@splat(' ')),
@@ -59,7 +59,7 @@ pub const Screen = struct {
     wrap: bool = false,
     /// Bounded logical dimensions. Changing these directly is only valid before
     /// output; this fixture deliberately does not emulate terminal text reflow.
-    columns: usize = width,
+    columns: usize = 80,
     rows: usize = height,
 
     fn down(self: *Screen) !void {
@@ -180,6 +180,18 @@ pub const Screen = struct {
         return total;
     }
 };
+
+test "wide PTY replay does not fabricate wrapped approval ghosts" {
+    const body: [120]u8 = @splat('x');
+    const bytes = "Approval #4\r\n" ++ body ++ "\r\n> \r\x1b[2A\r\x1b[K\r\n\x1b[K\r\n> ";
+    var wide: Screen = .{ .columns = 160 };
+    try wide.replay(bytes);
+    try std.testing.expect(!wide.visible("Approval #4"));
+    try std.testing.expectEqual(@as(usize, 2), wide.row);
+    var mismatched: Screen = .{};
+    try mismatched.replay(bytes);
+    try std.testing.expect(mismatched.visible("Approval #4"));
+}
 
 test "regular grid retains prior output and committed answers through tail redraw" {
     var s: Screen = .{};

@@ -23,6 +23,7 @@ pub const Cluster = struct { end: usize, width: usize };
 
 /// 单个码点的列宽；wcwidth 返回 -1（不可打印）时按 1 列计。
 fn scalarWidth(c: u21) usize {
+    if (c >= 0x20 and c < 0x7f) return 1;
     const w = wcwidth(@intCast(c));
     return if (w < 0) 1 else @intCast(w);
 }
@@ -93,6 +94,9 @@ pub const ClusterState = struct {
             self.awaitZWJ = false;
             return true;
         }
+        // Printable ASCII cannot extend a cluster except immediately after
+        // ZWJ, handled above. Avoid Unicode width queries for ordinary text.
+        if (cp >= 0x20 and cp < 0x7f) return false;
         if (extend(cp)) {
             if (cp == 0xfe0f) self.width = @max(self.width, 2);
             if (modifier(cp)) self.width += scalarWidth(cp);
@@ -142,6 +146,22 @@ pub fn width(s: []const u8) usize {
         i = c.end;
     }
     return col;
+}
+
+test "printable ASCII width and cluster shortcuts retain ZWJ joins" {
+    try initLocale();
+    for (0x20..0x7f) |value| {
+        const cp: u21 = @intCast(value);
+        try std.testing.expectEqual(@as(c_int, 1), wcwidth(@intCast(cp)));
+        try std.testing.expectEqual(@as(usize, 1), scalarWidth(cp));
+        var ordinary = ClusterState.init('a', 0);
+        try std.testing.expect(!ordinary.accept(cp));
+        var joined = ClusterState.init('a', 0);
+        try std.testing.expect(joined.accept(0x200d));
+        try std.testing.expect(joined.accept(cp));
+        try std.testing.expectEqual(@as(usize, 2), joined.width);
+        try std.testing.expect(!joined.accept('z'));
+    }
 }
 
 // 测试：清洗控制字符、非法 UTF-8 与双向控制符，且截断标记不超过预算。

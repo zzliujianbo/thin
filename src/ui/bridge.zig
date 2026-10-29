@@ -154,6 +154,19 @@ const Copy = struct {
     }
 };
 
+/// 单个正文切片的最大 UTF-8 安全长度：不超过 limit，且不切断多字节码点。
+/// 返回 0 仅当 src 为空（或 limit 为 0）；非空 src 且 limit > 0 时至少返回 1，
+/// 因此调用方的逐段循环一定会前进。
+fn chunkLen(src: []const u8, limit: usize) usize {
+    const n = @min(src.len, limit);
+    if (n == src.len or n == 0) return n;
+    // 中文：结尾落在续字节上时回退到码点起点，让该码点整体留在下一片。
+    var cut = n;
+    while (cut > 0 and (src[cut] & 0xc0) == 0x80) cut -= 1;
+    // 中文：极端非法字节串（整片都是续字节）无法对齐；退回原长度，仍保证不丢字节。
+    return if (cut == 0) n else cut;
+}
+
 /// 单生产者 / 单消费者的有界事件桥。负责队列与字节预算、权限请求的同步，以及任务终态的传递。
 pub const Bridge = struct {
     /// 用于拷贝事件内存的分配器。
@@ -162,6 +175,9 @@ pub const Bridge = struct {
     io: Io,
     /// 外部取消令牌；close 与 reset 会修改它。
     cancel: *p.Cancellation,
+    /// Optional coalescing owner notification. Install before producers start;
+    /// keep context alive until all producers join. Never a source of state.
+    notification: ?struct { context: *anyopaque, notify_fn: *const fn (*anyopaque) void } = null,
 
     /// 保护本结构中所有可变字段的互斥锁。
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
@@ -190,6 +206,10 @@ pub const Bridge = struct {
     answer: ?r.Decision = null,
     /// 见过的最大权限 ID，新请求的 ID 必须严格大于它。
     last_id: ?u64 = null,
+
+    fn notify(self: *Bridge) void {
+        if (self.notification) |n| n.notify_fn(n.context);
+    }
 
     /// 创建桥对象。返回值需要放到稳定地址上使用（见文件头说明）。
     pub fn init(a: std.mem.Allocator, io: Io, cancel: *p.Cancellation) Bridge {
@@ -240,6 +260,7 @@ pub const Bridge = struct {
     }
 
     /// 运行时的事件入口（工作线程调用）。流程：处理终态 -> 检查取消 -> 校验权限 ID -> 两阶段预留预算并拷贝 -> 入队。
+    /// 只有 .text / .reasoning 会被切成多段逐个入队，其它事件仍是一条一次。
     fn emit(ctx: ?*anyopaque, event: r.Event, cancel: *const p.Cancellation) anyerror!void {
         const self = from(ctx);
         // Canonical injected user text is never a clipped display preview.
@@ -250,6 +271,7 @@ pub const Bridge = struct {
             self.terminal = event.finished;
             self.clearPermission();
             self.unlock();
+            self.notify();
             return;
         }
 
@@ -280,6 +302,40 @@ pub const Bridge = struct {
             self.unlock();
         };
 
+        // 中文：流式正文可能一次远大于单条 item_budget（例如非流式应答整段下发）。
+        // 原先 Copy.text 会把超出部分静默截断，TUI 永久丢失已生成内容，因此只对
+        // text / reasoning 按 UTF-8 边界切段，逐段走同一条既定入队路径。
+        // 单生产者保证切片顺序入队、不与其它事件交错，因此无需额外屏障。
+        switch (event) {
+            .text => |body| try self.enqueueBody(.text, body, cancel),
+            .reasoning => |body| try self.enqueueBody(.reasoning, body, cancel),
+            else => try self.enqueue(event, cancel),
+        }
+    }
+
+    /// 正文切片的种类，也决定每一段还原成哪种事件。
+    const BodyKind = enum { text, reasoning };
+
+    /// 把一段流式正文切成不超过 item_budget 的 UTF-8 安全片，逐片顺序入队。
+    /// 空正文仍然入队一个空事件（与截断前的行为一致）；不整段预留预算。
+    fn enqueueBody(self: *Bridge, kind: BodyKind, body: []const u8, cancel: *const p.Cancellation) anyerror!void {
+        var offset: usize = 0;
+        while (true) {
+            const take = chunkLen(body[offset..], item_budget);
+            const part = body[offset..][0..take];
+            try self.enqueue(switch (kind) {
+                .text => .{ .text = part },
+                .reasoning => .{ .reasoning = part },
+            }, cancel);
+            offset += take;
+            if (offset >= body.len) return;
+        }
+    }
+
+    /// 单条事件的两阶段入队：锁内测量并预留预算 -> 锁外分配并拷贝 -> 锁内入队。
+    /// 队列满或预算不足时短暂让出重试；每段入队后唤醒消费者，让切分的大正文
+    /// 在消费端逐段回收预算，不会因为等待唤醒而死锁。
+    fn enqueue(self: *Bridge, event: r.Event, cancel: *const p.Cancellation) anyerror!void {
         // 中文：第一遍只测量需要的字节数，不做分配。
         var measure = Copy{};
         _ = measure.event(event);
@@ -311,13 +367,16 @@ pub const Bridge = struct {
         var copy = Copy{ .storage = storage };
         const owned = copy.event(event);
 
-        self.lock();
-        defer self.unlock();
-        // 中文：分配期间 UI 可能已断开或被取消，入队前必须再检查一次。
-        if (self.stopped(cancel)) return error.Canceled;
-        self.queue[(self.head + self.len) % queue_capacity] = .{ .event = owned, .display_truncated = copy.clipped, .canonical_complete = copy.canonical_complete, .storage = storage, .owner = self };
-        self.len += 1;
-        self.outstanding += 1;
+        {
+            self.lock();
+            defer self.unlock();
+            // 中文：分配期间 UI 可能已断开或被取消，入队前必须再检查一次。
+            if (self.stopped(cancel)) return error.Canceled;
+            self.queue[(self.head + self.len) % queue_capacity] = .{ .event = owned, .display_truncated = copy.clipped, .canonical_complete = copy.canonical_complete, .storage = storage, .owner = self };
+            self.len += 1;
+            self.outstanding += 1;
+        }
+        self.notify();
     }
 
     /// 权限确认入口（工作线程调用）。登记 pending 请求后轮询，直到 UI 调用 decide 作出回答。
@@ -577,4 +636,322 @@ test "task snapshot clipping stops on a utf8 boundary inside the shared item cap
     try t.expectEqual(item_budget - 1, item.storage.len);
     try t.expect(task.truncated and item.display_truncated);
     try t.expect(std.unicode.utf8ValidateSlice(task.text));
+}
+
+// 中文：以下为正文切片入队的定点测试。它们只在本文件的私有测试根中运行，
+// 不联网、不执行工具，也不依赖其它模块的测试夹具。
+
+/// 一次入队进度的只读快照（持锁读取，供测试观察生产者线程）。
+const Progress = struct { len: usize, bytes: usize, outstanding: usize };
+
+fn progress(bridge: *Bridge) Progress {
+    bridge.lock();
+    defer bridge.unlock();
+    return .{ .len = bridge.len, .bytes = bridge.bytes, .outstanding = bridge.outstanding };
+}
+
+/// 201 KiB 的三字节字符正文：长度可被 3 整除，因此每个切片都必须回退到码点边界。
+fn multibyteBody(a: std.mem.Allocator) ![]u8 {
+    const len = 201 * 1024;
+    std.debug.assert(len % 3 == 0);
+    const body = try a.alloc(u8, len);
+    var at: usize = 0;
+    while (at < body.len) : (at += 3) @memcpy(body[at..][0..3], "\xe5\xad\x97");
+    return body;
+}
+
+const Drained = struct { parts: usize, bytes: usize };
+
+/// 测试用生产者：把一段正文交给 Bridge，并记录返回值供主线程断言。
+const BodyProducer = struct {
+    host_: r.Host,
+    cancel: *p.Cancellation,
+    body: []const u8,
+    done: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+
+    fn run(self: *BodyProducer) !void {
+        defer self.done.store(true, .release);
+        self.host_.emit_fn(self.host_.context, .{ .text = self.body }, self.cancel) catch |err| {
+            self.err = err;
+        };
+    }
+};
+
+/// 逐个 pop 并核对：所有条目都是同一种正文事件、按顺序精确拼回 expected、
+/// 每段不超过 item_budget 且没有截断/不完整标记，存储归 Item 所有。
+fn drainBody(bridge: *Bridge, expected: []const u8, kind: Bridge.BodyKind) !Drained {
+    const t = std.testing;
+    var seen: usize = 0;
+    var parts: usize = 0;
+    while (bridge.pop()) |value| {
+        var item = value;
+        defer item.deinit();
+        const part = switch (kind) {
+            .text => if (item.event == .text) item.event.text else return error.WrongEvent,
+            .reasoning => if (item.event == .reasoning) item.event.reasoning else return error.WrongEvent,
+        };
+        try t.expect(part.len <= item_budget);
+        try t.expect(!item.display_truncated);
+        try t.expect(item.canonical_complete);
+        try t.expectEqual(part.len, item.storage.len);
+        if (part.len > 0) {
+            const lo = @intFromPtr(item.storage.ptr);
+            try t.expect(@intFromPtr(part.ptr) >= lo);
+            try t.expect(@intFromPtr(part.ptr) + part.len <= lo + item.storage.len);
+        }
+        try t.expect(std.unicode.utf8ValidateSlice(part));
+        try t.expect(seen + part.len <= expected.len);
+        try t.expect(std.mem.eql(u8, part, expected[seen..][0..part.len]));
+        seen += part.len;
+        parts += 1;
+    }
+    try t.expectEqual(expected.len, seen);
+    return .{ .parts = parts, .bytes = seen };
+}
+
+test "multibyte text body above the item cap streams as ordered untruncated slices" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+    const body = try multibyteBody(t.allocator);
+    defer t.allocator.free(body);
+
+    try host_.emit_fn(host_.context, .{ .text = body }, &cancel);
+    // 201 KiB 仍在共享的 256 KiB 预算内，因此一次 emit 就能入队全部切片。
+    try t.expectEqual(@as(usize, 4), progress(&bridge).len);
+    try t.expectEqual(@as(usize, body.len), progress(&bridge).bytes);
+
+    const drained = try drainBody(&bridge, body, .text);
+    try t.expectEqual(@as(usize, 4), drained.parts);
+    try t.expectEqual(body.len, drained.bytes);
+    try t.expectEqual(@as(usize, 0), progress(&bridge).bytes);
+}
+
+test "multibyte reasoning body streams as ordered untruncated slices" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+    const body = try multibyteBody(t.allocator);
+    defer t.allocator.free(body);
+
+    try host_.emit_fn(host_.context, .{ .reasoning = body }, &cancel);
+    const drained = try drainBody(&bridge, body, .reasoning);
+    try t.expectEqual(@as(usize, 4), drained.parts);
+    try t.expectEqual(body.len, drained.bytes);
+}
+
+test "empty and exact-bound bodies stay one event while one byte more splits" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+
+    // 空正文行为不变：仍然恰好一个空事件，零字节存储，没有截断标记。
+    try host_.emit_fn(host_.context, .{ .text = "" }, &cancel);
+    try t.expectEqual(@as(usize, 1), progress(&bridge).len);
+    {
+        var empty = bridge.pop().?;
+        defer empty.deinit();
+        try t.expect(empty.event == .text);
+        try t.expectEqual(@as(usize, 0), empty.event.text.len);
+        try t.expectEqual(@as(usize, 0), empty.storage.len);
+        try t.expect(!empty.display_truncated and empty.canonical_complete);
+    }
+    try t.expectEqual(@as(usize, 0), progress(&bridge).bytes);
+
+    // 正好 item_budget 是一条完整事件，不应多切一段。
+    const exact = try t.allocator.alloc(u8, item_budget);
+    defer t.allocator.free(exact);
+    @memset(exact, 'e');
+    try host_.emit_fn(host_.context, .{ .text = exact }, &cancel);
+    try t.expectEqual(@as(usize, 1), progress(&bridge).len);
+    {
+        var one = bridge.pop().?;
+        defer one.deinit();
+        try t.expect(one.event == .text);
+        try t.expectEqual(item_budget, one.event.text.len);
+        try t.expect(std.mem.eql(u8, one.event.text, exact));
+        try t.expect(!one.display_truncated);
+    }
+
+    // 多一个字节就切成两段，而不是产出一个被截断的事件。
+    const over = try t.allocator.alloc(u8, item_budget + 1);
+    defer t.allocator.free(over);
+    @memset(over, 'o');
+    try host_.emit_fn(host_.context, .{ .text = over }, &cancel);
+    const drained = try drainBody(&bridge, over, .text);
+    try t.expectEqual(@as(usize, 2), drained.parts);
+    try t.expectEqual(over.len, drained.bytes);
+}
+
+test "body larger than the shared byte budget streams under consumer backpressure" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    // 与既有 bridge 测试相同的做法：专用线程化后端跑生产者，主线程当消费者。
+    var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });
+    defer backend.deinit();
+    var bridge = Bridge.init(t.allocator, backend.io(), &cancel);
+    defer bridge.deinit();
+
+    // 1 MiB 正文是整桥预算的 4 倍：只有逐段预留、逐段被消费者回收才可能完成。
+    const body = try t.allocator.alloc(u8, 4 * data_budget);
+    defer t.allocator.free(body);
+    for (body, 0..) |*byte, i| byte.* = @truncate(i % 251);
+    const got = try t.allocator.alloc(u8, body.len);
+    defer t.allocator.free(got);
+
+    var producer = BodyProducer{ .host_ = bridge.host(), .cancel = &cancel, .body = body };
+    var worker = try Io.concurrent(bridge.io, BodyProducer.run, .{&producer});
+    defer worker.cancel(bridge.io) catch {};
+
+    var seen: usize = 0;
+    var parts: usize = 0;
+    var oversize = false;
+    var clipped = false;
+    while (seen < got.len) {
+        if (bridge.pop()) |value| {
+            var item = value;
+            defer item.deinit();
+            if (item.event != .text) {
+                oversize = true;
+                continue;
+            }
+            const part = item.event.text;
+            if (part.len > got.len - seen) {
+                oversize = true;
+                continue;
+            }
+            @memcpy(got[seen..][0..part.len], part);
+            seen += part.len;
+            parts += 1;
+            if (part.len > item_budget or item.display_truncated) clipped = true;
+            continue;
+        }
+        if (producer.done.load(.acquire)) break;
+        try Io.sleep(bridge.io, .fromMilliseconds(1), .awake);
+    }
+    try worker.await(bridge.io);
+
+    try t.expect(producer.err == null);
+    try t.expect(!oversize and !clipped);
+    try t.expectEqual(body.len, seen);
+    try t.expect(std.mem.eql(u8, got, body));
+    try t.expect(parts >= 4 * data_budget / item_budget);
+    // 全部切片都已归还预算，1 MiB 从未被整体预留。
+    try t.expectEqual(@as(usize, 0), progress(&bridge).bytes);
+    try t.expectEqual(@as(usize, 0), progress(&bridge).outstanding);
+}
+
+test "cancel while a split body is blocked keeps only the truthful emitted prefix" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });
+    defer backend.deinit();
+    var bridge = Bridge.init(t.allocator, backend.io(), &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+
+    // 两条整事件占去三分之二预算，只剩两段切片的额度。
+    const filler = try t.allocator.alloc(u8, item_budget);
+    defer t.allocator.free(filler);
+    @memset(filler, 'f');
+    try host_.emit_fn(host_.context, .{ .text = filler }, &cancel);
+    try host_.emit_fn(host_.context, .{ .text = filler }, &cancel);
+    try t.expectEqual(2 * item_budget, progress(&bridge).bytes);
+
+    const body = try t.allocator.alloc(u8, 3 * item_budget);
+    defer t.allocator.free(body);
+    @memset(body, 'b');
+
+    var producer = BodyProducer{ .host_ = host_, .cancel = &cancel, .body = body };
+    var worker = try Io.concurrent(bridge.io, BodyProducer.run, .{&producer});
+    defer worker.cancel(bridge.io) catch {};
+
+    // 第三段需要的 64 KiB 已无预算：生产者必须阻塞在预留循环里。
+    var blocked = false;
+    for (0..5_000) |_| {
+        const state = progress(&bridge);
+        if (state.len == 4 and state.bytes == data_budget) {
+            blocked = true;
+            break;
+        }
+        if (producer.done.load(.acquire)) break;
+        try Io.sleep(bridge.io, .fromMilliseconds(1), .awake);
+    }
+    cancel.cancel();
+    try worker.await(bridge.io);
+
+    try t.expect(blocked);
+    try t.expectEqual(@as(?anyerror, error.Canceled), producer.err);
+
+    for (0..2) |_| {
+        var item = bridge.pop().?;
+        defer item.deinit();
+        try t.expect(item.event == .text);
+        try t.expect(std.mem.eql(u8, item.event.text, filler));
+    }
+    var prefix: usize = 0;
+    while (bridge.pop()) |value| {
+        var item = value;
+        defer item.deinit();
+        try t.expect(item.event == .text);
+        try t.expect(prefix + item.event.text.len <= body.len);
+        try t.expect(std.mem.eql(u8, item.event.text, body[prefix..][0..item.event.text.len]));
+        prefix += item.event.text.len;
+    }
+    // 已入队的只是真实前缀，既没有伪造“已完整”的尾部，也没有截断标记。
+    try t.expectEqual(2 * item_budget, prefix);
+    try t.expectEqual(@as(usize, 0), progress(&bridge).bytes);
+    try t.expectEqual(@as(usize, 0), progress(&bridge).outstanding);
+}
+
+test "terminal follows every split part and is never queued behind them" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+    const body = try multibyteBody(t.allocator);
+    defer t.allocator.free(body);
+
+    try host_.emit_fn(host_.context, .{ .text = body }, &cancel);
+    // 终态优先级不变：finished 不排队、不占预算，也不等待正文切片被消费。
+    try host_.emit_fn(host_.context, .{ .finished = .{ .status = .success } }, &cancel);
+    try t.expectEqual(@as(usize, 4), progress(&bridge).len);
+    try t.expectEqual(@as(usize, body.len), progress(&bridge).bytes);
+    const terminal = bridge.takeTerminal().?;
+    try t.expectEqual(r.Status.success, terminal.status);
+
+    const drained = try drainBody(&bridge, body, .text);
+    try t.expectEqual(@as(usize, 4), drained.parts);
+    try t.expectEqual(body.len, drained.bytes);
+}
+
+test "allocation failure mid-body keeps the emitted prefix and returns the reservation" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    // 第二段的分配失败：第一段已入队，失败段的预留预算必须原额归还。
+    var backing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 1 });
+    var bridge = Bridge.init(backing.allocator(), std.testing.io, &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+
+    const body = try t.allocator.alloc(u8, 3 * item_budget);
+    defer t.allocator.free(body);
+    @memset(body, 'a');
+
+    try t.expectError(error.OutOfMemory, host_.emit_fn(host_.context, .{ .text = body }, &cancel));
+    try t.expectEqual(@as(usize, 1), progress(&bridge).len);
+    try t.expectEqual(item_budget, progress(&bridge).bytes);
+
+    const drained = try drainBody(&bridge, body[0..item_budget], .text);
+    try t.expectEqual(@as(usize, 1), drained.parts);
+    try t.expectEqual(@as(usize, 0), progress(&bridge).bytes);
+    try t.expectEqual(@as(usize, 0), progress(&bridge).outstanding);
 }

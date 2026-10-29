@@ -26,6 +26,8 @@
 #ifndef MD4C_H
 #define MD4C_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
     extern "C" {
 #endif
@@ -398,6 +400,141 @@ typedef MD_PARSER MD_RENDERER;
  * returning non-zero, the return value of the callback is returned.
  */
 int md_parse(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userdata);
+/* Parse a single inline paragraph without interpreting block syntax. */
+int md_parse_inline(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userdata);
+
+/* Confirmed inline spans, emitted once, immediately before their enter_span
+ * callback. Ranges are half-open offsets in the original input (bytes in the
+ * UTF-8 build). The event pointer is valid only during the callback. Nested
+ * events occur in enter order. Attribute data remains in the normal parser
+ * callbacks. This interface reports EM, STRONG, CODE, DEL and bracketed
+ * A/IMG spans; autolinks, wikilinks, underline and other span types are not
+ * reported. Link closer ranges include the destination syntax. Nonzero aborts immediately
+ * with the callback's return value. */
+typedef struct MD_INLINE_SPAN_tag {
+    MD_SPANTYPE type;
+    MD_SIZE opener_begin, opener_end;
+    MD_SIZE closer_begin, closer_end;
+} MD_INLINE_SPAN;
+typedef int (*MD_INLINE_SPAN_CALLBACK)(const MD_INLINE_SPAN*, void*);
+/* Source positions refer to the post-container native header line; header_end
+ * excludes its line terminator. fence_begin/end delimit only the fence run. */
+typedef struct MD_FENCE_SOURCE_tag {
+    MD_SIZE fence_begin, fence_end, header_begin, header_end;
+    MD_CHAR fence_char;
+    /* Zero/zero unless the native block recognizer consumed a closing fence. */
+    MD_SIZE closing_begin, closing_end;
+} MD_FENCE_SOURCE;
+typedef int (*MD_FENCE_SOURCE_CALLBACK)(const MD_FENCE_SOURCE*, void*);
+typedef struct MD_CELL_SOURCE_tag {
+    MD_SIZE column, begin, end, row_begin, row_end;
+    MD_ALIGN alignment;
+    int header;
+    int cell_complete, row_complete;
+    /* Actual half-open source range before trim/skip; present distinguishes an
+     * actual empty cell (even at zero) from a synthetic missing column. For an
+     * incomplete cell next_begin equals raw_end and does not prove payload.
+     * For a complete cell it passes its separator, and for the last actual
+     * cell of a complete row also the physical LF/CRLF when present. Synthetic
+     * offsets are zero and completion only establishes logical emptiness. */
+    MD_SIZE raw_begin, raw_end, next_begin;
+    int present;
+} MD_CELL_SOURCE;
+typedef int (*MD_CELL_SOURCE_CALLBACK)(const MD_CELL_SOURCE*, void*);
+/* Native container prefix of a document table, captured while the block
+ * analyzer still knows the open containers. `mark` is '>' or the list mark
+ * character; the indents are the native columns used for continuation lines.
+ * The array is borrowed for the callback only and is never stored by md4c. */
+typedef struct MD_TABLE_CONTAINER_tag {
+    MD_CHAR mark;
+    unsigned mark_indent;
+    unsigned contents_indent;
+} MD_TABLE_CONTAINER;
+typedef struct MD_TABLE_SOURCE_tag {
+    const MD_TABLE_CONTAINER* containers;
+    unsigned n_containers;
+    /* Raw physical header start and first byte after delimiter LF/CRLF,
+     * or input size at EOF. Offsets are relative to the original input.
+     * header_complete is nonzero only for an LF or a non-partial EOF.
+     * Zeroed fields indicate absent header context. */
+    unsigned header_begin, body_begin, header_complete;
+} MD_TABLE_SOURCE;
+typedef int (*MD_TABLE_SOURCE_CALLBACK)(const MD_TABLE_SOURCE*, void*);
+/* Optional semantic replay for a cell whose opener was retired. The host sets
+ * handled only after successfully emitting its owned continuation state. */
+typedef int (*MD_CELL_CONTENT_CALLBACK)(MD_SIZE begin, MD_SIZE end, int *handled, void*);
+typedef struct MD_REFERENCE_STORE MD_REFERENCE_STORE;
+typedef struct MD_REFERENCE_UPDATE MD_REFERENCE_UPDATE;
+/* Definition attributes contain raw source text (including Markdown escapes),
+ * with entity/null substrings classified, and are borrowed for the callback.
+ * Prepare copies them. Only one update may be outstanding per store; resolve
+ * it by commit/abort before preparing another or destroying the store. */
+typedef struct MD_REFERENCE_DEFINITION_tag {
+    MD_SIZE begin, end;
+    MD_ATTRIBUTE label, destination, title;
+} MD_REFERENCE_DEFINITION;
+typedef int (*MD_REFERENCE_DEFINITION_CALLBACK)(const MD_REFERENCE_DEFINITION*, void*);
+/* Partial-input source range that must remain available: a possible table
+ * header or a reference definition whose optional title is still undecided.
+ * Offsets describe the original physical source; callbacks may report both. */
+#define MD_CANDIDATE_TABLE 1u
+#define MD_CANDIDATE_REFERENCE 2u
+typedef int (*MD_TABLE_CANDIDATE_CALLBACK)(MD_SIZE, MD_SIZE, unsigned, void*);
+MD_REFERENCE_STORE *md_reference_store_create(unsigned, size_t);
+void md_reference_store_destroy(MD_REFERENCE_STORE*);
+int md_reference_store_prepare(MD_REFERENCE_STORE*, const MD_REFERENCE_DEFINITION*, unsigned, MD_REFERENCE_UPDATE**);
+void md_reference_store_commit(MD_REFERENCE_STORE*, MD_REFERENCE_UPDATE*);
+void md_reference_store_abort(MD_REFERENCE_UPDATE*);
+typedef struct MD_SOURCE_CALLBACKS_tag {
+    MD_INLINE_SPAN_CALLBACK span;
+    MD_FENCE_SOURCE_CALLBACK fence;
+    MD_CELL_SOURCE_CALLBACK cell;
+    MD_CELL_CONTENT_CALLBACK cell_content;
+    const MD_REFERENCE_STORE *references;
+    MD_REFERENCE_DEFINITION_CALLBACK definition;
+    MD_TABLE_CANDIDATE_CALLBACK candidate;
+    /* Emitted once when a document table block starts, before its rows. */
+    MD_TABLE_SOURCE_CALLBACK table;
+    int partial_input;
+} MD_SOURCE_CALLBACKS;
+typedef struct MD_TABLE_RESUME_tag {
+    MD_SIZE columns, first_column;
+    const MD_ALIGN *alignments;
+    /* Absolute source positions already emitted for each column, relative to
+     * this input. Positions before input[0] are represented as zero. */
+    const MD_SIZE *skip;
+    int partial_cell;
+    /* Native container prefix snapshot from MD_TABLE_SOURCE. Continuation
+     * rows strip this prefix from each raw physical line; the table ends on a
+     * blank/container-only line or when fewer parents match. */
+    const MD_TABLE_CONTAINER *containers;
+    unsigned n_containers;
+    /* Non-zero when input[0] follows a container prefix that is already
+     * consumed (the cut landed inside the physical line). */
+    int first_line_partial;
+    /* Default zero. Trim the first resumed cell even if partial_cell is set;
+     * use only while the retired prefix contained leading whitespace alone. */
+    int trim_leading;
+} MD_TABLE_RESUME;
+typedef struct MD_TABLE_FRAGMENT_RESULT_tag {
+    /* Non-zero when a line after the table was found inside the input. */
+    int closed;
+    /* Raw input offset of the first byte not belonging to the table. When
+     * closed is zero this equals the input size (all bytes are row content). */
+    MD_SIZE end;
+} MD_TABLE_FRAGMENT_RESULT;
+/* Parse one known table-row continuation with native inline/pipe recognition.
+ * It deliberately does not recognize a new document or manufacture a header.
+ * result is optional; when given it reports the native table boundary. */
+int md_parse_table_fragment(const MD_CHAR*, MD_SIZE, const MD_PARSER*,
+    const MD_SOURCE_CALLBACKS*, const MD_TABLE_RESUME*, MD_TABLE_FRAGMENT_RESULT*, void*);
+/* Events are borrowed for the callback only; nonzero is propagated unchanged.
+ * Fence events occur after attribute setup, immediately before entering CODE. */
+int md_parse_source(const MD_CHAR*, MD_SIZE, const MD_PARSER*, const MD_SOURCE_CALLBACKS*, void*);
+int md_parse_inline_source(const MD_CHAR*, MD_SIZE, const MD_PARSER*, const MD_SOURCE_CALLBACKS*, void*);
+int md_parse_spans(const MD_CHAR*, MD_SIZE, const MD_PARSER*, MD_INLINE_SPAN_CALLBACK, void*);
+int md_parse_inline_spans(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser,
+                          MD_INLINE_SPAN_CALLBACK span_callback, void* userdata);
 
 
 #ifdef __cplusplus

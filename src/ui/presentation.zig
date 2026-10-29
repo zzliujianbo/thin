@@ -353,6 +353,13 @@ test "unselected model prompt shows no preset ID policy marker or percentage" {
     }
 }
 
+test "unselected synchronizing prompt is not a ready marker" {
+    const rendered = try prompt(std.testing.allocator, "", null, 80, .{ .busy = true });
+    defer rendered.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(u8, "> ", rendered.plain));
+    try std.testing.expectEqual(@as(usize, 2), text.width(rendered.plain));
+}
+
 pub const PromptActivity = struct {
     busy: bool = false,
     now_ms: u64 = 0,
@@ -394,7 +401,7 @@ pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Context
 
 fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, motion: PromptActivity) !Prompt {
     if (model.len == 0) {
-        const plain = try a.dupe(u8, "> ");
+        const plain = try std.fmt.allocPrint(a, "{s} ", .{if (motion.busy) activity.spinner(motion.now_ms) else ">"});
         errdefer a.free(plain);
         return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     }

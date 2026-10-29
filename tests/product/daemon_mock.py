@@ -165,6 +165,20 @@ SERVICE_MARKER = 'daemon-svc.marker'
 # Bounded VT subset: the product runs a main-buffer TUI, never alt screen.
 # ---------------------------------------------------------------------------
 
+# Real idle composer decorations, as rendered by src/ui/presentation.zig's
+# `prompt()`: `> ` with no model selected, and `(model) 0.0%> ` /
+# `(model) L1.6%> ` / `(model) high> ` / `0.0%> ` once one is. The slot in front
+# of the marker is a transient effort-confirmation level name or the retained
+# context (`?%`, `>100%`, `N.N%`), optionally prefixed by the low-price `L`.
+# The busy marker replaces the `>` with the non-ASCII activity spinner, which
+# this bounded VT subset never stores, so a busy composer can never reach the
+# same shape.
+_VALUE_SLOT = (r'(?:L?(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
+               r'xhigh|max|\?))')
+_IDLE_COMPOSER = re.compile(
+    r'^(?:> |(?:\([^)]*\) )?' + _VALUE_SLOT + r'> )$')
+
+
 class Screen:
     def __init__(self, columns, rows=30):
         self.columns = columns
@@ -236,8 +250,21 @@ class Screen:
         return [''.join(row).rstrip() for row in self.grid[-rows:]]
 
     def idle(self):
-        """True only on a settled idle composer row (busy rows end in a glyph)."""
-        return ''.join(self.grid[-1]).rstrip().endswith('>')
+        """True only on the cursor row of a settled, empty composer.
+
+        §3.3 floats the composer at the current tail location, so it owns the
+        cursor row and not necessarily the physical bottom row: read the cursor,
+        never `grid[-1]`. A stale completed prompt further up, a transcript row
+        that merely ends with `>`, a modal editor line (Search>/Settings>/
+        Address>/Provider>/API key>) and the busy spinner are all rejected.
+        """
+        if not 0 <= self.row < self.rows:
+            return False
+        column = min(max(self.col, 0), self.columns)
+        line = ''.join(self.grid[self.row])
+        if line[column:].strip():
+            return False  # Editor text follows the decoration: not empty.
+        return _IDLE_COMPOSER.match(line[:column]) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +637,41 @@ class ModelFixture:
 # ---------------------------------------------------------------------------
 # Owned workspace, config and case harness
 # ---------------------------------------------------------------------------
+
+def assert_screen_idle_contract():
+    """Direct Screen regression, run by each fixture entry point before spawning.
+
+    A drifting shared idle parser must fail here instead of timing out a 30s
+    latency/request-count wait: the composer floats at the current terminal
+    location, so idle is a cursor-row property, not a physical-bottom property.
+    """
+    def state(lines, cursor_row, total_rows=8, columns=40):
+        screen = Screen(columns, total_rows)
+        for index, line in enumerate(lines):
+            screen.grid[index][:len(line)] = list(line)
+        screen.row = cursor_row
+        screen.col = len(lines[cursor_row])
+        return screen
+
+    # Floating tail: the composer row is written above the physical bottom.
+    assert state(['(fixture-model) 0.0%> '], 0).idle(), 'floating configured composer'
+    assert state(['> '], 0).idle(), 'floating unconfigured composer'
+    assert state(['(fixture-model) L1.6%> '], 0).idle(), 'low-price composer'
+    assert state(['(fixture-model) high> '], 0).idle(), 'effort confirmation composer'
+    # Bottom placement keeps working.
+    assert state([''] * 7 + ['(fixture-model) 0.0%> '], 7).idle(), 'bottom composer'
+    # A stale completed prompt above a busy cursor row is not idle.
+    assert not state(['> ', '(fixture-model) 0.0% '], 1).idle(), 'stale prompt above busy'
+    # Modal editor lines, approval choices, body rows and drafts never imply idle.
+    assert not state(['Search> '], 0).idle(), 'search line'
+    assert not state(['Settings> '], 0).idle(), 'settings line'
+    assert not state(['Address> '], 0).idle(), 'proxy address line'
+    assert not state(['Provider> '], 0).idle(), 'provider line'
+    assert not state(['API key> '], 0).idle(), 'secret line'
+    assert not state(['> Allow once                Deny'], 0).idle(), 'approval choice row'
+    assert not state(['rm -rf protected-owned-dir >'], 0).idle(), 'body row ending in >'
+    assert not state(['(fixture-model) 0.0%> draft'], 0).idle(), 'filled composer'
+
 
 def write_config(home, url, limits=None):
     path = Path(home) / '.thin' / 'config.json'
@@ -1367,7 +1429,7 @@ def case_detach_continues(app, base):
                           guard=case.model.check)
         mark = client.mark()
         client.send_line('/cd ' + str(project))
-        client.pump_until(lambda: client.frame_after(mark), 'launcher cd redraw', 20,
+        client.pump_until(lambda: client.idle_after(mark, b'Launcher directory:'), 'launcher cd completed', 20,
                           guard=case.model.check)
         client.send_line(DETACH_PROMPT)
         case.wait_prompt(DETACH_PROMPT)
@@ -1447,11 +1509,11 @@ def case_parallel(app, base):
         mark = client_a.mark()
         # A failing /cd must keep the previous launcher directory/connection.
         client_a.send_line('/cd /nonexistent-owned-directory-%d' % os.getpid())
-        client_a.pump_until(lambda: client_a.frame_after(mark), 'failed cd redraw', 20,
+        client_a.pump_until(lambda: client_a.frame_after(mark, b'Directory is not accessible; launcher unchanged'), 'failed cd completed', 20,
                             guard=case.model.check)
         mark = client_a.mark()
         client_a.send_line('/cd ' + str(project_a))
-        client_a.pump_until(lambda: client_a.frame_after(mark), 'cd to A redraw', 20,
+        client_a.pump_until(lambda: client_a.idle_after(mark, b'Launcher directory:'), 'cd to A completed', 20,
                             guard=case.model.check)
         client_a.send_line(PAR_A_PROMPT)
         case.wait_prompt(PAR_A_PROMPT)
@@ -1462,7 +1524,7 @@ def case_parallel(app, base):
                             guard=case.model.check)
         mark = client_b.mark()
         client_b.send_line('/cd ' + str(project_b))
-        client_b.pump_until(lambda: client_b.frame_after(mark), 'cd to B redraw', 20,
+        client_b.pump_until(lambda: client_b.idle_after(mark, b'Launcher directory:'), 'cd to B completed', 20,
                             guard=case.model.check)
         client_b.send_line(PAR_B_PROMPT)
         case.wait_prompt(PAR_B_PROMPT)
@@ -1527,7 +1589,7 @@ def case_controller(app, base):
                          guard=case.model.check)
         mark = first.mark()
         first.send_line('/cd ' + str(project))
-        first.pump_until(lambda: first.frame_after(mark), 'cd redraw', 20, guard=case.model.check)
+        first.pump_until(lambda: first.idle_after(mark, b'Launcher directory:'), 'cd completed', 20, guard=case.model.check)
         busy = first.mark()
         first.send_line(CONTROLLER_PROMPT)
         case.wait_prompt(CONTROLLER_PROMPT)
@@ -1638,7 +1700,7 @@ def case_ownership(app, base):
                                  guard=case.model.check)
         mark = daemon_client.mark()
         daemon_client.send_line('/cd ' + str(project_b))
-        daemon_client.pump_until(lambda: daemon_client.frame_after(mark), 'daemon cd redraw', 20,
+        daemon_client.pump_until(lambda: daemon_client.idle_after(mark, b'Launcher directory:'), 'daemon cd completed', 20,
                                  guard=case.model.check)
         daemon_client.send_line(DB_PROMPT)
         daemon_client.pump_until(lambda: daemon_client.idle_after(0, DB_ANSWER.encode()),
@@ -1704,7 +1766,7 @@ def case_offline_approval(app, base):
                           guard=case.model.check)
         mark = client.mark()
         client.send_line('/cd ' + str(project))
-        client.pump_until(lambda: client.frame_after(mark), 'approval cd redraw', 20,
+        client.pump_until(lambda: client.idle_after(mark, b'Launcher directory:'), 'approval cd completed', 20,
                           guard=case.model.check)
         client.send_line(APPROVAL_PROMPT)
         client.pump_until(lambda: client.frame_after(0, b'Approval #'), 'approval popup', 40,
@@ -1774,7 +1836,7 @@ def case_daemon_reclaim(app, base):
                           guard=case.model.check)
         mark = client.mark()
         client.send_line('/cd ' + str(project))
-        client.pump_until(lambda: client.frame_after(mark), 'reclaim cd redraw', 20,
+        client.pump_until(lambda: client.idle_after(mark, b'Launcher directory:'), 'reclaim cd completed', 20,
                           guard=case.model.check)
         client.send_line(SERVICE_PROMPT)
         client.pump_until(lambda: client.idle_after(0, SERVICE_ANSWER.encode()),
@@ -1813,10 +1875,112 @@ def no_pid_resignal(pid):
 
 # ---------------------------------------------------------------------------
 
+def case_streaming(app, base, daemon=False):
+    """A fast SSE must stay incremental while its terminal event is withheld."""
+    import re
+    case = Case(app, base, 'stream-daemon' if daemon else 'stream-foreground')
+    release = threading.Event()
+    case.state['stream_release'] = release
+    sent = []
+    count = 1600
+
+    class StreamFixture(ModelFixture):
+        def emit(self, handler, value):
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'text/event-stream')
+            handler.send_header('Connection', 'close')
+            handler.close_connection = True
+            handler.end_headers()
+            for index in range(count):
+                frame = {'choices': [{'index': 0, 'delta': {'content': 'K%04d ' % index},
+                                       'finish_reason': None}]}
+                # One monotonic clock covers send-start and PTY observation.
+                # Record before flush so an immediately visible byte cannot
+                # race ahead of its timestamp in the fixture thread.
+                sent.append(time.monotonic())
+                handler.wfile.write(b'data: ' + json.dumps(frame).encode() + b'\n\n')
+                handler.wfile.flush()
+                if release.wait(0.002):
+                    return
+            assert release.wait(20), 'frontend did not display the stream before completion'
+            frame = {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}],
+                     'usage': {'prompt_tokens': 120, 'completion_tokens': count,
+                               'total_tokens': 120 + count}}
+            handler.wfile.write(b'data: ' + json.dumps(frame).encode() + b'\n\ndata: [DONE]\n\n')
+            handler.wfile.flush()
+
+    try:
+        case.model = StreamFixture(lambda body: text_answer('unused'))
+        write_config(case.workspace.home, case.model.start())
+        project = case.workspace.project_a
+        if daemon:
+            case.start_daemon()
+        client = case.client(['--connect'] if daemon else [], project, 'stream-view')
+        client.pump_until(lambda: client.idle_after(0), 'stream initial idle', 25,
+                          guard=case.model.check)
+        if daemon:
+            mark = client.mark()
+            client.send_line('/cd ' + str(project))
+            client.pump_until(lambda: client.idle_after(mark, b'Launcher directory:'), 'stream project completed', 20,
+                              guard=case.model.check)
+        mark = client.mark()
+        client.send_line('Stream the owned sequence without tool calls.')
+        deadline = time.monotonic() + 15
+        latest = -1
+        maximum_lag = 0
+        updates = 0
+        visible_latency_ms = []
+        while time.monotonic() < deadline:
+            client.pump(0.002)
+            case.model.check()
+            visible = [int(value) for value in re.findall(r'K(\d{4})', client.screen_text())]
+            current = max(visible, default=-1)
+            if current > latest:
+                observed = time.monotonic()
+                # Every newly covered sequence position gets the observation
+                # time, not just the freshest chunk (which hides repaint waits).
+                visible_latency_ms.extend((observed - sent[index]) * 1000
+                                          for index in range(latest + 1, current + 1))
+                updates += 1
+                latest = current
+            # Enough room for scheduling jitter and a complete terminal frame,
+            # but not for the 1024-event eviction/history-replay catch-up path.
+            lag = len(sent) - 1 - latest
+            maximum_lag = max(maximum_lag, lag)
+            assert lag <= 256, 'stream display fell behind by %d events' % lag
+            if latest == count - 1:
+                break
+        assert latest == count - 1, 'stream tail not visible while final event is gated'
+        assert updates >= 8, 'stream collapsed into a final bulk repaint'
+        ordered_latency = sorted(visible_latency_ms)
+        latency = {'p50_ms': round(ordered_latency[len(ordered_latency) // 2], 3),
+                   'p95_ms': round(ordered_latency[(len(ordered_latency) * 95 - 1) // 100], 3),
+                   'max_ms': round(max(ordered_latency), 3),
+                   'samples': len(ordered_latency),
+                   'scope': 'SSE send-start to owned PTY observed sequence coverage'}
+        print('STREAM_LATENCY ' + json.dumps(latency), flush=True)
+        assert latency['p95_ms'] <= 30, 'stream p95 visibility latency exceeded 30ms: %s' % latency
+        assert not release.is_set(), 'completion gate opened before incremental visibility'
+        release.set()
+        client.pump_until(lambda: client.idle_after(mark, b'K1599'), 'stream final idle', 20,
+                          guard=case.model.check)
+        assert case.model.count() == 1, 'stream recovery repeated inference'
+        client.send(b'\x04')
+        assert client.wait_exit('stream frontend exit', 20) == 0
+        return {'case': 'stream-daemon' if daemon else 'stream-foreground',
+                'requests': 1, 'chunks': len(sent), 'visible_updates': updates,
+                'max_pending_chunks': maximum_lag, 'tail_before_finish': True,
+                'visibility_latency': latency}
+    finally:
+        release.set()
+        case.close()
+
+
 def main():
     if len(sys.argv) != 2 or sys.platform != 'linux':
         raise SystemExit('usage: python3 tests/product/daemon_mock.py /absolute/path/thin')
     app = str(Path(sys.argv[1]).resolve(strict=True))
+    assert_screen_idle_contract()
     results = []
     with tempfile.TemporaryDirectory(prefix='thin-daemon-owned-') as base:
         root = Path(base)
@@ -1829,6 +1993,8 @@ def main():
             ('ownership boundaries and resume', case_ownership),
             ('offline dangerous approval', case_offline_approval),
             ('daemon SIGTERM reclaim', case_daemon_reclaim),
+            ('foreground incremental stream', case_streaming),
+            ('daemon incremental stream', lambda app, root: case_streaming(app, root, daemon=True)),
         )
         for label, run_case in cases:
             evidence = run_case(app, root)

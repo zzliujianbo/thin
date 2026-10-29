@@ -26,6 +26,7 @@
 #include "md4c.h"
 
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -166,6 +167,18 @@ struct MD_CTX_tag {
     SZ size;
     MD_PARSER parser;
     void* userdata;
+    MD_INLINE_SPAN_CALLBACK inline_span_callback;
+    MD_FENCE_SOURCE_CALLBACK fence_source_callback;
+    MD_CELL_SOURCE_CALLBACK cell_source_callback;
+    int partial_input;
+    int partial_final_block;
+    MD_CELL_CONTENT_CALLBACK cell_content_callback;
+    const MD_TABLE_RESUME* table_resume;
+    const MD_REFERENCE_STORE* references;
+    MD_REFERENCE_DEFINITION_CALLBACK definition_callback;
+    MD_TABLE_CANDIDATE_CALLBACK candidate_callback;
+    MD_TABLE_SOURCE_CALLBACK table_source_callback;
+    int source_error;
 
     /* When this is true, it allows some optimizations. */
     int doc_ends_with_newline;
@@ -250,6 +263,14 @@ struct MD_CTX_tag {
     MD_CONTAINER* containers;
     int n_containers;
     int alloc_containers;
+
+    /* Bounded, append-only snapshots of the native container prefix of each
+     * document table, captured while the block analyzer still knows the open
+     * containers. MD_BLOCK_TABLE stores the slice in closing_begin/closing_end
+     * and MD_BLOCK_TABLE_SOURCE borrows it during block processing. */
+    MD_TABLE_CONTAINER* table_containers;
+    int n_table_containers;
+    int alloc_table_containers;
 
     /* Minimal indentation to call the block "indented code block". */
     unsigned code_indent_offset;
@@ -1702,6 +1723,129 @@ md_link_label_cmp(const CHAR* a_label, SZ a_size, const CHAR* b_label, SZ b_size
     return 0;
 }
 
+/* Committed entries own raw parser input, not pointers into retired windows.
+ * The bucket array is allocated once; publication only links prepared nodes. */
+typedef struct MD_STORED_REFERENCE {
+    struct MD_STORED_REFERENCE *next, *bucket_next;
+    unsigned hash;
+    SZ label_size, dest_size, title_size;
+    CHAR *label, *dest, *title;
+    size_t bytes;
+} MD_STORED_REFERENCE;
+struct MD_REFERENCE_STORE {
+    unsigned max_entries, count, bucket_count;
+    size_t max_bytes, bytes;
+    MD_STORED_REFERENCE **buckets, *entries;
+};
+struct MD_REFERENCE_UPDATE {
+    MD_REFERENCE_STORE *owner;
+    MD_STORED_REFERENCE *entries;
+    unsigned count;
+    size_t bytes;
+};
+
+static const MD_STORED_REFERENCE*
+md_stored_lookup(const MD_REFERENCE_STORE *s, const CHAR *label, SZ len, unsigned hash)
+{
+    const MD_STORED_REFERENCE *p;
+    if(s == NULL) return NULL;
+    for(p = s->buckets[hash % s->bucket_count]; p; p = p->bucket_next)
+        if(p->hash == hash && md_link_label_cmp(p->label, p->label_size, label, len) == 0)
+            return p;
+    return NULL;
+}
+
+MD_REFERENCE_STORE*
+md_reference_store_create(unsigned max_entries, size_t max_bytes)
+{
+    MD_REFERENCE_STORE *s;
+    unsigned buckets;
+    if(max_entries == 0 || max_bytes == 0 || max_entries > (UINT_MAX - 1) / 2)
+        return NULL;
+    buckets = max_entries * 2 + 1;
+    if((size_t)buckets > SIZE_MAX / sizeof(*s->buckets)) return NULL;
+    s = (MD_REFERENCE_STORE*) malloc(sizeof(*s));
+    if(!s) return NULL;
+    memset(s, 0, sizeof(*s));
+    s->buckets = (MD_STORED_REFERENCE**) malloc((size_t)buckets * sizeof(*s->buckets));
+    if(!s->buckets) { free(s); return NULL; }
+    memset(s->buckets, 0, (size_t)buckets * sizeof(*s->buckets));
+    s->bucket_count = buckets; s->max_entries = max_entries; s->max_bytes = max_bytes;
+    return s;
+}
+
+static void md_stored_free_list(MD_STORED_REFERENCE *p)
+{
+    while(p) { MD_STORED_REFERENCE *next = p->next; free(p); p = next; }
+}
+void md_reference_store_destroy(MD_REFERENCE_STORE *s)
+{
+    if(s) { md_stored_free_list(s->entries); free(s->buckets); free(s); }
+}
+void md_reference_store_abort(MD_REFERENCE_UPDATE *u)
+{
+    if(u) { md_stored_free_list(u->entries); free(u); }
+}
+int md_reference_store_prepare(MD_REFERENCE_STORE *s, const MD_REFERENCE_DEFINITION *defs,
+                               unsigned count, MD_REFERENCE_UPDATE **out)
+{
+    MD_REFERENCE_UPDATE *u;
+    unsigned i;
+    int result = -2;
+    if(out == NULL) return -2;
+    *out = NULL;
+    if(!s || (count && !defs)) return -2;
+    u = (MD_REFERENCE_UPDATE*) malloc(sizeof(*u));
+    if(!u) return -1;
+    memset(u, 0, sizeof(*u));
+    u->owner = s;
+    for(i = 0; i < count; i++) {
+        const MD_REFERENCE_DEFINITION *d = &defs[i];
+        const MD_ATTRIBUTE *a = &d->label, *b = &d->destination, *c = &d->title;
+        MD_STORED_REFERENCE *p;
+        size_t chars, bytes;
+        unsigned hash;
+        if(d->begin > d->end || !a->size || !a->text || (b->size && !b->text) || (c->size && !c->text)) goto fail;
+        hash = md_link_label_hash(a->text, a->size);
+        if(md_stored_lookup(s, a->text, a->size, hash)) continue;
+        for(p = u->entries; p; p = p->next)
+            if(p->hash == hash && md_link_label_cmp(p->label, p->label_size, a->text, a->size) == 0) break;
+        if(p) continue;
+        chars = (size_t)a->size + (size_t)b->size + (size_t)c->size;
+        if(chars < a->size || chars < b->size || chars < c->size || chars > (SIZE_MAX - sizeof(*p)) / sizeof(CHAR)) goto fail;
+        bytes = chars * sizeof(CHAR);
+        if(u->count >= s->max_entries - s->count || bytes > s->max_bytes - s->bytes || u->bytes > s->max_bytes - s->bytes - bytes) goto fail;
+        p = (MD_STORED_REFERENCE*) malloc(sizeof(*p) + bytes);
+        if(!p) { result = -1; goto fail; }
+        memset(p, 0, sizeof(*p));
+        p->hash = hash; p->label_size = a->size; p->dest_size = b->size; p->title_size = c->size; p->bytes = bytes;
+        p->label = (CHAR*)(p + 1); p->dest = p->label + a->size; p->title = p->dest + b->size;
+        memcpy(p->label, a->text, (size_t)a->size * sizeof(CHAR));
+        if(b->size) memcpy(p->dest, b->text, (size_t)b->size * sizeof(CHAR));
+        if(c->size) memcpy(p->title, c->text, (size_t)c->size * sizeof(CHAR));
+        p->next = u->entries; u->entries = p; u->count++; u->bytes += bytes;
+    }
+    *out = u;
+    return 0;
+fail:
+    md_reference_store_abort(u);
+    return result;
+}
+void md_reference_store_commit(MD_REFERENCE_STORE *s, MD_REFERENCE_UPDATE *u)
+{
+    MD_STORED_REFERENCE *p;
+    if(!u) return;
+    MD_ASSERT(s == u->owner);
+    while((p = u->entries) != NULL) {
+        unsigned bucket = p->hash % s->bucket_count;
+        u->entries = p->next;
+        p->bucket_next = s->buckets[bucket]; s->buckets[bucket] = p;
+        p->next = s->entries; s->entries = p;
+    }
+    s->count += u->count; s->bytes += u->bytes;
+    free(u);
+}
+
 typedef struct MD_REF_DEF_LIST_tag MD_REF_DEF_LIST;
 struct MD_REF_DEF_LIST_tag {
     int n_ref_defs;
@@ -1936,6 +2080,8 @@ struct MD_LINK_ATTR_tag {
     CHAR* title;
     SZ title_size;
     int title_needs_free;
+    const CHAR* stored_dest;
+    SZ stored_dest_size;
 };
 
 
@@ -2099,7 +2245,7 @@ md_is_link_destination(MD_CTX* ctx, OFF beg, OFF max_end, OFF* p_end,
 static int
 md_is_link_title(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines, OFF beg,
                  OFF* p_end, MD_SIZE* p_beg_line_index, MD_SIZE* p_end_line_index,
-                 OFF* p_contents_beg, OFF* p_contents_end)
+                 OFF* p_contents_beg, OFF* p_contents_end, int* incomplete)
 {
     OFF off = beg;
     CHAR closer_char;
@@ -2110,13 +2256,20 @@ md_is_link_title(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines, OFF beg,
         off++;
     if(off >= lines[line_index].end) {
         line_index++;
-        if(line_index >= n_lines)
+        if(line_index >= n_lines) {
+            if(incomplete) *incomplete = TRUE;
             return FALSE;
+        }
         off = lines[line_index].beg;
     }
     if(off == beg)
         return FALSE;
 
+    if(incomplete && line_index + 1 == n_lines && lines[line_index].end == ctx->size) {
+        OFF k = off;
+        while(k < lines[line_index].end && ISWHITESPACE(k)) k++;
+        if(k == lines[line_index].end) *incomplete = TRUE;
+    }
     *p_beg_line_index = line_index;
 
     /* First char determines how to detect end of it. */
@@ -2153,6 +2306,7 @@ md_is_link_title(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines, OFF beg,
         line_index++;
     }
 
+    if(incomplete) *incomplete = TRUE;
     return FALSE;
 }
 
@@ -2173,10 +2327,11 @@ md_is_link_reference_definition(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lin
     int label_is_multiline = FALSE;
     OFF dest_contents_beg;
     OFF dest_contents_end;
-    OFF title_contents_beg;
+    OFF title_contents_beg = (OFF)-1;
     OFF title_contents_end;
     MD_SIZE title_contents_line_index;
     int title_is_multiline = FALSE;
+    int title_incomplete = FALSE, title_matched, title_opened;
     OFF off;
     MD_SIZE line_index = 0;
     MD_SIZE tmp_line_index;
@@ -2212,10 +2367,11 @@ md_is_link_reference_definition(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lin
 
     /* (Optional) title. Note we interpret it as an title only if nothing
      * more follows on its last line. */
-    if(md_is_link_title(ctx, lines + line_index, n_lines - line_index, off,
+    title_matched = md_is_link_title(ctx, lines + line_index, n_lines - line_index, off,
                 &off, &title_contents_line_index, &tmp_line_index,
-                &title_contents_beg, &title_contents_end)
-        &&  off >= lines[line_index + tmp_line_index].end)
+                &title_contents_beg, &title_contents_end, &title_incomplete);
+    title_opened = (title_contents_beg != (OFF)-1);
+    if(title_matched && off >= lines[line_index + tmp_line_index].end)
     {
         title_is_multiline = (tmp_line_index != title_contents_line_index);
         title_contents_line_index += line_index;
@@ -2227,6 +2383,24 @@ md_is_link_reference_definition(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lin
         title_contents_end = off;
         title_contents_line_index = 0;
     }
+
+    /* Only the actual final paragraph of partial input can grow. The native
+     * title recognizer distinguishes exhaustion from a grammar rejection. */
+    if(ctx->partial_final_block && ctx->candidate_callback &&
+       (title_incomplete || (title_matched && lines[line_index].end == ctx->size))) {
+        OFF begin = lines[0].beg, end = lines[line_index].end;
+        int cb;
+        while(begin > 0 && CH(begin-1) != _T('\n') && CH(begin-1) != _T('\r')) begin--;
+        while(end < ctx->size && !ISNEWLINE(end)) end++;
+        if(end < ctx->size && CH(end) == _T('\r')) end++;
+        if(end < ctx->size && CH(end) == _T('\n')) end++;
+        cb = ctx->candidate_callback(begin, end, MD_CANDIDATE_REFERENCE, ctx->userdata);
+        if(cb != 0) { ctx->source_error = cb; return -1; }
+    }
+
+    /* An opened, unfinished title remains provisional in partial input. */
+    if(ctx->partial_final_block && title_incomplete && title_opened)
+        return FALSE;
 
     /* Nothing more can follow on the last line. */
     if(off < lines[line_index].end)
@@ -2279,8 +2453,31 @@ md_is_link_reference_definition(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lin
     def->dest_beg = dest_contents_beg;
     def->dest_end = dest_contents_end;
 
-    /* Success. */
+    /* Raw attributes retain escapes for later native reconstruction. */
     ctx->n_ref_defs++;
+    if(ctx->definition_callback != NULL) {
+        MD_REFERENCE_DEFINITION event;
+        MD_ATTRIBUTE_BUILD builds[3] = {{0}, {0}, {0}};
+        OFF definition_end = lines[line_index].end;
+        int cb = 0;
+        memset(&event, 0, sizeof(event));
+        event.begin = lines[0].beg;
+        while(definition_end < ctx->size && !ISNEWLINE(definition_end)) definition_end++;
+        if(definition_end < ctx->size && CH(definition_end) == _T('\r')) definition_end++;
+        if(definition_end < ctx->size && CH(definition_end) == _T('\n')) definition_end++;
+        event.end = definition_end;
+        if(md_build_attribute(ctx, def->label, def->label_size, MD_BUILD_ATTR_NO_ESCAPES, &event.label, &builds[0]) != 0 ||
+           md_build_attribute(ctx, STR(def->dest_beg), def->dest_end - def->dest_beg, MD_BUILD_ATTR_NO_ESCAPES, &event.destination, &builds[1]) != 0 ||
+           md_build_attribute(ctx, def->title, def->title_size, MD_BUILD_ATTR_NO_ESCAPES, &event.title, &builds[2]) != 0) {
+            cb = -1;
+        } else {
+            cb = ctx->definition_callback(&event, ctx->userdata);
+        }
+        md_free_attribute(ctx, &builds[0]);
+        md_free_attribute(ctx, &builds[1]);
+        md_free_attribute(ctx, &builds[2]);
+        if(cb != 0) { ctx->source_error = cb; return -1; }
+    }
     return line_index + 1;
 
 abort:
@@ -2297,6 +2494,7 @@ md_is_link_reference(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines,
                      OFF beg, OFF end, MD_LINK_ATTR* attr)
 {
     const MD_REF_DEF* def;
+    const MD_STORED_REFERENCE* stored;
     const MD_LINE* beg_line;
     int is_multiline;
     CHAR* label;
@@ -2321,8 +2519,15 @@ md_is_link_reference(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines,
         label_size = end - beg;
     }
 
-    def = md_lookup_ref_def(ctx, label, label_size);
-    if(def != NULL) {
+    stored = md_stored_lookup(ctx->references, label, label_size, md_link_label_hash(label, label_size));
+    def = stored ? NULL : md_lookup_ref_def(ctx, label, label_size);
+    if(stored != NULL) {
+        attr->stored_dest = stored->dest;
+        attr->stored_dest_size = stored->dest_size;
+        attr->title = stored->title;
+        attr->title_size = stored->title_size;
+        attr->title_needs_free = FALSE;
+    } else if(def != NULL) {
         attr->dest_beg = def->dest_beg;
         attr->dest_end = def->dest_end;
         attr->title = def->title;
@@ -2333,7 +2538,7 @@ md_is_link_reference(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines,
     if(is_multiline)
         free(label);
 
-    ret = (def != NULL);
+    ret = (def != NULL || stored != NULL);
 
 abort:
     return ret;
@@ -2388,7 +2593,7 @@ md_is_inline_link_spec(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines,
     /* (Optional) title. */
     if(md_is_link_title(ctx, lines + line_index, n_lines - line_index, off,
                 &off, &title_contents_line_index, &tmp_line_index,
-                &title_contents_beg, &title_contents_end))
+                &title_contents_beg, &title_contents_end, NULL))
     {
         title_is_multiline = (tmp_line_index != title_contents_line_index);
         title_contents_line_index += line_index;
@@ -3441,7 +3646,7 @@ md_resolve_links(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
         int next_index = opener->prev;
         MD_MARK* next_opener;
         MD_MARK* next_closer;
-        MD_LINK_ATTR attr;
+        MD_LINK_ATTR attr = { 0 };
         int is_link = FALSE;
 
         if(next_index >= 0) {
@@ -3636,8 +3841,15 @@ md_resolve_links(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
             /* If it is a link, we store the destination and title in the two
              * dummy marks after the opener. */
             MD_ASSERT(ctx->marks[opener_index+1].ch == 'D');
-            ctx->marks[opener_index+1].beg = attr.dest_beg;
-            ctx->marks[opener_index+1].end = attr.dest_end;
+            if(attr.stored_dest != NULL) {
+                md_mark_store_ptr(ctx, opener_index+1, (void*)attr.stored_dest);
+                ctx->marks[opener_index+1].prev = (int)attr.stored_dest_size;
+                ctx->marks[opener_index+1].next = 1;
+            } else {
+                ctx->marks[opener_index+1].beg = attr.dest_beg;
+                ctx->marks[opener_index+1].end = attr.dest_end;
+                ctx->marks[opener_index+1].next = 0;
+            }
 
             MD_ASSERT(ctx->marks[opener_index+2].ch == 'D');
             md_mark_store_ptr(ctx, opener_index+2, attr.title);
@@ -4229,6 +4441,18 @@ abort:
 }
 
 
+/* Emit only fully resolved native pairs, before the corresponding enter. */
+static int
+md_inline_span_event(MD_CTX* ctx, MD_SPANTYPE type, OFF ob, OFF oe, OFF cb, OFF ce)
+{
+    MD_INLINE_SPAN event;
+    if(ctx->inline_span_callback == NULL) return 0;
+    event.type = type;
+    event.opener_begin = ob; event.opener_end = oe;
+    event.closer_begin = cb; event.closer_end = ce;
+    return ctx->inline_span_callback(&event, ctx->userdata);
+}
+
 /* Render the output, accordingly to the analyzed ctx->marks. */
 static int
 md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
@@ -4277,6 +4501,8 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
 
                 case '`':       /* Code span. */
                     if(mark->flags & MD_MARK_OPENER) {
+                        const MD_MARK* closer = &ctx->marks[mark->next];
+                        MD_CHECK_PROCESS(md_inline_span_event(ctx, MD_SPAN_CODE, mark->beg, mark->end, closer->beg, closer->end));
                         MD_ENTER_SPAN(MD_SPAN_CODE, NULL);
                         text_type = MD_TEXT_CODE;
                     } else {
@@ -4288,7 +4514,11 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                 case '_':       /* Underline (or emphasis if we fall through). */
                     if(ctx->parser.flags & MD_FLAG_UNDERLINE) {
                         if(mark->flags & MD_MARK_OPENER) {
+                            const MD_MARK* closer = &ctx->marks[mark->next];
                             while(off < mark->end) {
+                                OFF distance = off - mark->beg;
+                                MD_CHECK_PROCESS(md_inline_span_event(ctx, MD_SPAN_U, off, off+1,
+                                    closer->end-distance-1, closer->end-distance));
                                 MD_ENTER_SPAN(MD_SPAN_U, NULL);
                                 off++;
                             }
@@ -4304,11 +4534,17 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
 
                 case '*':       /* Emphasis, strong emphasis. */
                     if(mark->flags & MD_MARK_OPENER) {
-                        if((mark->end - off) % 2) {
+                        const MD_MARK* closer = &ctx->marks[mark->next];
+                        OFF odd = (mark->end - off) % 2;
+                        if(odd) {
+                            MD_CHECK_PROCESS(md_inline_span_event(ctx, MD_SPAN_EM, off, off+1, closer->end-1, closer->end));
                             MD_ENTER_SPAN(MD_SPAN_EM, NULL);
                             off++;
                         }
                         while(off + 1 < mark->end) {
+                            OFF distance = off - mark->beg - odd;
+                            OFF close_end = closer->end - odd - distance;
+                            MD_CHECK_PROCESS(md_inline_span_event(ctx, MD_SPAN_STRONG, off, off+2, close_end-2, close_end));
                             MD_ENTER_SPAN(MD_SPAN_STRONG, NULL);
                             off += 2;
                         }
@@ -4325,14 +4561,20 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                     break;
 
                 case '~':
-                    if(mark->flags & MD_MARK_OPENER)
+                    if(mark->flags & MD_MARK_OPENER) {
+                        const MD_MARK* closer = &ctx->marks[mark->next];
+                        MD_CHECK_PROCESS(md_inline_span_event(ctx, MD_SPAN_DEL, mark->beg, mark->end, closer->beg, closer->end));
                         MD_ENTER_SPAN(MD_SPAN_DEL, NULL);
-                    else
+                    } else
                         MD_LEAVE_SPAN(MD_SPAN_DEL, NULL);
                     break;
 
                 case '$':
                     if(mark->flags & MD_MARK_OPENER) {
+                        const MD_MARK* closer = &ctx->marks[mark->next];
+                        MD_CHECK_PROCESS(md_inline_span_event(ctx,
+                            (mark->end - off) % 2 ? MD_SPAN_LATEXMATH : MD_SPAN_LATEXMATH_DISPLAY,
+                            mark->beg, mark->end, closer->beg, closer->end));
                         MD_ENTER_SPAN((mark->end - off) % 2 ? MD_SPAN_LATEXMATH : MD_SPAN_LATEXMATH_DISPLAY, NULL);
                         text_type = MD_TEXT_LATEXMATH;
                     } else {
@@ -4362,6 +4604,8 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                         else
                             target_sz = closer->beg - opener->end;
 
+                        if(mark->ch != ']') MD_CHECK_PROCESS(md_inline_span_event(ctx, MD_SPAN_WIKILINK,
+                            opener->beg, opener->end, closer->beg, closer->end));
                         MD_CHECK_PROCESS(md_enter_leave_span_wikilink(ctx, (mark->ch != ']'),
                                  has_label ? STR(opener->beg+2) : STR(opener->end),
                                  target_sz));
@@ -4374,9 +4618,13 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                     title_mark = opener+2;
                     MD_ASSERT(title_mark->ch == 'D');
 
+                    if(mark->ch != ']')
+                        MD_CHECK_PROCESS(md_inline_span_event(ctx, (opener->ch == '!' ? MD_SPAN_IMG : MD_SPAN_A),
+                                         opener->beg, opener->end, closer->beg, closer->end));
                     MD_CHECK_PROCESS(md_enter_leave_span_a(ctx, (mark->ch != ']'),
                                 (opener->ch == '!' ? MD_SPAN_IMG : MD_SPAN_A),
-                                STR(dest_mark->beg), dest_mark->end - dest_mark->beg, FALSE,
+                                dest_mark->next ? (const CHAR*)md_mark_get_ptr(ctx, (int)(dest_mark - ctx->marks)) : STR(dest_mark->beg),
+                                dest_mark->next ? (SZ)dest_mark->prev : dest_mark->end - dest_mark->beg, FALSE,
                                 md_mark_get_ptr(ctx, (int)(title_mark - ctx->marks)),
 								title_mark->prev));
 
@@ -4417,8 +4665,11 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                      *
                      * With this flag, we make sure that we output the closer
                      * only if we processed the opener. */
-                    if(mark->flags & MD_MARK_OPENER)
+                    if(mark->flags & MD_MARK_OPENER) {
                         closer->flags |= MD_MARK_VALIDPERMISSIVEAUTOLINK;
+                        MD_CHECK_PROCESS(md_inline_span_event(ctx, MD_SPAN_A,
+                            opener->beg, opener->end, closer->beg, closer->end));
+                    }
 
                     if(opener->ch == '@' || opener->ch == '.' ||
                         (opener->ch == '<' && (opener->flags & MD_MARK_AUTOLINK_MISSING_MAILTO)))
@@ -4552,23 +4803,44 @@ md_analyze_table_alignment(MD_CTX* ctx, OFF beg, OFF end, MD_ALIGN* align, int n
 static int md_process_normal_block_contents(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines);
 
 static int
-md_process_table_cell(MD_CTX* ctx, MD_BLOCKTYPE cell_type, MD_ALIGN align, OFF beg, OFF end)
+md_process_table_cell(MD_CTX* ctx, MD_BLOCKTYPE cell_type, MD_ALIGN align, OFF beg, OFF end,
+                      int column, OFF row_begin, OFF row_end, int cell_complete, int row_complete,
+                      int present, OFF raw_end, OFF next_begin)
 {
+    OFF raw_begin = beg;
     MD_LINE line;
     MD_BLOCK_TD_DETAIL det;
     int ret = 0;
 
-    while(beg < end  &&  ISWHITESPACE(beg))
-        beg++;
-    while(end > beg  &&  ISWHITESPACE(end-1))
-        end--;
+    if(ctx->table_resume == NULL || !ctx->table_resume->partial_cell ||
+       (MD_SIZE)column != ctx->table_resume->first_column || ctx->table_resume->trim_leading) {
+        while(beg < end && ISWHITESPACE(beg)) beg++;
+    }
+    while(end > beg && ISWHITESPACE(end-1)) end--;
+    if(ctx->table_resume != NULL && ctx->table_resume->skip != NULL && ctx->table_resume->skip[column] > beg)
+        beg = ctx->table_resume->skip[column] < end ? ctx->table_resume->skip[column] : end;
+    if(ctx->cell_source_callback != NULL) {
+        MD_CELL_SOURCE source;
+        source.column = column; source.begin = beg; source.end = end;
+        source.row_begin = row_begin; source.row_end = row_end;
+        source.alignment = align; source.header = (cell_type == MD_BLOCK_TH);
+        source.cell_complete = cell_complete; source.row_complete = row_complete;
+        source.raw_begin = raw_begin; source.raw_end = raw_end;
+        source.next_begin = next_begin; source.present = present;
+        MD_CHECK_PROCESS(ctx->cell_source_callback(&source, ctx->userdata));
+    }
 
     det.align = align;
     line.beg = beg;
     line.end = end;
 
     MD_ENTER_BLOCK(cell_type, &det);
-    MD_CHECK_PROCESS(md_process_normal_block_contents(ctx, &line, 1));
+    {
+        int handled = FALSE;
+        if(ctx->cell_content_callback != NULL)
+            MD_CHECK_PROCESS(ctx->cell_content_callback(beg, end, &handled, ctx->userdata));
+        if(!handled) MD_CHECK_PROCESS(md_process_normal_block_contents(ctx, &line, 1));
+    }
     MD_LEAVE_BLOCK(cell_type, &det);
 
 abort:
@@ -4582,8 +4854,12 @@ md_process_table_row(MD_CTX* ctx, MD_BLOCKTYPE cell_type, OFF beg, OFF end,
     MD_LINE line;
     OFF* pipe_offs = NULL;
     int i, j, k, n;
+    int row_complete;
+    OFF row_scan = end;
     int ret = 0;
 
+    while(row_scan < ctx->size && !ISNEWLINE(row_scan)) row_scan++;
+    row_complete = row_scan < ctx->size || !ctx->partial_input;
     line.beg = beg;
     line.end = end;
 
@@ -4610,15 +4886,32 @@ md_process_table_row(MD_CTX* ctx, MD_BLOCKTYPE cell_type, OFF beg, OFF end,
 
     /* Process cells. */
     MD_ENTER_BLOCK(MD_BLOCK_TR, NULL);
-    k = 0;
-    for(i = 0; i < j-1  &&  k < col_count; i++) {
-        if(pipe_offs[i] < pipe_offs[i+1]-1)
-            MD_CHECK_PROCESS(md_process_table_cell(ctx, cell_type, align[k++], pipe_offs[i], pipe_offs[i+1]-1));
+    k = ctx->table_resume != NULL ? (int)ctx->table_resume->first_column : 0;
+    for(i = 0; i < j-1 && k < col_count; i++) {
+        /* A leading/trailing pipe is a border; interior empty cells are real
+         * cells and must not collapse later columns to the left. */
+        if((i != 0 || pipe_offs[i] < pipe_offs[i+1]-1 ||
+            (ctx->table_resume != NULL && ctx->table_resume->partial_cell)) &&
+           (i != j-2 || pipe_offs[i] < pipe_offs[i+1]-1 || j == 2)) {
+            int complete = i + 1 < j - 1 || row_complete;
+            int last_actual = i + 1 == j - 1 ||
+                              (i + 1 == j - 2 && pipe_offs[i+1] == end);
+            OFF next = complete && i + 1 < j - 1 ? pipe_offs[i+1] : pipe_offs[i+1]-1;
+            if(complete && row_complete && last_actual) {
+                next = row_scan;
+                if(next < ctx->size && CH(next) == _T('\r')) next++;
+                if(next < ctx->size && CH(next) == _T('\n')) next++;
+            }
+            MD_CHECK_PROCESS(md_process_table_cell(ctx, cell_type, align[k], pipe_offs[i], pipe_offs[i+1]-1, k, beg, end, complete, row_complete, TRUE, i + 1 == j - 1 ? row_scan : pipe_offs[i+1]-1, next));
+            k++;
+        }
     }
     /* Make sure we call enough table cells even if the current table contains
      * too few of them. */
-    while(k < col_count)
-        MD_CHECK_PROCESS(md_process_table_cell(ctx, cell_type, align[k++], 0, 0));
+    while(k < col_count) {
+        MD_CHECK_PROCESS(md_process_table_cell(ctx, cell_type, align[k], 0, 0, k, beg, end, row_complete, row_complete, FALSE, 0, 0));
+        k++;
+    }
     MD_LEAVE_BLOCK(MD_BLOCK_TR, NULL);
 
 abort:
@@ -4696,6 +4989,8 @@ struct MD_BLOCK_tag {
      * MD_BLOCK_OL:     Start item number.
      */
     MD_SIZE n_lines;
+    /* Streaming provenance only; these do not change the public block ABI. */
+    OFF closing_begin, closing_end;
 };
 
 struct MD_CONTAINER_tag {
@@ -4789,7 +5084,8 @@ md_process_code_block_contents(MD_CTX* ctx, int is_fenced, const MD_VERBATIMLINE
 
 static int
 md_setup_fenced_code_detail(MD_CTX* ctx, const MD_BLOCK* block, MD_BLOCK_CODE_DETAIL* det,
-                            MD_ATTRIBUTE_BUILD* info_build, MD_ATTRIBUTE_BUILD* lang_build)
+                            MD_ATTRIBUTE_BUILD* info_build, MD_ATTRIBUTE_BUILD* lang_build,
+                            MD_FENCE_SOURCE* source)
 {
     const MD_VERBATIMLINE* fence_line = (const MD_VERBATIMLINE*)(block + 1);
     OFF beg = fence_line->beg;
@@ -4801,6 +5097,13 @@ md_setup_fenced_code_detail(MD_CTX* ctx, const MD_BLOCK* block, MD_BLOCK_CODE_DE
     /* Skip the fence itself. */
     while(beg < ctx->size  &&  CH(beg) == fence_ch)
         beg++;
+    source->fence_begin = fence_line->beg;
+    source->fence_end = beg;
+    source->header_begin = fence_line->beg;
+    source->header_end = fence_line->end;
+    source->fence_char = fence_ch;
+    source->closing_begin = block->closing_begin;
+    source->closing_end = block->closing_end;
     /* Trim initial spaces. */
     while(beg < ctx->size  &&  CH(beg) == _T(' '))
         beg++;
@@ -4834,6 +5137,7 @@ md_process_leaf_block(MD_CTX* ctx, const MD_BLOCK* block)
     } det;
     MD_ATTRIBUTE_BUILD info_build = { 0 };
     MD_ATTRIBUTE_BUILD lang_build = { 0 };
+    MD_FENCE_SOURCE fence_source;
     int is_in_tight_list;
     int clean_fence_code_detail = FALSE;
     int ret = 0;
@@ -4855,7 +5159,9 @@ md_process_leaf_block(MD_CTX* ctx, const MD_BLOCK* block)
             if(block->data != 0) {
                 memset(&det.code, 0, sizeof(MD_BLOCK_CODE_DETAIL));
                 clean_fence_code_detail = TRUE;
-                MD_CHECK(md_setup_fenced_code_detail(ctx, block, &det.code, &info_build, &lang_build));
+                MD_CHECK(md_setup_fenced_code_detail(ctx, block, &det.code, &info_build, &lang_build, &fence_source));
+                if(ctx->fence_source_callback != NULL)
+                    MD_CHECK_PROCESS(ctx->fence_source_callback(&fence_source, ctx->userdata));
             }
             break;
 
@@ -4863,6 +5169,32 @@ md_process_leaf_block(MD_CTX* ctx, const MD_BLOCK* block)
             det.table.col_count = block->data;
             det.table.head_row_count = 1;
             det.table.body_row_count = block->n_lines - 2;
+            if(ctx->table_source_callback != NULL) {
+                MD_TABLE_SOURCE source;
+                const MD_LINE* lines = (const MD_LINE*) (block + 1);
+                OFF header_begin = lines[0].beg;
+                OFF body_begin = lines[1].end;
+                size_t first = (size_t) block->closing_begin;
+                size_t count = (size_t) block->closing_end;
+
+                while(header_begin > 0 && ctx->text[header_begin - 1] != _T('\n'))
+                    header_begin--;
+                while(body_begin < ctx->size && ctx->text[body_begin] != _T('\n'))
+                    body_begin++;
+                source.header_begin = header_begin;
+                source.header_complete = (body_begin < ctx->size || !ctx->partial_input);
+                if(body_begin < ctx->size)
+                    body_begin++;
+                source.body_begin = body_begin;
+                source.containers = NULL;
+                source.n_containers = 0;
+                if(count > 0  &&  first <= (size_t) ctx->n_table_containers  &&
+                   count <= (size_t) ctx->n_table_containers - first) {
+                    source.containers = ctx->table_containers + first;
+                    source.n_containers = (unsigned) count;
+                }
+                MD_CHECK_PROCESS(ctx->table_source_callback(&source, ctx->userdata));
+            }
             break;
 
         default:
@@ -5073,6 +5405,7 @@ md_start_new_block(MD_CTX* ctx, const MD_LINE_ANALYSIS* line)
     }
 
     block->flags = 0;
+    block->closing_begin = block->closing_end = 0;
     block->data = line->data;
     block->n_lines = 0;
 
@@ -5304,6 +5637,29 @@ md_is_setext_underline(MD_CTX* ctx, OFF beg, OFF* p_end, unsigned* p_level)
     *p_level = (CH(beg) == _T('=') ? 1 : 2);
     *p_end = off;
     return TRUE;
+}
+
+/* Count real table boundaries using the same inline recognizer as row
+ * rendering: escaped pipes and pipes in code spans are not delimiters. */
+static int
+md_table_header_columns(MD_CTX *ctx, const MD_LINE *line, unsigned *count)
+{
+    int ret, i;
+    unsigned n = 1;
+    ret = md_analyze_inlines(ctx, line, 1, TRUE);
+    if(ret == 0) {
+        n += (unsigned)ctx->n_table_cell_boundaries;
+        i = ctx->table_cell_boundaries_head;
+        if(i >= 0 && ctx->marks[i].beg == line->beg) n--;
+        i = ctx->table_cell_boundaries_tail;
+        if(i >= 0 && ctx->marks[i].end == line->end) n--;
+        *count = n;
+    }
+    for(i = ctx->ptr_stack.top; i >= 0; i = ctx->marks[i].next)
+        free(md_mark_get_ptr(ctx, i));
+    ctx->ptr_stack.top = -1;
+    ctx->table_cell_boundaries_head = ctx->table_cell_boundaries_tail = -1;
+    return ret;
 }
 
 static int
@@ -5839,6 +6195,56 @@ md_line_indentation(MD_CTX* ctx, unsigned total_indent, OFF beg, OFF* p_end)
 
 static const MD_LINE_ANALYSIS md_dummy_blank_line = { MD_LINE_BLANK, 0, 0, 0, 0, 0 };
 
+/* Consume the native container prefix at the start of one physical line.
+ * This is the single parent-matching grammar used by both ordinary line
+ * analysis and continuation-fragment row bounds; it reads only 'ch' and
+ * 'contents_indent' from each container. On return *p_off is the first content
+ * byte, *p_indent the residual indentation and *p_total_indent the accumulated
+ * column. The number of matched parents is returned. */
+static int
+md_match_containers(MD_CTX* ctx, const MD_CONTAINER* containers, int n_containers,
+                    OFF beg, unsigned* p_indent, unsigned* p_total_indent, OFF* p_off)
+{
+    unsigned total_indent = 0;
+    unsigned indent;
+    OFF off = beg;
+    int n_parents = 0;
+
+    indent = md_line_indentation(ctx, total_indent, off, &off);
+    total_indent += indent;
+
+    while(n_parents < n_containers) {
+        const MD_CONTAINER* c = &containers[n_parents];
+
+        if(c->ch == _T('>')  &&  indent < ctx->code_indent_offset  &&
+            off < ctx->size  &&  CH(off) == _T('>'))
+        {
+            /* Block quote mark. */
+            off++;
+            total_indent++;
+            indent = md_line_indentation(ctx, total_indent, off, &off);
+            total_indent += indent;
+
+            /* The optional 1st space after '>' is part of the block quote mark. */
+            if(indent > 0)
+                indent--;
+
+        } else if(c->ch != _T('>')  &&  indent >= c->contents_indent) {
+            /* List. */
+            indent -= c->contents_indent;
+        } else {
+            break;
+        }
+
+        n_parents++;
+    }
+
+    *p_indent = indent;
+    *p_total_indent = total_indent;
+    *p_off = off;
+    return n_parents;
+}
+
 /* Analyze type of the line and find some its properties. This serves as a
  * main input for determining type and boundaries of a block. */
 static int
@@ -5855,40 +6261,15 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
     OFF hr_killer = 0;
     int ret = 0;
 
-    line->indent = md_line_indentation(ctx, total_indent, off, &off);
-    total_indent += line->indent;
-    line->beg = off;
+    line->indent = 0;
+    total_indent = 0;
     line->enforce_new_block = FALSE;
 
     /* Given the indentation and block quote marks '>', determine how many of
      * the current containers are our parents. */
-    while(n_parents < ctx->n_containers) {
-        MD_CONTAINER* c = &ctx->containers[n_parents];
-
-        if(c->ch == _T('>')  &&  line->indent < ctx->code_indent_offset  &&
-            off < ctx->size  &&  CH(off) == _T('>'))
-        {
-            /* Block quote mark. */
-            off++;
-            total_indent++;
-            line->indent = md_line_indentation(ctx, total_indent, off, &off);
-            total_indent += line->indent;
-
-            /* The optional 1st space after '>' is part of the block quote mark. */
-            if(line->indent > 0)
-                line->indent--;
-
-            line->beg = off;
-
-        } else if(c->ch != _T('>')  &&  line->indent >= c->contents_indent) {
-            /* List. */
-            line->indent -= c->contents_indent;
-        } else {
-            break;
-        }
-
-        n_parents++;
-    }
+    n_parents = md_match_containers(ctx, ctx->containers, ctx->n_containers,
+                                    beg, &line->indent, &total_indent, &off);
+    line->beg = off;
 
     if(off >= ctx->size  ||  ISNEWLINE(off)) {
         /* Blank line does not need any real indentation to be nested inside
@@ -5907,7 +6288,12 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
             /* We are another MD_LINE_FENCEDCODE unless we are closing fence
              * which we transform into MD_LINE_BLANK. */
             if(line->indent < ctx->code_indent_offset) {
+                OFF closing_begin = off;
                 if(md_is_closing_code_fence(ctx, CH(pivot_line->beg), off, &off)) {
+                    if(ctx->current_block != NULL && ctx->current_block->type == MD_BLOCK_CODE) {
+                        ctx->current_block->closing_begin = closing_begin;
+                        ctx->current_block->closing_end = off;
+                    }
                     line->type = MD_LINE_BLANK;
                     ctx->last_line_has_list_loosening_effect = FALSE;
                     break;
@@ -6191,17 +6577,24 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
 
         /* Check for table underline. */
         if((ctx->parser.flags & MD_FLAG_TABLES)  &&  pivot_line->type == MD_LINE_TEXT
+            &&  line->indent < ctx->code_indent_offset
             &&  off < ctx->size  &&  ISANYOF3(off, _T('|'), _T('-'), _T(':'))
             &&  n_parents == ctx->n_containers)
         {
-            unsigned col_count;
+            unsigned col_count, header_columns;
+            OFF underline_end = off;
 
-            if(ctx->current_block != NULL  &&  ctx->current_block->n_lines == 1  &&
-                md_is_table_underline(ctx, off, &off, &col_count))
-            {
-                line->data = col_count;
-                line->type = MD_LINE_TABLEUNDERLINE;
-                break;
+            if(ctx->current_block != NULL && ctx->current_block->n_lines >= 1 &&
+               md_is_table_underline(ctx, off, &underline_end, &col_count) &&
+               (!ctx->partial_input || underline_end < ctx->size)) {
+                const MD_LINE *header = (const MD_LINE*)(ctx->current_block + 1) + ctx->current_block->n_lines - 1;
+                MD_CHECK(md_table_header_columns(ctx, header, &header_columns));
+                if(header_columns == col_count) {
+                    off = underline_end;
+                    line->data = col_count;
+                    line->type = MD_LINE_TABLEUNDERLINE;
+                    break;
+                }
             }
         }
 
@@ -6330,6 +6723,52 @@ abort:
     return ret;
 }
 
+/* Snapshot the currently open native containers for the table block being
+ * started. The table block stores the slice offset/count in its otherwise
+ * unused closing_begin/closing_end provenance fields. */
+static int
+md_record_table_containers(MD_CTX* ctx)
+{
+    int n = ctx->n_containers;
+    int index = ctx->n_table_containers;
+    int i;
+
+    if(n < 0)
+        return -1;
+    if(n > 0  &&  index > INT_MAX - n)
+        return -1;
+    if(index + n > ctx->alloc_table_containers) {
+        int alloc = ctx->alloc_table_containers;
+        MD_TABLE_CONTAINER* next;
+
+        if(alloc == 0)
+            alloc = 8;
+        while(alloc < index + n) {
+            if(alloc > INT_MAX / 2)
+                return -1;
+            alloc *= 2;
+        }
+        next = (MD_TABLE_CONTAINER*) realloc(ctx->table_containers,
+                                (size_t) alloc * sizeof(MD_TABLE_CONTAINER));
+        if(next == NULL) {
+            MD_LOG("realloc() failed.");
+            return -1;
+        }
+        ctx->table_containers = next;
+        ctx->alloc_table_containers = alloc;
+    }
+
+    for(i = 0; i < n; i++) {
+        ctx->table_containers[index + i].mark = ctx->containers[i].ch;
+        ctx->table_containers[index + i].mark_indent = ctx->containers[i].mark_indent;
+        ctx->table_containers[index + i].contents_indent = ctx->containers[i].contents_indent;
+    }
+    ctx->n_table_containers = index + n;
+    ctx->current_block->closing_begin = (OFF) index;
+    ctx->current_block->closing_end = (OFF) n;
+    return 0;
+}
+
 static int
 md_process_line(MD_CTX* ctx, const MD_LINE_ANALYSIS** p_pivot_line, MD_LINE_ANALYSIS* line)
 {
@@ -6380,9 +6819,24 @@ md_process_line(MD_CTX* ctx, const MD_LINE_ANALYSIS** p_pivot_line, MD_LINE_ANAL
     /* MD_LINE_TABLEUNDERLINE changes meaning of the current block. */
     if(line->type == MD_LINE_TABLEUNDERLINE) {
         MD_ASSERT(ctx->current_block != NULL);
-        MD_ASSERT(ctx->current_block->n_lines == 1);
+        if(ctx->current_block->n_lines > 1) {
+            /* The preceding paragraph and the table header are separate native
+             * blocks. Remove the last physical line before finalizing the
+             * paragraph so reference definitions are consumed normally. */
+            MD_LINE header = ((MD_LINE*) (ctx->current_block + 1))[ctx->current_block->n_lines - 1];
+            MD_LINE_ANALYSIS header_analysis = *pivot_line;
+            ctx->current_block->n_lines--;
+            ctx->n_block_bytes -= sizeof(MD_LINE);
+            MD_CHECK(md_end_current_block(ctx));
+            header_analysis.type = MD_LINE_TEXT;
+            header_analysis.beg = header.beg;
+            header_analysis.end = header.end;
+            MD_CHECK(md_start_new_block(ctx, &header_analysis));
+            MD_CHECK(md_add_line_into_current_block(ctx, &header_analysis));
+        }
         ctx->current_block->type = MD_BLOCK_TABLE;
         ctx->current_block->data = line->data;
+        MD_CHECK(md_record_table_containers(ctx));
         MD_ASSERT(pivot_line != &md_dummy_blank_line);
         ((MD_LINE_ANALYSIS*)pivot_line)->type = MD_LINE_TABLE;
         MD_CHECK(md_add_line_into_current_block(ctx, line));
@@ -6406,13 +6860,146 @@ abort:
     return ret;
 }
 
+/* If a native multiline code span opens in a paragraph and closes inside the
+ * table block that the paragraph split produced (the closing tick was not yet
+ * part of any MD_LINE when the underline arrived), the table promotion was
+ * invalid. Resolve the combined paragraph+table lines with the native mark
+ * collector (no callbacks) and, when the resolved span crosses the table
+ * header boundary, rejoin the table lines into the paragraph in place. */
+static int
+md_merge_table_into_code_paragraph(MD_CTX* ctx, MD_BLOCK* paragraph, MD_BLOCK* table)
+{
+    MD_LINE* p_lines = (MD_LINE*) (paragraph + 1);
+    MD_LINE* t_lines = (MD_LINE*) (table + 1);
+    MD_SIZE n_p = paragraph->n_lines;
+    MD_SIZE n_t = table->n_lines;
+    MD_SIZE i;
+    OFF header_beg;
+    MD_LINE* combined;
+    int has_tick = FALSE;
+    int merged = FALSE;
+    int ret = 0;
+
+    if(n_p == 0  ||  n_t == 0)
+        return 0;
+
+    for(i = 0; i < n_p  &&  !has_tick; i++) {
+        OFF k;
+        for(k = p_lines[i].beg; k < p_lines[i].end; k++) {
+            if(CH(k) == _T('`')) {
+                has_tick = TRUE;
+                break;
+            }
+        }
+    }
+    if(!has_tick)
+        return 0;
+
+    header_beg = t_lines[0].beg;
+    if((size_t) n_p + n_t > SIZE_MAX / sizeof(MD_LINE))
+        return -1;
+    combined = (MD_LINE*) malloc(((size_t) n_p + n_t) * sizeof(MD_LINE));
+    if(combined == NULL) {
+        MD_LOG("malloc() failed.");
+        return -1;
+    }
+    memcpy(combined, p_lines, (size_t) n_p * sizeof(MD_LINE));
+    memcpy(combined + n_p, t_lines, (size_t) n_t * sizeof(MD_LINE));
+
+    ctx->n_marks = 0;
+    ret = md_collect_marks(ctx, combined, n_p + n_t, FALSE);
+    if(ret == 0) {
+        int m;
+        for(m = 0; m < ctx->n_marks; m++) {
+            MD_MARK* opener = &ctx->marks[m];
+            MD_MARK* closer;
+
+            if(opener->ch != _T('`')  ||  opener->next < 0  ||  opener->next >= ctx->n_marks)
+                continue;
+            if(!(opener->flags & MD_MARK_OPENER)  ||  !(opener->flags & MD_MARK_RESOLVED))
+                continue;
+            closer = &ctx->marks[opener->next];
+            if(opener->end <= header_beg  &&  closer->beg >= header_beg) {
+                merged = TRUE;
+                break;
+            }
+        }
+    }
+    free(combined);
+
+    if(!merged)
+        return ret;
+
+    {
+        MD_SIZE n = n_p + n_t;
+        char* base = (char*) ctx->block_bytes;
+        char* dest = (char*) (paragraph + 1) + (size_t) n_p * sizeof(MD_LINE);
+        char* tail_old = (char*) table + sizeof(MD_BLOCK) + (size_t) n_t * sizeof(MD_LINE);
+        char* tail_dest = (char*) (paragraph + 1) + (size_t) n * sizeof(MD_LINE);
+        size_t tail_len = (size_t) ctx->n_block_bytes - (size_t) (tail_old - base);
+
+        /* Both moves go to lower addresses; memmove keeps them safe. */
+        memmove(dest, t_lines, (size_t) n_t * sizeof(MD_LINE));
+        if(tail_len > 0)
+            memmove(tail_dest, tail_old, tail_len);
+        ctx->n_block_bytes = (int) ((tail_dest - base) + tail_len);
+        paragraph->n_lines = n;
+    }
+    return 1;
+}
+
+static int
+md_merge_inline_code_across_tables(MD_CTX* ctx)
+{
+    int off = 0;
+    int prev_off = -1;
+    int prev_end = 0;
+
+    while(off < ctx->n_block_bytes) {
+        MD_BLOCK* block = (MD_BLOCK*) ((char*) ctx->block_bytes + off);
+        size_t line_size = (block->type == MD_BLOCK_CODE || block->type == MD_BLOCK_HTML)
+                            ? sizeof(MD_VERBATIMLINE) : sizeof(MD_LINE);
+        int size;
+        int ret;
+
+        if((size_t) block->n_lines > (size_t) INT_MAX / line_size)
+            return -1;
+        if(block->flags & MD_BLOCK_CONTAINER)
+            size = (int) sizeof(MD_BLOCK);
+        else
+            size = (int) (sizeof(MD_BLOCK) + (size_t) block->n_lines * line_size);
+
+        if(block->type == MD_BLOCK_TABLE  &&  prev_off >= 0  &&  prev_end == off) {
+            MD_BLOCK* prev = (MD_BLOCK*) ((char*) ctx->block_bytes + prev_off);
+            if(prev->type == MD_BLOCK_P) {
+                ret = md_merge_table_into_code_paragraph(ctx, prev, block);
+                if(ret < 0)
+                    return -1;
+                if(ret > 0) {
+                    size = (int) (sizeof(MD_BLOCK) + (size_t) prev->n_lines * sizeof(MD_LINE));
+                    off = prev_off + size;
+                    prev_end = off;
+                    continue;
+                }
+            }
+        }
+
+        prev_off = off;
+        prev_end = off + size;
+        off += size;
+    }
+    return 0;
+}
+
 static int
 md_process_doc(MD_CTX *ctx)
 {
     const MD_LINE_ANALYSIS* pivot_line = &md_dummy_blank_line;
     MD_LINE_ANALYSIS line_buf[2];
     MD_LINE_ANALYSIS* line = &line_buf[0];
-    OFF off = 0;
+    OFF off = 0, candidate_beg = 0, candidate_end = 0;
+    size_t candidate_block = 0;
+    int have_candidate = FALSE;
     int ret = 0;
 
     MD_ENTER_BLOCK(MD_BLOCK_DOC, NULL);
@@ -6421,12 +7008,54 @@ md_process_doc(MD_CTX *ctx)
         if(line == pivot_line)
             line = (line == &line_buf[0] ? &line_buf[1] : &line_buf[0]);
 
+        /* An unfinished possible delimiter must retain the preceding header,
+         * even if this temporary prefix is parsed as an ordinary line or HR. */
+        if(ctx->partial_input && ctx->candidate_callback && ctx->current_block &&
+           ctx->current_block->type == MD_BLOCK_P && ctx->current_block->n_lines) {
+            OFF k = off;
+            while(k < ctx->size && (CH(k) == _T(' ') || CH(k) == _T('\t') ||
+                  CH(k) == _T('>') || CH(k) == _T('|') || CH(k) == _T('-') || CH(k) == _T(':'))) k++;
+            if(k == ctx->size) {
+                MD_LINE *last = (MD_LINE*)(ctx->current_block + 1) + ctx->current_block->n_lines - 1;
+                candidate_block = (size_t)((char*)ctx->current_block - (char*)ctx->block_bytes);
+                candidate_beg = last->beg; candidate_end = last->end; have_candidate = TRUE;
+            }
+        }
         MD_CHECK(md_analyze_line(ctx, off, &off, pivot_line, line));
         MD_CHECK(md_process_line(ctx, &pivot_line, line));
     }
 
+    if(!have_candidate && ctx->partial_input && ctx->candidate_callback &&
+       ctx->current_block && ctx->current_block->type == MD_BLOCK_P && ctx->current_block->n_lines) {
+        MD_LINE *last = (MD_LINE*)(ctx->current_block + 1) + ctx->current_block->n_lines - 1;
+        candidate_block = (size_t)((char*)ctx->current_block - (char*)ctx->block_bytes);
+        candidate_beg = last->beg; candidate_end = last->end; have_candidate = TRUE;
+    }
+    ctx->partial_final_block = ctx->partial_input;
     MD_CHECK(md_end_current_block(ctx));
+    ctx->partial_final_block = FALSE;
 
+    /* Reference-definition consumption may have removed the line. Verify it
+     * remains a paragraph line before reporting its physical source range. */
+    if(have_candidate && candidate_block + sizeof(MD_BLOCK) <= (size_t)ctx->n_block_bytes) {
+        MD_BLOCK *block = (MD_BLOCK*)((char*)ctx->block_bytes + candidate_block);
+        if(block->type == MD_BLOCK_P) {
+            MD_LINE *lines = (MD_LINE*)(block + 1);
+            MD_SIZE i;
+            for(i = 0; i < block->n_lines; i++) {
+                if(lines[i].beg == candidate_beg && lines[i].end == candidate_end) {
+                    OFF begin = candidate_beg, end = candidate_end;
+                    while(begin > 0 && CH(begin-1) != _T('\n') && CH(begin-1) != _T('\r')) begin--;
+                    while(end < ctx->size && !ISNEWLINE(end)) end++;
+                    if(end < ctx->size && CH(end) == _T('\r')) end++;
+                    if(end < ctx->size && CH(end) == _T('\n')) end++;
+                    MD_CHECK_PROCESS(ctx->candidate_callback(begin, end, MD_CANDIDATE_TABLE, ctx->userdata));
+                    break;
+                }
+            }
+        }
+    }
+    MD_CHECK(md_merge_inline_code_across_tables(ctx));
     MD_CHECK(md_build_ref_def_hashtable(ctx));
 
     /* Process all blocks. */
@@ -6467,8 +7096,9 @@ abort:
  ***  Public API  ***
  ********************/
 
-int
-md_parse(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userdata)
+static int
+md_parse_impl(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser,
+              const MD_SOURCE_CALLBACKS* callbacks, void* userdata)
 {
     MD_CTX ctx;
     int i;
@@ -6486,6 +7116,17 @@ md_parse(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userd
     ctx.size = size;
     memcpy(&ctx.parser, parser, sizeof(MD_PARSER));
     ctx.userdata = userdata;
+    if(callbacks != NULL) {
+        ctx.inline_span_callback = callbacks->span;
+        ctx.fence_source_callback = callbacks->fence;
+        ctx.cell_source_callback = callbacks->cell;
+        ctx.cell_content_callback = callbacks->cell_content;
+        ctx.partial_input = callbacks->partial_input;
+        ctx.references = callbacks->references;
+        ctx.definition_callback = callbacks->definition;
+        ctx.candidate_callback = callbacks->candidate;
+        ctx.table_source_callback = callbacks->table;
+    }
     ctx.code_indent_offset = (ctx.parser.flags & MD_FLAG_NOINDENTEDCODEBLOCKS) ? (OFF)(-1) : 4;
     md_build_mark_char_map(&ctx);
     ctx.doc_ends_with_newline = (size > 0  &&  ISNEWLINE_(text[size-1]));
@@ -6501,6 +7142,7 @@ md_parse(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userd
 
     /* All the work. */
     ret = md_process_doc(&ctx);
+    if(ctx.source_error != 0) ret = ctx.source_error;
 
     /* Clean-up. */
     md_free_ref_defs(&ctx);
@@ -6509,6 +7151,267 @@ md_parse(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userd
     free(ctx.marks);
     free(ctx.block_bytes);
     free(ctx.containers);
+    free(ctx.table_containers);
 
     return ret;
 }
+
+int
+md_parse(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userdata)
+{
+    return md_parse_impl(text, size, parser, NULL, userdata);
+}
+
+int
+md_parse_spans(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser,
+               MD_INLINE_SPAN_CALLBACK span_callback, void* userdata)
+{
+    MD_SOURCE_CALLBACKS callbacks = { 0 };
+    callbacks.span = span_callback;
+    return md_parse_impl(text, size, parser, &callbacks, userdata);
+}
+
+int
+md_parse_source(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser,
+                const MD_SOURCE_CALLBACKS* callbacks, void* userdata)
+{
+    return md_parse_impl(text, size, parser, callbacks, userdata);
+}
+
+static int
+md_parse_inline_impl(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser,
+                     MD_INLINE_SPAN_CALLBACK span_callback, const MD_SOURCE_CALLBACKS* sources,
+                     const MD_TABLE_RESUME* table_resume, MD_TABLE_FRAGMENT_RESULT* table_result,
+                     void* userdata)
+{
+    MD_CTX storage;
+    MD_CTX* ctx = &storage;
+    MD_LINE* lines = NULL;
+    MD_CONTAINER* resume_containers = NULL;
+    MD_SIZE count = 0, i, beg = 0, index = 0, resume_container_count = 0;
+    int table_closed = FALSE;
+    int ret = 0;
+    if(parser == NULL || parser->abi_version != 0 || (size != 0 && text == NULL))
+        return -1;
+    if(table_result != NULL) {
+        table_result->closed = 0;
+        table_result->end = size;
+    }
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->text = text;
+    ctx->size = size;
+    memcpy(&ctx->parser, parser, sizeof(MD_PARSER));
+    ctx->userdata = userdata;
+    ctx->inline_span_callback = span_callback;
+    ctx->table_resume = table_resume;
+    if(sources != NULL) {
+        ctx->inline_span_callback = sources->span;
+        ctx->cell_source_callback = sources->cell;
+        ctx->cell_content_callback = sources->cell_content;
+        ctx->partial_input = sources->partial_input;
+        ctx->references = sources->references;
+        ctx->definition_callback = sources->definition;
+        ctx->candidate_callback = sources->candidate;
+    }
+    ctx->code_indent_offset = (ctx->parser.flags & MD_FLAG_NOINDENTEDCODEBLOCKS) ? (OFF)(-1) : 4;
+    md_build_mark_char_map(ctx);
+    ctx->doc_ends_with_newline = (size > 0 && ISNEWLINE_(text[size-1]));
+    for(i = 0; i < (MD_SIZE) SIZEOF_ARRAY(ctx->opener_stacks); i++)
+        ctx->opener_stacks[i].top = -1;
+    ctx->ptr_stack.top = -1;
+    ctx->unresolved_link_head = ctx->unresolved_link_tail = -1;
+    ctx->table_cell_boundaries_head = ctx->table_cell_boundaries_tail = -1;
+
+    if(table_resume != NULL) {
+        if(table_resume->columns == 0 || table_resume->columns > 32 ||
+           table_resume->first_column > table_resume->columns ||
+           table_resume->alignments == NULL ||
+           (table_resume->n_containers > 0 && table_resume->containers == NULL)) {
+            ret = -1;
+            goto abort;
+        }
+        resume_container_count = table_resume->n_containers;
+        if(resume_container_count > 0) {
+            if((size_t) resume_container_count > SIZE_MAX / sizeof(MD_CONTAINER)) {
+                ret = -1;
+                goto abort;
+            }
+            resume_containers = (MD_CONTAINER*) malloc((size_t) resume_container_count * sizeof(MD_CONTAINER));
+            if(resume_containers == NULL) {
+                ret = -1;
+                goto abort;
+            }
+            for(i = 0; i < resume_container_count; i++) {
+                memset(&resume_containers[i], 0, sizeof(MD_CONTAINER));
+                resume_containers[i].ch = table_resume->containers[i].mark;
+                resume_containers[i].mark_indent = table_resume->containers[i].mark_indent;
+                resume_containers[i].contents_indent = table_resume->containers[i].contents_indent;
+            }
+        }
+    }
+
+    for(i = 0; i < size; i++) if(text[i] == _T('\n')) count++;
+    if(size > 0 && text[size-1] != _T('\n')) count++;
+    if(count != 0) {
+        if((size_t) count > SIZE_MAX / sizeof(*lines)) { ret = -1; goto abort; }
+        lines = (MD_LINE*) malloc((size_t) count * sizeof(*lines));
+        if(lines == NULL) { ret = -1; goto abort; }
+    }
+
+    if(table_resume == NULL) {
+        for(i = 0; i < size; i++) {
+            if(text[i] == _T('\n')) {
+                lines[index].beg = beg;
+                lines[index].end = (i > beg && text[i-1] == _T('\r')) ? i-1 : i;
+                /* Match md_analyze_line(): trailing spaces belong to the hard
+                 * break marker, not to the visible text. */
+                while(lines[index].end > lines[index].beg && text[lines[index].end-1] == _T(' '))
+                    lines[index].end--;
+                index++;
+                beg = i+1;
+            }
+        }
+        if(beg < size) {
+            /* The trailing segment has no newline: it is a continuation cut, so
+             * its trailing blanks are content rather than a hard-break marker. */
+            lines[index].beg = beg;
+            lines[index].end = size;
+            index++;
+        }
+    } else {
+        /* Each physical line is one continuation row. Native container prefixes
+         * are consumed at real line starts; a resumed first line may begin after
+         * an already-consumed prefix. A blank/container-only line or a dedent
+         * below the table's native parents ends the table at that raw line. */
+        OFF raw = 0;
+        int first_line = TRUE;
+        while(raw < size) {
+            OFF raw_end = raw;
+            OFF content_beg = raw;
+            OFF content_end;
+            unsigned indent = 0, total_indent = 0;
+            OFF off = raw;
+            int has_lf;
+            int blank;
+
+            while(raw_end < size && text[raw_end] != _T('\n'))
+                raw_end++;
+            has_lf = (raw_end < size);
+            content_end = raw_end;
+            if(content_end > raw && text[content_end-1] == _T('\r'))
+                content_end--;
+
+            if(first_line && table_resume->first_line_partial) {
+                /* Mid-row cut: the prefix was consumed by the caller. An empty
+                 * remainder carries no row bytes of its own. */
+                if(content_end == raw) {
+                    if(!has_lf)
+                        break;
+                    first_line = FALSE;
+                    raw = raw_end + 1;
+                    continue;
+                }
+                blank = FALSE;
+            } else {
+                int matched = md_match_containers(ctx, resume_containers,
+                                    (int) resume_container_count, raw,
+                                    &indent, &total_indent, &off);
+                if((unsigned) matched < resume_container_count) {
+                    if(!has_lf && ctx->partial_input)
+                        break;
+                    table_closed = TRUE;
+                    break;
+                }
+                if(resume_container_count > 0)
+                    content_beg = off;
+                blank = (off >= size  ||  ISNEWLINE(off));
+            }
+
+            if(blank) {
+                if(!has_lf && ctx->partial_input)
+                    break;
+                table_closed = TRUE;
+                break;
+            }
+
+            if(has_lf) {
+                while(content_end > content_beg && text[content_end-1] == _T(' '))
+                    content_end--;
+            }
+            lines[index].beg = content_beg;
+            lines[index].end = content_end;
+            index++;
+            first_line = FALSE;
+            raw = has_lf ? raw_end + 1 : size;
+        }
+        if(table_result != NULL) {
+            table_result->closed = table_closed ? 1 : 0;
+            table_result->end = table_closed ? raw : size;
+        }
+    }
+    count = index;
+
+    MD_ENTER_BLOCK(MD_BLOCK_DOC, NULL);
+    if(table_resume != NULL) {
+        MD_BLOCK_TABLE_DETAIL detail;
+        detail.col_count = table_resume->columns;
+        detail.head_row_count = 0; detail.body_row_count = count;
+        MD_ENTER_BLOCK(MD_BLOCK_TABLE, &detail);
+        for(i = 0; i < count; i++) {
+            MD_TABLE_RESUME row_resume = *table_resume;
+            if(i != 0) { row_resume.first_column = 0; row_resume.partial_cell = FALSE; row_resume.trim_leading = FALSE; }
+            ctx->table_resume = &row_resume;
+            MD_CHECK_PROCESS(md_process_table_row(ctx, MD_BLOCK_TD, lines[i].beg, lines[i].end,
+                table_resume->alignments, table_resume->columns));
+        }
+        ctx->table_resume = table_resume;
+        MD_LEAVE_BLOCK(MD_BLOCK_TABLE, &detail);
+    } else {
+        MD_ENTER_BLOCK(MD_BLOCK_P, NULL);
+        if(count != 0) MD_CHECK_PROCESS(md_process_normal_block_contents(ctx, lines, count));
+        MD_LEAVE_BLOCK(MD_BLOCK_P, NULL);
+    }
+    MD_LEAVE_BLOCK(MD_BLOCK_DOC, NULL);
+abort:
+    free(lines);
+    free(resume_containers);
+    md_free_ref_defs(ctx);
+    md_free_ref_def_hashtable(ctx);
+    free(ctx->buffer);
+    free(ctx->marks);
+    free(ctx->block_bytes);
+    free(ctx->containers);
+    free(ctx->table_containers);
+    return ret;
+}
+
+int
+md_parse_table_fragment(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser,
+                        const MD_SOURCE_CALLBACKS* sources, const MD_TABLE_RESUME* resume,
+                        MD_TABLE_FRAGMENT_RESULT* result, void* userdata)
+{
+    if(resume == NULL) return -1;
+    return md_parse_inline_impl(text, size, parser, NULL, sources, resume, result, userdata);
+}
+
+int
+md_parse_inline_source(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser,
+                       const MD_SOURCE_CALLBACKS* sources, void* userdata)
+{
+    return md_parse_inline_impl(text, size, parser, NULL, sources, NULL, NULL, userdata);
+}
+
+int
+md_parse_inline(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userdata)
+{
+    return md_parse_inline_impl(text, size, parser, NULL, NULL, NULL, NULL, userdata);
+}
+
+int
+md_parse_inline_spans(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser,
+                      MD_INLINE_SPAN_CALLBACK span_callback, void* userdata)
+{
+    return md_parse_inline_impl(text, size, parser, span_callback, NULL, NULL, NULL, userdata);
+}
+
+#include "md4c_stream_blocks.inc"

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Owned PTY/loopback coalesced resize recovery + fresh-ACK acceptance.
+"""Owned PTY/loopback passive resize invalidation + fresh-ACK acceptance.
 No real API/config. Byte-level checks complement emulator viewport acceptance.
+A size change only takes the new dimensions, releases interrupted controls and
+drops old-frame authority: no automatic repair, no bottom jump, no replay. It
+must stay quiescent past the former 150ms debounce; real input or new server
+content draws the next complete frame at the new size.
 """
 import errno
 import fcntl
@@ -19,10 +23,30 @@ import tempfile
 import termios
 import threading
 import time
+import unicodedata
 
 ACK = b'\x1b[?25h'
-CLEANUP = b'\x18\x1b[0m\x1b[?2026l' + ACK
+SYNC_BEGIN = b'\x1b[?2026h'
+# A complete frame releases synchronized display and then shows the cursor
+# (src/ui/terminal.zig). Exit and resize-rescue bytes reuse the bare cursor-show
+# and the bare sync release, so completion needs this exact pair.
+FRAME_END = b'\x1b[?2026l' + ACK
+# A resize may release interrupted controls only (CAN, SGR reset, sync release,
+# cursor show); any interface payload or drawn frame is a failure.
+CONTROL_RELEASE = re.compile(rb'\x18|\x1b\[\?2026[lh]|\x1b\[\?25[hl]|\x1b\[0m')
 CSI = re.compile(rb'\x1b\[([0-9;?]*)([@-~])')
+
+
+def cells(raw):
+    """Display cells of one styled frame line.
+
+    Callers pass frame bytes with their SGR/CSI styling still in place, so the
+    escapes are stripped here. UTF-8 byte length is not a cell count: combining
+    marks occupy no cell, an ASCII or other single-cell glyph one, and an East
+    Asian wide/fullwidth glyph two. No third-party width table is needed.
+    """
+    return sum(0 if unicodedata.combining(ch) else 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+               for ch in CSI.sub(b'', raw).decode('utf-8'))
 
 
 class Service(http.server.BaseHTTPRequestHandler):
@@ -141,47 +165,87 @@ def run(app):
 
             def last_frame():
                 end = capture.rfind(ACK)
-                begin = capture.rfind(b'\x1b[?2026h', 0, end)
+                begin = capture.rfind(SYNC_BEGIN, 0, end)
                 return CSI.sub(b'', bytes(capture[max(0, begin):end]))
 
-            def settled(start, quiet=True):
-                def complete():
-                    delta = bytes(capture[start:])
-                    at = delta.find(b'\x1b[999B\r\n')
-                    return at >= 0 and ACK in delta[at:]
-                wait(complete, timeout=2, label='settled resize repair')
-                if quiet:
-                    frames = capture.count(ACK)
-                    pump(.22)
-                    assert capture.count(ACK) == frames, 'settled idle resize kept redrawing'
+            def complete_frame(position, needle=b''):
+                """CSI-stripped body of the first complete frame after `position`.
 
-            def hold_resize(rows, columns, settle=True, quiet=True):
+                A frame owns authority only through its exact sync_end+cursor-show
+                sequence: a bare cursor-show can belong to exit/rescue bytes, a
+                CAN aborts the payload, and a newer begin proves this frame never
+                completed, so the search re-anchors there. The needle is matched
+                after CSI stripping because SGR spans may sit between the
+                composer decoration and its text; later spinner-only diffs still
+                legitimately omit unchanged body text.
+                """
+                data = bytes(capture)
+                begin = data.find(SYNC_BEGIN, position)
+                while begin >= 0:
+                    end = data.find(FRAME_END, begin + len(SYNC_BEGIN))
+                    if end < 0:
+                        return None
+                    nested = data.find(SYNC_BEGIN, begin + len(SYNC_BEGIN), end)
+                    if nested >= 0:
+                        begin = nested  # The earlier begin never completed.
+                        continue
+                    if b'\x18' in data[begin:end]:
+                        begin = data.find(SYNC_BEGIN, begin + len(SYNC_BEGIN))
+                        continue  # Aborted payload owns no complete frame.
+                    body = CSI.sub(b'', data[begin:end])
+                    if needle in body:
+                        return body
+                    begin = data.find(SYNC_BEGIN, end + len(FRAME_END))
+                return None
+
+            def press(data, quiet=.1):
+                os.write(master, data)
+                pump(quiet)
+                assert Service.failed is None, Service.failed
+
+            def hold_resize(rows, columns):
+                """Resize is passive: dimensions only, nothing is redrawn.
+
+                The owned file byte stream is the strict oracle here: the former
+                implementation repaired the screen 150ms after the last resize,
+                so passing that bound without a byte is exactly the approved
+                contract. A save/rescue frame therefore needs real input or new
+                content, never elapsed time.
+                """
                 start = len(capture)
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
                 os.killpg(child.pid, signal.SIGWINCH)
                 pump(.05)
-                # During the debounce, only release interrupted terminal controls.
-                delta = bytes(capture[start:])
-                assert delta.replace(CLEANUP, b'') == b'', 'live resize emitted interface payload'
-                if settle:
-                    settled(start, quiet)
+                # Only interrupted terminal controls may be released.
+                assert CONTROL_RELEASE.sub(b'', bytes(capture[start:])) == b'', 'live resize emitted interface payload'
+                mark = len(capture)
+                pump(.22)
+                # Past the removed debounce the application still must not draw.
+                assert CONTROL_RELEASE.sub(b'', bytes(capture[mark:])) == b'', 'resize-only idle emitted a late payload'
+                window = bytes(capture[start:])
+                assert SYNC_BEGIN not in window, 'resize-only idle drew a frame'
+                assert b'\x1b[999B' not in window, 'resize-only idle jumped to the bottom'
+                return window
 
             try:
                 wait(lambda: ACK in capture, label='startup ACK')
                 pump(.1)
-                start = len(capture)
                 for size in [(24, 60), (18, 60), (24, 80)]:
-                    hold_resize(*size, settle=False)
-                settled(start)  # A burst gets one repair, without a key or content.
-                assert bytes(capture[start:]).count(b'\x1b[999B\r\n') == 1
+                    # A burst, including the ABA return to the original geometry,
+                    # changes dimensions only and never restores old authority.
+                    hold_resize(*size)
                 assert Service.requests == 0
-                key(b'x')
-                assert b'x' in capture
+                start = len(capture)
+                key(b'x')  # Real input draws the first fresh frame at the new size.
+                typed = complete_frame(start, b'> x')
+                assert typed is not None, 'real input drew no complete frame with the typed composer cell'
+                typed_lines = [line for line in re.split(rb'\r\n|\r|\n', typed) if line.strip()]
+                assert typed_lines and typed_lines[-1].rstrip().endswith(b'> x'), 'typed cell is not on the current composer row'
                 key(b'\x15/settings\r')
                 assert b'Low-price input' in capture
                 initial_bytes = path.read_bytes()
-                hold_resize(20, 70, settle=False)
-                key(b'\r')  # Before the repair, the revoked ACK cannot toggle.
+                hold_resize(20, 70)  # Passive resize drops the old complete-frame ACK.
+                press(b'\r')  # Confirmation arriving before a fresh frame cannot toggle.
                 assert path.read_bytes() == initial_bytes, 'stale settings confirmation saved'
                 key(b'\r')
                 assert json.loads(path.read_text())['limits']['low_price_input'] is True
@@ -197,10 +261,15 @@ def run(app):
                 wait(lambda: Service.requests == 1, label='stream command submitted')
                 wait(lambda: b'before-resize-proof' in capture and capture.count(ACK) > before, label='first stream content')
                 pump(.12)
-                hold_resize(18, 64, quiet=False)  # Busy viewport also recovers without data.
+                # Busy with no new data: the size change alone must stay quiet too.
+                hold_resize(18, 64)
                 start = len(capture)
                 Service.more.set()
-                wait(lambda: b'after-resize-proof' in capture[start:] and ACK in capture[start:], label='stream continuation')
+                wait(lambda: complete_frame(start, b'after-resize-proof') is not None, label='stream continuation')
+                resumed = complete_frame(start, b'after-resize-proof')
+                assert resumed is not None, 'stream continuation lost content'
+                assert b'after-resize-proof' in resumed, 'stream continuation lost content'
+                assert max((cells(line) for line in re.split(rb'\r\n|\r|\n', resumed) if line), default=0) <= 64, 'new frame ignored the resized width'
                 before = capture.count(ACK)
                 pump(.24)
                 assert capture.count(ACK) > before, 'animation did not resume after content'
@@ -218,7 +287,7 @@ def run(app):
                 assert Service.requests == 1 and Service.failed is None, Service.failed
                 raw = bytes(capture)
                 assert not any(x in raw for x in (b'\x1b[2J', b'\x1b[3J', b'\x1b[?1049h', b'\x1b[?1047h'))
-                print('PASS resize-deferred: live width/height/ABA hold, one settled recovery without input, idle quiescence, stale Settings ACK denied, busy recovery, content/animation resumed, primary=1, menu=0, termios/fd restored')
+                print('PASS resize-deferred: passive width/height/ABA past the former 150ms debounce, no repair/bottom jump/replay, fresh frame on real input at new dimensions, stale Settings ACK denied, busy quiescence then content/animation resumed, primary=1, menu=0, termios/fd restored')
             finally:
                 Service.more.set()
                 Service.finish_gate.set()

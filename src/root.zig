@@ -146,4 +146,10 @@ test {
     _ = @import("tests/session_context_test.zig");
     _ = @import("tests/adapter_integration_test.zig");
     _ = @import("tool_metadata_adapter_test.zig");
+
+    // Discovery blocks alone are not evidence that a named test was selected.
+    for (@import("builtin").test_functions) |test_fn| {
+        if (@import("std").mem.indexOf(u8, test_fn.name, ".test.") != null) return;
+    }
+    return error.NoMatchingProductTests;
 }

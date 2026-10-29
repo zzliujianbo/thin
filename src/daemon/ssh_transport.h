@@ -12,6 +12,7 @@ int thin_ssh_active(void);
 ptrdiff_t thin_ssh_read(void *out, size_t length);
 ptrdiff_t thin_ssh_write(const void *data, size_t length);
 int thin_ssh_wait(int want_write, int ms);
+int thin_ssh_notification_fd(int fd);
 void thin_ssh_size(unsigned *columns, unsigned *rows);
 int thin_ssh_finish(int code);
 void thin_ssh_close(void);

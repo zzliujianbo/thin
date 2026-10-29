@@ -769,6 +769,23 @@ pub const Listener = struct {
         }
     }
 
+    /// Single nonblocking accept attempt. A quiet listener never waits on the
+    /// owner thread; caller readiness polling owns scheduling and deadlines.
+    pub fn acceptStep(self: *Listener) !?Connection {
+        const rc = linux.accept4(self.fd, null, null, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const fd: c.fd_t = @intCast(rc);
+                errdefer fs.closeFd(fd);
+                const peer = try socketCredentials(fd);
+                if (peer.uid != self.uid) return error.PeerUidMismatch;
+                return Connection.init(self.allocator, fd, peer);
+            },
+            .AGAIN, .INTR, .CONNABORTED => return null,
+            else => |err| return mapErrno(err),
+        }
+    }
+
     /// Close the listening descriptor only; the socket file is left for deinit.
     pub fn close(self: *Listener) void {
         if (self.fd >= 0) {
@@ -876,6 +893,13 @@ pub const Connection = struct {
     body_read: usize = 0,
     write_progress: usize = 0,
     poisoned: bool = false,
+    /// Owned header+payload for the step writer. Exactly one frame may be
+    /// pending; synchronous writes cannot interleave with it.
+    outgoing: []u8 = &.{},
+    outgoing_offset: usize = 0,
+
+    pub const ReadStep = union(enum) { pending, eof, frame: []u8 };
+    pub const step_bytes: usize = 64 * 1024;
 
     /// Takes ownership of `fd`; peer must already be verified.
     pub fn init(allocator: std.mem.Allocator, fd: c.fd_t, peer: Credentials) Connection {
@@ -927,11 +951,114 @@ pub const Connection = struct {
         return frame;
     }
 
+    /// At most two immediate recv calls (header, then a bounded body slice).
+    /// Partial frames remain owned across turns; EOF inside a frame is fatal.
+    /// MSG_DONTWAIT also makes this safe for an externally supplied blocking fd.
+    pub fn readStep(self: *Connection) !ReadStep {
+        if (self.poisoned) return error.StreamPoisoned;
+        if (self.state == .header) {
+            const n = self.receiveStep(self.header[self.header_read..]) catch |err| switch (err) {
+                error.WouldBlock => return .pending,
+                else => return err,
+            };
+            if (n == 0) {
+                if (self.header_read == 0) return .eof;
+                self.poisoned = true;
+                return error.TruncatedFrame;
+            }
+            self.header_read += n;
+            if (self.header_read < header_size) return .pending;
+            self.declared = std.mem.readInt(u32, &self.header, .big);
+            if (self.declared > max_frame_len) {
+                self.poisoned = true;
+                return error.FrameTooLarge;
+            }
+            self.state = .body;
+        }
+        if (self.body.len != self.declared) self.body = try self.allocator.alloc(u8, self.declared);
+        if (self.body_read < self.declared) {
+            const end = @min(self.declared, self.body_read + step_bytes);
+            const n = self.receiveStep(self.body[self.body_read..end]) catch |err| switch (err) {
+                error.WouldBlock => return .pending,
+                else => return err,
+            };
+            if (n == 0) {
+                self.poisoned = true;
+                return error.TruncatedFrame;
+            }
+            self.body_read += n;
+            if (self.body_read < self.declared) return .pending;
+        }
+        const frame = self.body;
+        self.body = &.{};
+        self.clearFrame();
+        return .{ .frame = frame };
+    }
+
+    fn receiveStep(self: *Connection, bytes: []u8) !usize {
+        const n = c.recv(self.fd, bytes.ptr, bytes.len, linux.MSG.DONTWAIT);
+        if (n >= 0) return @intCast(n);
+        const err = libcErrno();
+        if (err == .AGAIN or err == .INTR) return error.WouldBlock;
+        self.poisoned = true;
+        return mapErrno(err);
+    }
+
+    /// Copy once before publication; the caller may immediately wipe its reply.
+    /// No write, wait or callback occurs while queueing.
+    pub fn queueFrame(self: *Connection, payload: []const u8) !void {
+        if (self.poisoned) return error.StreamPoisoned;
+        if (self.writePending()) return error.WriteInProgress;
+        if (payload.len > max_frame_len) return error.FrameTooLarge;
+        const frame = try self.allocator.alloc(u8, header_size + payload.len);
+        std.mem.writeInt(u32, frame[0..header_size], @intCast(payload.len), .big);
+        @memcpy(frame[header_size..], payload);
+        self.outgoing = frame;
+        self.outgoing_offset = 0;
+    }
+
+    pub fn writePending(self: *const Connection) bool {
+        return self.outgoing.len != 0;
+    }
+
+    /// One bounded nonblocking send. A false result means pending, not failure.
+    /// EAGAIN never discards or poisons a partial frame. The caller owns the
+    /// absolute deadline and must close, not restart, a timed-out partial frame.
+    pub fn writeStep(self: *Connection) !bool {
+        if (self.poisoned) return error.StreamPoisoned;
+        if (!self.writePending()) return true;
+        const end = @min(self.outgoing.len, self.outgoing_offset + step_bytes);
+        const bytes = self.outgoing[self.outgoing_offset..end];
+        const n = c.send(self.fd, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT);
+        if (n < 0) {
+            const err = libcErrno();
+            if (err == .AGAIN or err == .INTR) return false;
+            self.poisoned = true;
+            return mapErrno(err);
+        }
+        if (n == 0) {
+            self.poisoned = true;
+            return error.ConnectionClosed;
+        }
+        self.outgoing_offset += @intCast(n);
+        if (self.outgoing_offset != self.outgoing.len) return false;
+        self.clearOutgoing();
+        return true;
+    }
+
+    fn clearOutgoing(self: *Connection) void {
+        std.crypto.secureZero(u8, self.outgoing);
+        self.allocator.free(self.outgoing);
+        self.outgoing = &.{};
+        self.outgoing_offset = 0;
+    }
+
     /// Write one frame. A payload above `max_frame_len` is rejected before any
     /// byte is written. Any failure after a partial write poisons the stream;
     /// a timeout/cancel before the first byte leaves the frame retryable.
     pub fn writeFrame(self: *Connection, payload: []const u8, wait: Wait) !void {
         if (self.poisoned) return error.StreamPoisoned;
+        if (self.writePending()) return error.WriteInProgress;
         if (payload.len > max_frame_len) return error.FrameTooLarge;
 
         var deadline = Deadline.init(wait);
@@ -945,6 +1072,7 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
+        self.clearOutgoing();
         self.freeBody();
         if (self.fd >= 0) {
             fs.closeFd(self.fd);
@@ -1084,6 +1212,96 @@ test "partial frame storage is wiped before discard and close is idempotent" {
     conn.close();
     try std.testing.expectEqual(@as(usize, 0), conn.body.len);
     conn.close();
+}
+
+test "step reader preserves partial header and body without waiting" {
+    var pair = try testPair(std.testing.allocator);
+    defer pair.a.close();
+    defer pair.b.close();
+    try std.testing.expect((try pair.a.readStep()) == .pending);
+    try sendAll(pair.b.fd, &.{ 0, 0 });
+    try std.testing.expect((try pair.a.readStep()) == .pending);
+    try std.testing.expectEqual(@as(usize, 2), pair.a.header_read);
+    try sendAll(pair.b.fd, &.{ 0, 3, 'a' });
+    try std.testing.expect((try pair.a.readStep()) == .pending);
+    try std.testing.expectEqual(@as(usize, 1), pair.a.body_read);
+    try sendAll(pair.b.fd, "bc");
+    const frame = (try pair.a.readStep()).frame;
+    defer std.testing.allocator.free(frame);
+    try std.testing.expectEqualStrings("abc", frame);
+    try sendAll(pair.b.fd, &.{ 0, 0, 0, 0 });
+    const empty = (try pair.a.readStep()).frame;
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    pair.b.close();
+    try std.testing.expect((try pair.a.readStep()) == .eof);
+}
+
+test "step reader rejects truncated and oversized frames" {
+    for ([_][]const u8{ &.{0}, &.{ 0, 0, 0, 2, 'x' }, &.{ 0xff, 0xff, 0xff, 0xff } }, 0..) |raw, index| {
+        var pair = try testPair(std.testing.allocator);
+        defer pair.a.close();
+        defer pair.b.close();
+        try sendAll(pair.b.fd, raw);
+        pair.b.close();
+        if (index == 2) {
+            try std.testing.expectError(error.FrameTooLarge, pair.a.readStep());
+        } else {
+            try std.testing.expect((try pair.a.readStep()) == .pending);
+            try std.testing.expectError(error.TruncatedFrame, pair.a.readStep());
+        }
+        try std.testing.expectError(error.StreamPoisoned, pair.a.readStep());
+    }
+}
+
+test "step writer backpressure preserves the exact frame and another connection progresses" {
+    const a = std.testing.allocator;
+    var slow = try testPair(a);
+    defer slow.a.close();
+    defer slow.b.close();
+    var fast = try testPair(a);
+    defer fast.a.close();
+    defer fast.b.close();
+    const payload = try a.alloc(u8, max_frame_len);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @intCast(index % 251);
+    try slow.a.queueFrame(payload);
+    try std.testing.expectError(error.WriteInProgress, slow.a.queueFrame("interleave"));
+    try std.testing.expectError(error.WriteInProgress, slow.a.writeFrame("interleave", testWait()));
+    // Do not read the peer: bounded steps eventually encounter EAGAIN.
+    for (0..64) |_| _ = try slow.a.writeStep();
+    try std.testing.expect(slow.a.writePending());
+    try std.testing.expect(slow.a.outgoing_offset > 0);
+    const stopped_at = slow.a.outgoing_offset;
+    try std.testing.expect(!try slow.a.writeStep());
+    try std.testing.expectEqual(stopped_at, slow.a.outgoing_offset);
+    try fast.a.queueFrame("control-reply");
+    try std.testing.expect(try fast.a.writeStep());
+    const quick = (try fast.b.readStep()).frame;
+    defer a.free(quick);
+    try std.testing.expectEqualStrings("control-reply", quick);
+    var received = false;
+    for (0..128) |_| {
+        _ = try slow.a.writeStep();
+        switch (try slow.b.readStep()) {
+            .frame => |frame| {
+                defer a.free(frame);
+                try std.testing.expectEqualSlices(u8, payload, frame);
+                received = true;
+                break;
+            },
+            .pending => {},
+            .eof => return error.UnexpectedEof,
+        }
+    }
+    try std.testing.expect(received);
+    try std.testing.expect(!slow.a.poisoned);
+    try std.testing.expect(!slow.a.writePending());
+    try slow.a.queueFrame("next");
+    try std.testing.expect(try slow.a.writeStep());
+    const next = (try slow.b.readStep()).frame;
+    defer a.free(next);
+    try std.testing.expectEqualStrings("next", next);
 }
 
 test "frame roundtrip and clean EOF" {

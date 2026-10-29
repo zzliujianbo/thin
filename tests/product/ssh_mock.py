@@ -19,7 +19,8 @@ import struct
 import termios
 
 from daemon_mock import (Case, Child, Screen, FRAME_END, SYNC_BEGIN, wait_daemon_socket,
-                         wait_checkpoint, children_of, stop_daemon, text_answer)
+                         wait_checkpoint, children_of, stop_daemon, text_answer,
+                         assert_screen_idle_contract)
 
 PROMPT = 'ssh-owned-detach-prompt'
 ANSWER = 'ssh-owned-completed-answer'
@@ -48,8 +49,19 @@ class SshChild(Child):
         return end >= 0 and tail.rfind(SYNC_BEGIN) <= end and (not marker or marker in tail[:end])
 
 
+def settled(c, offset=0, marker=b''):
+    """Complete frame after offset that ends on an idle owned composer.
+
+    Readiness is the product's own idle input row (`Screen.idle` reads the
+    cursor row, wherever §3.3 floats the composer), never version/banner text
+    and never an assumption that the composer owns the physical bottom row.
+    """
+    return c.frame_after(offset, marker) and c.screen.idle()
+
+
 def main():
     app = str(Path(sys.argv[1]).resolve())
+    assert_screen_idle_contract()
     root = Path(tempfile.mkdtemp(prefix='thin-ssh-'))
     root.chmod(0o700)
     case = Case(app, root, 'd')
@@ -122,14 +134,23 @@ def main():
         def client(key, name):
             c = SshChild('/usr/bin/ssh', args(key), ws.home, env, name, ws.logs, True, 80, 24)
             case.children.append(c)
-            c.pump_until(lambda: c.idle_after(0, b'thin '), 'real SSH TUI', 20, case.model.check)
-            assert str(ws.home) in [line.strip() for line in c.screen_text().splitlines()], 'initial header must agree with HOME launcher'
+            c.pump_until(lambda: settled(c), 'real SSH TUI', 20, case.model.check)
+            # There is no startup banner to carry the launcher directory. The
+            # initial launcher is proven by resolving '.' against it: a relative
+            # path can only land on the owned HOME if that is the launcher.
+            mark = c.mark()
+            c.send_line('/cd .')
+            c.pump_until(lambda: settled(c, mark, b'Launcher directory:'), 'initial launcher directory', 20, case.model.check)
+            resolved = str(ws.home.resolve())
+            headers = [''.join(row).strip() for row in c.screen.grid if 'Launcher directory:' in ''.join(row)]
+            assert headers and (resolved in headers[-1] or str(ws.home) in headers[-1]), \
+                'initial header must agree with HOME launcher'
             return c
 
         def normal_exit(c):
             c.send(b'\x04')
             c.pump_until(lambda: c.proc.poll() is not None, 'normal SSH exit', 15)
-            assert c.proc.returncode == 0, 'normal SSH exit must be zero'
+            assert c.proc.returncode == 0, 'normal SSH exit must be zero (label=%s returncode=%r)' % (c.label, c.proc.returncode)
 
         # A stalled handshake and a healthy login coexist on the SAME listener.
         slow = socket.create_connection(('127.0.0.1', port), 2)
@@ -145,7 +166,12 @@ def main():
         only_public = root / 'public-only'
         only_public.write_bytes(Path(str(keys['a'])+'.pub').read_bytes())
         unsigned = run(['/usr/bin/ssh'] + args(str(only_public)), env)
-        assert unsigned.returncode != 0 and b'thin 0.' not in unsigned.stdout
+        # A public-key file cannot sign. Require real denial evidence and prove
+        # that no product session/TUI started: no owned frame, cursor ACK,
+        # composer or model decoration may appear on stdout.
+        assert unsigned.returncode != 0 and b'Permission denied' in unsigned.stderr
+        assert SYNC_BEGIN not in unsigned.stdout and b'\x1b[?25h' not in unsigned.stdout
+        assert b'%> ' not in unsigned.stdout and b'(fixture-model)' not in unsigned.stdout
         passed('multi-key-and-signature-required')
         slow.settimeout(13)
         while slow.recv(1024):
@@ -178,7 +204,7 @@ def main():
         revoked = run(['/usr/bin/ssh']+args('a'), env)
         assert revoked.returncode != 0 and b'Permission denied' in revoked.stderr
         mark = a.mark(); a.send_line('/help')
-        a.pump_until(lambda: a.idle_after(mark), 'existing connection survives revocation', 20)
+        a.pump_until(lambda: settled(a, mark), 'existing connection survives revocation', 20)
         c = client('c', 'new-key-c')
         normal_exit(c)
         # Invalid current authorization affects new auth, not established views.
@@ -217,7 +243,14 @@ def main():
         m=b.mark()
         b.screen=Screen(100,35)
         fcntl.ioctl(b.master,termios.TIOCSWINSZ,struct.pack('HHHH',35,100,0,0))
-        b.pump_until(lambda:b.frame_after(m), 'resize ACK', 20)
+        # Resize is passive: Thin takes the new size, drops old-frame authority and
+        # may only release interrupted controls, so there is no automatic frame to
+        # wait for. A bounded owned pump must therefore see no complete frame.
+        b.pump(.25)
+        assert not b.frame_after(m), 'resize-only output drew a frame'
+        # The replacement Screen(100,35) replays only the bytes after this point at
+        # the new width; neither the fixture nor the product reflows the rows above.
+        # The real edit below is what draws the 100-column editor.
         m=b.mark();b.send(b'x'*95)
         b.pump_until(lambda:b.frame_after(m) and draft(b,'x')[0]==95, '100-column draft', 20)
         assert draft(b,'x')[1]==narrow+20
@@ -241,7 +274,7 @@ def main():
 
         live=client('b','detached-task')
         m=live.mark();live.send_line('/cd '+str(ws.project_a))
-        live.pump_until(lambda:live.idle_after(m), 'select project',20)
+        live.pump_until(lambda:settled(live, m, b'Launcher directory:'), 'select project completed',20)
         live.send_line(PROMPT)
         case.wait_prompt(PROMPT)
         live.kill();live.wait();live.close()
@@ -251,9 +284,9 @@ def main():
         checkpoint=wait_checkpoint(ws.project_a,ANSWER)
         again=client('b','reattach-task')
         m=again.mark();again.send_line('/cd '+str(ws.project_a))
-        again.pump_until(lambda:again.idle_after(m),'reattach project',20)
+        again.pump_until(lambda:settled(again, m, b'Launcher directory:'),'reattach project completed',20)
         m=again.mark();again.send_line('/attach '+checkpoint.stem)
-        again.pump_until(lambda:again.idle_after(m,ANSWER.encode()),'canonical answer after detach',30,case.model.check)
+        again.pump_until(lambda:settled(again, m, ANSWER.encode()),'canonical answer after detach',30,case.model.check)
         assert case.model.count()==1
         passed('task-detach-checkpoint-reattach-without-replay')
 

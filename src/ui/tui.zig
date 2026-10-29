@@ -23,6 +23,8 @@ const local_command_output = @import("local_command_output.zig");
 const tool_views_module = @import("tool_views.zig");
 const text = @import("text.zig");
 const markdown = @import("markdown.zig");
+const body_stream = @import("body_stream.zig");
+const plain_tail = @import("plain_tail.zig");
 const tail_frame = @import("tail_frame.zig");
 const StreamPrefix = @import("stream_prefix.zig").Prefix;
 const theme = @import("theme.zig");
@@ -31,9 +33,14 @@ const presentation = @import("presentation.zig");
 const shared = @import("../presentation.zig");
 const bridge_module = @import("bridge.zig");
 const session_client = @import("session_client.zig");
+const remote_action = @import("remote_action.zig");
 const Io = std.Io;
 
 pub const ModelProvider = picker_module.Provider;
+
+/// Ordinary body-repaint cadence. Pending work is coalesced onto this interval,
+/// measured from the previous draw's start; input and geometry never wait for it.
+const draw_interval_ms: u16 = 8;
 
 const StopIdentity = struct {
     runtime: ?*r.Runtime,
@@ -48,11 +55,19 @@ const StopIdentity = struct {
 /// 单条显示记录的字节上限（128 KiB）。超出部分只影响显示，不影响模型历史。
 const record_limit = 128 * 1024;
 
+/// Thinking is a bounded rolling display window, not a transcript: three visible
+/// rows over a fixed conservative retained budget (the tail clamps terminals to
+/// 512 columns). The canonical provider/reasoning history is a separate owner.
+const reasoning_tail_rows = 3;
+const reasoning_tail_bytes = 64 * 1024;
+
 /// 显示记录的种类：用户输入、助手正文、推理内容、工具事件、系统提示。
 const Kind = enum { user, assistant, reasoning, tool, notice };
 
 /// 对话区中的一条显示记录。body 保存原始 UTF-8 文本；渲染结果缓存在 cache 的 arena 中。
 const Record = struct {
+    id: u64 = 0,
+    stream_generation: u64 = 0,
     /// 记录种类，决定标题与 Markdown 渲染方式。
     kind: Kind,
     /// Compact completion caption; explicit local output uses a separate plain record.
@@ -69,10 +84,21 @@ const Record = struct {
     flow_prefix: ?StreamPrefix = null,
     pending_flow_prefix: ?StreamPrefix = null,
     pending_flow_change: bool = false,
+    /// Exact full-prefix comparison for the current layout cache; null means
+    /// unknown. Reset by invalidate() and by every committed-prefix change, so a
+    /// repaint of an unchanged cache never rescans all released rows.
+    flow_match: ?bool = null,
+    /// pending_flow_prefix rows were taken from the still-current lines cache.
+    pending_flow_layout_valid: bool = false,
+    /// Test-only evidence that a cached comparison skipped the exact scan.
+    /// Outside test builds this is void: production ships no tracking storage.
+    flow_scan_count: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
     /// 原始文本（UTF-8），受 record_limit 约束。
     body: std.ArrayList(u8) = .empty,
     /// 文本超过上限被截断；渲染时会附加提示。
     clipped: bool = false,
+    /// A full comparison mirror does not mean streamed output was clipped.
+    mirror_full: bool = false,
     /// 流式草稿因取消或失败而被中断。
     interrupted: bool = false,
     /// 渲染后的行被截断（行数超过上限），标题会标注 display excerpt。
@@ -83,17 +109,47 @@ const Record = struct {
     columns: usize = 0,
     /// 已渲染的显示行，引用 cache arena 中的内存。
     lines: []const []const u8 = &.{},
+    /// Incremental active-answer body: sanitizer, bounded parser window, rows
+    /// with parser-source provenance. Null for static/batch records.
+    stream: ?*body_stream.Body = null,
+    /// Rows already written AND fully ACKed into native scrollback.
+    stream_written: usize = 0,
+    /// Rows written by the in-flight frame; committed only on a full fresh ACK.
+    pending_stream_rows: usize = 0,
+    /// A real canonical revision replaced already-released stream rows.
+    stream_revised: bool = false,
+    stream_columns: usize = 0,
+    /// Static records (restored history) deliberately use the batch renderer.
+    batch: bool = false,
+    /// Heap-owned bounded incremental thinking tail. It survives invalidate()
+    /// and Record moves unchanged (the Writer sink points at the heap Tail, not
+    /// at this record) and is destroyed exactly once, in deinit().
+    tail: ?*plain_tail.Tail = null,
+    /// Absolute source end this record's rows have actually proven visible for
+    /// the CURRENT stream generation. Persists across frames: displayed content
+    /// stays displayed, and a later fence for the same generation may use it.
+    delivery_visible: usize = 0,
+    /// At least one complete fresh frame displayed every row this record had at
+    /// the time (no cropped tail, no modal replacement).
+    delivery_complete: bool = false,
 
     /// 释放渲染缓存，下次 layout 时重新渲染。
     fn invalidate(self: *Record) void {
         if (self.cache) |*cache| cache.deinit();
         self.cache = null;
         self.lines = &.{};
+        // A staged checkpoint belongs to the cache it was copied from.
+        self.flow_match = null;
+        self.pending_flow_layout_valid = false;
     }
 
     /// 释放记录占用的全部内存（渲染缓存与原始文本）。
     fn deinit(self: *Record, a: std.mem.Allocator) void {
         self.invalidate();
+        if (self.stream) |stream| stream.destroy();
+        self.stream = null;
+        if (self.tail) |tail| tail.destroy();
+        self.tail = null;
         if (self.flow_prefix) |*prefix| prefix.deinit();
         self.discardPendingFlow();
         self.body.deinit(a);
@@ -104,14 +160,52 @@ const Record = struct {
         if (self.pending_flow_prefix) |*prefix| prefix.deinit();
         self.pending_flow_prefix = null;
         self.pending_flow_change = false;
+        self.pending_flow_layout_valid = false;
+    }
+
+    /// Cached exact prefix comparison. Only a layout invalidation (or a new
+    /// committed prefix) clears it, so ordinary repaints reuse the verdict.
+    fn flowMatches(self: *Record, columns: usize) bool {
+        const shown = if (self.flow_prefix) |*prefix| prefix else return false;
+        // A width that is not this cache's layout cannot reuse or overwrite its
+        // verdict. Callers re-layout before asking for a real comparison.
+        if (columns != self.columns or self.cache == null) return false;
+        if (self.flow_match) |cached| return cached;
+        if (@import("builtin").is_test) self.flow_scan_count += 1;
+        const matched = shown.matches(self.lines, columns);
+        self.flow_match = matched;
+        return matched;
     }
 
     fn stageFlow(self: *Record, a: std.mem.Allocator, count: usize) !bool {
+        if (count > self.lines.len) return false;
         var next: ?StreamPrefix = null;
-        if (count != 0) next = (try StreamPrefix.capture(a, self.lines[0..count], self.columns)) orelse return false;
+        if (count != 0) {
+            // Grow from an already-released checkpoint instead of recopying the
+            // whole prefix. A pending checkpoint from this same cache needs no
+            // scan; a committed one needs the exact comparison after new text or
+            // a new width. Bounds/OOM leave the current checkpoint untouched.
+            const base: ?*StreamPrefix = blk: {
+                if (self.pending_flow_prefix != null and self.pending_flow_layout_valid) {
+                    if (self.pending_flow_prefix) |*prefix| break :blk prefix;
+                } else if (self.flow_prefix) |*prefix| {
+                    if (self.flowMatches(self.columns)) break :blk prefix;
+                }
+                break :blk null;
+            };
+            if (base) |prior| {
+                if (count < prior.rowCount())
+                    next = try StreamPrefix.capture(a, self.lines[0..count], self.columns) orelse return false
+                else
+                    next = try prior.extend(a, self.lines[prior.rowCount()..count], self.columns) orelse return false;
+            } else {
+                next = try StreamPrefix.capture(a, self.lines[0..count], self.columns) orelse return false;
+            }
+        }
         self.discardPendingFlow();
         self.pending_flow_prefix = next;
         self.pending_flow_change = true;
+        self.pending_flow_layout_valid = next != null;
         return true;
     }
 
@@ -127,22 +221,69 @@ const Record = struct {
         self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome, .write_marks = if (caption.write_marks) |marks| marks.shifted(start + activity.icon(caption.kind).len + 1) else null });
     }
 
+    /// Create the bounded thinking tail once, at the current terminal width.
+    /// A standalone record (columns == 0) uses the documented 80-column default.
+    fn attachTail(self: *Record, a: std.mem.Allocator, columns: usize) !void {
+        if (self.tail != null) return;
+        self.tail = try plain_tail.Tail.create(a, if (columns == 0) 80 else columns, reasoning_tail_rows, reasoning_tail_bytes);
+    }
+
     /// 追加文本。超出 record_limit 时截断，并在截断后忽略后续追加。
+    fn resetStream(self: *Record) !void {
+        self.stream_generation +%= 1;
+        self.pending_output = false;
+        if (self.stream) |stream| stream.destroy();
+        self.stream = null;
+        self.stream_written = 0;
+        self.pending_stream_rows = 0;
+        self.stream_columns = 0;
+        // A new generation owns new source; an old frame's coverage cannot be
+        // reused as proof for it.
+        self.delivery_visible = 0;
+        self.delivery_complete = false;
+    }
+
     fn append(self: *Record, a: std.mem.Allocator, bytes: []const u8) !void {
-        if (self.kind == .reasoning) {
-            // Thinking is a bounded rolling window, not a permanent transcript.
-            // Keep the newest UTF-8 suffix even after the first display limit.
-            var start = bytes.len -| record_limit;
-            while (start < bytes.len and bytes[start] & 0xc0 == 0x80) start += 1;
-            const suffix = bytes[start..];
-            var drop = self.body.items.len + suffix.len -| record_limit;
-            while (drop < self.body.items.len and self.body.items[drop] & 0xc0 == 0x80) drop += 1;
-            if (drop != 0) {
-                std.mem.copyForwards(u8, self.body.items, self.body.items[drop..]);
-                self.body.items.len -= drop;
+        if (self.kind == .assistant and !self.batch) {
+            // Active body display is never gated by the 128 KiB mirror. Input
+            // ownership belongs to the incremental Body; `body` is a bounded
+            // preview used only for the one exact canonical comparison.
+            if (self.stream == null) {
+                const columns = if (self.columns != 0) self.columns else 80;
+                self.stream = try body_stream.Body.create(a, columns);
+                self.stream_columns = columns;
             }
-            try self.body.appendSlice(a, suffix);
-            self.clipped = self.clipped or start != 0 or drop != 0;
+            self.stream.?.append(bytes) catch |err| {
+                // A failed parse/limit must not lose the bytes already accepted;
+                // Body retains them and reports a sticky display limit.
+                self.invalidate();
+                return err;
+            };
+            if (!self.mirror_full) {
+                var end = @min(record_limit - self.body.items.len, bytes.len);
+                while (end > 0 and end < bytes.len and bytes[end] & 0xc0 == 0x80) end -= 1;
+                try self.body.appendSlice(a, bytes[0..end]);
+                self.mirror_full = end < bytes.len;
+            }
+            self.invalidate();
+            return;
+        }
+        // Static content changes invalidate an older frame's output candidate;
+        // incremental reasoning and assistant streams retain their owner generation.
+        if (self.kind != .reasoning) self.stream_generation +%= 1;
+        self.pending_output = false;
+        self.delivery_visible = 0;
+        self.delivery_complete = false;
+        if (self.kind == .reasoning) {
+            // Incremental only: feed the new chunk into the bounded tail. No
+            // 128 KiB body is retained or rescanned, and the tail owns its own
+            // sanitizer state, rows and retained source window.
+            try self.attachTail(a, self.columns);
+            self.tail.?.append(bytes) catch |err| {
+                // Even a partial append/limit change must not leave a stale frame.
+                self.invalidate();
+                return err;
+            };
             self.invalidate();
             return;
         }
@@ -160,13 +301,67 @@ const Record = struct {
 
     /// 按列宽渲染为显示行并缓存；缓存有效（列宽未变）时直接返回。
     fn layout(self: *Record, a: std.mem.Allocator, columns: usize) !void {
-        if (self.cache != null and self.columns == columns) return;
+        if (self.cache != null and self.columns == columns) {
+            // The cached slices borrow Body's render. A completed zero-row
+            // frame can release its pin while leaving this cache intact; repin
+            // through build before using the slices or their coverage as proof.
+            if (self.stream == null or self.stream.?.pinned) return;
+        }
         self.invalidate();
 
         // 渲染用的临时内存放在独立 arena 中，成功后整体交给 self.cache 持有。
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const temp = arena.allocator();
+
+        if (self.stream) |stream| {
+            if (stream.columnCount() != columns) stream.resize(columns);
+            stream.build() catch |err| {
+                if (err == error.OutOfMemory) return err;
+            };
+            const rows = stream.visibleRows();
+            const limited = stream.limit != .none;
+            const lines = try temp.alloc([]const u8, rows.len + @intFromBool(limited));
+            for (rows, 0..) |row, i| lines[i] = row.text;
+            if (limited) lines[rows.len] = try temp.dupe(u8, "[Display render limit; model history unchanged]");
+            self.lines = lines;
+            self.excerpt = limited;
+            self.columns = columns;
+            self.cache = arena;
+            return;
+        }
+
+        if (self.kind == .reasoning) {
+            const tail = self.tail orelse {
+                // A failed create must still leave a readable (empty) record.
+                self.lines = &.{};
+                self.excerpt = false;
+                self.columns = columns;
+                self.cache = arena;
+                return;
+            };
+            // Reflow ONLY on a real width change, and only the retained source.
+            // snapshot() is a clone: a repeated redraw never re-consumes bytes.
+            if (tail.columns() != columns) try tail.resize(columns);
+            const snap = try tail.snapshot(temp);
+            if (snap.limit == .none) {
+                self.lines = snap.rows;
+            } else {
+                // Sticky display limit is explicit inside the three-row window;
+                // never silently fall back to the unbounded old source.
+                const marker = try std.fmt.allocPrint(temp, "thinking display limited: {s}; model history unchanged", .{@tagName(snap.limit)});
+                const line = try presentation.singleLine(temp, marker, columns);
+                const styled = try std.fmt.allocPrint(temp, "{s}{s}{s}", .{ theme.reset, theme.caution, line });
+                const rows = try temp.alloc([]const u8, snap.rows.len + 1);
+                @memcpy(rows[0..snap.rows.len], snap.rows);
+                rows[snap.rows.len] = styled;
+                self.lines = rows;
+            }
+            self.excerpt = false;
+            self.columns = columns;
+            self.cache = arena;
+            return;
+        }
 
         if (self.command_row) {
             const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns, self.duration_ms, null);
@@ -254,6 +449,9 @@ pub const Connection = struct {
     /// checkpoints stay owned by the backend and the UI only submits, ACKs and
     /// renders. Absent keeps the original local foreground ownership path.
     session_client: ?session_client.Client = null,
+    /// Optional nonblocking command/completion channel. Queue admission never
+    /// authorizes optimistic UI success or bypasses the existing frame ACK.
+    async_actions: ?remote_action.Channel = null,
 
     pub const State = struct {
         runtime: ?*r.Runtime,
@@ -365,14 +563,13 @@ pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge
     var terminal = try terminal_module.Terminal.open();
     // defer 逆序执行：先 ui.deinit（等待 worker 结束），再 terminal.deinit（恢复终端）。
     defer terminal.deinit();
+    if (connection.async_actions) |actions| try terminal.setNotification(actions.wake_fd);
     var ui = Ui{ .allocator = a, .io = io, .connection = connection, .bridge = bridge, .cancel = cancel, .terminal = &terminal, .editor = .{ .allocator = a }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" } };
     defer ui.deinit();
 
-    var directory: [Io.Dir.max_path_bytes]u8 = undefined;
-    const directory_len = try Io.Dir.cwd().realPath(io, &directory);
-    const banner = try @import("startup.zig").banner(a, directory[0..directory_len], Io.Clock.real.now(io).toSeconds());
-    defer a.free(banner);
-    _ = try ui.add(.notice, banner);
+    // Initial entry owns exactly the composer at the terminal's current row:
+    // no startup banner, no blank-screen padding and no implied bottom. Explicit
+    // history restore, real notices/errors and real output grow from there.
     if (connection.initial_history_fn) |history| try ui.restoreHistory(history(connection.context));
     // Remote attach may already own a running task; adopt its epoch before the
     // first frame so a stale approval or queue send cannot cross sessions.
@@ -399,11 +596,110 @@ fn finishExit(terminal: *terminal_module.Terminal, result: u8, read_signal: *con
 }
 
 /// TUI 的全部状态。只在 UI 线程（run/loop）中访问；后台 Job 只通过 bridge 与之通信。
+const AsyncPurpose = enum { submit, enqueue, withdraw, manage, approve, cancel, cancel_clear, open_stop, release_stop, queue_resume, configure, model, effort, preference, setting, decision, image, proxy, proxy_address, refresh };
+const AsyncPending = struct {
+    ticket: u64,
+    purpose: AsyncPurpose,
+    original_editor: []u8,
+    editor_revision: u64,
+    epoch: u64,
+    permission_id: ?u64,
+    inherited: bool = false,
+    previous_effort: shared.ReasoningEffort,
+    settings_generation: u64,
+    stop_instance: u64,
+    record: ?Record = null,
+    history_entry: ?[]u8 = null,
+
+    fn deinit(self: *AsyncPending, a: std.mem.Allocator) void {
+        if (self.record) |*record| record.deinit(a);
+        if (self.history_entry) |entry| @import("input_history.zig").History.discard(a, entry);
+        std.crypto.secureZero(u8, self.original_editor);
+        a.free(self.original_editor);
+    }
+};
+
+const FrameRecord = struct {
+    record_id: u64,
+    generation: u64,
+    stream_rows: usize = 0,
+    /// A zero-row metadata render staged in an unobscured frame.
+    metadata_staged: bool = false,
+    output_candidate: bool = false,
+    flow_change: bool = false,
+    flow_prefix: ?StreamPrefix = null,
+    flow_layout_valid: bool = false,
+    /// Absolute accepted source end this frame actually displayed for the
+    /// record, captured from the pinned render BEFORE `Body.commit`. Zero means
+    /// no source was proven visible by this frame.
+    visible_source_end: usize = 0,
+    /// Candidates captured before commit: coverage of the whole pinned render,
+    /// and coverage of the frozen prefix rows that went to native scrollback.
+    stream_full_end: usize = 0,
+    stream_prefix_end: usize = 0,
+    /// This record has no undisplayed row left over after this frame's layout:
+    /// every row either went to native scrollback or sits inside the visible
+    /// mutable tail. A cropped/overlaid tail is never "complete".
+    visible_complete: bool = false,
+    /// Index into the frame's mutable tail where this record's tail rows begin,
+    /// and how many rows it contributed. Used only to decide `visible_complete`
+    /// after the final tail crop is known.
+    tail_line_start: usize = 0,
+    tail_rows: usize = 0,
+    /// Thinking is a rolling window: its proof is "the newest rows are on
+    /// screen", not "every retained row exists".
+    reasoning: bool = false,
+};
+
+/// One admitted live event's display obligation. Created only AFTER the event
+/// was successfully applied, so its target is state the UI really owns; nothing
+/// here is a prediction. Fences keep the admitted order and are never merged
+/// while their proof is outstanding, so an unmet hole can never swallow a later
+/// independently shown event.
+///
+/// `record_id == 0` means the event has no display record of its own (owner
+/// state, usage, captions): a complete fresh frame staged after application
+/// proves it. A record fence needs that record's rows actually displayed, so a
+/// retained mutable window can still be acknowledged without waiting for EOF.
+const DeliveryFence = struct {
+    epoch: u64,
+    /// Highest sequence this entry covers (its own sequence, or the last of an
+    /// already-enqueued proven run).
+    sequence: u64,
+    /// Lowest sequence of that run; equals `sequence` for a single event.
+    first: u64 = 0,
+    record_id: u64 = 0,
+    generation: u64 = 0,
+    /// Absolute accepted source end that must be visible for this record.
+    /// Zero for records without an incremental body (a whole-row obligation).
+    target: usize = 0,
+    reasoning: bool = false,
+    proven: bool = false,
+    /// Its exact interval was already handed to the delivery ACK channel. The
+    /// proof is retained (compactly) only to advance the contiguous watermark.
+    enqueued: bool = false,
+};
+
+/// Bounded per-event fences, one per admitted live sequence and never merged:
+/// an unmovable later target must not swallow earlier already-shown proof. The
+/// bound is real backpressure, not a discard policy (`displayBackpressured`).
+const delivery_fence_capacity = 256;
+
+/// What an applied live payload actually advanced. `source` distinguishes a
+/// payload that appended new source bytes from one that carried none (an
+/// exactly empty text/reasoning delta): an empty increment owns no source
+/// obligation, so it must never inherit the current body's accepted end.
+const DeliveryReceipt = struct { id: u64, generation: u64, reasoning: bool = false, source: bool = true };
+
 const Ui = struct {
     /// 分配显示记录、草稿与帧缓冲的内存分配器。
     allocator: std.mem.Allocator,
     io: Io,
     connection: Connection,
+    async_pending: [8]?AsyncPending = @splat(null),
+    async_stop_intent: u64 = 0,
+    stop_instance: u64 = 0,
+    withdrawn_draft: ?[]u8 = null,
     /// 事件队列与审批应答通道，运行时与 UI 的唯一桥梁。
     bridge: *bridge_module.Bridge,
     /// 取消信号，与后台任务共享。
@@ -415,6 +711,7 @@ const Ui = struct {
     secret_quarantine: bool = false,
     /// 输入框编辑器（UTF-8 字节缓冲）。
     editor: input.Editor,
+    editor_revision: u64 = 0,
     input_history: @import("input_history.zig").History = .{},
     history_draft: ?input.Editor = null,
     history_draft_pasted: bool = false,
@@ -463,6 +760,9 @@ const Ui = struct {
     last_input_ms: u64 = 0,
     /// 对话显示记录；超过 64 条或约 1 MiB 时丢弃最旧的。
     records: std.ArrayList(Record) = .empty,
+    record_index: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    next_record_id: u64 = 1,
+    draw_record_visits: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
     /// 正在流式接收的助手正文记录索引；null 表示没有草稿。
     draft: ?usize = null,
     /// 正在流式接收的推理记录索引。
@@ -482,10 +782,10 @@ const Ui = struct {
     permission_scroll: usize = 0,
     /// 审批期间是否出现过粘贴；出现后该审批只能拒绝。
     approval_paste_seen: bool = false,
-    /// 对话区向上滚动的行数（0 表示贴底）。
-    scroll: usize = 0,
     /// 已有旧记录被丢弃，标题栏会提示 older display clipped。
     dropped_display: bool = false,
+    /// Static restored history uses the batch renderer, not live streaming.
+    restoring: bool = false,
     /// 后台任务是否正在运行。
     busy: bool = false,
     // The UI owns the only inbox. Never reach through State.runtime to draw it:
@@ -504,10 +804,42 @@ const Ui = struct {
     /// Remote control epoch currently displayed; a change retires old ACK
     /// authority and any queue ownership for the replaced session.
     remote_epoch: u64 = 0,
+    // Live delivery is admitted only after application, and proven only by a
+    // complete fresh frame. A failed nonblocking enqueue retains the proof.
+    delivery_epoch: u64 = 0,
+    delivery_admitted: u64 = 0,
+    delivery_proven: u64 = 0,
+    delivery_acked: u64 = 0,
+    delivery_fault: bool = false,
+    /// The attached adapter has no ACK channel. Display stays truthful and the
+    /// watermark stays pending; this is reported once instead of silently
+    /// retiring live content the backend would resend.
+    delivery_ack_unsupported: bool = false,
+    /// The adapter has no exact-range ACK channel. Selective proof is retained
+    /// but can never be handed over; this is reported instead of closing a hole
+    /// with a cumulative claim.
+    delivery_range_unsupported: bool = false,
+    delivery_fences: std.ArrayListUnmanaged(DeliveryFence) = .empty,
+    /// Post-application identity of the record the last event advanced.
+    delivery_receipt: ?DeliveryReceipt = null,
+    frame_delivery_epoch: u64 = 0,
+    frame_delivery_sequence: u64 = 0,
+    /// This frame wrote the applied session state (body tail, thinking window
+    /// or the approval modal). A narrow/hidden frame proves nothing.
+    frame_delivery_shown: bool = false,
+    frame_delivery_reasoning: bool = false,
+    terminal_delivery: ?struct { epoch: u64, sequence: u64 } = null,
+    replay_refused: bool = false,
     remote_observed_busy: bool = false,
+    remote_observed_sync: bool = false,
     remote_kind: session_client.TaskKind = .prompt,
     /// Consecutive idle observations used to settle a lost remote terminal.
     remote_idle_ticks: u8 = 0,
+    /// A remote terminal was already handled while the owner still reported that
+    /// same task busy. The result and its notice stay visible, but the view keeps
+    /// the busy composer until ordered owner idle or a new task state event
+    /// arrives; a repeated busy snapshot proves neither.
+    remote_terminal_wait: bool = false,
     /// Epoch injected with the next display event; copied into the approval so
     /// the decision is bound to the session that displayed it.
     inject_epoch: u64 = 0,
@@ -525,11 +857,18 @@ const Ui = struct {
     poisoned: bool = false,
     /// 是否需要重绘，由事件与按键置位。
     dirty: bool = true,
-    /// Genuine input/content, unlike a pulse or settled-resize repair.
+    /// Ordinary body repaints coalesce on this cadence, measured from the start
+    /// of the previous draw. It is a scheduling parameter, not a latency budget.
+    last_draw_ms: u64 = 0,
+    /// Keyboard input pending an actual fresh draw. Cleared only when that draw
+    /// is staged, so input preempts the ordinary cadence without ever cutting an
+    /// already-started frame or a pending geometry/resize turn.
+    urgent_draw: bool = false,
+    /// Genuine input/content, unlike an animation pulse.
     display_changed: bool = true,
+    /// Geometry is unproven: inhibit animation and staging until real input or
+    /// content calls requestDraw. There is no timer and no automatic repair.
     resize_waiting: bool = false,
-    /// Coalesce geometry changes, then repair a viewport reflow may have lost.
-    resize_redraw_at_ms: ?u64 = null,
     /// UI接收状态：用于计时/忙碌标记，不显示常驻mode文字。
     mode: ?r.State = null,
     /// 仅必要的错误、设置和隔离提示使用临时hint。
@@ -562,18 +901,13 @@ const Ui = struct {
     prompt: ?[]const u8 = null,
     /// 待写出帧所在的 arena，帧全部写完后释放。
     frame_arena: ?std.heap.ArenaAllocator = null,
+    frame_records: []FrameRecord = &.{},
     /// Independent bounded copies, never borrowed Record.lines. Only complete
     /// writes publish the candidate as a reusable acknowledged tail snapshot.
     frame_tail_snapshot: ?tail_frame.Snapshot = null,
     tail_snapshot: ?tail_frame.Snapshot = null,
     menu_history: ?tail_frame.MenuHistory = null,
     frame_menu_history: ?tail_frame.MenuHistory = null,
-    /// Rebuild a display-only history window after resize revokes a popup's
-    /// physical backing coordinates. Never replay these rows as model history.
-    menu_history_recovery: bool = false,
-    /// Sparse relative edits cannot survive reflow: keep a full one-pass tail
-    /// in the same frame arena for CAN/bottom recovery after any resize.
-    frame_full_tail: []const u8 = "",
     frame_sparse: bool = false,
     /// Display requests, not messages. Only a complete frame consumes them.
     idle_breaks: u16 = 0,
@@ -581,6 +915,9 @@ const Ui = struct {
     frame_idle_prefix_end: usize = 0,
     compact_composer: bool = false,
     compact_hint_hash: u64 = 0,
+    /// Last fully ACKed footer hint. Idle release may compact only while the
+    /// currently visible hint is still that ACKed one.
+    tail_hint_hash: u64 = 0,
     frame_hint_hash: u64 = 0,
     /// A normal Enter behind display-only breaks waits for their ACK, never
     /// until the next task completes. Move the editor (no allocation) so typing
@@ -595,6 +932,8 @@ const Ui = struct {
     frame_cursor_rows_up: usize = 0,
     frame_composer_rows: usize = 1,
     frame_size: terminal_module.Size = .{ .columns = 0, .rows = 0 },
+    /// Rows borrowed from ACKed transcript rows for an overlay in this frame.
+    frame_borrow_rows: usize = 0,
     frame_fresh: bool = false,
     /// Requeue a real update interrupted before ACK; never requeue a pure pulse.
     frame_changed: bool = false,
@@ -602,6 +941,13 @@ const Ui = struct {
     /// A resize may interrupt even an escape sequence in the reclaim prefix.
     resize_rescue: []const u8 = "",
     tail_height: usize = 0,
+    /// True only while the ACKed tail is proven to end at the physical bottom.
+    /// Promoted by a fresh complete frame whose footprint fills the screen and
+    /// dropped by any resize or abandoned tail. Delete-line/erase optimizations
+    /// below the owned footprint require it; a floating tail uses row rewrites.
+    tail_bottom: bool = false,
+    /// Staged proof for `tail_bottom`; promoted only by finishFrame's ACK.
+    frame_bottom: bool = false,
     /// Published only by a complete ACK, relative to the tail's bottom row.
     tail_cursor_rows_up: usize = 0,
     tail_composer_rows: usize = 1,
@@ -628,6 +974,8 @@ const Ui = struct {
         self.clearToolCaptions();
         self.tool_calls.deinit(self.allocator);
         self.tool_views.deinit(self.allocator);
+        self.discardFrameRecords(self.frame_records);
+        self.frame_records = &.{};
         if (self.frame_arena) |*arena| arena.deinit();
         if (self.frame_tail_snapshot) |*snapshot| snapshot.deinit();
         if (self.tail_snapshot) |*snapshot| snapshot.deinit();
@@ -635,6 +983,8 @@ const Ui = struct {
         if (self.frame_menu_history) |*history| history.deinit();
         for (self.records.items) |*record| record.deinit(self.allocator);
         self.records.deinit(self.allocator);
+        self.record_index.deinit(self.allocator);
+        self.delivery_fences.deinit(self.allocator);
         self.secret.deinit();
         self.closeModelPicker();
         self.parser.secretMode(false);
@@ -648,6 +998,11 @@ const Ui = struct {
         self.dropProxyRestore();
         if (self.notice_owned) |owned| self.allocator.free(owned);
         if (self.stop_close) |id| self.allocator.free(id);
+        for (&self.async_pending) |*pending| if (pending.*) |*value| value.deinit(self.allocator);
+        if (self.withdrawn_draft) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            self.allocator.free(bytes);
+        }
     }
 
     // ---- Remote session adapter -------------------------------------------------
@@ -657,6 +1012,238 @@ const Ui = struct {
 
     fn remote(self: *const Ui) ?session_client.Client {
         return self.connection.session_client;
+    }
+
+    fn hasAsync(self: *const Ui, purpose: AsyncPurpose) bool {
+        for (self.async_pending) |pending| if (pending) |value| {
+            if (value.purpose == purpose) return true;
+        };
+        return false;
+    }
+
+    fn presentationWaiting(self: *const Ui) bool {
+        // A request is not an accepted Runtime task, but it is not a settled
+        // idle composer either. Keep task/history state receipt-gated.
+        for (self.async_pending) |pending| if (pending != null) return true;
+        return false;
+    }
+
+    fn urgentAsync(purpose: AsyncPurpose) bool {
+        return switch (purpose) {
+            .approve, .cancel, .cancel_clear, .open_stop, .release_stop => true,
+            else => false,
+        };
+    }
+
+    fn normalAsyncPending(self: *const Ui) bool {
+        for (self.async_pending) |pending| if (pending) |value| {
+            if (!urgentAsync(value.purpose)) return true;
+        };
+        return false;
+    }
+
+    fn blocksSubmit(self: *const Ui) bool {
+        // Thinking/metadata probes do not switch the primary model or session.
+        // Preserve a fast Enter behind them instead of dropping submit intent.
+        for (self.async_pending) |pending| if (pending) |value| {
+            if (!urgentAsync(value.purpose) and value.purpose != .effort and value.purpose != .refresh) return true;
+        };
+        return false;
+    }
+
+    fn beginAsync(self: *Ui, action: remote_action.Action, purpose: AsyncPurpose) ?*AsyncPending {
+        const channel = self.connection.async_actions orelse return null;
+        if ((!urgentAsync(purpose) and (if (purpose == .submit) self.blocksSubmit() else self.normalAsyncPending())) or
+            (purpose != .open_stop and purpose != .release_stop and self.hasAsync(purpose)))
+        {
+            self.notice = "Operation pending; input kept";
+            return null;
+        }
+        var target: ?*?AsyncPending = null;
+        for (&self.async_pending) |*slot| if (slot.* == null) {
+            target = slot;
+            break;
+        };
+        const slot = target orelse {
+            self.notice = "Control queue full; input kept";
+            return null;
+        };
+        const original = self.allocator.dupe(u8, self.editor.bytes.items) catch {
+            self.notice = "Out of memory; action not sent";
+            return null;
+        };
+        const epoch = if (purpose == .approve) (if (self.permission) |permission| permission.epoch else self.remote_epoch) else self.remote_epoch;
+        const ticket = channel.start(epoch, action) catch |err| {
+            self.allocator.free(original);
+            self.notice = session_client.describe(err);
+            return null;
+        };
+        slot.* = .{ .ticket = ticket, .purpose = purpose, .original_editor = original, .editor_revision = self.editor_revision, .epoch = epoch, .permission_id = if (self.permission) |permission| permission.id else null, .previous_effort = self.connection.current().reasoning_effort, .settings_generation = self.settings_menu.generation, .stop_instance = self.stop_instance };
+        if (purpose == .open_stop or purpose == .release_stop) self.async_stop_intent = ticket;
+        self.parser.stop_feed = true;
+        self.notice = "Waiting for session...";
+        self.requestDraw();
+        return &slot.*.?;
+    }
+
+    fn clearSubmittedEditor(self: *Ui, pending: *const AsyncPending) void {
+        if (self.editor_revision == pending.editor_revision and std.mem.eql(u8, self.editor.bytes.items, pending.original_editor)) self.wipeEditor();
+    }
+
+    fn adoptWithdrawn(self: *Ui, bytes: []u8) void {
+        self.editor.deinit();
+        self.editor = .{ .allocator = self.allocator, .bytes = .{ .items = bytes, .capacity = bytes.len, .pointer_stability = .{} }, .cursor = bytes.len };
+        self.editor_pasted = false;
+        self.input_history.index = null;
+        self.vertical_column = null;
+        self.notice = "Pending message withdrawn as plain draft";
+    }
+
+    fn activateStop(self: *Ui) void {
+        self.stop_instance +%= 1;
+        self.stop_open = true;
+        self.stop_danger = false;
+        self.stop_identity = self.stopIdentity();
+        self.invalidateStop();
+        self.parser.stop_feed = true;
+    }
+
+    fn pumpAsync(self: *Ui) void {
+        const channel = self.connection.async_actions orelse return;
+        for (0..self.async_pending.len) |_| {
+            var completion = channel.poll() orelse break;
+            defer completion.deinit();
+            var found: ?AsyncPending = null;
+            for (&self.async_pending) |*slot| if (slot.*) |pending| {
+                if (pending.ticket == completion.request.ticket) {
+                    found = pending;
+                    slot.* = null;
+                    break;
+                }
+            };
+            var pending = found orelse continue;
+            defer pending.deinit(self.allocator);
+            if (completion.obsolete) continue;
+            if (pending.purpose == .approve) {
+                const permission = self.permission orelse continue;
+                if (permission.epoch != pending.epoch or permission.id != pending.permission_id) continue;
+            }
+            if (completion.failure) |err| {
+                self.notice = if (err == error.PublicationUnavailable) "Operation result unavailable; verify before retrying" else switch (pending.purpose) {
+                    .refresh => if (err == error.NoOfficialProvider) "No official provider configured; use /login first" else if (err == error.MetadataRefreshBusy) "Official metadata refresh already running" else "Could not start metadata refresh; previous cache kept",
+                    .effort => switch (err) {
+                        error.ThinkingCapabilitiesLoading => "Thinking capabilities are loading; try Shift+Tab again shortly",
+                        error.ThinkingCapabilitiesUnknown => "Thinking capabilities unknown: refresh /model or declare reasoning levels in configuration",
+                        else => "Could not save thinking option; previous option kept",
+                    },
+                    .configure => "Could not save configuration; use /login to retry",
+                    .model => "Could not switch; selection is unchanged",
+                    .preference, .setting, .decision, .image, .proxy, .proxy_address => "Could not save setting; previous value kept",
+                    else => session_client.describe(err),
+                };
+                if (pending.purpose == .configure and self.secret_mode) self.endSecret();
+                self.requestDraw();
+                continue;
+            }
+            self.completeAsync(&pending, &completion);
+            self.requestDraw();
+        }
+    }
+
+    fn completeAsync(self: *Ui, pending: *AsyncPending, completion: *remote_action.Completion) void {
+        const action = completion.request.action;
+        switch (pending.purpose) {
+            .submit => {
+                const record = if (pending.record) |*value| value else return;
+                if (self.remote()) |client| self.remote_epoch = client.snapshot().control_epoch;
+                self.acceptRemote(action.submit.kind, record, &pending.history_entry);
+                self.clearSubmittedEditor(pending);
+            },
+            .enqueue => {
+                self.clearSubmittedEditor(pending);
+                self.notice = if (action.enqueue.kind == .steering) "Steering pending" else "FollowUp pending";
+            },
+            .withdraw => {
+                if (completion.value != .withdrawn) return;
+                const bytes = completion.value.withdrawn orelse {
+                    self.notice = "Message already consumed; nothing withdrawn";
+                    return;
+                };
+                completion.value = .none;
+                if (self.editor.bytes.items.len == 0) self.adoptWithdrawn(bytes) else {
+                    self.withdrawn_draft = bytes;
+                    self.notice = "Message withdrawn; clear draft and press Esc to restore it";
+                }
+            },
+            .manage => {
+                if (completion.value == .managed) self.acceptManage(&completion.value.managed, true);
+            },
+            .approve => {
+                if (self.permission) |permission| if (permission.epoch == pending.epoch and permission.id == action.approve.id) self.clearPermission();
+                self.notice = if (action.approve.decision == .deny) "Request denied" else "Allowed once";
+            },
+            .cancel, .cancel_clear => {
+                if (self.permission) |permission| if (permission.epoch == pending.epoch and pending.permission_id == permission.id) self.clearPermission();
+                if (pending.purpose == .cancel_clear and self.stop_open and self.stop_instance == pending.stop_instance) {
+                    self.stop_open = false;
+                    self.stop_identity = null;
+                    self.stop_instance +%= 1;
+                    self.invalidateStop();
+                }
+                if (self.last_terminal) |result| {
+                    // A late cancel receipt must not replace a handled terminal
+                    // while the view waits for ordered owner idle.
+                    if (self.remote_terminal_wait) self.notice = terminalNotice(result);
+                } else self.notice = if (pending.purpose == .cancel_clear) "Stop requested; queue cleared; draft kept" else "Cancellation requested; cleaning up, not rolling back effects";
+            },
+            .open_stop => if (self.async_stop_intent == pending.ticket) {
+                self.activateStop();
+                self.notice = "Confirm stop";
+            },
+            .release_stop => if (self.async_stop_intent == pending.ticket and self.last_terminal == null) {
+                self.notice = "Stop dismissed";
+            },
+            .queue_resume => {
+                self.clearSubmittedEditor(pending);
+                self.notice = "Queue resumed";
+            },
+            .configure => {
+                if (self.secret_mode) self.endSecret();
+                self.secret_quarantine = false;
+                self.notice = if (action.configure.provider != null) "Key saved locally; use /model to select or activate it" else "Saved locally; send a message to connect";
+            },
+            .model => {
+                self.finishModelSelection(pending.inherited);
+                self.clearSubmittedEditor(pending);
+            },
+            .effort => {
+                const next = if (completion.value == .effort) completion.value.effort else self.connection.current().reasoning_effort;
+                if (next == pending.previous_effort) {
+                    self.notice = "This model has no other supported thinking level";
+                    return;
+                }
+                self.display.setEffort(next);
+                self.effort_flash = .{ .level = next, .until_ms = self.clock_ms +| 2000 };
+                self.notice = "Ready";
+            },
+            .preference, .setting, .decision, .image, .proxy, .proxy_address => {
+                self.display.context = self.connection.current().initial_context;
+                self.frame_settings_generation = null;
+                const same_menu = self.settings_open and self.settings_menu.generation == pending.settings_generation;
+                if (same_menu) switch (pending.purpose) {
+                    .preference => if (self.settings_value_picker != null) self.backFromSettingsValue(),
+                    .decision, .image => if (self.settingsModelOpen()) self.backToSettings(),
+                    .proxy_address => if (self.proxy_address_open) self.backToProxySubmenu(0),
+                    else => {},
+                };
+                self.notice = switch (pending.purpose) {
+                    .proxy => "Saved proxy models; main route applies in a new session",
+                    .proxy_address => if (action.proxy_address.len == 0) "Empty disables proxy; a new session applies it" else "Saved proxy address; main route applies in a new session",
+                    else => "Ready",
+                };
+            },
+            .refresh => self.notice = "Refreshing official model metadata...",
+        }
     }
 
     /// True for a locally executed !command, which projects literal streams.
@@ -715,11 +1302,10 @@ const Ui = struct {
         }
     }
 
-    /// Transfer the next backend display event into the local Bridge. Only one
-    /// event is injected per tick into a provably empty queue: this thread both
-    /// produces and consumes that queue, so a blocking emit on a full queue
-    /// could never make progress.
+    /// Apply an owned remote event directly while its payload is alive. Only
+    /// the terminal uses the Bridge completion path.
     fn pumpRemote(self: *Ui) !void {
+        if (self.hasAsync(.submit)) return;
         const client = self.remote() orelse return;
         var snapshot = client.snapshot();
         if (snapshot.control_epoch != self.remote_epoch) {
@@ -727,6 +1313,8 @@ const Ui = struct {
             self.resetSessionView(snapshot);
             snapshot = client.snapshot();
         }
+        self.retryDeliveryAck();
+        if (self.terminal_delivery != null) return;
         if (self.bridgeEmpty()) {
             const delivered = pollRemote(client, self.allocator) catch |err| blk: {
                 self.notice = session_client.describe(err);
@@ -738,27 +1326,408 @@ const Ui = struct {
                 defer item.deinit();
                 self.inject_epoch = item.epoch;
                 self.adoptReplayHistory(&item);
-                if (item.event == .permission or item.event == .permission_cleared) {
-                    // Approvals are backend-owned. The local Bridge's pending id
-                    // belongs to a Runtime authorize() call that never happens
-                    // remotely, so routing them there would strand the next one.
-                    self.applyEvent(item.event, item.display_truncated, item.canonical_complete) catch {
-                        self.notice = "Approval display failed; reattach to resync";
-                        self.requestDraw();
-                    };
-                } else {
+                if (self.replay_refused and (item.history_replay or item.history_display_reset)) return;
+                if (item.event == .finished) {
                     const host = self.bridge.host();
-                    host.emit_fn(host.context, item.event, self.cancel) catch |err| switch (err) {
-                        error.Canceled => {},
-                        else => {
-                            self.notice = "Display queue rejected a session event; reattach to resync";
-                            self.requestDraw();
-                        },
+                    host.emit_fn(host.context, item.event, self.cancel) catch |err| {
+                        self.notice = "Display queue rejected a session event; reattach to resync";
+                        self.requestDraw();
+                        return err;
                     };
+                    if (item.delivery_sequence != 0) self.terminal_delivery = .{ .epoch = item.delivery_epoch, .sequence = item.delivery_sequence };
+                } else {
+                    // A receipt from an unrelated local event must never name
+                    // this live event's record.
+                    self.delivery_receipt = null;
+                    try self.applyEvent(item.event, item.display_truncated, item.canonical_complete);
+                    // 0 means "single raw event"; a coalesced item keeps the full
+                    // first..last interval so no interior raw sequence is lost.
+                    const first = if (item.delivery_first_sequence == 0)
+                        item.delivery_sequence
+                    else
+                        item.delivery_first_sequence;
+                    self.admitDeliverySpan(item.delivery_epoch, first, item.delivery_sequence);
                 }
             }
         }
-        self.adoptRemoteActivity(client.snapshot());
+        // A snapshot can already say idle while its earlier live events are
+        // still queued. Do not count those pending events as idle samples.
+        if (client.snapshot().busy or (!client.buffered() and self.bridgeEmpty()))
+            self.adoptRemoteActivity(client.snapshot());
+    }
+
+    /// Single-sequence admission; the terminal path and fixture tests use it.
+    fn admitDelivery(self: *Ui, epoch: u64, sequence: u64) void {
+        self.admitDeliverySpan(epoch, sequence, sequence);
+    }
+
+    /// Admit one applied live payload covering raw sequences `first..last`.
+    ///
+    /// C may coalesce several contiguous raw events into one item, so the last
+    /// sequence alone is NOT the coverage: acknowledging only it would strand
+    /// `first..last-1` in the server ring. The payload was applied as a whole,
+    /// so displaying it proves the whole interval; the fence keeps the real
+    /// span and the ACK range covers every original raw event.
+    fn admitDeliverySpan(self: *Ui, epoch: u64, first: u64, last: u64) void {
+        const receipt = self.delivery_receipt;
+        self.delivery_receipt = null;
+        if (last == 0) return;
+        const span_first = if (first == 0 or first > last) last else first;
+        if (epoch == 0 or (self.delivery_epoch != 0 and epoch != self.delivery_epoch)) {
+            self.delivery_fault = true;
+            self.notice = "Delivery epoch changed; reattach to resync";
+            self.requestDraw();
+            return;
+        }
+        if (last <= self.delivery_acked) return;
+        // A retransmission is never applied twice; a retained interval (single or
+        // coalesced) already covers every sequence it represents.
+        for (self.delivery_fences.items) |fence| {
+            const start = if (fence.first == 0) fence.sequence else fence.first;
+            if (last >= start and span_first <= fence.sequence) return;
+        }
+        self.delivery_epoch = epoch;
+        self.delivery_admitted = @max(self.delivery_admitted, last);
+        var fence = DeliveryFence{ .epoch = epoch, .sequence = last, .first = span_first };
+        if (receipt) |value| {
+            fence.reasoning = value.reasoning;
+            if (value.id != 0) {
+                if (self.record_index.get(value.id)) |index| {
+                    const record = &self.records.items[index];
+                    if (record.stream_generation == value.generation) {
+                        fence.record_id = record.id;
+                        fence.generation = record.stream_generation;
+                        fence.reasoning = fence.reasoning or record.kind == .reasoning;
+                        // Only a payload that appended source can own a source
+                        // target. An empty increment keeps the record's explicit
+                        // UX ownership but no new source to display.
+                        if (value.source) {
+                            if (record.stream) |stream| fence.target = stream.acceptedSourceEnd();
+                        }
+                    }
+                }
+            }
+        }
+        self.pushDeliveryFence(fence);
+    }
+
+    /// Fences are never coalesced while proof is outstanding: every admitted
+    /// sequence owns its own target, so an unmovable later target (a held CR, an
+    /// undisplayed tail) cannot swallow the proof of earlier already-shown
+    /// events. Only entries whose exact interval was already handed over are
+    /// merged, and only to keep the retained set bounded.
+    fn pushDeliveryFence(self: *Ui, fence: DeliveryFence) void {
+        self.pruneDeliveryFences();
+        if (self.unenqueuedFenceCount() >= delivery_fence_capacity or
+            self.delivery_fences.items.len >= delivery_fence_capacity * 2 + 2)
+        {
+            // The poll gate above should have stopped admission already. Keep the
+            // failure truthful: never drop a fence and never ACK what it covered.
+            self.delivery_fault = true;
+            self.notice = "Display delivery backlog exceeded; reattach to resync";
+            self.requestDraw();
+            return;
+        }
+        self.delivery_fences.append(self.allocator, fence) catch {
+            self.delivery_fault = true;
+            self.notice = "Display delivery fence allocation failed; reattach to resync";
+            self.requestDraw();
+        };
+    }
+
+    /// Fences whose exact interval has NOT been handed to the ACK channel yet.
+    /// This is the real UI delivery capacity: an already-enqueued later proof
+    /// must free capacity while its retained sequence keeps the watermark honest.
+    fn unenqueuedFenceCount(self: *const Ui) usize {
+        var count: usize = 0;
+        for (self.delivery_fences.items) |fence| {
+            if (!fence.enqueued) count += 1;
+        }
+        return count;
+    }
+
+    /// Drop fences the contiguous ACK watermark already passed. A proven-but-
+    /// later entry stays: only `delivery_acked` (proven AND handed over) may
+    /// release a sequence, never a high `admitted` value.
+    fn pruneDeliveryFences(self: *Ui) void {
+        var drop: usize = 0;
+        while (drop < self.delivery_fences.items.len and
+            self.delivery_fences.items[drop].sequence <= self.delivery_acked)
+        {
+            drop += 1;
+        }
+        if (drop == 0) return;
+        const keep = self.delivery_fences.items.len - drop;
+        std.mem.copyForwards(DeliveryFence, self.delivery_fences.items[0..keep], self.delivery_fences.items[drop..]);
+        self.delivery_fences.shrinkRetainingCapacity(keep);
+    }
+
+    /// Merge adjacent retained entries whose proof was already enqueued. No hole
+    /// can be crossed (a hole is an unproven entry between them), so this bounds
+    /// the retained set without inventing coverage.
+    fn coalesceEnqueuedFences(self: *Ui) void {
+        if (self.delivery_fences.items.len < 2) return;
+        var write: usize = 1;
+        for (self.delivery_fences.items[1..]) |fence| {
+            const previous = &self.delivery_fences.items[write - 1];
+            if (previous.enqueued and previous.proven and fence.enqueued and fence.proven) {
+                previous.sequence = @max(previous.sequence, fence.sequence);
+                continue;
+            }
+            self.delivery_fences.items[write] = fence;
+            write += 1;
+        }
+        self.delivery_fences.shrinkRetainingCapacity(write);
+    }
+
+    fn hasUnmetFence(self: *const Ui, record_id: u64) bool {
+        for (self.delivery_fences.items) |fence| {
+            if (!fence.proven and fence.record_id == record_id) return true;
+        }
+        return false;
+    }
+
+    /// Authoritative REMOVAL (withdrawn canonical text, reasoning retired by UX,
+    /// or a guarded eviction): the sequence keeps its ordering but the record is
+    /// gone, so only a fresh frame of the applied state can settle it.
+    fn retargetDeliveryFences(self: *Ui, record_id: u64) void {
+        if (record_id == 0) return;
+        for (self.delivery_fences.items) |*fence| {
+            if (fence.proven or fence.enqueued or fence.record_id != record_id) continue;
+            fence.record_id = 0;
+            fence.generation = 0;
+            fence.target = 0;
+        }
+    }
+
+    /// Explicit CANONICAL REPLACEMENT: the same sequences now require the
+    /// replacement's own source (or its rows, when it has no incremental body)
+    /// to be displayed. Nothing here infers a replacement from an unexplained
+    /// generation mismatch.
+    fn retargetDeliveryFencesTo(self: *Ui, record_id: u64, generation: u64, target: usize) void {
+        if (record_id == 0) return;
+        for (self.delivery_fences.items) |*fence| {
+            if (fence.proven or fence.enqueued or fence.record_id != record_id) continue;
+            fence.generation = generation;
+            fence.target = target;
+        }
+    }
+
+    /// Source fence prefixes and all-row proof are renderer-owned numbers: a
+    /// `max(row.end)` reconstruction could overclaim a table prefix or an
+    /// atomic suffix, so there is deliberately no local fallback.
+    fn bodyShownEnd(stream: *const body_stream.Body, shown: usize) usize {
+        return stream.visibleSourceEndForRows(shown);
+    }
+
+    /// Proof is published, then handed over: the contiguous prefix uses the
+    /// cumulative watermark, and every independently proven run past a hole uses
+    /// an exact range. A failure keeps the exact proof for retry.
+    fn retryDeliveryAck(self: *Ui) void {
+        if (self.delivery_fault or self.delivery_epoch == 0) return;
+        self.advanceContiguousDelivery();
+        self.pruneDeliveryFences();
+        self.enqueueDeliveryProof();
+        self.advanceContiguousDelivery();
+        self.pruneDeliveryFences();
+    }
+
+    /// Contiguous watermarks only: `delivery_proven` stops at the first unproven
+    /// hole, `delivery_acked` additionally stops at the first proven-but-not-yet-
+    /// handed-over entry. Neither is ever a max(sequence).
+    fn advanceContiguousDelivery(self: *Ui) void {
+        var proven = self.delivery_proven;
+        var acked = self.delivery_acked;
+        var ack_open = true;
+        for (self.delivery_fences.items) |fence| {
+            if (!fence.proven) break;
+            proven = @max(proven, fence.sequence);
+            if (!ack_open) continue;
+            if (fence.enqueued) acked = @max(acked, fence.sequence) else ack_open = false;
+        }
+        self.delivery_proven = proven;
+        self.delivery_acked = acked;
+    }
+
+    fn enqueueDeliveryProof(self: *Ui) void {
+        const client = self.remote() orelse return;
+        if (client.snapshot().control_epoch != self.remote_epoch) return;
+        // Only a genuinely complete prefix may use the cumulative watermark.
+        if (self.delivery_proven > self.delivery_acked) {
+            if (self.delivery_ack_unsupported) return;
+            client.acknowledge(self.delivery_epoch, self.delivery_proven) catch |err| {
+                // Unsupported is permanent for this adapter: say so once instead
+                // of implying the live stream was retired backend-side.
+                if (err == error.Unsupported and !self.delivery_ack_unsupported) {
+                    self.delivery_ack_unsupported = true;
+                    self.notice = "Live delivery ACK unsupported; display retained";
+                    self.requestDraw();
+                }
+                return;
+            };
+            self.delivery_acked = self.delivery_proven;
+            self.pruneDeliveryFences();
+            return;
+        }
+        if (self.delivery_range_unsupported) return;
+        // Exact ranges of consecutive proven sequences. A hole (unproven entry)
+        // ends the run, so a range can never bridge undisplayed content.
+        var enqueued_any = false;
+        var index: usize = 0;
+        while (index < self.delivery_fences.items.len) : (index += 1) {
+            const start = self.delivery_fences.items[index];
+            if (!start.proven or start.enqueued) continue;
+            var end = index;
+            while (end + 1 < self.delivery_fences.items.len) {
+                const next = self.delivery_fences.items[end + 1];
+                if (!next.proven or next.enqueued) break;
+                const next_first = if (next.first == 0) next.sequence else next.first;
+                if (next_first != self.delivery_fences.items[end].sequence + 1) break;
+                end += 1;
+            }
+            const first = if (start.first == 0) start.sequence else start.first;
+            const last = self.delivery_fences.items[end].sequence;
+            client.acknowledgeRange(self.delivery_epoch, first, last) catch |err| {
+                // Keep the exact interval un-enqueued so the same range is retried.
+                if (err == error.Unsupported and !self.delivery_range_unsupported) {
+                    self.delivery_range_unsupported = true;
+                    self.notice = "Live delivery range ACK unsupported; display retained";
+                    self.requestDraw();
+                }
+                break;
+            };
+            // Marking is not structural, so the scan can continue in this pass.
+            for (self.delivery_fences.items[index .. end + 1]) |*fence| fence.enqueued = true;
+            index = end;
+            enqueued_any = true;
+        }
+        if (enqueued_any) self.coalesceEnqueuedFences();
+    }
+
+    /// The UX retires a thinking window when prose starts, a tool runs, or the
+    /// user hides it. That is an intentional replacement, not a lost stream.
+    fn reasoningReplaced(self: *const Ui) bool {
+        return !self.show_reasoning or self.draft != null or
+            self.tool_views.entries.items.len != 0 or self.active_tool != null;
+    }
+
+    /// One fence against already-published display proof. Nothing here looks at
+    /// `Body.finished`: an active stream's displayed prefix is provable on its
+    /// own, and a cropped/hidden row simply leaves the fence unmet.
+    fn deliveryFenceProven(self: *const Ui, fence: DeliveryFence, frame_valid: bool) bool {
+        if (fence.epoch != self.delivery_epoch) return false;
+        // Coverage can only come from a frame staged AFTER this sequence was
+        // admitted. An event applied after the frame was built is never covered
+        // by that earlier admission snapshot, whatever its target looks like.
+        if (fence.sequence > self.frame_delivery_sequence) return false;
+        if (fence.reasoning) {
+            // An intentionally replaced thinking window (prose began, a tool ran,
+            // the user hid it) is settled by that explicit UX rule; otherwise only
+            // a frame that actually draws its newest rows proves it.
+            if (self.reasoningReplaced()) return frame_valid and self.frame_delivery_shown;
+            if (fence.record_id == 0) return false;
+            const index = self.record_index.get(fence.record_id) orelse return false;
+            if (self.records.items[index].stream_generation != fence.generation) return false;
+            return frame_valid and self.frame_delivery_reasoning;
+        }
+        if (fence.record_id == 0) {
+            if (!frame_valid or !self.frame_delivery_shown) return false;
+            return true;
+        }
+        const index = self.record_index.get(fence.record_id) orelse return false;
+        const record = &self.records.items[index];
+        if (record.stream_generation != fence.generation) return false;
+        if (fence.target != 0) return record.delivery_visible >= fence.target;
+        return record.delivery_complete;
+    }
+
+    /// Mark every independently shown fence this frame's admission snapshot
+    /// covers, continuing PAST unmet earlier holes, then publish exactly what can
+    /// be claimed. A hole never blocks a later metadata/source proof, and later
+    /// proofs never widen the contiguous watermarks over that hole.
+    /// There is deliberately NO inference from a vanished/re-generated record:
+    /// only an explicit canonical replacement/removal retargets a fence.
+    fn promoteDeliveryFences(self: *Ui, frame_valid: bool) void {
+        if (self.delivery_fault or self.delivery_epoch == 0) return;
+        self.pruneDeliveryFences();
+        for (self.delivery_fences.items) |*fence| {
+            if (fence.proven) continue;
+            if (self.deliveryFenceProven(fence.*, frame_valid)) fence.proven = true;
+        }
+        self.retryDeliveryAck();
+    }
+
+    // A tool_result may add caption, local output and truncation notice (3).
+    // assistant_committed can add a new body and withdrawal/truncation notice
+    // (at most 2). Each mirror is capped at record_limit (128 KiB), including
+    // formatted command output; reserve three full mirrors, not just wire bytes.
+    const event_record_reserve = 3;
+    const event_byte_reserve = event_record_reserve * record_limit;
+
+    fn displayBackpressured(self: *const Ui) bool {
+        // Live delivery fences are the first bound: at capacity no further event
+        // may be polled, so an unprovable prefix is never dropped or fabricated.
+        // Only proof that has NOT been handed over counts against capacity.
+        if (self.unenqueuedFenceCount() >= delivery_fence_capacity) return true;
+        var count: usize = self.records.items.len;
+        var bytes: usize = 0;
+        for (self.records.items) |record| {
+            bytes += record.body.items.len;
+        }
+        for (self.records.items) |record| {
+            if (!record.output) if (record.stream) |stream| {
+                if (stream.pendingBytes() >= 64 * 1024 or stream.windowBytes() >= 128 * 1024) return true;
+            };
+        }
+        for (self.async_pending) |pending| if (pending) |value| {
+            if (value.record) |record| {
+                count += 1;
+                bytes += record.body.items.len;
+            }
+        };
+        return count + event_record_reserve > 64 or bytes + event_byte_reserve > 1024 * 1024;
+    }
+
+    fn reclaimDisplayCapacity(self: *Ui) void {
+        while (self.displayBackpressured() and self.canEvictOldest()) {
+            self.removeRecord(0);
+            self.dropped_display = true;
+        }
+    }
+
+    /// Drain at most the existing per-tick event budget. The first poll may
+    /// fetch one page; subsequent polls only consume buffered items.
+    fn pumpDisplay(self: *Ui) !void {
+        self.retryDeliveryAck();
+        for (0..64) |index| {
+            // A remote terminal must settle before this batch polls the item that
+            // follows it: finished(task 1) plus state/text(task 2) can share one
+            // read, and the next task must not be closed as task 1's residue.
+            if (self.remote() != null) {
+                try self.finishReadyTask();
+                if (self.terminal_delivery) |delivery| {
+                    if (self.bridge.terminal != null) break;
+                    self.terminal_delivery = null;
+                    // A terminal event has no record of its own: its result rows
+                    // are proven by the next complete frame, not by leftovers.
+                    self.delivery_receipt = null;
+                    self.admitDelivery(delivery.epoch, delivery.sequence);
+                    self.requestDraw();
+                }
+            }
+            self.reclaimDisplayCapacity();
+            if (self.displayBackpressured()) break;
+            if (index == 0 or (if (self.remote()) |client| client.buffered() else false))
+                try self.pumpRemote();
+            if (self.bridge.pop()) |value| {
+                var item = value;
+                defer item.deinit();
+                try self.event(item);
+            } else if (self.remote()) |client| {
+                // Direct remote events still consume budget.
+                if (!client.buffered()) break;
+            } else break;
+        }
     }
 
     /// Take the next delta that belongs to the current control epoch. Deltas a
@@ -770,6 +1739,9 @@ const Ui = struct {
             var item = polled orelse return null;
             if (item.epoch != 0 and item.epoch != client.snapshot().control_epoch) {
                 item.deinit();
+                // Never turn stale-item draining into repeated blocking page
+                // requests in one UI tick.
+                if (!client.buffered()) return null;
                 continue;
             }
             return item;
@@ -785,6 +1757,46 @@ const Ui = struct {
     /// back so the reset cannot lose it. Live/queued events carry neither
     /// marker, so they cannot duplicate a history entry.
     fn adoptReplayHistory(self: *Ui, item: *const session_client.Item) void {
+        if (item.history_display_reset) {
+            self.replay_refused = self.delivery_admitted != self.delivery_acked;
+            for (self.records.items) |record| {
+                if (record.kind == .reasoning) continue;
+                if (record.stream) |stream| {
+                    if (stream.windowBytes() != 0 or stream.carry_len != 0 or stream.held_cr or record.pending_stream_rows != 0)
+                        self.replay_refused = true;
+                }
+            }
+            if (self.replay_refused) {
+                self.notice = "History reset refused; unacknowledged display retained";
+                self.requestDraw();
+                return;
+            }
+            // Replace the current view with one canonical baseline, including a
+            // submit whose receipt overtook the baseline. Do not clear native
+            // scrollback, the composer, pending commands, or owner barriers.
+            self.discardResizedFrame();
+            self.clearPermission();
+            self.clearActiveTool();
+            self.clearToolCaptions();
+            self.tool_calls.deinit(self.allocator);
+            self.tool_calls = .{};
+            self.tool_views.clear(self.allocator);
+            // The startup banner and local notices are not canonical history;
+            // a first baseline must not erase them before the first frame.
+            var kept: usize = 0;
+            for (self.records.items) |*record| {
+                if (record.kind == .notice) {
+                    self.records.items[kept] = record.*;
+                    kept += 1;
+                } else record.deinit(self.allocator);
+            }
+            self.records.items.len = kept;
+            self.record_index.clearRetainingCapacity();
+            for (self.records.items, 0..) |record, index| self.record_index.putAssumeCapacityNoClobber(record.id, index);
+            self.draft = null;
+            self.reasoning = null;
+            self.requestDraw();
+        }
         if (item.history_reset) {
             if (self.input_history.index != null and self.history_draft != null) {
                 self.restoreHistoryDraft();
@@ -811,14 +1823,27 @@ const Ui = struct {
     /// Track owner-reported activity. A task that becomes idle without a
     /// delivered terminal is settled explicitly after a second observation, so
     /// a lost result never leaves the composer stuck in a busy state.
+    fn remoteSynchronizing(self: *const Ui) bool {
+        const client = self.remote() orelse return false;
+        return client.snapshot().attached and !client.snapshot().available;
+    }
+
     fn adoptRemoteActivity(self: *Ui, snapshot: *const session_client.Snapshot) void {
+        const syncing = snapshot.attached and !snapshot.available;
+        if (syncing != self.remote_observed_sync) {
+            self.remote_observed_sync = syncing;
+            if (!syncing and std.mem.eql(u8, self.notice, "Synchronizing session; draft kept")) self.notice = "Ready";
+            self.requestDraw();
+        }
         if (snapshot.busy) {
             self.remote_idle_ticks = 0;
-            // The owner can stay busy across two tasks: completing the previous
-            // task clears the local view while `remote_observed_busy` is still
-            // true. Re-adopt whenever the owner reports a task and the local
-            // view is idle, or the next task could never become visible.
-            if (!self.busy) {
+            // The owner can stay busy across two tasks, and a handled terminal no
+            // longer clears the local view when the owner still reports busy, so
+            // this busy sample may be the same task rather than a next one.
+            // Re-adopt only when the local view really is idle and nothing is
+            // waiting for ordered evidence, or a continuous next task could never
+            // become visible.
+            if (!self.remote_terminal_wait and !self.busy) {
                 self.busy = true;
                 self.mode = snapshot.mode orelse .calling_model;
                 self.remote_kind = snapshot.task_kind;
@@ -831,16 +1856,35 @@ const Ui = struct {
             // clears `remote_observed_busy`; entering this branch at all already
             // requires a busy sample, either now or when the count started.
             self.remote_idle_ticks +|= 1;
-            if (self.remote_idle_ticks >= 2 and self.bridge.terminal == null and self.bridgeEmpty()) self.settleRemoteIdle();
+            if (self.remote_idle_ticks >= 2 and self.bridge.terminal == null and self.bridgeEmpty()) {
+                if (self.remote_terminal_wait) self.releaseRemoteTerminalWait() else self.settleRemoteIdle();
+            }
         }
         self.remote_observed_busy = snapshot.busy;
     }
 
-    fn settleRemoteIdle(self: *Ui) void {
+    /// Owner-ordered idle consumed a terminal that was already handled: the task
+    /// view may end, but the delivered result and its notice stay visible. This
+    /// is not the missing-terminal path.
+    fn releaseRemoteTerminalWait(self: *Ui) void {
+        self.remote_terminal_wait = false;
         self.busy = false;
         self.mode = null;
         self.remote_idle_ticks = 0;
-        if (self.draft) |index| self.records.items[index].interrupted = true;
+        self.requestDraw();
+    }
+
+    fn settleRemoteIdle(self: *Ui) void {
+        self.remote_terminal_wait = false;
+        self.busy = false;
+        self.mode = null;
+        self.remote_idle_ticks = 0;
+        if (self.draft) |index| {
+            self.records.items[index].interrupted = true;
+            if (self.records.items[index].stream) |stream| stream.finish() catch {
+                self.notice = "Could not finalize interrupted display";
+            };
+        }
         self.discardReasoning();
         self.draft = null;
         self.clearActiveTool();
@@ -858,6 +1902,21 @@ const Ui = struct {
         // The owner's snapshot is the only source of epoch identity; nothing is
         // read from a local Runtime for an attached remote session.
         self.remote_epoch = snapshot.control_epoch;
+        self.delivery_epoch = 0;
+        self.delivery_admitted = 0;
+        self.delivery_proven = 0;
+        self.delivery_acked = 0;
+        self.delivery_fault = false;
+        self.delivery_ack_unsupported = false;
+        self.delivery_range_unsupported = false;
+        self.delivery_fences.clearRetainingCapacity();
+        self.delivery_receipt = null;
+        self.frame_delivery_epoch = 0;
+        self.frame_delivery_sequence = 0;
+        self.frame_delivery_shown = false;
+        self.frame_delivery_reasoning = false;
+        self.terminal_delivery = null;
+        self.replay_refused = false;
         self.clearPermission();
         self.stop_open = false;
         self.stop_danger = false;
@@ -878,12 +1937,13 @@ const Ui = struct {
         self.tool_calls.deinit(self.allocator);
         self.tool_calls = .{};
         self.tool_views.clear(self.allocator);
+        self.discardResizedFrame();
         for (self.records.items) |*record| record.deinit(self.allocator);
         self.records.clearRetainingCapacity();
+        self.record_index.clearRetainingCapacity();
         self.draft = null;
         self.reasoning = null;
         self.dropped_display = false;
-        self.scroll = 0;
         self.last_terminal = null;
         self.mode = null;
         self.display = .{};
@@ -928,12 +1988,12 @@ const Ui = struct {
         self.remote_kind = snapshot.task_kind;
         self.remote_observed_busy = snapshot.busy;
         self.remote_idle_ticks = 0;
+        self.remote_terminal_wait = false;
         self.busy = snapshot.busy;
         if (snapshot.busy) self.mode = snapshot.mode orelse self.mode;
         self.notice = if (snapshot.busy) "Attached; task is running" else "Ready";
         self.display_changed = true;
         self.resize_waiting = false;
-        self.resize_redraw_at_ms = null;
         self.frame_fresh = false;
         self.dirty = true;
     }
@@ -1070,14 +2130,35 @@ const Ui = struct {
     }
 
     fn applyManage(self: *Ui, client: session_client.Client, request: session_client.Manage) void {
+        if (self.connection.async_actions != null) {
+            _ = self.beginAsync(.{ .manage = request }, .manage);
+            return;
+        }
         var outcome = client.manage(self.allocator, request) catch |err| {
             self.notice = session_client.describe(err);
             self.requestDraw();
             return;
         };
         defer outcome.deinit(self.allocator);
+        self.acceptManage(&outcome, false);
+    }
+
+    fn acceptManage(self: *Ui, outcome: *session_client.Outcome, preserve_editor: bool) void {
         const leaving = outcome.exit;
-        if (outcome.switched) self.resetSessionView(client.snapshot());
+        if (outcome.switched) if (self.remote()) |client| {
+            if (preserve_editor) {
+                const parked = self.editor;
+                const pasted = self.editor_pasted;
+                self.editor = .{ .allocator = self.allocator };
+                self.resetSessionView(client.snapshot());
+                self.editor.deinit();
+                self.editor = parked;
+                self.editor_pasted = pasted;
+            } else self.resetSessionView(client.snapshot());
+        };
+        // Leaving the owner view ends any handled-terminal wait; the result and
+        // its notice stay as the last known state instead of a busy display.
+        if (self.remote()) |client| if (!client.snapshot().attached and self.remote_terminal_wait) self.releaseRemoteTerminalWait();
         if (outcome.listing) |listing| _ = self.add(.notice, listing) catch {};
         if (outcome.notice) |notice| {
             // Transfer ownership instead of copying a bounded listing twice.
@@ -1109,6 +2190,7 @@ const Ui = struct {
                 self.notice = "Out of memory; close not requested";
                 return;
             };
+            self.stop_instance +%= 1;
             self.stop_open = true;
             self.stop_danger = false;
             self.stop_identity = self.stopIdentity();
@@ -1129,13 +2211,50 @@ const Ui = struct {
         self.frame_permission_choice = null;
     }
 
-    /// 追加一条新显示记录。超出条数或字节上限时丢弃最旧的记录，返回新记录的索引。
     fn add(self: *Ui, kind: Kind, data: []const u8) !usize {
         var bytes: usize = 0;
         for (self.records.items) |record| bytes += record.body.items.len;
+        const growth = if (self.restoring and (kind == .assistant or (kind == .tool and data.len == 0)))
+            record_limit
+        else
+            @min(data.len, record_limit);
+        if (self.restoring) {
+            // Completed restored rows consume their actual bytes. Only an
+            // assistant being constructed from blocks (or a tool caption
+            // appended immediately after add) needs a full mirror reservation.
+            while (true) {
+                const active_reserve: usize = if (self.draft) |i| blk: {
+                    const active = self.records.items[i];
+                    break :blk if (active.batch and active.kind == .assistant) record_limit -| active.body.items.len else 0;
+                } else 0;
+                if (self.records.items.len < 64 and bytes + active_reserve + growth <= 1024 * 1024) break;
+                var oldest: ?usize = null;
+                for (self.records.items, 0..) |record, index| {
+                    if (!record.batch or self.draft == index or self.reasoning == index or
+                        record.pending_output or record.pending_stream_rows != 0 or record.pending_flow_change) continue;
+                    var frame_owned = false;
+                    for (self.frame_records) |entry| if (entry.record_id == record.id) {
+                        frame_owned = true;
+                        break;
+                    };
+                    if (!frame_owned) {
+                        oldest = index;
+                        break;
+                    }
+                }
+                const index = oldest orelse return error.DisplayCapacity;
+                bytes -= self.records.items[index].body.items.len;
+                self.removeRecord(index);
+                self.dropped_display = true;
+            }
+        }
 
         // 丢弃最旧记录时同步修正 draft/reasoning 索引，避免指向错误的记录。
-        while (self.records.items.len > 0 and (self.records.items.len >= 64 or bytes + @min(data.len, record_limit) > 1024 * 1024)) {
+        // An unprinted active body is never evicted: that would silently drop
+        // content the terminal has not received yet.
+        while (!self.restoring and self.records.items.len > 0 and (self.records.items.len >= 64 or bytes + growth > 1024 * 1024)) {
+            if (!self.canEvictOldest()) break;
+            self.forgetRecord(0);
             var removed = self.records.orderedRemove(0);
             bytes -= removed.body.items.len;
             removed.deinit(self.allocator);
@@ -1144,8 +2263,15 @@ const Ui = struct {
             self.dropped_display = true;
         }
 
-        try self.records.append(self.allocator, .{ .kind = kind });
+        if (self.records.items.len >= 64 or bytes + growth > 1024 * 1024)
+            return error.DisplayCapacity;
+        try self.reserveRecord();
+        var record = Record{ .kind = kind, .batch = self.restoring };
+        // Actual current terminal width, not a default, before the first append.
+        if (kind == .reasoning) try record.attachTail(self.allocator, @max(1, self.size.columns -| 1));
+        self.records.appendAssumeCapacity(record);
         const index = self.records.items.len - 1;
+        try self.registerRecord(index);
         try self.records.items[index].append(self.allocator, data);
         self.requestDraw();
         return index;
@@ -1155,7 +2281,11 @@ const Ui = struct {
     /// No Bridge/observer events, execution, approvals or live reasoning replay.
     fn restoreHistory(self: *Ui, messages: []const p.Message) !void {
         if (messages.len == 0) return;
-        _ = try self.add(.notice, "Restored model context (display may be shortened); prior tools are NOT rerun");
+        const prior_restoring = self.restoring;
+        self.restoring = true;
+        defer self.restoring = prior_restoring;
+        const restore_notice = try self.add(.notice, "Restored model context (display may be shortened); prior tools are NOT rerun");
+        self.records.items[restore_notice].batch = false;
         for (messages, 0..) |message, index| switch (message.role) {
             .user, .context => {
                 for (message.blocks) |block| switch (block) {
@@ -1203,6 +2333,11 @@ const Ui = struct {
     }
 
     fn removeRecord(self: *Ui, index: usize) void {
+        // A record that is intentionally replaced never keeps an unprovable
+        // identity: its fences stay ordered but wait for a fresh frame of the
+        // replacement instead of fabricating stale/ABA proof.
+        self.retargetDeliveryFences(self.records.items[index].id);
+        self.forgetRecord(index);
         var removed = self.records.orderedRemove(index);
         removed.deinit(self.allocator);
         if (self.draft) |i| self.draft = if (i == index) null else if (i > index) i - 1 else i;
@@ -1390,31 +2525,107 @@ const Ui = struct {
     fn replaceCommitted(self: *Ui, blocks: []const p.Block, clipped: bool, blocks_complete: bool) !void {
         self.discardReasoning();
         var withdrawn_preview = false;
+        var truncated_stream = false;
+        var revised_stream = false;
         if (self.draft) |i| {
-            self.records.items[i].body.clearRetainingCapacity();
-            self.records.items[i].clipped = false;
-            self.records.items[i].invalidate();
-        }
-        for (blocks) |block| switch (block) {
-            .text => |v| try self.appendDraft(.assistant, v),
-            else => {},
-        };
-        if (clipped) {
-            if (self.draft) |i| {
-                self.records.items[i].clipped = true;
-                self.records.items[i].invalidate();
-            }
-        }
-        if (self.draft) |i| {
-            if (self.records.items[i].body.items.len == 0) {
-                withdrawn_preview = self.records.items[i].flow_prefix != null or self.records.items[i].pending_flow_prefix != null;
-                self.removeRecord(i);
+            const record = &self.records.items[i];
+            // Bounded canonical text for the ONE exact comparison. The proof
+            // that a complete, untruncated canonical body fits the mirror is
+            // upstream (64 KiB total copy budget < 128 KiB mirror), so no
+            // equivalence between deltas and canonical is ever assumed.
+            var canonical: std.ArrayList(u8) = .empty;
+            defer canonical.deinit(self.allocator);
+            for (blocks) |block| switch (block) {
+                .text => |v| try canonical.appendSlice(self.allocator, v),
+                else => {},
+            };
+            if (record.stream != null) {
+                if (canonical.items.len == 0 and !clipped and blocks_complete) {
+                    // Explicitly withdrawn text is explained; a tool-only answer
+                    // never had final prose to withdraw, so it stays silent.
+                    withdrawn_preview = blocks.len == 0 and
+                        (record.stream.?.visibleRows().len != 0 or record.stream_written != 0);
+                    self.removeRecord(i);
+                } else {
+                    record.final_answer = shared.answer.classify(blocks, blocks_complete) == .final;
+                    if (!clipped and blocks_complete and canonical.items.len <= record_limit) {
+                        const same = !record.clipped and !record.mirror_full and record.body.items.len == canonical.items.len and
+                            std.mem.eql(u8, record.body.items, canonical.items);
+                        if (!same) {
+                            record.output = false;
+                            revised_stream = record.stream_written != 0;
+                            record.stream_revised = revised_stream;
+                            try record.resetStream();
+                            record.body.clearRetainingCapacity();
+                            record.clipped = false;
+                            record.mirror_full = false;
+                            try record.append(self.allocator, canonical.items);
+                            // Explicit canonical replacement: the older sequences
+                            // now require the REPLACEMENT's own source to be shown,
+                            // never the retired generation's.
+                            if (record.stream) |stream|
+                                self.retargetDeliveryFencesTo(record.id, record.stream_generation, stream.acceptedSourceEnd());
+                        }
+                        record.stream.?.finish() catch {};
+                        // A finished body is a new render generation: drop the
+                        // cached rows so the next layout re-builds and pins it.
+                        // Without a pin the renderer cannot report coverage.
+                        record.invalidate();
+                    } else {
+                        // A clipped/partial canonical is NOT a complete body: keep
+                        // the already displayed long stream, mark it explicitly.
+                        record.clipped = true;
+                        truncated_stream = true;
+                        record.stream.?.finish() catch {};
+                        record.invalidate();
+                    }
+                }
             } else {
-                self.records.items[i].final_answer = shared.answer.classify(blocks, blocks_complete) == .final;
+                record.body.clearRetainingCapacity();
+                record.clipped = false;
+                record.invalidate();
+                for (blocks) |block| switch (block) {
+                    .text => |v| try record.append(self.allocator, v),
+                    else => {},
+                };
+                if (clipped) {
+                    record.clipped = true;
+                    record.invalidate();
+                }
+                if (record.body.items.len == 0) {
+                    withdrawn_preview = record.flow_prefix != null or record.pending_flow_prefix != null;
+                    // Authoritative withdrawal: the record is gone, so its fences
+                    // settle only through a fresh frame of the applied state.
+                    self.removeRecord(i);
+                } else {
+                    record.final_answer = shared.answer.classify(blocks, blocks_complete) == .final;
+                    // Rebuilt from canonical blocks without an incremental body:
+                    // the same sequences now own the replacement's rows.
+                    self.retargetDeliveryFencesTo(record.id, record.stream_generation, 0);
+                }
+            }
+        } else {
+            // No prior draft (e.g. reasoning-only preview was discarded): the
+            // canonical text creates the record exactly as before.
+            for (blocks) |block| switch (block) {
+                .text => |v| try self.appendDraft(.assistant, v),
+                else => {},
+            };
+            if (self.draft) |i| {
+                const record = &self.records.items[i];
+                if (clipped) {
+                    record.clipped = true;
+                    record.invalidate();
+                }
+                if (record.body.items.len == 0) {
+                    withdrawn_preview = record.flow_prefix != null or record.pending_flow_prefix != null;
+                    self.removeRecord(i);
+                } else record.final_answer = shared.answer.classify(blocks, blocks_complete) == .final;
             }
         }
         self.draft = null;
         if (withdrawn_preview) _ = try self.add(.notice, "Stream preview withdrawn (final response has no text)");
+        if (truncated_stream) _ = try self.add(.notice, "Final response was truncated for display; the streamed preview above is unchanged");
     }
 
     /// 把一个 bridge 事件应用到 UI 状态：追加文本、更新状态、插入审批或工具记录等。
@@ -1422,15 +2633,107 @@ const Ui = struct {
         return self.applyEvent(item.event, item.display_truncated, item.canonical_complete);
     }
 
+    /// Pre-application display identity, so the receipt can name the record that
+    /// this event actually advanced without predicting later state.
+    const DeliveryBefore = struct {
+        draft_id: u64,
+        reasoning_id: u64,
+        next_id: u64,
+    };
+
+    fn captureDeliveryBefore(self: *const Ui) DeliveryBefore {
+        return .{
+            .draft_id = if (self.draft) |index| self.records.items[index].id else 0,
+            .reasoning_id = if (self.reasoning) |index| self.records.items[index].id else 0,
+            .next_id = self.next_record_id,
+        };
+    }
+
+    /// The newest record this event created, or null when it created none.
+    fn newestDeliveryRecord(self: *const Ui, before_next_id: u64) ?usize {
+        if (self.records.items.len == 0) return null;
+        const index = self.records.items.len - 1;
+        if (self.records.items[index].id >= before_next_id) return index;
+        return null;
+    }
+
+    /// Receipt capture is payload-aware, not tag-aware: an exactly empty raw
+    /// text/reasoning payload appends no source, so it cannot point at the
+    /// current body's accepted end. A held CR keeps that end unmoved across the
+    /// resolving LF too, so "accepted end unchanged" would be the wrong rule;
+    /// only the actual payload length can say whether this event added source.
+    fn captureDeliveryReceipt(self: *Ui, before: DeliveryBefore, applied: r.Event) void {
+        self.delivery_receipt = null;
+        var candidate: ?usize = null;
+        var reasoning = false;
+        var source = true;
+        switch (applied) {
+            .text => |v| {
+                // No bytes were appended, so nothing new needs displaying. The
+                // sequence is a metadata fence: its own fresh frame proves it,
+                // never the older body's held-CR target (unreachable for it).
+                if (v.len == 0) return;
+                candidate = self.recordIndexOfId(before.draft_id);
+            },
+            .assistant_committed => candidate = self.recordIndexOfId(before.draft_id),
+            .reasoning => |v| {
+                // Empty thinking keeps its explicit UX ownership (the record's
+                // newest rows prove it) but carries no new source.
+                candidate = self.recordIndexOfId(before.reasoning_id);
+                reasoning = true;
+                source = v.len != 0;
+            },
+            .user_committed, .tool_result, .compacted, .compaction_failed, .fallback => {},
+            else => return,
+        }
+        if (candidate == null) candidate = self.newestDeliveryRecord(before.next_id);
+        const index = candidate orelse {
+            // A payload the UX intentionally hid (reasoning while prose runs)
+            // still owns its span; keep the replacement semantics explicit.
+            if (reasoning) self.delivery_receipt = .{ .id = 0, .generation = 0, .reasoning = true };
+            return;
+        };
+        self.delivery_receipt = .{
+            .id = self.records.items[index].id,
+            .generation = self.records.items[index].stream_generation,
+            .reasoning = reasoning or self.records.items[index].kind == .reasoning,
+            .source = source,
+        };
+    }
+
+    fn recordIndexOfId(self: *const Ui, id: u64) ?usize {
+        if (id == 0) return null;
+        return self.record_index.get(id);
+    }
+
     /// One typed event applied to the UI. Local workers reach this through the
-    /// Bridge; remote display deltas reuse the same path, with approvals applied
-    /// directly because their authorization belongs to the backend, not to the
-    /// local Bridge's Runtime-pending bookkeeping.
+    /// Bridge; owned remote display deltas reuse the same path directly.
     fn applyEvent(self: *Ui, event_: r.Event, display_truncated: bool, canonical_complete: bool) !void {
+        const delivery_before = self.captureDeliveryBefore();
+        defer self.captureDeliveryReceipt(delivery_before, event_);
         self.requestDraw();
         self.display.observe(event_, self.clock_ms);
         switch (event_) {
-            .state => |state| self.mode = state,
+            .state => |state| {
+                // An ordered owner state after a handled terminal is the next
+                // task. That holds both while a busy snapshot still waits for
+                // owner idle and after a terminal that already saw idle owner
+                // state: the busy boolean alone could never prove either case.
+                if (self.remote() != null and (self.remote_terminal_wait or self.last_terminal != null)) {
+                    self.remote_terminal_wait = false;
+                    self.last_terminal = null;
+                    self.busy = true;
+                    // Old idle samples belong to the finished task and must not
+                    // settle the new one; this ordered state is its first busy
+                    // evidence even when the snapshot itself still says idle.
+                    self.remote_idle_ticks = 0;
+                    self.remote_observed_busy = true;
+                    self.remote_kind = if (self.remote()) |client| client.snapshot().task_kind else self.remote_kind;
+                    self.notice = "Attached; task is running";
+                    self.approval_paste_seen = false;
+                }
+                self.mode = state;
+            },
             .user_committed => |v| {
                 self.draft = null;
                 self.discardReasoning();
@@ -1536,15 +2839,15 @@ const Ui = struct {
         return self.ctrl_d_exit or interrupt.signal() != 0;
     }
     fn settingsIdle(self: *const Ui) bool {
-        return !self.busy and self.future == null and self.permission == null and !self.poisoned and !self.exitAuthorized() and !self.secret_mode and !self.secret_quarantine and !self.parser.pasted;
+        return !self.busy and !self.remoteSynchronizing() and self.future == null and self.permission == null and !self.poisoned and !self.exitAuthorized() and !self.secret_mode and !self.secret_quarantine and !self.parser.pasted;
     }
     /// No worker can still publish after its Future was joined. Check borrowed
     /// Bridge items as well as the queue, without reset's cancellation side effects.
     fn idleEnter(self: *Ui) bool {
-        if (self.deferred_submit != null or !self.settingsIdle() or self.editor_pasted or self.parser.batch_paste or
+        if (self.deferred_submit != null or self.presentationWaiting() or !self.settingsIdle() or self.editor_pasted or self.parser.batch_paste or
             self.parser.escape_len != 0 or self.parser.utf8_len != 0 or self.stop_open or
             self.settings_open or self.provider_open or self.model_picker != null or
-            self.mode != null or self.active_tool != null or self.draft != null or self.scroll != 0 or
+            self.mode != null or self.active_tool != null or self.draft != null or
             self.size.columns < 9 or self.size.rows < 7 or
             std.mem.trim(u8, self.editor.bytes.items, " \t\r\n").len != 0) return false;
         const queue = self.inbox.snapshot();
@@ -1830,6 +3133,10 @@ const Ui = struct {
             self.notice = "Global settings unavailable; changes disabled";
             return false;
         };
+        if (self.connection.async_actions != null) {
+            _ = self.beginAsync(.{ .preference = .{ .key = key_, .value = value } }, .preference);
+            return false;
+        }
         save(self.connection.context, key_, value) catch {
             self.notice = "Could not save setting; previous value kept";
             return false;
@@ -1992,6 +3299,10 @@ const Ui = struct {
             self.notice = "Settings require a drained session bridge";
             return;
         };
+        if (self.connection.async_actions != null) {
+            _ = self.beginAsync(.{ .proxy_address = value }, .proxy_address);
+            return;
+        }
         save(self.connection.context, value) catch {
             self.notice = "Could not save setting; previous value kept";
             return;
@@ -2126,6 +3437,10 @@ const Ui = struct {
             self.notice = "Settings require a drained session bridge";
             return;
         };
+        if (self.connection.async_actions != null) {
+            _ = self.beginAsync(.{ .proxy = .{ .model = name, .enabled = !proxy_picker_module.isSelected(state.proxy_models, name) } }, .proxy);
+            return;
+        }
         save(self.connection.context, name, !proxy_picker_module.isSelected(state.proxy_models, name)) catch {
             self.notice = "Could not save setting; previous value kept";
             return;
@@ -2136,6 +3451,7 @@ const Ui = struct {
         self.notice = "Saved proxy models; main route applies in a new session";
     }
     fn settingsKey(self: *Ui, event_: input.Event) !void {
+        if (self.normalAsyncPending() and event_ != .escape and event_ != .cancel and event_ != .left and event_ != .quit) return;
         if (self.settings_value_picker != null) return self.settingsValueKey(event_);
         if (self.proxy_address_open) return self.proxyAddressKey(event_);
         if (self.proxy_open and (event_ == .left or event_ == .escape or event_ == .cancel)) {
@@ -2256,6 +3572,10 @@ const Ui = struct {
                         return;
                     };
                     const selected = decision_picker_module.choice(self.settingsModels(state), state.model_providers, self.editor.bytes.items, self.settings_menu.selected) orelse return;
+                    if (self.connection.async_actions != null) {
+                        _ = self.beginAsync(if (self.image_open) .{ .image = selected } else .{ .decision = selected }, if (self.image_open) .image else .decision);
+                        return;
+                    }
                     save(self.connection.context, selected) catch {
                         self.notice = "Could not save setting; previous value kept";
                         return;
@@ -2266,6 +3586,10 @@ const Ui = struct {
                         self.notice = "Global settings unavailable; changes disabled";
                         return;
                     };
+                    if (self.connection.async_actions != null) {
+                        _ = self.beginAsync(.{ .setting = .{ .key = .low_price_input, .value = !state.low_price_input_enabled } }, .setting);
+                        return;
+                    }
                     save(self.connection.context, .low_price_input, !state.low_price_input_enabled) catch {
                         self.notice = "Could not save setting; previous value kept";
                         return;
@@ -2358,7 +3682,16 @@ const Ui = struct {
             inherited = false;
             break;
         };
+        if (self.connection.async_actions != null) {
+            const pending = self.beginAsync(.{ .model = name }, .model) orelse return error.Busy;
+            pending.inherited = inherited;
+            return error.AsyncPending;
+        }
         try self.connection.selectModel(name);
+        self.finishModelSelection(inherited);
+    }
+
+    fn finishModelSelection(self: *Ui, inherited: bool) void {
         const state = self.connection.current();
         self.display = .{ .context = state.initial_context, .reasoning_effort = state.reasoning_effort };
         self.effort_flash = if (state.effort_levels.contains(state.reasoning_effort))
@@ -2382,6 +3715,10 @@ const Ui = struct {
             return;
         };
         const state = self.connection.current();
+        if (self.connection.async_actions != null) {
+            _ = self.beginAsync(.cycle_effort, .effort);
+            return;
+        }
         const next = if (self.connection.cycle_effort_fn) |cycle|
             cycle(self.connection.context) catch |err| {
                 self.notice = switch (err) {
@@ -2421,6 +3758,7 @@ const Ui = struct {
         }
     }
     fn modelKey(self: *Ui, event_: input.Event) !void {
+        if (self.normalAsyncPending() and event_ != .escape and event_ != .cancel and event_ != .quit) return;
         const picker = &self.model_picker.?;
         switch (event_) {
             .escape, .cancel => {
@@ -2468,8 +3806,8 @@ const Ui = struct {
                     const name = try picker.selectionName(self.allocator, choice);
                     defer self.allocator.free(name);
                     if (!picker.modelShown(name)) return;
-                    self.selectModel(name) catch {
-                        self.notice = "Could not switch; selection is unchanged";
+                    self.selectModel(name) catch |err| {
+                        if (err != error.AsyncPending) self.notice = "Could not switch; selection is unchanged";
                     };
                 } else picker.move(event_ == .down, choices.len);
             },
@@ -2480,6 +3818,10 @@ const Ui = struct {
     /// 提交当前输入并启动后台任务。忙碀或已 poisoned 时拒绝；提交不排队。
     fn submit(self: *Ui) !void {
         if (self.exitAuthorized()) return;
+        if (self.blocksSubmit()) {
+            self.notice = "Operation pending; input kept";
+            return;
+        }
         const command = std.mem.trim(u8, self.editor.bytes.items, " \t\r\n");
         // Session management resolves before steering: /ls, /cd, /attach,
         // /detach, /exit and /close work while a task is busy and never enter
@@ -2509,6 +3851,10 @@ const Ui = struct {
                 return;
             }
             if (self.remote()) |client| {
+                if (self.connection.async_actions != null) {
+                    _ = self.beginAsync(.queue_resume, .queue_resume);
+                    return;
+                }
                 client.queueResume(self.remote_epoch) catch |err| {
                     self.notice = session_client.describe(err);
                     return;
@@ -2533,6 +3879,10 @@ const Ui = struct {
                 self.notice = "Metadata refresh unavailable";
                 return;
             };
+            if (self.connection.async_actions != null) {
+                _ = self.beginAsync(.refresh_models, .refresh);
+                return;
+            }
             refresh(self.connection.context) catch |err| {
                 self.notice = if (err == error.NoOfficialProvider) "No official provider configured; use /login first" else if (err == error.MetadataRefreshBusy) "Official metadata refresh already running" else "Could not start metadata refresh; previous cache kept";
                 return;
@@ -2594,7 +3944,8 @@ const Ui = struct {
                 self.wipeEditor();
                 self.notice = "Usage: /model or /model exact-id (one token)";
             } else {
-                self.selectModel(name) catch {
+                self.selectModel(name) catch |err| {
+                    if (err == error.AsyncPending) return;
                     self.wipeEditor();
                     self.notice = "Could not switch; selection is unchanged";
                     return;
@@ -2660,6 +4011,8 @@ const Ui = struct {
     // All fallible display/history preparation precedes worker launch. Queued
     // prompts pass explicit text and never borrow or clear the current draft.
     fn startPrompt(self: *Ui, runtime: *r.Runtime, value: []const u8, kind: @TypeOf(@as(task.Job, undefined).kind)) !void {
+        self.reclaimDisplayCapacity();
+        if (self.displayBackpressured()) return error.DisplayBackpressured;
         if (!self.queueOwnerMatches()) return error.QueueOwnerChanged;
         try self.bridge.reset();
         self.cancel.* = .{};
@@ -2676,7 +4029,7 @@ const Ui = struct {
         var record = Record{ .kind = .user };
         errdefer record.deinit(self.allocator);
         try record.append(self.allocator, prompt);
-        try self.records.ensureUnusedCapacity(self.allocator, 1);
+        try self.reserveRecord();
         self.job = .{ .runtime = runtime, .cancel = self.cancel, .prompt = prompt, .kind = kind };
         self.attachInbox(runtime);
         errdefer self.detachInbox();
@@ -2684,6 +4037,8 @@ const Ui = struct {
         var bytes: usize = record.body.items.len;
         for (self.records.items) |old| bytes += old.body.items.len;
         while (self.records.items.len != 0 and (self.records.items.len >= 64 or bytes > 1024 * 1024)) {
+            if (!self.canEvictOldest()) break;
+            self.forgetRecord(0);
             var removed = self.records.orderedRemove(0);
             bytes -= removed.body.items.len;
             removed.deinit(self.allocator);
@@ -2692,6 +4047,11 @@ const Ui = struct {
             self.dropped_display = true;
         }
         self.records.appendAssumeCapacity(record);
+        self.registerRecord(self.records.items.len - 1) catch |err| {
+            var removed = self.records.pop().?;
+            removed.deinit(self.allocator);
+            return err;
+        };
         self.task_epoch +%= 1;
         self.input_history.commit(self.allocator, history_entry);
         self.dropHistoryDraft();
@@ -2707,7 +4067,6 @@ const Ui = struct {
         self.display.reset();
         self.clearActiveTool();
         self.clearToolCaptions();
-        self.scroll = 0;
     }
 
     /// Summary-only worker, sharing the ordinary cancellation/join/terminal path.
@@ -2737,7 +4096,6 @@ const Ui = struct {
         self.clearActiveTool();
         self.clearToolCaptions();
         self.closeCommandMenu();
-        self.scroll = 0;
     }
 
     /// Remote task submission. The backend owns the task, its jobs and its
@@ -2745,12 +4103,17 @@ const Ui = struct {
     /// adopts owner-reported activity. Returns false when nothing was accepted,
     /// in which case the draft and display are unchanged.
     fn remoteStart(self: *Ui, client: session_client.Client, kind: session_client.TaskKind, value: []const u8) !bool {
+        self.reclaimDisplayCapacity();
+        if (kind != .compact and self.displayBackpressured()) {
+            self.notice = "Display is catching up; draft kept";
+            return false;
+        }
         if (!self.queueOwnerMatches()) {
             self.notice = "Queue belongs to another session; Ctrl-C to clear explicitly";
             return false;
         }
         if (!client.snapshot().available) {
-            self.notice = "Session unavailable; /exit and reconnect";
+            self.notice = if (client.snapshot().attached) "Synchronizing session; draft kept" else "Session unavailable; /exit and reconnect";
             return false;
         }
         self.bridge.reset() catch {
@@ -2770,15 +4133,34 @@ const Ui = struct {
         var record_moved = false;
         defer if (!record_moved) record.deinit(self.allocator);
         if (kind != .compact) try record.append(self.allocator, value);
-        if (kind != .compact) try self.records.ensureUnusedCapacity(self.allocator, 1);
+        if (kind != .compact) try self.reserveRecord();
+        if (self.connection.async_actions != null) {
+            if (self.beginAsync(.{ .submit = .{ .kind = kind, .text = value } }, .submit)) |pending| {
+                pending.record = record;
+                pending.history_entry = history_entry;
+                record_moved = true;
+                history_committed = true;
+            }
+            return false;
+        }
         client.submit(self.remote_epoch, kind, value) catch |err| {
             self.notice = session_client.describe(err);
             return false;
         };
-        // Accepted: publish the row, evict old display rows, commit history.
+        self.acceptRemote(kind, &record, &history_entry);
+        record_moved = true;
+        history_committed = true;
+        return true;
+    }
+
+    fn acceptRemote(self: *Ui, kind: session_client.TaskKind, record: *Record, history_entry: *?[]u8) void {
+        // Called only for an accepted receipt, with all display storage prepared
+        // before queue admission. Stream delivery is held until this point.
         var bytes: usize = record.body.items.len;
         for (self.records.items) |old| bytes += old.body.items.len;
         while (self.records.items.len != 0 and (self.records.items.len >= 64 or bytes > 1024 * 1024)) {
+            if (!self.canEvictOldest()) break;
+            self.forgetRecord(0);
             var removed = self.records.orderedRemove(0);
             bytes -= removed.body.items.len;
             removed.deinit(self.allocator);
@@ -2787,18 +4169,24 @@ const Ui = struct {
             self.dropped_display = true;
         }
         if (kind != .compact) {
-            self.records.appendAssumeCapacity(record);
-            record_moved = true;
+            self.records.appendAssumeCapacity(record.*);
+            record.* = .{ .kind = .user };
+            if (self.registerRecord(self.records.items.len - 1)) {
+                // Reservation guarantees this; never drop an accepted receipt.
+            } else |_| {
+                std.debug.assert(false);
+            }
         }
-        if (history_entry) |entry| {
+        if (history_entry.*) |entry| {
             self.input_history.commit(self.allocator, entry);
-            history_committed = true;
+            history_entry.* = null;
         }
         self.dropHistoryDraft();
         self.task_epoch +%= 1;
         self.remote_kind = kind;
         self.remote_observed_busy = false;
         self.remote_idle_ticks = 0;
+        self.remote_terminal_wait = false;
         self.has_submitted = true;
         self.busy = true;
         self.compact_composer = false;
@@ -2817,8 +4205,6 @@ const Ui = struct {
         self.display.reset();
         self.clearActiveTool();
         self.clearToolCaptions();
-        self.scroll = 0;
-        return true;
     }
 
     /// Return the unsent draft parked by Up browsing to the editor without
@@ -2891,6 +4277,7 @@ const Ui = struct {
             self.editor.deinit();
         }
         self.editor = replacement;
+        self.editor_revision +%= 1;
         self.input_history.index = selected.index;
         self.editor_pasted = false;
     }
@@ -2937,6 +4324,10 @@ const Ui = struct {
         if (self.remote()) |client| {
             // Delivery, pause and terminal state stay owned by the backend; a
             // failed enqueue keeps the draft so the user can retry.
+            if (self.connection.async_actions != null) {
+                _ = self.beginAsync(.{ .enqueue = .{ .kind = kind, .text = self.editor.bytes.items } }, .enqueue);
+                return;
+            }
             client.enqueue(self.remote_epoch, kind, self.editor.bytes.items) catch |err| {
                 self.notice = session_client.describe(err);
                 return;
@@ -3037,7 +4428,9 @@ const Ui = struct {
             if (was_open and identity != null) {
                 const current = client.snapshot();
                 if (identity.?.remote_epoch == current.control_epoch and std.meta.eql(identity.?.session, current.session_id)) {
-                    client.setConfirming(identity.?.remote_epoch, false) catch {
+                    if (self.connection.async_actions != null) {
+                        _ = self.beginAsync(.{ .confirming = false }, .release_stop);
+                    } else client.setConfirming(identity.?.remote_epoch, false) catch {
                         // The modal is already gone, so stop gating on it; the
                         // owner clears the barrier on detach/EOF instead.
                         self.notice = "Stop dismissed; remote confirmation barrier not released until disconnect";
@@ -3046,6 +4439,7 @@ const Ui = struct {
             }
         } else self.inbox.pauseClaims(false);
         self.stop_open = false;
+        self.stop_instance +%= 1;
         self.stop_danger = false;
         self.stop_identity = null;
         if (self.stop_close) |id| {
@@ -3095,6 +4489,11 @@ const Ui = struct {
                     return;
                 }
                 if (self.remote()) |client| {
+                    if (self.connection.async_actions != null) {
+                        _ = self.beginAsync(.{ .cancel_clear = identity.revision }, .cancel_clear);
+                        self.displayed_stop = null;
+                        return;
+                    }
                     client.cancelClear(self.remote_epoch, identity.revision) catch |err| {
                         self.notice = session_client.describe(err);
                         self.closeStop();
@@ -3135,6 +4534,10 @@ const Ui = struct {
             // adopts a fresh snapshot on success, so request the barrier before
             // the modal claims anything and authorize against the adopted queue
             // revision. A rejected request must never open a fake-safe modal.
+            if (self.connection.async_actions != null) {
+                _ = self.beginAsync(.{ .confirming = true }, .open_stop);
+                return;
+            }
             client.setConfirming(self.remote_epoch, true) catch |err| {
                 self.notice = session_client.describe(err);
                 self.requestDraw();
@@ -3142,11 +4545,7 @@ const Ui = struct {
                 return;
             };
         } else self.inbox.pauseClaims(true);
-        self.stop_open = true;
-        self.stop_danger = false;
-        self.stop_identity = self.stopIdentity();
-        self.invalidateStop();
-        self.parser.stop_feed = true;
+        self.activateStop();
     }
 
     /// Busy /close confirmation accepted: cancel, join, save and release via
@@ -3167,9 +4566,18 @@ const Ui = struct {
             self.notice = "Draft kept; clear it before withdrawing a pending message";
             return;
         }
+        if (self.withdrawn_draft) |bytes| {
+            self.withdrawn_draft = null;
+            self.adoptWithdrawn(bytes);
+            return;
+        }
         const snapshot = self.queueSnapshot();
         if (snapshot.newest_id) |id| {
             if (self.remote()) |client| {
+                if (self.connection.async_actions != null) {
+                    _ = self.beginAsync(.{ .withdraw = id }, .withdraw);
+                    return;
+                }
                 const withdrawn = client.withdraw(self.allocator, self.remote_epoch, id) catch |err| {
                     self.notice = session_client.describe(err);
                     return;
@@ -3210,6 +4618,10 @@ const Ui = struct {
         if (self.remote()) |client| {
             // Only the current task is canceled; the attached session, its
             // queue ownership and this connection stay alive.
+            if (self.connection.async_actions != null) {
+                _ = self.beginAsync(.cancel, .cancel);
+                return;
+            }
             client.cancel(self.remote_epoch) catch |err| {
                 self.notice = session_client.describe(err);
                 return;
@@ -3226,6 +4638,7 @@ const Ui = struct {
     }
 
     fn wipeEditor(self: *Ui) void {
+        self.editor_revision +%= 1;
         self.dropHistoryDraft();
         self.vertical_column = null;
         self.input_history.index = null;
@@ -3244,6 +4657,7 @@ const Ui = struct {
     }
 
     fn secretKey(self: *Ui, event_: input.Event) !void {
+        if (self.hasAsync(.configure) and event_ != .escape and event_ != .cancel and event_ != .quit) return;
         switch (event_) {
             .text => |v| {
                 self.secret.insert(v.value);
@@ -3286,6 +4700,10 @@ const Ui = struct {
                     return;
                 };
                 const named = self.secret_provider != null;
+                if (self.connection.async_actions != null) {
+                    if (self.beginAsync(.{ .configure = .{ .provider = self.secret_provider, .key = key_bytes } }, .configure) != null) self.secret.wipe();
+                    return;
+                }
                 const saved = if (self.secret_provider) |id| self.connection.configureProvider(id, key_bytes) else self.connection.configure(key_bytes);
                 saved catch {
                     self.endSecret();
@@ -3332,8 +4750,20 @@ const Ui = struct {
             return;
         }
         if (self.remote()) |client| {
+            if (decision != .deny and !client.snapshot().available) {
+                self.displayed_permission = null;
+                self.displayed_permission_choice = null;
+                self.notice = "Session display is resynchronizing; approval not sent";
+                return;
+            }
             // The decision is bound to the epoch that displayed the request; the
             // backend rejects approvals from a replaced controller.
+            if (self.connection.async_actions != null) {
+                _ = self.beginAsync(.{ .approve = .{ .id = permission.id, .decision = decision } }, .approve);
+                self.displayed_permission = null;
+                self.displayed_permission_choice = null;
+                return;
+            }
             client.approve(permission.epoch, permission.id, decision) catch |err| {
                 self.notice = session_client.describe(err);
                 self.clearPermission();
@@ -3393,7 +4823,14 @@ const Ui = struct {
     fn key(ctx: *anyopaque, event_: input.Event) !void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
         if (self.exitAuthorized()) return;
+        // Keyboard input must reach the next fresh draw without waiting for the
+        // ordinary cadence; it still never interrupts an already-started frame.
+        self.urgent_draw = true;
         self.requestDraw();
+        if (event_ == .escape and self.hasAsync(.open_stop) and !self.stop_open) {
+            _ = self.beginAsync(.{ .confirming = false }, .release_stop);
+            return;
+        }
         if (event_ != .up and event_ != .down) self.vertical_column = null;
         if ((event_ == .enter or event_ == .follow_up) and (self.parser.pasted or self.parser.batch_paste)) return;
         if (self.secret_mode) {
@@ -3432,6 +4869,10 @@ const Ui = struct {
         if (self.settings_open and self.permission == null) return self.settingsKey(event_);
         if (self.provider_open and self.permission == null) return self.providerKey(event_);
         if (self.model_picker != null and self.permission == null) return self.modelKey(event_);
+        switch (event_) {
+            .text, .tab, .backspace, .delete, .clear, .kill_end => self.editor_revision +%= 1,
+            else => {},
+        }
         switch (event_) {
             .backspace, .delete, .clear, .kill_end => {
                 self.input_history.index = null;
@@ -3511,8 +4952,9 @@ const Ui = struct {
             .cycle_effort => self.cycleEffort(),
             .escape => {},
             .up, .down => try self.navigateInput(event_ == .down),
-            .page_up => self.scroll +|= 10,
-            .page_down => self.scroll -|= 10,
+            // Native scrollback owns completed conversation rows; no program
+            // key injection and no full-history repaint from PageUp/PageDown.
+            .page_up, .page_down => {},
             .backspace => self.editor.backspace(),
             .delete => self.editor.delete(),
             .left => self.editor.left(),
@@ -3598,6 +5040,17 @@ const Ui = struct {
         };
     }
 
+    /// The only displayed wording for a delivered terminal result. Shared so a
+    /// late cancel receipt or an ordered idle release can restore it verbatim.
+    fn terminalNotice(result: r.Terminal) []const u8 {
+        return switch (result.status) {
+            .success => "Ready",
+            .canceled => "Canceled; prior side effects remain",
+            .paused => if (result.model_failure == .output_limit or r.policyPause(result.detail)) "Paused" else "Paused at round limit; send a message to continue",
+            .failed => "Failed",
+        };
+    }
+
     /// 判断是否有任务可以收尾。远端终态由本线程经 Bridge 交付，本地 busy 只是
     /// 视图：两个任务之间它可能已经为 false，所以不能把真实 terminal 留在
     /// Bridge 里等一个永远不会再出现的 busy 周期。本地任务仍需 busy 且
@@ -3623,11 +5076,14 @@ const Ui = struct {
 
         // The producer can finish after our per-tick drain limit. Once joined,
         // at most one bounded queue remains; consume it before accepting Submit.
-        while (self.bridge.pop()) |value| {
-            var item = value;
+        while (true) {
+            self.reclaimDisplayCapacity();
+            if (self.displayBackpressured()) break;
+            var item = self.bridge.pop() orelse break;
             defer item.deinit();
             try self.event(item);
         }
+        if (!self.bridgeEmpty()) return;
         self.busy = false;
         self.remote_idle_ticks = 0;
 
@@ -3652,21 +5108,32 @@ const Ui = struct {
         // 清理失败或无法安全继续时进入 poisoned，禁止再次提交。
         if (result.status != .success and !is_remote) self.inbox.pause();
         self.poisoned = if (result.detail) |detail| detail == error.CleanupFailed or detail == error.UnsafeToContinue else false;
-        self.notice = switch (result.status) {
-            .success => "Ready",
-            .canceled => "Canceled; prior side effects remain",
-            .paused => if (result.model_failure == .output_limit or r.policyPause(result.detail)) "Paused" else "Paused at round limit; send a message to continue",
-            .failed => "Failed",
-        };
+        self.notice = terminalNotice(result);
 
-        // 任务结束时仍未收到 canonical 内容的草稿，标记为中断。
-        if (self.draft) |i| self.records.items[i].interrupted = true;
+        // A truncated or canceled stream still has to drain its final window.
+        if (self.draft) |i| {
+            self.records.items[i].interrupted = true;
+            if (self.records.items[i].stream) |stream| stream.finish() catch {
+                self.notice = "Could not finalize interrupted display";
+            };
+        }
         self.discardReasoning();
         self.draft = null;
         self.clearActiveTool();
         self.clearToolCaptions();
         self.tool_views.clear(self.allocator);
         self.mode = null;
+        // The owner can still report this task busy after delivering its
+        // terminal. Keep the composer busy instead of painting an idle prompt
+        // that the next stale snapshot would immediately re-busy; ordered owner
+        // idle releases it, and an ordered state event adopts the next task.
+        const owner_busy = if (self.remote()) |client| client.snapshot().busy else false;
+        self.remote_terminal_wait = owner_busy;
+        if (owner_busy) {
+            self.busy = true;
+            self.remote_observed_busy = true;
+            self.remote_idle_ticks = 0;
+        }
         self.requestDraw();
     }
 
@@ -3691,24 +5158,83 @@ const Ui = struct {
     fn requestDraw(self: *Ui) void {
         self.display_changed = true;
         self.resize_waiting = false;
-        self.resize_redraw_at_ms = null;
         self.dirty = true;
+    }
+
+    /// Display progress of already-accepted content. It needs another frame but
+    /// is not new input: it must not resurrect a screen whose geometry just
+    /// changed, and it must not keep a resize-hold open.
+    fn requestProgressDraw(self: *Ui) void {
+        self.dirty = true;
+    }
+
+    fn registerRecord(self: *Ui, index: usize) !void {
+        try self.record_index.ensureUnusedCapacity(self.allocator, 1);
+        const id = self.next_record_id;
+        self.next_record_id += 1;
+        self.records.items[index].id = id;
+        self.record_index.putAssumeCapacityNoClobber(id, index);
+    }
+
+    fn forgetRecord(self: *Ui, index: usize) void {
+        _ = self.record_index.remove(self.records.items[index].id);
+        for (self.records.items[index + 1 ..], index..) |record, shifted| {
+            self.record_index.getPtr(record.id).?.* = shifted;
+        }
+    }
+
+    /// Reserve every capacity a future record publication needs, so accepting an
+    /// event can never fail after the receipt has already been consumed.
+    fn reserveRecord(self: *Ui) !void {
+        // Reserve for the caller's own publication plus one nesting level, so an
+        // intervening display record can never consume a pending reservation.
+        try self.records.ensureUnusedCapacity(self.allocator, 2);
+        try self.record_index.ensureUnusedCapacity(self.allocator, 2);
+    }
+
+    /// Never evict unacknowledged, active, or frame-owned display records.
+    fn canEvictOldest(self: *const Ui) bool {
+        if (self.records.items.len == 0) return false;
+        const record = &self.records.items[0];
+        return record.output and self.draft != 0 and self.reasoning != 0 and
+            !record.pending_output and record.pending_stream_rows == 0 and !record.pending_flow_change and
+            // An unmet display fence owns its record: evicting it would erase
+            // the only evidence that could prove the event was shown.
+            !self.hasUnmetFence(record.id);
     }
 
     fn drawReady(self: *const Ui) bool {
         return self.dirty and !self.resize_waiting and self.frame.len == 0 and self.resize_rescue.len == 0;
     }
 
+    /// Pi-style ordinary display cadence: at most one fresh body frame per
+    /// interval, counted from the previous draw's start so the draw's own cost is
+    /// already used. Urgent input bypasses it; an unproven geometry waits for
+    /// real input/content and never enters here by timer.
+    fn drawDue(self: *const Ui) bool {
+        if (!self.drawReady()) return false;
+        if (self.urgent_draw) return true;
+        return self.clock_ms -| self.last_draw_ms >= draw_interval_ms;
+    }
+
+    /// Remaining wait for a throttled dirty frame: the rest of the interval, not
+    /// a fresh full interval after work that already happened.
+    fn cadenceWaitMs(self: *const Ui) u16 {
+        const elapsed = self.clock_ms -| self.last_draw_ms;
+        const remaining = draw_interval_ms -| elapsed;
+        return @intCast(@max(1, @min(remaining, draw_interval_ms)));
+    }
+
     fn idleBreaksDrawable(self: *const Ui) bool {
         return self.idle_breaks != 0 and self.size.columns >= 9 and self.size.rows >= 7 and
             self.permission == null and !self.stop_open and !self.settings_open and !self.provider_open and
             self.model_picker == null and !self.secret_mode and !self.secret_quarantine and
-            !self.busy and self.mode == null and self.active_tool == null;
+            !self.busy and !self.presentationWaiting() and !self.remoteSynchronizing() and self.mode == null and self.active_tool == null;
     }
 
     fn animate(self: *Ui) void {
         const tick = self.clock_ms / 80;
-        if (!self.busy or self.resize_waiting or self.animation_tick == tick) return;
+        if ((!self.busy and !self.presentationWaiting() and !self.remoteSynchronizing()) or self.resize_waiting or self.animation_tick == tick) return;
         self.animation_tick = tick;
         // An approval owns a full, non-sparse preview. Repainting that unchanged
         // preview for a composer pulse sends its title/body again every 80 ms.
@@ -3717,9 +5243,9 @@ const Ui = struct {
         if (self.permission == null) self.dirty = true;
     }
 
-    /// 主事件循环：分批消费 bridge 事件、读取按键、分段写出帧、按节流重绘；满足退出条件时返回退出码。
+    /// 主事件循环：有界消费、处理按键，然后绘制最新状态；仅动画自身限频。
+    /// 已开始的帧仍完整写完并 ACK，不丢弃部分帧或清除原生 scrollback。
     fn loop(self: *Ui) !u8 {
-        var last_draw = Io.Clock.awake.now(self.io);
         var buffer: [4096]u8 = undefined;
         defer std.crypto.secureZero(u8, &buffer);
         while (true) {
@@ -3730,15 +5256,10 @@ const Ui = struct {
             self.expireEffortFlash();
             self.expireMetadataToast();
             self.expireMemoryNotice();
-            // Remote output arrives as polled typed deltas and is injected into
-            // the same Bridge a local worker uses, one event per idle queue.
-            try self.pumpRemote();
-            // 每轮最多处理 64 个事件，避免大量输出阻塞输入与绘制。
-            for (0..64) |_| {
-                var item = self.bridge.pop() orelse break;
-                defer item.deinit();
-                try self.event(item);
-            }
+            self.pumpAsync();
+            // Both local and remote output share the bounded event budget;
+            // buffered remote deltas must not wait one terminal tick apiece.
+            try self.pumpDisplay();
 
             // acquire 与 worker 的 release 配对，确保读到任务结果。
             try self.finishReadyTask();
@@ -3788,44 +5309,63 @@ const Ui = struct {
                 try self.writeFrame();
             }
 
-            // 仅当上一帧已写完、有脉冲标记且距上次绘制超过 33ms（约 30 FPS）时才重绘。
-            if (self.drawReady() and last_draw.untilNow(self.io, .awake).toMilliseconds() >= 33) {
+            // Draw latest state on the ordinary cadence, but preserve the
+            // input/geometry turn before its first write. Already-buffered keys
+            // must not gain authority from a frame they could not have seen;
+            // urgent input waits only for a frame that has already started.
+            // Cadence starts when the draw can actually run, not at the loop's
+            // earlier clock sample before pumping/input/output work.
+            self.clock_ms = @intCast(@max(0, Io.Clock.awake.now(self.io).toMilliseconds()));
+            const staged = self.drawDue();
+            if (staged) {
                 try self.draw();
-                last_draw = Io.Clock.awake.now(self.io);
                 self.dirty = false;
+                self.urgent_draw = false;
             }
 
-            // 等待终端可读（有待写帧时同时等待可写），最多 16ms，避免忙等。
-            try self.terminal.wait(self.frame.len != 0 or self.resize_rescue.len != 0, 16);
+            // A fresh frame immediately returns through that safety turn. An
+            // existing blocked/partial write still waits for output readiness,
+            // rather than spinning just because a frame remains outstanding.
+            const local_buffered = blk: {
+                std.debug.assert(std.c.pthread_mutex_lock(&self.bridge.mutex) == .SUCCESS);
+                defer std.debug.assert(std.c.pthread_mutex_unlock(&self.bridge.mutex) == .SUCCESS);
+                // Active producers/borrowed storage are ownership, not queued
+                // display work; an approval waiter must not make us spin.
+                break :blk self.bridge.len != 0 or self.bridge.terminal != null;
+            };
+            const buffered = local_buffered or (!self.hasAsync(.submit) and
+                (if (self.remote()) |client| client.buffered() else false));
+            // Wake at the coalescing deadline rather than a full tick after work
+            // that already happened; buffered events are consumed immediately and
+            // never spin merely because a throttled dirty frame exists.
+            var wait_ms: u16 = if (staged or buffered) 0 else 16;
+            if (!staged and !buffered and self.frame.len == 0 and self.resize_rescue.len == 0 and
+                self.drawReady() and !self.urgent_draw)
+                wait_ms = self.cadenceWaitMs();
+            try self.terminal.wait(self.frame.len != 0 or self.resize_rescue.len != 0, wait_ms);
         }
     }
 
     fn resize(self: *Ui, dimensions: terminal_module.Size) void {
-        if (dimensions.columns == self.size.columns and dimensions.rows == self.size.rows) {
-            if (self.resize_redraw_at_ms) |due| {
-                if (self.resize_waiting and self.clock_ms >= due and dimensions.columns != 0 and dimensions.rows != 0) {
-                    self.resize_redraw_at_ms = null;
-                    self.resize_waiting = false;
-                    self.dirty = true;
-                    // A repair is not new content. If interrupted by another
-                    // resize, coalesce again instead of replaying immediately.
-                }
-            }
-            return;
-        }
+        // Same geometry proves nothing new; a repeated size report is not a draw
+        // request and must not restart any recovery state.
+        if (dimensions.columns == self.size.columns and dimensions.rows == self.size.rows) return;
+        // Real content staged in this turn keeps its obligation to be drawn even
+        // though the frame carrying it is about to be discarded.
         const changed = self.display_changed or (self.frame.len != 0 and self.frame_changed);
         // A full ACK proves ownership before resize, not after terminal reflow
-        // or cursor clamping (even height-only). Never erase guessed old rows.
-        // Conservative recovery can retain old visual previews in scrollback;
-        // those are not canonical transcript or completed execution records.
+        // or cursor clamping (even height-only). Never erase guessed old rows:
+        // pre-resize pixels belong to terminal-managed screen/scrollback from
+        // now on, so they are neither canonical transcript nor completed
+        // execution records, and this client no longer owns their coordinates.
         self.size = dimensions;
         self.vertical_column = null;
         self.tail_cursor_rows_up = 0;
         self.tail_composer_rows = 1;
-        if ((self.records.items.len != 0 and (self.settings_open or self.provider_open or self.model_picker != null or self.commandMenuVisible())) or
-            (self.menu_history != null and self.menu_history.?.borrowed.len != 0) or
-            (self.frame_menu_history != null and self.frame_menu_history.?.borrowed.len != 0))
-            self.menu_history_recovery = true;
+        // Reflow may have moved our rows: nothing is proven about the bottom or
+        // about the rows we owned before this geometry change.
+        self.tail_bottom = false;
+        self.frame_bottom = false;
         self.displayed_permission = null;
         self.displayed_permission_choice = null;
         self.frame_permission_choice = null;
@@ -3844,13 +5384,33 @@ const Ui = struct {
         self.tail_snapshot = null;
         self.abandon_tail = self.abandon_tail or self.tail_height != 0 or self.frame_offset != 0;
         self.discardResizedFrame();
-        // Genuine updates may proceed immediately. Otherwise stop animation
-        // during live resizing, but do not depend on a key to restore a viewport
-        // whose rows may have been lost by terminal reflow/cursor clamping.
+        // Pending genuine input/content is ordinary work and draws once at the
+        // new geometry; it is never dropped just because a resize shared its
+        // turn. Otherwise only an animation pulse or repeated resize is pending:
+        // stay inhibited until real input/content arrives. No timer, no repair
+        // frame, no replay, and no CUD999/clear/fill is scheduled here.
         self.display_changed = changed or self.idleBreaksDrawable();
         self.resize_waiting = !self.display_changed;
-        self.resize_redraw_at_ms = if (self.resize_waiting) self.clock_ms +| 150 else null;
         self.dirty = self.display_changed;
+    }
+
+    fn discardFrameRecords(self: *Ui, records: []FrameRecord) void {
+        for (records) |*entry| {
+            if (self.record_index.get(entry.record_id)) |index| {
+                const record = &self.records.items[index];
+                if (record.stream_generation == entry.generation) {
+                    record.pending_output = false;
+                    record.pending_stream_rows = 0;
+                    record.discardPendingFlow();
+                    if (record.stream) |stream| {
+                        stream.abort();
+                        record.invalidate();
+                    }
+                }
+            }
+            if (entry.flow_prefix) |*prefix| prefix.deinit();
+            entry.flow_prefix = null;
+        }
     }
 
     fn discardResizedFrame(self: *Ui) void {
@@ -3862,10 +5422,8 @@ const Ui = struct {
         // visibility, but never move, erase, scroll or replay old-width content.
         if (self.frame_offset != 0 or self.resize_rescue.len != 0)
             self.resize_rescue = "\x18\x1b[0m" ++ terminal_module.sync_end ++ "\x1b[?25h";
-        for (self.records.items) |*record| {
-            record.pending_output = false;
-            record.discardPendingFlow();
-        }
+        self.discardFrameRecords(self.frame_records);
+        self.frame_records = &.{};
         if (self.frame_tail_snapshot) |*snapshot| snapshot.deinit();
         self.frame_tail_snapshot = null;
         if (self.frame_menu_history) |*history| history.deinit();
@@ -3875,14 +5433,19 @@ const Ui = struct {
         self.frame = "";
         self.frame_offset = 0;
         self.frame_clear_end = 0;
-        self.frame_full_tail = "";
         self.frame_sparse = false;
         self.frame_changed = false;
         self.frame_idle_breaks = 0;
         self.frame_idle_prefix_end = 0;
+        self.frame_bottom = false;
+        self.frame_delivery_shown = false;
+        self.frame_delivery_reasoning = false;
     }
 
     fn writeFrame(self: *Ui) !void {
+        // Rendering/input handling can take time after the loop's first size
+        // sample. Revalidate before writing any owned interface payload.
+        self.resize(self.terminal.size());
         if (self.resize_rescue.len != 0) {
             const n = try self.terminal.write(self.resize_rescue);
             self.resize_rescue = self.resize_rescue[n..];
@@ -3894,7 +5457,7 @@ const Ui = struct {
     }
 
     fn finishFrame(self: *Ui) void {
-        if (self.frame.len == 0) return; // A discarded frame cannot acknowledge anything.
+        if (self.frame.len == 0 or self.frame_offset != self.frame.len) return;
         // Resize invalidation is sticky, even if the window returns to its old size.
         self.displayed_stop = if (self.frame_fresh) self.frame_stop else null;
         self.displayed_permission = if (self.frame_fresh) self.frame_permission else null;
@@ -3913,19 +5476,88 @@ const Ui = struct {
         self.displayed_decision_fingerprint = if (self.frame_fresh and self.displayed_settings_generation != null) self.frame_decision_fingerprint else null;
         self.displayed_proxy_fingerprint = if (self.frame_fresh and self.displayed_settings_generation != null) self.frame_proxy_fingerprint else null;
         self.tail_height = self.frame_height;
+        if (self.frame_fresh) self.tail_hint_hash = self.frame_hint_hash;
+        // Only a fresh, complete frame that fills the screen proves that its last
+        // row is the physical bottom. Fractional/partial state never promotes.
+        self.tail_bottom = self.frame_fresh and self.frame_bottom;
         self.tail_cursor_rows_up = if (self.frame_fresh) self.frame_cursor_rows_up else 0;
         self.tail_composer_rows = if (self.frame_fresh) self.frame_composer_rows else 1;
         self.tail_size = self.frame_size;
-        for (self.records.items) |*record| {
-            if (record.pending_output) record.output = true;
-            record.pending_output = false;
-            if (record.pending_flow_change and self.frame_fresh) {
-                if (record.flow_prefix) |*prefix| prefix.deinit();
-                record.flow_prefix = record.pending_flow_prefix;
-                record.pending_flow_prefix = null;
+        var delivery_frame_valid = self.frame_fresh and self.frame_offset == self.frame.len;
+        for (self.frame_records) |*entry| {
+            defer if (entry.flow_prefix) |*prefix| prefix.deinit();
+            const index = self.record_index.get(entry.record_id) orelse {
+                delivery_frame_valid = false;
+                continue;
+            };
+            const record = &self.records.items[index];
+            if (record.stream_generation != entry.generation) {
+                delivery_frame_valid = false;
+                continue;
             }
-            record.discardPendingFlow();
+            record.pending_output = false;
+            record.pending_stream_rows = 0;
+            if (!self.frame_fresh) {
+                if (record.stream) |stream| {
+                    stream.abort();
+                    record.invalidate();
+                }
+                continue;
+            }
+            var committed = true;
+            if (record.stream) |stream| {
+                if (entry.stream_rows != 0 or entry.metadata_staged) {
+                    const before_base = stream.base;
+                    if (stream.commit(entry.stream_rows)) |done| {
+                        const progressed = done != 0 or stream.base > before_base;
+                        if (entry.metadata_staged and entry.stream_rows == 0 and stream.base > before_base)
+                            record.delivery_visible = @max(record.delivery_visible, stream.base);
+                        record.stream_written += done;
+                        if (done != entry.stream_rows) {
+                            committed = false;
+                            self.notice = "Display commit incomplete; output retained";
+                            self.requestDraw();
+                        }
+                        record.invalidate();
+                        if (progressed and (stream.pendingBytes() != 0 or stream.hasMetadataProgress() or stream.hasPendingPresentation())) self.requestProgressDraw();
+                    } else |_| {
+                        committed = false;
+                        stream.abort();
+                        record.invalidate();
+                        self.notice = "Display commit failed; output retained";
+                        self.requestDraw();
+                    }
+                } else stream.releasePin();
+                if (entry.output_candidate and !stream.isDrained()) {
+                    committed = false;
+                    // Waiting for more provider bytes is not progress; an append,
+                    // EOF or another independent state change requests its own draw.
+                }
+            }
+            if (!committed) delivery_frame_valid = false;
+            // Persist what this complete fresh frame actually displayed BEFORE
+            // any later commit/frame can change the render. Prior proof stays.
+            if (self.frame_fresh) {
+                record.delivery_visible = @max(record.delivery_visible, entry.visible_source_end);
+                record.delivery_complete = record.delivery_complete or entry.visible_complete;
+            }
+            if (committed and entry.output_candidate) record.output = true;
+            if (committed and entry.flow_change) {
+                if (record.flow_prefix) |*prefix| prefix.deinit();
+                record.flow_prefix = entry.flow_prefix;
+                entry.flow_prefix = null;
+                record.flow_match = if (entry.flow_layout_valid and record.cache != null) true else null;
+            }
         }
+        self.frame_records = &.{};
+        if (!self.delivery_fault and self.frame_delivery_epoch == self.delivery_epoch and
+            self.frame_delivery_sequence != 0)
+        {
+            self.promoteDeliveryFences(delivery_frame_valid);
+            self.retryDeliveryAck();
+        }
+        self.frame_delivery_shown = false;
+        self.frame_delivery_reasoning = false;
         if (self.tail_snapshot) |*snapshot| snapshot.deinit();
         self.tail_snapshot = null;
         if (self.frame_fresh) {
@@ -3953,7 +5585,6 @@ const Ui = struct {
         // advance them, without turning that retained work into a redraw loop.
         if (self.idleBreaksDrawable()) self.requestDraw();
         self.frame_changed = false;
-        self.frame_full_tail = "";
         self.frame_sparse = false;
         self.frame = "";
         self.frame_offset = 0;
@@ -3962,6 +5593,11 @@ const Ui = struct {
 
     /// Exit gets a bounded chance to publish the final canonical reply, never an infinite drain.
     fn drainExit(self: *Ui) !void {
+        // Exit is a real end of input: finish retained bodies so their last
+        // acknowledged rows can be published instead of waiting for more tokens.
+        for (self.records.items) |*record| {
+            if (record.stream) |stream| stream.finish() catch {};
+        }
         const start = Io.Clock.awake.now(self.io);
         for (0..128) |_| {
             self.resize(self.terminal.size());
@@ -3990,7 +5626,7 @@ const Ui = struct {
         if (!self.ctrl_d_exit or self.has_submitted or self.busy or self.future != null or
             self.frame.len != 0 or self.resize_rescue.len != 0 or !self.frame_fresh or
             self.abandon_tail or self.tail_snapshot == null or self.tail_height == 0 or
-            (self.menu_history != null and self.menu_history.?.borrowed.len != 0) or self.menu_history_recovery or
+            (self.menu_history != null and self.menu_history.?.borrowed.len != 0) or
             self.tail_height > self.size.rows or self.tail_size.rows != self.size.rows or
             self.tail_size.columns != self.size.columns) return false;
         try writer.writeAll(terminal_module.sync_begin ++ "\x1b[?25l\r");
@@ -4057,7 +5693,7 @@ const Ui = struct {
         const prefix = try editorDisplay(a, visible[0..cursor]);
         const suffix = try editorDisplay(a, visible[cursor..]);
         const display_bytes = try std.mem.concat(a, u8, &.{ prefix, suffix });
-        const working = self.busy or self.mode != null or self.active_tool != null;
+        const working = self.busy or self.presentationWaiting() or self.remoteSynchronizing() or self.mode != null or self.active_tool != null;
         const view = self.display.view(self.clock_ms);
         self.model_flow.advance(self.clock_ms, working, view.live_tps_tenths);
         const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
@@ -4068,7 +5704,34 @@ const Ui = struct {
         return .{ .decoration = decoration, .layout = try composer_layout.layout(a, display_bytes, prefix.len, cols -| text.width(decoration.plain), limit) };
     }
 
+    /// Restore borrowed ACKed rows at their original owned coordinates, ahead
+    /// of any rows this frame appends, and count them as transcript so the tail
+    /// advances past them. The rows stay owned restoration data, never replayed
+    /// history, and leave `borrowed` empty.
+    fn releaseBorrowedPrefix(
+        a: std.mem.Allocator,
+        out: *std.Io.Writer.Allocating,
+        clear_end: usize,
+        borrowed: *[]const []const u8,
+        transcript_rows: *usize,
+    ) !void {
+        if (borrowed.*.len == 0) return;
+        var rebuilt: std.Io.Writer.Allocating = .init(a);
+        try rebuilt.writer.writeAll(out.written()[0..clear_end]);
+        for (borrowed.*) |line| {
+            try rebuilt.writer.writeAll(line);
+            try rebuilt.writer.writeAll("\r\n");
+        }
+        try rebuilt.writer.writeAll(out.written()[clear_end..]);
+        out.* = rebuilt;
+        transcript_rows.* += borrowed.*.len;
+        borrowed.* = &.{};
+    }
+
     fn draw(self: *Ui) !void {
+        // Cadence is measured from the start of this draw, so its own work is
+        // already counted before the next ordinary frame may be staged.
+        self.last_draw_ms = self.clock_ms;
         self.refreshStop();
         self.displayed_stop = null;
         self.frame_stop = null;
@@ -4078,10 +5741,8 @@ const Ui = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        errdefer for (self.records.items) |*record| {
-            record.discardPendingFlow();
-            record.pending_output = false;
-        };
+        var frame_records: std.ArrayList(FrameRecord) = .empty;
+        errdefer self.discardFrameRecords(frame_records.items);
         const cols = self.size.columns -| 1; // Never trigger terminal autowrap.
         const state = self.connection.current();
         self.display.seed(state.initial_context);
@@ -4096,6 +5757,10 @@ const Ui = struct {
         self.displayed_permission_choice = null;
         self.frame_permission = null;
         self.frame_permission_choice = null;
+        // This frame's delivery proof starts empty; only a written row can
+        // promote it, and only `finishFrame` may publish it.
+        self.frame_delivery_shown = false;
+        self.frame_delivery_reasoning = false;
 
         const pending_transcript = for (self.records.items) |record| {
             if (record.kind != .reasoning and !record.output) break true;
@@ -4130,12 +5795,16 @@ const Ui = struct {
         } else if (self.abandon_tail or (self.tail_height != 0 and
             (self.tail_size.columns != self.size.columns or self.tail_size.rows != self.size.rows)))
         {
-            try writer.writeAll("\x1b[999B\r\n");
+            // Unknown geometry owns no coordinates. Continue naturally from the
+            // cursor's current row only: never force the physical bottom, clear
+            // the screen, fill blank rows, or attempt an old-coordinate reclaim.
+            try writer.writeAll("\r\n");
         } else if (self.tail_height != 0) {
             const top_distance = (self.tail_height - 1) -| self.tail_cursor_rows_up;
             if (top_distance != 0) try writer.print("\x1b[{d}A", .{top_distance});
-            // Replace each row once, without exposing a whole-tail blank pass.
-            // Transcript rows plus the nonshrinking live tail cover our footprint.
+            // Replace each owned row once, without exposing a whole-tail blank
+            // pass. Transcript rows plus the new tail cover the old footprint;
+            // rows the frame no longer needs are contracted after it.
             try writer.writeAll("\r");
         }
 
@@ -4146,20 +5815,10 @@ const Ui = struct {
         var borrowed: []const []const u8 = if (history_valid and !release_idle) self.menu_history.?.borrowed else &.{};
 
         // Native scrollback is an appendable document, not a sliding window.
-        // Streamed body prefixes may leave the mutable tail as DISPLAY previews;
-        // canonical flags/history remain separate. Thinking is always transient.
+        // Completed records are released once and never regrouped, re-laid out
+        // or replayed here; only the still-mutable tail joins `lines`.
         var lines: std.ArrayList([]const u8) = .empty;
-        if (self.menu_history_recovery) {
-            for (self.records.items) |record| {
-                // New real output returns to normal append/commit semantics.
-                if (!record.output and record.kind != .reasoning) {
-                    self.menu_history_recovery = false;
-                    break;
-                }
-            }
-        }
-        const preview = self.scroll != 0 or self.menu_history_recovery;
-        const flow_allowed = !preview and self.size.rows >= 7 and cols >= 8 and
+        const flow_allowed = self.size.rows >= 7 and cols >= 8 and
             self.permission == null and self.model_picker == null and !self.provider_open and !self.settings_open and
             !self.commandMenuVisible() and !self.stop_open and !self.secret_mode and !self.secret_quarantine;
         const mutable_rows = @max(1, self.size.rows -| (3 + composer_rows));
@@ -4168,18 +5827,34 @@ const Ui = struct {
         var transcript_rows: usize = 0;
         var previous_kind: ?Kind = null;
         for (self.records.items, 0..) |*record, index| {
+            if (@import("builtin").is_test) self.draw_record_visits += 1;
             if (record.kind == .reasoning) continue;
             const drafting = self.draft == index;
-            if (record.output and !preview and !drafting) {
+            if (record.output and !drafting) {
                 previous_kind = record.kind;
                 continue;
             }
+            // Only the current draft can receive later text chunks. A static
+            // or committed body needs EOF before its final rows can drain.
+            if (!drafting) if (record.stream) |stream| {
+                if (!stream.finished) {
+                    record.invalidate();
+                    try stream.finish();
+                }
+            };
+            try frame_records.append(a, .{ .record_id = record.id, .generation = record.stream_generation });
+            const frame_record = &frame_records.items[frame_records.items.len - 1];
             try record.layout(self.allocator, @max(1, cols));
             const heading = if (record.interrupted) "Interrupted response — preview" else if (record.excerpt) "Display excerpt" else "";
+            // Body records keep no full-prefix copy: rows below the ACKed
+            // written cursor were retired by the Body and no longer exist, so
+            // this frame writes only uncommitted rows. Batched/static records
+            // keep the existing shared-prefix path.
+            const stream_record = record.stream != null;
             var prefix: usize = 0;
-            if (record.flow_prefix) |*shown| {
-                if (shown.matches(record.lines, @max(1, cols))) {
-                    prefix = shown.rows.len;
+            if (!stream_record and record.flow_prefix != null) {
+                if (record.flowMatches(@max(1, cols))) {
+                    prefix = record.flow_prefix.?.rowCount();
                 } else if (self.permission == null and (!drafting or flow_allowed)) {
                     // Do not clear/replay native history as Pi's regular renderer
                     // can do. A revised/reflowed preview is explicitly superseded.
@@ -4194,20 +5869,35 @@ const Ui = struct {
             // full-height preview can scroll away the context it must restore.
             const finalized = cols >= 8 and !record.output and !drafting and self.permission == null;
             var stop = prefix;
-            if (drafting and flow_allowed) {
-                const wanted = @max(prefix, record.lines.len -| mutable_rows);
-                if (wanted > prefix and try record.stageFlow(self.allocator, wanted)) stop = wanted;
+            if (stream_record) {
+                stop = if (finalized) record.lines.len else if (drafting and flow_allowed) record.stream.?.releaseLimit(record.lines.len -| mutable_rows) else 0;
+                record.pending_stream_rows = stop;
+            } else {
+                if (drafting and flow_allowed) {
+                    const wanted = @max(prefix, record.lines.len -| mutable_rows);
+                    if (wanted > prefix and try record.stageFlow(self.allocator, wanted)) stop = wanted;
+                }
+                if (finalized) stop = record.lines.len;
             }
-            if (finalized) stop = record.lines.len;
+            var gap_wanted = if (stream_record) record.stream_written == 0 else prefix == 0;
+            if (stream_record and record.stream_revised and (finalized or stop > prefix)) {
+                // A real revision superseded released preview rows. Explain it
+                // once, then re-open the transcript with exactly one gap.
+                try putToneLine(writer, a, 1, "Response revised — earlier stream preview above", cols, theme.muted);
+                try writer.writeAll("\r\n");
+                transcript_rows += 1;
+                record.stream_revised = false;
+                gap_wanted = true;
+            }
             if (finalized or stop > prefix) {
-                if (prefix == 0) {
+                if (gap_wanted) {
                     if (previous_kind) |prior| if (prior != .tool or record.kind != .tool) {
                         try putStyled(writer, 1, "");
                         try writer.writeAll("\r\n");
                         transcript_rows += 1;
                     };
                 }
-                if (heading.len != 0 and (prefix == 0 or finalized)) {
+                if (heading.len != 0 and (gap_wanted or finalized)) {
                     try putToneLine(writer, a, 1, heading, cols, theme.muted);
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
@@ -4220,40 +5910,56 @@ const Ui = struct {
                 if (finalized) {
                     record.pending_output = true;
                     canonical_output = true;
-                    _ = try record.stageFlow(self.allocator, 0);
+                    if (!stream_record) _ = try record.stageFlow(self.allocator, 0);
                 }
                 prefix = stop;
             }
-            if (preview or drafting) {
-                const begin = if (preview) 0 else prefix;
-                if (begin == 0) {
+            frame_record.tail_line_start = lines.items.len;
+            if (stream_record and record.lines.len == 0 and flow_allowed and record.stream.?.hasMetadataProgress())
+                frame_record.metadata_staged = true;
+            if (drafting) {
+                const begin = prefix;
+                if (begin == 0 and !(stream_record and record.stream_written != 0)) {
                     if (previous_kind) |prior| if (prior != .tool or record.kind != .tool) try lines.append(a, "");
                     if (heading.len != 0) {
                         const headings = try markdown.render(a, heading, .{ .columns = @max(1, cols), .max_lines = 32, .markdown = false, .tone = .muted });
                         try lines.appendSlice(a, headings.lines);
                     }
                 }
+                // The record's own rows start here; the leading gap/heading above
+                // are layout decoration and never stand in for source rows.
+                frame_record.tail_line_start = lines.items.len;
                 try lines.appendSlice(a, record.lines[begin..]);
-                if (drafting and begin != 0) flow_continuation = true;
+                frame_record.tail_rows = lines.items.len - frame_record.tail_line_start;
+                if (begin != 0 or (stream_record and record.stream_written != 0)) flow_continuation = true;
             }
+            // Display proof candidates, captured while this frame's render is
+            // still pinned. Which of them survives is decided by the tail crop
+            // below (a modal/crop never counts as visible).
+            if (stream_record) {
+                const stream = record.stream.?;
+                frame_record.stream_full_end = stream.visibleSourceEnd();
+                frame_record.stream_prefix_end = bodyShownEnd(stream, stop);
+                frame_record.visible_source_end = if (finalized) frame_record.stream_full_end else 0;
+                frame_record.visible_complete = finalized;
+            } else {
+                frame_record.visible_complete = finalized;
+            }
+            frame_record.stream_rows = record.pending_stream_rows;
+            frame_record.output_candidate = record.pending_output;
+            frame_record.flow_change = record.pending_flow_change;
+            frame_record.flow_prefix = record.pending_flow_prefix;
+            frame_record.flow_layout_valid = record.pending_flow_layout_valid;
+            record.pending_flow_prefix = null;
+            record.pending_flow_change = false;
+            record.pending_flow_layout_valid = false;
             previous_kind = record.kind;
         }
         // A real transcript advance releases the borrowed prefix at its original
         // document coordinates before committing new rows. A menu-only redraw
         // instead keeps it reversible (no scrollback duplication).
-        if (transcript_rows != 0 and borrowed.len != 0) {
-            var rebuilt: std.Io.Writer.Allocating = .init(a);
-            try rebuilt.writer.writeAll(out.written()[0..self.frame_clear_end]);
-            for (borrowed) |line| {
-                try rebuilt.writer.writeAll(line);
-                try rebuilt.writer.writeAll("\r\n");
-            }
-            try rebuilt.writer.writeAll(out.written()[self.frame_clear_end..]);
-            out = rebuilt;
-            transcript_rows += borrowed.len;
-            borrowed = &.{};
-        }
-        if (!preview) {
+        if (transcript_rows != 0) try releaseBorrowedPrefix(a, &out, self.frame_clear_end, &borrowed, &transcript_rows);
+        {
             const detached_active = if (self.active_tool) |active| if (active.display_key) |identity| self.tool_views.get(identity) == null else true else false;
             if (self.tool_views.entries.items.len != 0 or detached_active) {
                 if (previous_kind) |prior| if (prior != .tool) try lines.append(a, "");
@@ -4275,19 +5981,28 @@ const Ui = struct {
                 if (detached_active) try lines.append(a, try self.pendingCommand(a, @max(1, cols)));
             }
         }
-        const thinking = if (self.show_reasoning and !preview and self.draft == null and self.tool_views.entries.items.len == 0 and self.active_tool == null) self.reasoning else null;
+        const thinking = if (self.show_reasoning and self.draft == null and self.tool_views.entries.items.len == 0 and self.active_tool == null) self.reasoning else null;
         var thinking_lines: []const []const u8 = &.{};
         if (thinking) |index| {
             const record = &self.records.items[index];
-            try record.layout(self.allocator, @max(1, cols));
-            thinking_lines = record.lines[record.lines.len -| 3..];
+            if (!record.output) {
+                // The thinking window is a real display obligation while it is
+                // active: it is replaced by UX rules, never ignored silently.
+                try record.layout(self.allocator, @max(1, cols));
+                try frame_records.append(a, .{
+                    .record_id = record.id,
+                    .generation = record.stream_generation,
+                    .reasoning = true,
+                });
+                thinking_lines = record.lines[record.lines.len -| 3..];
+            }
         }
         // Transient reasoning follows the transcript without committing a gap
         // or reasoning text to scrollback. Its gap does not consume the latest3.
         const thinking_gap: usize = @intFromBool(thinking != null and thinking_lines.len != 0 and previous_kind != null);
         // A live draft already has one leading gap in lines. Keep it outside
         // the scrollable slice so a long draft cannot clip it next to the user.
-        const live_gap: usize = @intFromBool(!preview and !flow_continuation and lines.items.len != 0 and lines.items[0].len == 0);
+        const live_gap: usize = @intFromBool(!flow_continuation and lines.items.len != 0 and lines.items[0].len == 0);
         const secret_destination = if (self.secret_mode) blk: {
             if (self.secret_provider) |id| break :blk try std.fmt.allocPrint(a, "API key for {s}\nBase URL: {s}\nSaved locally only; /model activates the saved key", .{ id.label(), id.baseUrl() });
             const secret_state = self.connection.current();
@@ -4304,12 +6019,26 @@ const Ui = struct {
         // Normal output keeps its empty gap; acknowledged shell-like idle
         // lines instead keep a single-row composer without extra redraw scroll.
         const hint_hash = std.hash.Wyhash.hash(0, hint_line);
-        const compact = ((release_idle and self.frame_hint_hash == hint_hash) or
-            (self.compact_composer and self.compact_hint_hash == hint_hash)) and
-            !self.busy and self.permission == null and !self.stop_open and !self.settings_open and
-            !self.provider_open and self.model_picker == null and (release_idle or !self.commandMenuVisible()) and
-            !self.secret_mode and !self.secret_quarantine and thinking == null and composer_rows == 1;
-        const footer_rows: usize = if (compact) 1 else 1 + composer_rows + @as(usize, @intFromBool(hint_line.len != 0));
+        // Idle release keeps the one-row composer only while the hint it would
+        // hide is exactly the one already ACKed. A newly published diagnostic
+        // therefore keeps its own row instead of being dismissed by this Enter.
+        const compact = (release_idle and self.tail_hint_hash == hint_hash) or
+            ((self.compact_composer and self.compact_hint_hash == hint_hash) and
+                !self.busy and self.permission == null and !self.stop_open and !self.settings_open and
+                !self.provider_open and self.model_picker == null and !self.commandMenuVisible() and
+                !self.secret_mode and !self.secret_quarantine and thinking == null and composer_rows == 1);
+        // The separator row is footprint, so it exists only while there is
+        // something above it to separate: mutable body, an approval/secret
+        // panel, pending reasoning, a candidate/menu popup, or canonical rows
+        // released above this tail. Initial entry has none of these and writes
+        // the composer alone at the terminal's existing row.
+        const popup_requested = self.stop_open or self.settings_open or self.provider_open or
+            self.model_picker != null or (!release_idle and self.commandMenuVisible()) or
+            (self.permission == null and queue_snapshot.preview_count != 0);
+        const body_present = lines.items.len != 0 or borrowed.len != 0 or transcript_rows != 0 or above.len != 0 or
+            self.permission != null or self.secret_mode or thinking != null or popup_requested;
+        const separator: usize = @intFromBool(!compact and body_present);
+        const footer_rows: usize = if (compact) 1 else composer_rows + separator + @as(usize, @intFromBool(hint_line.len != 0));
         const body_limit = self.size.rows -| footer_rows;
         const candidate_limit = body_limit -| 1; // Separate candidates from conversation even in short windows.
         const model_state = state;
@@ -4379,38 +6108,53 @@ const Ui = struct {
         const content_body_limit = body_limit -| (popup_lines.len + popup_gap);
         self.frame_model_epoch = null;
         self.frame_model_generation = null;
-        // Transient reasoning is a reversible OVERLAY over rows that are already
-        // ACKed at this exact width, never a bottom growth that scrolls canonical
-        // rows out of view. A pending canonical row in the same frame would also
+        // Reasoning resumes into its own downward window. A closed popup,
+        // approval or secret prompt may have borrowed ACKed rows above this
+        // tail; put them back at their original coordinates before the window
+        // can paint over them. They join the tail as an ordinary transcript
+        // prefix, so this frame defers (thinking_deferred) and the window
+        // appears on the next complete ACK.
+        const reasoning_resumes = thinking != null and popup_lines.len == 0 and
+            self.permission == null and !self.secret_mode and !self.secret_quarantine;
+        if (reasoning_resumes) try releaseBorrowedPrefix(a, &out, self.frame_clear_end, &borrowed, &transcript_rows);
+        // Transient reasoning owns a downward-growing window inside the tail. It
+        // never borrows ACKed rows, so the committed user row above it is never
+        // painted over. A pending canonical row in the same frame would also
         // grow the tail; defer the window to the next fresh frame instead of
         // committing reasoning rows. The initial tail==0 screen and an abandoned
-        // tail keep their existing baseline geometry.
+        // tail keep their baseline geometry.
         const thinking_overlay = thinking != null and transcript_rows == 0 and history_valid and
             self.tail_height != 0 and !self.abandon_tail and !release_idle;
         const thinking_deferred = thinking != null and !thinking_overlay and
             self.tail_height != 0 and !self.abandon_tail;
         const show_thinking = thinking != null and !thinking_deferred;
+        self.frame_delivery_reasoning = show_thinking;
         const wanted_body = if (self.stop_open) 0 else if (self.permission != null)
-            @min(body_limit, 1 + @max(1, approval_lines.lines.len))
-        else if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (show_thinking) @min(thinking_gap + @min(3, thinking_lines.len), content_body_limit) else @min(lines.items.len, content_body_limit);
-        // Initial blank space keeps the first conversation at the top. Each
-        // immutable row consumes it; expanding drafts scroll old content upward.
-        // Never shrink a tail without replacing it by committed rows: the editor
-        // therefore stays on the physical bottom row, without absolute positioning.
-        const available = if (release_idle) @as(usize, 1) else if (self.tail_height == 0 or self.abandon_tail) self.size.rows else self.tail_height;
-        const wanted_rows = @min(self.size.rows, @max(footer_rows + popup_lines.len + popup_gap + wanted_body, available -| transcript_rows));
-        // Only known ACKed rows may fund the overlay; unknown/partial state shows
-        // fewer reasoning rows instead of inventing physical rows.
-        const rows = if (thinking_overlay) @min(wanted_rows, @min(self.size.rows, self.tail_height + above.len)) else wanted_rows;
-        // Popups, history preview and the reasoning overlay grow UP into exact
-        // ACKed transcript rows, without pushing duplicate content into native
-        // scrollback. Keep these restoration rows when returning to the normal
-        // live tail. Unknown/reflowed/partially written rows never grant upward
-        // ownership.
-        const borrow_count = if ((popup_lines.len != 0 or preview or self.permission != null or thinking_overlay) and transcript_rows == 0)
+            @min(body_limit, 2 + @max(1, approval_lines.lines.len))
+        else if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (show_thinking) @min(thinking_gap + @min(3, thinking_lines.len), content_body_limit) else @min(borrowed.len + lines.items.len, content_body_limit);
+        // The owned footprint is exactly the rows this frame writes: it has no
+        // full-screen floor, no blank-screen padding and implies no physical
+        // bottom. Real body/popup rows grow it, closing popups contract it.
+        const wanted_rows = @min(self.size.rows, footer_rows + popup_lines.len + popup_gap + wanted_body);
+        // The overlay keeps this frame's actual wanted footprint. Only known
+        // ACKed rows may fund upward borrowing; any remainder grows naturally
+        // instead of inventing rows or suppressing the reasoning window.
+        const rows = wanted_rows;
+        // Only a popup or approval grows UP into exact ACKed transcript rows,
+        // without pushing duplicate content into native scrollback. Keep those
+        // restoration rows when returning to the normal live tail. Reasoning
+        // never borrows: its window grows downward instead.
+        // Unknown/reflowed/partially written rows never grant upward ownership.
+        // Any overlay (permission, candidate menus, pickers) may need rows above
+        // the live tail. They are borrowed from ACKed transcript rows so closing
+        // the overlay restores them instead of leaving the rows overwritten.
+        const overlay_visible = self.permission != null or popup_lines.len != 0 or menu_visible or
+            self.model_picker != null or self.provider_open or self.settings_open;
+        const borrow_count = if (overlay_visible and transcript_rows == 0)
             @min(rows -| self.tail_height, above.len)
         else
             0;
+        self.frame_borrow_rows = borrow_count;
         if (borrow_count != 0) {
             var prefix: std.ArrayList([]const u8) = .empty;
             try prefix.appendSlice(a, above[above.len - borrow_count ..]);
@@ -4424,14 +6168,15 @@ const Ui = struct {
             out = rebuilt;
         }
         const active_lines = lines.items;
-        // Preview already contains the complete canonical history. Borrowed rows
-        // remain owned restoration data, not another prefix of that history.
-        if (!preview and borrowed.len != 0) {
+        if (borrowed.len != 0) {
             var combined: std.ArrayList([]const u8) = .empty;
             try combined.appendSlice(a, borrowed);
             try combined.appendSlice(a, active_lines);
             lines = combined;
         }
+        // Record tail indices were captured before any borrowed rows were
+        // prepended to the mutable tail; keep the coordinate shift explicit.
+        const tail_row_shift: usize = if (borrowed.len != 0) borrowed.len else 0;
         var next_above: std.ArrayList([]const u8) = .empty;
         try next_above.appendSlice(a, above);
         if (release_idle) {
@@ -4449,10 +6194,19 @@ const Ui = struct {
 
         // Build the complete candidate tail before choosing full or sparse output.
         // Its bytes also provide recovery if resize interrupts a sparse frame.
+        // Rows this frame returns belong to the previous ACKed footprint only:
+        // a smaller floating footprint is contracted after the tail, at the same
+        // width and geometry. Differential frames never leave rows behind.
+        const reclaimable = !release_idle and !self.abandon_tail and
+            self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows;
+        const vacated = if (reclaimable) (self.tail_height + borrow_count) -| (transcript_rows + rows) else 0;
         writer = &tail_out.writer;
         var cursor_offset: usize = 0;
         var cursor_rows_up: usize = 0;
         var rendered_composer_rows: usize = 1;
+        // First mutable-tail row index this frame really painted. Anything before
+        // it was cropped (or replaced by a modal) and is never claimed visible.
+        var visible_from: usize = std.math.maxInt(usize);
         // 终端太小时只显示提示，避免布局越界。
         // 审批标题之外至少留一行正文；尺寸不足不属于永久的 clipped 状态。
         const hides_approval_id = if (self.permission) |permission| !self.approvalFits(permission.id, permission.choice) else false;
@@ -4505,8 +6259,13 @@ const Ui = struct {
                 try putToneLine(writer, a, body_rows, choices, cols, theme.accent);
                 self.frame_permission = permission.id;
                 self.frame_permission_choice = self.permission.?.choice;
+                // The approval modal itself is a real display of the applied
+                // event, even though it hides the conversation tail.
+                self.frame_delivery_shown = true;
             } else if (show_thinking) {
-                // Latest THREE content rows, without any title/prefix.
+                // Latest THREE content rows, without any title/prefix. This
+                // window never borrows rows, so any borrowed ACKed prefix was
+                // already restored above the tail before it resumes.
                 const visible_rows = @min(3, content_body_rows -| thinking_gap);
                 const start = thinking_lines.len -| visible_rows;
                 for (0..content_body_rows) |line| {
@@ -4514,19 +6273,22 @@ const Ui = struct {
                     try putStyled(writer, 1 + line, if (line >= thinking_gap and index < visible_rows and start + index < thinking_lines.len) thinking_lines[start + index] else "");
                 }
                 self.frame_permission = null;
+                self.frame_delivery_shown = true;
             } else {
-                // 有界 live draft / retained history preview，不重写终端滚屏。
-                // 从底部向上回退 scroll 行，得到显示窗口的结束位置。
+                // Bounded live draft: only its last rows that fit are written,
+                // and new rows grow naturally below the owned footprint. This
+                // is not a regenerated history window.
                 const leading_gap = if (borrowed.len == 0) live_gap else 0;
                 const content = lines.items[leading_gap..];
                 const content_rows = content_body_rows -| leading_gap;
-                const end = content.len -| @min(self.scroll, content.len -| content_rows);
-                const start = end -| content_rows;
+                const start = content.len -| content_rows;
                 for (0..content_body_rows) |line| {
                     const index = line -| leading_gap;
-                    try putStyled(writer, 1 + line, if (line >= leading_gap and start + index < end) content[start + index] else "");
+                    try putStyled(writer, 1 + line, if (line >= leading_gap and start + index < content.len) content[start + index] else "");
                 }
                 self.frame_permission = null;
+                self.frame_delivery_shown = true;
+                visible_from = leading_gap + start;
             }
 
             // Explicit empty separator belongs to the tail and is repaired on
@@ -4557,8 +6319,10 @@ const Ui = struct {
                 if (!self.stop_open and menu_visible and menu_rows.can_confirm) self.frame_command_generation = self.command_menu.generation;
             }
 
-            if (!compact and hint_line.len != 0) try putToneLine(writer, a, rows - composer_rows - 1, hint_line, cols, theme.muted);
-            if (!compact) try putLine(writer, a, rows - composer_rows, "", cols);
+            // Footer rows are bottom-up: separator (only while something is
+            // above), the real notice, then the composer itself.
+            if (!compact and hint_line.len != 0) try putToneLine(writer, a, rows - composer_rows - separator, hint_line, cols, theme.muted);
+            if (!compact and separator != 0) try putLine(writer, a, rows - composer_rows, "", cols);
 
             if (self.secret_mode or self.secret_quarantine) {
                 // Only a bounded mask is copied to the frame; never format secret bytes.
@@ -4620,6 +6384,22 @@ const Ui = struct {
             }
         }
 
+        // Resolve the per-record delivery proof now that the real crop is known.
+        // A record's mutable rows only count when the layout actually wrote all
+        // of them; otherwise only its frozen prefix (native scrollback) is proof.
+        resolveDeliveryCoverage(frame_records.items, tail_row_shift, visible_from, self.frame_delivery_reasoning);
+
+        // Contract from the LAST WRITTEN row BEFORE any cursor suffix. A
+        // multiline composer suffix already moved the cursor up to its first
+        // line; cleaning from there would erase the composer's own lower rows.
+        // Save the suffix, truncate the rows, clean the owned vacated footprint,
+        // then replay the cursor suffix (and keep it in Snapshot.cursor_suffix).
+        if (vacated != 0) {
+            const saved_suffix = try a.dupe(u8, tail_out.written()[cursor_offset..]);
+            tail_out.shrinkRetainingCapacity(cursor_offset);
+            try tail_frame.emitVacatedRows(&tail_out.writer, vacated);
+            try tail_out.writer.writeAll(saved_suffix);
+        }
         // Include release in the trusted cursor suffix so full/sparse/recovery
         // tails all close synchronization; cursor-show remains the final marker.
         try writer.writeAll(terminal_module.sync_end ++ "\x1b[?25h");
@@ -4635,18 +6415,19 @@ const Ui = struct {
         var growth_out: std.Io.Writer.Allocating = .init(a);
         writer = &out.writer;
         if (growing) {
-            // Compare at unchanged document indices; only CRLF past the old
-            // physical bottom creates new history. No sliding-window DL.
+            // Compare at unchanged document indices from the ACKed tail origin.
+            // CRLF past the old bottom appends natively (scrolling only once the
+            // physical bottom is actually reached). No sliding-window DL.
             const released = try a.alloc([]const u8, transcript_rows);
             var split = std.mem.splitSequence(u8, out.written()[self.frame_clear_end..], "\r\n");
             for (released) |*line| line.* = split.next() orelse return error.InvalidTailFrame;
             try growth_out.writer.writeAll(out.written()[0..self.frame_clear_end]);
             try candidate.?.emitGrowingDiff(&growth_out.writer, &self.tail_snapshot.?, released);
         } else if (sparse) {
-            // Tail sizing pins its last row to the physical bottom. Only the
-            // current live view may reuse lines; internal history browsing keeps
-            // the ordinary diff, and all modal/ACK/resize gates remain above.
-            if (self.scroll == 0 and self.draft == null)
+            // Delete-line repair shifts only cursor..bottom, so it needs the
+            // ACKed tail to be proven at the physical bottom. A floating tail
+            // keeps the plain relative row diff; modal/ACK/resize gates stay above.
+            if (self.tail_bottom and self.draft == null)
                 try candidate.?.emitBottomDiff(writer, &self.tail_snapshot.?)
             else
                 try candidate.?.emitDiff(writer, &self.tail_snapshot.?);
@@ -4655,7 +6436,6 @@ const Ui = struct {
         }
 
         // frame 指向 arena 内存，arena 所有权交给 frame_arena，直到这帧写完。
-        self.frame_full_tail = tail_out.written();
         self.frame_idle_breaks = break_count;
         self.frame_idle_prefix_end = if (release_idle) self.frame_clear_end else 0;
         self.frame_hint_hash = hint_hash;
@@ -4665,11 +6445,15 @@ const Ui = struct {
         next_history = null;
         self.frame = if (growing) growth_out.written() else out.written();
         self.frame_offset = 0;
+        self.frame_records = frame_records.items;
+        self.frame_delivery_epoch = self.delivery_epoch;
+        self.frame_delivery_sequence = self.delivery_admitted;
         self.frame_arena = arena;
         self.frame_height = rows;
         self.frame_cursor_rows_up = cursor_rows_up;
         self.frame_composer_rows = rendered_composer_rows;
         self.frame_size = self.size;
+        self.frame_bottom = rows == self.size.rows;
         self.frame_fresh = true;
         self.frame_changed = self.display_changed;
         self.display_changed = false;
@@ -4677,6 +6461,32 @@ const Ui = struct {
         self.abandon_tail = false;
     }
 };
+
+/// Resolve every staged record's display proof once the frame's real tail crop
+/// is known. `shift` moves the record coordinates into the final mutable tail
+/// (borrowed ACKed rows are prepended); `visible_from` is the first tail row the
+/// layout actually painted. Rows above it were cropped or replaced by a modal,
+/// and frozen prefix rows are always in native scrollback by construction.
+fn resolveDeliveryCoverage(entries: []FrameRecord, shift: usize, visible_from: usize, reasoning_shown: bool) void {
+    for (entries) |*entry| {
+        if (entry.reasoning) {
+            // A rolling thinking window is complete for ACK purposes as soon as
+            // its newest rows are the ones on screen.
+            entry.visible_complete = reasoning_shown;
+            entry.visible_source_end = 0;
+            continue;
+        }
+        if (entry.metadata_staged and entry.tail_line_start + shift < visible_from)
+            entry.metadata_staged = false;
+        if (entry.visible_complete) continue;
+        if (entry.tail_rows != 0 and entry.tail_line_start + shift >= visible_from) {
+            entry.visible_complete = true;
+            entry.visible_source_end = entry.stream_full_end;
+        } else if (entry.stream_full_end != 0) {
+            entry.visible_source_end = entry.stream_prefix_end;
+        }
+    }
+}
 
 fn compactCommand(command: []const u8) bool {
     return std.mem.eql(u8, command, "/compact") or std.mem.startsWith(u8, command, "/compact ") or std.mem.startsWith(u8, command, "/compact\t");
@@ -4859,6 +6669,26 @@ fn fixtureUi(bridge: *bridge_module.Bridge, cancel: *p.Cancellation) Ui {
     return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = undefined, .editor = .{ .allocator = std.testing.allocator }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" }, .size = .{ .columns = 80, .rows = 24 } };
 }
 
+fn testAcknowledgeFullFrame(ui: *Ui) void {
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+}
+
+/// Prior shell output with the cursor left on the physical bottom row, so the
+/// floating composer starts where a real terminal prompt stopped. No text
+/// reflow or native-viewport position is inferred from this fixture.
+fn seedPriorBottom(screen: *@import("../tests/regular_screen.zig").Screen) !void {
+    for (0..screen.rows - 1) |_| try screen.replay("\r\n");
+    try std.testing.expectEqual(screen.rows - 1, screen.row);
+}
+
+/// Absolute row whose cells start with `prefix`; popup rows are only guaranteed
+/// to be adjacent and above the composer, not to sit at a fixed screen row.
+fn rowStartingWith(screen: *const @import("../tests/regular_screen.zig").Screen, prefix: []const u8) !usize {
+    for (screen.grid, 0..) |line, row| if (std.mem.startsWith(u8, &line, prefix)) return row;
+    return error.MissingRowPrefix;
+}
+
 test "idle Enter releases exactly one native row and redraw keeps the live draft" {
     for ([_]usize{ 80, 16 }) |columns| {
         var cancel: p.Cancellation = .{};
@@ -4868,9 +6698,10 @@ test "idle Enter releases exactly one native row and redraw keeps the live draft
         defer ui.deinit();
         ui.size.columns = columns;
         var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = columns };
+        try seedPriorBottom(&screen);
         try ui.draw();
         try screen.replay(ui.frame);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         const history_start = screen.history_len;
         const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
         // A read batch can contain several blank lines and then a new draft.
@@ -4883,7 +6714,7 @@ test "idle Enter releases exactly one native row and redraw keeps the live draft
         try screen.replay(ui.frame);
         try std.testing.expectEqual(history_start + 3, screen.history_len);
         try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
         try std.testing.expect(ui.future == null and !ui.busy and !ui.has_submitted and ui.prompt == null);
         try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
@@ -4898,7 +6729,7 @@ test "idle Enter releases exactly one native row and redraw keeps the live draft
             try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
             expected_history += ui.frame_height -| old_height;
             try screen.replay(ui.frame);
-            ui.finishFrame();
+            testAcknowledgeFullFrame(&ui);
             try std.testing.expectEqual(expected_history, screen.history_len);
             try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
         }
@@ -4919,20 +6750,21 @@ test "idle Enter bounded stages retain more than one frame of line requests" {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try seedPriorBottom(&screen);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const old_history = screen.history_len;
     for (0..300) |_| try Ui.key(&ui, .enter);
     try ui.draw();
     try std.testing.expectEqual(@as(u16, 256), ui.frame_idle_breaks);
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(u16, 44), ui.idle_breaks);
     try ui.draw();
     try std.testing.expectEqual(@as(u16, 44), ui.frame_idle_breaks);
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
     try std.testing.expectEqual(old_history + 300, screen.history_len);
     try std.testing.expectEqual(@as(usize, 301), screen.count("?%>"));
@@ -4998,7 +6830,7 @@ test "idle Enter precedes rapid nonempty submit and preserves following draft" {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("\r\rquestion\rnext draft", sink);
     try std.testing.expect(ui.deferred_submit != null);
@@ -5009,7 +6841,7 @@ test "idle Enter precedes rapid nonempty submit and preserves following draft" {
     try std.testing.expectEqual(@as(u16, 2), ui.frame_idle_breaks);
     try ui.flushDeferredSubmit();
     try std.testing.expect(ui.deferred_submit != null and !ui.has_submitted);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.flushDeferredSubmit();
     try std.testing.expect(ui.deferred_submit == null and !ui.has_submitted);
     try std.testing.expectEqualStrings("Not configured: use /login first", ui.notice);
@@ -5028,25 +6860,213 @@ test "idle Enter does not release an acknowledged draft erased in the same read 
     try ui.parser.feed("deleted-draft", sink);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 1), screen.count("deleted-draft"));
     try ui.parser.feed("\x15\r", sink);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 0), screen.count("deleted-draft"));
     try std.testing.expectEqual(@as(usize, 2), screen.count("?%>"));
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     try ui.parser.feed("/", sink);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try Ui.key(&ui, .escape);
     try Ui.key(&ui, .clear);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 0), screen.count("deleted-draft"));
+}
+
+test "rendered unacknowledged body window applies admission pressure" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const index = try ui.add(.assistant, "");
+    ui.draft = index;
+    const bytes = try std.testing.allocator.alloc(u8, 128 * 1024);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'x');
+    try ui.records.items[index].append(std.testing.allocator, bytes);
+    const body = ui.records.items[index].stream.?;
+    try body.build();
+    // Parsing is sliced: the first window is bounded and the remainder is still
+    // queued, which is exactly the admission-pressure signal.
+    try std.testing.expect(body.pendingBytes() != 0);
+    try std.testing.expect(body.render.source_len <= 4 * 1024 + 64 * 1024);
+    try std.testing.expectEqual(@as(usize, 128 * 1024), body.windowBytes());
+    try std.testing.expect(ui.displayBackpressured());
+    body.abort();
+}
+
+test "large history restore retains bounded visible suffix" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var messages: [100]p.Message = undefined;
+    for (&messages) |*message| message.* = .{ .role = .user, .blocks = &.{.{ .text = "restored" }} };
+    try ui.restoreHistory(&messages);
+    try std.testing.expectEqual(@as(usize, 64), ui.records.items.len);
+    try std.testing.expect(ui.dropped_display);
+    try std.testing.expect(std.mem.indexOf(u8, ui.records.items[0].body.items, "display may be shortened") != null);
+}
+
+test "restore mixed long multi-block assistants stays within byte budget" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const chunk = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(chunk);
+    @memset(chunk, 'x');
+    const blocks = [_]p.Block{ .{ .text = chunk }, .{ .text = chunk } };
+    var messages: [24]p.Message = undefined;
+    for (&messages, 0..) |*message, i| {
+        message.* = if (i % 2 == 0)
+            .{ .role = .assistant, .blocks = &blocks }
+        else
+            .{ .role = .user, .blocks = &.{.{ .text = "short" }} };
+    }
+    try ui.restoreHistory(&messages);
+    var bytes: usize = 0;
+    for (ui.records.items) |record| bytes += record.body.items.len;
+    try std.testing.expect(bytes <= 1024 * 1024);
+    try std.testing.expect(ui.records.items.len <= 64);
+    try std.testing.expect(ui.dropped_display);
+    try std.testing.expectEqualStrings("short", ui.records.items[ui.records.items.len - 1].body.items);
+}
+
+test "normal admission never evicts unprinted records" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    for (0..64) |_| _ = try ui.add(.user, "pending");
+    try std.testing.expectError(error.DisplayCapacity, ui.add(.user, "overflow"));
+    try std.testing.expectEqual(@as(usize, 64), ui.records.items.len);
+    try std.testing.expect(!ui.dropped_display);
+}
+
+test "real frame ignores a record removed before ack" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const first = try ui.add(.user, "old pending");
+    try ui.draw();
+    const id = ui.records.items[first].id;
+    ui.removeRecord(first);
+    const second = try ui.add(.user, "new pending");
+    try std.testing.expect(ui.records.items[second].id != id);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(!ui.records.items[second].output);
+}
+
+test "frame descriptor keeps its checkpoint across stream append" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.size = .{ .columns = 80, .rows = 7 };
+    const index = try ui.add(.assistant, "one\n\ntwo\n\nthree\n\nfour\n\nfive\n\nsix\n\nseven\n\n");
+    ui.draft = index;
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 1), ui.frame_records.len);
+    const checkpoint = ui.frame_records[0].stream_rows;
+    try std.testing.expect(checkpoint != 0);
+    const generation = ui.frame_records[0].generation;
+    try ui.records.items[index].append(std.testing.allocator, "later\n");
+    try std.testing.expectEqual(checkpoint, ui.frame_records[0].stream_rows);
+    try std.testing.expectEqual(generation, ui.records.items[index].stream_generation);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(checkpoint, ui.records.items[index].stream_written);
+    try std.testing.expect(!ui.records.items[index].output);
+}
+
+test "frame descriptors ignore removed and replaced records" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const index = try ui.add(.assistant, "first");
+    const id = ui.records.items[index].id;
+    var entries = [_]FrameRecord{.{ .record_id = id, .generation = ui.records.items[index].stream_generation, .output_candidate = true }};
+    try ui.records.items[index].resetStream();
+    ui.frame_records = &entries;
+    ui.frame = "x";
+    ui.frame_fresh = true;
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(!ui.records.items[index].output);
+    ui.removeRecord(index);
+    try std.testing.expect(ui.record_index.get(id) == null);
+    entries[0] = .{ .record_id = id, .generation = 0, .output_candidate = true };
+    ui.frame_records = &entries;
+    ui.frame = "x";
+    testAcknowledgeFullFrame(&ui);
+}
+
+test "resize ABA discards frame checkpoint and fresh draw can commit" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.size = .{ .columns = 80, .rows = 24 };
+    const index = try ui.add(.user, "resize pending");
+    try ui.draw();
+    ui.resize(.{ .columns = 70, .rows = 24 });
+    ui.resize(.{ .columns = 80, .rows = 24 });
+    try std.testing.expect(!ui.records.items[index].output);
+    try std.testing.expectEqual(@as(usize, 0), ui.frame_records.len);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[index].output);
+}
+
+test "frame abort keeps unacknowledged record" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const index = try ui.add(.assistant, "first");
+    var entries = [_]FrameRecord{.{ .record_id = ui.records.items[index].id, .generation = ui.records.items[index].stream_generation, .output_candidate = true }};
+    ui.frame_records = &entries;
+    ui.discardResizedFrame();
+    try std.testing.expect(!ui.records.items[index].output);
+    try std.testing.expect(ui.records.items[index].stream != null);
+}
+
+test "eviction requires acknowledged inactive record without frame state" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const index = try ui.add(.user, "pending");
+    try std.testing.expect(!ui.canEvictOldest());
+    ui.records.items[index].output = true;
+    try std.testing.expect(ui.canEvictOldest());
+    ui.records.items[index].pending_output = true;
+    try std.testing.expect(!ui.canEvictOldest());
+    ui.records.items[index].pending_output = false;
+    ui.draft = index;
+    try std.testing.expect(!ui.canEvictOldest());
+    ui.draft = null;
+    ui.records.items[index].pending_flow_change = true;
+    try std.testing.expect(!ui.canEvictOldest());
 }
 
 test "idle Enter waits for pending transcript output before releasing prompt rows" {
@@ -5056,18 +7076,20 @@ test "idle Enter waits for pending transcript output before releasing prompt row
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     var record = Record{ .kind = .user };
     try record.append(std.testing.allocator, "pending-output");
+    try ui.record_index.ensureUnusedCapacity(std.testing.allocator, 1);
     try ui.records.append(std.testing.allocator, record);
+    try ui.registerRecord(ui.records.items.len - 1);
     try Ui.key(&ui, .enter);
     try ui.draw();
     try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
     try std.testing.expect(ui.records.items[0].pending_output);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.draw();
     try std.testing.expectEqual(@as(u16, 1), ui.frame_idle_breaks);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "idle Enter display barrier also precedes a rapid compact command" {
@@ -5077,7 +7099,7 @@ test "idle Enter display barrier also precedes a rapid compact command" {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r/compact\r", .{ .context = &ui, .emit_fn = Ui.key });
     try std.testing.expect(ui.deferred_submit != null);
     try std.testing.expectEqualStrings("/compact", ui.deferred_submit.?.editor.bytes.items);
@@ -5085,7 +7107,7 @@ test "idle Enter display barrier also precedes a rapid compact command" {
     try std.testing.expectEqual(@as(u16, 1), ui.frame_idle_breaks);
     try ui.flushDeferredSubmit();
     try std.testing.expect(ui.deferred_submit != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.flushDeferredSubmit();
     try std.testing.expect(ui.deferred_submit == null and ui.future == null);
     try std.testing.expectEqualStrings("Not configured: use /login first", ui.notice);
@@ -5100,42 +7122,43 @@ test "idle Enter acknowledged prompts survive a command popup without duplicatio
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     for (0..3) |_| try Ui.key(&ui, .enter);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const old_history = screen.history_len;
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("/", sink);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.menu_history.?.borrowed.len != 0);
     try Ui.key(&ui, .escape);
     try Ui.key(&ui, .clear);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(old_history, screen.history_len);
     try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
-    // Releasing this restored tail transfers borrowed rows to native history;
-    // another popup must not retain a second copy of those same coordinates.
+    // Releasing this restored tail keeps every released prompt exactly once.
+    // A floating composer that has not reached the terminal bottom advances
+    // inside its own rows instead of fabricating native history.
     try Ui.key(&ui, .enter);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
-    try std.testing.expectEqual(old_history + 1, screen.history_len);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(old_history, screen.history_len);
     try std.testing.expectEqual(@as(usize, 5), screen.count("?%>"));
     try ui.parser.feed("/", sink);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try Ui.key(&ui, .escape);
     try Ui.key(&ui, .clear);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 5), screen.count("?%>"));
 }
 
@@ -5148,13 +7171,13 @@ test "idle Enter keeps a newly published diagnostic visible across redraws" {
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try Ui.key(&ui, .enter);
     ui.notice = "new-safety-diagnostic";
     for (0..3) |_| {
         try ui.draw();
         try screen.replay(ui.frame);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expect(screen.visible("new-safety-diagnostic"));
     }
     try std.testing.expect(!ui.compact_composer);
@@ -5170,7 +7193,7 @@ test "idle Enter resize at every frame byte never replays or drops CRLF" {
         var ui = fixtureUi(&bridge, &cancel);
         defer ui.deinit();
         try ui.draw();
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try Ui.key(&ui, .enter);
         try Ui.key(&ui, .enter);
         try ui.draw();
@@ -5192,10 +7215,10 @@ test "idle Enter resize at every frame byte never replays or drops CRLF" {
         ui.resize_rescue = ""; // Simulate the controls-only cleanup being written.
         try ui.draw();
         try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
-        ui.finishFrame(); // Establish a fresh-width composer first.
+        testAcknowledgeFullFrame(&ui); // Establish a fresh-width composer first.
         try ui.draw();
         try std.testing.expectEqual(remaining, ui.frame_idle_breaks);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
     }
 }
@@ -5207,7 +7230,7 @@ fn idleEnterAllocationScenario(a: std.mem.Allocator) !void {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try Ui.key(&ui, .enter);
     _ = try ui.editor.insert("draft survives OOM");
     ui.allocator = a;
@@ -5217,7 +7240,7 @@ fn idleEnterAllocationScenario(a: std.mem.Allocator) !void {
         try std.testing.expect(ui.frame.len == 0 and ui.frame_idle_breaks == 0);
         return if (err == error.WriteFailed) error.OutOfMemory else err;
     };
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "idle Enter captured before resize waits until a supported composer is acknowledged" {
@@ -5227,22 +7250,22 @@ test "idle Enter captured before resize waits until a supported composer is ackn
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try Ui.key(&ui, .enter);
     ui.resize(.{ .columns = 1, .rows = 24 });
     for (0..2) |_| {
         try ui.draw();
         try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(@as(u16, 1), ui.idle_breaks);
     }
     ui.resize(.{ .columns = 80, .rows = 24 });
     try ui.draw();
     try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.draw();
     try std.testing.expectEqual(@as(u16, 1), ui.frame_idle_breaks);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
 }
 
@@ -5255,7 +7278,7 @@ test "idle Enter waits quietly after partial frame shrinks below supported size"
         defer ui.deinit();
         try ui.draw();
         ui.dirty = false;
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try Ui.key(&ui, .enter);
         try Ui.key(&ui, .enter);
         try ui.draw();
@@ -5267,7 +7290,7 @@ test "idle Enter waits quietly after partial frame shrinks below supported size"
         try ui.draw();
         ui.dirty = false;
         try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         for (0..4) |_| {
             ui.clock_ms += 80;
             ui.animate();
@@ -5279,16 +7302,16 @@ test "idle Enter waits quietly after partial frame shrinks below supported size"
         try ui.draw();
         ui.dirty = false;
         try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
-        ui.finishFrame(); // The new supported composer is now fully ACKed.
+        testAcknowledgeFullFrame(&ui); // The new supported composer is now fully ACKed.
         try std.testing.expect(ui.drawReady());
         try ui.draw();
         ui.dirty = false;
         try std.testing.expectEqual(@as(u16, 2), ui.frame_idle_breaks);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
         try ui.draw();
         ui.dirty = false;
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expect(!ui.drawReady());
     }
 }
@@ -5482,7 +7505,7 @@ test "command elapsed time uses source timestamps freezes results and resets per
     try std.testing.expect(ui.records.items[2].duration_ms == null);
 }
 
-test "regular transcript starts at top and keeps composer at bottom without role tags" {
+test "regular transcript writes committed rows above a natural composer tail without role tags" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -5499,11 +7522,12 @@ test "regular transcript starts at top and keeps composer at bottom without role
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.user_background) != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    // One released user row above the gap+draft body and the hinted composer.
+    try std.testing.expectEqual(@as(usize, 5), screen.row);
     try std.testing.expect(std.mem.find(u8, &screen.grid[0], "unique committed user") != null);
     try std.testing.expect(!ui.records.items[0].output);
-    try std.testing.expectEqual(@as(usize, 23), ui.frame_height); // One committed user row, no trailing gap.
-    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 5), ui.frame_height); // One committed user row, no full-screen padding.
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.records.items[0].output);
     try std.testing.expect(!ui.records.items[1].output);
     try ui.replaceCommitted(&.{.{ .text = "unique canonical reply" }}, false, true);
@@ -5511,18 +7535,52 @@ test "regular transcript starts at top and keeps composer at bottom without role
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique committed user") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "uncanonical draft") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") != null);
-    try std.testing.expectEqual(@as(usize, 21), ui.frame_height); // Leading gap + canonical body, no title.
+    try std.testing.expectEqual(@as(usize, 3), ui.frame_height); // Leading gap + canonical body, no title.
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
-    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 5), screen.row);
+    testAcknowledgeFullFrame(&ui);
     try ui.draw();
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    try std.testing.expectEqual(@as(usize, 5), screen.row);
     try std.testing.expectEqual(@as(usize, 1), screen.count("unique canonical reply"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "unique canonical reply") == null);
-    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\x1b[20A"));
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\x1b[2A"));
     for ([_][]const u8{ "1049", "1047", "\x1b[H", "\x1b[2J", ";1H" }) |forbidden|
         try std.testing.expect(std.mem.find(u8, ui.frame, forbidden) == null);
+}
+
+test "static assistant EOF drains once without phantom transcript rows" {
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const index = try ui.add(.assistant, "static-row-one\nstatic-row-two");
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[index].output);
+    try std.testing.expect(ui.records.items[index].stream.?.isDrained());
+    const before = screen.grid;
+    const history_before = screen.history_len;
+    const above_before = ui.menu_history.?.above.len;
+    try ui.draw();
+    try std.testing.expectEqual(above_before, ui.frame_menu_history.?.above.len);
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(history_before, screen.history_len);
+    for (before[0 .. ui.size.rows - 2], screen.grid[0 .. ui.size.rows - 2]) |old, actual|
+        try std.testing.expectEqualStrings(&old, &actual);
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("/", sink);
+    try ui.draw();
+    // Opening a menu may borrow owned rows, but cannot append new transcript.
+    const menu_history = ui.frame_menu_history.?;
+    try std.testing.expectEqual(above_before, menu_history.above.len + menu_history.borrowed.len);
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(history_before, screen.history_len);
 }
 
 test "growing a compact live tail keeps replaceable drafts out of scrollback" {
@@ -5540,26 +7598,32 @@ test "growing a compact live tail keeps replaceable drafts out of scrollback" {
         var screen: @import("../tests/regular_screen.zig").Screen = .{};
         try ui.draw();
         try screen.replay(ui.frame);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(@as(usize, 3), ui.tail_height);
         try std.testing.expectEqual(@as(usize, 23), screen.row);
 
         try ui.appendDraft(.assistant, "growth-draft-marker\nsecond-draft-line");
         try ui.draw();
         try screen.replay(ui.frame);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(@as(usize, 6), ui.tail_height); // Gap + two draft rows + hinted footer; no preview-title row.
         try std.testing.expectEqual(@as(usize, 23), screen.row);
+        const draft_row = screen.row;
         for (screen.history[0..screen.history_len]) |line| try std.testing.expect(std.mem.find(u8, &line, "growth-draft-marker") == null);
 
         try ui.replaceCommitted(&.{.{ .text = if (same_final) "growth-draft-marker" else "different-final-marker" }}, false, true);
         try ui.draw();
         try screen.replay(ui.frame);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(@as(usize, @intFromBool(same_final)), screen.count("growth-draft-marker"));
         try std.testing.expectEqual(@as(usize, @intFromBool(!same_final)), screen.count("different-final-marker"));
         try std.testing.expectEqual(@as(usize, 0), screen.count("second-draft-line"));
-        try std.testing.expectEqual(@as(usize, 23), screen.row);
+        // The committed row replaces the draft and releases rows in place. The
+        // old draft contributed gap + two rows while the final contributes
+        // gap + one row, and the three footer rows are unchanged, so this frame
+        // contracts exactly ONE row from the ACKed draft cursor.
+        try std.testing.expectEqual(draft_row - 1, screen.row);
+        try std.testing.expectEqual(@as(usize, 3), ui.tail_height);
     }
 }
 
@@ -5595,13 +7659,15 @@ test "user thinking streaming prefixes and revised replies keep explicit gaps" {
         try expectTranscriptGap(&screen, "user-row-end", "think-first");
         for ([_][]const u8{ "think-first", "think-second", "think-last" }) |marker| try std.testing.expect(screen.visible(marker));
         try std.testing.expect(!screen.visible("old-think"));
-        try std.testing.expectEqual(@as(usize, 23), screen.row);
-        ui.finishFrame();
+        // Two released user rows plus a gap row and three reasoning rows, then
+        // the separator, the fixture notice and the composer.
+        try std.testing.expectEqual(@as(usize, 8), screen.row);
+        testAcknowledgeFullFrame(&ui);
         try ui.appendDraft(.reasoning, "\nthink-new\nthink-new-last");
         try ui.draw();
         try screen.replay(ui.frame);
         try expectTranscriptGap(&screen, "user-row-end", "think-last");
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try ui.appendDraft(.assistant, "live-start\nlive-end");
         try ui.draw();
         try screen.replay(ui.frame);
@@ -5609,7 +7675,7 @@ test "user thinking streaming prefixes and revised replies keep explicit gaps" {
         try std.testing.expectEqual(@as(usize, 0), screen.count("think-"));
         try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Streaming") == null);
         try std.testing.expect(std.mem.indexOf(u8, ui.frame, "History preview") == null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         // Growing native history preserves the original start and its gap,
         // instead of clipping the stream into a moving last-screen window.
         for (0..60) |i| {
@@ -5617,11 +7683,32 @@ test "user thinking streaming prefixes and revised replies keep explicit gaps" {
             defer std.testing.allocator.free(delta);
             try ui.appendDraft(.assistant, delta);
         }
+        const prior_tail = ui.tail_height;
         try ui.draw();
+        // draw stages a new tail; tail_height remains the prior complete ACK.
+        try std.testing.expectEqual(prior_tail, ui.tail_height);
         try screen.replay(ui.frame);
         try expectTranscriptGap(&screen, "user-row-end", "live-start");
+        try std.testing.expect(screen.count("live-line-") > 0);
+        try std.testing.expectEqual(@as(usize, 1), screen.count("user-row-end"));
+        // The draft grew past the window, so its tail ends on the physical bottom
+        // without necessarily owning every physical row.
         try std.testing.expectEqual(@as(usize, 23), screen.row);
-        ui.finishFrame();
+        // The staged footprint is the remaining draft rows after the pending
+        // released prefix, plus any fresh leading gap and the fixture footer,
+        // clamped to the physical window. A short bottom-anchored tail is valid.
+        const draft_record = &ui.records.items[ui.draft.?];
+        const released = draft_record.pending_stream_rows;
+        try std.testing.expect(released != 0);
+        const remaining = draft_record.lines.len -| released;
+        const leading_gap: usize = @intFromBool(released == 0);
+        const fixture_footer_rows: usize = 3; // notice, separator, composer
+        const staged = @min(ui.size.rows, remaining + leading_gap + fixture_footer_rows);
+        try std.testing.expectEqual(staged, ui.frame_height);
+        testAcknowledgeFullFrame(&ui);
+        try std.testing.expectEqual(staged, ui.tail_height);
+        // First row owned by the ACKed tail: the revision frame starts here.
+        const tail_origin = screen.row - (ui.tail_height - 1);
         try ui.replaceCommitted(&.{.{ .text = "formal-final" }}, false, true);
         try ui.draw();
         try screen.replay(ui.frame);
@@ -5629,8 +7716,11 @@ test "user thinking streaming prefixes and revised replies keep explicit gaps" {
         try std.testing.expectEqual(@as(usize, 1), screen.count("formal-final"));
         try std.testing.expect(screen.count("live-line-") > 0);
         try std.testing.expectEqual(@as(usize, 1), screen.count("user-row-end"));
-        try std.testing.expectEqual(@as(usize, 23), screen.row);
-        ui.finishFrame();
+        // The revision emits exactly THREE rows from that origin (revision
+        // notice, gap, final body) below the borrowed tail start, then paints its
+        // own footer tail, so the cursor is origin + 3 + frame_height - 1.
+        try std.testing.expectEqual(tail_origin + 3 + ui.frame_height - 1, screen.row);
+        testAcknowledgeFullFrame(&ui);
     }
 }
 
@@ -5661,7 +7751,6 @@ test "composer history arrows require exact origin while slash arrows only selec
     try ui.parser.feed("\x15/\x1b[B", sink);
     try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
     try std.testing.expectEqual(command_menu_module.Command.auth, ui.command_menu.choice(ui.command_matches).?);
-    try std.testing.expectEqual(@as(usize, 0), ui.scroll);
     try std.testing.expect(!ui.busy and ui.future == null); // Browsing is never submission.
     ui.wipeEditor();
     ui.beginSecret(null);
@@ -5834,8 +7923,9 @@ test "idle exit reclaims only acknowledged blank tail and preserves startup and 
     try std.testing.expect(!try ui.idleExitBytes(&writer));
     try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
     try screen.replay(ui.frame);
-    ui.finishFrame();
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(usize, 6), screen.row);
+    try std.testing.expectEqual(@as(usize, 3), ui.tail_height);
     try std.testing.expect(try ui.idleExitBytes(&writer));
     try screen.replay(writer.buffered());
     try screen.replay("\r\nshell-next");
@@ -5935,8 +8025,10 @@ test "thinking scrolls in three rows and body replaces it without retaining reas
     try screen.replay(ui.frame);
     try std.testing.expect(!screen.visible("think-one"));
     for ([_][]const u8{ "think-two", "think-three", "think-four" }) |marker| try std.testing.expect(screen.visible(marker));
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
-    ui.finishFrame();
+    // Three reasoning rows above the separator, the fixture notice and the composer.
+    try std.testing.expectEqual(@as(usize, 5), screen.row);
+    try std.testing.expectEqual(@as(usize, 6), ui.frame_height);
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(!ui.records.items[0].output);
     try ui.appendDraft(.reasoning, "\nthink-five\nthink-six");
     try ui.draw();
@@ -5944,7 +8036,7 @@ test "thinking scrolls in three rows and body replaces it without retaining reas
     try std.testing.expect(!screen.visible("think-two") and !screen.visible("think-three"));
     for ([_][]const u8{ "think-four", "think-five", "think-six" }) |marker| try std.testing.expect(screen.visible(marker));
     for (screen.history[0..screen.history_len]) |line| try std.testing.expect(std.mem.find(u8, &line, "think-") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 
     try ui.appendDraft(.assistant, "partial-answer\x1b[2J");
     try ui.appendDraft(.reasoning, "late-reasoning");
@@ -5955,7 +8047,7 @@ test "thinking scrolls in three rows and body replaces it without retaining reas
     try std.testing.expectEqual(@as(usize, 0), screen.count("think-"));
     try std.testing.expectEqual(@as(usize, 0), screen.count("late-reasoning"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const draft = ui.draft.?;
     try std.testing.expect(!ui.records.items[draft].output);
     // Cancellation keeps only the unfinished visible answer, explicitly marked.
@@ -5964,15 +8056,53 @@ test "thinking scrolls in three rows and body replaces it without retaining reas
     try ui.draw();
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("Interrupted response"));
-    ui.finishFrame();
-    ui.scroll = 1;
+    testAcknowledgeFullFrame(&ui);
+    // PageUp is terminal-native history: it must not regroup completed records
+    // or repaint reasoning into this frame.
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b[5~", sink);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "History preview") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "think-") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
-test "rolling thinking keeps latest bounded UTF8 suffix and can be hidden" {
+test "reasoning grows from a small acknowledged tail and hides reversibly" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    const small_tail = ui.tail_height;
+    try std.testing.expect(small_tail != 0 and small_tail < 6);
+    try ui.appendDraft(.reasoning, "think-a\nthink-b\nthink-c");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    for ([_][]const u8{ "think-a", "think-b", "think-c" }) |marker| try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
+    try std.testing.expect(ui.frame_height > small_tail); // Growth, not a hidden reasoning row.
+    testAcknowledgeFullFrame(&ui);
+    // There was no ACKed row above the small tail to borrow, so every new row
+    // grew naturally and no reasoning row entered native history.
+    try std.testing.expectEqual(@as(usize, 0), ui.menu_history.?.borrowed.len);
+    for (screen.history[0..screen.history_len]) |line| try std.testing.expect(std.mem.find(u8, &line, "think-") == null);
+    ui.show_reasoning = false;
+    try ui.draw();
+    try screen.replay(ui.frame);
+    for ([_][]const u8{ "think-a", "think-b", "think-c" }) |marker| try std.testing.expect(!screen.visible(marker));
+    testAcknowledgeFullFrame(&ui);
+    ui.show_reasoning = true;
+    try ui.draw();
+    try screen.replay(ui.frame);
+    for ([_][]const u8{ "think-a", "think-b", "think-c" }) |marker| try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
+    testAcknowledgeFullFrame(&ui);
+}
+
+test "rolling thinking keeps a bounded incremental tail and can be hidden" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -5984,22 +8114,168 @@ test "rolling thinking keeps latest bounded UTF8 suffix and can be hidden" {
     try ui.appendDraft(.reasoning, large);
     try ui.appendDraft(.reasoning, "\nnewest-thinking");
     const record = &ui.records.items[ui.reasoning.?];
-    try std.testing.expect(record.body.items.len <= record_limit);
-    try std.testing.expect(record.clipped);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(record.body.items));
-    try std.testing.expect(std.mem.endsWith(u8, record.body.items, "newest-thinking"));
+    const tail = record.tail.?;
+    // The record never retains the stream body; the tail owns a bounded window.
+    try std.testing.expectEqual(@as(usize, 0), record.body.items.len);
+    try std.testing.expectEqual(reasoning_tail_rows, tail.keepRows());
+    try std.testing.expectEqual(plain_tail.Limit.none, tail.limitState());
+    try std.testing.expect(tail.retainedBytes() <= reasoning_tail_bytes);
+    try std.testing.expect(tail.ownedBytes() <= tail.ownedBound());
+    try std.testing.expect(tail.retainedSource().len <= reasoning_tail_bytes);
+    try std.testing.expect(tail.retainedBytes() < large.len);
+    try std.testing.expect(std.mem.endsWith(u8, tail.retainedSource(), "newest-thinking"));
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("newest-thinking"));
+    testAcknowledgeFullFrame(&ui);
+    // A redraw/layout never re-consumes or extends the retained source. Sparse
+    // diffs may omit unchanged glyphs, so assert the replayed screen instead of
+    // raw frame bytes.
+    const source_len = tail.retainedSource().len;
+    const retained = tail.retainedBytes();
+    record.invalidate();
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("newest-thinking"));
+    try std.testing.expectEqual(source_len, tail.retainedSource().len);
+    try std.testing.expectEqual(retained, tail.retainedBytes());
+    testAcknowledgeFullFrame(&ui);
     ui.show_reasoning = false;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "newest-thinking") == null);
-    ui.finishFrame();
+    try screen.replay(ui.frame);
+    try std.testing.expect(!screen.visible("newest-thinking"));
+    testAcknowledgeFullFrame(&ui);
     ui.show_reasoning = true;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "newest-thinking") != null);
-    ui.finishFrame();
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("newest-thinking"));
+    testAcknowledgeFullFrame(&ui);
+    // The bounded/source invariants above were proven on the live owner while
+    // it still existed. Cancellation deinitializes that tail, so the proof after
+    // the discard must be about ownership, never about dereferencing `tail`.
     ui.discardReasoning(); // Same cancellation cleanup as complete.
+    try std.testing.expect(ui.reasoning == null);
+    // The fixture holds no other Record, so removal left no reasoning owner and
+    // no draft: every retained reasoning byte was released with its tail.
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try std.testing.expect(ui.draft == null);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "newest-thinking") == null);
-    ui.finishFrame();
+    try screen.replay(ui.frame);
+    try std.testing.expect(!screen.visible("newest-thinking"));
+    testAcknowledgeFullFrame(&ui);
+}
+
+/// Shared plain renderer reference: the exact Writer settings the bounded tail
+/// uses, so a live tail can be compared byte-for-byte at a given width.
+fn plainWidthRows(a: std.mem.Allocator, columns: usize, body: []const u8, out: *std.ArrayList([]u8)) !void {
+    const writer_module = @import("markdown_writer.zig");
+    const display_text = @import("../util/display_text.zig");
+    const clean = try display_text.sanitize(a, body, 1 << 20);
+    defer a.free(clean);
+    var w: writer_module.Writer = .{ .a = a, .columns = std.math.clamp(columns, 1, 512), .ansi = true, .base = .thinking };
+    defer w.deinit();
+    try w.emit(clean);
+    try w.finish();
+    for (w.lines.items) |row| try out.append(a, try a.dupe(u8, row));
+}
+
+fn expectTailMatchesPlain(tail: *plain_tail.Tail, columns: usize, body: []const u8) !void {
+    const a = std.testing.allocator;
+    var want: std.ArrayList([]u8) = .empty;
+    defer {
+        for (want.items) |row| a.free(row);
+        want.deinit(a);
+    }
+    try plainWidthRows(a, columns, body, &want);
+    var snap = try tail.snapshot(a);
+    defer snap.deinit(a);
+    const count = @min(tail.keepRows(), want.items.len);
+    try std.testing.expectEqual(count, snap.rows.len);
+    const expected = want.items[want.items.len - count ..];
+    for (expected, snap.rows) |e, got| try std.testing.expectEqualStrings(e, got);
+}
+
+test "live reasoning tail is created at the drawing width before its first layout" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    // draw() never uses the raw terminal width: it reserves one column so the
+    // terminal cannot autowrap.
+    const draw_columns = @max(1, ui.size.columns -| 1);
+    try std.testing.expect(draw_columns != ui.size.columns);
+    // One long payload without a newline: at a stale width its first draw would
+    // have to reflow rows that were already admitted at the wrong width and
+    // could discard them, so the width must be right before any layout.
+    var payload: [400]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = 'a' + @as(u8, @intCast(i % 26));
+    try ui.appendDraft(.reasoning, &payload);
+    const record = &ui.records.items[ui.reasoning.?];
+    const tail = record.tail.?;
+    try std.testing.expectEqual(draw_columns, tail.columns());
+    try expectTailMatchesPlain(tail, draw_columns, &payload);
+    const retained = tail.retainedBytes();
+    const source_len = tail.retainedSource().len;
+    try ui.draw();
+    // The first draw agrees instead of resizing the already-admitted rows.
+    try std.testing.expectEqual(draw_columns, tail.columns());
+    try std.testing.expectEqual(retained, tail.retainedBytes());
+    try std.testing.expectEqual(source_len, tail.retainedSource().len);
+    try std.testing.expectEqual(draw_columns, record.columns);
+    try expectTailMatchesPlain(tail, draw_columns, &payload);
+    testAcknowledgeFullFrame(&ui);
+}
+
+test "reasoning tail splits UTF8 chunks, wraps, and never resurrects old rows" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    var record: Record = .{ .kind = .reasoning };
+    defer record.deinit(a);
+    const body = "forgotten-old-row\none\ntwo\nthree-has-wrap ab中文👍🏽cd";
+    const emoji = std.mem.indexOf(u8, body, "👍🏽").?;
+    // Split inside the four-byte emoji so the incremental carry must finish it.
+    try record.append(a, body[0 .. emoji + 2]);
+    try record.append(a, body[emoji + 2 ..]);
+    try record.layout(a, 6);
+    const tail = record.tail.?;
+    try std.testing.expectEqual(@as(usize, 6), tail.columns());
+    try std.testing.expect(record.lines.len <= reasoning_tail_rows);
+    try std.testing.expect(record.lines.len >= 2); // narrow width wrapped
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(a);
+    for (record.lines) |line| try joined.appendSlice(a, line);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "👍🏽") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "\u{fffd}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "forgotten-old-row") == null);
+    // Reflow only the retained window: the forgotten row cannot come back.
+    try record.layout(a, 20);
+    try std.testing.expectEqual(@as(usize, 20), tail.columns());
+    var reflowed: std.ArrayList(u8) = .empty;
+    defer reflowed.deinit(a);
+    for (record.lines) |line| try reflowed.appendSlice(a, line);
+    try std.testing.expect(std.mem.indexOf(u8, reflowed.items, "forgotten") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tail.retainedSource(), "forgotten") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reflowed.items, "👍🏽") != null);
+}
+
+test "thinking display limit marker is explicit and bounded" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    var record: Record = .{ .kind = .reasoning };
+    defer record.deinit(a);
+    try record.append(a, "ok\na");
+    for (0..5000) |_| try record.append(a, "\u{0301}");
+    try record.layout(a, 80);
+    const tail = record.tail.?;
+    try std.testing.expectEqual(plain_tail.Limit.cluster, tail.limitState());
+    try std.testing.expect(tail.retainedBytes() <= reasoning_tail_bytes);
+    try std.testing.expect(record.lines.len <= reasoning_tail_rows + 1);
+    const shown = record.lines[record.lines.len -| reasoning_tail_rows..];
+    try std.testing.expect(std.mem.find(u8, shown[shown.len - 1], "thinking display limited: cluster; model history unchanged") != null);
 }
 
 fn emitToolUi(ui: *Ui, event_: r.Event) !void {
@@ -6013,7 +8289,7 @@ fn emitToolUi(ui: *Ui, event_: r.Event) !void {
 fn replayToolFrame(ui: *Ui, screen: *@import("../tests/regular_screen.zig").Screen) !void {
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(ui);
 }
 
 test "typed tool row updates in place before execution and uses ready metadata after Bridge clipping" {
@@ -6042,7 +8318,7 @@ test "typed tool row updates in place before execution and uses ready metadata a
     // Updating captions cannot mutate/release a partially written frame.
     try std.testing.expectEqualStrings(in_flight, ui.frame);
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     for (0..3) |_| {
         try replayToolFrame(&ui, screen);
         try std.testing.expectEqual(@as(usize, 1), screen.count("src/preview.zig"));
@@ -6205,7 +8481,7 @@ test "raw write deltas alone never display JSON or invent execution" {
         try std.testing.expect(std.mem.find(u8, ui.frame, "received") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "RAW_WRITE_BYTES") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "+3") == null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
     }
     const events = [_]r.Event{
         .{ .assistant_committed = &.{.{ .tool_call = .{ .id = "write-2", .name = "write_file", .arguments = "{\"path\":\"preview.txt\"}" } }} },
@@ -6233,7 +8509,7 @@ test "raw write deltas alone never display JSON or invent execution" {
             try std.testing.expect(std.mem.find(u8, ui.frame, "preview.txt") != null);
             try std.testing.expect(std.mem.find(u8, ui.frame, "+3") != null);
         }
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
     }
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "+3") != null);
@@ -6271,11 +8547,11 @@ test "tool animation is transient and raw tool JSON never enters displayed recor
         try std.testing.expect(std.mem.find(u8, ui.frame, "#7") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "Running memory") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "Running bash") == null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         ui.clock_ms = 120;
         try ui.draw();
         try std.testing.expect(std.mem.find(u8, ui.frame, activity.spinner(120)) != null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try host.emit_fn(host.context, .{ .tool_preview = .{ .index = 0, .arguments = "{\"hidden-tool-argument\":1}" } }, &cancel);
         item = bridge.pop().?;
         try ui.event(item);
@@ -6291,7 +8567,7 @@ test "tool animation is transient and raw tool JSON never enters displayed recor
         try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-tool-") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "requested-answer") != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "completed") == null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
     }
 }
 
@@ -6306,20 +8582,20 @@ test "first pending tool follows user gap then tools stay contiguous" {
         _ = try ui.add(.user, "tool-user-end");
         try ui.draw();
         try screen.replay(ui.frame);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         const args = if (std.mem.eql(u8, name, "bash")) "{\"command\":\"target-one\"}" else if (std.mem.eql(u8, name, "memory")) "{\"action\":\"read\",\"topic\":\"target-one\"}" else "{\"path\":\"target-one\"}";
         try ui.captureToolCaptions(&.{.{ .tool_call = .{ .id = "gap-one", .name = name, .arguments = args } }});
         ui.active_tool = .{ .id = 1, .caption = try ui.nextToolCaption(name), .started_ms = 0 };
         try ui.draw();
         try screen.replay(ui.frame);
         try expectTranscriptGap(&screen, "tool-user-end", "target-one");
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try ui.toolCompleted(ui.active_tool.?.caption, .{ .text = "{}" });
         ui.clearActiveTool();
         try ui.draw();
         try screen.replay(ui.frame);
         try expectTranscriptGap(&screen, "tool-user-end", "target-one");
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         const second: presentation.Caption = .{ .kind = .read, .label = "target-two" };
         ui.active_tool = .{ .id = 2, .caption = .{ .kind = .read, .label = try std.testing.allocator.dupe(u8, second.label) }, .started_ms = 0 };
         try ui.draw();
@@ -6332,8 +8608,9 @@ test "first pending tool follows user gap then tools stay contiguous" {
         }
         try std.testing.expect(first_row != null and second_row != null);
         try std.testing.expectEqual(first_row.? + 1, second_row.?);
-        try std.testing.expectEqual(@as(usize, 23), screen.row);
-        ui.finishFrame();
+        // Two released tool rows above the one-row tool body and hinted footer.
+        try std.testing.expectEqual(@as(usize, 6), screen.row);
+        testAcknowledgeFullFrame(&ui);
     }
 }
 
@@ -6372,8 +8649,8 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     }
     try std.testing.expect(failed_row != null and pending_row != null);
     try std.testing.expectEqual(failed_row.? + 1, pending_row.?);
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
-    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 4), screen.row);
+    testAcknowledgeFullFrame(&ui);
     try host.emit_fn(host.context, .{ .tool_result = .{ .id = 2, .name = "bash", .result = .{ .text = "hidden-output-json" } } }, &cancel);
     item = bridge.pop().?;
     try ui.event(item);
@@ -6399,8 +8676,11 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     }
     try std.testing.expect(failed_row != null and pending_row != null);
     try std.testing.expectEqual(failed_row.? + 1, pending_row.?);
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
-    ui.finishFrame();
+    // Both captions are contiguous at rows 0 and 1, so the second one is the
+    // last body row; the separator, hint and composer follow it unchanged and
+    // the cursor lands exactly three rows below the pending caption.
+    try std.testing.expectEqual(pending_row.? + 3, screen.row);
+    testAcknowledgeFullFrame(&ui);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, " date [error]") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, " pwd") == null);
@@ -6424,7 +8704,7 @@ test "incomplete canonical block tails cannot publish a false final heading" {
     try std.testing.expect(!ui.records.items[0].final_answer);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Final answer") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "tool only reasoning only and empty canonical bodies remove a previously visible draft" {
@@ -6441,14 +8721,14 @@ test "tool only reasoning only and empty canonical bodies remove a previously vi
         _ = try ui.add(.user, "retained-user");
         try ui.appendDraft(.assistant, "provisional-body");
         try ui.draw();
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try ui.replaceCommitted(&.{block}, false, true);
         try std.testing.expect(ui.draft == null and ui.records.items.len == 1);
         try std.testing.expectEqual(Kind.user, ui.records.items[0].kind);
         try ui.draw();
         try std.testing.expect(std.mem.find(u8, ui.frame, "Final answer") == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "provisional-body") == null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
     }
 }
 
@@ -6482,16 +8762,16 @@ test "file captions are contiguous but separated from final prose and percent co
     try screen.replay(ui.frame);
     try std.testing.expect(!screen.visible("Final answer") and screen.visible("final-body-marker"));
     for (screen.grid[1]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
-    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 5), screen.row);
+    testAcknowledgeFullFrame(&ui);
     try ui.draw();
     try screen.replay(ui.frame);
     try std.testing.expectEqual(@as(usize, 0), screen.count("=> Final answer"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("final-body-marker"));
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
-test "committed large Markdown caches stay untouched on resize until history preview opens" {
+test "committed large Markdown caches stay untouched across resize and PageUp" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -6508,44 +8788,30 @@ test "committed large Markdown caches stay untouched on resize until history pre
     try ui.draw();
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    ui.finishFrame();
-    const old_columns = ui.records.items[0].columns;
-    const caches = .{ ui.records.items[0].cache.?.state, ui.records.items[1].cache.?.state };
-    const line_ptrs = .{ ui.records.items[0].lines.ptr, ui.records.items[1].lines.ptr };
+    testAcknowledgeFullFrame(&ui);
+    // Active bodies are incremental: acknowledged source is gone, so there is
+    // no committed cache to preserve. What matters is that nothing is replayed.
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items[0].stream.?.windowBytes() -| ui.records.items[0].stream.?.pendingBytes());
     ui.resize(.{ .columns = 41, .rows = 24 });
     try ui.draw();
     inline for (0..2) |i| {
         const record = &ui.records.items[i];
-        try std.testing.expect(record.output and !record.pending_output);
-        try std.testing.expectEqual(old_columns, record.columns);
-        try std.testing.expectEqualDeep(caches[i], record.cache.?.state);
-        try std.testing.expectEqual(line_ptrs[i], record.lines.ptr);
+        try std.testing.expect(record.output or record.stream != null);
     }
     try std.testing.expect(std.mem.find(u8, ui.frame, "history-marker") == null);
     try screen.replay(ui.frame);
-    ui.finishFrame();
-    ui.scroll = 1;
+    testAcknowledgeFullFrame(&ui);
+    // No program history preview path exists: committed records are never
+    // re-laid out or replayed for a PageUp or a resize.
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    for (0..2) |_| try ui.parser.feed("\x1b[5~", sink);
     try ui.draw();
-    for (ui.records.items) |*record| {
-        try std.testing.expectEqual(@as(usize, 40), record.columns);
-        try std.testing.expect(record.output and !record.pending_output);
-        for (record.lines) |line| {
-            var at: usize = 0;
-            var width: usize = 0;
-            while (at < line.len) {
-                const cluster = text.nextStyledCluster(line, at, width);
-                width += cluster.width;
-                at = cluster.end;
-            }
-            try std.testing.expect(width <= 40);
-        }
+    inline for (0..2) |i| {
+        try std.testing.expect(ui.records.items[i].stream != null);
     }
+    try std.testing.expect(std.mem.find(u8, ui.frame, "history-marker") == null);
     try screen.replay(ui.frame);
-    ui.finishFrame();
-    ui.scroll = 0;
-    try ui.draw();
-    try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Screen is only a fixed-grid transcript counter, not a resize/reflow oracle.
     try std.testing.expectEqual(@as(usize, 1), screen.count("once-history-marker"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("second-history-marker"));
@@ -6575,7 +8841,7 @@ test "growing and bulk committed frames synchronize before scrolling and release
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 3), ui.tail_height);
 
     try ui.appendDraft(.assistant, "growth-draft-marker\nsecond-draft-line");
@@ -6585,7 +8851,7 @@ test "growing and bulk committed frames synchronize before scrolling and release
     // This expansion scrolls three rows. Supporting terminals must not publish
     // the intermediate state where draft rows have overwritten the old footer.
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 6), ui.tail_height);
 
     source.clearRetainingCapacity();
@@ -6597,14 +8863,14 @@ test "growing and bulk committed frames synchronize before scrolling and release
     try std.testing.expectEqual(@as(usize, 1), screen.count("committed-63"));
     try std.testing.expectEqual(@as(usize, 0), screen.count("growth-draft-marker"));
     try std.testing.expectEqual(@as(usize, 23), screen.row);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 
     try ui.draw();
     try std.testing.expect(ui.frame_sparse);
     try expectSynchronizedFrame(ui.frame);
     try std.testing.expect(std.mem.find(u8, ui.frame, "committed-") == null);
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "bulk frames repaint before erasing stale line suffixes" {
@@ -6635,6 +8901,7 @@ test "bulk frames repaint before erasing stale line suffixes" {
     defer ui.deinit();
     ui.busy = true;
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try seedPriorBottom(&screen);
     for (0..32) |i| {
         var buffer: [128]u8 = undefined;
         const chunk = try std.fmt.bufPrint(&buffer, "bulk-{d} **changing body** with several words to fill the viewport.\n\n", .{i});
@@ -6645,7 +8912,7 @@ test "bulk frames repaint before erasing stale line suffixes" {
         try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2K") == null);
         try screen.replay(ui.frame);
         try std.testing.expectEqual(@as(usize, 23), screen.row);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
     }
     try std.testing.expect(screen.visible("bulk-31"));
 }
@@ -6666,7 +8933,7 @@ test "stable large table body is not erased or reprinted for a footer animation 
     try ui.draw();
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const before = screen.grid;
     ui.clock_ms = 80;
     try ui.draw();
@@ -6677,7 +8944,7 @@ test "stable large table body is not erased or reprinted for a footer animation 
     try screen.replay(ui.frame);
     for (0..23) |row| try std.testing.expectEqualSlices(u8, &before[row], &screen.grid[row]);
     try std.testing.expectEqual(@as(usize, 23), screen.row);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "one-pass transcript separators erase acknowledged approval preview before committing records" {
@@ -6690,7 +8957,7 @@ test "one-pass transcript separators erase acknowledged approval preview before 
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const host = bridge.host();
     try host.emit_fn(host.context, .{ .permission = .{ .id = 1, .tool_name = "bash", .description = "GHOST-preview-1\nGHOST-preview-2\nGHOST-preview-3\nGHOST-preview-4\nGHOST-preview-5\nGHOST-preview-6" } }, &cancel);
     var item = bridge.pop().?;
@@ -6698,7 +8965,7 @@ test "one-pass transcript separators erase acknowledged approval preview before 
     item.deinit();
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(screen.visible("Approval #1"));
     try std.testing.expect(ui.tail_snapshot == null);
     // The actual loop can answer and receive results before its next draw slot.
@@ -6709,13 +8976,13 @@ test "one-pass transcript separators erase acknowledged approval preview before 
     try ui.draw();
     try std.testing.expect(!ui.frame_sparse and ui.frame_tail_snapshot != null);
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 0), screen.count("Approval #1"));
     try std.testing.expectEqual(@as(usize, 0), screen.count("GHOST-preview"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("completed-tool-result"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("next-user-record"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("short-canonical-record"));
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    try std.testing.expectEqual(@as(usize, 9), screen.row);
 }
 
 test "long approval Escape restores acknowledged conversation without blank screen or replay" {
@@ -6736,7 +9003,7 @@ test "long approval Escape restores acknowledged conversation without blank scre
         var screen: @import("../tests/regular_screen.zig").Screen = .{};
         try ui.draw();
         try screen.replay(ui.frame);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expect(screen.visible("PRIOR-RESPONSE-17"));
         const history_before = screen.history_len;
         const pending_index = ui.records.items.len;
@@ -6763,7 +9030,7 @@ test "long approval Escape restores acknowledged conversation without blank scre
                 ui.requestCancel(); // Cancel while the last preview is in flight.
                 try screen.replay(ui.frame[split..]);
             } else try screen.replay(ui.frame);
-            ui.finishFrame();
+            testAcknowledgeFullFrame(&ui);
         }
         try std.testing.expect(screen.visible("Approval #14"));
         const record_count = ui.records.items.len;
@@ -6773,7 +9040,7 @@ test "long approval Escape restores acknowledged conversation without blank scre
         try std.testing.expect(ui.permission == null);
         try ui.draw();
         try screen.replay(ui.frame);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         if (!screen.visible("PRIOR-RESPONSE-17")) std.debug.print("APPROVAL_CANCEL pending_canonical={any} history_delta={d} retained_prior={d} prior_visible=false\n", .{ pending_canonical, screen.history_len -| history_before, screen.count("PRIOR-RESPONSE-") });
         try std.testing.expect(screen.visible("PRIOR-RESPONSE-17"));
         try std.testing.expectEqual(@as(usize, 18), screen.count("PRIOR-RESPONSE-"));
@@ -6799,7 +9066,7 @@ test "approval restoration borrows only acknowledged same-width rows" {
         _ = try ui.add(.assistant, "owned-0\nowned-1\nowned-2\nowned-3\nowned-4\nowned-5");
         try ui.draw();
         if (scenario == 1) ui.frame_fresh = false;
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         if (scenario == 2) {
             ui.resize(.{ .columns = 79, .rows = 24 });
             ui.resize(.{ .columns = 80, .rows = 24 });
@@ -6817,7 +9084,7 @@ test "approval restoration borrows only acknowledged same-width rows" {
         const borrowed = ui.frame_menu_history.?.borrowed.len;
         if (scenario == 0) try std.testing.expect(borrowed != 0) else try std.testing.expectEqual(@as(usize, 0), borrowed);
         try std.testing.expect(ui.displayed_permission == null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
     }
 }
 
@@ -6839,7 +9106,7 @@ test "approval waiting pulse never adds repeated prompts to native scrollback" {
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     var source: Io.Writer.Allocating = .init(std.testing.allocator);
     defer source.deinit();
     for (0..125) |i| try source.writer.print("synthetic-step-{d}: Chinese 中文注释 only; abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz\n", .{i});
@@ -6850,7 +9117,7 @@ test "approval waiting pulse never adds repeated prompts to native scrollback" {
     item.deinit();
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const history_before = screen.history_len;
     try std.testing.expect(screen.visible("Approval #14"));
     ui.dirty = false;
@@ -6861,7 +9128,7 @@ test "approval waiting pulse never adds repeated prompts to native scrollback" {
         // Explicit redraws (input/events) must still preserve tail ownership.
         try ui.draw();
         try screen.replay(ui.frame);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(history_before, screen.history_len);
         try std.testing.expectEqual(@as(usize, 1), screen.count("Approval #14"));
         try std.testing.expectEqual(@as(usize, 23), screen.row);
@@ -6879,6 +9146,51 @@ test "approval waiting pulse never adds repeated prompts to native scrollback" {
     try std.testing.expect(!cancel.isRequested());
 }
 
+test "ordinary redraws coalesce from the previous draw start while input stays urgent" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    // Nothing pending: no idle redraw and no cadence wake-up is requested.
+    ui.dirty = false;
+    try std.testing.expect(!ui.drawReady() and !ui.drawDue());
+
+    // Keyboard input is urgent but still waits for an already-started frame.
+    ui.clock_ms = 1000;
+    ui.urgent_draw = true;
+    ui.dirty = true;
+    try std.testing.expect(ui.drawDue());
+    ui.frame = "partial";
+    try std.testing.expect(!ui.drawDue());
+    ui.frame = "";
+    try ui.draw();
+    try std.testing.expectEqual(@as(u64, 1000), ui.last_draw_ms);
+    // Only staging that fresh draw consumes the urgent bit; draw() itself keeps
+    // it so a caller cannot lose input without writing a frame.
+    try std.testing.expect(ui.urgent_draw);
+    ui.urgent_draw = false;
+    testAcknowledgeFullFrame(&ui);
+    ui.dirty = false;
+
+    // Ordinary work waits only for the rest of the interval, never a new one.
+    ui.clock_ms = 1005;
+    ui.dirty = true;
+    try std.testing.expect(!ui.drawDue());
+    try std.testing.expectEqual(@as(u16, 3), ui.cadenceWaitMs());
+    ui.clock_ms = 1007;
+    try std.testing.expect(!ui.drawDue());
+    try std.testing.expectEqual(@as(u16, 1), ui.cadenceWaitMs());
+    ui.clock_ms = 1008;
+    try std.testing.expect(ui.drawDue());
+
+    // Unproven geometry keeps its own inhibited state and never enters the
+    // cadence by timer, even when input is urgent.
+    ui.resize_waiting = true;
+    ui.urgent_draw = true;
+    try std.testing.expect(!ui.drawReady() and !ui.drawDue());
+}
+
 fn seedShiftDraft(ui: *Ui) !void {
     try ui.appendDraft(.assistant, "```\n");
     for (0..35) |row_index| {
@@ -6892,7 +9204,7 @@ fn nativeLine(screen: *const @import("../tests/regular_screen.zig").Screen, inde
     return if (index < screen.history_len) &screen.history[index] else &screen.grid[index - screen.history_len];
 }
 
-test "stream prefix publishes only after ACK and matching canonical text is not duplicated" {
+test "stream rows publish only after ACK and matching canonical text is not duplicated" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -6901,27 +9213,121 @@ test "stream prefix publishes only after ACK and matching canonical text is not 
     try seedShiftDraft(&ui);
     const index = ui.draft.?;
     try ui.draw();
+    // The active body keeps no full styled prefix copy; only unwritten rows.
     try std.testing.expect(ui.records.items[index].flow_prefix == null);
-    try std.testing.expect(ui.records.items[index].pending_flow_prefix != null);
+    try std.testing.expect(ui.records.items[index].pending_stream_rows != 0);
     try std.testing.expect(!ui.records.items[index].output and !ui.records.items[index].pending_output);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    // Invalidating the render cache cannot invalidate the in-flight checkpoint.
+    // Content arriving mid-frame cannot invalidate the delivery in flight.
     try ui.appendDraft(.assistant, "```");
-    ui.finishFrame();
-    try std.testing.expect(ui.records.items[index].flow_prefix != null);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[index].stream_written != 0);
     const body = try std.testing.allocator.dupe(u8, ui.records.items[index].body.items);
     defer std.testing.allocator.free(body);
     try ui.replaceCommitted(&.{.{ .text = body }}, false, true);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.records.items[index].output);
     try std.testing.expect(ui.records.items[index].flow_prefix == null);
     try std.testing.expectEqual(@as(usize, 35), screen.count("stream-row-"));
     try std.testing.expectEqual(@as(usize, 0), screen.count("Response revised"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("stream-row-000"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("stream-row-034"));
+}
+
+test "ACKed stream rows are not rewritten by ordinary repaints" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try seedShiftDraft(&ui);
+    const index = ui.draft.?;
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    const written = ui.records.items[index].stream_written;
+    try std.testing.expect(written != 0);
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(written, ui.records.items[index].stream_written);
+    try std.testing.expectEqual(@as(usize, 0), screen.count("Response revised"));
+    try std.testing.expect(screen.count("stream-row-000") <= 1);
+}
+
+test "width changes re-render only the retained window without duplicate rows" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try seedShiftDraft(&ui);
+    const index = ui.draft.?;
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    const written = ui.records.items[index].stream_written;
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    // A width ABA discards the in-flight frame authority and re-analyzes only
+    // the retained window; frozen rows are never replayed.
+    ui.resize(.{ .columns = 40, .rows = 12 });
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    ui.resize(.{ .columns = 80, .rows = 24 });
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[index].stream_written >= written);
+    try std.testing.expect(screen.count("stream-row-000") <= 1);
+}
+
+test "new stream text releases each row exactly once" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try seedShiftDraft(&ui);
+    const index = ui.draft.?;
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    const old_written = ui.records.items[index].stream_written;
+    try ui.appendDraft(.assistant, "stream-row-035 abcdefghijklmnopqrstuvwxyz abcdefghijklmnop\n");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[index].stream_written > old_written);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-row-035"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-row-000"));
+}
+
+test "late ACK commits pinned rows and does not lose mid-frame content" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try seedShiftDraft(&ui);
+    const index = ui.draft.?;
+    try ui.draw();
+    const staged = ui.records.items[index].pending_stream_rows;
+    try std.testing.expect(staged != 0);
+    // Content arrives after staging but before the frame is acknowledged.
+    try ui.appendDraft(.assistant, "stream-row-035 abcdefghijklmnopqrstuvwxyz abcdefghijklmnop\n");
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(staged, ui.records.items[index].stream_written);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-row-035"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-row-000"));
 }
 
 test "withdrawn streamed text is explained without clearing native scrollback" {
@@ -6934,13 +9340,80 @@ test "withdrawn streamed text is explained without clearing native scrollback" {
     try ui.draw();
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.replaceCommitted(&.{}, false, true);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(screen.count("stream-row-") > 0);
     try std.testing.expectEqual(@as(usize, 1), screen.count("Stream preview withdrawn"));
+}
+
+test "clipped empty canonical preserves an unacknowledged streamed body" {
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.appendDraft(.assistant, "BODY-NOT-YET-ACKED");
+    const id = ui.records.items[ui.draft.?].id;
+    const thought = try std.testing.allocator.alloc(u8, 70 * 1024);
+    defer std.testing.allocator.free(thought);
+    @memset(thought, 'r');
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .assistant_committed = &.{ .{ .reasoning = thought }, .{ .text = "BODY-NOT-YET-ACKED" } } }, &cancel);
+    var item = bridge.pop().?;
+    defer item.deinit();
+    try std.testing.expect(item.display_truncated and item.canonical_complete);
+    try std.testing.expectEqual(@as(usize, 0), item.event.assistant_committed[1].text.len);
+    try ui.event(item);
+    const index = ui.record_index.get(id).?;
+    try std.testing.expectEqualStrings("BODY-NOT-YET-ACKED", ui.records.items[index].body.items);
+    try std.testing.expect(ui.records.items[index].clipped);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("BODY-NOT-YET-ACKED"));
+}
+
+test "complete empty canonical withdraws an unacknowledged streamed body" {
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.appendDraft(.assistant, "withdraw-me");
+    const id = ui.records.items[ui.draft.?].id;
+    try ui.replaceCommitted(&.{}, false, true);
+    try std.testing.expect(ui.record_index.get(id) == null);
+}
+
+test "clipped canonical never replaces a complete displayed stream" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try seedShiftDraft(&ui);
+    const index = ui.draft.?;
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    const preview = try std.testing.allocator.dupe(u8, ui.records.items[index].body.items);
+    defer std.testing.allocator.free(preview);
+    // display_truncated canonical is not a complete body: the long preview and
+    // its rows must survive, with an explicit notice instead of a rewrite.
+    try ui.replaceCommitted(&.{.{ .text = "cropped final" }}, true, true);
+    try std.testing.expect(ui.records.items[index].clipped);
+    try std.testing.expectEqualStrings(preview, ui.records.items[index].body.items);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-row-034"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("cropped final"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("truncated for display"));
 }
 
 test "native history viewport stays stable during streaming and revisions are explicit" {
@@ -6954,12 +9427,12 @@ test "native history viewport stays stable during streaming and revisions are ex
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // A native viewport is an absolute slice of scrollback+screen, NOT Ui.scroll.
     // Pin an observer eight rows above the current bottom; send no wheel input.
     try std.testing.expect(screen.history_len >= 8);
     const view_top = screen.history_len - 8;
-    var pinned: [24][80]u8 = undefined;
+    var pinned: [24]@TypeOf(screen.grid[0]) = undefined;
     for (&pinned, 0..) |*line, index| @memcpy(line, nativeLine(&screen, view_top + index));
     const history = screen.history_len;
     for (35..43) |row_index| {
@@ -6976,16 +9449,16 @@ test "native history viewport stays stable during streaming and revisions are ex
         for (&pinned, 0..) |*line_, index| try std.testing.expectEqualSlices(u8, line_, nativeLine(&screen, view_top + index));
         try std.testing.expectEqual(@as(usize, 23), screen.row);
         try std.testing.expect(screen.visible(line[0..14]));
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
     }
     try ui.replaceCommitted(&.{.{ .text = "final-canonical-only" }}, false, true);
     try ui.draw();
     try std.testing.expect(!ui.frame_sparse);
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Already-visible previews remain identifiable, not silently erased or
     // presented as the corrected canonical answer.
     try std.testing.expect(screen.count("stream-row-") > 0);
@@ -7005,7 +9478,7 @@ test "tail snapshots publish only on full ACK and own bytes after record invalid
     try std.testing.expect(ui.tail_snapshot == null and ui.frame_tail_snapshot != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(std.mem.find(u8, ui.tail_snapshot.?.rows[0], "stable-body-A") != null);
     // appendDraft invalidates/frees Record.lines; the acknowledged copy stays valid.
     try ui.appendDraft(.assistant, "-extended");
@@ -7014,15 +9487,15 @@ test "tail snapshots publish only on full ACK and own bytes after record invalid
     try std.testing.expect(ui.frame_sparse);
     try std.testing.expect(std.mem.find(u8, ui.tail_snapshot.?.rows[0], "extended") == null);
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(std.mem.find(u8, ui.tail_snapshot.?.rows[0], "extended") != null);
     try ui.draw();
     try std.testing.expect(ui.frame_sparse);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ui.frame, "\x1b[K"));
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("stable-body-A-extended"));
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
-    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 3), screen.row);
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "resize defers idle and busy screens during live geometry changes but input may resume early" {
@@ -7035,17 +9508,20 @@ test "resize defers idle and busy screens during live geometry changes but input
         ui.busy = busy;
         _ = try ui.add(.assistant, "stable resize body");
         try ui.draw();
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         for ([_]terminal_module.Size{ .{ .columns = 40, .rows = 24 }, .{ .columns = 40, .rows = 12 }, .{ .columns = 80, .rows = 24 } }) |size| {
             ui.resize(size);
             try std.testing.expect(ui.resize_waiting and !ui.dirty and !ui.drawReady());
             try std.testing.expect(ui.frame.len == 0 and ui.resize_rescue.len == 0);
             try std.testing.expect(ui.tail_snapshot == null and !ui.frame_fresh);
-            for (0..6) |_| {
+            // Arbitrarily advanced time with only resize reports and animation
+            // pulses never produces a frame: no timer, no automatic repair.
+            for (0..20) |_| {
                 ui.clock_ms += 20;
                 ui.resize(size);
                 ui.animate();
                 try std.testing.expect(!ui.drawReady() and !ui.dirty);
+                try std.testing.expect(ui.frame.len == 0 and ui.resize_rescue.len == 0);
             }
         }
         try Ui.key(&ui, .{ .text = .{ .value = "x", .pasted = false } });
@@ -7053,47 +9529,57 @@ test "resize defers idle and busy screens during live geometry changes but input
         try std.testing.expectEqualStrings("x", ui.editor.bytes.items);
         try ui.draw();
         try std.testing.expect(ui.frame_fresh and !ui.display_changed);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try std.testing.expect(ui.tail_snapshot != null);
     }
 }
 
-test "resize restores an idle viewport once after stable geometry without input" {
+test "resize alone never draws and the next real input draws once at the new size" {
+    try text.initLocale();
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 80, .rows = 24 };
     try Ui.key(&ui, .{ .text = .{ .value = "visible draft", .pasted = false } });
     try ui.draw();
-    ui.finishFrame();
-    ui.clock_ms = 1000;
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
     const size: terminal_module.Size = .{ .columns = 60, .rows = 12 };
     ui.resize(size);
-    for (0..7) |_| {
-        ui.clock_ms += 20;
-        ui.resize(size);
-        try std.testing.expect(!ui.drawReady());
-    }
-    ui.clock_ms = 1150;
-    ui.resize(size);
-    try std.testing.expect(ui.drawReady() and !ui.display_changed);
-    try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "visible draft") != null);
-    try std.testing.expect(!ui.frame_changed and !ui.frame_sparse and ui.tail_snapshot == null);
-    ui.finishFrame();
-    ui.dirty = false; // The loop clears dirty when staging the frame.
+    // The new dimensions are current, and every old authority/bottom proof is gone.
+    try std.testing.expectEqual(size.columns, ui.size.columns);
+    try std.testing.expectEqual(size.rows, ui.size.rows);
+    try std.testing.expect(ui.resize_waiting and !ui.dirty and !ui.drawReady());
+    try std.testing.expect(ui.tail_snapshot == null and !ui.tail_bottom and ui.abandon_tail);
+    // No autonomous payload, however far the clock advances.
     for (0..20) |_| {
         ui.clock_ms += 80;
         ui.resize(size);
         ui.animate();
-        try std.testing.expect(!ui.drawReady());
+        try std.testing.expect(!ui.drawReady() and !ui.dirty);
+        try std.testing.expect(ui.frame.len == 0 and ui.resize_rescue.len == 0);
     }
+    // The next real input is ordinary work: one fresh frame at the new width,
+    // starting from the cursor's natural next row and replaying nothing.
+    try Ui.key(&ui, .{ .text = .{ .value = "!", .pasted = false } });
+    try std.testing.expect(ui.drawReady() and !ui.resize_waiting);
+    try ui.draw();
+    try std.testing.expectEqual(size.columns, ui.frame_size.columns);
+    try std.testing.expectEqual(size.rows, ui.frame_size.rows);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "visible draft!") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[999B") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[0J") == null);
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\r\n"));
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.tail_snapshot != null);
-    try std.testing.expectEqualStrings("visible draft", ui.editor.bytes.items);
+    try std.testing.expectEqualStrings("visible draft!", ui.editor.bytes.items);
 }
 
-test "resize settled recovery restarts on ABA and only a complete new frame acknowledges" {
+test "resize revokes approval across ABA and only a complete new frame acknowledges" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -7101,37 +9587,47 @@ test "resize settled recovery restarts on ABA and only a complete new frame ackn
     defer ui.deinit();
     ui.permission = .{ .id = 42, .description = try std.testing.allocator.dupe(u8, "settled resize approval"), .clipped = false };
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     ui.clock_ms = 1000;
     ui.resize(.{ .columns = 60, .rows = 12 });
     ui.clock_ms = 1100;
     const restored: terminal_module.Size = .{ .columns = 80, .rows = 24 };
     ui.resize(restored);
-    ui.clock_ms = 1150;
-    ui.resize(restored);
+    ui.resize(restored); // A repeated report of the restored size is not an ACK.
     try std.testing.expect(!ui.drawReady() and ui.displayed_permission == null);
-    ui.clock_ms = 1249;
-    ui.resize(restored);
-    try std.testing.expect(!ui.drawReady());
+    // ABA plus arbitrarily advanced time still cannot revive the authority or
+    // produce an autonomous frame.
     ui.clock_ms = 1250;
     ui.resize(restored);
+    ui.clock_ms = 4000;
+    ui.resize(restored);
+    ui.animate();
+    try std.testing.expect(!ui.drawReady() and !ui.dirty);
+    try std.testing.expect(ui.frame.len == 0 and ui.resize_rescue.len == 0);
+    // Only genuine input/content resumes drawing, and the approval still needs a
+    // complete fresh frame at the current geometry before Enter may confirm it.
+    ui.requestDraw();
     try std.testing.expect(ui.drawReady() and ui.displayed_permission == null);
     try ui.draw();
-    try std.testing.expect(ui.frame_permission == 42 and ui.displayed_permission == null and !ui.frame_changed);
+    try std.testing.expect(ui.frame_permission == 42 and ui.displayed_permission == null);
+    // A partial frame interrupted by another resize may publish nothing, but the
+    // genuine content it carried keeps its draw obligation: only the old ACK dies.
     ui.frame_offset = 1;
     ui.resize(.{ .columns = 70, .rows = 20 });
     ui.finishFrame();
-    try std.testing.expect(ui.displayed_permission == null and ui.resize_waiting and !ui.drawReady());
+    try std.testing.expect(ui.displayed_permission == null and !ui.resize_waiting and ui.dirty);
+    // Interrupted-write controls must drain first and never acknowledge anything.
+    try std.testing.expect(ui.resize_rescue.len != 0 and !ui.drawReady());
     ui.resize_rescue = ""; // Controls-only cleanup cannot publish an ACK.
-    ui.clock_ms += 149;
+    // The surviving obligation is ordinary work: no new input, timer or resize is
+    // needed to become drawable, and only a complete current-geometry frame ACKs.
+    ui.clock_ms += 5000;
     ui.resize(ui.size);
-    try std.testing.expect(!ui.drawReady());
-    ui.clock_ms += 1;
-    ui.resize(ui.size);
-    try std.testing.expect(ui.drawReady());
+    ui.animate();
+    try std.testing.expect(ui.dirty and ui.drawReady() and ui.displayed_permission == null);
     try ui.draw();
-    try std.testing.expect(ui.displayed_permission == null);
-    ui.finishFrame();
+    try std.testing.expect(ui.frame_permission == 42 and ui.displayed_permission == null);
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(?u64, 42), ui.displayed_permission);
 }
 
@@ -7145,7 +9641,7 @@ test "resize requeues unfinished content but discards animation frames without p
             defer ui.deinit();
             ui.busy = true;
             try ui.draw();
-            ui.finishFrame();
+            testAcknowledgeFullFrame(&ui);
             ui.clock_ms = 160;
             ui.animate();
             if (changed) {
@@ -7167,11 +9663,23 @@ test "resize requeues unfinished content but discards animation frames without p
             ui.finishFrame();
             try std.testing.expect(!ui.frame_fresh and ui.tail_snapshot == null);
             ui.resize_rescue = ""; // Controls-only flush is not a display ACK.
+            if (!changed) {
+                // A pure animation pulse is not resurrected by an advanced clock.
+                for (0..20) |_| {
+                    ui.clock_ms += 80;
+                    ui.resize(.{ .columns = 40, .rows = 12 });
+                    ui.animate();
+                    try std.testing.expect(!ui.drawReady());
+                }
+            }
             try std.testing.expectEqual(changed, ui.drawReady());
             if (changed) {
                 try ui.draw();
                 try std.testing.expect(std.mem.indexOf(u8, ui.frame, "new resize content") != null);
-                ui.finishFrame();
+                // Continues from the cursor's own row; never a forced bottom move.
+                try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[999B") == null);
+                try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\r\n"));
+                testAcknowledgeFullFrame(&ui);
             }
         }
     }
@@ -7184,7 +9692,7 @@ test "resize preserves real input updates not yet staged" {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try Ui.key(&ui, .{ .text = .{ .value = "pending draft", .pasted = false } });
     ui.resize(.{ .columns = 40, .rows = 24 });
     try std.testing.expect(ui.drawReady() and !ui.resize_waiting);
@@ -7199,7 +9707,7 @@ test "resize invalidates acknowledged approval until fresh input and frame" {
     defer ui.deinit();
     ui.permission = .{ .id = 42, .description = try std.testing.allocator.dupe(u8, "safe resize approval"), .clipped = false };
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(?u64, 42), ui.displayed_permission);
     ui.resize(.{ .columns = 70, .rows = 20 });
     try std.testing.expect(ui.resize_waiting and ui.displayed_permission == null and !ui.dirty);
@@ -7207,7 +9715,7 @@ test "resize invalidates acknowledged approval until fresh input and frame" {
     try std.testing.expect(ui.permission != null and ui.displayed_permission == null and ui.drawReady());
     try ui.draw();
     try std.testing.expect(ui.displayed_permission == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(?u64, 42), ui.displayed_permission);
 }
 
@@ -7225,11 +9733,11 @@ test "resize at every sparse frame byte drops stale relative edits and cannot re
             // not a terminal's replacement-character policy for truncated UTF-8.
             if (shifted) try seedShiftDraft(&ui) else try ui.appendDraft(.assistant, "owned body");
             try ui.draw();
-            ui.finishFrame();
+            testAcknowledgeFullFrame(&ui);
             try ui.appendDraft(.assistant, if (shifted) "stream-row-035 abcdefghijklmnopqrstuvwxyz abcdefghijklmnop\n" else " extended");
             try ui.draw();
             try std.testing.expect(ui.frame_sparse);
-            const old_prefix = if (ui.draft) |index| if (ui.records.items[index].flow_prefix) |prefix| prefix.rows.len else 0 else 0;
+            const old_prefix = if (ui.draft) |index| if (ui.records.items[index].flow_prefix) |prefix| prefix.rowCount() else 0 else 0;
             if (shifted) {
                 try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1M") == null);
                 try std.testing.expect(std.mem.find(u8, ui.frame, "\n") != null);
@@ -7259,7 +9767,7 @@ test "resize at every sparse frame byte drops stale relative edits and cannot re
             try std.testing.expect(ui.displayed_permission == null and ui.displayed_model_epoch == null);
             if (ui.draft) |index| {
                 const record = &ui.records.items[index];
-                try std.testing.expectEqual(old_prefix, if (record.flow_prefix) |prefix| prefix.rows.len else 0);
+                try std.testing.expectEqual(old_prefix, if (record.flow_prefix) |prefix| prefix.rowCount() else 0);
                 try std.testing.expect(record.pending_flow_prefix == null);
             }
             try std.testing.expect(ui.abandon_tail);
@@ -7276,7 +9784,6 @@ fn discardFixtureFrame(ui: *Ui) void {
     ui.frame_menu_history = null;
     ui.frame_arena = null;
     ui.frame_tail_snapshot = null;
-    ui.frame_full_tail = "";
     ui.frame_sparse = false;
     ui.frame_offset = 0;
     ui.frame = "";
@@ -7291,11 +9798,11 @@ fn seedCompactAckedTail(ui: *Ui, screen: *@import("../tests/regular_screen.zig")
     _ = try ui.add(.user, "canon-b1\ncanon-b2\ncanon-b3\ncanon-b4\ncanon-b5\ncanon-b6");
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(ui);
     _ = try ui.add(.user, "canon-c1\ncanon-c2\ncanon-c3\ncanon-c4\ncanon-c5\ncanon-c6\ncanon-c7\ncanon-c8\ncanon-c9\ncanon-c10\ncanon-c11\ncanon-c12\ncanon-c13");
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(ui);
 }
 
 fn tailAllocationDraw(ui: *Ui) !void {
@@ -7315,15 +9822,15 @@ fn tailAllocationScenario(a: std.mem.Allocator, native: bool) !void {
     defer ui.deinit();
     if (native) try seedShiftDraft(&ui) else try ui.appendDraft(.assistant, "| K | V |\n| --- | --- |\n| old | body |\n");
     try tailAllocationDraw(&ui);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const old_ack = ui.tail_snapshot.?.full;
-    const prefix_count = if (ui.records.items[ui.draft.?].flow_prefix) |prefix| prefix.rows.len else 0;
+    const prefix_count = if (ui.records.items[ui.draft.?].flow_prefix) |prefix| prefix.rowCount() else 0;
     try ui.appendDraft(.assistant, if (native) "stream-row-035 more body\n" else "| new | cell |\n");
     tailAllocationDraw(&ui) catch |err| {
         // A failed candidate cannot replace/free the last acknowledged bytes.
         try std.testing.expectEqualStrings(old_ack, ui.tail_snapshot.?.full);
         const record = &ui.records.items[ui.draft.?];
-        try std.testing.expectEqual(prefix_count, if (record.flow_prefix) |prefix| prefix.rows.len else 0);
+        try std.testing.expectEqual(prefix_count, if (record.flow_prefix) |prefix| prefix.rowCount() else 0);
         try std.testing.expect(record.pending_flow_prefix == null and !record.pending_flow_change);
         try std.testing.expect(ui.frame.len == 0 and ui.frame_tail_snapshot == null);
         return err;
@@ -7331,13 +9838,40 @@ fn tailAllocationScenario(a: std.mem.Allocator, native: bool) !void {
     ui.resize(.{ .columns = 40, .rows = 12 });
     ui.finishFrame();
     try tailAllocationDraw(&ui);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "tail snapshot construction and resize release all allocations under OOM" {
     try text.initLocale();
     var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     for ([_]bool{ false, true }) |native| try std.testing.checkAllAllocationFailures(backing.allocator(), tailAllocationScenario, .{native});
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+}
+
+fn reasoningTailAllocationScenario(a: std.mem.Allocator) !void {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    ui.allocator = a;
+    ui.editor.allocator = a;
+    defer ui.deinit();
+    try ui.appendDraft(.reasoning, "alpha 中文\nbeta\n");
+    tailAllocationDraw(&ui) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+    testAcknowledgeFullFrame(&ui);
+    try ui.appendDraft(.reasoning, "gamma-delta");
+    ui.resize(.{ .columns = 20, .rows = 12 });
+    tailAllocationDraw(&ui) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+    testAcknowledgeFullFrame(&ui);
+    ui.discardReasoning();
+    tailAllocationDraw(&ui) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+    testAcknowledgeFullFrame(&ui);
+}
+
+test "reasoning tail allocation failures release every owned tail and record" {
+    try text.initLocale();
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), reasoningTailAllocationScenario, .{});
     try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
 }
 
@@ -7352,7 +9886,7 @@ test "composer displays startup zero and latest actual usage or unknown without 
     const prompt_end = theme.reset ++ "\x1b[1m>" ++ theme.reset ++ " ";
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, green_prompt ++ "0.0%" ++ prompt_end) != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const Case = struct { purpose: p.Purpose, usage: p.Usage, prefix: []const u8 };
     const host = bridge.host();
     for ([_]Case{
@@ -7367,7 +9901,7 @@ test "composer displays startup zero and latest actual usage or unknown without 
         item.deinit();
         try ui.draw();
         try std.testing.expect(std.mem.find(u8, ui.frame, case.prefix) != null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
     }
 }
 
@@ -7428,7 +9962,7 @@ test "decision pause wins over stale Ready thinking warnings and empty queue pau
     try std.testing.expect(std.mem.find(u8, ui.frame, expected) != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "S:0 F:0") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/queue resume") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Real queued input remains visible, but never ahead of the failure.
     _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "retained queued input");
     const queued = try ui.footerHint(arena.allocator(), state);
@@ -7467,7 +10001,7 @@ test "read command errors include a safe reason after error and never display ra
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "[error] FileNotFound: file not found") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "3ms") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.toolCompleted(caption, .{ .text = "{\"private-result\":\"secret\"}\n\x1b[2J", .is_error = true });
     try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "[error] Read failed: details unavailable") != null);
     try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "secret") == null);
@@ -7493,7 +10027,7 @@ test "sequential tool records from different frames have no gaps then final pros
         try ui.draw();
         try screen.replay(ui.frame);
         try std.testing.expect(std.mem.find(u8, &screen.grid[i], path) != null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
     }
     try ui.replaceCommitted(&.{.{ .text = "answer-without-heading" }}, false, true);
     try ui.draw();
@@ -7501,12 +10035,12 @@ test "sequential tool records from different frames have no gaps then final pros
     for (screen.grid[3]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
     try std.testing.expect(std.mem.find(u8, &screen.grid[4], "answer-without-heading") != null);
     try std.testing.expectEqual(@as(usize, 0), screen.count("Final answer"));
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.draw();
     try screen.replay(ui.frame);
     try std.testing.expectEqual(@as(usize, 1), screen.count("answer-without-heading"));
     for ([_][]const u8{ "one.txt", "two.txt", "three.txt" }) |path| try std.testing.expectEqual(@as(usize, 1), screen.count(path));
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "configured effort colors idle prefix before reasoning but never the busy marker" {
@@ -7530,7 +10064,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     // Idle startup, without any delta or mutable Runtime reads.
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.high)) ++ "fixture" ++ theme.reset ++ "\x1b[1m) " ++ theme.reset ++ "\x1b[1m?%" ++ theme.reset ++ "\x1b[1m>" ++ theme.reset ++ " input-default") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     ui.mode = .calling_model;
     ui.display.reset();
     ui.display.observe(.{ .state = .calling_model }, 0);
@@ -7542,7 +10076,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
         try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, theme.effortColor(.high)) == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, theme.model_flow[ui.model_flow.step()]) != null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
     }
     ui.display.observe(.{ .reasoning = "late thought" }, 9100);
     ui.display.finish(.{ .status = .success });
@@ -7550,11 +10084,11 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     owner.effort = .low;
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.low)) ++ "fixture" ++ theme.reset ++ "\x1b[1m) " ++ theme.reset ++ "\x1b[1m?%" ++ theme.reset ++ "\x1b[1m>" ++ theme.reset ++ " input-default") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     owner.effort = .unspecified;
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1m(fixture) ?%>" ++ theme.reset ++ " input-default") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "composer frame keeps context occupancy colors static while model and spinner animate" {
@@ -7573,7 +10107,7 @@ test "composer frame keeps context occupancy colors static while model and spinn
             const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}.0%{s}\x1b[1m{s}{s}{s} default-input", .{ if (tokens == 0) theme.success else if (tokens == 25) "\x1b[38;5;220m" else theme.failure, tokens, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", theme.reset });
             defer std.testing.allocator.free(expected);
             try std.testing.expect(std.mem.find(u8, ui.frame, expected) != null);
-            ui.finishFrame();
+            testAcknowledgeFullFrame(&ui);
         }
     }
 }
@@ -7654,7 +10188,7 @@ test "model only default color prompt has no headers cache or status and preserv
     defer std.testing.allocator.free(position);
     try std.testing.expect(std.mem.endsWith(u8, ui.frame, position));
     try std.testing.expectEqualStrings("hello\t你", ui.editor.bytes.items);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "single composer hides statistics and completion and uses flow and exact braille spinner" {
@@ -7678,14 +10212,16 @@ test "single composer hides statistics and completion and uses flow and exact br
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("visible-body"));
-    for (screen.grid[22]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
-    try std.testing.expect(std.mem.find(u8, &screen.grid[23], "(fixture) ?%~ typed-default-color") != null);
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
-    ui.finishFrame();
+    // No full-screen padding: only the actual body, separator, notice and
+    // composer rows are written from the terminal's current row.
+    for (screen.grid[2]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[3], "(fixture) ?%~ typed-default-color") != null);
+    try std.testing.expectEqual(@as(usize, 3), screen.row);
+    testAcknowledgeFullFrame(&ui);
     ui.clock_ms = 680;
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.command_pulse[5] ++ "⠇" ++ theme.reset ++ " typed-default-color") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     ui.mode = null;
     ui.draft = null;
     ui.notice = "Completed"; // Even old application success notices cannot add a row.
@@ -7694,7 +10230,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1m(fixture) ?%>" ++ theme.reset ++ " typed-default-color") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Completed") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "tokens in:") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "flow model prefix wraps long editor suffix without changing raw cursor bytes" {
@@ -7714,23 +10250,30 @@ test "flow model prefix wraps long editor suffix without changing raw cursor byt
     try ui.draw();
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    const first_row = screen.grid.len - ui.frame_composer_rows;
-    try std.testing.expectEqual(first_row, screen.row);
+    // The cursor is on the first wrapped composer row, not the frame's last row.
+    try std.testing.expectEqual(ui.frame_height - 1 - ui.frame_cursor_rows_up, screen.row);
+    const first_row = screen.row - first_composer.layout.cursor_row;
     try std.testing.expect(std.mem.startsWith(u8, &screen.grid[first_row], "(fixture) ?%~ x"));
     try std.testing.expectEqual(text.width(first_composer.decoration.plain) + first_composer.layout.cursor_column, screen.col);
-    if (first_row > 0) for (screen.grid[first_row - 1]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
+    // With no body above it, the composer is preceded only by the fixture's real
+    // notice: no reserved blank row and no second composer.
+    if (first_row > 0) {
+        try std.testing.expect(std.mem.find(u8, &screen.grid[first_row - 1], "Not configured") != null);
+        try std.testing.expect(std.mem.find(u8, &screen.grid[first_row - 1], "?%>") == null);
+    }
     try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     ui.editor.cursor = raw.len;
     var last_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer last_arena.deinit();
     const last_composer = try ui.prepareComposer(last_arena.allocator(), ui.connection.current(), ui.size.columns -| 1);
     try ui.draw();
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(screen.grid.len - last_composer.layout.lines.len + last_composer.layout.cursor_row, screen.row);
+    // The composer is the frame's last block: its final row is the frame row.
+    try std.testing.expectEqual(ui.frame_height - 1 - (last_composer.layout.lines.len - 1 - last_composer.layout.cursor_row), screen.row);
     try std.testing.expectEqual(text.width(last_composer.decoration.plain) + last_composer.layout.cursor_column, screen.col);
     try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "resize abandons unknown rows and old completed approval cannot authorize" {
@@ -7741,7 +10284,7 @@ test "resize abandons unknown rows and old completed approval cannot authorize" 
     defer ui.deinit();
     ui.permission = .{ .id = 42, .description = try std.testing.allocator.dupe(u8, "safe preview"), .clipped = false };
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(?u64, 42), ui.displayed_permission);
     try ui.draw();
     try std.testing.expect(ui.displayed_permission == null);
@@ -7752,12 +10295,23 @@ test "resize abandons unknown rows and old completed approval cannot authorize" 
     ui.resize(.{ .columns = 80, .rows = 24 });
     ui.finishFrame();
     try std.testing.expect(ui.displayed_permission == null);
+    // ABA down to the repeated size report cannot schedule an autonomous frame.
+    ui.clock_ms += 5000;
+    ui.resize(.{ .columns = 80, .rows = 24 });
+    ui.animate();
+    try std.testing.expect(!ui.drawReady() and ui.frame.len == 0);
+    ui.requestDraw(); // Genuine update, not a timer or a geometry repair.
     try ui.draw();
-    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\x1b[999B\r\n"));
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\r\n"));
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[999B") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[6A") == null);
-    try std.testing.expectEqual(@as(usize, 24), ui.frame_height);
+    // Fixed safety layout, not a reclaimed full screen: the authorizable
+    // approval needs title + preview + choices (3) plus separator + hint +
+    // composer (3), i.e. six rows.
+    try std.testing.expectEqual(@as(usize, 6), ui.frame_height);
     try std.testing.expect(ui.displayed_permission == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(?u64, 42), ui.displayed_permission);
 }
 
@@ -8056,7 +10610,7 @@ test "canonical reasoning is discarded even when clipped and body remains canoni
     try std.testing.expectEqualStrings("canonical body", ui.records.items[0].body.items);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "reasoning") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "six-row approval cannot authorize and recovers after a complete visible frame" {
@@ -8175,7 +10729,10 @@ test "editor tabs expand before clipping and cursor placement but submit unchang
         try std.testing.expect(std.mem.findScalar(u8, ui.frame, '\t') == null);
         var screen: @import("../tests/regular_screen.zig").Screen = .{};
         try screen.replay(ui.frame);
-        try std.testing.expectEqual(ui.size.rows - prepared.layout.lines.len + prepared.layout.cursor_row, screen.row);
+        // The configured fixture has no notice, so the composer is the whole tail
+        // and it sits exactly on its own layout rows.
+        try std.testing.expectEqual(prepared.layout.lines.len, ui.frame_height);
+        try std.testing.expectEqual(prepared.layout.cursor_row, screen.row);
         try std.testing.expectEqual(text.width(prepared.decoration.plain) + prepared.layout.cursor_column, screen.col);
         try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);
         discardFixtureFrame(&ui);
@@ -8347,12 +10904,12 @@ test "unselected startup prompts login and model with no placeholder ID or budge
     try std.testing.expect(std.mem.find(u8, ui.frame, "/login, then /model") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "deepseek-flash") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "?%") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     ui.openModelPicker();
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "No logged-in providers") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "fixture-next") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.modelKey(.enter);
     try std.testing.expect(ui.model_picker != null);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
@@ -8376,7 +10933,7 @@ test "model selection and late default completion flash the actual logical level
     try ui.draw();
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("fixture-next) medium"));
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     fixture.effort = .unspecified;
     fixture.levels = .{};
     fixture.pending_default = .high;
@@ -8435,7 +10992,7 @@ test "flat logged model list directly shows models and requires exact ACK" {
     try std.testing.expect(std.mem.find(u8, ui.frame, "go-id") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "proxy/org/model") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-id") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.modelKey(.left);
     try std.testing.expect(ui.model_picker == null and ui.commandMenuVisible());
     ui.openModelPicker();
@@ -8443,7 +11000,7 @@ test "flat logged model list directly shows models and requires exact ACK" {
     try ui.draw();
     try ui.modelKey(.enter); // A partial frame must not authorize the new row.
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.modelKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.selections);
     try std.testing.expectEqualStrings("proxy/org/model", fixture.name);
@@ -8464,12 +11021,12 @@ test "flat model confirmation rejects credential list replacement after ACK" {
     ui.connection = fixture.connection();
     ui.openModelPicker();
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     fixture.model_providers = &.{.{ .name = "replacement" }};
     try ui.modelKey(.enter);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.modelKey(.enter);
     try std.testing.expectEqualStrings("replacement/model", fixture.name);
 }
@@ -8489,14 +11046,14 @@ test "model picker rejects disabled unknown protocol even after frame acknowledg
     try ui.modelKey(.down);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Protocol unknown") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.modelKey(.enter);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
     try std.testing.expect(ui.model_picker != null);
     // Disabling a row after its acknowledged frame is also checked at Enter.
     fixture.disabled_models = &.{};
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     fixture.disabled_models = &.{true};
     try ui.modelKey(.enter);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
@@ -8523,13 +11080,13 @@ test "metadata refresh command excludes paste and revokes picker confirmation af
     try std.testing.expectEqual(@as(usize, 1), fixture.refreshes);
     ui.openModelPicker();
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     fixture.metadata_changed = true;
     ui.pollMetadata();
     try ui.modelKey(.enter);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.modelKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.selections);
 }
@@ -8608,7 +11165,7 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     ui.openSettingsMenu();
     ui.settings_menu.selected = 6;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expect(ui.image_open and !ui.decision_open and ui.settings_menu.selected == 0);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
@@ -8616,45 +11173,45 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     try std.testing.expect(std.mem.find(u8, ui.frame, "login/deepseek-flash") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "unlogged/deepseek-flash") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "family/judge") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("no-match", sink);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "No matching models") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try Ui.key(&ui, .clear);
     try ui.parser.feed("FLASH login", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(fixture.state.image_enabled and !ui.image_open and ui.settings_menu.selected == 6);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
     try std.testing.expectEqualStrings("login/family/judge", fixture.state.decision_model.?);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.image_open and ui.settings_menu.selected == 1);
     try ui.parser.feed("\x1b[A", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(!fixture.state.image_enabled and ui.settings_menu.selected == 6);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\rquery\x1b[D\r", sink); // Root open discards the entire tail.
     try std.testing.expect(ui.image_open and ui.editor.bytes.items.len == 0);
     try ui.parser.feed("query\x1b[D\r", sink);
     try std.testing.expect(!ui.image_open and ui.settings_menu.selected == 6 and ui.editor.bytes.items.len == 0);
     ui.settings_menu.selected = 1;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.decision_open and !ui.image_open);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.decision_calls);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
@@ -8674,7 +11231,7 @@ test "Image settings fresh ACK pending partial resize changed candidates paste f
     ui.openSettingsMenu();
     ui.settings_menu.selected = 6;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try ui.parser.feed("\x1b[B", sink);
     try ui.draw();
@@ -8682,7 +11239,7 @@ test "Image settings fresh ACK pending partial resize changed candidates paste f
     ui.frame_offset = 1;
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     var replaced = ImageModelFixture.profiles;
     replaced[0].name = "login/replaced";
     fixture.state.image_models = &replaced;
@@ -8692,14 +11249,14 @@ test "Image settings fresh ACK pending partial resize changed candidates paste f
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const size = ui.size;
     ui.resize(.{ .columns = 8, .rows = size.rows });
     ui.resize(size);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     fixture.fail = true;
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
@@ -8708,10 +11265,10 @@ test "Image settings fresh ACK pending partial resize changed candidates paste f
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     fixture.fail = false;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[200~flash\x1b[201~\r", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     ui.closeSettingsMenu();
@@ -8773,7 +11330,7 @@ test "Decision direct list isolates selection and consumes failed save ACK and i
     ui.openSettingsMenu();
     try ui.parser.feed("\x1b[B", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try ui.parser.feed("\x1b[B", sink);
     try std.testing.expect(ui.settings_open and ui.decision_open and ui.model_picker == null);
@@ -8786,7 +11343,7 @@ test "Decision direct list isolates selection and consumes failed save ACK and i
     ui.frame_offset = 1;
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Same-index rename, protocol-only replacement, and logout all revoke ACK.
     var replacement = DecisionModelFixture.profiles;
     for (0..3) |scenario| {
@@ -8804,7 +11361,7 @@ test "Decision direct list isolates selection and consumes failed save ACK and i
             2 => fixture.state.model_providers = &.{},
             else => unreachable,
         }
-        if (scenario != 0) ui.finishFrame(); // Publish only the frame's old identity.
+        if (scenario != 0) testAcknowledgeFullFrame(&ui); // Publish only the frame's old identity.
         try ui.parser.feed("\r\r", sink);
         try std.testing.expectEqual(@as(usize, 0), fixture.calls);
         fixture.state.decision_models = &DecisionModelFixture.profiles;
@@ -8813,21 +11370,21 @@ test "Decision direct list isolates selection and consumes failed save ACK and i
         try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     }
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // The same raw ID on a different newly visible alias cannot inherit ACK.
     fixture.state.model_providers = &DecisionModelFixture.other;
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     fixture.state.model_providers = &DecisionModelFixture.logged;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const size = ui.size;
     ui.resize(.{ .columns = 8, .rows = size.rows });
     ui.resize(size);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     fixture.fail = true;
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
@@ -8836,7 +11393,7 @@ test "Decision direct list isolates selection and consumes failed save ACK and i
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     fixture.fail = false;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r\x1b[A", sink);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try std.testing.expectEqualStrings("login/family/judge", fixture.saved[0..fixture.saved_len]);
@@ -8845,7 +11402,7 @@ test "Decision direct list isolates selection and consumes failed save ACK and i
     try std.testing.expect(ui.settings_open and !ui.decision_open and ui.model_picker == null);
     try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.decision_open and ui.settings_menu.selected == 1);
     try ui.parser.feed("\x1b[D\r", sink);
@@ -8871,7 +11428,7 @@ test "Decision list offers Off without providers and never invents search identi
     try std.testing.expect(std.mem.find(u8, ui.frame, "login/family/judge") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "ghost-current") == null);
     try std.testing.expect(ui.frame_settings_generation != null); // Off remains available.
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     fixture.state.model_providers = &DecisionModelFixture.logged;
     try ui.parser.feed("\r", sink); // Availability changed since ACK, even for Off.
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
@@ -8879,18 +11436,18 @@ test "Decision list offers Off without providers and never invents search identi
     ui.settings_menu.selected = 1;
     try ui.draw();
     try std.testing.expect(ui.model_picker == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try Ui.key(&ui, .escape);
     try std.testing.expect(ui.settings_open and !ui.decision_open and ui.settings_menu.selected == 1);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.decision_open);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[200~login/family/judge\x1b[201~\r", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expectEqual(@as(usize, 0), fixture.main_calls);
@@ -8909,7 +11466,7 @@ test "Decision search edits revoke query ACK including pending frames and clear 
     ui.openSettingsMenu();
     ui.decision_open = true;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("LOGIN FAMILY/JUDGE\r", sink);
     try std.testing.expectEqualStrings("LOGIN FAMILY/JUDGE", ui.editor.bytes.items);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
@@ -8918,29 +11475,29 @@ test "Decision search edits revoke query ACK including pending frames and clear 
     try std.testing.expect(std.mem.find(u8, ui.frame, "Search> ") != null);
     // An edit while the old query frame is in flight must revoke its ACK too.
     try ui.parser.feed("x", sink);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "No matching models") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[A\x1b[B\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.parser.feed("\x7f", sink);
     try std.testing.expectEqualStrings("LOGIN FAMILY/JUDGE", ui.editor.bytes.items);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Query changes and changes back cannot resurrect the old identity proof.
     try ui.parser.feed("x\x7f\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(!ui.decision_open and ui.editor.bytes.items.len == 0);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "login/family/judge") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.decision_open and ui.editor.bytes.items.len == 0);
     try ui.parser.feed("oFf\x15missing", sink);
@@ -8948,7 +11505,7 @@ test "Decision search edits revoke query ACK including pending frames and clear 
     try Ui.key(&ui, .escape);
     try std.testing.expect(!ui.decision_open and ui.editor.bytes.items.len == 0);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     const large: [257]u8 = @splat('x');
     try Ui.key(&ui, .{ .text = .{ .value = &large, .pasted = false } });
@@ -8982,7 +11539,7 @@ test "Decision search clips UTF8 controls and tiny windows without granting auth
         try ui.draw();
         try std.testing.expect(std.unicode.utf8ValidateSlice(ui.frame));
         try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try ui.settingsKey(.enter);
         try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     }
@@ -9034,16 +11591,16 @@ test "settings TUI custom seconds stages equivalent milliseconds" {
     ui.openSettingsValue(.command_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expect(std.mem.find(u8, ui.notice, "seconds") != null);
     try ui.settingsKey(.{ .text = .{ .value = "123.456", .pasted = false } });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(u32, 123456), fixture.state.limits.command_timeout_ms);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
@@ -9101,7 +11658,7 @@ test "Auto memory root toggles only after fresh ACK without overlays and preserv
     try ui.draw();
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(!fixture.state.memory_auto);
@@ -9110,7 +11667,7 @@ test "Auto memory root toggles only after fresh ACK without overlays and preserv
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     fixture.fail = true;
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
@@ -9118,7 +11675,7 @@ test "Auto memory root toggles only after fresh ACK without overlays and preserv
     try std.testing.expect(ui.settings_value_picker == null and !ui.settingsModelOpen());
     fixture.fail = false;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(fixture.state.memory_auto);
     try std.testing.expectEqual(@as(usize, 3), fixture.calls);
@@ -9139,7 +11696,7 @@ test "settings numeric child consumes ACK before failed save and preserves paren
     try ui.draw();
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(!fixture.state.limits.compaction_enabled);
@@ -9150,14 +11707,14 @@ test "settings numeric child consumes ACK before failed save and preserves paren
     ui.frame_offset = 1;
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const size = ui.size;
     ui.resize(.{ .columns = 8, .rows = size.rows });
     ui.resize(size);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     fixture.fail = true;
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
@@ -9166,7 +11723,7 @@ test "settings numeric child consumes ACK before failed save and preserves paren
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     fixture.fail = false;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r\x1b[B", sink);
     try std.testing.expectEqual(@as(usize, 3), fixture.calls);
     try std.testing.expectEqual(@as(u32, 60000), fixture.state.limits.command_timeout_ms);
@@ -9190,20 +11747,20 @@ test "settings custom task timeout stages before a second fresh ACK and preserve
     ui.openSettingsValue(.task_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expect(ui.settings_value_picker.?.editing);
     try ui.parser.feed("\x158.192\r", sink);
     try std.testing.expect(ui.settings_value_picker.?.editing);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expect(!ui.settings_value_picker.?.editing);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expectEqual(@as(u32, 1024), fixture.state.limits.task_timeout_ms);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expectEqual(@as(u32, 8192), fixture.state.limits.task_timeout_ms);
@@ -9211,7 +11768,7 @@ test "settings custom task timeout stages before a second fresh ACK and preserve
     ui.openSettingsValue(.task_timeout_ms, fixture.state);
     ui.settings_menu.selected = try preferenceOption(ui.settings_value_picker.?, 300000);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try std.testing.expectEqual(@as(u32, 300000), fixture.state.limits.task_timeout_ms);
@@ -9233,11 +11790,11 @@ test "settings shared request timeout rejects pasted numbers and preserves paren
     ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try ui.parser.feed("\x1b[200~1000\r\x1b[201~\r", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expect(ui.settings_value_picker.?.editing);
@@ -9248,7 +11805,7 @@ test "settings shared request timeout rejects pasted numbers and preserves paren
     ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try preferenceOption(ui.settings_value_picker.?, 60000);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expectEqual(@as(u32, 60000), fixture.state.limits.request_timeout_ms);
@@ -9306,7 +11863,7 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expectEqual(@as(usize, 10), screen.col);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r\x1b[B", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(!fixture.state.low_price_input_enabled and ui.settings_menu.selected == 0);
@@ -9314,7 +11871,7 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try ui.parser.feed("\x1b[B", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.decision_open and !fixture.state.decision_enabled);
     const before_choice = fixture.calls;
@@ -9324,7 +11881,7 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     ui.frame_offset = 1;
     try ui.parser.feed("\r", sink); // Partial child output cannot confirm.
     try std.testing.expectEqual(before_choice, fixture.calls);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Save the direct identity without changing chat.
     try ui.parser.feed("\r\r\x1b[A", sink);
     try std.testing.expect(fixture.state.decision_enabled);
@@ -9333,12 +11890,12 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     try std.testing.expectEqual(@as(u32, 42), ui.display.context.?.tokens);
     fixture.fail = true;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink); // Open the selected model, not toggle.
     try std.testing.expect(ui.decision_open);
     try ui.parser.feed("\x1b[A", sink); // Off.
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(fixture.state.decision_enabled);
     try std.testing.expectEqualStrings("Could not save setting; previous value kept", ui.notice);
@@ -9349,7 +11906,7 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     try std.testing.expect(!ui.decision_open and ui.settings_menu.selected == 1);
     try std.testing.expectEqual(calls, fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.decision_open);
     try Ui.key(&ui, .escape);
@@ -9358,12 +11915,12 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     fixture.state.global_settings_available = false;
     try ui.parser.feed("\x1b[A", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(calls, fixture.calls);
     fixture.state.global_settings_available = true;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const original = ui.size;
     ui.resize(.{ .columns = 8, .rows = original.rows });
     ui.resize(original); // Resize ABA cannot restore authority.
@@ -9371,16 +11928,16 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     try std.testing.expectEqual(calls, fixture.calls);
     ui.resize(.{ .columns = 12, .rows = original.rows });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(calls, fixture.calls);
     ui.resize(original);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[200~pasted\x1b[201~\r", sink);
     try std.testing.expectEqual(calls, fixture.calls);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(calls, fixture.calls);
     try ui.parser.feed("\x1b[D", sink);
@@ -9418,7 +11975,7 @@ test "decision child requires full fresh unclipped ACK and never saves pasted ba
     ui.openSettingsMenu();
     try ui.parser.feed("\x1b[B", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expect(ui.decision_open);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
@@ -9428,7 +11985,7 @@ test "decision child requires full fresh unclipped ACK and never saves pasted ba
     ui.frame_offset = 1;
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const size = ui.size;
     ui.resize(.{ .columns = 8, .rows = size.rows });
     ui.resize(size);
@@ -9436,16 +11993,16 @@ test "decision child requires full fresh unclipped ACK and never saves pasted ba
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     ui.resize(.{ .columns = 17, .rows = size.rows });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink); // Complete provider/raw ID does not fit.
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     ui.resize(size);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[200~\r\x1b[D\x1b[201~\r", sink);
     try std.testing.expect(ui.decision_open);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.parser.feed("\x1b[D\r", sink);
@@ -9453,11 +12010,11 @@ test "decision child requires full fresh unclipped ACK and never saves pasted ba
     try ui.parser.feed("\r", sink); // Old child ACK cannot open parent.
     try std.testing.expect(!ui.decision_open);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.decision_open);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink); // Off works without a declaration.
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(!fixture.state.decision_enabled and !ui.decision_open);
@@ -9482,17 +12039,17 @@ test "menus stay above composer share colors and Left returns to acknowledged pa
     try ui.parser.feed("/", sink);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[B\r", sink); // Move to login, but no fresh ACK yet.
     try std.testing.expect(!ui.provider_open and !ui.secret_mode);
     try std.testing.expectEqual(command_menu_module.Command.auth, ui.command_menu.choice(ui.command_matches).?);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "> /login") != null);
     try screen.replay(ui.frame);
-    ui.finishFrame();
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[18], "  /model"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[19], "> /login"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[20], "  /compact"));
+    testAcknowledgeFullFrame(&ui);
+    const model_row = try rowStartingWith(&screen, "  /model");
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[model_row + 1], "> /login"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[model_row + 2], "  /compact"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("menu-prior-answer"));
     try ui.parser.feed("\r", sink);
     try ui.draw();
@@ -9500,27 +12057,27 @@ test "menus stay above composer share colors and Left returns to acknowledged pa
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.muted ++ "    DeepSeek") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "Provider> " ++ theme.reset) != null);
     try screen.replay(ui.frame);
-    ui.finishFrame();
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[18], ">   Current endpoint"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], "    OpenCode Go"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "Provider> "));
+    testAcknowledgeFullFrame(&ui);
+    const endpoint_row = try rowStartingWith(&screen, ">   Current endpoint");
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[endpoint_row + 3], "    OpenCode Go"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[screen.row], "Provider> "));
     try ui.parser.feed("\x1b[D\r", sink);
     try std.testing.expect(!ui.provider_open and !ui.secret_mode);
     try std.testing.expectEqual(command_menu_module.Command.auth, ui.command_menu.choice(ui.command_matches).?);
     try ui.parser.feed("\x1b[A", sink); // Return from login to model.
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.success ++ "✓" ++ theme.accent ++ " fixture/fixture-old") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.muted ++ "    fixture/fixture-next") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "Search> " ++ theme.reset) != null);
     try screen.replay(ui.frame);
-    ui.finishFrame();
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[20], "> ~ fixture/fixture-old"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], "    fixture/fixture-next"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "Search> "));
+    testAcknowledgeFullFrame(&ui);
+    const selected_model_row = try rowStartingWith(&screen, "> ~ fixture/fixture-old");
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[selected_model_row + 1], "    fixture/fixture-next"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[screen.row], "Search> "));
     try ui.parser.feed("\t\x1b[5~\x1b[6~", sink);
     try std.testing.expectEqual(@as(usize, 0), ui.model_picker.?.selected);
     try std.testing.expectEqualStrings("", ui.model_picker.?.query.bytes.items);
@@ -9553,15 +12110,16 @@ test "model popup shows at most ten bottom rows and keeps the selected item visi
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ ">   fixture/menu-11") != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     var count: usize = 0;
     for (screen.grid) |line| if (std.mem.find(u8, &line, "menu-") != null) {
         count += 1;
     };
     try std.testing.expectEqual(@as(usize, 10), count);
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[12], "    fixture/menu-02"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[21], ">   fixture/menu-11"));
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "Search> "));
+    // Ten bottom-pinned rows end with the selection; the composer stays below.
+    const selected_row = try rowStartingWith(&screen, ">   fixture/menu-11");
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[selected_row - 9], "    fixture/menu-02"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[screen.row], "Search> "));
 }
 
 test "secret Escape cancels and Left returns to provider without leaking paste tails" {
@@ -9578,13 +12136,13 @@ test "secret Escape cancels and Left returns to provider without leaking paste t
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("/login\r\x1b[B", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try ui.parser.feed("fake-ui-key", sink);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "API key> " ++ theme.reset) != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "fake-ui-key") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[Ddiscard-tail", sink);
     try std.testing.expect(ui.provider_open and !ui.secret_mode and ui.secret.len == 0);
     try std.testing.expectEqual(core_config.providers.Id.opencode_zen, ui.provider_choices.items[ui.provider_picker.selected].provider);
@@ -9593,7 +12151,7 @@ test "secret Escape cancels and Left returns to provider without leaking paste t
     try ui.parser.feed("\r", sink);
     try std.testing.expect(!ui.secret_mode); // Newly reopened parent needs ACK.
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try ui.parser.feed("\x1b[200~fake-ui-key\x1b[201~\x1b[Ddiscard", sink);
     try std.testing.expect(ui.secret_mode and !ui.provider_open);
@@ -9761,8 +12319,11 @@ test "wrapped composer cursor is ACK owned across sparse redraws" {
     try std.testing.expect(ui.frame_composer_rows > 1 and ui.frame_composer_rows <= composer_layout.max_rows);
     try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 11), screen.row);
-    ui.finishFrame();
+    // The composer occupies the tail; the notice sits directly above it and no
+    // blank screen rows are written below the last composer row.
+    try std.testing.expectEqual(ui.frame_composer_rows + 1, ui.frame_height);
+    try std.testing.expectEqual(ui.frame_height - 1, screen.row);
+    testAcknowledgeFullFrame(&ui);
     const rows = ui.tail_composer_rows;
     ui.editor.cursor = 0;
     try ui.draw();
@@ -9770,18 +12331,67 @@ test "wrapped composer cursor is ACK owned across sparse redraws" {
     try std.testing.expect(ui.frame_cursor_rows_up > 0);
     try screen.replay(ui.frame);
     const up = ui.frame_cursor_rows_up;
-    try std.testing.expectEqual(11 - up, screen.row);
-    ui.finishFrame();
+    try std.testing.expectEqual(rows - up, screen.row);
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(up, ui.tail_cursor_rows_up);
     try std.testing.expectEqual(rows, ui.tail_composer_rows);
     ui.editor.cursor = ui.editor.bytes.items.len;
     try ui.draw();
     try std.testing.expect(ui.frame_sparse);
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 11), screen.row);
+    try std.testing.expectEqual(ui.frame_height - 1, screen.row);
     try std.testing.expectEqual(@as(usize, 1), screen.count("(fixture)"));
     try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
+}
+
+test "contraction cleans the last written row before a multiline cursor suffix" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.size = .{ .columns = 30, .rows = 16 };
+    _ = try ui.editor.insert("AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH");
+    ui.editor.cursor = 0;
+    ui.permission = .{ .id = 7, .description = try std.testing.allocator.dupe(u8, "approval one\napproval two\napproval three"), .clipped = false };
+    var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 30, .rows = 16 };
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    const before = ui.tail_height;
+    try std.testing.expect(before > 4);
+    ui.clearPermission();
+    try ui.draw();
+    const after = ui.frame_height;
+    try std.testing.expect(before > after); // a real contraction
+    try std.testing.expect(ui.frame_composer_rows > 1);
+    try std.testing.expect(ui.frame_cursor_rows_up > 0); // cursor on the first composer line
+    const suffix = ui.frame_tail_snapshot.?.cursor_suffix;
+    // Cleanup is now the suffix prefix, from the last written row.
+    try std.testing.expect(std.mem.startsWith(u8, suffix, "\r\x1b[1B\x1b[0K"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, suffix, '\n') == null);
+    try std.testing.expect(std.mem.indexOf(u8, suffix, "\x1b[M") == null);
+    try screen.replay(ui.frame);
+    // Every prepared composer row survives; cleaning from the already-moved-up
+    // cursor row would have erased the lower two. The HHHH marker wraps across
+    // two rows, so compare each actual visible suffix and the whole raw text.
+    var composer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer composer_arena.deinit();
+    const prepared = try ui.prepareComposer(composer_arena.allocator(), ui.connection.current(), ui.size.columns -| 1);
+    try std.testing.expectEqual(ui.frame_composer_rows, prepared.layout.lines.len);
+    const decoration_width = text.width(prepared.decoration.plain);
+    const first_row = screen.row - prepared.layout.cursor_row;
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (prepared.layout.lines, 0..) |line, index| {
+        const visible = std.mem.trimEnd(u8, screen.grid[first_row + index][decoration_width..], " ");
+        try std.testing.expectEqualStrings(line, visible);
+        try joined.appendSlice(std.testing.allocator, visible);
+    }
+    try std.testing.expectEqualStrings(ui.editor.bytes.items, joined.items);
+    try std.testing.expectEqual(after - 1 - ui.frame_cursor_rows_up, screen.row);
+    testAcknowledgeFullFrame(&ui);
 }
 
 test "wrapped composer idle LF debt first obtains a single row fresh ACK" {
@@ -9794,7 +12404,7 @@ test "wrapped composer idle LF debt first obtains a single row fresh ACK" {
     _ = try ui.editor.insert("abcdefghijklmnopqrstuvwxyz0123456789");
     ui.editor.cursor = 0;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.tail_composer_rows > 1 and ui.tail_cursor_rows_up > 0);
     ui.editor.clear();
     try Ui.key(&ui, .enter);
@@ -9802,10 +12412,10 @@ test "wrapped composer idle LF debt first obtains a single row fresh ACK" {
     try ui.draw();
     try std.testing.expectEqual(@as(u16, 0), ui.frame_idle_breaks);
     try std.testing.expectEqual(@as(usize, 1), ui.frame_composer_rows);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.draw();
     try std.testing.expectEqual(@as(u16, 1), ui.frame_idle_breaks);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 }
@@ -9924,7 +12534,7 @@ test "provider auth Go fresh Enter after pasted key restores ordinary drawn comp
     try std.testing.expect(!ui.secret_mode); // No unseen selection authority.
     try ui.draw();
     for ([_][]const u8{ "DeepSeek", "OpenCode Zen", ">   OpenCode Go", "Provider> " }) |label| try std.testing.expect(std.mem.find(u8, ui.frame, label) != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.secret_mode and !ui.provider_open);
     try std.testing.expectEqual(core_config.providers.Id.opencode_go, ui.secret_provider.?);
@@ -9935,11 +12545,11 @@ test "provider auth Go fresh Enter after pasted key restores ordinary drawn comp
     try ui.parser.feed("\x1b[200~fake-ui-key\x1b[201~", sink);
     try ui.draw();
     try screen.replay(ui.frame);
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[23], "API key> ***********"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[screen.row], "API key> ***********"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "API key for OpenCode Go") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "https://opencode.ai/zen/go/v1") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "fake-ui-key") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\rsame-read-secret-tail", sink);
     try std.testing.expect(!ui.secret_mode and !ui.secret_quarantine and !ui.parser.secret and ui.secret_provider == null and ui.secret.len == 0);
     try std.testing.expect(ui.parser.stop_feed and !ui.parser.secret_paste and !ui.parser.secret_batch_paste);
@@ -9953,14 +12563,14 @@ test "provider auth Go fresh Enter after pasted key restores ordinary drawn comp
     }
     try screen.replay(ui.frame);
     for ([_][]const u8{ "API key", "***", "fake-ui-key", "same-read-secret-tail" }) |hidden| try std.testing.expectEqual(@as(usize, 0), screen.count(hidden));
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("nexttext", sink);
     try std.testing.expectEqualStrings("nexttext", ui.editor.bytes.items);
     try ui.draw();
     try screen.replay(ui.frame);
-    try std.testing.expect(std.mem.find(u8, &screen.grid[23], "nexttext") != null);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], "nexttext") != null);
     try std.testing.expectEqual(@as(usize, 0), screen.count("same-read-secret-tail"));
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(fixture.key_matched and fixture.provider_saves == 1);
     try std.testing.expectEqual(core_config.providers.Id.opencode_go, fixture.saved_provider.?);
     try std.testing.expect(std.mem.find(u8, ui.notice, "saved locally") != null);
@@ -9982,33 +12592,33 @@ test "provider auth denies partial stale resize reopen and pasted choices" {
     try ui.parser.feed("\r", sink);
     try std.testing.expect(!ui.secret_mode);
     try ui.parser.feed("\x1b[B", sink);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(!ui.secret_mode);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     ui.resize(.{ .columns = 81, .rows = 24 });
     ui.resize(.{ .columns = 80, .rows = 24 });
     try ui.parser.feed("\r", sink);
     try std.testing.expect(!ui.secret_mode);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b", sink);
     try ui.parser.expireEscape(sink);
     try std.testing.expect(!ui.provider_open);
     try ui.parser.feed("/login\r\r", sink);
     try std.testing.expect(ui.provider_open and !ui.secret_mode);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[200~fake-ui-key\x1b[201~\r", sink);
     try std.testing.expect(ui.provider_picker.pasted and !ui.secret_mode);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "fake-ui-key") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x15\r", sink);
     try std.testing.expect(!ui.secret_mode); // Clear requires a fresh frame too.
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.secret_mode);
     try std.testing.expectEqual(@as(usize, 0), fixture.provider_saves);
@@ -10029,13 +12639,13 @@ test "provider auth requires a visible full label and save failure wipes the key
     try std.testing.expectEqual(@as(usize, 3), ui.provider_choices.len);
     ui.size = .{ .columns = 12, .rows = 9 };
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(!ui.secret_mode);
     ui.resize(.{ .columns = 80, .rows = 24 });
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "DeepSeek") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\rfake-ui-key\r", sink);
     // Entering secret mode deliberately discards the rest of that read.
     try std.testing.expect(ui.secret_mode and ui.secret.len == 0);
@@ -10085,7 +12695,7 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     defer ui.deinit();
     ui.connection = session.connection();
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expect(std.mem.find(u8, ui.notice, "are loading") != null);
@@ -10107,14 +12717,14 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     defer a.free(saved_settings);
     try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data = "{}" });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expect(std.mem.find(u8, ui.notice, "Could not save") != null);
     try std.testing.expect(session.app.?.config.value.model.reasoning != null);
     try std.testing.expectEqual(shared.ReasoningEffort.high, session.connection().current().reasoning_effort);
     try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data = saved_settings });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expectEqualStrings("Ready", ui.notice);
     try std.testing.expectEqual(shared.ReasoningEffort.max, session.connection().current().reasoning_effort);
@@ -10125,11 +12735,11 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     // The adopted map must be owned, not borrowed from movable cache storage.
     session.metadata_cache = .{};
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expectEqual(shared.ReasoningEffort.off, session.connection().current().reasoning_effort);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expectEqual(shared.ReasoningEffort.low, session.connection().current().reasoning_effort);
     try std.testing.expectEqual(shared.ReasoningEffort.low, shared.ReasoningEffort.fromName(session.global_config.?.value.registry.?.reasoning_effort));
@@ -10154,7 +12764,7 @@ test "effort confirmation expires after two seconds and repeated switches restar
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(screen.visible("fixture-old) 3.1%"));
     try std.testing.expect(ui.effort_flash == null);
 
@@ -10164,10 +12774,12 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try std.testing.expectEqualStrings("Ready", ui.notice);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(screen.visible("fixture-old) high"));
     try std.testing.expectEqualDeep(context, ui.display.context);
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    // The composer and its real notice are the whole floating tail.
+    try std.testing.expectEqual(@as(usize, 1), screen.row);
+    try std.testing.expectEqual(@as(usize, 2), ui.frame_height);
     try std.testing.expectEqual(text.width("(fixture-old) high> "), screen.col);
 
     ui.clock_ms = 2500;
@@ -10186,7 +12798,7 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try std.testing.expect(!ui.dirty);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(screen.visible("fixture-old) max"));
 
     ui.display.context = .{ .tokens = 2000, .limit = fixture.limit };
@@ -10195,9 +12807,9 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try std.testing.expect(ui.dirty and ui.effort_flash == null);
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(screen.visible("fixture-old) 6.1%"));
-    try std.testing.expectEqual(@as(usize, 23), screen.row);
+    try std.testing.expectEqual(@as(usize, 1), screen.row);
     ui.cycleEffort();
     try std.testing.expect(ui.effort_flash == null);
     fixture.fail = false;
@@ -10262,14 +12874,14 @@ test "slash menu shows model login compact with arguments and descriptions but n
     try std.testing.expect(std.mem.find(u8, ui.frame, "Type to filter; Tab complete") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Up/Down select; Enter run") == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 
     // Case-insensitive filtering keeps only the matching entry.
     try ui.parser.feed("LO", sink);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "/login") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/model") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 
     // Esc dismisses until the token changes again.
     try ui.parser.feed("\x1b", sink);
@@ -10280,11 +12892,11 @@ test "slash menu shows model login compact with arguments and descriptions but n
     try std.testing.expect(std.mem.find(u8, ui.frame, "Configure provider") == null);
     // The independent setup hint remains; it is not a menu item.
     try std.testing.expect(std.mem.find(u8, ui.frame, "Not configured: /login") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("G", sink);
     try std.testing.expect(ui.commandMenuVisible());
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
 
     // Enter runs the highlighted `/login`, which here means entering key entry.
     try ui.parser.feed("\r", sink);
@@ -10310,7 +12922,7 @@ test "slash menu enter selects the highlighted model entry" {
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.model_picker == null);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.model_picker != null);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
@@ -10329,7 +12941,7 @@ test "slash menu Tab completes only an ACKed choice without executing while ordi
     ui.frame_offset = ui.frame.len / 2;
     try ui.parser.feed("\t", sink);
     try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\t", sink);
     try std.testing.expectEqualStrings("/model", ui.editor.bytes.items);
     try std.testing.expectEqual(ui.editor.bytes.items.len, ui.editor.cursor);
@@ -10338,7 +12950,7 @@ test "slash menu Tab completes only an ACKed choice without executing while ordi
     try std.testing.expect(ui.displayed_command_generation == null);
     try ui.draw();
     try std.testing.expect(ui.commandMenuVisible());
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\t", sink); // Already complete: no spaces, cycling or action.
     try std.testing.expectEqualStrings("/model", ui.editor.bytes.items);
     try std.testing.expect(ui.model_picker == null and !ui.busy);
@@ -10366,7 +12978,7 @@ test "slash menu Tab canonicalizes filtered commands without opening surfaces or
         try ui.parser.feed("\t", sink); // No visible ACK yet.
         try std.testing.expectEqualStrings(case.prefix, ui.editor.bytes.items);
         try ui.draw();
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try ui.parser.feed("\t", sink);
         try std.testing.expectEqualStrings(case.full, ui.editor.bytes.items);
         try std.testing.expectEqual(case.full.len, ui.editor.cursor);
@@ -10384,11 +12996,11 @@ test "slash menu Tab honors highlighted selection only after a new ACK" {
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("/", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[B\t", sink);
     try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\t", sink);
     try std.testing.expectEqualStrings("/login", ui.editor.bytes.items);
     try std.testing.expect(!ui.secret_mode and !ui.provider_open and ui.model_picker == null and !ui.busy);
@@ -10424,17 +13036,17 @@ test "slash menu rejects stale navigation generations and resize ABA" {
             // Same token/choice after clear must not inherit the earlier frame.
             try ui.parser.feed("\x15/", sink);
         }
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try ui.parser.feed("\t", sink);
         try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
         try ui.parser.feed("\r", sink);
         try std.testing.expect(ui.model_picker == null and !ui.secret_mode);
         try ui.draw();
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try ui.parser.feed("lg\t\r", sink);
         try std.testing.expect(!ui.secret_mode); // Changed token/selection is not yet shown.
         try ui.draw();
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         try ui.parser.feed("\r", sink);
         try std.testing.expect(ui.secret_mode);
     }
@@ -10469,15 +13081,23 @@ test "popup close restores every visible transcript row for root provider and mo
                 _ = try ui.add(.assistant, history.items);
                 var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = dimensions.columns, .rows = dimensions.rows };
                 try ui.draw();
+                const initial_height = ui.frame_height;
+                const initial_above = ui.frame_menu_history.?.above.len;
+                const initial_borrowed = ui.frame_menu_history.?.borrowed.len;
                 try screen.replay(ui.frame);
-                ui.finishFrame();
+                const initial_tail_start = (screen.row + ui.frame_cursor_rows_up + 1) -| initial_height;
+                testAcknowledgeFullFrame(&ui);
                 const before = screen.grid;
                 const history_before = screen.history_len;
                 const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
                 try ui.parser.feed(command, sink);
                 try ui.draw();
+                const menu_height = ui.frame_height;
+                const menu_borrow_count = ui.frame_borrow_rows;
+                const menu_above = ui.frame_menu_history.?.above.len;
+                const menu_borrowed = ui.frame_menu_history.?.borrowed.len;
                 try screen.replay(ui.frame);
-                ui.finishFrame();
+                testAcknowledgeFullFrame(&ui);
                 // Locate the actual first candidate, not merely missing labels.
                 var first: ?usize = null;
                 for (screen.grid, 0..) |line, i| {
@@ -10494,33 +13114,46 @@ test "popup close restores every visible transcript row for root provider and mo
                 try ui.parser.expireEscape(sink);
                 try ui.parser.feed("\x15", sink);
                 try ui.draw();
+                const close_height = ui.frame_height;
+                const close_above = ui.frame_menu_history.?.above.len;
+                const close_borrowed = ui.frame_menu_history.?.borrowed.len;
                 try screen.replay(ui.frame);
-                ui.finishFrame();
-                for (before[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2]) |old, restored|
+                testAcknowledgeFullFrame(&ui);
+                for (before[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2], 0..) |old, restored, row| {
+                    if (!std.mem.eql(u8, &old, &restored)) {
+                        std.debug.print("popup restore history={d} size={d}x{d} command={s} row={d}\ninitial height={d} tail_start={d} above={d} borrowed={d}; menu height={d} borrow_count={d} above={d} borrowed={d}; close height={d} above={d} borrowed={d}\n", .{
+                            history_length,    dimensions.columns, dimensions.rows, std.mem.trimEnd(u8, command, "\r"), row,
+                            initial_height,    initial_tail_start, initial_above,   initial_borrowed,                   menu_height,
+                            menu_borrow_count, menu_above,         menu_borrowed,   close_height,                       close_above,
+                            close_borrowed,
+                        });
+                    }
                     try std.testing.expectEqualStrings(&old, &restored);
+                }
                 try std.testing.expectEqual(history_before, screen.history_len);
                 // A second ordinary frame must retain the repaired history too.
                 try ui.draw();
                 try screen.replay(ui.frame);
-                ui.finishFrame();
+                testAcknowledgeFullFrame(&ui);
                 for (before[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2]) |old, restored|
                     try std.testing.expectEqualStrings(&old, &restored);
                 if (history_length == 60) {
-                    // History preview is rebuilt from canonical records. Popup
-                    // restoration rows must not precede that complete history.
+                    // Completed history belongs to native scrollback: PageUp is
+                    // not a program preview and never regroups canonical records.
                     const browsing_before = screen.grid;
                     for (0..8) |_| try ui.parser.feed("\x1b[5~", sink);
                     try ui.draw();
+                    try std.testing.expect(std.mem.find(u8, ui.frame, "row-0") == null);
                     try screen.replay(ui.frame);
-                    ui.finishFrame();
-                    const first_preview_row = dimensions.rows - ui.tail_height;
-                    try std.testing.expectEqualStrings("row-000", std.mem.trim(u8, &screen.grid[first_preview_row], " "));
+                    testAcknowledgeFullFrame(&ui);
                     try std.testing.expectEqual(history_before, screen.history_len);
+                    for (browsing_before[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2]) |old, restored|
+                        try std.testing.expectEqualStrings(&old, &restored);
                     for (0..8) |_| try ui.parser.feed("\x1b[6~", sink);
                     try ui.draw();
+                    try std.testing.expect(std.mem.find(u8, ui.frame, "row-0") == null);
                     try screen.replay(ui.frame);
-                    ui.finishFrame();
-                    try std.testing.expectEqual(@as(usize, 0), ui.scroll);
+                    testAcknowledgeFullFrame(&ui);
                     for (browsing_before[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2]) |old, restored|
                         try std.testing.expectEqualStrings(&old, &restored);
                     try std.testing.expectEqual(history_before, screen.history_len);
@@ -10528,7 +13161,7 @@ test "popup close restores every visible transcript row for root provider and mo
                 _ = try ui.add(.assistant, "new-row");
                 try ui.draw();
                 try screen.replay(ui.frame);
-                ui.finishFrame();
+                testAcknowledgeFullFrame(&ui);
                 // Releasing a repaired prefix for subsequent output must not
                 // duplicate or lose ANY earlier line, including native history.
                 for (0..history_length) |i| {
@@ -10537,33 +13170,87 @@ test "popup close restores every visible transcript row for root provider and mo
                     try std.testing.expectEqual(@as(usize, 1), screen.count(value));
                 }
                 try std.testing.expectEqual(@as(usize, 1), screen.count("new-row"));
-                const before_resize = screen.grid;
                 try ui.parser.feed(command, sink);
                 try ui.draw();
                 try screen.replay(ui.frame);
-                ui.finishFrame();
-                // A width ABA revokes all physical coordinates even though the
-                // final grid width is unchanged. Reconstruct from retained
-                // canonical display records, never reclaim the stale backing.
+                testAcknowledgeFullFrame(&ui);
+                // A width ABA revokes every physical coordinate. The next frame
+                // continues from the cursor's natural row instead of reclaiming
+                // stale rows, and no completed record text is regenerated.
                 ui.resize(.{ .columns = dimensions.columns - 1, .rows = dimensions.rows });
                 ui.resize(dimensions);
-                try std.testing.expect(ui.menu_history_recovery);
+                try std.testing.expect(ui.tail_snapshot == null and ui.abandon_tail and !ui.tail_bottom);
+                // ABA back to the original size grants no autonomous repaint.
+                ui.clock_ms += 5000;
+                ui.resize(dimensions);
+                ui.animate();
+                try std.testing.expect(!ui.drawReady() and ui.frame.len == 0);
+                ui.requestDraw(); // Genuine input, not a geometry repair.
                 try ui.draw();
-                try std.testing.expect(std.mem.find(u8, ui.frame[0..ui.frame_clear_end], "\x1b[999B") != null);
+                try std.testing.expect(std.mem.find(u8, ui.frame[0..ui.frame_clear_end], "\x1b[999B") == null);
+                try std.testing.expect(std.mem.find(u8, ui.frame[0..ui.frame_clear_end], "\x1b[2J") == null);
+                try std.testing.expect(std.mem.find(u8, ui.frame[0..ui.frame_clear_end], "\x1b[0J") == null);
+                try std.testing.expect(std.mem.endsWith(u8, ui.frame[0..ui.frame_clear_end], "\r\n"));
+                try std.testing.expect(std.mem.find(u8, ui.frame, "row-0") == null);
                 try screen.replay(ui.frame);
-                ui.finishFrame();
+                testAcknowledgeFullFrame(&ui);
                 try ui.parser.feed("\x1b", sink);
                 try ui.parser.expireEscape(sink);
                 try ui.parser.feed("\x15", sink);
                 try ui.draw();
+                try std.testing.expect(std.mem.find(u8, ui.frame, "row-0") == null);
                 try screen.replay(ui.frame);
-                ui.finishFrame();
-                for (before_resize[0 .. dimensions.rows - 2], screen.grid[0 .. dimensions.rows - 2]) |old, restored|
-                    try std.testing.expectEqualStrings(&old, &restored);
+                testAcknowledgeFullFrame(&ui);
+                // Closing revokes the popup rows. Rows that lived only inside the
+                // revoked overlay are not regenerated, but nothing is duplicated.
+                for (0..history_length) |i| {
+                    var marker: [16]u8 = undefined;
+                    const value = try std.fmt.bufPrint(&marker, "row-{d:0>3}", .{i});
+                    try std.testing.expect(screen.count(value) <= 1);
+                }
+                try std.testing.expect(screen.count("new-row") <= 1);
+                // Pre-ABA overlay pixels are terminal-managed now and may survive
+                // outside our ownership. Only the freshly ACKed tail is ours to
+                // claim: locate it from the real cursor and tail geometry instead
+                // of scanning the whole grid, and require no candidate inside it.
+                const tail_bottom = screen.row + ui.tail_cursor_rows_up;
+                try std.testing.expect(ui.tail_height != 0 and tail_bottom < screen.rows);
+                try std.testing.expect(tail_bottom + 1 >= ui.tail_height);
+                const tail_top = tail_bottom + 1 - ui.tail_height;
+                try std.testing.expect(tail_top <= screen.row);
+                // An empty composer is not a menu candidate. Below 12 columns
+                // presentation.prompt suppresses the model label, so the live
+                // composer legitimately renders a plain "> " prompt. Derive
+                // that prompt here rather than skipping composer-shaped rows:
+                // the exemption below is exactly one cursor row, and every
+                // other owned "> ..." row must still be rejected.
+                const state_after = ui.connection.current();
+                const narrow_prompt = try presentation.prompt(std.testing.allocator, state_after.model, null, dimensions.columns - 1, .{});
+                defer narrow_prompt.deinit(std.testing.allocator);
+                const plain_prompt = dimensions.columns < 12;
+                if (plain_prompt) {
+                    try std.testing.expectEqualStrings("> ", narrow_prompt.plain);
+                } else {
+                    // Wide layouts keep the model label, so the exemption is
+                    // unreachable and a "> "-shaped row would still fail.
+                    try std.testing.expect(!std.mem.startsWith(u8, narrow_prompt.plain, "> "));
+                }
+                try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+                for (tail_top..tail_bottom + 1) |owned| {
+                    if (!std.mem.startsWith(u8, &screen.grid[owned], "> ")) continue;
+                    // Sole permitted case: the actual cursor row holding the
+                    // empty plain-"> " composer, text trimmed to ">", with the
+                    // cursor resting exactly after the two-glyph prompt.
+                    try std.testing.expect(plain_prompt);
+                    try std.testing.expectEqual(screen.row, owned);
+                    try std.testing.expectEqualStrings(">", std.mem.trim(u8, &screen.grid[owned], " "));
+                    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+                    try std.testing.expectEqual(@as(usize, 2), screen.col);
+                }
                 try ui.parser.feed(command, sink);
                 try ui.draw();
                 try screen.replay(ui.frame);
-                ui.finishFrame();
+                testAcknowledgeFullFrame(&ui);
                 const resized: terminal_module.Size = if (dimensions.rows == 12)
                     .{ .columns = 80, .rows = 24 }
                 else
@@ -10578,23 +13265,24 @@ test "popup close restores every visible transcript row for root provider and mo
                 screen.col = @min(screen.col, resized.columns - 1);
                 try ui.draw();
                 try screen.replay(ui.frame);
-                ui.finishFrame();
+                testAcknowledgeFullFrame(&ui);
                 try ui.parser.feed("\x1b", sink);
                 try ui.parser.expireEscape(sink);
                 try ui.parser.feed("\x15", sink);
                 try ui.draw();
+                try std.testing.expect(std.mem.find(u8, ui.frame, "row-0") == null);
                 try screen.replay(ui.frame);
-                ui.finishFrame();
-                const body_rows = resized.rows - 3;
-                const start = (history_length + 2) -| body_rows;
-                for (0..body_rows) |row| {
-                    const index = start + row;
+                testAcknowledgeFullFrame(&ui);
+                // After the geometry change only the owned tail is painted at the
+                // new width; completed rows are neither reflowed nor replayed and
+                // never duplicated.
+                for (0..history_length) |i| {
                     var marker: [16]u8 = undefined;
-                    const expected = if (index < history_length)
-                        try std.fmt.bufPrint(&marker, "row-{d:0>3}", .{index})
-                    else if (index == history_length + 1) "new-row" else "";
-                    try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, &screen.grid[row], " "));
+                    const value = try std.fmt.bufPrint(&marker, "row-{d:0>3}", .{i});
+                    try std.testing.expect(screen.count(value) <= 1);
                 }
+                try std.testing.expect(screen.count("new-row") <= 1);
+                try std.testing.expect(ui.tail_height <= @as(usize, 3));
             }
         }
     }
@@ -10613,17 +13301,17 @@ test "slash menu grows a short tail and cannot authorize a clipped panel" {
     try std.testing.expect(ui.frame_height >= 4);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/model") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/login") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     ui.resize(.{ .columns = 7, .rows = 6 });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\t", sink);
     try std.testing.expectEqualStrings("/", ui.editor.bytes.items);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.model_picker == null and !ui.secret_mode);
 }
 
-test "transient reasoning borrows ACKed rows and restores the canonical region" {
+test "reasoning window grows below the committed user row and never borrows it" {
     try text.initLocale();
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -10631,49 +13319,54 @@ test "transient reasoning borrows ACKed rows and restores the canonical region" 
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 80, .rows = 24 };
-    try seedCompactAckedTail(&ui, &screen);
-    try std.testing.expect(ui.tail_height <= 4);
-    try std.testing.expect(ui.menu_history.?.above.len >= 10);
-    const history_before = screen.history_len;
+    // A small floating tail: the committed user row is the only row above it.
+    _ = try ui.add(.user, "stream-task");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
     const tail_before = ui.tail_height;
-    try ui.appendDraft(.reasoning, "think-A\nthink-B\nthink-C");
+    try std.testing.expect(tail_before != 0 and tail_before < 6);
+    try std.testing.expectEqual(@as(usize, 1), ui.menu_history.?.above.len);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-task"));
+    try ui.appendDraft(.reasoning, "think-one\nthink-two\nthink-three\nthink-four");
     try ui.draw();
-    const overlay_rows = ui.frame_height;
-    // The window only borrows known ACKed rows; it never invents height.
-    try std.testing.expect(overlay_rows > tail_before);
-    try std.testing.expect(overlay_rows <= tail_before + ui.menu_history.?.above.len);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "think-B") != null);
     try screen.replay(ui.frame);
-    // Tiny overlay frame adds no native rows and overwrites no scrollback.
-    try std.testing.expectEqual(history_before, screen.history_len);
-    try std.testing.expectEqual(@as(usize, 0), screen.count("canon-c13"));
-    ui.finishFrame();
-    // Exactly the rows above the old tail were borrowed, and they stay owned.
-    try std.testing.expectEqual(overlay_rows - tail_before, ui.menu_history.?.borrowed.len);
-    try std.testing.expectEqual(overlay_rows - tail_before, ui.tail_height - tail_before);
-    // Paused finish: the borrowed canonical rows return to their physical rows.
-    ui.discardReasoning();
-    ui.notice = "DecisionUnavailable: HTTP 429";
+    // The window is one leading gap plus its last three rows, grown downward
+    // under the committed user row instead of borrowed upward over it.
+    try std.testing.expectEqual(tail_before + 1 + 3, ui.frame_height);
+    try std.testing.expect(!screen.visible("think-one"));
+    for ([_][]const u8{ "think-two", "think-three", "think-four" }) |marker|
+        try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-task"));
+    try expectTranscriptGap(&screen, "stream-task", "think-two");
+    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(usize, 0), ui.menu_history.?.borrowed.len);
+    const window_rows = ui.tail_height;
+    // A later reasoning update repaints only those same three rows.
+    try ui.appendDraft(.reasoning, "\nthink-five\nthink-six");
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "think-") == null);
-    try std.testing.expectEqual(overlay_rows, ui.frame_height);
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(history_before, screen.history_len);
-    const base = screen.rows - ui.frame_height;
-    const restored = [_]struct { row: usize, marker: []const u8 }{
-        .{ .row = base, .marker = "canon-c10" },
-        .{ .row = base + 1, .marker = "canon-c11" },
-        .{ .row = base + 2, .marker = "canon-c12" },
-        .{ .row = base + 3, .marker = "canon-c13" },
-    };
-    for (restored) |entry| {
-        try std.testing.expectEqual(@as(usize, 1), screen.count(entry.marker));
-        try std.testing.expect(std.mem.startsWith(u8, std.mem.trimEnd(u8, &screen.grid[entry.row], " "), entry.marker));
-    }
-    try std.testing.expectEqual(screen.rows - 1, screen.row);
+    try std.testing.expectEqual(window_rows, ui.frame_height);
+    try std.testing.expect(!screen.visible("think-two"));
+    for ([_][]const u8{ "think-four", "think-five", "think-six" }) |marker|
+        try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-task"));
+    try expectTranscriptGap(&screen, "stream-task", "think-four");
+    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    testAcknowledgeFullFrame(&ui);
+    // The canonical answer replaces the window; the user row is not replayed.
+    try ui.appendDraft(.assistant, "final-answer");
+    try std.testing.expect(ui.reasoning == null);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 0), screen.count("think-"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-task"));
+    try std.testing.expect(screen.visible("final-answer"));
+    testAcknowledgeFullFrame(&ui);
 }
 
-test "pending user row in the reasoning frame defers the overlay instead of growing it" {
+test "busy stop modal during reasoning restores the borrowed user row and window" {
     try text.initLocale();
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -10681,41 +13374,49 @@ test "pending user row in the reasoning frame defers the overlay instead of grow
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 80, .rows = 24 };
-    try seedCompactAckedTail(&ui, &screen);
+    _ = try ui.add(.user, "stream-task");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
     const tail_before = ui.tail_height;
-    try ui.appendDraft(.reasoning, "think-A\nthink-B\nthink-C");
-    _ = try ui.add(.user, "pending-row");
+    try std.testing.expect(tail_before != 0 and tail_before < 6);
+    // Reasoning starts, then the busy stop confirmation borrows the one ACKed
+    // row above the small tail while the window itself stays deferred behind it.
+    try ui.appendDraft(.reasoning, "think-one\nthink-two\nthink-three\nthink-four");
+    ui.busy = true;
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x03", sink);
+    try std.testing.expect(ui.stop_open);
     try ui.draw();
-    // The real canonical row commits; the reasoning window waits for a fresh ACK.
-    try std.testing.expect(std.mem.find(u8, ui.frame, "pending-row") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "think-B") == null);
-    try std.testing.expect(ui.frame_height <= tail_before);
     try screen.replay(ui.frame);
-    ui.finishFrame();
-    // The deferred window appears only on the next complete frame, and the
-    // committed row it borrows stays restorable instead of being duplicated.
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(usize, 1), ui.menu_history.?.borrowed.len);
+    try std.testing.expectEqual(@as(usize, 0), screen.count("stream-task"));
+    // Closing the modal must not keep ignoring that borrowed prefix: the user
+    // row returns to its original row before the window resumes.
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(!ui.stop_open);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "think-B") != null);
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 1), screen.count("think-B"));
-    try std.testing.expect(screen.count("pending-row") <= 1);
-    ui.finishFrame();
-    var restorable = false;
-    for (ui.menu_history.?.borrowed) |row| {
-        if (std.mem.find(u8, row, "pending-row") != null) restorable = true;
-    }
-    try std.testing.expect(restorable);
-    // Hiding the window puts the borrowed canonical row back on screen once.
-    ui.discardReasoning();
-    ui.notice = "DecisionUnavailable: HTTP 429";
-    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-task"));
     try std.testing.expect(std.mem.find(u8, ui.frame, "think-") == null);
+    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(usize, 0), ui.menu_history.?.borrowed.len);
+    try std.testing.expectEqual(tail_before, ui.tail_height);
+    // The next frame updates the same three-row window below that row.
+    try ui.draw();
     try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 1), screen.count("pending-row"));
-    ui.finishFrame();
+    try std.testing.expectEqual(tail_before + 1 + 3, ui.frame_height);
+    try std.testing.expect(!screen.visible("think-one"));
+    for ([_][]const u8{ "stream-task", "think-two", "think-three", "think-four" }) |marker|
+        try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
+    try expectTranscriptGap(&screen, "stream-task", "think-two");
+    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    testAcknowledgeFullFrame(&ui);
 }
 
-test "resized reasoning frame invalidates old ACK and recovers a bounded viewport" {
+test "resized reasoning frame revokes the old ACK without autonomous recovery" {
     try text.initLocale();
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -10741,65 +13442,78 @@ test "resized reasoning frame invalidates old ACK and recovers a bounded viewpor
             target.rows = new_rows;
         }
     };
-    // Only the live viewport must stay deduplicated. Screen.count/Screen.visible
-    // scan native history too, where a recovered preview may legitimately remain.
-    const viewport = struct {
-        fn count(target: *const @import("../tests/regular_screen.zig").Screen, needle: []const u8) usize {
-            var total: usize = 0;
-            for (target.grid[0..target.rows], 0..) |_, row_index|
-                total += std.mem.count(u8, &target.grid[row_index], needle);
-            return total;
-        }
-    };
     const markers = [_][]const u8{ "canon-c10", "canon-c11", "canon-c12", "canon-c13", "think-B" };
+    // Tail footprint is content-derived: the three visible reasoning rows, their
+    // leading gap, and the owned notice/separator/composer footer.
+    const thinking_rows = 3;
+    const thinking_gap = 1;
+    const footer_rows = 3;
+    const reasoning_footprint = thinking_rows + thinking_gap + footer_rows;
     try seedCompactAckedTail(&ui, &screen);
     try ui.appendDraft(.reasoning, "think-A\nthink-B\nthink-C");
     try ui.draw();
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     for (markers) |marker| try std.testing.expect(screen.count(marker) <= 1);
     // Partial geometry (same width, unknown height) grants no upward ownership.
     ui.tail_size = .{ .columns = ui.size.columns, .rows = ui.size.rows + 1 };
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "think-") == null);
     try screen.replay(ui.frame);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     for (markers) |marker| try std.testing.expect(screen.count(marker) <= 1);
     const records_before = ui.records.items.len;
     // Height-only resize invalidates every old ACKed geometry.
     ui.resize(.{ .columns = 80, .rows = 18 });
     try Shrink.apply(&screen, 18);
+    // Resize is not content: no timer and no animation pulse may stage a frame.
+    ui.clock_ms += 5000;
+    ui.resize(.{ .columns = 80, .rows = 18 });
+    ui.animate();
+    try std.testing.expect(!ui.drawReady() and !ui.dirty and ui.frame.len == 0);
+    try std.testing.expect(ui.tail_snapshot == null and !ui.tail_bottom and ui.abandon_tail);
+    try std.testing.expectEqual(@as(usize, 18), ui.size.rows);
+    // The next genuine update draws once at the new geometry. It continues from
+    // the cursor's own row: no physical-bottom move, no whole-screen clear, no
+    // blank fill, and no attempt to reclaim old coordinates.
+    ui.requestDraw();
     try ui.draw();
-    // A full rewrite replaces the aborted tail; no upward borrow from old ACKs.
-    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[999B") != null);
-    try std.testing.expectEqual(@as(usize, 18), ui.frame_height);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[999B") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[0J") == null);
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame, terminal_module.sync_begin ++ "\x1b[?25l\r\r\n"));
+    // The bounded reasoning window carries its visible rows only; completed
+    // canonical rows are neither reflowed nor replayed at the new width.
+    try std.testing.expectEqual(reasoning_footprint, ui.frame_height);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "canon-c") == null);
     try screen.replay(ui.frame);
-    // A lost geometry permits one conservative viewport recovery: it may revive
-    // an old visual preview in native history. Such rows are display previews,
-    // not a canonical re-commit of transcript or completed execution records,
-    // so the full document may hold them twice while the viewport holds them once.
-    for (markers) |marker| try std.testing.expect(viewport.count(&screen, marker) <= 1);
+    // Old visible previews may remain after an interrupted geometry; they are
+    // discarded display state, not a duplicate canonical record. No zero-ghost
+    // or unique-viewport requirement survives the resize any more.
     try std.testing.expectEqual(records_before, ui.records.items.len);
     for (ui.records.items) |record| {
         if (record.kind == .reasoning) continue;
         try std.testing.expect(record.output);
     }
-    // Freeze what that single recovery produced; stability means no further
+    // Freeze what that single frame produced; stability means no further
     // appends or duplicate rows, not that history matches the pre-resize state.
     var recovered: [markers.len]usize = undefined;
     for (markers, 0..) |marker, index| recovered[index] = screen.count(marker);
     const recovered_history = screen.history_len;
-    ui.finishFrame();
-    // The next stable frame re-establishes geometry without replaying canonical rows.
+    testAcknowledgeFullFrame(&ui);
+    // The fresh tail borrowed no unknown or old-width row.
+    try std.testing.expectEqual(@as(usize, 0), ui.menu_history.?.borrowed.len);
+    // The next stable frame keeps the same content-derived footprint without
+    // replaying canonical rows.
     try ui.draw();
-    try std.testing.expectEqual(@as(usize, 18), ui.frame_height);
+    try std.testing.expectEqual(reasoning_footprint, ui.frame_height);
     try screen.replay(ui.frame);
     for (markers, 0..) |marker, index| {
         try std.testing.expectEqual(recovered[index], screen.count(marker));
-        try std.testing.expect(viewport.count(&screen, marker) <= 1);
     }
     try std.testing.expectEqual(recovered_history, screen.history_len);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(usize, 0), ui.menu_history.?.borrowed.len);
 }
 
 test "slash menu never opens for pasted arguments unknown tokens or busy sessions" {
@@ -10845,7 +13559,7 @@ test "model picker confirms acknowledged epoch and revision preserving transcrip
     try std.testing.expect(std.mem.find(u8, ui.frame, "Search> ") != null);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.selections);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqualStrings("fixture-next", fixture.name);
     try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
@@ -10857,16 +13571,16 @@ test "model picker confirms acknowledged epoch and revision preserving transcrip
     try ui.draw();
     try ui.modelKey(.cancel);
     ui.openModelPicker();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.modelKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.selections);
     try ui.draw();
     ui.resize(.{ .columns = 40, .rows = 12 });
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.modelKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.selections);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.modelKey(.enter);
     try std.testing.expectEqual(@as(usize, 2), fixture.selections);
 }
@@ -10893,14 +13607,14 @@ test "selection guards paste secret busy joined future poison and rollback" {
     var effort_screen: @import("../tests/regular_screen.zig").Screen = .{};
     try effort_screen.replay(ui.frame);
     try std.testing.expect(effort_screen.visible("(fixture-next) minimal> "));
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // 2 秒后自动恢复为上下文百分比。
     ui.clock_ms = 2001;
     ui.expireEffortFlash();
     try ui.draw();
     try effort_screen.replay(ui.frame);
     try std.testing.expect(effort_screen.visible("(fixture-next) 1.5%> "));
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     ui.busy = true;
     try ui.parser.feed("\x1b[Z/model busy-id\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.selections);
@@ -11150,7 +13864,7 @@ test "compact slash menu requires acknowledged choice then joins a summary-only 
     ui.frame_offset = 1;
     try ui.parser.feed("\r", sink); // Partial output still has no authority.
     try std.testing.expect(ui.future == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(ui.busy and ui.future != null and ui.prompt == null);
     try std.testing.expectEqual(.compact, ui.job.kind);
@@ -11300,16 +14014,16 @@ test "slash composer frames keep model prefixes and hide credentials with comman
         try ui.draw();
         var screen: @import("../tests/regular_screen.zig").Screen = .{};
         try screen.replay(ui.frame);
-        try std.testing.expect(std.mem.find(u8, &screen.grid[23], case.shown) != null);
+        try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], case.shown) != null);
         if (case.hidden) |hidden| {
             try std.testing.expect(std.mem.find(u8, ui.frame, hidden) == null);
             try std.testing.expectEqual(@as(usize, 0), screen.count(hidden));
         }
         if (!std.mem.startsWith(u8, case.raw, "/login")) {
-            try std.testing.expect(std.mem.find(u8, &screen.grid[23], "/login") == null);
+            try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], "/login") == null);
         }
         try std.testing.expectEqualStrings(case.raw, ui.editor.bytes.items);
-        ui.finishFrame();
+        testAcknowledgeFullFrame(&ui);
         const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
         try ui.parser.feed("\r", sink);
         try std.testing.expect(!ui.secret_mode and !ui.provider_open);
@@ -11351,7 +14065,7 @@ test "slash composer keeps supported management arguments visible without submit
         try ui.draw();
         var screen: @import("../tests/regular_screen.zig").Screen = .{};
         try screen.replay(ui.frame);
-        try std.testing.expect(std.mem.find(u8, &screen.grid[23], case.shown) != null);
+        try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], case.shown) != null);
         if (case.hidden) |hidden| {
             try std.testing.expect(std.mem.find(u8, ui.frame, hidden) == null);
             try std.testing.expectEqual(@as(usize, 0), screen.count(hidden));
@@ -11389,7 +14103,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     try std.testing.expect(std.mem.find(u8, ui.frame, "Proxy") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Proxy models") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "10.0.0.1:8080") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Root Enter opens the second level; Address stays selected by default.
     try ui.parser.feed("\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try std.testing.expect(ui.proxy_sub_open and !ui.proxy_open and !ui.proxy_address_open);
@@ -11397,19 +14111,19 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "> Address") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "10.0.0.1:8080") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Down reaches Models, which opens the existing acknowledged picker.
     try ui.parser.feed("\x1b[B", input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try ui.draw();
     try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try std.testing.expect(ui.proxy_open and ui.proxy_sub_open and !ui.proxy_address_open);
     try std.testing.expect(!ui.decision_open and !ui.image_open);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "[ ] fixture/one") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "unlogged/three") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // One ACKed Enter saves exactly one model; the same batch cannot flip twice.
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
@@ -11421,12 +14135,12 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "[x] fixture/one") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // A second model can be toggled without leaving the submenu.
     try ui.parser.feed("\x1b[B", input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try ui.draw();
     try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 2), fixture.proxy_saves);
     try std.testing.expectEqualStrings("fixture/two", fixture.proxy_last.?);
@@ -11434,7 +14148,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     // Owner save failure keeps the checkbox and the query, and still consumes ACK.
     fixture.proxy_fail = true;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 3), fixture.proxy_saves);
     try std.testing.expectEqual(@as(usize, 2), fixture.proxy_len);
@@ -11446,7 +14160,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     // Search keeps the exact case and inner slashes of the saved name.
     try ui.settingsKey(.{ .text = .{ .value = "TWO", .pasted = false } });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 4), fixture.proxy_saves);
     try std.testing.expectEqualStrings("fixture/two", fixture.proxy_last.?);
@@ -11458,7 +14172,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
     // Esc from the second level returns to the root Proxy row, draft intact.
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.escape);
     try std.testing.expect(!ui.proxy_sub_open and !ui.proxy_address_open and ui.settings_open);
     try std.testing.expectEqual(@as(usize, 8), ui.settings_menu.selected);
@@ -11482,11 +14196,11 @@ test "proxy picker owns its query while the parent submenu stays marked" {
     ui.openSettingsMenu();
     ui.settings_menu.selected = 8;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try ui.settingsKey(.down);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Models opens the picker while the parent marker stays set.
     try ui.settingsKey(.enter);
     try std.testing.expect(ui.proxy_open and ui.proxy_sub_open and !ui.proxy_address_open);
@@ -11498,7 +14212,7 @@ test "proxy picker owns its query while the parent submenu stays marked" {
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "[ ] fixture/two") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "fixture/one") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // A complete ACKed Enter toggles the filtered row instead of Address.
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
@@ -11528,22 +14242,22 @@ test "settings proxy submenu reports a missing endpoint instead of stalling" {
     ui.openSettingsMenu();
     ui.settings_menu.selected = 8;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expect(ui.proxy_sub_open and !ui.proxy_open);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Not configured") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Models opens without an endpoint and states the blocker up front.
     try ui.parser.feed("\x1b[B", input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expect(ui.proxy_open);
     try std.testing.expect(std.mem.find(u8, ui.notice, "Configure a proxy address first") != null);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "not configured") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // An acknowledged Enter still refuses to guess an endpoint or save a model.
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_saves);
@@ -11554,16 +14268,16 @@ test "settings proxy submenu reports a missing endpoint instead of stalling" {
     try ui.settingsKey(.escape);
     try ui.settingsKey(.up);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expect(ui.proxy_address_open and ui.proxy_sub_open and !ui.proxy_open);
     try std.testing.expectEqualStrings("", ui.editor.bytes.items);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Address> ") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.{ .text = .{ .value = "fixture", .pasted = false } });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
     try std.testing.expect(std.mem.find(u8, ui.notice, "Invalid proxy address") != null);
@@ -11591,19 +14305,19 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     ui.openSettingsMenu();
     ui.settings_menu.selected = 8;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Root 8 -> second level -> Address, prefilled empty when nothing is set.
     try ui.settingsKey(.enter);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expect(ui.proxy_address_open and ui.editor.bytes.items.len == 0);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("127.0.0.1:8888", input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_address_saves);
     try std.testing.expectEqualStrings("127.0.0.1:8888", fixture.proxy_endpoint[0..fixture.proxy_endpoint_len]);
@@ -11617,14 +14331,14 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     try std.testing.expect(std.mem.find(u8, ui.notice, "new session") != null);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "127.0.0.1:8888") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // Models now accepts one acknowledged toggle.
     try ui.settingsKey(.down);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
     try std.testing.expectEqualStrings("fixture/one", fixture.proxy_last.?);
@@ -11633,15 +14347,15 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     try ui.settingsKey(.escape);
     try ui.settingsKey(.up);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqualStrings("127.0.0.1:8888", ui.editor.bytes.items);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.clear);
     try ui.settingsKey(.{ .text = .{ .value = "10.0.0.1:3128", .pasted = false } });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 2), fixture.proxy_address_saves);
     try std.testing.expectEqualStrings("10.0.0.1", fixture.proxy_address.?);
@@ -11650,13 +14364,13 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     // Empty input removes the whole proxy through the same callback, dropping
     // the member list as the backend does; nothing survives the disable.
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expect(ui.proxy_address_open);
     try std.testing.expectEqualStrings("10.0.0.1:3128", ui.editor.bytes.items);
     try ui.settingsKey(.clear);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 3), fixture.proxy_address_saves);
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_endpoint_len);
@@ -11683,10 +14397,10 @@ test "proxy address saves only when the endpoint fits the reserved columns" {
     ui.openSettingsMenu();
     ui.settings_menu.selected = 8;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expect(ui.proxy_address_open);
     // 63+1+2 host plus ":8888" is 71 bytes; with the 9-byte prompt it needs
@@ -11695,7 +14409,7 @@ test "proxy address saves only when the endpoint fits the reserved columns" {
     try std.testing.expectEqual(@as(usize, 71), endpoint.len);
     try ui.parser.feed(endpoint, input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     // At 80 columns the row keeps one spare column, so the text is not fully
     // visible: the save is refused with a reason instead of silently failing.
     try ui.settingsKey(.enter);
@@ -11705,7 +14419,7 @@ test "proxy address saves only when the endpoint fits the reserved columns" {
     // One wider column authorizes the same text after a fresh complete frame.
     ui.resize(.{ .columns = 81, .rows = 24 });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_address_saves);
     try std.testing.expectEqualStrings(endpoint, fixture.proxy_endpoint[0..fixture.proxy_endpoint_len]);
@@ -11728,10 +14442,10 @@ test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" 
     ui.openSettingsMenu();
     ui.settings_menu.selected = 8;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expect(ui.proxy_address_open);
     try std.testing.expectEqualStrings("10.0.0.1:8080", ui.editor.bytes.items);
@@ -11739,7 +14453,7 @@ test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" 
     try ui.settingsKey(.clear);
     try ui.settingsKey(.{ .text = .{ .value = "10.0.0.1:0", .pasted = false } });
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
     try std.testing.expect(std.mem.find(u8, ui.notice, "Invalid proxy address") != null);
@@ -11751,19 +14465,19 @@ test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" 
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "10.0.0.1:8080") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
     try std.testing.expectEqualStrings("10.0.0.1:8080", ui.editor.bytes.items);
     // Text and Enter in one read batch cannot save: the edit revoked the ACK.
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("9\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
     try std.testing.expect(ui.proxy_address_open);
     // Pasting only edits the buffer; the same batch Enter is refused too.
     try ui.settingsKey(.clear);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[200~10.0.0.9:3128\x1b[201~\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try std.testing.expectEqualStrings("10.0.0.9:3128", ui.editor.bytes.items);
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
@@ -11774,7 +14488,7 @@ test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" 
     // arrives as a fresh read of its own after a complete frame.
     fixture.proxy_address_fail = true;
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_address_saves);
     try std.testing.expectEqualStrings("10.0.0.1", fixture.proxy_address.?);
@@ -11787,7 +14501,7 @@ test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" 
     // A fresh complete frame after the same edit does save it, and the retry
     // is again a new read rather than a byte of the previous one.
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", input.Sink{ .context = &ui, .emit_fn = Ui.key });
     try std.testing.expectEqual(@as(usize, 2), fixture.proxy_address_saves);
     try std.testing.expectEqualStrings("10.0.0.9", fixture.proxy_address.?);
@@ -12079,7 +14793,7 @@ test "stop clear requires fresh complete ACK and independent dangerous Enter wit
     try std.testing.expect(ui.inbox.snapshot().confirming);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "> Continue") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[C\r", sink);
     try std.testing.expect(ui.stop_danger and !cancel.isRequested());
     try ui.parser.feed("\r", sink); // No frame yet: no authorization.
@@ -12087,7 +14801,7 @@ test "stop clear requires fresh complete ACK and independent dangerous Enter wit
     try ui.parser.feed("\x1b[C", sink); // Reselect after a pre-ACK/held Enter.
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "> Stop and clear") != null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\x03", sink);
     try std.testing.expect(cancel.isRequested() and !ui.stop_open);
     try std.testing.expect(ui.inbox.snapshot().newest_id == null);
@@ -12106,18 +14820,18 @@ test "stop modal rejects queue revision resize paste and repeated CtrlC authorit
     try ui.parser.feed("\x03", sink);
     try ui.parser.feed("\x1b[B", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "raced message");
     try ui.parser.feed("\r", sink);
     try std.testing.expect(!cancel.isRequested() and !ui.stop_danger);
     try ui.parser.feed("\x1b[C", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     ui.resize(.{ .columns = 18, .rows = 7 });
     try ui.parser.feed("\r", sink);
     try std.testing.expect(!cancel.isRequested());
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.displayed_stop == null);
     try ui.parser.feed("\r", sink);
     try std.testing.expect(!cancel.isRequested());
@@ -12126,7 +14840,7 @@ test "stop modal rejects queue revision resize paste and repeated CtrlC authorit
     try std.testing.expect(!ui.stop_danger and !cancel.isRequested());
     try ui.parser.feed("\x1b[C", sink);
     try ui.draw();
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[200~\r\x1b[201~\r", sink);
     try std.testing.expect(!cancel.isRequested());
     // The discarded paste tail cannot confirm; fresh Esc solely dismisses.
@@ -12292,7 +15006,7 @@ test "configure enables same-process submit without sending secrets or commands"
     try std.testing.expect(std.mem.find(u8, ui.frame, "Esc closes") == null);
     try std.testing.expect(!ui.secret_mode and !ui.secret_quarantine);
     try std.testing.expect(std.mem.find(u8, ui.frame, "sk-fixture-secret") == null);
-    ui.finishFrame();
+    testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 1), fixture.saves);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
@@ -12317,6 +15031,9 @@ test "configure enables same-process submit without sending secrets or commands"
 const FakeRemote = struct {
     snapshot: session_client.Snapshot = .{ .available = true, .attached = true, .control_epoch = 1 },
     item: ?session_client.Item = null,
+    buffered_items: []session_client.Item = &.{},
+    buffered_index: usize = 0,
+    empty_polls: usize = 0,
     submits: usize = 0,
     last_submit_epoch: u64 = 0,
     last_submit_kind: session_client.TaskKind = .prompt,
@@ -12342,6 +15059,36 @@ const FakeRemote = struct {
     manage_switched: bool = false,
     manage_exit: bool = false,
     submit_failure: ?anyerror = null,
+    ack_failure: bool = false,
+    ack_count: usize = 0,
+    ack_epoch: u64 = 0,
+    ack_sequence: u64 = 0,
+    /// Exact intervals handed to the selective range channel, in order.
+    ack_ranges: [64]struct { first: u64, last: u64 } = @splat(.{ .first = 0, .last = 0 }),
+    ack_range_count: usize = 0,
+    ack_range_failure: bool = false,
+    ack_range_epoch: u64 = 0,
+
+    fn acknowledgeFn(ctx: *anyopaque, epoch: u64, sequence: u64) anyerror!void {
+        const self = from(ctx);
+        if (self.ack_failure) return error.QueueFull;
+        self.ack_count += 1;
+        self.ack_epoch = epoch;
+        self.ack_sequence = sequence;
+    }
+
+    fn acknowledgeRangeFn(ctx: *anyopaque, epoch: u64, first: u64, last: u64) anyerror!void {
+        const self = from(ctx);
+        // Prefix acks (first == 0) are legacy acknowledge semantics.
+        if (first == 0) return acknowledgeFn(ctx, epoch, last);
+        if (self.ack_range_failure) return error.QueueFull;
+        if (first == 0 or first > last) return error.InvalidSequence;
+        self.ack_range_epoch = epoch;
+        if (self.ack_range_count < self.ack_ranges.len) {
+            self.ack_ranges[self.ack_range_count] = .{ .first = first, .last = last };
+            self.ack_range_count += 1;
+        }
+    }
 
     fn client(self: *FakeRemote) session_client.Client {
         return .{ .context = self, .vtable = &vtable };
@@ -12369,9 +15116,21 @@ const FakeRemote = struct {
     }
     fn pollFn(ctx: *anyopaque, _: std.mem.Allocator) anyerror!?session_client.Item {
         const self = from(ctx);
-        const value = self.item orelse return null;
-        self.item = null;
-        return value;
+        if (self.item) |value| {
+            self.item = null;
+            return value;
+        }
+        if (self.buffered_index < self.buffered_items.len) {
+            const value = self.buffered_items[self.buffered_index];
+            self.buffered_index += 1;
+            return value;
+        }
+        self.empty_polls += 1;
+        return null;
+    }
+    fn bufferedFn(ctx: *anyopaque) bool {
+        const self = from(ctx);
+        return self.item != null or self.buffered_index < self.buffered_items.len;
     }
     fn cancelFn(ctx: *anyopaque, _: u64) anyerror!void {
         from(ctx).cancels += 1;
@@ -12426,6 +15185,9 @@ const FakeRemote = struct {
         .snapshot_fn = snapshotFn,
         .submit_fn = submitFn,
         .poll_fn = pollFn,
+        .buffered_fn = bufferedFn,
+        .acknowledge_fn = acknowledgeFn,
+        .acknowledge_range_fn = acknowledgeRangeFn,
         .cancel_fn = cancelFn,
         .cancel_clear_fn = cancelClearFn,
         .set_confirming_fn = setConfirmingFn,
@@ -12480,6 +15242,1192 @@ fn drainBridge(ui: *Ui) !void {
 
 fn typeDraft(ui: *Ui, value: []const u8) !void {
     _ = try ui.editor.insert(value);
+}
+
+test "remote delivery requires a complete fresh frame and retries failed admission" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .state = .calling_model });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.finishFrame(); // Partial frame must not be proof.
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    ui.frame_offset = ui.frame.len;
+    ui.frame_fresh = false;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    fake.ack_failure = true;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 1), ui.delivery_proven);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    fake.ack_failure = false;
+    ui.retryDeliveryAck();
+    try std.testing.expectEqual(@as(u64, 9), fake.ack_epoch);
+    try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+    try std.testing.expectEqual(@as(usize, 1), fake.ack_count);
+}
+
+test "remote delivery retains source across batches and unsafe history reset" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    for (1..3) |sequence| {
+        fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "pending text" });
+        fake.item.?.delivery_epoch = 9;
+        fake.item.?.delivery_sequence = @intCast(sequence);
+        try ui.pumpRemote();
+    }
+    const index = ui.draft.?;
+    const before = ui.records.items[index].stream.?.windowBytes();
+    try std.testing.expect(before != 0);
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    // Visibility contract: a complete fresh frame proves the mutable window it
+    // actually displayed, so live delivery is acknowledged without EOF. The
+    // Body still owns its source for future syntax.
+    try std.testing.expectEqual(@as(usize, 1), fake.ack_count);
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);
+    try std.testing.expectEqual(@as(usize, before), ui.records.items[index].stream.?.windowBytes());
+    // Accepted-but-undisplayed bytes stay unprovable: a later event that has no
+    // frame yet keeps history display reset unsafe and the source retained.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = " late" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 3;
+    try ui.pumpRemote();
+    var baseline = try session_client.ownEvent(std.testing.allocator, 1, .{ .state = .calling_model });
+    defer baseline.deinit();
+    baseline.history_display_reset = true;
+    ui.adoptReplayHistory(&baseline);
+    try std.testing.expect(ui.replay_refused);
+    try std.testing.expect(ui.records.items[ui.draft.?].stream.?.windowBytes() != 0);
+}
+
+test "delivery coverage resolution never claims a cropped or replaced row" {
+    const frozen = FrameRecord{ .record_id = 1, .generation = 1, .visible_complete = true, .stream_full_end = 60, .visible_source_end = 60 };
+    const shown_tail = FrameRecord{ .record_id = 2, .generation = 1, .tail_line_start = 3, .tail_rows = 2, .stream_full_end = 90, .stream_prefix_end = 40 };
+    const cropped_tail = FrameRecord{ .record_id = 3, .generation = 1, .tail_line_start = 0, .tail_rows = 2, .stream_full_end = 70, .stream_prefix_end = 30 };
+    const replaced = FrameRecord{ .record_id = 4, .generation = 1, .stream_full_end = 50, .stream_prefix_end = 20 };
+    const thinking = FrameRecord{ .record_id = 5, .generation = 1, .reasoning = true };
+    var entries = [_]FrameRecord{ frozen, shown_tail, cropped_tail, replaced, thinking };
+    resolveDeliveryCoverage(&entries, 0, 1, true);
+    // Rows already released into native scrollback are displayed by definition.
+    try std.testing.expect(entries[0].visible_complete);
+    try std.testing.expectEqual(@as(usize, 60), entries[0].visible_source_end);
+    // The whole mutable tail below the visible origin was written.
+    try std.testing.expect(entries[1].visible_complete);
+    try std.testing.expectEqual(@as(usize, 90), entries[1].visible_source_end);
+    // A crop above the record's own rows leaves only the frozen prefix proven.
+    try std.testing.expect(!entries[2].visible_complete);
+    try std.testing.expectEqual(@as(usize, 30), entries[2].visible_source_end);
+    // A modal replaced the body: no tail row of it was painted.
+    try std.testing.expect(!entries[3].visible_complete);
+    try std.testing.expectEqual(@as(usize, 20), entries[3].visible_source_end);
+    try std.testing.expect(entries[4].visible_complete);
+    // A deferred thinking window proves nothing until its newest rows are shown.
+    var deferred = [_]FrameRecord{thinking};
+    resolveDeliveryCoverage(&deferred, 0, 1, false);
+    try std.testing.expect(!deferred[0].visible_complete);
+    // Borrowed ACKed rows shift the tail; the record still counts as complete.
+    var shifted = [_]FrameRecord{shown_tail};
+    resolveDeliveryCoverage(&shifted, 2, 4, false);
+    try std.testing.expect(shifted[0].visible_complete);
+    var unshifted = [_]FrameRecord{shown_tail};
+    resolveDeliveryCoverage(&unshifted, 0, 4, false);
+    try std.testing.expect(!unshifted[0].visible_complete);
+    try std.testing.expectEqual(@as(usize, 40), unshifted[0].visible_source_end);
+}
+
+test "approval modal withholds body fences until the body is shown again" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "hidden while approving" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    ui.permission = .{ .id = 7, .description = try ui.allocator.dupe(u8, "run a command"), .clipped = false, .pasted = false, .epoch = 9 };
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    // Closing the modal restores the body; only that fresh frame proves it.
+    ui.clearPermission();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 1), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+}
+
+test "modal release repins cached body for fresh delivery proof without reparsing" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "shown" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = " hidden while approving" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 2;
+    try ui.pumpRemote();
+    const index = ui.draft.?;
+    const body = ui.records.items[index].stream.?;
+    ui.permission = .{ .id = 7, .description = try ui.allocator.dupe(u8, "run a command"), .clipped = false, .pasted = false, .epoch = 9 };
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+    try std.testing.expect(!body.pinned);
+    try std.testing.expect(ui.records.items[index].cache != null);
+    const renders = body.stats.renders;
+    const parsed_bytes = body.stats.window_bytes;
+    ui.clearPermission();
+    try ui.draw();
+    try std.testing.expect(body.pinned);
+    try std.testing.expectEqual(renders, body.stats.renders);
+    try std.testing.expectEqual(parsed_bytes, body.stats.window_bytes);
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 2), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);
+}
+
+test "an append during a pinned frame cannot extend its ACK snapshot" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "one" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    try ui.draw(); // Staged with admission snapshot 1 and a pinned render.
+    try std.testing.expect(ui.frame.len != 0);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "two" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 2;
+    try ui.pumpRemote();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 1), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+    try std.testing.expectEqual(@as(u64, 2), ui.delivery_admitted);
+    // The next complete frame renders and proves the appended bytes.
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);
+}
+
+test "a held CR blocks only its own fence while earlier rows progress" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .user_committed = .{ .id = 1, .text = "hello" } });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "abc\r" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 2;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    // The committed user row is fully shown even though the body still holds a
+    // pending CR byte that no row can represent yet.
+    try std.testing.expectEqual(@as(u64, 1), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "\ndef" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 3;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 3), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 3), fake.ack_sequence);
+}
+
+test "metadata is selectively acknowledged while a data fence stays unmet" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "abc\r" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .state = .calling_model });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 2;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    // The applied owner state is displayed, so it is acknowledged selectively...
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.ack_range_count);
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_ranges[0].first);
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_ranges[0].last);
+    // ...while the cumulative watermarks stop at the unprovable text event.
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    try std.testing.expect(!ui.delivery_fences.items[0].proven);
+    try std.testing.expect(ui.delivery_fences.items[0].record_id != 0);
+}
+
+test "metadata past a held CR hole is selectively acknowledged until the LF arrives" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    // The seed ends in a CR: no row can represent that byte yet.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "seed\r" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_range_count);
+    // A modal frame never showed the body, so it cannot claim that source.
+    ui.permission = .{ .id = 7, .description = try ui.allocator.dupe(u8, "run a command"), .clipped = false, .pasted = false, .epoch = 9 };
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_range_count);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    ui.clearPermission();
+    // >1024 ordered metadata deltas behind that hole.
+    var sequence: u64 = 2;
+    var chunk: usize = 0;
+    while (sequence <= 1100) : (sequence += 1) {
+        fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .state = .calling_model });
+        fake.item.?.delivery_epoch = 9;
+        fake.item.?.delivery_sequence = sequence;
+        try ui.pumpRemote();
+        chunk += 1;
+        if (chunk == 1) {
+            // Metadata must never inherit the body's unchanged CR target.
+            for (ui.delivery_fences.items[1..]) |fence| {
+                try std.testing.expectEqual(@as(u64, 0), fence.record_id);
+                try std.testing.expectEqual(@as(usize, 0), fence.target);
+            }
+        }
+        if (chunk == 200) {
+            chunk = 0;
+            try ui.draw();
+            ui.frame_offset = ui.frame.len;
+            ui.finishFrame();
+        }
+    }
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    // The ring never needs to hold metadata that the UI already displayed.
+    try std.testing.expect(fake.ack_range_count != 0);
+    for (fake.ack_ranges[0..fake.ack_range_count]) |range| {
+        try std.testing.expect(range.first >= 2);
+        try std.testing.expect(range.last <= 1100);
+    }
+    // The held-CR hole stays retained and is never claimed by a watermark.
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    try std.testing.expect(ui.delivery_fences.items.len >= 2);
+    try std.testing.expect(!ui.delivery_fences.items[0].proven);
+    try std.testing.expect(ui.delivery_fences.items[0].record_id != 0);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    // The LF resolves the byte; only now may the prefix cover everything.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "\n" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1101;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 1101), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 1101), ui.delivery_acked);
+    try std.testing.expectEqual(@as(u64, 1101), fake.ack_sequence);
+    try std.testing.expectEqual(@as(usize, 0), ui.delivery_fences.items.len);
+}
+
+test "a failed selective range keeps its exact interval for retry" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "seed\r" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    var sequence: u64 = 2;
+    while (sequence <= 4) : (sequence += 1) {
+        fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .state = .calling_model });
+        fake.item.?.delivery_epoch = 9;
+        fake.item.?.delivery_sequence = sequence;
+        try ui.pumpRemote();
+    }
+    fake.ack_range_failure = true;
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_range_count);
+    for (ui.delivery_fences.items) |fence| try std.testing.expect(!fence.enqueued);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    // Retrying re-sends exactly the same proven interval, never a wider claim.
+    fake.ack_range_failure = false;
+    ui.retryDeliveryAck();
+    try std.testing.expectEqual(@as(usize, 1), fake.ack_range_count);
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_ranges[0].first);
+    try std.testing.expectEqual(@as(u64, 4), fake.ack_ranges[0].last);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+}
+
+test "sparse event sequences are acknowledged as exact ranges, never bridged" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "seed\r" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    for ([_]u64{ 2, 5, 9 }) |sequence| {
+        fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .state = .calling_model });
+        fake.item.?.delivery_epoch = 9;
+        fake.item.?.delivery_sequence = sequence;
+        try ui.pumpRemote();
+    }
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 3), fake.ack_range_count);
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_ranges[0].first);
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_ranges[0].last);
+    try std.testing.expectEqual(@as(u64, 5), fake.ack_ranges[1].first);
+    try std.testing.expectEqual(@as(u64, 5), fake.ack_ranges[1].last);
+    try std.testing.expectEqual(@as(u64, 9), fake.ack_ranges[2].first);
+    try std.testing.expectEqual(@as(u64, 9), fake.ack_ranges[2].last);
+    // A high later sequence never advances the contiguous cursors over the hole.
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+}
+
+test "a stalled selective ACK keeps cancel input live" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 1 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "seed\r" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .state = .calling_model });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 2;
+    try ui.pumpRemote();
+    fake.ack_range_failure = true;
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    try Ui.key(&ui, .cancel);
+    try std.testing.expect(ui.stop_open);
+}
+
+test "a missing range channel never closes a hole with a cumulative claim" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var vtable = FakeRemote.vtable;
+    vtable.acknowledge_range_fn = null;
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    ui.connection.session_client = .{ .context = &fake, .vtable = &vtable };
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "seed\r" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .state = .calling_model });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 2;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expect(ui.delivery_range_unsupported);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "range ACK unsupported") != null);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_range_count);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try std.testing.expect(!ui.delivery_fences.items[0].proven);
+}
+
+test "a coalesced raw span is acknowledged as its full interval, not its last sequence" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    // Primary body ends in a held CR: seq1 cannot be shown yet.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "seed\r" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    // One coalesced reasoning payload standing for raw events 2..1024, which the
+    // existing UX hides because prose already started.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .reasoning = "hidden reasoning tail" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_first_sequence = 2;
+    fake.item.?.delivery_sequence = 1024;
+    try ui.pumpRemote();
+    try std.testing.expectEqual(@as(usize, 2), ui.delivery_fences.items.len);
+    try std.testing.expectEqual(@as(u64, 2), ui.delivery_fences.items[1].first);
+    try std.testing.expectEqual(@as(u64, 1024), ui.delivery_fences.items[1].sequence);
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    // The whole coalesced interval is claimed; the singleton 1024 would strand
+    // raw sequences 2..1023 in the server ring.
+    try std.testing.expectEqual(@as(usize, 1), fake.ack_range_count);
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_ranges[0].first);
+    try std.testing.expectEqual(@as(u64, 1024), fake.ack_ranges[0].last);
+    // The CR hole still owns the contiguous cursors.
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try std.testing.expect(!ui.delivery_fences.items[0].proven);
+    // The later LF releases the hole and the whole prefix together.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "\n" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_first_sequence = 1025;
+    fake.item.?.delivery_sequence = 1025;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 1025), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 1025), ui.delivery_acked);
+    try std.testing.expectEqual(@as(u64, 1025), fake.ack_sequence);
+    try std.testing.expectEqual(@as(usize, 0), ui.delivery_fences.items.len);
+}
+
+test "an exactly empty payload inherits no held-CR source target" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    // Primary body ends in a held CR: seq1 owns a source target no frame can
+    // display yet.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "seed\r" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    const draft_id = ui.records.items[ui.draft.?].id;
+    const held = ui.records.items[ui.draft.?].stream.?.acceptedSourceEnd();
+    try std.testing.expect(held != 0);
+    // One coalesced EMPTY text payload standing for raw events 2..1024. It
+    // appends no source, so it must NOT be pointed at the draft's held-CR end:
+    // that target can never be shown and would strand the whole interval in the
+    // server ring until the finite fence queue blocks the resolving LF.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_first_sequence = 2;
+    fake.item.?.delivery_sequence = 1024;
+    try ui.pumpRemote();
+    try std.testing.expectEqual(@as(usize, 2), ui.delivery_fences.items.len);
+    const empty = ui.delivery_fences.items[1];
+    try std.testing.expectEqual(@as(u64, 2), empty.first);
+    try std.testing.expectEqual(@as(u64, 1024), empty.sequence);
+    // Metadata fence: no record, no source, no reasoning ownership.
+    try std.testing.expectEqual(@as(u64, 0), empty.record_id);
+    try std.testing.expectEqual(@as(u64, 0), empty.generation);
+    try std.testing.expectEqual(@as(usize, 0), empty.target);
+    try std.testing.expect(!empty.reasoning);
+    // The empty span added nothing to the body it did not own.
+    try std.testing.expectEqual(draft_id, ui.records.items[ui.draft.?].id);
+    try std.testing.expectEqual(held, ui.records.items[ui.draft.?].stream.?.acceptedSourceEnd());
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    // Its OWN fresh frame proves the whole coalesced interval exactly, while the
+    // CR hole still holds the contiguous cursors: no prefix release.
+    try std.testing.expectEqual(@as(usize, 1), fake.ack_range_count);
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_ranges[0].first);
+    try std.testing.expectEqual(@as(u64, 1024), fake.ack_ranges[0].last);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try std.testing.expect(!ui.delivery_fences.items[0].proven);
+    // A NON-EMPTY LF after that held CR does not move the accepted end at all
+    // (the held CR byte becomes the real newline), yet it renders a newline and
+    // keeps a real source obligation. "Accepted end unchanged" is therefore not
+    // a rule for metadata fences; only the exact empty payload is.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "\n" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_first_sequence = 1025;
+    fake.item.?.delivery_sequence = 1025;
+    try ui.pumpRemote();
+    const lf = ui.delivery_fences.items[ui.delivery_fences.items.len - 1];
+    try std.testing.expectEqual(@as(u64, 1025), lf.sequence);
+    try std.testing.expectEqual(draft_id, lf.record_id);
+    try std.testing.expect(lf.target != 0);
+    try std.testing.expect(!lf.reasoning);
+    try std.testing.expectEqual(held, ui.records.items[ui.draft.?].stream.?.acceptedSourceEnd());
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    // The resolving newline is displayed, so hole and interval settle together.
+    try std.testing.expectEqual(@as(u64, 1025), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 1025), ui.delivery_acked);
+    try std.testing.expectEqual(@as(u64, 1025), fake.ack_sequence);
+    try std.testing.expectEqual(@as(usize, 0), ui.delivery_fences.items.len);
+}
+
+test "an exactly empty reasoning payload keeps UX ownership without a new source" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    // Thinking only: no prose has started, so the thinking window is the frame.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .reasoning = "think\r" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    const reasoning_index = ui.reasoning.?;
+    const reasoning_id = ui.records.items[reasoning_index].id;
+    // Thinking rows are owned by the bounded plain Tail, never by an active
+    // assistant Body: the fixture must read the real owner, not a null stream.
+    try std.testing.expect(ui.records.items[reasoning_index].stream == null);
+    const reasoning_tail_ptr = ui.records.items[reasoning_index].tail;
+    try std.testing.expect(reasoning_tail_ptr != null);
+    const reasoning_tail = reasoning_tail_ptr.?;
+    const held = reasoning_tail.writer.pos;
+    const held_source_base = reasoning_tail.source_base;
+    const held_source_len = reasoning_tail.source.items.len;
+    const held_carry_len = reasoning_tail.carry_len;
+    const held_cr = reasoning_tail.held_cr;
+    // An empty coalesced reasoning span: it keeps the explicit thinking UX
+    // ownership but requires no new source bytes.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .reasoning = "" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_first_sequence = 2;
+    fake.item.?.delivery_sequence = 3;
+    try ui.pumpRemote();
+    const empty = ui.delivery_fences.items[ui.delivery_fences.items.len - 1];
+    try std.testing.expectEqual(@as(u64, 2), empty.first);
+    try std.testing.expectEqual(@as(u64, 3), empty.sequence);
+    try std.testing.expect(empty.reasoning);
+    try std.testing.expectEqual(reasoning_id, empty.record_id);
+    try std.testing.expectEqual(@as(usize, 0), empty.target);
+    try std.testing.expect(ui.records.items[reasoning_index].stream == null);
+    try std.testing.expect(ui.records.items[reasoning_index].tail == reasoning_tail);
+    try std.testing.expectEqual(held, reasoning_tail.writer.pos);
+    try std.testing.expectEqual(held_source_base, reasoning_tail.source_base);
+    try std.testing.expectEqual(held_source_len, reasoning_tail.source.items.len);
+    try std.testing.expectEqual(held_carry_len, reasoning_tail.carry_len);
+    try std.testing.expectEqual(held_cr, reasoning_tail.held_cr);
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    // A fresh frame that draws the newest thinking rows proves both sequences;
+    // nothing waits for source bytes that were never appended.
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_range_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.ack_count);
+    try std.testing.expectEqual(@as(u64, 3), fake.ack_sequence);
+    try std.testing.expectEqual(@as(usize, 0), ui.delivery_fences.items.len);
+}
+
+test "incremental reasoning fences retain their owner and frame admission boundary" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    for ([_][]const u8{ "first", " second" }, 1..) |chunk, seq| {
+        fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .reasoning = chunk });
+        fake.item.?.delivery_epoch = 9;
+        fake.item.?.delivery_sequence = @intCast(seq);
+        try ui.pumpRemote();
+    }
+    const index = ui.reasoning.?;
+    const generation = ui.records.items[index].stream_generation;
+    try std.testing.expectEqual(generation, ui.delivery_fences.items[0].generation);
+    try std.testing.expectEqual(generation, ui.delivery_fences.items[1].generation);
+    try ui.draw();
+    // A partial frame is not an ACK; a later admission cannot inherit this frame.
+    ui.frame_offset = ui.frame.len - 1;
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .reasoning = " third" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 3;
+    try ui.pumpRemote();
+    try std.testing.expectEqual(generation, ui.records.items[index].stream_generation);
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 3), fake.ack_sequence);
+}
+
+test "reasoning stale geometry and reset ABA never acknowledge old fences" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    for ([_][]const u8{ "first", " second" }, 1..) |chunk, seq| {
+        fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .reasoning = chunk });
+        fake.item.?.delivery_epoch = 9;
+        fake.item.?.delivery_sequence = @intCast(seq);
+        try ui.pumpRemote();
+    }
+    const index = ui.reasoning.?;
+    const generation = ui.records.items[index].stream_generation;
+    try std.testing.expectEqual(generation, ui.delivery_fences.items[0].generation);
+    try std.testing.expectEqual(generation, ui.delivery_fences.items[1].generation);
+    try ui.draw();
+    // A resize discards the frame even when geometry subsequently returns.
+    ui.resize(.{ .columns = 79, .rows = 24 });
+    ui.resize(.{ .columns = 80, .rows = 24 });
+    try std.testing.expectEqual(@as(usize, 0), ui.frame.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try ui.draw();
+    try ui.records.items[index].resetStream();
+    try std.testing.expect(ui.records.items[index].stream_generation != generation);
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try std.testing.expectEqual(generation, ui.delivery_fences.items[0].generation);
+}
+
+test "zero-row reference metadata requires a complete fresh unobscured commit" {
+    for (0..3) |scenario| {
+        var fake = FakeRemote{};
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = remoteUi(&fake, &bridge, &cancel);
+        defer ui.deinit();
+        const definition = "[r]: https://example.org/one\n\n";
+        fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = definition });
+        fake.item.?.delivery_epoch = 9;
+        fake.item.?.delivery_sequence = 1;
+        try ui.pumpRemote();
+        const index = ui.draft.?;
+        const body = ui.records.items[index].stream.?;
+        if (scenario == 2) ui.permission = .{ .id = 7, .description = try ui.allocator.dupe(u8, "approval"), .clipped = false, .pasted = false, .epoch = 9 };
+        try ui.draw();
+        try std.testing.expectEqual(@as(usize, 0), body.visibleRows().len);
+        try std.testing.expectEqual(@as(usize, 0), body.base);
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
+        if (scenario == 0) {
+            try std.testing.expect(ui.frame.len > 1);
+            ui.frame_offset = ui.frame.len - 1;
+            ui.finishFrame();
+            try std.testing.expectEqual(@as(usize, 0), body.base);
+            try std.testing.expect(body.references == null);
+            try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+        } else if (scenario == 1) ui.frame_fresh = false;
+        ui.frame_offset = ui.frame.len;
+        ui.finishFrame();
+        if (scenario != 0) {
+            try std.testing.expectEqual(@as(usize, 0), body.base);
+            try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
+            try std.testing.expect(body.references == null);
+            try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+            if (scenario == 2) ui.clearPermission();
+            try ui.draw();
+            ui.frame_offset = ui.frame.len;
+            ui.finishFrame();
+        }
+        try std.testing.expectEqual(definition.len, body.base);
+        try std.testing.expectEqual(definition.len, ui.records.items[index].delivery_visible);
+        try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+        try std.testing.expect(body.references != null);
+        fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "later [two][r]\n" });
+        fake.item.?.delivery_epoch = 9;
+        fake.item.?.delivery_sequence = 2;
+        try ui.pumpRemote();
+        try ui.draw();
+        var found = false;
+        for (body.visibleRows()) |row| if (std.mem.indexOf(u8, row.text, "https://example.org/one") != null) {
+            found = true;
+        };
+        try std.testing.expect(found);
+        ui.frame_offset = ui.frame.len;
+        ui.finishFrame();
+        try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);
+    }
+}
+
+test "unresolved zero-cut reference waits without redraw or source acknowledgement" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    const candidate = "[ref]: https://example.org/url\n";
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = candidate });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    const index = ui.draft.?;
+    const body = ui.records.items[index].stream.?;
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 0), body.visibleRows().len);
+    try std.testing.expect(!body.hasMetadataProgress());
+    ui.dirty = false;
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expect(!ui.dirty);
+    try std.testing.expectEqual(@as(usize, 0), body.base);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try std.testing.expectEqual(@as(usize, candidate.len), body.windowBytes());
+    try std.testing.expect(body.references == null);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "  \"title\"\n\n[link][ref]\n" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 2;
+    try ui.pumpRemote();
+    try ui.draw();
+    var found = false;
+    for (body.visibleRows()) |row| if (std.mem.indexOf(u8, row.text, "https://example.org/url") != null) {
+        found = true;
+    };
+    try std.testing.expect(found);
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);
+}
+
+test "an unexplained generation replacement is never acknowledged, even later" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "abcdef" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    try ui.draw();
+    const index = ui.draft.?;
+    // Nobody asked for this replacement: an ABA/generation mismatch is not
+    // authority to ACK, neither through the stale frame nor any later one.
+    try ui.records.items[index].resetStream();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    for (0..3) |_| {
+        try ui.draw();
+        ui.frame_offset = ui.frame.len;
+        ui.finishFrame();
+    }
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    // The fence kept its own generation; no inference rewrote it.
+    try std.testing.expect(ui.delivery_fences.items[0].generation != ui.records.items[index].stream_generation);
+    // Only an explicit canonical replacement retargets the same sequences to the
+    // replacement's own display obligation, and only a fresh frame proves it.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .assistant_committed = &.{.{ .text = "abcdef" }} });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 2;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);
+}
+
+test "256 CR-terminated events prove every earlier sequence while the last CR waits" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    var sequence: u64 = 1;
+    while (sequence <= delivery_fence_capacity) : (sequence += 1) {
+        const chunk = [2]u8{ 'a' + @as(u8, @intCast(sequence % 26)), '\r' };
+        fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = &chunk });
+        fake.item.?.delivery_epoch = 9;
+        fake.item.?.delivery_sequence = sequence;
+        try ui.pumpRemote();
+    }
+    // Every event keeps its own ordered fence: the last target cannot swallow
+    // the earlier ones, so the queue is exactly the bound.
+    try std.testing.expectEqual(@as(usize, delivery_fence_capacity), ui.delivery_fences.items.len);
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    // All shown prefixes are proven; only the pending CR byte (no row can
+    // represent it yet) keeps the newest sequence outstanding.
+    try std.testing.expectEqual(@as(u64, delivery_fence_capacity - 1), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, delivery_fence_capacity - 1), fake.ack_sequence);
+    try std.testing.expectEqual(@as(usize, 1), ui.delivery_fences.items.len);
+    // The resolving chunk settles the last sequence too.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "\n" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = delivery_fence_capacity + 1;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, delivery_fence_capacity + 1), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, delivery_fence_capacity + 1), fake.ack_sequence);
+}
+
+test "a full delivery fence queue blocks polling without losing the event" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 1 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.delivery_epoch = 9;
+    var sequence: u64 = 1;
+    while (sequence <= delivery_fence_capacity) : (sequence += 1)
+        ui.pushDeliveryFence(.{ .epoch = 9, .sequence = sequence });
+    try std.testing.expectEqual(@as(usize, delivery_fence_capacity), ui.delivery_fences.items.len);
+    try std.testing.expect(ui.displayBackpressured());
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "must not be consumed" });
+    defer if (fake.item) |*item| item.deinit();
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = delivery_fence_capacity + 1;
+    try ui.pumpDisplay();
+    try std.testing.expect(fake.item != null);
+    try std.testing.expectEqual(@as(usize, 0), bridge.len);
+    try std.testing.expect(!ui.delivery_fault);
+    try std.testing.expectEqual(@as(usize, delivery_fence_capacity), ui.delivery_fences.items.len);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+}
+
+test "an event applied after the frame was built is never covered by it" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "abcdef" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+    // Stage a frame, THEN apply an event whose target is already covered by the
+    // pinned rows. The earlier admission snapshot cannot prove it.
+    try ui.draw();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .assistant_committed = &.{.{ .text = "abcdef" }} });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 2;
+    try ui.pumpRemote();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 1), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+    // A frame staged after that admission does cover it.
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);
+}
+
+test "canonical replacement waits for its own rendered source" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "aaaa" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    try ui.draw();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .assistant_committed = &.{.{ .text = "bbbbbbbb" }} });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 2;
+    try ui.pumpRemote();
+    // The stale frame shows the retired generation, so it proves neither.
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    // Both sequences now own the replacement's source; the fresh frame proves it.
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_sequence);
+}
+
+test "successive frames prove progressively more of one active body" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    // Comfortably more than the renderer's default 4 KiB work window.
+    for (0..900) |_| try body.appendSlice(std.testing.allocator, "abcdef\n");
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = body.items });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    // The first window is displayed but the accepted tail is not; no ACK yet.
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    for (0..8) |_| {
+        if (ui.delivery_proven == 1) break;
+        try ui.draw();
+        ui.frame_offset = ui.frame.len;
+        ui.finishFrame();
+    }
+    try std.testing.expectEqual(@as(u64, 1), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
+    // Retained source is not EOF: the answer is still streaming in display terms.
+    try std.testing.expect(ui.records.items[ui.draft.?].stream.?.windowBytes() != 0);
+}
+
+test "an unsupported ACK enqueue never retires live delivery" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var vtable = FakeRemote.vtable;
+    vtable.acknowledge_fn = null;
+    vtable.acknowledge_range_fn = null;
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    ui.connection.session_client = .{ .context = &fake, .vtable = &vtable };
+    defer ui.deinit();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "cannot ack" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = 1;
+    try ui.pumpRemote();
+    try ui.draw();
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(u64, 1), ui.delivery_proven);
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_acked);
+    try std.testing.expect(!ui.delivery_fault);
+    // The lack of an ACK channel is reported, never treated as an ACK.
+    try std.testing.expect(ui.delivery_ack_unsupported);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "ACK unsupported") != null);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+}
+
+test "an unmet delivery fence protects its record from eviction" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.add(.user, "old output");
+    ui.records.items[0].output = true;
+    _ = try ui.add(.user, "live tail");
+    ui.draft = 1;
+    ui.reasoning = 1;
+    try std.testing.expect(ui.canEvictOldest());
+    const id = ui.records.items[0].id;
+    ui.pushDeliveryFence(.{ .epoch = 9, .sequence = 1, .record_id = id });
+    try std.testing.expect(!ui.canEvictOldest());
+    ui.delivery_fences.items[0].proven = true;
+    try std.testing.expect(ui.canEvictOldest());
+}
+
+test "remote delivery rejects resized and stale record frames" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.admitDelivery(9, 1);
+    try ui.draw();
+    ui.discardResizedFrame();
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try ui.draw();
+    var stale = [_]FrameRecord{.{ .record_id = 999999, .generation = 1 }};
+    ui.frame_records = &stale;
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+}
+
+test "remote delivery revokes pending proof on epoch takeover" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.admitDelivery(9, 1);
+    try ui.draw();
+    fake.snapshot.control_epoch = 2;
+    ui.frame_offset = ui.frame.len;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    ui.resetSessionView(&fake.snapshot);
+    ui.retryDeliveryAck();
+    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+}
+
+test "display admission leaves remote event queued while cancel input remains live" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 1 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    for (0..62) |_| _ = try ui.add(.user, "pending");
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "not consumed" });
+    defer if (fake.item) |*item| item.deinit();
+    try ui.pumpDisplay();
+    try std.testing.expect(fake.item != null);
+    try std.testing.expectEqual(@as(usize, 0), bridge.len);
+    try Ui.key(&ui, .cancel);
+    try std.testing.expect(ui.stop_open);
+}
+
+test "synchronizing remote view never paints an idle prompt or invents a running task" {
+    var fake = FakeRemote{ .snapshot = .{ .available = false, .attached = true, .control_epoch = 1 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    ui.adoptRemoteActivity(&fake.snapshot);
+    try std.testing.expect(!ui.busy and ui.remoteSynchronizing());
+    try std.testing.expect(!ui.settingsIdle());
+    const before = try ui.prepareComposer(arena.allocator(), ui.connection.current(), 79);
+    try std.testing.expect(!std.mem.endsWith(u8, before.decoration.plain, "> "));
+    try typeDraft(&ui, "kept");
+    try std.testing.expect(!try ui.remoteStart(fake.client(), .prompt, ui.editor.bytes.items));
+    try std.testing.expectEqualStrings("kept", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+    try std.testing.expectEqualStrings("Synchronizing session; draft kept", ui.notice);
+    ui.dirty = false;
+    fake.snapshot.available = true;
+    ui.adoptRemoteActivity(&fake.snapshot);
+    try std.testing.expect(ui.dirty and !ui.busy and !ui.remoteSynchronizing());
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    const after = try ui.prepareComposer(arena.allocator(), ui.connection.current(), 79);
+    try std.testing.expect(std.mem.endsWith(u8, after.decoration.plain, "> "));
+}
+
+test "remote display drains a bounded batch without polling empty pages or settling queued output" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 4 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    var items: [72]session_client.Item = undefined;
+    var initialized: usize = 0;
+    defer for (items[fake.buffered_index..initialized]) |*item| item.deinit();
+    for (0..70) |index| {
+        items[index] = try session_client.ownEvent(std.testing.allocator, 4, .{ .text = "x" });
+        initialized += 1;
+    }
+    const body: [70]u8 = @splat('x');
+    const blocks = [_]p.Block{.{ .text = &body }};
+    items[70] = try session_client.ownEvent(std.testing.allocator, 4, .{ .assistant_committed = &blocks });
+    initialized += 1;
+    items[71] = try session_client.ownEvent(std.testing.allocator, 4, .{ .finished = (session_client.Terminal{ .status = .success }).toRuntime() });
+    initialized += 1;
+    fake.buffered_items = &items;
+    // The owner has already finished, but queued live events still own display.
+    fake.snapshot.busy = false;
+    try ui.pumpDisplay();
+    try std.testing.expectEqual(@as(usize, 64), fake.buffered_index);
+    try std.testing.expectEqual(@as(usize, 64), ui.records.items[ui.draft.?].body.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.empty_polls);
+    try std.testing.expect(ui.busy and ui.last_terminal == null);
+    try std.testing.expectEqual(@as(u8, 0), ui.remote_idle_ticks);
+    try ui.pumpDisplay();
+    try std.testing.expectEqual(@as(usize, 72), fake.buffered_index);
+    try std.testing.expectEqual(@as(usize, 0), fake.empty_polls);
+    try ui.complete();
+    try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
+    try std.testing.expect(!ui.busy);
+    try std.testing.expectEqualStrings(&body, ui.records.items[ui.records.items.len - 1].body.items);
+    // One empty tick makes just one adapter poll, not 64 synchronous RPCs.
+    try ui.pumpDisplay();
+    try std.testing.expectEqual(@as(usize, 1), fake.empty_polls);
 }
 
 test "remote deinit detaches and never cancels or clears the daemon task" {
@@ -12547,6 +16495,295 @@ test "remote approval binds the epoch that displayed it and bypasses the local b
     try std.testing.expect(ui.permission == null);
 }
 
+const FakeAsync = struct {
+    requests: [8]?*remote_action.Owned = @splat(null),
+    next: usize = 0,
+    completed: ?remote_action.Completion = null,
+
+    fn channel(self: *FakeAsync) remote_action.Channel {
+        return .{ .context = self, .start_fn = start, .poll_fn = poll, .wake_fd = -1 };
+    }
+    fn start(raw: *anyopaque, epoch: u64, action: remote_action.Action) !u64 {
+        const self: *FakeAsync = @ptrCast(@alignCast(raw));
+        if (self.next == self.requests.len) return error.QueueFull;
+        const ticket: u64 = @intCast(self.next + 1);
+        self.requests[self.next] = try remote_action.Owned.create(std.testing.allocator, ticket, 1, epoch, action);
+        self.next += 1;
+        return ticket;
+    }
+    fn poll(raw: *anyopaque) ?remote_action.Completion {
+        const self: *FakeAsync = @ptrCast(@alignCast(raw));
+        const value = self.completed;
+        self.completed = null;
+        return value;
+    }
+    fn complete(self: *FakeAsync, value: remote_action.Value, failure: ?anyerror, obsolete: bool) void {
+        std.debug.assert(self.completed == null);
+        for (&self.requests) |*slot| if (slot.*) |request| {
+            self.completed = .{ .request = request, .value = value, .failure = failure, .obsolete = obsolete };
+            slot.* = null;
+            return;
+        };
+        unreachable;
+    }
+    fn deinit(self: *FakeAsync) void {
+        for (self.requests) |slot| if (slot) |request| request.deinit();
+        if (self.completed) |*value| value.deinit();
+    }
+};
+
+test "multiple reserved async records survive intervening display records" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    for (0..4) |slot| {
+        try ui.reserveRecord();
+        const ticket = try FakeAsync.start(&actions, 6, .{ .submit = .{ .kind = .prompt, .text = "reserved" } });
+        var record = Record{ .kind = .user };
+        try record.append(std.testing.allocator, "reserved");
+        ui.async_pending[slot] = .{
+            .ticket = ticket,
+            .purpose = .submit,
+            .original_editor = try std.testing.allocator.dupe(u8, ""),
+            .editor_revision = 0,
+            .epoch = 6,
+            .permission_id = null,
+            .previous_effort = ui.connection.current().reasoning_effort,
+            .settings_generation = 0,
+            .stop_instance = 0,
+            .record = record,
+        };
+        _ = try ui.add(.notice, "intervening event");
+    }
+    for (0..4) |_| {
+        actions.complete(.none, null, false);
+        ui.pumpAsync();
+    }
+    try std.testing.expectEqual(@as(usize, 8), ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 8), ui.record_index.count());
+    for (ui.records.items, 0..) |record, index| try std.testing.expectEqual(index, ui.record_index.get(record.id).?);
+}
+
+test "async submit queues behind an effort probe without dropping Enter" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    try std.testing.expect(ui.beginAsync(.cycle_effort, .effort) != null);
+    try typeDraft(&ui, "after probe");
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 2), actions.next);
+    try std.testing.expectEqualStrings("after probe", actions.requests[1].?.action.submit.text);
+    actions.complete(.none, error.ThinkingCapabilitiesUnknown, false);
+    ui.pumpAsync();
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqualStrings("after probe", ui.records.items[0].body.items);
+}
+
+test "late cancel acknowledgements do not overwrite the terminal result" {
+    for ([_]bool{ false, true }) |clear| {
+        var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
+        var actions: FakeAsync = .{};
+        defer actions.deinit();
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = remoteUi(&fake, &bridge, &cancel);
+        defer ui.deinit();
+        ui.connection.async_actions = actions.channel();
+        try std.testing.expect(ui.beginAsync(if (clear) .{ .cancel_clear = 1 } else .cancel, if (clear) .cancel_clear else .cancel) != null);
+        ui.last_terminal = .{ .status = .canceled, .detail = error.Canceled };
+        ui.busy = false;
+        ui.notice = "Canceled; prior side effects remain";
+        actions.complete(.none, null, false);
+        ui.pumpAsync();
+        try std.testing.expectEqualStrings("Canceled; prior side effects remain", ui.notice);
+    }
+}
+
+test "async metadata errors retain the actionable synchronous notice" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    try std.testing.expect(ui.beginAsync(.refresh_models, .refresh) != null);
+    actions.complete(.none, error.NoOfficialProvider, false);
+    ui.pumpAsync();
+    try std.testing.expectEqualStrings("No official provider configured; use /login first", ui.notice);
+    try std.testing.expect(ui.beginAsync(.cycle_effort, .effort) != null);
+    actions.complete(.none, error.ThinkingCapabilitiesLoading, false);
+    ui.pumpAsync();
+    try std.testing.expectEqualStrings("Thinking capabilities are loading; try Shift+Tab again shortly", ui.notice);
+}
+
+test "async submit commits once after receipt and preserves newer draft" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    try typeDraft(&ui, "first prompt");
+    try std.testing.expect(!try ui.remoteStart(fake.client(), .prompt, ui.editor.bytes.items));
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+    try std.testing.expect(!ui.busy);
+    try std.testing.expect(ui.presentationWaiting());
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const pending_composer = try ui.prepareComposer(arena.allocator(), ui.connection.current(), 79);
+    try std.testing.expect(!std.mem.endsWith(u8, pending_composer.decoration.plain, "> "));
+    ui.wipeEditor();
+    try typeDraft(&ui, "new draft");
+    try std.testing.expectEqualStrings("first prompt", actions.requests[0].?.action.submit.text);
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    ui.pumpAsync();
+    try std.testing.expect(!ui.presentationWaiting());
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqualStrings("first prompt", ui.records.items[0].body.items);
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    try std.testing.expectEqualStrings("new draft", ui.editor.bytes.items);
+}
+
+test "async acceptance preserves identical text that was cleared and retyped" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    try typeDraft(&ui, "repeat this");
+    try std.testing.expect(!try ui.remoteStart(fake.client(), .prompt, ui.editor.bytes.items));
+    try Ui.key(&ui, .clear);
+    try Ui.key(&ui, .{ .text = .{ .value = "repeat this", .pasted = false } });
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expectEqualStrings("repeat this", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+}
+
+test "async rejected and obsolete submissions keep draft without publishing history" {
+    for ([_]bool{ false, true }) |obsolete| {
+        var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+        var actions: FakeAsync = .{};
+        defer actions.deinit();
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = remoteUi(&fake, &bridge, &cancel);
+        defer ui.deinit();
+        ui.connection.async_actions = actions.channel();
+        try typeDraft(&ui, "keep this");
+        try std.testing.expect(!try ui.remoteStart(fake.client(), .prompt, ui.editor.bytes.items));
+        actions.complete(.none, if (obsolete) null else error.Rejected, obsolete);
+        ui.pumpAsync();
+        try std.testing.expectEqualStrings("keep this", ui.editor.bytes.items);
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+        try std.testing.expect(!ui.normalAsyncPending());
+        try std.testing.expect(!ui.busy);
+    }
+}
+
+test "authoritative baseline replaces accepted user echo without erasing a new draft" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.add(.notice, "startup banner");
+    try std.testing.expect(try ui.remoteStart(fake.client(), .prompt, "accepted prompt"));
+    try typeDraft(&ui, "next draft");
+    var item = try session_client.ownEvent(std.testing.allocator, 6, .{ .user_committed = .{ .id = 1, .text = "accepted prompt" } });
+    item.history_reset = true;
+    item.history_display_reset = true;
+    item.history_replay = true;
+    fake.item = item;
+    try ui.pumpDisplay();
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expectEqualStrings("startup banner", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("accepted prompt", ui.records.items[1].body.items);
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    try std.testing.expectEqualStrings("next draft", ui.editor.bytes.items);
+}
+
+test "async queue reply does not block body delivery or erase typeahead" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    try typeDraft(&ui, "queued message");
+    try ui.enqueueDraft(.steering);
+    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
+    ui.wipeEditor();
+    try typeDraft(&ui, "typeahead");
+    fake.item = try session_client.ownEvent(std.testing.allocator, 6, .{ .text = "live body" });
+    try ui.pumpDisplay();
+    try std.testing.expect(ui.draft != null);
+    try std.testing.expectEqualStrings("live body", ui.records.items[ui.draft.?].body.items);
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expectEqualStrings("typeahead", ui.editor.bytes.items);
+    try std.testing.expectEqualStrings("Steering pending", ui.notice);
+}
+
+test "late async approval cannot clear or relabel a newer permission" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 6, .{ .permission = .{ .id = 11, .tool_name = "bash", .description = "old request" } });
+    try ui.pumpDisplay();
+    ui.decidePermission(.deny, false);
+    try std.testing.expectEqual(@as(usize, 0), fake.approvals);
+    try std.testing.expect(ui.permission != null);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 6, .{ .permission = .{ .id = 12, .tool_name = "bash", .description = "new request" } });
+    try ui.pumpDisplay();
+    ui.notice = "New request";
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expectEqual(@as(u64, 12), ui.permission.?.id);
+    try std.testing.expectEqualStrings("New request", ui.notice);
+}
+
 test "remote queue sends bind the current epoch and are never launched locally" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
     var cancel: p.Cancellation = .{};
@@ -12611,6 +16848,27 @@ test "remote management commands run while busy instead of entering steering" {
     try std.testing.expectEqual(@as(?r.State, .awaiting_permission), ui.mode);
 }
 
+test "remote committed flags survive direct application without bridge payload" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    for ([_]bool{ true, false }) |clipped| {
+        try ui.appendDraft(.assistant, "remote-stream");
+        const id = ui.records.items[ui.draft.?].id;
+        fake.item = try session_client.ownEvent(std.testing.allocator, 6, .{ .assistant_committed = &.{} });
+        fake.item.?.display_truncated = clipped;
+        fake.item.?.canonical_complete = clipped;
+        try ui.pumpRemote();
+        try std.testing.expect(ui.bridgeEmpty());
+        const index = ui.record_index.get(id).?;
+        try std.testing.expectEqualStrings("remote-stream", ui.records.items[index].body.items);
+        try std.testing.expect(ui.records.items[index].clipped);
+    }
+}
+
 test "remote terminal completes without a local future and marks the task idle once" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
     var cancel: p.Cancellation = .{};
@@ -12647,11 +16905,13 @@ test "remote lost terminal fallback settles only after two consecutive idle samp
     fake.snapshot.busy = false;
     try ui.pumpRemote();
     try std.testing.expect(ui.busy);
+    try std.testing.expect(!ui.remote_terminal_wait);
     try std.testing.expectEqual(@as(u8, 1), ui.remote_idle_ticks);
     try std.testing.expect(ui.last_terminal == null);
     // The second consecutive idle sample settles the view without a success.
     try ui.pumpRemote();
     try std.testing.expect(!ui.busy);
+    try std.testing.expect(!ui.remote_terminal_wait);
     try std.testing.expect(ui.mode == null);
     try std.testing.expectEqual(@as(u8, 0), ui.remote_idle_ticks);
     try std.testing.expect(ui.last_terminal == null);
@@ -12799,30 +17059,186 @@ test "remote decision diagnostic survives terminal copies and empty paused queue
     try std.testing.expect(std.mem.find(u8, try ui.footerHint(arena.allocator(), ui.connection.current()), "/queue resume") != null);
 }
 
-test "remote owner still busy re-adopts the next task after the local view went idle" {
-    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 13 } };
+test "handled remote terminal keeps the busy composer until ordered owner idle" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .mode = .calling_model, .control_epoch = 14 } };
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = remoteUi(&fake, &bridge, &cancel);
     defer ui.deinit();
-    // Task 1: the owner stays busy while its terminal returns the local view to
-    // idle, so `remote_observed_busy` is still true afterwards.
+    try std.testing.expect(ui.busy and ui.remote_observed_busy);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 14, .{ .finished = (session_client.Terminal{ .status = .canceled, .failure = .canceled }).toRuntime() });
+    try ui.pumpRemote();
+    try ui.finishReadyTask();
+    // The terminal is handled while the owner still reports this task busy, so
+    // no idle composer or settings-idle state is published and the result holds.
+    try std.testing.expect(ui.busy);
+    try std.testing.expect(ui.remote_terminal_wait);
+    try std.testing.expect(!ui.settingsIdle());
+    try std.testing.expect(ui.mode == null);
+    try std.testing.expectEqual(r.Status.canceled, ui.last_terminal.?.status);
+    try std.testing.expectEqual(error.Canceled, ui.last_terminal.?.detail.?);
+    try std.testing.expectEqualStrings("Canceled; prior side effects remain", ui.notice);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const held = try ui.prepareComposer(arena.allocator(), ui.connection.current(), 79);
+    try std.testing.expect(!std.mem.endsWith(u8, held.decoration.plain, "> "));
+    // Ordered owner idle releases the held view without inventing a missing
+    // terminal or discarding the real result and its exact failure detail.
+    ui.dirty = false;
+    fake.snapshot.busy = false;
+    try ui.pumpRemote();
+    try std.testing.expect(ui.busy and ui.remote_terminal_wait);
+    try std.testing.expectEqualStrings("Canceled; prior side effects remain", ui.notice);
+    try ui.pumpRemote();
+    try std.testing.expect(!ui.busy);
+    try std.testing.expect(!ui.remote_terminal_wait);
+    try std.testing.expect(ui.mode == null);
+    try std.testing.expectEqual(@as(u8, 0), ui.remote_idle_ticks);
+    try std.testing.expect(ui.dirty);
+    try std.testing.expect(ui.settingsIdle());
+    try std.testing.expectEqual(r.Status.canceled, ui.last_terminal.?.status);
+    try std.testing.expectEqual(error.Canceled, ui.last_terminal.?.detail.?);
+    try std.testing.expectEqualStrings("Canceled; prior side effects remain", ui.notice);
+}
+
+test "one display batch settles a terminal before the next task state and text" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .mode = .calling_model, .control_epoch = 15 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try std.testing.expect(ui.busy);
+    var items: [3]session_client.Item = undefined;
+    var initialized: usize = 0;
+    defer for (items[fake.buffered_index..initialized]) |*item| item.deinit();
+    items[0] = try session_client.ownEvent(std.testing.allocator, 15, .{ .finished = (session_client.Terminal{ .status = .canceled, .failure = .canceled }).toRuntime() });
+    initialized += 1;
+    items[1] = try session_client.ownEvent(std.testing.allocator, 15, .{ .state = .awaiting_permission });
+    initialized += 1;
+    items[2] = try session_client.ownEvent(std.testing.allocator, 15, .{ .text = "second task" });
+    initialized += 1;
+    fake.buffered_items = &items;
+    fake.snapshot.task_kind = .command;
+    // finished(task 1), state(task 2) and text(task 2) share one bounded batch:
+    // the terminal must settle first, and the ordered state then adopts task 2.
+    try ui.pumpDisplay();
+    try std.testing.expectEqual(@as(usize, 3), fake.buffered_index);
+    try std.testing.expect(!ui.remote_terminal_wait);
+    try std.testing.expect(ui.last_terminal == null);
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqual(@as(?r.State, .awaiting_permission), ui.mode);
+    try std.testing.expectEqual(session_client.TaskKind.command, ui.remote_kind);
+    try std.testing.expectEqualStrings("Attached; task is running", ui.notice);
+    // Task 2's body is live content, not task 1's interrupted residue.
+    try std.testing.expect(ui.draft != null);
+    try std.testing.expectEqualStrings("second task", ui.records.items[ui.draft.?].body.items);
+    try std.testing.expect(!ui.records.items[ui.draft.?].interrupted);
+}
+
+test "one display batch starts a next task after a terminal when the owner already reports idle" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 18 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try std.testing.expect(!ui.busy);
+    var items: [3]session_client.Item = undefined;
+    var initialized: usize = 0;
+    defer for (items[fake.buffered_index..initialized]) |*item| item.deinit();
+    items[0] = try session_client.ownEvent(std.testing.allocator, 18, .{ .finished = (session_client.Terminal{ .status = .success }).toRuntime() });
+    initialized += 1;
+    items[1] = try session_client.ownEvent(std.testing.allocator, 18, .{ .state = .executing_tool });
+    initialized += 1;
+    items[2] = try session_client.ownEvent(std.testing.allocator, 18, .{ .text = "next task" });
+    initialized += 1;
+    fake.buffered_items = &items;
+    fake.snapshot.task_kind = .command;
+    // The terminal settles against an already-idle owner view, and the ordered
+    // state in the same batch is still the next task, not task 1 residue.
+    try ui.pumpDisplay();
+    try std.testing.expectEqual(@as(usize, 3), fake.buffered_index);
+    try std.testing.expect(ui.last_terminal == null);
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqual(@as(?r.State, .executing_tool), ui.mode);
+    try std.testing.expectEqual(session_client.TaskKind.command, ui.remote_kind);
+    try std.testing.expectEqualStrings("Attached; task is running", ui.notice);
+    try std.testing.expect(!std.mem.eql(u8, ui.notice, "Remote task ended without a terminal result; reattach to verify"));
+    try std.testing.expect(ui.draft != null);
+    try std.testing.expectEqualStrings("next task", ui.records.items[ui.draft.?].body.items);
+    try std.testing.expect(!ui.records.items[ui.draft.?].interrupted);
+}
+
+test "late cancel acknowledgement cannot replace a result awaiting owner idle" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .mode = .calling_model, .control_epoch = 17 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    fake.item = try session_client.ownEvent(std.testing.allocator, 17, .{ .finished = (session_client.Terminal{ .status = .failed, .failure = .transport }).toRuntime() });
+    try ui.pumpRemote();
+    try ui.finishReadyTask();
+    try std.testing.expect(ui.busy and ui.remote_terminal_wait);
+    try std.testing.expectEqualStrings("Failed", ui.notice);
+    // The user's late cancellation still travels to the owner, but its receipt
+    // must not replace the handled result while ordered idle is still pending.
+    try std.testing.expect(ui.beginAsync(.cancel, .cancel) != null);
+    try std.testing.expectEqualStrings("Waiting for session...", ui.notice);
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expectEqualStrings("Failed", ui.notice);
+    try std.testing.expect(ui.busy and ui.remote_terminal_wait);
+    try std.testing.expectEqual(r.Status.failed, ui.last_terminal.?.status);
+    try std.testing.expectEqual(error.Transport, ui.last_terminal.?.detail.?);
+    // Ordered idle then releases the view and keeps the same result.
+    fake.snapshot.busy = false;
+    try ui.pumpRemote();
+    try ui.pumpRemote();
+    try std.testing.expect(!ui.busy);
+    try std.testing.expectEqualStrings("Failed", ui.notice);
+    try std.testing.expectEqual(r.Status.failed, ui.last_terminal.?.status);
+}
+
+test "remote owner still busy keeps the handled result until ordered next-task state" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .mode = .calling_model, .control_epoch = 13 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    // Task 1: the owner stays busy while its terminal arrives, so the view keeps
+    // the busy composer instead of painting an idle prompt it would re-busy.
     try std.testing.expect(ui.busy and ui.remote_observed_busy);
     fake.item = try session_client.ownEvent(std.testing.allocator, 13, .{ .finished = (session_client.Terminal{ .status = .success }).toRuntime() });
     try ui.pumpRemote();
     try ui.finishReadyTask();
-    try std.testing.expect(!ui.busy);
+    try std.testing.expect(ui.busy);
+    try std.testing.expect(ui.remote_terminal_wait);
+    try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
     try std.testing.expect(ui.remote_observed_busy);
-    // Task 2 starts while the owner is still busy: no idle snapshot intervenes,
-    // so requiring `!remote_observed_busy` here would never adopt it.
-    fake.snapshot.mode = .calling_model;
+    // A bare busy snapshot proves neither ordering nor a next task.
     fake.snapshot.task_kind = .command;
     try ui.pumpRemote();
+    try std.testing.expect(ui.remote_terminal_wait);
+    try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    // An ordered state event is the next task: it ends the wait and adopts it
+    // from the current owner snapshot rather than from a busy boolean edge.
+    fake.item = try session_client.ownEvent(std.testing.allocator, 13, .{ .state = .calling_model });
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expect(!ui.remote_terminal_wait);
+    try std.testing.expect(ui.last_terminal == null);
     try std.testing.expect(ui.busy);
     try std.testing.expectEqual(@as(?r.State, .calling_model), ui.mode);
     try std.testing.expectEqual(session_client.TaskKind.command, ui.remote_kind);
-    try std.testing.expect(ui.remote_observed_busy);
     try std.testing.expectEqualStrings("Attached; task is running", ui.notice);
 }
 

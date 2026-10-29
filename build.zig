@@ -66,8 +66,21 @@ pub fn build(b: *std.Build) void {
     addSsh(b, unit.root_module, ssh_include, ssh_library);
     // Test-only parser copy with allocation injection; never linked into thin.
     unit.root_module.addCSourceFile(.{ .file = b.path("src/tests/md4c_fault_test.c"), .flags = &.{"-std=c11"} });
+    unit.root_module.addCSourceFile(.{ .file = b.path("src/tests/md4c_stream_blocks_test.c"), .flags = &.{"-std=c11"} });
     const run_unit = b.addRunArtifact(unit);
     b.step("test-unit", "Run product unit tests without network or credentials").dependOn(&run_unit.step);
+
+    // Filters belong to separate compile artifacts, never to the full unit suite.
+    const focus_filter = b.option([]const u8, "test-filter", "Nonempty substring for test-focus");
+    const focus_step = b.step("test-focus", "Run unit tests matching -Dtest-filter");
+    if (focus_filter) |filter| {
+        if (std.mem.trim(u8, filter, " \t\r\n").len != 0) {
+            const focused = b.addTest(.{ .use_llvm = false, .root_module = unit.root_module, .filters = &.{filter} });
+            focus_step.dependOn(&b.addRunArtifact(focused).step);
+        } else focus_step.dependOn(&b.addFail("test-focus requires a nonempty -Dtest-filter").step);
+    } else focus_step.dependOn(&b.addFail("test-focus requires a nonempty -Dtest-filter").step);
+    const rendering = b.addTest(.{ .use_llvm = false, .root_module = unit.root_module, .filters = &.{ "ui.", "util.display_text." } });
+    b.step("test-render", "Run rendering-related unit tests").dependOn(&b.addRunArtifact(rendering).step);
 
     const memory_tests = b.addTest(.{
         .use_llvm = false,
@@ -169,6 +182,8 @@ pub fn build(b: *std.Build) void {
     // 应用验收：Node 脚本同时拿到 thin 可执行文件与 PTY 驱动，在隔离环境中运行 CLI 与 PTY 测试。
     const run_app = fixture(b, "node", "tests/product/app_mock.mjs", &.{ exe, pty_driver }, &.{});
     b.step("test-app", "Run isolated CLI and PTY application acceptance (requires Node)").dependOn(&run_app.step);
+    const run_streaming = fixture(b, "node", "tests/product/app_mock.mjs", &.{ exe, pty_driver }, &.{"--streaming-only"});
+    b.step("test-streaming", "Run focused streaming Markdown and history PTY acceptance").dependOn(&run_streaming.step);
 
     const run_memory_app = fixture(b, "node", "tests/product/memory_auto_mock.mjs", &.{exe}, &.{});
     b.step("test-memory-app", "Run owned loopback automatic-memory CLI lifecycle acceptance").dependOn(&run_memory_app.step);
@@ -187,12 +202,14 @@ pub fn build(b: *std.Build) void {
     // Daemon/attach/takeover acceptance over owned loopback and a real PTY.
     const run_daemon = fixture(b, "python3", "tests/product/daemon_mock.py", &.{exe}, &.{});
     b.step("test-daemon", "Run owned daemon/attach/takeover/approval/SIGTERM acceptance").dependOn(&run_daemon.step);
+    const run_subscription = fixture(b, "python3", "tests/product/subscription_mock.py", &.{exe}, &.{});
+    b.step("test-subscription", "Run owned push-stream binding, watermark and slow-reader acceptance").dependOn(&run_subscription.step);
 
     const run_idle_enter = fixture(b, "python3", "tests/product/idle_enter_mock.py", &.{exe}, &.{});
     b.step("test-idle-enter", "Run owned idle prompt newline PTYs (requires Python 3)").dependOn(&run_idle_enter.step);
 
     const run_resize = fixture(b, "python3", "tests/product/resize_deferred_mock.py", &.{exe}, &.{});
-    b.step("test-resize-deferred", "Run owned deferred resize, animation and fresh-ACK PTY checks").dependOn(&run_resize.step);
+    b.step("test-resize-deferred", "Run owned passive size/safety, ACK invalidation and stream-resume PTY checks (no auto repair)").dependOn(&run_resize.step);
 
     const viewport_step = b.step("test-resize-viewport", "Run owned tmux viewport, multiline composer and local-command lifecycle checks");
     // Same script and artifacts; only the viewport mode differs.
@@ -226,14 +243,29 @@ pub fn build(b: *std.Build) void {
     const run_queued = fixture(b, "node", "tests/product/steering_followup_mock.mjs", &.{ exe, pty_driver }, &.{});
     b.step("test-queued", "Run owned steering, follow-up, withdrawal and stop-clear confirmation PTYs").dependOn(&run_queued.step);
 
+    const interaction = b.step("test-interaction", "Run selected interaction PTY fixtures");
+    interaction.dependOn(&run_idle_enter.step);
+    interaction.dependOn(&run_resize.step);
+    interaction.dependOn(viewport_step);
+    interaction.dependOn(&run_approval_cancel.step);
+    interaction.dependOn(&run_command.step);
+    const communication = b.step("test-communication", "Run subscription, daemon and SSH fixtures");
+    communication.dependOn(&run_subscription.step);
+    communication.dependOn(&run_daemon.step);
+    communication.dependOn(&run_ssh.step);
+
+    // The workflow's own offline unit tests are part of the complete gate.
+    const workflow_tests = b.addSystemCommand(&.{ "python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_workflow.py" });
     // 聚合步骤 `zig build test`：依次挂载所有离线测试（不含需要真实 API 的内容）。
     const test_all = b.step("test", "Run all offline unit, transport, application and foundation tests");
+    test_all.dependOn(&workflow_tests.step);
     test_all.dependOn(&run_unit.step);
     test_all.dependOn(&run_memory.step);
     test_all.dependOn(&run_memory_app.step);
     test_all.dependOn(&run_subagent.step);
     test_all.dependOn(&run_background.step);
     test_all.dependOn(&run_daemon.step);
+    test_all.dependOn(&run_subscription.step);
     test_all.dependOn(&run_ssh.step);
     test_all.dependOn(&run_presentation.step);
     test_all.dependOn(&run_http.step);

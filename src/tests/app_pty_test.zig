@@ -69,6 +69,16 @@ const Driver = struct {
     output: [2 * 1024 * 1024]u8 = undefined,
     /// output 中已写入的字节数。
     used: usize = 0,
+    settings_key_start: usize = 0,
+    columns: usize = 80,
+    /// Owns every explicit screen snapshot returned by `screen()`. One Screen
+    /// is ~330 KiB (160x24 grid plus 2048 history rows), far beyond the
+    /// acceptance stack, so snapshots live here until Driver.deinit.
+    screens: std.heap.ArenaAllocator,
+    /// Single heap scratch screen reused by `acknowledgedScreen()`, which is
+    /// polled frequently. Owners must not retain the pointer across another
+    /// call; use `screen()` for an independent snapshot.
+    scratch: ?*regular.Screen = null,
 
     /// 在最多 ms 毫秒内轮询 master 并读尽可读数据；若子进程仍归属本驱动器，则非阻塞检查它是否已退出。
     fn drain(self: *Driver, ms: c_int) !void {
@@ -123,6 +133,32 @@ const Driver = struct {
         return error.VisibleTextTimeout;
     }
 
+    /// A redraw may be an asynchronous pending frame. Inspect only a complete
+    /// acknowledged screen, never historical text or an unfinished latest diff.
+    /// Polling reuses one Driver-owned scratch Screen: the result is valid only
+    /// until the next acknowledgedScreen() call.
+    fn acknowledgedScreen(self: *Driver, start: usize) !?*regular.Screen {
+        const bytes = self.output[0..self.used];
+        const ack = std.mem.lastIndexOf(u8, bytes, "\x1b[?25h") orelse return null;
+        if (ack < start) return null;
+        if (std.mem.lastIndexOf(u8, bytes, "\x1b[?2026h")) |begin| if (begin > ack) return null;
+        if (self.scratch == null) self.scratch = try self.screens.allocator().create(regular.Screen);
+        const view = self.scratch.?;
+        view.* = .{ .columns = self.columns };
+        try view.replay(bytes[0 .. ack + "\x1b[?25h".len]);
+        return view;
+    }
+
+    fn waitVisibleFrame(self: *Driver, start: usize, text_: []const u8) !void {
+        const until = now() + 10000;
+        while (now() < until) {
+            try self.drain(20);
+            if (try self.acknowledgedScreen(start)) |view| if (view.visible(text_)) return;
+            if (!self.owned) return error.EarlyExit;
+        }
+        return error.VisibleTextTimeout;
+    }
+
     /// A generated/ready caption is already visible before execution. Observe
     /// the current complete screen's braille row, not an earlier name match.
     fn waitRunningFrame(self: *Driver, start: usize, command: []const u8) !void {
@@ -136,7 +172,7 @@ const Driver = struct {
             const raw = self.output[0..self.used];
             const ack = std.mem.lastIndexOf(u8, raw, "\x1b[?25h") orelse continue;
             if (ack < start) continue;
-            view.* = .{};
+            view.* = .{ .columns = self.columns };
             try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
             if (view.visible(needle)) return;
             if (!self.owned) return error.EarlyExit;
@@ -148,25 +184,18 @@ const Driver = struct {
     /// in new output: the model's neutral closing parenthesis precedes the
     /// percentage, which resets before the marker. Keep the full-frame cursor ACK.
     fn waitIdle(self: *Driver, start: usize) !void {
-        const until = now() + 10000;
+        try self.waitIdleUntil(start, now() + 10000);
+    }
+
+    fn waitIdleUntil(self: *Driver, start: usize, until: i64) !void {
         while (now() < until) {
             try self.drain(20);
-            const bytes = self.output[start..self.used];
-            for ([_][]const u8{
-                "%> ",
-                "%\x1b[0m> ",
-                "%>\x1b[0m ",
-                "%\x1b[0m\x1b[1m>\x1b[0m ",
-            }) |idle| if (std.mem.indexOf(u8, bytes, idle)) |marker| {
-                if (std.mem.indexOf(u8, bytes[marker + idle.len ..], "\x1b[?25h") != null) return;
-            };
-            for ([_][]const u8{ "\x1b[0m> \x1b[0m\x1b[K", "\x1b[1m>\x1b[0m " }) |idle| {
-                if (std.mem.indexOf(u8, bytes, idle)) |marker| {
-                    if (std.mem.indexOf(u8, bytes[marker + idle.len ..], "\x1b[?25h") != null) {
-                        const visible = try self.screen();
-                        if (std.mem.startsWith(u8, &visible.grid[visible.row], "> ")) return;
-                    }
-                }
+            // A pending-submit redraw can contain an idle prefix before the
+            // busy/answer frames. Historical raw matches are not current idle.
+            if (try self.acknowledgedScreen(start)) |view| {
+                const composer = &view.grid[view.row];
+                if (std.mem.indexOf(u8, composer, "%> ") != null or
+                    std.mem.startsWith(u8, composer, "> ")) return;
             }
             if (!self.owned) return error.EarlyExit;
         }
@@ -219,15 +248,52 @@ const Driver = struct {
         for (line) |byte| try check(byte == ' ');
     }
 
+    /// §3.3 first entry: the effective area is the composer row itself. It sits
+    /// directly after the prior terminal output (or after the single owned hint
+    /// row), never after banner lines or blank padding, and nothing is written
+    /// below it: the terminal keeps its own rows.
+    fn checkStartupFootprint(view: *const regular.Screen) !void {
+        try check(view.history_len == 0); // A first screen has not scrolled yet.
+        var prior_row: ?usize = null;
+        var composer_row: ?usize = null;
+        for (view.grid, 0..) |line, row| {
+            if (std.mem.indexOf(u8, &line, regular.prior) != null) prior_row = row;
+            if (std.mem.indexOf(u8, &line, "%> ") != null or std.mem.startsWith(u8, &line, "> ")) composer_row = row;
+        }
+        try check(prior_row != null and composer_row != null);
+        // One composer row after the prior sentinel, optionally after one real
+        // hint row (recording off / not configured). A blank row is padding.
+        try check(composer_row.? == prior_row.? + 1 or composer_row.? == prior_row.? + 2);
+        if (composer_row.? == prior_row.? + 2)
+            try check(std.mem.trim(u8, &view.grid[prior_row.? + 1], " ").len != 0);
+        try check(view.row == composer_row.?);
+        for (view.grid[composer_row.? + 1 ..]) |line| for (line) |byte| try check(byte == ' ');
+    }
+
+    /// The composer owns the last written row. Rows below it stay blank (a
+    /// closed panel reclaims its own rows), and at most one separator row may
+    /// sit between the content and the composer: a short transcript is never
+    /// padded down to the physical bottom. This deliberately does not claim a
+    /// physical bottom row; a floating input need not own one.
+    fn checkComposerTail(view: *const regular.Screen) !void {
+        try check(view.row < view.grid.len);
+        for (view.grid[view.row + 1 ..]) |line| for (line) |byte| try check(byte == ' ');
+        if (view.row >= 2 and std.mem.trim(u8, &view.grid[view.row - 1], " ").len == 0)
+            try check(std.mem.trim(u8, &view.grid[view.row - 2], " ").len != 0);
+    }
+
     /// Fixed-size replay only: resize cases check sequences, not terminal reflow.
-    fn screen(self: *const Driver) !regular.Screen {
-        var result: regular.Screen = .{};
+    /// Each call returns an independent Driver-owned snapshot that stays valid
+    /// until Driver.deinit, so before/after comparisons never alias.
+    fn screen(self: *Driver) !*regular.Screen {
+        const result = try self.screens.allocator().create(regular.Screen);
+        result.* = .{ .columns = self.columns };
         try result.replay(self.output[0..self.used]);
         return result;
     }
 
     /// Candidate rows stay below prior output and directly above the composer.
-    fn checkMenu(self: *const Driver, candidate: []const u8, composer: []const u8) !void {
+    fn checkMenu(self: *Driver, candidate: []const u8, composer: []const u8) !void {
         const view = try self.screen();
         try check(view.count(regular.prior) == 1);
         try check(!view.visible("Commands") and !view.visible("Configure provider (API key)"));
@@ -239,6 +305,10 @@ const Driver = struct {
             if (std.mem.indexOf(u8, line, regular.prior) != null) prior_row = i;
             if (std.mem.indexOf(u8, line, candidate) != null) candidate_row = i;
             if (std.mem.indexOf(u8, line, composer) != null) composer_row = i;
+        }
+        if (prior_row == null or candidate_row == null or composer_row == null) {
+            std.debug.print("menu missing: prior={any} candidate={any} composer={any}; expected {s}\n", .{ prior_row, candidate_row, composer_row, composer });
+            for (view.grid) |row| std.debug.print("menu row: {s}\n", .{std.mem.trimEnd(u8, &row, " ")});
         }
         try check(prior_row != null and candidate_row != null and composer_row != null);
         try check(prior_row.? < candidate_row.? and candidate_row.? < composer_row.?);
@@ -352,6 +422,10 @@ const Driver = struct {
         // PTY 两端的关闭与子进程是否回收无关，始终执行。
         _ = c.close(self.master);
         _ = c.close(self.slave);
+
+        // All explicit snapshots and the polling scratch share this arena.
+        self.scratch = null;
+        self.screens.deinit();
     }
 };
 
@@ -389,16 +463,29 @@ fn settingsColor(d: *const Driver, start: usize, level: []const u8) !void {
 /// unchanged labels. Assertions below inspect the replayed owned screen.
 fn settingsKey(d: *Driver, bytes: []const u8) !void {
     const start = d.used;
+    d.settings_key_start = start;
     try d.send(bytes);
     try d.waitFrame(start, "\x1b[?25l");
 }
 
 fn settingsValues(d: *Driver, low: []const u8, decision: []const u8, selected: usize) !void {
-    const view = try d.screen();
-    var buffer: [100]u8 = undefined;
-    try check(view.visible(try std.fmt.bufPrint(&buffer, "Low-price input  {s}", .{low})));
-    try check(view.visible(try std.fmt.bufPrint(&buffer, "Decision model   {s}", .{decision})));
-    try check(view.visible(if (selected == 0) "> Low-price input" else "> Decision model"));
+    var low_buffer: [100]u8 = undefined;
+    var decision_buffer: [100]u8 = undefined;
+    const low_text = try std.fmt.bufPrint(&low_buffer, "Low-price input  {s}", .{low});
+    const decision_text = try std.fmt.bufPrint(&decision_buffer, "Decision model   {s}", .{decision});
+    const selected_text = if (selected == 0) "> Low-price input" else "> Decision model";
+    const until = now() + 10000;
+    while (now() < until) {
+        try d.drain(20);
+        if (try d.acknowledgedScreen(d.settings_key_start)) |view| {
+            if (view.visible(low_text) and view.visible(decision_text) and view.visible(selected_text)) return;
+        }
+        if (!d.owned) return error.EarlyExit;
+    }
+    std.debug.print("settings expected: {s}; {s}; {s}\n", .{ low_text, decision_text, selected_text });
+    const failed_view = try d.screen();
+    for (failed_view.grid) |row| std.debug.print("settings row: {s}\n", .{std.mem.trimEnd(u8, &row, " ")});
+    return error.SettingsValueFrameTimeout;
 }
 
 fn settingsDecisionChoose(d: *Driver, name: []const u8, backwards: bool) !void {
@@ -436,6 +523,7 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     try settingsKey(d, "\x1b[B");
     try settingsValues(d, after, decision_before, 1);
     try settingsKey(d, "\r");
+    try d.waitVisibleFrame(d.settings_key_start, "Search> ");
     const choice = try d.screen();
     try check(!choice.visible("OpenCode Jev Free") and !choice.visible("Logged-in model") and !choice.visible("Request timeout"));
     // The selected native row may be beyond the first bounded window. Verify
@@ -447,10 +535,12 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     try settingsKey(d, "\x1b[D");
     try settingsValues(d, after, decision_before, 1);
     try settingsKey(d, "\r");
+    try d.waitVisibleFrame(d.settings_key_start, "Search> ");
     try settingsKey(d, "\x1b");
     try settingsValues(d, after, decision_before, 1);
     if (!verify) {
         try settingsKey(d, "\r");
+        try d.waitVisibleFrame(d.settings_key_start, "Search> ");
         try settingsDecisionChoose(d, if (on or native) "native/family/native-review" else "Off", false);
         try settingsKey(d, "\r");
         try settingsValues(d, after, decision_after, 1);
@@ -509,7 +599,7 @@ fn decisionModelScreen(d: *Driver, a: std.mem.Allocator, required_text: []const 
         try d.drain(20);
         const raw = d.output[0..d.used];
         const ack = std.mem.lastIndexOf(u8, raw, "\x1b[?25h") orelse continue;
-        view.* = .{};
+        view.* = .{ .columns = d.columns };
         try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
         var matches = true;
         for (required_text) |needle| matches = matches and view.visible(needle);
@@ -673,7 +763,7 @@ fn settingsValueSelect(d: *Driver, a: std.mem.Allocator, label: []const u8) !voi
     const view = try a.create(regular.Screen);
     defer a.destroy(view);
     for (0..12) |_| {
-        view.* = .{};
+        view.* = .{ .columns = d.columns };
         try view.replay(d.output[0..d.used]);
         if (view.visible(needle)) return;
         try settingsKey(d, "\x1b[B");
@@ -731,7 +821,7 @@ fn settingsProxyState(d: *Driver, a: std.mem.Allocator, model: []const u8, check
         try d.drain(20);
         const raw = d.output[0..d.used];
         if (std.mem.lastIndexOf(u8, raw, "\x1b[?25h")) |ack| {
-            view.* = .{};
+            view.* = .{ .columns = d.columns };
             try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
             var found: ?usize = null;
             var total: usize = 0;
@@ -1059,7 +1149,7 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
 fn approvalCancelScreen(d: *Driver, view: *regular.Screen) !void {
     const raw = d.output[0..d.used];
     const ack = std.mem.lastIndexOf(u8, raw, "\x1b[?25h") orelse return error.MissingApprovalCancelAck;
-    view.* = .{};
+    view.* = .{ .columns = d.columns };
     try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
 }
 
@@ -1075,8 +1165,10 @@ fn checkApprovalCancelRestored(view: *const regular.Screen) !void {
         if (view.visible(text)) visible_prior += 1;
     }
     try check(view.count("Approval #") == 0 and view.count("GHOST-CANCEL-ONLY") == 0);
-    try check(view.row == 23);
-    const composer = &view.grid[23];
+    // The composer floats at the transcript tail; the closed panel must not
+    // leave stale rows below it or a blank pad above it.
+    try Driver.checkComposerTail(view);
+    const composer = &view.grid[view.row];
     try check(std.mem.indexOf(u8, composer, "%> ") != null);
     const tail = std.mem.trimEnd(u8, composer, " ");
     try check(view.col == tail.len + @as(usize, if (std.mem.endsWith(u8, tail, "%>")) 1 else 0));
@@ -1086,7 +1178,9 @@ fn checkApprovalCancelRestored(view: *const regular.Screen) !void {
     var occupied: usize = 0;
     var blanks: usize = 0;
     var longest_blank: usize = 0;
-    for (view.grid[0..23]) |row| {
+    // Only the rows above the floating composer are transcript; rows below it
+    // are already verified blank and are not part of this erased-screenful check.
+    for (view.grid[0..view.row]) |row| {
         if (std.mem.trim(u8, &row, " ").len == 0) {
             blanks += 1;
             longest_blank = @max(longest_blank, blanks);
@@ -1142,13 +1236,13 @@ fn approvalCancel(d: *Driver) !void {
     try queuedScreen(d, a, start, &.{"cancel-live-draft"});
     try approvalCancelScreen(d, view);
     try checkApprovalCancelRestored(view);
-    try check(std.mem.endsWith(u8, std.mem.trimEnd(u8, &view.grid[23], " "), "cancel-live-draft"));
+    try check(std.mem.endsWith(u8, std.mem.trimEnd(u8, &view.grid[view.row], " "), "cancel-live-draft"));
     start = d.used;
     try d.send("\x15");
     try queuedIdle(d, a, start);
     try approvalCancelScreen(d, view);
     try checkApprovalCancelRestored(view);
-    try check(std.mem.endsWith(u8, std.mem.trimEnd(u8, &view.grid[23], " "), "%>"));
+    try check(std.mem.endsWith(u8, std.mem.trimEnd(u8, &view.grid[view.row], " "), "%>"));
     std.debug.print("APPROVAL_CANCEL_GATE=verified\n", .{});
 }
 
@@ -1174,7 +1268,7 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         const view = try std.heap.page_allocator.create(regular.Screen);
         defer std.heap.page_allocator.destroy(view);
         const ack_before = std.mem.lastIndexOf(u8, d.output[0..d.used], "\x1b[?25h").? + "\x1b[?25h".len;
-        view.* = .{};
+        view.* = .{ .columns = d.columns };
         try view.replay(d.output[0..ack_before]);
         const history_before = view.history_len;
         try check(view.visible("Approval #"));
@@ -1183,7 +1277,7 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         try check(d.owned);
         const titles = std.mem.count(u8, d.output[waiting..d.used], "Approval #");
         const ack_after = std.mem.lastIndexOf(u8, d.output[0..d.used], "\x1b[?25h").? + "\x1b[?25h".len;
-        view.* = .{};
+        view.* = .{ .columns = d.columns };
         try view.replay(d.output[0..ack_after]);
         std.debug.print("APPROVAL_WAIT repeated_titles={d} history_delta={d} visible_titles={d}\n", .{ titles, view.history_len -| history_before, view.count("Approval #") });
         try check(titles == 0 and view.history_len == history_before and view.count("Approval #") == 1);
@@ -1242,7 +1336,7 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         // decoded stream lines. Keep the large screen off the driver's stack.
         const view = try std.heap.page_allocator.create(regular.Screen);
         defer std.heap.page_allocator.destroy(view);
-        view.* = .{};
+        view.* = .{ .columns = d.columns };
         try view.replay(d.output[0..d.used]);
         var stdout_line = false;
         var stderr_line = false;
@@ -1265,11 +1359,31 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         const batch = d.used;
         try d.send("!rm -rf absent; touch batch-first\r!touch batch-tail\r");
         try d.waitFrame(batch, "Approval #");
+        const title = "Approval #";
+        const number_start = batch + (std.mem.lastIndexOf(u8, d.output[batch..d.used], title) orelse return error.AcceptanceFailed) + title.len;
+        var number_end = number_start;
+        while (number_end < d.used and std.ascii.isDigit(d.output[number_end])) : (number_end += 1) {}
+        const denied_id = try std.fmt.parseInt(u64, d.output[number_start..number_end], 10);
         const rejected = d.used;
         try d.send("\r");
         try d.waitIdle(rejected);
         try d.quiet(150);
-        try check(std.mem.indexOf(u8, d.output[rejected..d.used], "Approval #") == null);
+        // The asynchronous denial may redraw the SAME permission while its
+        // receipt is pending. It must never create another permission or run
+        // the second command in the read batch (also checked by the Node owner).
+        var from = rejected;
+        while (std.mem.indexOfPos(u8, d.output[0..d.used], from, title)) |at| {
+            const begin = at + title.len;
+            var end = begin;
+            while (end < d.used and std.ascii.isDigit(d.output[end])) : (end += 1) {}
+            try check(try std.fmt.parseInt(u64, d.output[begin..end], 10) == denied_id);
+            from = end;
+        }
+        const settled = (try d.acknowledgedScreen(rejected)) orelse return error.AcceptanceFailed;
+        if (settled.visible(title)) {
+            for (settled.grid) |row| std.debug.print("denial row: {s}\n", .{std.mem.trimEnd(u8, &row, " ")});
+        }
+        try check(!settled.visible(title));
     }
 }
 
@@ -1292,7 +1406,7 @@ fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const 
         const ack = std.mem.lastIndexOf(u8, raw, "\x1b[?25h") orelse continue;
         if (ack < start) continue;
         const complete = raw[0 .. ack + "\x1b[?25h".len];
-        view.* = .{};
+        view.* = .{ .columns = d.columns };
         try view.replay(complete);
         if (!view.visible(needle)) continue;
         try check(view.count(needle) == 1);
@@ -1429,7 +1543,7 @@ fn queuedScreen(d: *Driver, a: std.mem.Allocator, since: usize, needles: []const
         const raw = d.output[0..d.used];
         if (std.mem.lastIndexOf(u8, raw, "\x1b[?25h")) |ack| {
             if (ack >= since) {
-                view.* = .{};
+                view.* = .{ .columns = d.columns };
                 try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
                 var found = true;
                 for (needles) |needle| found = found and view.visible(needle);
@@ -1456,7 +1570,7 @@ fn queuedIdle(d: *Driver, a: std.mem.Allocator, since: usize) !void {
         const raw = d.output[0..d.used];
         if (std.mem.lastIndexOf(u8, raw, "\x1b[?25h")) |ack| {
             if (ack >= since) {
-                view.* = .{};
+                view.* = .{ .columns = d.columns };
                 try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
                 const row = &view.grid[view.row];
                 if (std.mem.indexOf(u8, row, "%> ") != null or std.mem.startsWith(u8, row, "> ")) return;
@@ -1475,7 +1589,7 @@ fn queuedDraft(d: *Driver, a: std.mem.Allocator, text: []const u8) !void {
         try d.drain(20);
         const raw = d.output[0..d.used];
         if (std.mem.lastIndexOf(u8, raw, "\x1b[?25h")) |ack| {
-            view.* = .{};
+            view.* = .{ .columns = d.columns };
             try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
             const row = &view.grid[view.row];
             // Require the ENTIRE acknowledged editor tail, not recalled text
@@ -1495,6 +1609,34 @@ fn queuedDraft(d: *Driver, a: std.mem.Allocator, text: []const u8) !void {
         if (!d.owned) return error.EarlyExit;
     }
     return error.QueuedComposerDeadline;
+}
+
+/// Receipt, not activity: `waitBusy` below matches only the renderer's spinner,
+/// which is also drawn while an async submit is still pending (draw's `working`
+/// includes presentationWaiting) and before acceptance clears the submitted
+/// text. This waits instead for a FRESH complete acknowledged frame (cursor
+/// ACK, no later partial frame) whose composer row is the actual cursor row and
+/// shows the configured model prefix, the busy braille marker and an exactly
+/// EMPTY editor tail: the task is accepted and the submitted draft is gone.
+fn waitAcceptedBusy(d: *Driver, start: usize) !void {
+    const until = now() + 10000;
+    while (now() < until) {
+        try d.drain(20);
+        if (try d.acknowledgedScreen(start)) |view| {
+            const row = &view.grid[view.row];
+            if (std.mem.indexOf(u8, row, ") ")) |prefix| {
+                const slot_start = prefix + 2;
+                if (std.mem.findScalar(u8, row[slot_start..], ' ')) |space| {
+                    const slot_end = slot_start + space;
+                    // The busy braille marker is one cell and replays as '~'.
+                    if (slot_end > slot_start and row[slot_end - 1] == '~' and
+                        std.mem.trimEnd(u8, row[slot_end + 1 ..], " ").len == 0) return;
+                }
+            }
+        }
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.AcceptedBusyDeadline;
 }
 
 fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project: []const u8) !void {
@@ -1582,7 +1724,7 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
         try queuedDraft(d, a, "preserved-draft");
         const cleared_view = try a.create(regular.Screen);
         defer a.destroy(cleared_view);
-        cleared_view.* = .{};
+        cleared_view.* = .{ .columns = d.columns };
         const cleared_raw = d.output[0..d.used];
         const cleared_ack = std.mem.lastIndexOf(u8, cleared_raw, "\x1b[?25h").?;
         try cleared_view.replay(cleared_raw[0 .. cleared_ack + "\x1b[?25h".len]);
@@ -1790,7 +1932,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     _ = signal(2, onSignal);
 
     // 将 fd 所有权交给 Driver，并用 defer 保证任何退出路径都会清理子进程与 fd。
-    var d = Driver{ .master = master, .slave = slave, .pid = pid, .original = original, .flags = flags };
+    var d = Driver{ .master = master, .slave = slave, .pid = pid, .original = original, .flags = flags, .columns = size.col, .screens = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     handed_off = true;
     defer d.deinit();
 
@@ -1844,20 +1986,27 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(std.mem.indexOfScalar(u8, d.output[0..d.used], 0x1b) == null);
         return;
     }
-    // Startup/recovery cursor visibility is not itself the banner frame ACK.
-    // Require the version followed by a complete frame before inspecting it.
-    d.waitFrame(0, @import("../app/version.zig").text) catch |err| {
+    // §3.3: no automatic banner and no reserved blank screen. The first owned
+    // frame is the composer at the terminal's current position, so readiness is
+    // a fresh acknowledged idle composer, not version text. Keep the original
+    // 10s startup budget and report only fixed refusal identifiers.
+    const startup_until = now() + 10000;
+    d.waitIdleUntil(0, startup_until) catch |err| {
         // Only fixed identifiers from our owned child, never captured content.
         for ([_][]const u8{ "InvalidConfig", "UnknownField", "DefaultModelUnavailable", "UnknownInputPriceThreshold", "InvalidProvider", "InvalidModel" }) |code| {
             if (std.mem.indexOf(u8, d.output[0..d.used], code) != null) std.debug.print("error: {s}\n", .{code});
         }
         return err;
     };
-    try check(std.mem.indexOf(u8, d.output[0..d.used], project) != null);
-    try check(std.mem.indexOf(u8, d.output[0..d.used], "Directory:") == null);
-    try check(std.mem.indexOf(u8, d.output[0..d.used], "Time:") == null);
-    try check(std.mem.indexOf(u8, d.output[0..d.used], if (std.mem.eql(u8, timezone, "UTC-8")) " +0800" else " +0000") != null);
-    try check(std.mem.indexOf(u8, d.output[0..d.used], "Zig ") == null);
+    // A resumed conversation may raise an owned notice row above the composer;
+    // every other start owns exactly the composer row after the prior output.
+    if (!full_resume) {
+        const startup = (try d.acknowledgedScreen(0)) orelse return error.MissingStartupFrame;
+        try Driver.checkStartupFootprint(startup);
+    }
+    // The removed banner was the only startup version/directory text. Its
+    // absence is part of the first-screen contract, not a frozen caption.
+    try check(std.mem.indexOf(u8, d.output[0..d.used], @import("../app/version.zig").text) == null);
     if (std.mem.startsWith(u8, mode, "test-queued-")) {
         try queuedScenario(&d, init, mode, project);
         return;
@@ -2228,7 +2377,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         if (stage.history_len < 8) return error.NativeHistoryMissing;
         const top = stage.history_len - 8;
         const old_history = stage.history_len;
-        var pinned: [24][80]u8 = undefined;
+        var pinned: [24]@TypeOf(stage.grid[0]) = undefined;
         for (&pinned, 0..) |*line, index| {
             const position = top + index;
             @memcpy(line, if (position < stage.history_len) &stage.history[position] else &stage.grid[position - stage.history_len]);
@@ -2252,7 +2401,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     } else if (std.mem.eql(u8, mode, "stream-markdown")) {
         try d.waitIdle(0);
         const initial = try d.screen();
-        try check(std.mem.indexOf(u8, &initial.grid[23], "(fixture-model) 0.0%>") != null);
+        try check(std.mem.indexOf(u8, &initial.grid[initial.row], "(fixture-model) 0.0%>") != null);
         const start = d.used;
         try d.send("stream-task\r");
         try d.waitText(start, "reasoning-stage-one");
@@ -2264,8 +2413,9 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         if (!stage.visible("# **thinking-old-two**") or !stage.visible("- `thinking-old-three`")) return error.ThinkingMarkupNotLiteral;
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;103m# **thinking-old-two**") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;103m- `thinking-old-three`") != null);
-        try check(stage.visible("reasoning-stage-one") and stage.row == 23);
-        try Driver.checkGap(&stage, "stream-task", "thinking-old-two");
+        try check(stage.visible("reasoning-stage-one"));
+        try Driver.checkComposerTail(stage);
+        try Driver.checkGap(stage, "stream-task", "thinking-old-two");
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Thinking") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "thin |") == null);
         try check(!stage.visible("thinking-old-one"));
@@ -2275,17 +2425,19 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         stage = try d.screen();
         try check(stage.visible("thinking-new-five") and stage.visible("thinking-new-six") and stage.visible("reasoning-stage-two"));
         try check(!stage.visible("reasoning-stage-one") and !stage.visible("thinking-old-two"));
-        try Driver.checkGap(&stage, "stream-task", "thinking-new-five");
-        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model) ") != null and std.mem.indexOf(u8, &stage.grid[23], "%~") != null and stage.row == 23);
-        for (stage.grid[22]) |byte| try check(byte == ' ');
+        try Driver.checkGap(stage, "stream-task", "thinking-new-five");
+        try check(std.mem.indexOf(u8, &stage.grid[stage.row], "(fixture-model) ") != null and std.mem.indexOf(u8, &stage.grid[stage.row], "%~") != null);
+        for (stage.grid[stage.row - 1]) |byte| try check(byte == ' ');
         try check(!stage.visible("TPS:") and !stage.visible("tokens in:"));
-        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model) 0.0%~") != null);
+        try check(std.mem.indexOf(u8, &stage.grid[stage.row], "(fixture-model) 0.0%~") != null);
+        try Driver.checkComposerTail(stage);
         try d.waitText(start, "stream-stage-one");
         try d.quiet(100);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
         stage = try d.screen();
-        try check(stage.visible("Orange heading") and stage.visible("stream-stage-one") and stage.row == 23);
-        try Driver.checkGap(&stage, "stream-task", "Orange heading");
+        try check(stage.visible("Orange heading") and stage.visible("stream-stage-one"));
+        try Driver.checkComposerTail(stage);
+        try Driver.checkGap(stage, "stream-task", "Orange heading");
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Streaming") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "History preview") == null);
         try check(!stage.visible("reasoning-stage-two") and !stage.visible("Thinking"));
@@ -2303,13 +2455,13 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         stage = try d.screen();
         try check(stage.count("reasoning-stage-one") == 0 and stage.count("reasoning-stage-two") == 0);
         try check(stage.count("thinking-new-five") == 0 and stage.count("stream-final-answer") == 1);
-        try Driver.checkGap(&stage, "stream-task", "Orange heading");
+        try Driver.checkGap(stage, "stream-task", "Orange heading");
         try check(!stage.visible("TPS:") and !stage.visible("tokens in:") and !stage.visible("Completed"));
-        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model) ") != null and std.mem.indexOf(u8, &stage.grid[23], "%>") != null);
+        try check(std.mem.indexOf(u8, &stage.grid[stage.row], "(fixture-model) ") != null and std.mem.indexOf(u8, &stage.grid[stage.row], "%>") != null);
         try check(stage.count("Final answer") == 0 and !stage.visible("ctx ~"));
         // Loopback provider reported 12 input + 90 output = 102 total: 0.3%.
         // Cached9/reasoning30 already belong to those counts, not extra context.
-        try check(std.mem.indexOf(u8, &stage.grid[23], "(fixture-model) 0.3%>") != null);
+        try check(std.mem.indexOf(u8, &stage.grid[stage.row], "(fixture-model) 0.3%>") != null);
         // Real streamed Markdown uses independent semantic colors and a boxed
         // grid with a second body row, not just its old header-only rule.
         const markdown_output = d.output[start..d.used];
@@ -2330,15 +2482,16 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         }
         try check(std.mem.indexOf(u8, markdown_output, "(\x1b[38;5;75mfixture-model\x1b[0m\x1b[1m) \x1b[38;5;114m0.3%\x1b[0m\x1b[1m>\x1b[0m ") != null); // High model, static green occupancy.
         try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;75m>\x1b[0m") == null);
-        for (stage.grid[22]) |byte| try check(byte == ' ');
-        try check(stage.row == 23);
+        for (stage.grid[stage.row - 1]) |byte| try check(byte == ' ');
+        try Driver.checkComposerTail(stage);
     } else if (std.mem.eql(u8, mode, "architecture-table")) {
         const start = d.used;
         try d.send("architecture-table-task\r");
         try d.waitText(start, "architecture-table-final-answer");
         try d.waitIdle(start);
         const final = try d.screen();
-        try check(final.count("architecture-table-final-answer") == 1 and final.row == 23);
+        try check(final.count("architecture-table-final-answer") == 1);
+        try Driver.checkComposerTail(final);
         const raw = d.output[start..d.used];
         for ([_][]const u8{ "┌", "┬", "┼", "└", "┴", "app/", "core/", "llm/", "platform/", "util/" }) |marker| try check(std.mem.indexOf(u8, raw, marker) != null);
         try check(std.mem.indexOf(u8, raw, "|---|---|") == null);
@@ -2358,8 +2511,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.quiet(240);
         const second = try d.screen();
         try check(first.visible("~ sleep 1; cat r.json") and second.visible("~ sleep 1; cat r.json"));
-        try Driver.checkGap(&first, "tool-icon-task", "~ sleep 1; cat r.json");
-        try Driver.checkGap(&second, "tool-icon-task", "~ sleep 1; cat r.json");
+        try Driver.checkGap(first, "tool-icon-task", "~ sleep 1; cat r.json");
+        try Driver.checkGap(second, "tool-icon-task", "~ sleep 1; cat r.json");
         // The ASCII VT fixture maps non-ASCII glyphs to '~'; inspect only these
         // renderer-owned braille symbols, not a general Unicode-width claim.
         var frames: usize = 0;
@@ -2379,9 +2532,10 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         }
         try check(pulses >= 2); // Distinct prefix shades, not repeated glyph/text.
         try check(std.mem.indexOf(u8, d.output[start..d.used], ">_") == null);
-        try check(first.row == 23 and second.row == 23);
-        try check(std.mem.indexOf(u8, &first.grid[23], "(fixture-model) ") != null and std.mem.indexOf(u8, &first.grid[23], "%~") != null);
-        for (first.grid[22]) |byte| try check(byte == ' ');
+        try Driver.checkComposerTail(first);
+        try Driver.checkComposerTail(second);
+        try check(std.mem.indexOf(u8, &first.grid[first.row], "(fixture-model) ") != null and std.mem.indexOf(u8, &first.grid[first.row], "%~") != null);
+        for (first.grid[first.row - 1]) |byte| try check(byte == ' ');
         try d.waitRunningFrame(start, "sleep 0.6; printf ok");
         const next_pending = try d.screen();
         var completed_row: ?usize = null;
@@ -2391,7 +2545,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             if (std.mem.indexOf(u8, &line, "~ sleep 0.6; printf ok") != null) next_row = row;
         }
         try check(completed_row != null and next_row != null);
-        try check(next_row.? == completed_row.? + 1 and next_pending.row == 23);
+        try check(next_row.? == completed_row.? + 1);
+        try Driver.checkComposerTail(next_pending);
         try d.waitText(start, "tool-icon-final-answer");
         try d.waitIdle(start);
         try d.quiet(100);
@@ -2410,7 +2565,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(command_rows[0] != null and command_rows[1] != null and command_rows[2] != null);
         try check(command_rows[1].? == command_rows[0].? + 1 and command_rows[2].? == command_rows[1].? + 1);
         try check(final.count(markers[0]) == 1 and final.count(markers[1]) == 1 and final.count(markers[2]) == 1);
-        try check(final.row == 23);
+        try Driver.checkComposerTail(final);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m>\x1b[38;5;245m sleep 0.6; printf ok") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203m>\x1b[38;5;203m false; #") != null); // Failure prefix; summary still clips at80% in its existing failure color.
         try check(std.mem.indexOf(u8, d.output[start..d.used], "...\x1b[0m") != null);
@@ -2431,7 +2586,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(std.mem.indexOf(u8, d.output[start..d.used], "memory-summary-hidden-body") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "expected_version") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mm\x1b[38;5;245m read caption-note") != null);
-        try check(final.count("memory-summary-final-answer") == 1 and final.row == 23);
+        try check(final.count("memory-summary-final-answer") == 1);
+        try Driver.checkComposerTail(final);
     } else if (std.mem.eql(u8, mode, "file-stats")) {
         const start = d.used;
         try d.send("file-stats-task\r");
@@ -2450,7 +2606,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             previous = found;
         }
         try check(final.count("Final answer") == 0 and final.count("file-stats-final-answer") == 1);
-        try Driver.checkGap(&final, "file-stats-task", "w stats.txt");
+        try Driver.checkGap(final, "file-stats-task", "w stats.txt");
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mw\x1b[38;5;245m stats.txt") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mr\x1b[38;5;245m stats.txt") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203mw\x1b[38;5;203m stats.txt [error]") != null);
@@ -2463,7 +2619,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         };
         try check(answer != null and answer.? == previous.? + 2);
         for (final.grid[answer.? - 1]) |byte| try check(byte == ' ');
-        try check(std.mem.indexOf(u8, &final.grid[23], "(fixture-model) ") != null and std.mem.indexOf(u8, &final.grid[23], "%>") != null);
+        try check(std.mem.indexOf(u8, &final.grid[final.row], "(fixture-model) ") != null and std.mem.indexOf(u8, &final.grid[final.row], "%>") != null);
+        try Driver.checkComposerTail(final);
         try check(!final.visible("ctx ~"));
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\"written_bytes\"") == null);
     } else if (std.mem.startsWith(u8, mode, "tool-preview-")) {
@@ -2513,11 +2670,15 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             }
         } else if (std.mem.eql(u8, mode, "settings-pending-auth")) {
             try d.waitText(0, "/login");
+            // A visible not-configured prompt precedes its settled idle frame:
+            // settle it before capturing the offset this shortcut must follow.
+            try d.waitIdle(0);
             var start = d.used;
             try d.send("\x1b[Z");
             // Cycling a pending preference may leave the bare prompt pixels
-            // unchanged. Require a new complete frame, not an unchanged footer.
-            try d.waitFrame(start, "\x1b[?25l");
+            // unchanged, and its async busy frame is not the result. Require a
+            // settled idle operation, not an unchanged footer.
+            try d.waitIdle(start);
             const pending = try d.screen();
             try check(std.mem.startsWith(u8, &pending.grid[pending.row], "> ") and !pending.visible("fixture-model"));
             start = d.used;
@@ -2539,15 +2700,20 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             if (clamped) try d.waitText(0, "Saved thinking level adjusted");
             if (std.mem.eql(u8, mode, "settings-unknown-low")) try d.waitText(0, "Saved thinking level not applied");
             if (blocked) {
+                // A complete pending frame is not a settled operation: the
+                // optional saved-level notice may still be rendered, so settle
+                // the previous shortcut's operation before capturing "before".
+                try d.waitIdle(0);
                 const before = try d.screen();
                 const start = d.used;
                 try d.send("\x1b[Z");
                 // Unknown/fixed capabilities keep the same idle composer. A
                 // completed sparse frame may only replace its notice row; do
                 // not require unchanged model/percentage pixels to be reprinted.
-                try d.waitFrame(start, "\x1b[?25l");
+                // Wait for a settled idle operation, not a pending frame.
+                try d.waitIdle(start);
                 const after = try d.screen();
-                try check(std.mem.eql(u8, &before.grid[23], &after.grid[23]) and after.row == 23);
+                try check(after.row == before.row and std.mem.eql(u8, &before.grid[before.row], &after.grid[after.row]));
                 if (std.mem.indexOf(u8, d.output[start..d.used], "fixture-model") != null) {
                     try settingsColor(&d, start, level);
                 } else {
@@ -2562,18 +2728,22 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             try d.waitIdle(start);
         }
         const final = try d.screen();
-        try check(final.row == 23 and final.count(regular.prior) == 1);
+        try check(final.count(regular.prior) == 1);
+        try Driver.checkComposerTail(final);
     } else if (std.mem.eql(u8, mode, "model-select-empty")) {
         const start = d.used;
         try d.send("/model fixture-next\r");
-        try d.waitFrame(start, "fixture-next");
+        try d.waitVisibleFrame(start, "(fixture-next) ");
         try d.waitIdle(start);
         const selected = try d.screen();
         try check(selected.visible("fixture-next") and !selected.visible("Model selection failed"));
     } else if (std.mem.eql(u8, mode, "model-select")) {
         var start = d.used;
         try d.send("selection-first\r");
-        try d.waitBusy(start);
+        // Wait for the accepted receipt's cleared composer, not the pending
+        // submit spinner: only after acceptance is the busy composer empty, so
+        // the injected draft below cannot be appended to the submitted text.
+        try waitAcceptedBusy(&d, start);
         // Neither the effort shortcut nor direct command may mutate a live
         // request. The server checks exact first/continuation wire options.
         try d.send("\x1b[Z/model rejected-busy\r");
@@ -2605,7 +2775,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         // exact medium wire after ONE shortcut below proves low was applied.
         const selected_next = try d.screen();
         try check(selected_next.visible("fixture-next") and selected_next.visible("?%"));
-        try check(selected_next.row == 23 and !selected_next.visible("Search> "));
+        try check(!selected_next.visible("Search> "));
+        try Driver.checkComposerTail(selected_next);
         start = d.used;
         try d.send("\x1b[Z"); // Selected profile low -> medium.
         // Observe the acknowledged confirmation, then its automatic expiry.
@@ -2615,7 +2786,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         // invalid. Wait for a fresh complete frame carrying the changed
         // effort cells, then inspect the replayed screen before the transient
         // confirmation expires back to the ordinary percentage prompt.
-        try d.waitFrame(start, "medium");
+        try d.waitVisibleFrame(start, "(fixture-next) medium> ");
         const medium_screen = try d.screen();
         try check(medium_screen.visible("(fixture-next) medium> "));
         // The transient effort confirmation then expires back to the ordinary
@@ -2633,10 +2804,12 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitIdle(start);
         start = d.used;
         try d.send("/model fixture-custom\r");
+        try d.waitVisibleFrame(start, "(fixture-custom) ");
         try d.waitIdle(start);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "fixture-custom") != null);
         start = d.used;
         try d.send("\x1b[Z");
+        try d.waitFrame(start, "(\x1b[38;5;75mfixture-custom\x1b[0m\x1b[1m) \x1b[38;5;75m");
         try d.waitIdle(start);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;75mfixture-custom\x1b[0m\x1b[1m) \x1b[38;5;75m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;75m>\x1b[0m") == null);
@@ -2647,7 +2820,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         const final = try d.screen();
         try check(final.count("selection-answer-one") == 1 and final.count("selection-answer-two") == 1 and final.count("selection-answer-three") == 1);
         try check(final.count("selection-first") == 1 and final.count("selection-second") == 1 and final.count("selection-third") == 1);
-        try check(final.row == 23 and final.count("/model") == 0);
+        try check(final.count("/model") == 0);
+        try Driver.checkComposerTail(final);
     } else if (std.mem.eql(u8, mode, "log-failure")) {
         const start = d.used;
         try d.send("log-fixture-task\r");
@@ -2684,7 +2858,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
                 try driver.send(keys);
                 try driver.quiet(120);
                 const state = try driver.screen();
-                const row = &state.grid[23];
+                const row = &state.grid[state.row];
                 const at = std.mem.indexOf(u8, row, "> ") orelse return error.EditorNotIdle;
                 try check(std.mem.eql(u8, std.mem.trim(u8, row[at + 2 ..], " "), expected));
             }
@@ -2757,21 +2931,29 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.send("resume\r");
         try d.waitIdle(next);
     } else {
-        // 默认（交互）模式：验证 Unicode 输出，并在终端尺寸变化后界面仍能重绘。
+        // 默认（交互）模式：验证 Unicode 输出；缩放只更新尺寸并作废旧帧权限，
+        // 新尺寸下的完整帧由一次真实编辑触发，不再有自动重绘。
         const start = d.used;
         try d.send("unicode\r");
-        try d.waitIdle(start);
+        const reply_until = now() + 10000;
+        try d.waitText(start, "世界");
+        try d.waitIdleUntil(start, reply_until);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "世界") != null);
 
-        // 依次把列宽改为40/80/120；每次要求稳定几何后的新完整帧。
-        // ACK-owned差分不必重复未改变的提示符字节；专用resize夹具负责
-        // 核对底部位置、内容与150ms合并策略，这里只验证应用仍能完成重绘。
+        // 依次把列宽改为40/80/120。缩放本身不重绘、不强制移位到屏底、不回放旧画面：
+        // 应用只接收新尺寸并作废旧帧权限；每次用一次真实编辑触发新尺寸下的完整帧，
+        // 再用 Ctrl-U 清空并等待空输入行。字节级的无重绘/无回放与空闲静默由专用
+        // resize 夹具核对，这里只验证应用仍能在新尺寸下完成帧。
         for ([_]u16{ 40, 80, 120 }) |width| {
             size.col = width;
-            const mark = d.used;
-            // IOCSWINSZ 设置窗口尺寸，内核会向前台进程组发送 SIGWINCH，触发应用重绘。
+            // IOCSWINSZ 设置窗口尺寸，内核会向前台进程组发送 SIGWINCH；此处只登记新尺寸。
             try check(c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &size) == 0);
-            try d.waitFrame(mark, "");
+            const edited = d.used;
+            try d.send("x");
+            try d.waitFrame(edited, "x");
+            const cleared = d.used;
+            try d.send("\x15");
+            try d.waitIdle(cleared);
         }
     }
 

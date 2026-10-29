@@ -602,6 +602,15 @@ async function scenario(name, protocol, kind, isPty = false) {
         const lines = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].slice(0,6).map(match => match[1]).join('-') || 'unknown';
         error.fixtureCase = `pty/${kind}`;
         error.fixtureCheck = `PTY code ${result.code} at ${lines} requests ${requests}`;
+        if (kind === 'stream-markdown') {
+          const index = result.output.match(/(?:^|\n)Markdown assertion index: (\d+)\r?(?=\n|$)/);
+          if (index) error.fixtureCheck += ` Markdown assertion index: ${index[1]}`;
+        }
+        // Only numeric/missing row positions, never raw terminal or auth text.
+        if (kind === 'menu-navigation') {
+          const rows = result.output.match(/menu missing: prior=(null|\d+) candidate=(null|\d+) composer=(null|\d+);/);
+          if (rows) error.fixtureCheck += ` menu rows ${rows.slice(1).join('/')}`;
+        }
         throw error;
       }
       assert.equal(result.code, 0, `${name}: exit ${result.code}; ${codes || 'no safe error code'}; captured ${result.output.length} bytes (not rendered)`);
@@ -850,8 +859,10 @@ async function watchdogRegression() {
 }
 
 try {
-  await watchdogRegression();
-  if (process.argv.includes('--model-selection-only')) {
+  if (!process.argv.includes('--streaming-only')) await watchdogRegression();
+  if (process.argv.includes('--streaming-only')) {
+    for (const kind of ['stream-markdown','stream-native-history','architecture-table']) await scenario(`PTY/${kind}`,'chat',kind,true);
+  } else if (process.argv.includes('--model-selection-only')) {
     await scenario('PTY model/effort selection chat','chat','model-select',true);
     await scenario('PTY model/effort selection responses','responses','model-select',true);
   } else if (process.argv.includes('--settings-values-only')) {

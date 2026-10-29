@@ -154,10 +154,12 @@ pub const Snapshot = struct {
         try self.emitWithShift(writer, previous, null);
     }
 
-    /// Entry: row 0 of a fully acknowledged tail ending at the screen bottom.
-    /// Prefix rows are rendered rows released into native scrollback, not messages.
-    /// Compare logical indices before scrolling: CUD only reaches existing rows;
-    /// every row beyond the old bottom requires CRLF to create native history.
+    /// Entry: row 0 of a fully acknowledged tail, whose last row may or may not
+    /// be the physical bottom. Prefix rows are rendered rows released into
+    /// native scrollback, not messages. Compare logical indices before moving:
+    /// CUD only reaches existing rows; every row beyond the old tail bottom is
+    /// appended with CRLF, which creates native history only once it reaches the
+    /// physical bottom. No delete-line/scroll-region authority is implied.
     pub fn emitGrowingDiff(self: *const Snapshot, writer: *std.Io.Writer, previous: *const Snapshot, prefix_rows: []const []const u8) !void {
         const limit_rows = 8192;
         const limit_bytes = 8 * 1024 * 1024;
@@ -220,6 +222,21 @@ pub const Snapshot = struct {
         try self.emitWithShift(writer, previous, self.chooseShift(previous));
     }
 };
+
+/// Contract a floating tail whose new footprint is shorter than the ACKed one.
+/// Entry: the cursor is on the frame's last written row, at the same width and
+/// geometry as the previous complete ACK, and every vacated row was inside that
+/// ACKed footprint. Descent is CR+CUD only, never LF (which could scroll) or DL
+/// (which could shift a foreign row below the footprint). Each visited row is
+/// erased with EL after a constant CR+CUD1 descent, so exactly one owned row is
+/// consumed per step; CUU then returns to the frame row. Rows below the old
+/// footprint are never addressed.
+pub fn emitVacatedRows(writer: *std.Io.Writer, vacated: usize) !void {
+    if (vacated == 0) return;
+    if (vacated > max_rows) return error.InvalidTailFrame;
+    for (0..vacated) |_| try writer.writeAll("\r\x1b[1B\x1b[0K");
+    try writer.print("\r\x1b[{d}A", .{vacated});
+}
 
 const suffix = "\r\x1b[3C\x1b[?25h";
 const stable = "\x1b[0m\x1b[2Kstable table\x1b[0m";
@@ -515,6 +532,92 @@ test "growing diff accepts exact combined row bound" {
     try std.testing.expectEqual(8191 * 2 + suffix.len, out.written().len);
     for (0..8191) |i| try std.testing.expectEqualStrings("\r\n", out.written()[i * 2 ..][0..2]);
     try std.testing.expectEqualStrings(suffix, out.written()[8191 * 2 ..]);
+}
+
+test "floating contraction erases only the vacated owned rows and restores the cursor" {
+    const Screen = @import("../tests/regular_screen.zig").Screen;
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try emitVacatedRows(&out.writer, 0);
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    try emitVacatedRows(&out.writer, 2);
+    try std.testing.expectEqualStrings("\r\x1b[1B\x1b[0K\r\x1b[1B\x1b[0K\r\x1b[2A", out.written());
+    // Descent never uses LF or DL: neither can scroll or shift foreign rows.
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), '\n') == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "[M") == null);
+
+    // Prior shell output, a floating tail whose popup row is returned, and a
+    // foreign row below the owned footprint that must never be erased.
+    var screen: Screen = .{};
+    try screen.replay("shell-prior\r\nabove-1\r\nold-tail-1\r\nold-tail-2\r\npopup-1\r\npopup-2\r\nforeign-row");
+    try std.testing.expectEqual(@as(usize, 6), screen.row);
+    // Entry is the ACKed tail top (row 2) after the composer row (row 5).
+    try screen.replay("\r\x1b[1A\r\x1b[3A");
+    try screen.replay("\rnew-tail-1\r\nnew-tail-2\r\nnew-tail-3");
+    var contract: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer contract.deinit();
+    try emitVacatedRows(&contract.writer, 1);
+    try std.testing.expectEqualStrings("\r\x1b[1B\x1b[0K\r\x1b[1A", contract.written());
+    try screen.replay(contract.written());
+    try std.testing.expectEqual(@as(usize, 0), screen.history_len);
+    try std.testing.expectEqual(@as(usize, 4), screen.row);
+    try std.testing.expectEqual(@as(usize, 0), screen.col);
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[0], "shell-prior"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[1], "above-1"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[2], "new-tail-1"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[3], "new-tail-2"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[4], "new-tail-3"));
+    // Exactly the vacated owned row is blank; rows below it are untouched.
+    try std.testing.expectEqualStrings("", std.mem.trim(u8, &screen.grid[5], " "));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[6], "foreign-row"));
+}
+
+test "floating contraction erases every vacated owned row and keeps the foreign row below" {
+    const Screen = @import("../tests/regular_screen.zig").Screen;
+    // Prior shell output, an eight-row ACKed tail, then a distinct foreign
+    // sentinel immediately below the owned footprint.
+    var screen: Screen = .{};
+    try screen.replay("shell-prior\r\nabove-1\r\nold-tail-1\r\nold-tail-2\r\nold-tail-3\r\nold-tail-4\r\nold-tail-5\r\nold-tail-6\r\nold-tail-7\r\nold-tail-8\r\nforeign-sentinel");
+    try std.testing.expectEqual(@as(usize, 10), screen.row);
+    const history_before = screen.history_len;
+    // Entry: the tail top (row 2), as if the cursor sat on the old last row.
+    try screen.replay("\r\x1b[8A");
+    try screen.replay("\rnew-tail-1\r\nnew-tail-2\r\nnew-tail-3");
+    try std.testing.expectEqual(@as(usize, 4), screen.row);
+    var contract: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer contract.deinit();
+    try emitVacatedRows(&contract.writer, 5);
+    try std.testing.expectEqualStrings(
+        "\r\x1b[1B\x1b[0K\r\x1b[1B\x1b[0K\r\x1b[1B\x1b[0K\r\x1b[1B\x1b[0K\r\x1b[1B\x1b[0K\r\x1b[5A",
+        contract.written(),
+    );
+    try screen.replay(contract.written());
+    // Constant CR+CUD1 per row cannot overshoot into or erase the foreign row,
+    // and CUU(5) lands back on the original last new row.
+    try std.testing.expectEqual(history_before, screen.history_len);
+    try std.testing.expectEqual(@as(usize, 4), screen.row);
+    try std.testing.expectEqual(@as(usize, 0), screen.col);
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[0], "shell-prior"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[1], "above-1"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[2], "new-tail-1"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[3], "new-tail-2"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[4], "new-tail-3"));
+    // Every vacated owned row is blank; the foreign sentinel is untouched.
+    for (5..10) |row_index|
+        try std.testing.expectEqualStrings("", std.mem.trim(u8, &screen.grid[row_index], " "));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[10], "foreign-sentinel"));
+}
+
+test "vacated rows reject an unbounded plan before writing" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.InvalidTailFrame, emitVacatedRows(&out.writer, max_rows + 1));
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    try emitVacatedRows(&out.writer, max_rows);
+    // Constant CR+CUD1+EL per row, then CR+CUU(max_rows).
+    try std.testing.expectEqual(@as(usize, 1807), out.written().len);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), '\n') == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "[M") == null);
 }
 
 fn menuHistoryAllocationScenario(a: std.mem.Allocator) !void {
