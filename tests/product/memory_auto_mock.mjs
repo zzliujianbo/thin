@@ -115,7 +115,7 @@ async function run(cwd, prompt, {expectFact = false, expectHelper = true, bad = 
     answerSeen: false, helperResponded: false, primaryStopped: false, interrupted: false,
     answerBeforeHelperObserved: false, signalInterrupt: null};
   const env = {PATH: '/usr/bin:/bin', HOME: home, LANG: 'C.UTF-8', TERM: 'xterm-256color'};
-  const child = spawn(bin, args ?? ['--print', prompt, '--no-log'], {cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe']});
+  const child = spawn(bin, args ?? ['--print', prompt], {cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe']});
   let owned = true, size = 0, expired = false, rejectPending;
   const stdout = [], stderr = [];
   const kill = signal => { if (owned && child.pid) { try { process.kill(-child.pid, signal); } catch {} } };
@@ -160,7 +160,8 @@ async function run(cwd, prompt, {expectFact = false, expectHelper = true, bad = 
       else assert(!out.includes(ANSWER), 'canceled primary printed an answer');
     }
     if (expectAuxInterrupted) assert(err.includes('auxiliary Memory finalization did not succeed'), 'auxiliary cancellation was not reported');
-    assert(!await exists(join(cwd, '.thin/sessions')), 'no-log created session records');
+    if (args?.includes('--version')) assert(!await exists(join(cwd, '.thin/sessions')), 'version created session records');
+    else assert(await exists(join(cwd, '.thin/sessions')), 'accepted session not recorded');
     assert(!await exists(join(cwd, '.thin/logs')), 'legacy logs created');
   } finally {
     clearTimeout(timer); clearTimeout(escalator); kill('SIGKILL');
@@ -235,7 +236,7 @@ try {
     auxiliaryInterruptKeepsPrimarySuccess: true, primaryInterruptKeepsCanceledExit: true,
     noAuxiliaryReplayAfterInterrupt: true,
     wireBudgetIndependentOfDecodedJson: true}, null, 2) + '\n');
-  console.log('PASS memory CLI synchronous pre-settle source/save/retrieve/Off/no-log/no-jobs/interrupt primary=7 helper=5');
+  console.log('PASS memory CLI synchronous pre-settle source/save/retrieve/Off/automatic-logging/no-jobs/interrupt primary=7 helper=5');
 } finally {
   for (const socket of sockets) socket.destroy();
   if (server.listening) await new Promise(resolve => server.close(resolve));

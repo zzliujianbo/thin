@@ -81,7 +81,7 @@ test "Jev official refresh publishes native Decision candidates with only their 
     defer env.deinit();
     try env.put("HOME", home);
     try env.put("ZEN_OWN_KEY", "fake-zen-own-only");
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const app = session.app.?;
     const primary_auth = app.client.authorization.ptr;
@@ -136,7 +136,7 @@ test "Jev missing own key never borrows main Go or another official Zen alias ke
     defer env.deinit();
     try env.put("HOME", home);
     try env.put("ZEN_MISSING_KEY", "fake-other-zen-only");
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     try expectNativeCandidate(&session, "zen-unlogged/jev-1.13-free");
     try std.testing.expect(!contains(session.connection().current().decision_models, "zen/jev-1.13-free"));
@@ -161,7 +161,7 @@ test "Jev documented protocol cannot create absent delisted or empty-list Decisi
     try env.put("ZEN_OWN_KEY", "fake-zen-own-only");
     for ([_]?[]const u8{ null, zen_listing, "{\"data\":[{\"id\":\"jev-1.13\"}]}", "{\"data\":[]}" }, 0..) |listing, index| {
         if (listing) |body| try publishListing(home, .opencode_zen, body, 100 * index);
-        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
         defer session.deinit();
         const models = session.connection().current().decision_models;
         try std.testing.expectEqual(index == 1 or index == 2, contains(models, "zen/jev-1.13"));
@@ -190,7 +190,7 @@ test "Decision generic selection is declaration-only independent and survives re
     defer env.deinit();
     try env.put("HOME", home);
     try env.put("OWN_REVIEW_KEY", "fake-aux-only");
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const app = session.app.?;
     const auth = app.client.authorization.ptr;
@@ -226,7 +226,7 @@ test "Decision generic selection is declaration-only independent and survives re
     defer a.free(failed);
     try std.testing.expectEqualStrings(saved, failed);
     try env.put("OWN_REVIEW_KEY", "fake-aux-only");
-    var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer restarted.deinit();
     try std.testing.expectEqualStrings("other/family/judge", restarted.connection().current().decision_model.?);
     try std.testing.expectEqualStrings("first", restarted.app.?.config.value.model.name);
@@ -242,7 +242,7 @@ test "Decision owner rejects nonmembers unlogged aliases and auto but routes by 
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const before = try disk(home);
     defer a.free(before);
@@ -275,7 +275,7 @@ test "SystemOne without context is auxiliary eligible but cannot become primary 
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     try std.testing.expect(contains(session.connection().current().decision_models, "native/judge/raw"));
     const connection = session.connection();
@@ -325,7 +325,7 @@ test "Decision generic candidates use auxiliary caps even when primary candidate
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const row = try session.metadata_cache.directory.upsert(.deepseek, "tiny");
     row.available = true;
@@ -360,7 +360,7 @@ test "Decision generic CAS failure and same-model key refresh keep primary froze
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     try choose(&session, "route/second");
     const app = session.app.?;
@@ -411,7 +411,7 @@ test "Decision generic pending selection never activates or changes the main mod
     defer env.deinit();
     try env.put("HOME", home);
     try env.put("OWN_REVIEW_KEY", "fake-aux-only");
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     try std.testing.expect(session.app == null);
     try choose(&session, "other/family/judge");

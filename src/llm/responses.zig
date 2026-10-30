@@ -23,6 +23,45 @@ test "responses omits all output caps regardless of model capacity and purpose" 
     }
 }
 
+test "codex request fields and terminal done" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var req = test_support.request(.responses);
+    req.reasoning_effort = "high";
+    const wire = try j.parse(a, try encodeCodex(a, req));
+    try std.testing.expectEqualStrings("low", try c.text(j.get(wire, "text").?, "verbosity"));
+    try std.testing.expect(j.get(j.get(wire, "reasoning").?, "summary") == null);
+    const ordinary = try j.parse(a, try encode(a, req));
+    try std.testing.expect(j.get(ordinary, "include") != null);
+    try std.testing.expectEqualStrings("reasoning.encrypted_content", (try c.list(j.get(wire, "include").?))[0].string);
+    try std.testing.expect(j.get(wire, "parallel_tool_calls").?.bool);
+    req.system = " ";
+    try std.testing.expectError(error.EmptyInstructions, encodeCodex(a, req));
+    var stream = Stream.init(a, test_support.response_scope, .{});
+    try stream.feed("", "{\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"output\":[]}}");
+    try std.testing.expect((try stream.finish()) == .success);
+    var incomplete = Stream.init(a, test_support.response_scope, .{});
+    try incomplete.feed("", "{\"type\":\"response.done\",\"response\":{\"status\":\"incomplete\"}}");
+    try std.testing.expect((try incomplete.finish()) == .failure);
+}
+
+test "codex done failures retain usage and discard partial tools" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "failed", "unknown", "incomplete" }) |status| {
+        var s = Stream.init(a, test_support.response_scope, .{});
+        try s.feed("", "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"f\",\"arguments\":\"\"}}");
+        try s.feed("", "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc\",\"delta\":\"{\"}");
+        try s.feed("", try std.fmt.allocPrint(a, "{{\"type\":\"response.done\",\"response\":{{\"status\":\"{s}\",\"incomplete_details\":{{\"reason\":\"max_output_tokens\"}},\"usage\":{{\"output_tokens\":17}}}}}}", .{status}));
+        const failure = (try s.finish()).failure;
+        try std.testing.expectEqual(if (std.mem.eql(u8, status, "incomplete")) p.FailureKind.output_limit else p.FailureKind.model, failure.kind);
+        try std.testing.expectEqual(@as(?u64, 17), failure.usage.output_tokens);
+        try std.testing.expect(failure.raw_usage_json != null and failure.observed_content);
+    }
+}
+
 // 测试：usage 累计快照在 in_progress/incomplete 中仍被记录，但不会因此锁定内容（observedContent 为 false），失败结果也携带用量。
 test "responses output limit explicit cap with reasoning or partial tool never commits" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -403,6 +442,15 @@ fn message(a: std.mem.Allocator, role: []const u8, text: []const u8, assistant: 
 /// 将 Request 编码为 Responses 请求 JSON。store 固定为 false，并请求 reasoning.encrypted_content 以便下一轮回放推理。
 /// 返回值由 a 分配；内部临时数据使用 page_allocator 的独立 arena，函数返回前释放。
 pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
+    return encodeMode(a, req, false);
+}
+
+pub fn encodeCodex(a: std.mem.Allocator, req: p.Request) ![]u8 {
+    if (std.mem.trim(u8, req.system, " \t\r\n").len == 0) return error.EmptyInstructions;
+    return encodeMode(a, req, true);
+}
+
+fn encodeMode(a: std.mem.Allocator, req: p.Request, codex: bool) ![]u8 {
     try c.validateRequest(req, .responses);
     var temp = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer temp.deinit();
@@ -411,6 +459,13 @@ pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
     var root = try c.base(t, req, false);
     try c.put(t, &root, "instructions", j.str(req.system));
     try c.put(t, &root, "store", .{ .bool = false });
+    if (codex) {
+        var text = c.object(t);
+        try c.put(t, &text, "verbosity", j.str("low"));
+        try c.put(t, &root, "text", text);
+        try c.put(t, &root, "tool_choice", j.str("auto"));
+        try c.put(t, &root, "parallel_tool_calls", .{ .bool = true });
+    }
     var include = j.array(t);
     try j.append(&include, j.str("reasoning.encrypted_content"));
     try c.put(t, &root, "include", include);
@@ -601,8 +656,12 @@ pub const Stream = struct {
         };
 
         // 失败类事件只记录状态，不在此处返回错误；具体失败信息在 finish 中脱敏生成。
-        if (c.eq(typ, "error") or c.eq(typ, "response.failed") or c.eq(typ, "response.incomplete")) {
-            if (c.eq(typ, "response.incomplete")) {
+        const done_incomplete = c.eq(typ, "response.done") and if (j.get(v, "response")) |response| blk: {
+            const status = j.get(response, "status") orelse break :blk false;
+            break :blk status == .string and c.eq(status.string, "incomplete");
+        } else false;
+        if (c.eq(typ, "error") or c.eq(typ, "response.failed") or c.eq(typ, "response.incomplete") or done_incomplete) {
+            if (c.eq(typ, "response.incomplete") or done_incomplete) {
                 if (j.get(v, "response")) |response| {
                     if (response != .object) return error.InvalidEvent;
                     if (j.get(response, "status")) |status| {
@@ -621,8 +680,19 @@ pub const Stream = struct {
             return;
         }
 
+        // A done event with any other status is terminal failure, not a
+        // transport parse error: retain usage and discard provisional tools.
+        if (c.eq(typ, "response.done")) {
+            const response = j.get(v, "response") orelse return error.InvalidEvent;
+            const status = try c.text(response, "status");
+            if (!c.eq(status, "completed")) {
+                self.failed = true;
+                return;
+            }
+        }
+
         // completed 中的 output 是权威结果：先与流式登记的 item 逐一比对，一致后整体替换。
-        if (c.eq(typ, "response.completed")) {
+        if (c.eq(typ, "response.completed") or c.eq(typ, "response.done")) {
             const response = j.get(v, "response") orelse return error.InvalidEvent;
             if (!c.eq(try c.text(response, "status"), "completed")) return error.IncompleteOutput;
             const output = j.get(response, "output") orelse return error.InvalidEvent;

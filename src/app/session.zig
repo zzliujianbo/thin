@@ -4,6 +4,7 @@
 const std = @import("std");
 const cfg = @import("../core/config.zig");
 const r = @import("../core/runtime.zig");
+const diagnostics = @import("../core/diagnostics.zig");
 const App = @import("app.zig").App;
 const Store = @import("auth_store.zig").Store;
 const tui = @import("../ui/tui.zig");
@@ -26,6 +27,10 @@ const image_selection = @import("image_selection.zig");
 const proxy_selection = @import("proxy_selection.zig");
 const image = @import("../core/image.zig");
 const settings_preferences = @import("../core/settings.zig");
+const codex_login = @import("../core/codex_login.zig");
+const codex_oauth = @import("codex_oauth.zig");
+const codex_auth = @import("../core/codex_auth.zig");
+const p = @import("../core/protocol.zig");
 
 test {
     _ = @import("llm_session_test.zig");
@@ -37,6 +42,8 @@ test {
 
 const MetadataFetch = *const fn (std.mem.Allocator, std.Io, ProviderId, ?[]const u8) anyerror!metadata.Listing;
 const DevFetch = *const fn (std.mem.Allocator, std.Io) anyerror!metadata.Listing;
+/// Codex listing borrows an acquired OAuth credential instead of an API key.
+const MetadataCodexFetch = *const fn (std.mem.Allocator, std.Io, *const codex_auth.RequestCredential, ?*const p.Cancellation, u32) anyerror!metadata.Listing;
 const official_metadata_timeout_ms = 8000;
 const models_dev_timeout_ms = 30000;
 const official_refresh_success = "Official model list refreshed";
@@ -55,6 +62,74 @@ test "metadata notice TTL only expires complete refresh successes" {
     }
 }
 
+fn codexLoginAlias(registry: ?cfg.Registry, selected: ?[]const u8) []const u8 {
+    if (registry) |value| {
+        if (selected) |name| {
+            if (value.find(name)) |provider| if (Session.isCodexProvider(provider.connection)) return provider.name;
+        }
+        for (value.providers) |provider| if (Session.isCodexProvider(provider.connection)) return provider.name;
+    }
+    return ProviderId.openai_codex.slug();
+}
+
+const CodexLoginJob = struct {
+    io: std.Io,
+    manager: *codex_oauth.Manager,
+    alias: []u8,
+    cancel: p.Cancellation = .{},
+    mutex: std.Io.Mutex = .init,
+    view: codex_login.View,
+    done: std.atomic.Value(bool) = .init(false),
+    future: ?std.Io.Future(void) = null,
+
+    fn pending(raw: ?*anyopaque, prompt: codex_oauth.DevicePrompt) !void {
+        const self: *CodexLoginJob = @ptrCast(@alignCast(raw orelse return error.InvalidDevicePrompt));
+        if (!std.mem.eql(u8, prompt.verification_url, codex_login.verification_url) or prompt.user_code.len == 0 or prompt.user_code.len > 64) return error.InvalidDevicePrompt;
+        for (prompt.user_code) |c| if (c < 0x21 or c > 0x7e) return error.InvalidDevicePrompt;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        @memset(&self.view.code, 0);
+        @memcpy(self.view.code[0..prompt.user_code.len], prompt.user_code);
+        self.view.code_len = @intCast(prompt.user_code.len);
+    }
+    fn run(self: *CodexLoginJob) void {
+        defer self.done.store(true, .release);
+        const result = self.manager.login(self.alias, &self.cancel, .{ .context = self, .pending_fn = pending });
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        @memset(&self.view.code, 0);
+        self.view.code_len = 0;
+        if (result) |_| {
+            self.view.status = .succeeded;
+        } else |err| {
+            if (err == error.Cancelled or err == error.Canceled or self.cancel.isRequested()) {
+                self.view.status = .canceled;
+            } else {
+                self.view.status = .failed;
+                self.view.failure = switch (err) {
+                    error.OAuthDeviceExpired, error.OAuthTimeout => .expired,
+                    error.InvalidDevicePrompt => .invalid_response,
+                    error.OAuthLoginConflict, error.AuthStoreBusy => .busy,
+                    error.OAuthCommitFailed => .storage,
+                    else => .other,
+                };
+            }
+        }
+    }
+    fn snapshot(self: *CodexLoginJob) codex_login.View {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.view;
+    }
+    fn destroy(self: *CodexLoginJob, a: std.mem.Allocator) void {
+        self.cancel.cancel();
+        if (self.future) |*future| future.await(self.io);
+        self.manager.deinit();
+        a.free(self.alias);
+        a.destroy(self);
+    }
+};
+
 /// A prepared actual model is not a fresh catalog choice. Credential swaps
 /// preserve its budget, mapping, effective effort and context provenance.
 const MetadataJob = struct {
@@ -62,10 +137,19 @@ const MetadataJob = struct {
     io: std.Io,
     fetch: MetadataFetch,
     dev_fetch: DevFetch,
-    keys: [3]?[]u8 = @splat(null),
+    keys: [ProviderId.all.len]?[]u8 = @splat(null),
+    // Codex owns no API key: only an exact configured alias is borrowed, and
+    // its credential is acquired through this job's own Manager. Both are
+    // released after the official future is joined, never from the worker.
+    codex_manager: ?*codex_oauth.Manager = null,
+    codex_alias: ?[]u8 = null,
+    codex_cancel: p.Cancellation = .{},
+    codex_fetch: MetadataCodexFetch = metadata.fetchCodexListing,
+    /// Private offline seam; production always acquires through the Manager.
+    codex_source: ?codex_auth.CredentialSource = null,
     requested: u8 = 0,
     generations: metadata.Generations = @splat(0),
-    credential_revisions: [3]u64 = @splat(0),
+    credential_revisions: [ProviderId.all.len]u64 = @splat(0),
     succeeded: u8 = 0,
     listing: metadata.Listing = .{},
     manual: bool,
@@ -92,6 +176,8 @@ const MetadataJob = struct {
         defer self.done.store(true, .release);
         defer self.wipeKeys();
         for (ProviderId.all) |id| {
+            // Codex is authenticated discovery, not an API-key listing.
+            if (id == .openai_codex) continue;
             const index: usize = @intCast(@backingInt(id));
             const bit = @as(u8, 1) << @intCast(index);
             if (self.requested & bit == 0 or self.keys[index] == null) continue;
@@ -102,6 +188,43 @@ const MetadataJob = struct {
             metadata.mergeOfficial(&self.listing, &values, id) catch continue;
             self.succeeded |= bit;
         }
+        self.runCodex();
+    }
+    fn remainingCodexMs(started_ms: i64, now_ms: i64) ?u32 {
+        const elapsed = @max(@as(i128, 0), @as(i128, now_ms) - @as(i128, started_ms));
+        if (elapsed >= official_metadata_timeout_ms) return null;
+        return @intCast(@as(i128, official_metadata_timeout_ms) - elapsed);
+    }
+    fn codexRemaining(self: *MetadataJob) ?u32 {
+        if (self.codex_cancel.isRequested()) return null;
+        return remainingCodexMs(self.started_ms, @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds()));
+    }
+    /// A failed acquisition — including a credential awaiting reauthentication —
+    /// never becomes a listing request, so no send bypasses the stored login.
+    fn runCodex(self: *MetadataJob) void {
+        if (self.requested & metadata.bit(.openai_codex) == 0) return;
+        const alias = self.codex_alias orelse return;
+        const source = self.codex_source orelse blk: {
+            const manager = self.codex_manager orelse return;
+            break :blk manager.source();
+        };
+        const acquire_ms = self.codexRemaining() orelse return;
+        var credential = source.acquire(self.allocator, alias, &self.codex_cancel, acquire_ms) catch return;
+        defer credential.deinit(self.allocator);
+        const fetch_ms = self.codexRemaining() orelse return;
+        const values = self.codex_fetch(self.allocator, self.io, &credential, &self.codex_cancel, fetch_ms) catch return;
+        metadata.mergeOfficial(&self.listing, &values, .openai_codex) catch return;
+        self.succeeded |= metadata.bit(.openai_codex);
+    }
+    /// Owner-only teardown; the caller has already joined the official future.
+    fn releaseCodex(self: *MetadataJob) void {
+        self.codex_cancel.cancel();
+        if (self.codex_manager) |manager| manager.deinit();
+        self.codex_manager = null;
+        self.codex_source = null;
+        if (self.codex_alias) |alias| self.allocator.free(alias);
+        self.codex_alias = null;
+        self.codex_cancel = .{};
     }
     fn runDev(self: *MetadataJob) void {
         defer self.dev_done.store(true, .release);
@@ -119,6 +242,7 @@ const MetadataJob = struct {
         if (self.future) |*future| future.cancel(self.io);
         if (self.dev_future) |*future| future.cancel(self.io);
         self.wipeKeys();
+        self.releaseCodex();
         self.allocator.destroy(self);
     }
 };
@@ -129,7 +253,6 @@ pub const Session = struct {
     environ: *const std.process.Environ.Map,
     project: []const u8,
     host: r.Host,
-    logging: bool = true,
     /// Generated once before activation/logging; never read from the writer.
     session_id: ids.Id,
     store: Store,
@@ -163,7 +286,7 @@ pub const Session = struct {
     // borrow the global registry arena; current() rebuilds after each save.
     display_providers: [16]tui.ModelProvider = undefined,
     selected_alias: ?[]u8 = null,
-    credential_revisions: [3]u64 = @splat(0),
+    credential_revisions: [ProviderId.all.len]u64 = @splat(0),
     active_revision: u64 = 0,
     metadata_cache: metadata.Cache = .{},
     metadata_auto: bool = false,
@@ -175,8 +298,15 @@ pub const Session = struct {
     metadata_login_pending: u8 = 0,
     metadata_blocked: bool = false,
     metadata_job: ?*MetadataJob = null,
+    codex_job: ?*CodexLoginJob = null,
+    codex_view: codex_login.View = .{},
+    codex_reported: codex_login.View = .{},
     metadata_fetch: MetadataFetch = metadata.fetch,
     metadata_dev_fetch: DevFetch = metadata.fetchDev,
+    metadata_codex_fetch: MetadataCodexFetch = metadata.fetchCodexListing,
+    /// Private offline seam for the borrowed Codex credential source; the
+    /// production path always acquires through an owned Manager.
+    metadata_codex_source: ?codex_auth.CredentialSource = null,
     metadata_notice: ?[]const u8 = null,
     /// Identity snapshot only: App publishes process-lifetime static notices.
     /// Never retain or inspect worker-owned mutable Runtime state here.
@@ -199,7 +329,7 @@ pub const Session = struct {
     /// `session_id` is the explicit identity of a NEW session (daemon/foreground
     /// worker); resume keeps its own source id and rejects a conflicting value.
     /// `auto_refresh_models` is opt-in and never implied by ownership.
-    pub const Options = struct { session_id: ?ids.Id = null, restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, logging: bool = true, auto_refresh_models: bool = false };
+    pub const Options = struct { session_id: ?ids.Id = null, restore_selection: ?ids.Id = null, resume_session: ?ids.Id = null, auto_refresh_models: bool = false };
 
     /// 只做本地初始化；缺少凭证时保持 pending，不发起试探请求。
     pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host) !Session {
@@ -221,12 +351,9 @@ pub const Session = struct {
         var project_root = try fs.Root.open(a, io, project);
         var project_moved = false;
         errdefer if (!project_moved) project_root.deinit();
-        // Every resume takes the execution lease first, whatever the log policy:
-        // `--no-log` suppresses journal/checkpoint publication, not single
-        // ownership of this Session id. Only a log viewer may fall back to
-        // read-only history beside a live writer.
+        // Resume acquires an execution lease; viewers may fall back to read-only.
         var lease: ?resume_store.Lease = if (options.resume_session) |source_id| resume_store.Lease.open(&project_root, source_id, true) catch |err| switch (err) {
-            error.SessionInUse => if (options.logging) try resume_store.Lease.open(&project_root, source_id, false) else return error.SessionInUse,
+            error.SessionInUse => try resume_store.Lease.open(&project_root, source_id, false),
             error.AccessDenied, error.ReadOnlyFileSystem, error.UnsafeResumeFile => try resume_store.Lease.open(&project_root, source_id, false),
             else => return err,
         } else null;
@@ -256,7 +383,6 @@ pub const Session = struct {
             .environ = environ,
             .project = project,
             .host = host,
-            .logging = options.logging,
             .session_id = id,
             .store = auth_store,
             .project_root = project_root,
@@ -326,14 +452,19 @@ pub const Session = struct {
             return self;
         }
         if (config.selection_pending) return self;
-        const key = cfg.resolveApiKey(a, self.pending.?.value, environ) catch |err| {
-            if (err == error.ApiKeyNotFound or err == error.InvalidApiKey) {
+        if (isCodexProvider(config.provider)) {
+            if (!self.hasLocalCredential(config.provider)) {
                 self.settings_notice = "Not logged in; history available, use /login to activate";
                 return self;
             }
-            return err;
-        };
-        defer {
+        } else {
+            const key = cfg.resolveApiKey(a, self.pending.?.value, environ) catch |err| {
+                if (err == error.ApiKeyNotFound or err == error.InvalidApiKey) {
+                    self.settings_notice = "Not logged in; history available, use /login to activate";
+                    return self;
+                }
+                return err;
+            };
             std.crypto.secureZero(u8, key);
             a.free(key);
         }
@@ -442,13 +573,14 @@ pub const Session = struct {
         // Pin while the fresh journal still has zero counters. Imported sequence
         // numbers belong to the archive, not to a second pin operation.
         try candidate.pinSessionID(self.session_id);
-        candidate.setLogging(self.logging);
         try self.prepareLoadedHistory(candidate);
         return candidate;
     }
 
     /// 必须等 TUI 取消并 join worker 后再释放；Connection 不得比 Session 活得更久。
     pub fn deinit(self: *Session) void {
+        if (self.codex_job) |job| job.destroy(self.allocator);
+        self.codex_job = null;
         self.releaseLoadedHistory();
         if (self.metadata_job) |job| job.destroy();
         self.freeDisplayModels(self.display_models);
@@ -465,15 +597,9 @@ pub const Session = struct {
         self.* = undefined;
     }
 
-    /// main 在进入 TUI 前设置，也应用于之后 /login 创建的候选 App。
-    pub fn setLogging(self: *Session, enabled: bool) void {
-        self.logging = enabled;
-        if (self.app) |app| app.setLogging(enabled);
-    }
-
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -488,8 +614,8 @@ pub const Session = struct {
     /// run; this publishes the final clean generation. A failure never changes
     /// task success; the caller must withhold the command.
     pub fn saveOnExit(self: *Session) !bool {
-        if (!self.logging or self.read_only) return false;
-        if (initialHistory(self).len == 0) return false;
+        if (self.read_only) return false;
+        if (!hasConversationData(initialHistory(self))) return false;
         if (self.app) |app| app.journal.finish();
         const bytes = try self.encodeCheckpoint(false);
         defer {
@@ -504,14 +630,25 @@ pub const Session = struct {
         const app = self.app orelse return;
         if (app.runtime.observer.context == @as(*anyopaque, self)) return;
         if (app.runtime.busy.load(.acquire)) return;
+        app.runtime.diagnostics = app.journal.diagnosticSink();
         self.inner_observer = app.journal.observer();
         app.runtime.observer = .{ .context = self, .notify_fn = persistNotify };
     }
 
     fn persistNotify(ctx: ?*anyopaque, observation: r.Observation) void {
         const self: *Session = @ptrCast(@alignCast(ctx.?));
-        self.inner_observer.notify(observation);
-        if (!self.logging) return;
+        const measured = switch (observation) {
+            .event => |event| event == .assistant_committed or event == .finished,
+            else => false,
+        };
+        if (measured) {
+            const sink = if (self.app) |app| app.journal.diagnosticSink() else diagnostics.Sink{};
+            var observer_span = diagnostics.Span.start(sink, self.io, .{ .stage = .observer });
+            self.inner_observer.notify(observation);
+            observer_span.finish(.ok);
+        } else {
+            self.inner_observer.notify(observation);
+        }
         switch (observation) {
             .event => |event| switch (event) {
                 // Dirty only once a tool can have side effects. Model calls and
@@ -566,9 +703,18 @@ pub const Session = struct {
     }
 
     fn persistCheckpoint(self: *Session, during_run: bool) !void {
-        if (!self.logging) return;
+        const sink = if (self.app) |app| app.journal.diagnosticSink() else diagnostics.Sink{};
+        var span = diagnostics.Span.start(sink, self.io, .{ .stage = .checkpoint });
+        defer span.finish(.ok);
+        self.persistCheckpointInner(during_run) catch |err| {
+            span.fail(err);
+            return err;
+        };
+    }
+
+    fn persistCheckpointInner(self: *Session, during_run: bool) !void {
         const app = self.app orelse return;
-        if (app.runtime.messages().len == 0) return;
+        if (!hasConversationData(app.runtime.messages())) return;
         if (app.runtime.poisoned) return error.UnsafeToContinue;
         const bytes = try self.encodeCheckpoint(during_run);
         defer {
@@ -650,6 +796,7 @@ pub const Session = struct {
             }
         }
         return .{
+            .codex_login = self.codexLoginView(),
             .runtime = if (self.app) |app| &app.runtime else null,
             .initial_context = if (unselected or config.selection_pending) null else self.initial_context orelse .{ .tokens = 0, .limit = @intCast(config.model.context_tokens) },
             .model = if (unselected) "" else config.model.name,
@@ -699,7 +846,6 @@ pub const Session = struct {
             .settings_error = self.settings_error,
             .settings_notice = self.settings_notice,
             .base_url = config.provider.base_url,
-            .logging_enabled = self.logging and !self.read_only,
             // Journal failures already render as REC FAILED. Checkpoint saves use
             // that same channel when the journal itself is still healthy.
             .log_error = (if (self.app) |app| app.journal.failure() else null) orelse self.checkpointError(),
@@ -744,6 +890,129 @@ pub const Session = struct {
         return true;
     }
 
+    /// Owner-thread only. A login worker owns no Session or UI pointers.
+    pub fn startCodexLogin(self: *Session) !void {
+        try self.guardSelection();
+        if (self.codex_job != null) return error.Busy;
+        const generation = std.math.add(u64, self.codex_view.generation, 1) catch return error.Unavailable;
+        const home = self.environ.get("HOME") orelse return error.MissingHome;
+        const alias = try self.allocator.dupe(u8, codexLoginAlias(self.global_config.?.value.registry, self.mutableConfig().selected_provider));
+        errdefer self.allocator.free(alias);
+        const manager = try codex_oauth.Manager.init(self.allocator, self.io, home, self.environ);
+        errdefer manager.deinit();
+        const job = try self.allocator.create(CodexLoginJob);
+        errdefer self.allocator.destroy(job);
+        job.* = .{ .io = self.io, .manager = manager, .alias = alias, .view = .{ .generation = generation, .status = .pending } };
+        job.future = try std.Io.concurrent(self.io, CodexLoginJob.run, .{job});
+        self.codex_job = job;
+        self.codex_view = .{ .generation = generation, .status = .pending };
+    }
+
+    pub fn cancelCodexLogin(self: *Session, generation: u64) !void {
+        const job = self.codex_job orelse return error.InvalidSequence;
+        if (generation != job.view.generation) return error.InvalidSequence;
+        job.cancel.cancel();
+    }
+
+    pub fn codexLoginView(self: *Session) codex_login.View {
+        return if (self.codex_job) |job| job.snapshot() else self.codex_view;
+    }
+
+    /// Reload the committed declaration without replacing a live runtime or its
+    /// frozen model. Pending history remains owned until a candidate is ready.
+    fn reloadCodexLogin(self: *Session) !void {
+        var latest = try self.store.loadExisting();
+        errdefer cfg.release(&latest);
+        const active = self.mutableConfig().*;
+        var next: ?std.json.Parsed(cfg.Config) = null;
+        errdefer if (next) |*value| cfg.release(value);
+        var initial: ?*App = null;
+        errdefer if (initial) |value| value.deinit();
+        if (self.app == null) {
+            var merged = active;
+            merged.registry = latest.value.registry;
+            if (active.selected_provider) |name| {
+                if (latest.value.registry) |registry| if (registry.find(name)) |provider| {
+                    merged.provider = provider.connection;
+                };
+            }
+            next = try cfg.clone(self.allocator, merged);
+            if (!merged.selection_pending and isCodexProvider(merged.provider) and merged.provider.codex_oauth != null) {
+                const parsed = next.?;
+                next = null;
+                initial = try self.prepareApp(parsed);
+            }
+        }
+        const models = try self.buildModels(if (initial) |app| app.config.value else if (next) |value| value.value else active, latest.value);
+        errdefer self.freeDisplayModels(models);
+        const decisions = try self.buildDecisionModels(latest.value);
+        errdefer self.freeDisplayModels(decisions);
+        const images = try self.buildImageModels(latest.value);
+        errdefer self.freeDisplayModels(images);
+        if (self.global_config) |*old| cfg.release(old);
+        self.global_config = latest;
+        if (self.app == null) {
+            if (self.pending) |*old| cfg.release(old);
+            self.pending = next;
+            if (initial) |app| {
+                self.app = app;
+                self.pending_base_model = null;
+                self.armInitialDefault();
+                self.initial_context = app.runtime.contextSnapshot();
+                self.releaseLoadedHistory();
+                self.settings_notice = if (self.resumed) "Conversation restored; prior tools are NOT rerun" else null;
+            } else if (self.pending) |*pending| self.pending_base_model = pending.value.model;
+        }
+        self.freeDisplayModels(self.display_models);
+        self.freeDisplayModels(self.display_decision_models);
+        self.freeDisplayModels(self.display_image_models);
+        self.display_models = models;
+        self.display_decision_models = decisions;
+        self.display_image_models = images;
+        self.credential_revisions[@intCast(@backingInt(ProviderId.openai_codex))] +%= 1;
+        // The saved login refreshes exactly this provider's authenticated list
+        // plus the public catalog; other sources keep their own claim cadence.
+        // A running job defers only the official bit to its pending restart.
+        const codex_metadata: u8 = if (self.codexMetadataAlias() != null) metadata.bit(.openai_codex) else 0;
+        if (self.metadata_job == null) self.startMetadata(codex_metadata | metadata.dev_bit, true) catch {
+            self.metadata_notice = "Login saved; model metadata refresh failed";
+        } else if (codex_metadata != 0) self.metadata_login_pending |= codex_metadata;
+    }
+
+    /// Never waits for network; completion joins only after worker publication.
+    pub fn pollCodexLogin(self: *Session) !bool {
+        if (self.codex_job) |job| {
+            if (job.done.load(.acquire)) {
+                if (self.app) |app| if (app.runtime.busy.load(.acquire)) {
+                    const view = job.snapshot();
+                    const changed = !std.meta.eql(view, self.codex_reported);
+                    self.codex_reported = view;
+                    return changed;
+                };
+                if (job.future) |*future| future.await(self.io);
+                job.future = null;
+                self.codex_view = job.snapshot();
+                self.codex_job = null;
+                job.destroy(self.allocator);
+                if (self.codex_view.status == .succeeded) self.reloadCodexLogin() catch {
+                    self.settings_notice = "Login saved; local configuration reload failed";
+                };
+            }
+        }
+        const view = self.codexLoginView();
+        const changed = !std.meta.eql(view, self.codex_reported);
+        self.codex_reported = view;
+        return changed;
+    }
+
+    fn codexLogin(raw: *anyopaque, action: codex_login.Action, generation: u64) !void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        switch (action) {
+            .start => try self.startCodexLogin(),
+            .cancel => try self.cancelCodexLogin(generation),
+        }
+    }
+
     fn refreshModels(raw: *anyopaque) !void {
         const self: *Session = @ptrCast(@alignCast(raw));
         try self.startMetadata(self.configuredMask(self.global_config.?.value), true);
@@ -782,12 +1051,18 @@ pub const Session = struct {
         job.requested = claim.mask;
         job.generations = claim.generations;
         for (ProviderId.all) |id| {
+            // Codex borrows an OAuth request credential below, never a key.
+            if (id == .openai_codex) continue;
             const index: usize = @intCast(@backingInt(id));
             if (claim.mask & metadata.bit(id) != 0) job.keys[index] = self.keyFor(id) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => null, // Durable failed attempt; never fetch with a null key.
             };
         }
+        self.prepareCodexMetadata(job) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {}, // No exact alias/login or local store: this source is skipped.
+        };
         if (claim.mask == 0) {
             job.destroy();
             return;
@@ -807,7 +1082,7 @@ pub const Session = struct {
     /// source is still running. No public task is cancelled or restarted here.
     fn restartOfficialMetadata(self: *Session, job: *MetadataJob, requested: u8) !void {
         std.debug.assert(job.future == null and job.official_published);
-        var keys: [3]?[]u8 = @splat(null);
+        var keys: [ProviderId.all.len]?[]u8 = @splat(null);
         var transferred = false;
         defer if (!transferred) {
             for (keys) |key| if (key) |bytes| {
@@ -817,6 +1092,8 @@ pub const Session = struct {
         };
         const claim = try metadata.claimAt(&self.store.root, requested, true, self.metadataNow(), self.refreshPolicy());
         for (ProviderId.all) |id| {
+            // Codex is repopulated from its own Manager after this join.
+            if (id == .openai_codex) continue;
             if (claim.mask & metadata.bit(id) != 0) keys[@intCast(@backingInt(id))] = self.keyFor(id) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => null,
@@ -829,10 +1106,14 @@ pub const Session = struct {
         const previous_revisions = job.credential_revisions;
         const previous_generations = job.generations;
         job.wipeKeys();
+        // The official future is joined, so the previous exact alias, Manager
+        // and cancellation are released before a fresh source is prepared.
+        job.releaseCodex();
         job.keys = keys;
         transferred = true;
         errdefer {
             job.wipeKeys();
+            job.releaseCodex();
             job.requested = previous_mask;
             job.listing = previous_listing;
             job.succeeded = previous_succeeded;
@@ -842,9 +1123,10 @@ pub const Session = struct {
             job.official_published = true;
         }
         job.requested = claim.mask | (previous_mask & metadata.dev_bit);
+        try self.prepareCodexMetadata(job);
         // Restart replaces official ownership only; the public task keeps its
         // independent durable claim even if another session has since claimed.
-        for (0..3) |index| if (claim.mask & (@as(u8, 1) << @intCast(index)) != 0) {
+        for (0..ProviderId.all.len) |index| if (claim.mask & (@as(u8, 1) << @intCast(index)) != 0) {
             job.generations[index] = claim.generations[index];
         };
         job.listing = .{};
@@ -877,6 +1159,9 @@ pub const Session = struct {
         var session: Session = undefined;
         session.app = null;
         session.initial_default_pending = false;
+        session.codex_job = null;
+        session.codex_view = .{};
+        session.codex_reported = .{};
         var job: MetadataJob = undefined;
         job.future = null;
         job.dev_future = null;
@@ -906,17 +1191,24 @@ pub const Session = struct {
     fn pollModels(raw: *anyopaque, idle: bool) bool {
         const self: *Session = @ptrCast(@alignCast(raw));
         const memory_changed = self.memoryNoticeChanged(if (self.app) |app| app.memoryNotice() else null);
-        const default_changed = (self.completeInitialDefault(idle) catch false) or memory_changed;
+        const login_changed = self.pollCodexLogin() catch false;
+        const default_changed = (self.completeInitialDefault(idle) catch false) or memory_changed or login_changed;
         if (self.metadata_job) |job| {
             official_pending: {
                 if (job.future) |*future| {
                     if (job.done.load(.acquire)) {
                         future.await(self.io);
                     } else if (std.Io.Clock.awake.now(self.io).toMilliseconds() - job.started_ms >= official_metadata_timeout_ms) {
+                        // Stop the borrowed credential acquisition/listing first;
+                        // the join below owns both waits.
+                        job.codex_cancel.cancel();
                         future.cancel(self.io);
                     } else break :official_pending;
                     job.future = null;
                     job.wipeKeys(); // Also handles cancellation before the worker starts.
+                    // The worker is joined, so its Manager/alias can be released;
+                    // a queued login restart prepares a fresh source of its own.
+                    job.releaseCodex();
                 }
             }
             dev_pending: {
@@ -1049,7 +1341,18 @@ pub const Session = struct {
 
     // Presence only: never copy credentials into presentation state or probe an
     // endpoint. An empty literal or environment value is not a local login.
+    fn isCodexProvider(provider: cfg.Provider) bool {
+        return provider.kind == .openai_codex and std.mem.eql(u8, provider.base_url, ProviderId.openai_codex.baseUrl());
+    }
+
+    /// Authenticated discovery requires the exact official URL and a typed
+    /// OAuth declaration; a bare API key never becomes a Codex source.
+    fn codexMetadataProvider(provider: cfg.Provider) bool {
+        return provider.codex_oauth != null and ProviderId.fromUrl(provider.base_url) == ProviderId.openai_codex;
+    }
+
     fn hasLocalCredential(self: *const Session, provider: cfg.Provider) bool {
+        if (isCodexProvider(provider)) return provider.codex_oauth != null;
         if (provider.api_key) |key| if (key.len != 0) return true;
         if (provider.api_key_env.len != 0) {
             if (self.environ.get(provider.api_key_env)) |key| return key.len != 0;
@@ -1204,6 +1507,7 @@ pub const Session = struct {
     }
 
     fn keyFor(self: *Session, id: ProviderId) ![]u8 {
+        if (id == .openai_codex) return error.ApiKeyNotFound;
         const global = self.global_config.?.value;
         if (global.registry) |registry| {
             // Explicit selected connection wins; a missing env is not permission
@@ -1227,6 +1531,42 @@ pub const Session = struct {
 
     fn mutableConfig(self: *Session) *cfg.Config {
         return if (self.app) |app| &app.config.value else &self.pending.?.value;
+    }
+
+    /// Codex metadata reuses keyFor's protected latest-config lookup: the
+    /// selected connection wins and a missing login never falls back to another
+    /// alias. Only the exact alias is copied; the token stays in its Store.
+    fn codexMetadataAlias(self: *Session) ?[]const u8 {
+        const registry = self.global_config.?.value.registry orelse return null;
+        if (self.mutableConfig().selected_provider) |name| {
+            if (registry.find(name)) |provider| if (codexMetadataProvider(provider.connection)) return provider.name;
+        }
+        for (registry.providers) |provider| if (codexMetadataProvider(provider.connection)) return provider.name;
+        return null;
+    }
+
+    /// Prepare the Codex source only when Codex itself was claimed and its
+    /// typed login is present. Nothing is prepared for an API-key provider.
+    fn prepareCodexMetadata(self: *Session, job: *MetadataJob) !void {
+        if (job.requested & metadata.bit(.openai_codex) == 0) return;
+        const name = self.codexMetadataAlias() orelse return;
+        var manager: ?*codex_oauth.Manager = null;
+        if (self.metadata_codex_source == null) {
+            const home = self.environ.get("HOME") orelse return error.MissingHome;
+            manager = codex_oauth.Manager.init(self.allocator, self.io, home, self.environ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null, // Unavailable local auth storage gains no source.
+            };
+        }
+        const alias = self.allocator.dupe(u8, name) catch |err| {
+            if (manager) |owned| owned.deinit();
+            return err;
+        };
+        job.codex_manager = manager;
+        job.codex_source = self.metadata_codex_source;
+        job.codex_alias = alias;
+        job.codex_fetch = self.metadata_codex_fetch;
+        job.codex_cancel = .{};
     }
 
     fn guardSelection(self: *Session) !void {
@@ -1508,15 +1848,18 @@ pub const Session = struct {
         var initial: ?*App = null;
         errdefer if (replacement) |value| value.deinit();
         errdefer if (initial) |value| value.deinit();
-        const key = cfg.resolveApiKey(self.allocator, owned.value, self.environ) catch |err| blk: {
+        const codex = isCodexProvider(owned.value.provider);
+        const key: ?[]u8 = if (codex) null else cfg.resolveApiKey(self.allocator, owned.value, self.environ) catch |err| blk: {
             if ((err == error.ApiKeyNotFound or err == error.InvalidApiKey) and self.app == null) break :blk null;
             return err;
         };
+        const credential_available = if (codex) self.hasLocalCredential(owned.value.provider) else key != null;
+        if (codex and !credential_available and self.app != null) return error.ApiKeyNotFound;
         defer if (key) |bytes| {
             std.crypto.secureZero(u8, bytes);
             self.allocator.free(bytes);
         };
-        if (key != null) {
+        if (credential_available) {
             if (self.app) |app| {
                 consumed = true; // App preparation consumes even on error.
                 replacement = try app.prepareConnection(owned, self.environ);
@@ -1909,6 +2252,64 @@ const SessionTestFixture = struct {
     }
 };
 
+test "checkpoint persistence ignores machine-only context but retains prior conversation" {
+    const Message = @import("../core/protocol.zig").Message;
+    const summary_marker = @import("../core/context.zig").summary_marker;
+    const cases = [_]struct { messages: []const Message, persists: bool }{
+        .{ .messages = &.{.{ .role = .context, .blocks = &.{.{ .text = "machine prefix" }} }}, .persists = false },
+        .{ .messages = &.{.{ .role = .context, .blocks = &.{.{ .text = summary_marker ++ "prior conversation" }} }}, .persists = true },
+        .{ .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "prior question" }} }}, .persists = true },
+        .{ .messages = &.{.{ .role = .assistant, .blocks = &.{.{ .text = "prior answer" }} }}, .persists = true },
+    };
+    for (cases) |case| {
+        var fixture = try SessionTestFixture.init();
+        defer fixture.deinit();
+        var session = try fixture.open(.{});
+        defer session.deinit();
+        try session.connection().configure("fake-checkpoint-test");
+        const app = session.app.?;
+        try app.runtime.restoreCheckpoint(.{
+            .system = "saved system",
+            .selector = app.runtime.selector,
+            .estimator = .{},
+            .last_context_tokens = null,
+            .permission_id = 0,
+            .messages = case.messages,
+        });
+        try session.persistCheckpointInner(false);
+        var path_buffer: [100]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".thin/sessions/{s}.session", .{session.session_id});
+        if (case.persists) {
+            _ = try fixture.tmp.dir.statFile(std.testing.io, path, .{});
+        } else {
+            try std.testing.expect(session.resume_lease == null);
+            try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, path, .{}));
+        }
+        try std.testing.expectEqual(case.persists, try session.saveOnExit());
+        if (!case.persists) try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, path, .{}));
+    }
+}
+
+test "stream delta observations do not allocate diagnostic spans" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    var session = try fixture.open(.{});
+    defer session.deinit();
+    try session.connection().configure("fake-archive-original");
+    session.installObserver();
+    const app = session.app.?;
+    app.runtime.observer.notify(.{ .submitted = "test" });
+    app.journal.flush();
+    const before = app.journal.diagnostic_span;
+    for (0..512) |_| {
+        app.runtime.observer.notify(.{ .event = .{ .text = "delta" } });
+        app.runtime.observer.notify(.{ .event = .{ .reasoning = "delta" } });
+    }
+    try std.testing.expectEqual(before, app.journal.diagnostic_span);
+    try std.testing.expectEqual(@as(usize, 0), app.journal.diagnostic_outstanding);
+    try std.testing.expectEqual(null, app.journal.failure());
+}
+
 fn seedSessionTestHistory(session: *Session) !void {
     const app = session.app.?;
     try app.runtime.restoreCheckpoint(.{
@@ -1951,7 +2352,7 @@ test "empty HOME hides placeholder selection but retains initialized defaults" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try std.testing.expect(session.app == null);
     try std.testing.expect(session.loaded_checkpoint == null);
@@ -1978,7 +2379,7 @@ test "provider menu preserves local credential aliases and actual endpoint ident
     );
     try fixture.env.put("MENU_KEY", "fake-env");
     try fixture.env.put("EMPTY_MENU_KEY", "");
-    var session = try fixture.open(.{ .logging = false });
+    var session = try fixture.open(.{});
     defer session.deinit();
     const state = session.connection().current();
     const providers = state.model_providers;
@@ -2009,10 +2410,191 @@ test "provider menu preserves local credential aliases and actual endpoint ident
     try std.testing.expect(!session.hasLocalCredential(empty_literal));
 }
 
+test "codex public prompt and exact-generation cancellation" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    var session = try fixture.open(.{});
+    defer session.deinit();
+    var job: CodexLoginJob = .{ .io = std.testing.io, .manager = undefined, .alias = undefined, .view = .{ .generation = 7, .status = .pending } };
+    session.codex_job = &job;
+    defer session.codex_job = null;
+    try std.testing.expectError(error.InvalidSequence, session.cancelCodexLogin(6));
+    try std.testing.expect(!job.cancel.isRequested());
+    try CodexLoginJob.pending(&job, .{ .verification_url = codex_login.verification_url, .user_code = "ABCD-1234" });
+    const view = session.codexLoginView();
+    try std.testing.expectEqualStrings("ABCD-1234", view.userCode());
+    try std.testing.expect(try session.pollCodexLogin());
+    try std.testing.expect(!try session.pollCodexLogin());
+    try session.cancelCodexLogin(7);
+    try std.testing.expect(job.cancel.isRequested());
+    try std.testing.expectError(error.InvalidDevicePrompt, CodexLoginJob.pending(&job, .{ .verification_url = "https://evil.invalid/", .user_code = "CODE" }));
+}
+
+test "codex login selects exact official alias without requiring credentials" {
+    const official = cfg.Provider{ .base_url = ProviderId.openai_codex.baseUrl(), .kind = .openai_codex };
+    const providers = [_]cfg.NamedProvider{
+        .{ .name = "lookalike", .connection = .{ .base_url = "https://chatgpt.com/backend-api/codex/evil", .kind = .openai_codex } },
+        .{ .name = "wrong-kind", .connection = .{ .base_url = ProviderId.openai_codex.baseUrl() } },
+        .{ .name = "chatgpt", .connection = official },
+        .{ .name = "codex", .connection = official },
+    };
+    const registry = cfg.Registry{ .default = "", .providers = &providers };
+    try std.testing.expectEqualStrings("codex", codexLoginAlias(registry, "codex"));
+    try std.testing.expectEqualStrings("chatgpt", codexLoginAlias(registry, "lookalike"));
+    try std.testing.expectEqualStrings("chatgpt", codexLoginAlias(registry, "wrong-kind"));
+    try std.testing.expectEqualStrings(ProviderId.openai_codex.slug(), codexLoginAlias(null, null));
+    const invalid = cfg.Registry{ .default = "", .providers = providers[0..2] };
+    try std.testing.expectEqualStrings(ProviderId.openai_codex.slug(), codexLoginAlias(invalid, "lookalike"));
+}
+
+test "codex credential presence requires exact official identity" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    var session = try fixture.open(.{});
+    defer session.deinit();
+    var provider: cfg.Provider = .{ .base_url = ProviderId.openai_codex.baseUrl(), .kind = .openai_codex, .codex_oauth = .{ .access_token = "fixture", .refresh_token = "fixture", .expires_at_ms = 1 } };
+    try std.testing.expect(session.hasLocalCredential(provider));
+    provider.base_url = "https://example.invalid";
+    try std.testing.expect(!session.hasLocalCredential(provider));
+}
+
+test "codex metadata shares the original official deadline" {
+    const Fixture = struct {
+        var acquires: usize = 0;
+        var fetches: usize = 0;
+        var acquire_ms: u32 = 0;
+        var fetch_ms: u32 = 0;
+        var advance_ms: i64 = 0;
+        var cancel_after = false;
+        fn source(ctx: ?*anyopaque, a: std.mem.Allocator, _: []const u8, _: ?*const p.Cancellation, timeout_ms: u32) !codex_auth.RequestCredential {
+            const job: *MetadataJob = @ptrCast(@alignCast(ctx.?));
+            acquires += 1;
+            acquire_ms = timeout_ms;
+            job.started_ms -= advance_ms;
+            if (cancel_after) job.codex_cancel.cancel();
+            const token = try a.dupe(u8, "token");
+            errdefer a.free(token);
+            return .{ .access_token = token, .account_id = try a.dupe(u8, "account") };
+        }
+        fn fetch(_: std.mem.Allocator, _: std.Io, _: *const codex_auth.RequestCredential, _: ?*const p.Cancellation, timeout_ms: u32) !metadata.Listing {
+            fetches += 1;
+            fetch_ms = timeout_ms;
+            return .{};
+        }
+    };
+    const now: i64 = @intCast(std.Io.Clock.awake.now(std.testing.io).toMilliseconds());
+    try std.testing.expectEqual(@as(?u32, official_metadata_timeout_ms), MetadataJob.remainingCodexMs(now, now - 1));
+    try std.testing.expectEqual(@as(?u32, 1), MetadataJob.remainingCodexMs(now, now + official_metadata_timeout_ms - 1));
+    try std.testing.expectEqual(@as(?u32, null), MetadataJob.remainingCodexMs(now, now + official_metadata_timeout_ms));
+    var job: MetadataJob = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .fetch = metadata.fetch,
+        .dev_fetch = metadata.fetchDev,
+        .manual = false,
+        .started_ms = now - official_metadata_timeout_ms,
+        .requested = metadata.bit(.openai_codex),
+        .codex_fetch = Fixture.fetch,
+    };
+    job.codex_alias = @constCast("fixture");
+    job.codex_source = .{ .context = &job, .acquire_fn = Fixture.source };
+    Fixture.acquires = 0;
+    Fixture.fetches = 0;
+    Fixture.advance_ms = 0;
+    Fixture.cancel_after = false;
+    job.runCodex();
+    try std.testing.expectEqual(@as(usize, 0), Fixture.acquires);
+    try std.testing.expectEqual(@as(usize, 0), Fixture.fetches);
+
+    job.started_ms = @intCast(std.Io.Clock.awake.now(job.io).toMilliseconds());
+    Fixture.advance_ms = 1000;
+    job.runCodex();
+    try std.testing.expectEqual(@as(usize, 1), Fixture.acquires);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.fetches);
+    try std.testing.expect(Fixture.fetch_ms > 0 and Fixture.fetch_ms < Fixture.acquire_ms);
+
+    job.started_ms = @intCast(std.Io.Clock.awake.now(job.io).toMilliseconds());
+    Fixture.advance_ms = official_metadata_timeout_ms;
+    job.runCodex();
+    try std.testing.expectEqual(@as(usize, 2), Fixture.acquires);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.fetches);
+
+    job.started_ms = @intCast(std.Io.Clock.awake.now(job.io).toMilliseconds());
+    Fixture.advance_ms = 0;
+    Fixture.cancel_after = true;
+    job.runCodex();
+    try std.testing.expectEqual(@as(usize, 3), Fixture.acquires);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.fetches);
+}
+
+test "codex metadata refresh borrows the exact configured alias and skips sends before reauth" {
+    const Fixture = struct {
+        var acquires: std.atomic.Value(usize) = .init(0);
+        var reauth: std.atomic.Value(bool) = .init(false);
+        fn source(_: ?*anyopaque, a: std.mem.Allocator, alias: []const u8, _: ?*const p.Cancellation, _: u32) !codex_auth.RequestCredential {
+            _ = acquires.fetchAdd(1, .monotonic);
+            // Only the exact configured alias may be acquired.
+            if (!std.mem.eql(u8, alias, "chatgpt")) return error.UnexpectedAlias;
+            // refresh_pending means reauthentication is required: never send.
+            if (reauth.load(.monotonic)) return error.OAuthReauthenticationRequired;
+            return .{ .access_token = try a.dupe(u8, "fake-codex-access"), .account_id = try a.dupe(u8, "fake-codex-account") };
+        }
+        fn fetch(a: std.mem.Allocator, _: std.Io, credential: *const codex_auth.RequestCredential, _: ?*const p.Cancellation, _: u32) !metadata.Listing {
+            if (!std.mem.eql(u8, credential.access_token, "fake-codex-access")) return error.UnexpectedCredential;
+            return metadata.parseListing(a, "{\"models\":[{\"slug\":\"gpt-fixture\",\"visibility\":\"list\",\"context_window\":65536}]}", .openai_codex);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try writeSessionTestConfig(tmp.dir, session_codex_metadata_config);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    session.initial_default_pending = false;
+    session.metadata_wall_ms = 1000;
+    session.metadata_dev_fetch = MetadataFixture.dev;
+    session.metadata_codex_source = .{ .acquire_fn = Fixture.source };
+    session.metadata_codex_fetch = Fixture.fetch;
+    Fixture.acquires.store(0, .monotonic);
+    try Session.refreshModels(&session);
+    const job = session.metadata_job.?;
+    try std.testing.expectEqual(metadata.bit(.openai_codex) | metadata.dev_bit, job.requested);
+    // Only the exact alias is copied; Codex never consults an API key.
+    try std.testing.expectEqualStrings("chatgpt", job.codex_alias.?);
+    try std.testing.expect(job.keys[@intCast(@backingInt(ProviderId.openai_codex))] == null);
+    MetadataFixture.finish(&session);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expectEqual(@as(usize, 1), Fixture.acquires.load(.monotonic));
+    const listed = LayeredMetadataFixture.row(&session.metadata_cache.directory, .openai_codex, "gpt-fixture");
+    try std.testing.expectEqual(@as(?u32, 65536), listed.tokens);
+    try std.testing.expectEqual(p.Protocol.responses, listed.protocol);
+    const saved = try metadata.load(&session.store.root);
+    try std.testing.expect(saved.refresh[@intCast(@backingInt(ProviderId.openai_codex))].successful);
+    try std.testing.expect(session.metadata_job == null);
+    // A pending reauthentication keeps the last good list and issues no send.
+    Fixture.reauth.store(true, .monotonic);
+    session.metadata_wall_ms = 9999;
+    try Session.refreshModels(&session);
+    MetadataFixture.finish(&session);
+    try std.testing.expect(Session.pollModels(&session, true));
+    try std.testing.expectEqual(@as(usize, 2), Fixture.acquires.load(.monotonic));
+    try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&session.metadata_cache.directory, .openai_codex, "gpt-fixture").tokens);
+    try std.testing.expect(!(try metadata.load(&session.store.root)).refresh[@intCast(@backingInt(ProviderId.openai_codex))].successful);
+}
+
+const session_codex_metadata_config =
+    \\{"llm":{"default":"chatgpt/gpt-fixture","providers":{"chatgpt":{"base_url":"https://chatgpt.com/backend-api/codex","kind":"openai_codex","codex_oauth":{"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_at_ms":123456789},"models":{"gpt-fixture":{"protocol":"responses","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+;
+
 test "new llm pending startup and custom login activate without inference" {
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
-    var session = try fixture.open(.{ .logging = false });
+    var session = try fixture.open(.{});
     defer session.deinit();
     try std.testing.expect(session.app == null);
     try std.testing.expectEqualStrings("", session.connection().current().model);
@@ -2078,7 +2660,7 @@ test "invalid or empty key environment does not block restored history and can l
             \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key_env":"ARCHIVE_TEST_KEY","models":{"saved":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false}}
         );
         try fixture.env.put("ARCHIVE_TEST_KEY", value);
-        var resumed = try fixture.open(.{ .resume_session = id, .logging = false });
+        var resumed = try fixture.open(.{ .resume_session = id });
         defer resumed.deinit();
         try std.testing.expect(resumed.app == null);
         try std.testing.expect(std.mem.find(u8, resumed.settings_notice.?, "/login") != null);
@@ -2086,7 +2668,8 @@ test "invalid or empty key environment does not block restored history and can l
         try resumed.connection().configure("fake-valid-replacement");
         try std.testing.expect(resumed.app != null);
         try expectSessionTestHistory(&resumed);
-        try std.testing.expect(!try resumed.saveOnExit());
+        try std.testing.expect(!resumed.read_only);
+        try std.testing.expect(try resumed.saveOnExit());
     }
 }
 
@@ -2107,64 +2690,6 @@ test "concurrent checkpoint writer allows read only history without credentials"
     try std.testing.expectError(error.ResumeReadOnly, reader.connection().configure("fake-not-published"));
 }
 
-test "no-log resume cannot build a second runtime beside a live writer" {
-    var fixture = try SessionTestFixture.init();
-    defer fixture.deinit();
-    const id = try fixture.saveHistory();
-    var writer = try fixture.open(.{ .resume_session = id });
-    defer writer.deinit();
-    try std.testing.expect(writer.resume_lease.?.writable);
-    try std.testing.expect(writer.app != null);
-    // `--no-log` suppresses checkpoint publishing, not single ownership: the
-    // live owner must reject the second Runtime instead of granting an
-    // unlocked writable-looking session.
-    try std.testing.expectError(error.SessionInUse, fixture.open(.{ .resume_session = id, .logging = false }));
-    try std.testing.expect(writer.resume_lease.?.writable);
-    try std.testing.expect(writer.app != null);
-    try expectSessionTestHistory(&writer);
-}
-
-test "released lease runs no-log resume without republishing checkpoint or config" {
-    var fixture = try SessionTestFixture.init();
-    defer fixture.deinit();
-    const a = std.testing.allocator;
-    const id = try fixture.saveHistory();
-    {
-        var writer = try fixture.open(.{ .resume_session = id });
-        defer writer.deinit();
-        try std.testing.expectError(error.SessionInUse, fixture.open(.{ .resume_session = id, .logging = false }));
-    }
-    var buffer: [100]u8 = undefined;
-    const checkpoint_path = try std.fmt.bufPrint(&buffer, ".thin/sessions/{s}.session", .{id});
-    const checkpoint_before = try fixture.tmp.dir.readFileAlloc(std.testing.io, checkpoint_path, a, .limited(1 << 20));
-    defer a.free(checkpoint_before);
-    const config_before = try fixture.tmp.dir.readFileAlloc(std.testing.io, ".thin/config.json", a, .limited(1 << 16));
-    defer a.free(config_before);
-    var resumed = try fixture.open(.{ .resume_session = id, .logging = false });
-    defer resumed.deinit();
-    try std.testing.expect(!resumed.read_only);
-    try std.testing.expect(!resumed.logging);
-    try std.testing.expect(resumed.resume_lease.?.writable);
-    try std.testing.expect(resumed.app != null);
-    try expectSessionTestHistory(&resumed);
-    // The execution lease, not the log policy, is what blocks the second writer.
-    try std.testing.expectError(error.SessionInUse, resume_store.Lease.open(&resumed.project_root, id, true));
-    // Logging viewers keep the read-only history path; only the Host rejects a
-    // writable worker, Session.init itself must not fail here.
-    var viewer = try fixture.open(.{ .resume_session = id });
-    defer viewer.deinit();
-    try std.testing.expect(viewer.read_only);
-    try std.testing.expect(viewer.app == null);
-    try std.testing.expect(!viewer.resume_lease.?.writable);
-    try std.testing.expect(!try resumed.saveOnExit());
-    const checkpoint_after = try fixture.tmp.dir.readFileAlloc(std.testing.io, checkpoint_path, a, .limited(1 << 20));
-    defer a.free(checkpoint_after);
-    try std.testing.expectEqualSlices(u8, checkpoint_before, checkpoint_after);
-    const config_after = try fixture.tmp.dir.readFileAlloc(std.testing.io, ".thin/config.json", a, .limited(1 << 16));
-    defer a.free(config_after);
-    try std.testing.expectEqualSlices(u8, config_before, config_after);
-}
-
 test "changed credential and current budgets do not authenticate or reject checkpoint loading" {
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
@@ -2172,7 +2697,7 @@ test "changed credential and current budgets do not authenticate or reject check
     try writeSessionTestConfig(fixture.tmp.dir,
         \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key":"fake-rotated-key","models":{"saved":{"protocol":"responses","context_tokens":131072,"output_tokens":16384}}}}},"limits":{"low_price_input":true,"max_input_tokens":12000,"input_margin_tokens":1000}}
     );
-    var resumed = try fixture.open(.{ .resume_session = id, .logging = false });
+    var resumed = try fixture.open(.{ .resume_session = id });
     defer resumed.deinit();
     try expectSessionTestHistory(&resumed);
     try std.testing.expectEqualStrings("Bearer fake-rotated-key", resumed.app.?.client.authorization);
@@ -2182,7 +2707,8 @@ test "changed credential and current budgets do not authenticate or reject check
     try std.testing.expect(current_config.model.input_price_threshold == null);
     try std.testing.expectEqual(@as(?u32, 12000), current_config.limits.max_input_tokens);
     try std.testing.expectEqual(@import("../core/protocol.zig").Protocol.responses, current_config.model.protocol);
-    try std.testing.expect(!try resumed.saveOnExit());
+    try std.testing.expect(!resumed.read_only);
+    try std.testing.expect(try resumed.saveOnExit());
 }
 
 test "missing alias cannot borrow same model credential and preserves historical header" {
@@ -2212,7 +2738,7 @@ test "removed alias rebinds only by an unambiguous exact endpoint" {
     try writeSessionTestConfig(fixture.tmp.dir,
         \\{"llm":{"default":"renamed/saved","providers":{"renamed":{"base_url":"https://archive.invalid/v1","api_key":"fake-renamed","models":{"saved":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
     );
-    var resumed = try fixture.open(.{ .resume_session = id, .logging = false });
+    var resumed = try fixture.open(.{ .resume_session = id });
     defer resumed.deinit();
     try std.testing.expectEqualStrings("renamed/saved", resumed.connection().current().selection_name.?);
     try std.testing.expectEqualStrings("Bearer fake-renamed", resumed.app.?.client.authorization);
@@ -2248,13 +2774,12 @@ test "official provider login imports pending archive without switching global d
     try writeSessionTestConfig(fixture.tmp.dir,
         \\{"llm":{"default":"other/other","providers":{"archive":{"base_url":"https://api.deepseek.com","kind":"deepseek","models":{"saved":{"protocol":"chat","context_tokens":65536}}},"other":{"base_url":"https://other.invalid/v1","models":{"other":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
     );
-    var resumed = try fixture.open(.{ .resume_session = id, .logging = false });
+    var resumed = try fixture.open(.{ .resume_session = id });
     defer resumed.deinit();
     try std.testing.expect(resumed.app == null);
     try expectSessionTestHistory(&resumed);
-    const unchanged_generation = resumed.resume_lease.?.expected;
-    try std.testing.expect(!try resumed.saveOnExit());
-    try std.testing.expectEqual(unchanged_generation, resumed.resume_lease.?.expected);
+    try std.testing.expect(!resumed.read_only);
+    try std.testing.expect(try resumed.saveOnExit());
     try resumed.connection().configureProvider(.deepseek, "fake-official-login");
     try std.testing.expectEqualStrings("Bearer fake-official-login", resumed.app.?.client.authorization);
     try std.testing.expectEqualStrings("archive/saved", resumed.connection().current().selection_name.?);
@@ -2268,13 +2793,14 @@ test "missing config initializes latest defaults while retaining unconfigured ar
     defer fixture.deinit();
     const id = try fixture.saveHistory();
     try fixture.tmp.dir.deleteFile(std.testing.io, ".thin/config.json");
-    var resumed = try fixture.open(.{ .resume_session = id, .logging = false });
+    var resumed = try fixture.open(.{ .resume_session = id });
     defer resumed.deinit();
     try std.testing.expect(resumed.app == null);
     try std.testing.expectEqualStrings("archive/saved", resumed.connection().current().selection_name.?);
     try expectSessionTestHistory(&resumed);
     _ = try fixture.tmp.dir.statFile(std.testing.io, ".thin/config.json", .{});
-    try std.testing.expect(!try resumed.saveOnExit());
+    try std.testing.expect(!resumed.read_only);
+    try std.testing.expect(try resumed.saveOnExit());
 }
 
 test "restore selection without key or model remains pending and never imports messages" {
@@ -2317,7 +2843,7 @@ test "pending login save failure destroys candidate but retains source history" 
 test "custom credential rotation activates only on explicit same model reselect" {
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
-    var session = try fixture.open(.{ .logging = false });
+    var session = try fixture.open(.{});
     defer session.deinit();
     try session.connection().configure("fake-custom-before");
     try seedSessionTestHistory(&session);
@@ -2337,7 +2863,7 @@ test "custom kind does not authorize official metadata or credential borrowing" 
     try writeSessionTestConfig(fixture.tmp.dir,
         \\{"llm":{"default":"proxy/saved","providers":{"proxy":{"base_url":"https://proxy.invalid/v1","kind":"deepseek","api_key":"fake-proxy-only","models":{"saved":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false}}
     );
-    var session = try fixture.open(.{ .logging = false });
+    var session = try fixture.open(.{});
     defer session.deinit();
     try std.testing.expectEqual(@as(u8, 0), session.configuredMask(session.global_config.?.value));
     try std.testing.expect(session.connection().current().provider == null);
@@ -2373,7 +2899,7 @@ test "custom kind pending resume login stays on the actual endpoint" {
     try writeSessionTestConfig(fixture.tmp.dir,
         \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","kind":"opencode_zen","models":{"saved":{"protocol":"chat","context_tokens":65536,"output_tokens":4096}}}}},"limits":{"low_price_input":false}}
     );
-    var session = try fixture.open(.{ .resume_session = id, .logging = false });
+    var session = try fixture.open(.{ .resume_session = id });
     defer session.deinit();
     try std.testing.expect(session.app == null);
     try std.testing.expect(session.connection().current().provider == null);
@@ -2402,7 +2928,7 @@ test "pending model publication saves new archive selection without key" {
         try std.testing.expectEqualStrings("archive/saved", resumed.global_config.?.value.registry.?.default);
         try std.testing.expect(try resumed.saveOnExit());
     }
-    var reopened = try fixture.open(.{ .resume_session = id, .logging = false });
+    var reopened = try fixture.open(.{ .resume_session = id });
     defer reopened.deinit();
     try std.testing.expectEqualStrings("archive/next", reopened.connection().current().selection_name.?);
     try expectSessionTestHistory(&reopened);
@@ -2486,7 +3012,7 @@ test "Anthropic displayable session resume preserves signed replay and never exe
         try std.testing.expect(try source.saveOnExit());
     }
     {
-        var restored = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id, .logging = false });
+        var restored = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id });
         defer restored.deinit();
         try std.testing.expectEqual(id, restored.session_id);
         try std.testing.expect(restored.app.?.runtime.selector.selected == .anthropic);
@@ -2496,7 +3022,8 @@ test "Anthropic displayable session resume preserves signed replay and never exe
         defer a.free(actual);
         try std.testing.expectEqualStrings(expected.?, actual);
         try std.testing.expect(!restored.resume_lease.?.active);
-        try std.testing.expect(!try restored.saveOnExit());
+        try std.testing.expect(!restored.read_only);
+        try std.testing.expect(try restored.saveOnExit());
         try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "must-not-run.txt", .{}));
     }
 }
@@ -2538,7 +3065,7 @@ test "closed turn checkpoint is resumable before exit" {
         releaseLease(&source);
     }
     {
-        var resumed = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id, .logging = false });
+        var resumed = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id });
         defer resumed.deinit();
         try std.testing.expectEqual(@as(usize, 2), resumed.app.?.runtime.messages().len);
         try std.testing.expectEqualStrings("incremental question", resumed.app.?.runtime.messages()[0].blocks[0].text);
@@ -2574,6 +3101,9 @@ test "checkpoint save conflict reaches UI without changing restored history" {
 // Independent async/metadata regressions. These are real disk declarations in
 // the llm schema, not legacy Config -> registry conversion helpers. Presets have
 // no manual patches so refreshed capabilities remain visible in picker rows.
+const legacyMetadataTestProviders = [_]ProviderId{ .deepseek, .opencode_go, .opencode_zen };
+const legacyMetadataTestMask = metadata.bit(.deepseek) | metadata.bit(.opencode_go) | metadata.bit(.opencode_zen);
+
 fn writeOfficialMetadataTestConfig(dir: std.Io.Dir, id: ProviderId) !void {
     try writeSessionTestConfig(dir, switch (id) {
         .deepseek =>
@@ -2585,6 +3115,7 @@ fn writeOfficialMetadataTestConfig(dir: std.Io.Dir, id: ProviderId) !void {
         .opencode_zen =>
         \\{"llm":{"default":"opencode-zen/minimax-m2.7","providers":{"opencode-zen":{"base_url":"https://opencode.ai/zen/v1","kind":"opencode_zen","chat_max_tokens":true}}},"limits":{"low_price_input":false}}
         ,
+        .openai_codex => return error.UnexpectedFixtureProvider,
     });
 }
 
@@ -2660,7 +3191,7 @@ const MetadataPublicationFixture = struct {
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         try env.put("HOME", home);
-        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = false });
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .auto_refresh_models = false });
         defer session.deinit();
         session.initial_default_pending = false;
         session.metadata_wall_ms = 1000;
@@ -2727,7 +3258,7 @@ const MetadataPublicationFixture = struct {
             try std.testing.expectEqualDeep(previous_cache, session.metadata_cache);
         }
         const first_saved = try metadata.load(&session.store.root);
-        const first_index: usize = if (official_first) @intCast(@backingInt(ProviderId.deepseek)) else 3;
+        const first_index: usize = if (official_first) @intCast(@backingInt(ProviderId.deepseek)) else ProviderId.all.len;
         try std.testing.expectEqual(fault != .cache, first_saved.refresh[first_index].successful);
         try std.testing.expectEqual(@as(u16, 0), metadataNoticeTtl(session.metadata_notice));
         if (official_first) {
@@ -2742,7 +3273,7 @@ const MetadataPublicationFixture = struct {
         // The second stage really committed successfully, not another failure.
         const saved = try metadata.load(&session.store.root);
         if (official_first) {
-            try std.testing.expect(saved.refresh[3].successful);
+            try std.testing.expect(saved.refresh[ProviderId.all.len].successful);
         } else {
             const index: usize = @intCast(@backingInt(ProviderId.deepseek));
             try std.testing.expect(saved.refresh[index].successful);
@@ -2819,7 +3350,7 @@ test "initial default adopts late public metadata without cycling or normalizing
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = true });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .auto_refresh_models = true });
     defer session.deinit();
     Fetch.release.store(false, .release);
     defer Fetch.release.store(true, .release);
@@ -2873,7 +3404,7 @@ test "DeepSeek then Go Haiku selection applies global default with early or late
             var env = std.process.Environ.Map.init(a);
             defer env.deinit();
             try env.put("HOME", home);
-            var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+            var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
             defer session.deinit();
             try setGlobalEffortForTest(&session, wanted);
             session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.deepseek), try metadata.parseListing(a,
@@ -2950,7 +3481,7 @@ test "first activation defaults clamp without changing preference and own late c
             try writeSessionTestConfig(tmp.dir,
                 \\{"llm":{"default":"opencode-go/gpt-6-luna","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go"}}},"limits":{"low_price_input":false}}
             );
-            var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+            var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
             defer session.deinit();
             try setGlobalEffortForTest(&session, saved);
             const listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"effort\":{\"supported_levels\":[\"off\",\"low\",\"high\",\"max\"]}}]}", .opencode_go);
@@ -3002,7 +3533,7 @@ test "initial default stops after journal start and never overwrites an accepted
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-default-journal");
     try session.connection().selectModel("opencode-go/gpt-6-luna");
@@ -3048,7 +3579,7 @@ test "effort action cannot borrow official reasoning for a proxy kind hint" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", .deepseek);
     session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.deepseek), listing);
@@ -3081,7 +3612,7 @@ test "timed automatic metadata refresh repeats while active capabilities stay fr
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .deepseek);
     Fixture.calls.store(0, .monotonic);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true, .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true });
     defer session.deinit();
     session.metadata_fetch = Fixture.fetch;
     session.metadata_dev_fetch = MetadataFixture.dev;
@@ -3127,7 +3658,7 @@ test "manual metadata refresh filters obsolete credentials even with automatic r
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .deepseek);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = false });
     defer session.deinit();
     session.metadata_fetch = MetadataFixture.fetch;
     session.metadata_dev_fetch = MetadataFixture.dev;
@@ -3153,8 +3684,8 @@ test "manual metadata refresh filters obsolete credentials even with automatic r
     try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&stale_disk.directory, .deepseek, "deepseek-flash").tokens);
     try std.testing.expectEqual(@as(?u64, 1000), session.metadata_cache.refresh[0].last_success_ms);
     try std.testing.expect(!session.metadata_cache.refresh[0].successful);
-    try std.testing.expectEqual(@as(?u64, 2000), session.metadata_cache.refresh[3].last_success_ms);
-    try std.testing.expect(session.metadata_cache.refresh[3].successful);
+    try std.testing.expectEqual(@as(?u64, 2000), session.metadata_cache.refresh[ProviderId.all.len].last_success_ms);
+    try std.testing.expect(session.metadata_cache.refresh[ProviderId.all.len].successful);
     try std.testing.expect(!Session.pollModels(&session, true));
     try std.testing.expectEqual(@as(usize, 1), MetadataFixture.calls.load(.monotonic));
     // A new explicit refresh uses the replacement credential and can publish.
@@ -3176,7 +3707,7 @@ test "models.dev completion survives a stalled official source and owner teardow
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     session.metadata_fetch = MetadataFixture.stall;
     session.metadata_dev_fetch = LayeredMetadataFixture.dev;
@@ -3206,7 +3737,7 @@ test "official results publish while models.dev retains an independent longer de
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     session.metadata_fetch = LayeredMetadataFixture.official;
     session.metadata_dev_fetch = LayeredMetadataFixture.devStall;
@@ -3262,7 +3793,7 @@ test "login with new credentials refreshes official metadata without waiting for
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = true });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true });
     defer session.deinit();
     session.metadata_fetch = Fixture.official;
     session.metadata_dev_fetch = LayeredMetadataFixture.devStall;
@@ -3390,24 +3921,24 @@ test "manual refresh asynchronously discovers new IDs and preserves public proto
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .deepseek);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     session.metadata_fetch = Fixture.official;
     session.metadata_dev_fetch = Fixture.public;
-    for (ProviderId.all) |id| try session.connection().configureProvider(id, "fake-async-directory-key");
+    for (legacyMetadataTestProviders) |id| try session.connection().configureProvider(id, "fake-async-directory-key");
     Fixture.requested.store(0, .monotonic);
     Fixture.public_calls.store(0, .monotonic);
     const before = session.mutableConfig().model;
     try Session.refreshModels(&session);
     const job = session.metadata_job.?;
-    try std.testing.expectEqual(metadata.provider_mask | metadata.dev_bit, job.requested);
+    try std.testing.expectEqual(legacyMetadataTestMask | metadata.dev_bit, job.requested);
     try MetadataFixture.waitDone(session.io, &job.done);
     try MetadataFixture.waitDone(session.io, &job.dev_done);
     // Worker results remain private until owner join and revision filtering.
     try std.testing.expectEqual(@as(usize, 0), session.metadata_cache.directory.count);
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expect(session.metadata_job == null);
-    try std.testing.expectEqual(metadata.provider_mask, Fixture.requested.load(.monotonic));
+    try std.testing.expectEqual(legacyMetadataTestMask, Fixture.requested.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 1), Fixture.public_calls.load(.monotonic));
     const state = session.connection().current();
     try std.testing.expectEqual(before.protocol, session.mutableConfig().model.protocol);
@@ -3417,7 +3948,7 @@ test "manual refresh asynchronously discovers new IDs and preserves public proto
     defer picker.deinit();
     picker.allow_custom = false;
     const reloaded = try metadata.load(&session.store.root);
-    for (ProviderId.all) |id| {
+    for (legacyMetadataTestProviders) |id| {
         const selector = try std.fmt.allocPrint(a, "{s}/future-official-id", .{id.slug()});
         defer a.free(selector);
         picker.clear();
@@ -3449,7 +3980,7 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
     LayeredMetadataFixture.official_effort.store(false, .release);
     LayeredMetadataFixture.dev_calls.store(0, .monotonic);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true, .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true });
     defer session.deinit();
     session.metadata_fetch = LayeredMetadataFixture.official;
     session.metadata_dev_fetch = LayeredMetadataFixture.dev;
@@ -3477,7 +4008,7 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     const disk = try metadata.load(&session.store.root);
     try std.testing.expectEqualStrings("disabled", LayeredMetadataFixture.row(&disk.directory, .opencode_go, "claude-haiku-5-5").dev_reasoning.?.declaration().map.off.?);
     {
-        var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true, .logging = false });
+        var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true });
         defer again.deinit();
         again.metadata_fetch = MetadataFixture.fail;
         again.metadata_dev_fetch = LayeredMetadataFixture.devFail;
@@ -3547,11 +4078,11 @@ test "dynamic official IDs select for all providers and reject unknown protocols
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .deepseek);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
-    for (ProviderId.all) |id| try session.connection().configureProvider(id, "fake-dynamic-key");
-    session.metadata_cache.directory_mask = metadata.provider_mask;
-    for (ProviderId.all) |id| {
+    for (legacyMetadataTestProviders) |id| try session.connection().configureProvider(id, "fake-dynamic-key");
+    session.metadata_cache.directory_mask = legacyMetadataTestMask;
+    for (legacyMetadataTestProviders) |id| {
         const row = try session.metadata_cache.directory.upsert(id, "new/vendor-model");
         row.available = true;
         row.tokens = 131072;
@@ -3567,7 +4098,7 @@ test "dynamic official IDs select for all providers and reject unknown protocols
     for (state.models, 0..) |model, index| {
         try std.testing.expectEqual(model.protocol == .auto, state.model_disabled[index]);
     }
-    for (ProviderId.all) |id| {
+    for (legacyMetadataTestProviders) |id| {
         const selector = try std.fmt.allocPrint(a, "{s}/new/vendor-model", .{id.slug()});
         defer a.free(selector);
         try session.connection().selectModel(selector);
@@ -3645,7 +4176,7 @@ test "display candidates own names and explicit wires across cache and config re
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-owned-display-key");
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
@@ -3693,7 +4224,7 @@ test "raw explicit profile hides only the same provider dynamic identity" {
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-go-profile-key");
     try session.connection().configureProvider(.opencode_zen, "fake-zen-profile-key");
@@ -3724,7 +4255,7 @@ test "explicit user reasoning overrides metadata and survives default persistenc
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer source.deinit();
     // A manual registry patch is explicit; value/name similarity to metadata must not erase it.
     var parsed = try cfg.parse(a,
@@ -3762,7 +4293,7 @@ test "derived reasoning stays in cache and cannot revive after a tied refresh or
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer source.deinit();
     try source.connection().configureProvider(.opencode_go, "fake-provenance-go");
     source.metadata_cache = try metadata.commit(&source.store.root, 0, try metadata.parseDev(a, @embedFile("models_dev_fixture.json")));
@@ -3811,7 +4342,7 @@ test "derived reasoning stays in cache and cannot revive after a tied refresh or
         try std.testing.expect(request.reasoning_effort == null and request.thinking == null);
     }
     {
-        var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+        var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
         defer again.deinit();
         try std.testing.expect(!again.capabilitiesFor(again.mutableConfig().*).known);
         try std.testing.expect(again.mutableConfig().model.reasoning == null);
@@ -3875,7 +4406,7 @@ test "explicit raw and qualified profiles override dynamic rows including explic
     try writeSessionTestConfig(tmp.dir,
         \\{"llm":{"default":"opencode-go/minimax-m2.7","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"raw-override":{"context_tokens":32768,"protocol":"auto"},"qualified-override":{"context_tokens":32768,"protocol":"chat"}}}}},"limits":{"low_price_input":false}}
     );
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-explicit-key");
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
@@ -3912,7 +4443,7 @@ test "new raw custom model never inherits the previous model output capability" 
     try writeSessionTestConfig(tmp.dir,
         \\{"llm":{"default":"custom/previous","providers":{"custom":{"base_url":"https://custom.invalid/v1","models":{"previous":{"protocol":"chat","context_tokens":131072,"output_tokens":65536},"custom-next":{"protocol":"chat","context_tokens":131072},"custom-declared":{"protocol":"chat","context_tokens":131072,"output_tokens":4096}}}}},"limits":{"low_price_input":false}}
     );
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try std.testing.expectEqual(@as(?u32, 65536), session.mutableConfig().model.output_tokens);
     try session.connection().selectModel("custom-next");
@@ -3932,7 +4463,7 @@ test "pending auth retains trusted derived map while saving only cache backed de
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .deepseek);
-    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer source.deinit();
     var listing: metadata.Listing = .{};
     listing.directory_mask = metadata.bit(.deepseek);
@@ -3954,7 +4485,7 @@ test "pending auth retains trusted derived map while saving only cache backed de
     var disk = try source.store.loadExisting();
     defer cfg.release(&disk);
     try std.testing.expect(disk.value.model.reasoning == null and disk.value.model.reasoning_effort == null);
-    var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer again.deinit();
     try std.testing.expectEqualStrings("max", again.mutableConfig().model.reasoning_effort.?);
     try std.testing.expect(again.capabilitiesFor(again.mutableConfig().*).known);
@@ -3970,7 +4501,7 @@ test "derived metadata protocol or format mismatch clears stale mapping and effo
     defer env.deinit();
     try env.put("HOME", home);
     try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
-    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer source.deinit();
     const entry = catalog.find("opencode-go/gpt-6-luna").?;
     const row = try source.metadata_cache.directory.upsert(.opencode_go, "gpt-6-luna");
@@ -4015,7 +4546,7 @@ test "outdated cache recovers through automatic or explicit refresh only" {
         try writeSessionTestConfig(tmp.dir, config);
         try tmp.dir.writeFile(io, .{ .sub_path = ".thin/model-metadata.json", .data = legacy_cache });
         MetadataFixture.calls.store(0, .monotonic);
-        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = automatic });
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .auto_refresh_models = automatic });
         defer session.deinit();
         session.metadata_fetch = MetadataFixture.fetch;
         session.metadata_dev_fetch = MetadataFixture.dev;
@@ -4051,7 +4582,9 @@ test "outdated cache recovers through automatic or explicit refresh only" {
         try std.testing.expectEqual(@as(?bool, true), row.available);
         const body = try tmp.dir.readFileAlloc(io, ".thin/model-metadata.json", a, .limited(1 << 16));
         defer a.free(body);
-        try std.testing.expect(std.mem.find(u8, body, "\"version\":14") != null);
+        const current_version = try std.fmt.allocPrint(a, "\"version\":{d}", .{metadata.cache_version});
+        defer a.free(current_version);
+        try std.testing.expect(std.mem.find(u8, body, current_version) != null);
         try std.testing.expect(std.mem.find(u8, body, "\"version\":12") == null);
     }
 }
@@ -4062,12 +4595,11 @@ test "future or damaged cache blocks cadence until the file is moved away" {
     ;
     const a = std.testing.allocator;
     const io = std.testing.io;
-    for ([_][]const u8{
-        \\{"version":15,"directory_mask":1,"models":[]}
-        ,
-        \\{"version":14,"models":"damaged"}
-        ,
-    }) |poisoned| {
+    const future = try std.fmt.allocPrint(a, "{{\"version\":{d},\"directory_mask\":1,\"models\":[]}}", .{metadata.cache_version + 1});
+    defer a.free(future);
+    const damaged = try std.fmt.allocPrint(a, "{{\"version\":{d},\"models\":\"damaged\"}}", .{metadata.cache_version});
+    defer a.free(damaged);
+    for ([_][]const u8{ future, damaged }) |poisoned| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var path: [4096]u8 = undefined;
@@ -4078,7 +4610,7 @@ test "future or damaged cache blocks cadence until the file is moved away" {
         try writeSessionTestConfig(tmp.dir, config);
         try tmp.dir.writeFile(io, .{ .sub_path = ".thin/model-metadata.json", .data = poisoned });
         MetadataFixture.calls.store(0, .monotonic);
-        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = true });
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .auto_refresh_models = true });
         defer session.deinit();
         session.metadata_fetch = MetadataFixture.fetch;
         session.metadata_dev_fetch = MetadataFixture.dev;
@@ -4136,7 +4668,7 @@ test "proxy allowlist revalidates exact rows credentials and preserves unrelated
     defer fixture.deinit();
     try writeSessionTestConfig(fixture.tmp.dir, proxy_session_config);
     try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
-    var session = try fixture.open(.{ .logging = false });
+    var session = try fixture.open(.{});
     defer session.deinit();
     const app = session.app.?;
     const auth = app.client.authorization.ptr;
@@ -4211,7 +4743,7 @@ test "proxy refresh switches helper routes while primary client and history stay
     try writeSessionTestConfig(fixture.tmp.dir, proxy_helper_config);
     try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
     try fixture.env.put("PROXY_IMG_KEY", "fake-img-key");
-    var session = try fixture.open(.{ .logging = false });
+    var session = try fixture.open(.{});
     defer session.deinit();
     const app = session.app.?;
     const auth = app.client.authorization.ptr;
@@ -4322,7 +4854,7 @@ test "proxy membership CAS conflict rolls back declaration and helper ownership"
     defer fixture.deinit();
     try writeSessionTestConfig(fixture.tmp.dir, proxy_session_config);
     try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
-    var session = try fixture.open(.{ .logging = false });
+    var session = try fixture.open(.{});
     defer session.deinit();
     const app = session.app.?;
     try proxyToggle(&session, "aux/native/raw", true);
@@ -4350,7 +4882,7 @@ test "pending snapshot adopts an explicit proxy save without activating a route"
     defer fixture.deinit();
     try writeSessionTestConfig(fixture.tmp.dir, proxy_pending_config);
     try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
-    var session = try fixture.open(.{ .logging = false });
+    var session = try fixture.open(.{});
     defer session.deinit();
     try std.testing.expect(session.app == null);
     try proxyToggle(&session, "aux/other/raw", false);
@@ -4379,7 +4911,7 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try writeSessionTestConfig(fixture.tmp.dir, proxy_helper_config);
     try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
     try fixture.env.put("PROXY_IMG_KEY", "fake-img-key");
-    var session = try fixture.open(.{ .logging = false });
+    var session = try fixture.open(.{});
     defer session.deinit();
     const app = session.app.?;
     const auth = app.client.authorization.ptr;
@@ -4488,7 +5020,7 @@ test "pending proxy endpoint save updates the pending snapshot only" {
     defer fixture.deinit();
     try writeSessionTestConfig(fixture.tmp.dir, proxy_pending_config);
     try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
-    var session = try fixture.open(.{ .logging = false });
+    var session = try fixture.open(.{});
     defer session.deinit();
     try std.testing.expect(session.app == null);
     try setProxyEndpoint(&session, "192.0.2.7:1080");

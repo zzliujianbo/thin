@@ -12,6 +12,14 @@ test {
     _ = @import("llm_config_test.zig");
 }
 
+/// OAuth credentials are declarations in the protected config, not account identity proof.
+pub const CodexCredential = struct {
+    access_token: []const u8,
+    refresh_token: []const u8,
+    expires_at_ms: i64,
+    refresh_pending: bool = false,
+};
+
 /// 提供方连接信息。两种密钥来源最多配置一种，也允许尚未配置密钥。
 pub const Provider = struct {
     /// 提供方的基础 URL（仅允许 http/https，见 validateUrl）。
@@ -20,6 +28,7 @@ pub const Provider = struct {
     api_key_env: []const u8 = "",
     /// 内联 API key；未配置时必须为 null，不能是空字符串。
     api_key: ?[]const u8 = null,
+    codex_oauth: ?CodexCredential = null,
     /// Chat 兼容选项：DeepSeek 等服务使用 max_tokens；默认仍用 max_completion_tokens。
     chat_max_tokens: bool = false,
     /// Explicit service identity; custom endpoints may opt into its transport
@@ -631,6 +640,19 @@ fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, d
 const json_options: std.json.ParseOptions = .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" };
 
 fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
+    if (T == Provider) {
+        const fields = try object(value);
+        if (fields.get("codex_oauth")) |oauth| if (oauth != .null) {
+            const credential = try object(oauth);
+            _ = try string(credential.get("access_token") orelse return error.MissingField);
+            _ = try string(credential.get("refresh_token") orelse return error.MissingField);
+            const expiry = credential.get("expires_at_ms") orelse return error.MissingField;
+            if (expiry != .integer) return error.InvalidNumber;
+            if (credential.get("refresh_pending")) |pending| {
+                if (pending != .bool) return error.InvalidBoolean;
+            }
+        };
+    }
     if (T == ModelPatch or T == Limits or T == DecisionConfig or T == ImageConfig or T == ProxyConfig) {
         const fields = try object(value);
         if (T == DecisionConfig) _ = try string(fields.get("model") orelse return error.MissingField);
@@ -781,8 +803,15 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
             try s.objectField(p.name);
             try s.beginObject();
             inline for (@typeInfo(Provider).@"struct".field_names) |field| {
-                try s.objectField(field);
-                try s.write(@field(p.connection, field));
+                if (comptime std.mem.eql(u8, field, "codex_oauth")) {
+                    if (p.connection.codex_oauth) |oauth| {
+                        try s.objectField(field);
+                        try s.write(oauth);
+                    }
+                } else {
+                    try s.objectField(field);
+                    try s.write(@field(p.connection, field));
+                }
             }
             try s.objectField("models");
             try s.beginObject();
@@ -1052,6 +1081,15 @@ pub fn release(parsed: *std.json.Parsed(Config)) void {
 }
 
 pub fn validateKeySource(provider: Provider) !void {
+    const is_codex = provider.kind == .openai_codex;
+    const codex_url = std.mem.eql(u8, provider.base_url, providers.Id.openai_codex.baseUrl());
+    if (is_codex != codex_url) return error.InvalidCodexProvider;
+    if (is_codex and (provider.api_key != null or provider.api_key_env.len != 0)) return error.AmbiguousApiKey;
+    if (provider.codex_oauth) |credential| {
+        if (!is_codex) return error.InvalidCodexProvider;
+        if (provider.api_key != null or provider.api_key_env.len != 0) return error.AmbiguousApiKey;
+        if (!validText(credential.access_token, 16384) or !validText(credential.refresh_token, 16384) or credential.expires_at_ms <= 0) return error.InvalidCodexCredential;
+    }
     if (provider.api_key != null and provider.api_key_env.len != 0) return error.AmbiguousApiKey;
     if (provider.api_key) |key| {
         if (!validText(key, 16384)) return error.InvalidApiKey;
@@ -1379,6 +1417,109 @@ pub fn resolveApiKey(allocator: std.mem.Allocator, config: Config, environ: *con
     return allocator.dupe(u8, key);
 }
 
+const codex_fixture =
+    \\{"llm":{"default":"codex/model","providers":{"codex":{"base_url":"https://chatgpt.com/backend-api/codex","kind":"openai_codex","codex_oauth":{"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_at_ms":123456789}}}}}
+;
+
+fn codexConfigAllocationCase(a: std.mem.Allocator) !void {
+    var parsed = try parse(a, codex_fixture);
+    defer release(&parsed);
+    var copied = try clone(a, parsed.value);
+    defer release(&copied);
+    const original = parsed.value.provider.codex_oauth.?;
+    const clone_credential = copied.value.provider.codex_oauth.?;
+    try std.testing.expectEqualStrings(original.access_token, clone_credential.access_token);
+    try std.testing.expect(original.access_token.ptr != clone_credential.access_token.ptr);
+    try std.testing.expect(original.refresh_token.ptr != clone_credential.refresh_token.ptr);
+    var wiping = WipingAllocator{ .backing = a };
+    var out: std.Io.Writer.Allocating = .init(wiping.allocator());
+    defer out.deinit();
+    writeDisk(copied.value, &out.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    var again = try parse(a, out.written());
+    defer release(&again);
+    try std.testing.expectEqualStrings("fixture-refresh", again.value.provider.codex_oauth.?.refresh_token);
+    try std.testing.expectEqual(@as(i64, 123456789), again.value.provider.codex_oauth.?.expires_at_ms);
+    try std.testing.expect(!original.refresh_pending);
+    try std.testing.expect(!clone_credential.refresh_pending);
+    try std.testing.expect(!again.value.provider.codex_oauth.?.refresh_pending);
+}
+
+test "Codex credentials roundtrip owned clone and allocation failures" {
+    try codexConfigAllocationCase(std.testing.allocator);
+    const Stable = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var wiping = WipingAllocator{ .backing = a };
+            try codexConfigAllocationCase(wiping.allocator());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Stable.run, .{});
+}
+
+test "Codex identity and credential sources are strict" {
+    const a = std.testing.allocator;
+    var p: Provider = .{ .base_url = providers.Id.openai_codex.baseUrl(), .kind = .openai_codex };
+    try validateKeySource(p); // An unconfigured connection can start login.
+    p.codex_oauth = .{ .access_token = "access", .refresh_token = "refresh", .expires_at_ms = 1 };
+    try validateKeySource(p);
+    p.api_key = "key";
+    try std.testing.expectError(error.AmbiguousApiKey, validateKeySource(p));
+    p.api_key = null;
+    p.api_key_env = "KEY";
+    try std.testing.expectError(error.AmbiguousApiKey, validateKeySource(p));
+    p.api_key_env = "";
+    p.base_url = "https://chatgpt.com/backend-api/codex/";
+    try std.testing.expectError(error.InvalidCodexProvider, validateKeySource(p));
+    p.base_url = providers.Id.openai_codex.baseUrl();
+    p.kind = null;
+    try std.testing.expectError(error.InvalidCodexProvider, validateKeySource(p));
+    p.kind = .openai_codex;
+    p.codex_oauth.?.expires_at_ms = 0;
+    try std.testing.expectError(error.InvalidCodexCredential, validateKeySource(p));
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var parsed = try parse(a, codex_fixture);
+    defer release(&parsed);
+    try std.testing.expectError(error.ApiKeyNotFound, resolveApiKey(a, parsed.value, &env));
+}
+
+test "Codex pending refresh survives disk and clone" {
+    const a = std.testing.allocator;
+    const raw = try std.mem.replaceOwned(u8, a, codex_fixture, "\"expires_at_ms\":123456789", "\"expires_at_ms\":123456789,\"refresh_pending\":true");
+    defer a.free(raw);
+    var parsed = try parse(a, raw);
+    defer release(&parsed);
+    try std.testing.expect(parsed.value.provider.codex_oauth.?.refresh_pending);
+    var copied = try clone(a, parsed.value);
+    defer release(&copied);
+    try std.testing.expect(copied.value.provider.codex_oauth.?.refresh_pending);
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try writeDisk(copied.value, &out.writer);
+    var again = try parse(a, out.written());
+    defer release(&again);
+    try std.testing.expect(again.value.provider.codex_oauth.?.refresh_pending);
+}
+
+test "Codex disk parser rejects malformed credentials" {
+    const prefix = "{\"llm\":{\"default\":\"p/m\",\"providers\":{\"p\":{\"base_url\":\"https://chatgpt.com/backend-api/codex\",\"kind\":\"openai_codex\",\"codex_oauth\":";
+    inline for (.{
+        "{}",                                                                                            "[]",                                                                                          "{\"access_token\":\"a\",\"refresh_token\":\"r\",\"expires_at_ms\":1.5}",
+        "{\"access_token\":\"a\",\"refresh_token\":\"r\",\"expires_at_ms\":1,\"extra\":1}",              "{\"access_token\":\"a\",\"access_token\":\"b\",\"refresh_token\":\"r\",\"expires_at_ms\":1}", "{\"access_token\":\"a\",\"refresh_token\":\"r\",\"expires_at_ms\":1,\"refresh_pending\":\"true\"}",
+        "{\"access_token\":\"a\",\"refresh_token\":\"r\",\"expires_at_ms\":1,\"refresh_pending\":null}",
+    }) |bad| {
+        const raw = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, bad, "}}}}" });
+        defer std.testing.allocator.free(raw);
+        if (parse(std.testing.allocator, raw)) |value| {
+            var unexpected = value;
+            release(&unexpected);
+            return error.ExpectedInvalidCodexCredential;
+        } else |_| {}
+    }
+}
+
 test "official services without an explicit credential source never borrow keys" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
@@ -1388,6 +1529,7 @@ test "official services without an explicit credential source never borrow keys"
     c.provider.api_key_env = "";
     for (providers.Id.all) |id| {
         c.provider.base_url = id.baseUrl();
+        c.provider.kind = if (id == .openai_codex) id else null;
         try std.testing.expectError(error.ApiKeyNotFound, resolveApiKey(a, c, &env));
     }
     c.provider.kind = .deepseek;

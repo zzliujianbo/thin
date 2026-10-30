@@ -99,6 +99,7 @@ test "streaming chunks and ACK checkpoints match static glyph styles" {
     const samples = [_][]const u8{
         "# Heading\n**wide 中文 text and even longer bold across rows** [link](url)\n| raw | table |\n```\ncode 👩‍💻 é plain\n```\n",
         "normal é **a👩‍💻b** end\n",
+        "**before `中👩‍💻**` after** [a ``x`]`` b](url)\n",
     };
     for (samples) |source| for ([_]usize{ 1, 2, 7, 12 }) |columns| for ([_]usize{ 1, 7, 64, 4096 }) |quantum| {
         const reference = try markdown.render(a, source, .{ .columns = columns, .max_lines = 4096 });
@@ -123,10 +124,51 @@ test "streaming chunks and ACK checkpoints match static glyph styles" {
     };
 }
 
+test "inline code static and streaming agree at every split" {
+    try @import("../ui/text.zig").initLocale();
+    const a = std.testing.allocator;
+    const source = "**a `中👩‍💻**` z** [x ``a`]`` y](u)\n";
+    for ([_]usize{ 2, 7 }) |columns| for ([_]usize{ 1, 64 }) |quantum| {
+        const reference = try markdown.render(a, source, .{ .columns = columns, .max_lines = 256 });
+        defer markdown.release(a, reference);
+        for (0..source.len + 1) |split| {
+            const body = try body_mod.Body.create(a, columns);
+            defer body.destroy();
+            body.max_window_bytes = quantum;
+            var rows: std.ArrayList([]const u8) = .empty;
+            defer freeRows(a, &rows);
+            try body.append(source[0..split]);
+            try progress(a, body, &rows, false);
+            try body.append(source[split..]);
+            try body.finish();
+            try progress(a, body, &rows, true);
+            try std.testing.expect(body.isDrained());
+            try std.testing.expectEqual(body.acceptedSourceEnd(), body.committedSourceEnd());
+            try expectAppearance(a, reference.lines, rows.items);
+        }
+    };
+}
+
+test "inline code uses purple and keeps literal markup" {
+    const a = std.testing.allocator;
+    const rendered = try markdown.render(a, "x `**raw**` y", .{ .columns = 80, .max_lines = 16 });
+    defer markdown.release(a, rendered);
+    const glyphs = try appearance(a, rendered.lines);
+    defer a.free(glyphs);
+    const bytes = try a.alloc(u8, glyphs.len);
+    defer a.free(bytes);
+    for (glyphs, 0..) |g, i| bytes[i] = g.byte;
+    try std.testing.expectEqualStrings("x **raw** y\n", bytes);
+    for (glyphs[2..9]) |g| {
+        try std.testing.expectEqual(@as(u16, 141), g.style.fg);
+        try std.testing.expect(!g.style.bold);
+    }
+}
+
 test "single-byte chunks and one-row ACK preserve full-width and styled boundaries" {
     try @import("../ui/text.zig").initLocale();
     const a = std.testing.allocator;
-    const cases = [_][]const u8{ "abcd\n", "abcd", "**ab👩‍💻cdef**\n", "[abcd](url)\n" };
+    const cases = [_][]const u8{ "abcd\n", "abcd", "**ab👩‍💻cdef**\n", "[abcd](url)\n", "**a `中👩‍💻**` z**\n", "x ``a`b``\n" };
     for (cases) |source| {
         const reference = try markdown.render(a, source, .{ .columns = 4, .max_lines = 128 });
         defer markdown.release(a, reference);

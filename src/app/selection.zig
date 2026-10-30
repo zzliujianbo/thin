@@ -107,6 +107,22 @@ fn string(value: std.json.Value) ![]const u8 {
     return if (value == .string) value.string else error.InvalidSelection;
 }
 
+test "selection projection omits codex credentials" {
+    const config: cfg.Config = .{
+        .provider = .{ .base_url = cfg.providers.Id.openai_codex.baseUrl(), .kind = .openai_codex, .codex_oauth = .{ .access_token = "access-canary-private", .refresh_token = "refresh-canary-private", .expires_at_ms = 1 } },
+        .model = .{ .name = "fixture", .context_tokens = 32768, .protocol = .responses },
+    };
+    const snapshot = try capture(config);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try encode(&out.writer, &snapshot);
+    const bytes = out.written();
+    for ([_][]const u8{ "access-canary-private", "refresh-canary-private", "codex_oauth" }) |secret| try std.testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
+    const parsed = try parse(std.testing.allocator, bytes);
+    try std.testing.expectEqualStrings("fixture", parsed.model());
+    try std.testing.expectEqual(p.Protocol.responses, parsed.protocol);
+}
+
 pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Snapshot {
     if (bytes.len > max_bytes) return error.SelectionTooLarge;
     try fs.validateText(bytes);

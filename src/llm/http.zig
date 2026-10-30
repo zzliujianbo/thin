@@ -3,6 +3,8 @@
 const std = @import("std");
 const p = @import("../core/protocol.zig");
 const cfg = @import("../core/config.zig");
+const codex_auth = @import("../core/codex_auth.zig");
+const codex_base = "https://chatgpt.com/backend-api/codex";
 const sse = @import("sse.zig");
 const j = @import("../util/json.zig");
 const chat = @import("chat.zig");
@@ -24,6 +26,7 @@ pub const Client = struct {
     config: *const cfg.Config,
     /// 独立拷贝的 "Bearer <key>"，deinit 时清零后释放，避免密钥残留。
     authorization: []u8,
+    codex_source: ?codex_auth.CredentialSource = null,
     /// 底层 HTTP 客户端，内部连接池随 Client 生命周期存在。
     http: std.http.Client,
     /// Set once cleanupForClose has drained the native pool, so a retained
@@ -48,6 +51,7 @@ pub const Client = struct {
 
     pub fn initWithEnv(allocator: std.mem.Allocator, io: Io, config: *const cfg.Config, key: []const u8, env: *const std.process.Environ.Map) !Client {
         if (config.model.protocol == .systemone or cfg.providers.Id.fromSystemOneUrl(config.provider.base_url) != null) return error.UnsupportedProtocol;
+        if (isCodexConfig(config) or std.mem.eql(u8, config.provider.base_url, codex_base)) return error.UnsupportedProtocol;
         // 控制字符会破坏 HTTP 头格式，因此在这里拒绝。
         if (key.len == 0 or key.len > 16384) return error.InvalidApiKey;
         for (key) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidApiKey;
@@ -78,14 +82,31 @@ pub const Client = struct {
         };
     }
 
+    pub fn initCodexWithEnv(allocator: std.mem.Allocator, io: Io, config: *const cfg.Config, source: codex_auth.CredentialSource, env: *const std.process.Environ.Map) !Client {
+        if (!isCodexConfig(config) or !std.mem.eql(u8, config.provider.base_url, codex_base) or config.model.protocol != .responses) return error.UnsupportedProtocol;
+        if (source.acquire_fn == null) return error.MissingCredentialSource;
+        const authorization = try allocator.alloc(u8, 0);
+        errdefer allocator.free(authorization);
+        const proxy_http: ?curl.Client = if (config.proxyFor(config.selected_provider, config.model.name)) |route| blk: {
+            const url = try route.url(allocator);
+            defer allocator.free(url);
+            break :blk try curl.Client.initRouted(allocator, io, env, url);
+        } else null;
+        return .{ .allocator = allocator, .io = io, .config = config, .authorization = authorization, .codex_source = source, .proxy_http = proxy_http, .http = .{ .allocator = allocator, .io = io } };
+    }
+
     /// Independent mutable client for one child Runtime. The frozen parent
     /// authorization, CA/route transport and session identity are copied; the
     /// key is never re-resolved from a filtered command environment.
     pub fn cloneForConfig(self: *const Client, allocator: std.mem.Allocator, io: Io, config: *const cfg.Config) !Client {
         if (config.model.protocol == .systemone or cfg.providers.Id.fromSystemOneUrl(config.provider.base_url) != null)
             return error.UnsupportedProtocol;
-        if (!std.mem.startsWith(u8, self.authorization, "Bearer ") or self.authorization.len == "Bearer ".len)
-            return error.InvalidApiKey;
+        if (self.codex_source != null) {
+            if (!isCodexConfig(config) or !std.mem.eql(u8, config.provider.base_url, codex_base) or config.model.protocol != .responses) return error.UnsupportedProtocol;
+        } else {
+            if (isCodexConfig(config) or std.mem.eql(u8, config.provider.base_url, codex_base)) return error.UnsupportedProtocol;
+            if (!std.mem.startsWith(u8, self.authorization, "Bearer ") or self.authorization.len == "Bearer ".len) return error.InvalidApiKey;
+        }
         // The child config must resolve to the same explicit proxy route that
         // this client already froze; never silently switch direct <-> proxied.
         const expected = if (config.proxyFor(config.selected_provider, config.model.name)) |route| try route.url(allocator) else null;
@@ -112,6 +133,7 @@ pub const Client = struct {
             .io = io,
             .config = config,
             .authorization = authorization,
+            .codex_source = self.codex_source,
             .proxy_http = proxy_http,
             .http = .{ .allocator = allocator, .io = io },
             .session_id = self.session_id,
@@ -147,9 +169,22 @@ pub const Client = struct {
         self.allocator.free(self.authorization);
     }
 
-    fn requestHeaders(self: *Client, protocol: p.Protocol, buffer: *[4]std.http.Header) ![]const std.http.Header {
+    fn requestHeaders(self: *Client, protocol: p.Protocol, credential: ?*const codex_auth.RequestCredential, buffer: *[8]std.http.Header) ![]const std.http.Header {
         buffer[0] = .{ .name = "accept", .value = "text/event-stream" };
         var count: usize = 1;
+        if (credential) |auth| {
+            buffer[count] = .{ .name = "chatgpt-account-id", .value = auth.account_id };
+            buffer[count + 1] = .{ .name = "originator", .value = "thin" };
+            buffer[count + 2] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
+            count += 3;
+            if (self.session_id) |*id| {
+                for (id) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidSessionIdentity;
+                buffer[count] = .{ .name = "session-id", .value = id };
+                buffer[count + 1] = .{ .name = "x-client-request-id", .value = id };
+                count += 2;
+            }
+            return buffer[0..count];
+        }
         const kind = self.config.provider.kind orelse cfg.providers.Id.fromUrl(self.config.provider.base_url);
         if (kind != null and kind.?.usesSessionHeader()) {
             const id = if (self.session_id) |*id| id else return error.MissingSessionIdentity;
@@ -336,16 +371,16 @@ pub const Client = struct {
         }
     };
 
-    fn performProxy(job: *Job, transport: *curl.Client, a: std.mem.Allocator, address: []const u8, payload: []const u8) !p.Outcome {
+    fn performProxy(job: *Job, transport: *curl.Client, a: std.mem.Allocator, address: []const u8, payload: []const u8, credential: ?*const codex_auth.RequestCredential, authorization: []const u8) !p.Outcome {
         try job.checkBudget();
         try job.client.checkProxyCleanup();
-        var header_buffer: [4]std.http.Header = undefined;
-        const extra = try job.client.requestHeaders(job.request.scope.protocol, &header_buffer);
-        var headers: [5]std.http.Header = undefined;
+        var header_buffer: [8]std.http.Header = undefined;
+        const extra = try job.client.requestHeaders(job.request.scope.protocol, credential, &header_buffer);
+        var headers: [9]std.http.Header = undefined;
         @memcpy(headers[0..extra.len], extra);
         var count = extra.len;
         if (job.request.scope.protocol != .anthropic) {
-            headers[count] = .{ .name = "authorization", .value = job.client.authorization };
+            headers[count] = .{ .name = "authorization", .value = authorization };
             count += 1;
         }
         var stream: Stream = switch (job.request.scope.protocol) {
@@ -406,11 +441,30 @@ pub const Client = struct {
         defer scratch.deinit();
         const a = scratch.allocator();
         const protocol = job.request.scope.protocol;
+        try job.checkBudget();
+        var credential: ?codex_auth.RequestCredential = null;
+        defer if (credential) |*auth| auth.deinit(self.allocator);
+        var auth_owned: ?[]u8 = null;
+        defer if (auth_owned) |auth| {
+            std.crypto.secureZero(u8, auth);
+            self.allocator.free(auth);
+        };
+        if (self.codex_source) |source| {
+            if (!isCodexConfig(self.config) or !std.mem.eql(u8, self.config.provider.base_url, codex_base) or protocol != .responses) return error.UnsupportedProtocol;
+            const remaining = @as(i64, self.config.limits.request_timeout_ms) - job.start.untilNow(self.io, .awake).toMilliseconds();
+            if (remaining <= 0) return error.RequestTimeout;
+            credential = try source.acquire(self.allocator, self.config.selected_provider orelse return error.MissingProviderAlias, job.request.cancellation, @intCast(remaining));
+            try job.checkBudget();
+            try validateHeaderValue(credential.?.access_token);
+            try validateHeaderValue(credential.?.account_id);
+            auth_owned = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{credential.?.access_token});
+        } else if (isCodexConfig(self.config) or std.mem.eql(u8, self.config.provider.base_url, codex_base)) return error.UnsupportedProtocol;
+        const authorization = auth_owned orelse self.authorization;
 
         // 按协议选择编码器：Chat Completions 或 Responses。
         const payload = switch (protocol) {
             .chat => try chat.encode(a, job.request),
-            .responses => try responses.encode(a, job.request),
+            .responses => if (credential != null) try responses.encodeCodex(a, job.request) else try responses.encode(a, job.request),
             .anthropic => try anthropic.encode(a, job.request),
             .systemone => return error.UnsupportedProtocol,
             .auto => unreachable,
@@ -419,20 +473,20 @@ pub const Client = struct {
         // 去掉 base_url 结尾的斜杠，再拼接各协议固定的端点路径。
         const address = try requestAddress(a, self.config.provider.base_url, protocol);
 
-        if (self.proxy_http) |*transport| return performProxy(job, transport, a, address, payload);
+        if (self.proxy_http) |*transport| return performProxy(job, transport, a, address, payload, if (credential) |*auth| auth else null, authorization);
 
         // Before acquiring a socket, drop expired/closed/unread idle connections.
         // This sends nothing and never retries a POST. boot includes suspend time.
         try pool.prune(&self.http, self.last_request_finish, Io.Clock.boot.now(self.io));
 
         // 禁止自动跟随重定向（否则 Authorization 头可能被发送到其他主机）；要求不压缩，便于逐块解析 SSE。
-        var header_buffer: [4]std.http.Header = undefined;
-        const headers = try self.requestHeaders(protocol, &header_buffer);
+        var header_buffer: [8]std.http.Header = undefined;
+        const headers = try self.requestHeaders(protocol, if (credential) |*auth| auth else null, &header_buffer);
         const uri = try std.Uri.parse(address);
         var request = try acquireRequest(job, uri, .{
             .redirect_behavior = .unhandled,
             .headers = .{
-                .authorization = if (protocol == .anthropic) .omit else .{ .override = self.authorization },
+                .authorization = if (protocol == .anthropic) .omit else .{ .override = authorization },
                 .user_agent = .{ .override = "thin" },
                 .content_type = .{ .override = "application/json" },
                 .accept_encoding = .{ .override = "identity" },
@@ -536,6 +590,16 @@ pub const Client = struct {
     }
 };
 
+fn isCodexConfig(config: *const cfg.Config) bool {
+    const kind = config.provider.kind orelse return false;
+    return std.mem.eql(u8, @tagName(kind), "openai_codex");
+}
+
+fn validateHeaderValue(value: []const u8) !void {
+    if (value.len == 0 or value.len > 16384) return error.InvalidCredential;
+    for (value) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidCredential;
+}
+
 /// Never hold already-buffered SSE bytes hostage to the next socket read.
 fn readAvailable(reader: *Io.Reader, destination: []u8) Io.Reader.Error!usize {
     std.debug.assert(destination.len != 0);
@@ -548,6 +612,145 @@ fn readAvailable(reader: *Io.Reader, destination: []u8) Io.Reader.Error!usize {
     }
     var vectors = [_][]u8{destination};
     return reader.readVec(&vectors);
+}
+
+test "codex rejects missing source and forged endpoint" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    const kind = std.meta.stringToEnum(cfg.providers.Id, "openai_codex") orelse return;
+    var config: cfg.Config = .{ .provider = .{ .base_url = codex_base, .kind = kind }, .selected_provider = "codex", .model = .{ .name = "fixture", .context_tokens = 32768, .protocol = .responses } };
+    try std.testing.expectError(error.MissingCredentialSource, Client.initCodexWithEnv(std.testing.allocator, std.testing.io, &config, .{}, &env));
+    try std.testing.expectError(error.UnsupportedProtocol, Client.init(std.testing.allocator, std.testing.io, &config, "fake"));
+    for ([_][]const u8{
+        "https://chatgpt.com.evil/backend-api/codex",
+        "https://chatgpt.com/backend-api/codex/",
+        "https://chatgpt.com/backend-api/codex?x=1",
+        "https://chatgpt.com/backend-api/codex-lookalike",
+    }) |address| {
+        config.provider.base_url = address;
+        try std.testing.expectError(error.UnsupportedProtocol, Client.initCodexWithEnv(std.testing.allocator, std.testing.io, &config, .{}, &env));
+    }
+}
+
+test "codex clone keeps source and acquires using child alias" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn acquire(ctx: ?*anyopaque, a: std.mem.Allocator, alias: []const u8, _: ?*const p.Cancellation, _: u32) !codex_auth.RequestCredential {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            if (self.calls == 1) {
+                try std.testing.expectEqualStrings("parent", alias);
+            } else {
+                try std.testing.expectEqualStrings("child", alias);
+            }
+            const token = try a.dupe(u8, if (self.calls == 1) "first-access" else "second-access");
+            errdefer a.free(token);
+            const account = try a.dupe(u8, "account");
+            return .{ .access_token = token, .account_id = account };
+        }
+    };
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const parent_config: cfg.Config = .{ .provider = .{ .base_url = codex_base, .kind = .openai_codex }, .selected_provider = "parent", .model = .{ .name = "fixture", .context_tokens = 17000, .protocol = .responses } };
+    var child_config = parent_config;
+    child_config.selected_provider = "child";
+    var fake: Fake = .{};
+    var parent = try Client.initCodexWithEnv(a, std.testing.io, &parent_config, .{ .context = &fake, .acquire_fn = Fake.acquire }, &env);
+    defer parent.deinit();
+    var child = try parent.cloneForConfig(a, std.testing.io, &child_config);
+    defer child.deinit();
+    var first = try parent.codex_source.?.acquire(a, parent.config.selected_provider.?, null, 1000);
+    defer first.deinit(a);
+    var second = try child.codex_source.?.acquire(a, child.config.selected_provider.?, null, 1000);
+    defer second.deinit(a);
+    try std.testing.expectEqualStrings("first-access", first.access_token);
+    try std.testing.expectEqualStrings("second-access", second.access_token);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expect(child.config == &child_config);
+}
+
+test "codex perform gates credential acquisition on request budget and cancellation" {
+    const Fake = struct {
+        calls: usize = 0,
+        remaining: u32 = 0,
+        alias: []const u8 = "",
+        fn acquire(ctx: ?*anyopaque, _: std.mem.Allocator, alias: []const u8, _: ?*const p.Cancellation, remaining: u32) !codex_auth.RequestCredential {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.alias = alias;
+            self.remaining = remaining;
+            return error.LocalCaptureOnly;
+        }
+    };
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = codex_base, .kind = .openai_codex }, .selected_provider = "capture-alias", .model = .{ .name = "fixture", .context_tokens = 32768, .protocol = .responses }, .limits = .{ .request_timeout_ms = 60000 } };
+    var fake: Fake = .{};
+    var client = try Client.initCodexWithEnv(a, std.testing.io, &config, .{ .context = &fake, .acquire_fn = Fake.acquire }, &env);
+    defer client.deinit();
+    var cancel: p.Cancellation = .{};
+    var request = @import("../tests/adapter_test_support.zig").request(.responses);
+    request.cancellation = &cancel;
+    var job: Client.Job = .{ .client = &client, .allocator = a, .request = request, .sink = .{}, .start = Io.Clock.awake.now(std.testing.io) };
+
+    cancel.cancel();
+    try std.testing.expectError(error.Canceled, Client.perform(&job));
+    try std.testing.expect(job.done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    job.done.store(false, .release);
+    job.request.cancellation = null;
+    job.start = Io.Clock.awake.now(std.testing.io).subDuration(.fromMilliseconds(60000));
+    try std.testing.expectError(error.RequestTimeout, Client.perform(&job));
+    try std.testing.expect(job.done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    job.done.store(false, .release);
+    job.start = Io.Clock.awake.now(std.testing.io).subDuration(.fromMilliseconds(1000));
+    try std.testing.expectError(error.LocalCaptureOnly, Client.perform(&job));
+    try std.testing.expect(job.done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("capture-alias", fake.alias);
+    try std.testing.expect(fake.remaining > 0 and fake.remaining < config.limits.request_timeout_ms);
+}
+
+test "codex refresh redaction material is absent from headers and body" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = codex_base, .kind = .openai_codex }, .selected_provider = "codex", .model = .{ .name = "fixture", .context_tokens = 17000, .protocol = .responses } };
+    const Fake = struct {
+        fn acquire(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8, _: ?*const p.Cancellation, _: u32) !codex_auth.RequestCredential {
+            return error.Unused;
+        }
+    };
+    var client = try Client.initCodexWithEnv(a, std.testing.io, &config, .{ .acquire_fn = Fake.acquire }, &env);
+    defer client.deinit();
+    const canary = "refresh-secret-canary";
+    var credential: codex_auth.RequestCredential = .{ .access_token = try a.dupe(u8, "access"), .account_id = try a.dupe(u8, "account"), .redaction_refresh_token = try a.dupe(u8, canary) };
+    defer credential.deinit(a);
+    var header_buffer: [8]std.http.Header = undefined;
+    const headers = try client.requestHeaders(.responses, &credential, &header_buffer);
+    for (headers) |header| {
+        try std.testing.expect(std.mem.indexOf(u8, header.name, canary) == null);
+        try std.testing.expect(std.mem.indexOf(u8, header.value, canary) == null);
+    }
+    const authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{credential.access_token});
+    defer a.free(authorization);
+    try std.testing.expect(std.mem.indexOf(u8, authorization, canary) == null);
+    const req = @import("../tests/adapter_test_support.zig").request(.responses);
+    const body = try responses.encodeCodex(a, req);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, canary) == null);
+}
+
+test "codex header values reject control characters" {
+    for ([_][]const u8{ "", "bad\rvalue", "bad\nvalue", "bad\x00value", "bad\x7fvalue" }) |value| {
+        try std.testing.expectError(error.InvalidCredential, validateHeaderValue(value));
+    }
+    try validateHeaderValue("valid-token_123");
 }
 
 test "SSE buffered prefix returns before a subsequent failing transport read" {
@@ -610,7 +813,7 @@ fn requestAddress(a: std.mem.Allocator, base_url: []const u8, protocol: p.Protoc
             .opencode_zen => if (protocol == .anthropic) {
                 break :blk "https://opencode.ai/inference/v1";
             },
-            .deepseek => {},
+            else => {},
         };
         break :blk normalized;
     };
@@ -733,26 +936,27 @@ test "model proxy route cannot silently reuse a stale direct client after alias 
 
 test "OpenCode routing headers are stable explicit and absent on other services" {
     for (cfg.providers.Id.all) |id| {
+        if (std.mem.eql(u8, @tagName(id), "openai_codex")) continue;
         const config: cfg.Config = .{ .provider = .{ .base_url = id.baseUrl(), .kind = id }, .model = .{ .name = "fixture", .context_tokens = 32768 } };
         var client = try Client.init(std.testing.allocator, std.testing.io, &config, "fake-key");
         defer client.deinit();
-        var headers: [4]std.http.Header = undefined;
-        const first = try client.requestHeaders(.chat, &headers);
+        var headers: [8]std.http.Header = undefined;
+        const first = try client.requestHeaders(.chat, null, &headers);
         try std.testing.expectEqual(@as(usize, if (id.usesSessionHeader()) 2 else 1), first.len);
         if (id.usesSessionHeader()) {
             const generated = client.session_id.?;
             try std.testing.expectEqualStrings("x-opencode-session", first[1].name);
             try std.testing.expectEqualStrings(&generated, first[1].value);
-            try std.testing.expectEqualStrings(&generated, (try client.requestHeaders(.chat, &headers))[1].value);
+            try std.testing.expectEqualStrings(&generated, (try client.requestHeaders(.chat, null, &headers))[1].value);
         }
         client.session_id = @splat('a');
-        const pinned = try client.requestHeaders(.chat, &headers);
+        const pinned = try client.requestHeaders(.chat, null, &headers);
         if (id.usesSessionHeader()) {
             try std.testing.expectEqualStrings(&@as([32]u8, @splat('a')), pinned[1].value);
             client.session_id = @splat('\n');
-            try std.testing.expectError(error.InvalidSessionIdentity, client.requestHeaders(.chat, &headers));
+            try std.testing.expectError(error.InvalidSessionIdentity, client.requestHeaders(.chat, null, &headers));
             client.session_id = null;
-            try std.testing.expectError(error.MissingSessionIdentity, client.requestHeaders(.chat, &headers));
+            try std.testing.expectError(error.MissingSessionIdentity, client.requestHeaders(.chat, null, &headers));
         } else try std.testing.expectEqual(@as(usize, 1), pinned.len);
     }
 }
@@ -773,8 +977,8 @@ test "Anthropic exact routing and separate native authentication headers" {
         const config: cfg.Config = .{ .provider = .{ .base_url = case.base }, .model = .{ .name = "fixture", .context_tokens = 32768, .protocol = .anthropic } };
         var client = try Client.init(std.testing.allocator, std.testing.io, &config, "fake-key");
         defer client.deinit();
-        var buffer: [4]std.http.Header = undefined;
-        const headers = try client.requestHeaders(.anthropic, &buffer);
+        var buffer: [8]std.http.Header = undefined;
+        const headers = try client.requestHeaders(.anthropic, null, &buffer);
         const has_session = cfg.providers.Id.fromUrl(case.base) != null;
         try std.testing.expectEqual(@as(usize, if (has_session) 4 else 3), headers.len);
         try std.testing.expectEqualStrings("x-api-key", headers[headers.len - 2].name);

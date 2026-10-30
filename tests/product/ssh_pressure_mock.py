@@ -12,7 +12,7 @@ import time
 
 from daemon_mock import (Case, Child, wait_daemon_socket, wait_checkpoint, text_answer,
                          stop_daemon, assert_screen_idle_contract)
-from ssh_mock import SshChild, run, settled
+from ssh_mock import SshChild, run, settled, wait
 
 
 def check(app):
@@ -55,8 +55,14 @@ def check(app):
         case.children.append(case.daemon)
         wait_daemon_socket(case)
         host=keydir/'ssh_host_ed25519_key'
+        # Unix backlog readiness can precede atomic host identity publication.
+        def check_daemon_alive():
+            code = case.daemon.proc.poll()
+            if code is not None:
+                raise AssertionError('daemon exited before host identity publication: %r' % code)
+        wait(host.is_file, 'host identity not published', progress=check_daemon_alive, timeout=20)
         public=run(['ssh-keygen','-y','-P','','-f',str(host)],env)
-        assert public.returncode==0
+        assert public.returncode==0, 'ssh-keygen host identity conversion failed (returncode %r)' % public.returncode
         known=root/'known_hosts';known.write_bytes(('[127.0.0.1]:%d ' % port).encode()+public.stdout);known.chmod(0o600)
         argv=['-F','/dev/null','-o','IdentityAgent=none','-o','IdentitiesOnly=yes',
               '-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',

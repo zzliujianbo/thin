@@ -15,7 +15,7 @@ pub const Choice = union(enum) {
     }
 };
 pub const Choices = struct {
-    items: [4]Choice = undefined,
+    items: [Id.all.len + 1]Choice = undefined,
     len: usize = 0,
 };
 pub fn choices(include_current: bool) Choices {
@@ -111,11 +111,12 @@ test "provider selection wraps in both directions" {
 test "provider candidate window has no title and confirms complete labels only" {
     const a = std.testing.allocator;
     const available = choices(true);
+    const configured = (@as(u8, 1) << Id.all.len) - 1;
     for (0..available.len) |selected| {
         const picker: Picker = .{ .selected = selected };
         const width = 4 + text.width(available.items[selected].label());
         for (0..width + 1) |columns| {
-            const rendered = try rows(a, picker, available, 7, columns, 1);
+            const rendered = try rows(a, picker, available, configured, columns, 1);
             defer {
                 for (rendered.lines) |line| a.free(line);
                 a.free(rendered.lines);
@@ -171,7 +172,7 @@ test "provider checked bits follow saved visible rows not navigation selection" 
 
 test "provider picker distinguishes Zen Go and local setup without holding keys" {
     const available = choices(true);
-    try std.testing.expectEqual(@as(usize, 4), available.len);
+    try std.testing.expectEqual(Id.all.len + 1, available.len);
     try std.testing.expectEqualStrings("Current endpoint", available.items[0].label());
     try std.testing.expectEqualStrings("OpenCode Zen", available.items[2].label());
     try std.testing.expectEqualStrings("OpenCode Go", available.items[3].label());

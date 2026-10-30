@@ -6,6 +6,7 @@
 const std = @import("std");
 const cfg = @import("../core/config.zig");
 const fs = @import("../platform/filesystem.zig");
+const protocol = @import("../core/protocol.zig");
 
 const Digest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
@@ -94,6 +95,55 @@ pub const Store = struct {
             try std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake);
         }
         return error.AuthStoreBusy;
+    }
+
+    /// A transaction holds the directory flock across a latest read and write.
+    /// It must not outlive its Store, and must always be closed.
+    pub const Transaction = struct {
+        store: *Store,
+        fd: c_int,
+
+        pub fn deinit(self: *Transaction) void {
+            fs.closeFd(self.fd);
+            self.* = undefined;
+        }
+
+        pub fn loadLatest(self: *Transaction) !std.json.Parsed(cfg.Config) {
+            self.store.expected_version = null;
+            var bytes = (try self.store.read()) orelse return error.ConfigNotFound;
+            defer bytes.deinit();
+            const parsed = try cfg.parse(self.store.root.allocator, bytes.data());
+            self.store.expected_version = digest(bytes.data());
+            return parsed;
+        }
+
+        /// Caller must first loadLatest and modify that snapshot while holding this lock.
+        pub fn saveLatest(self: *Transaction, config: cfg.Config) !void {
+            const expected = self.store.expected_version orelse return error.AuthStoreNotLoaded;
+            var bytes = try self.store.serialize(config);
+            defer bytes.deinit();
+            var current = (try self.store.read()) orelse return error.AuthVersionConflict;
+            defer current.deinit();
+            if (!std.mem.eql(u8, &expected, &digest(current.data()))) return error.AuthVersionConflict;
+            try self.store.root.writeMode(cfg.file_name, bytes.data(), true, 0o600);
+            self.store.expected_version = digest(bytes.data());
+        }
+    };
+
+    /// Wait using the caller's original remaining budget; no ambient HOME lookup.
+    pub fn beginTransaction(self: *Store, cancel: ?*const protocol.Cancellation, timeout_ms: u32) !Transaction {
+        const fd = try fs.openDirectory(self.root.dir.handle, ".");
+        errdefer fs.closeFd(fd);
+        const started = std.Io.Clock.awake.now(self.root.io).toMilliseconds();
+        while (true) {
+            if (cancel) |c| if (c.isRequested()) return error.Cancelled;
+            const elapsed = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() -| started);
+            if (elapsed >= timeout_ms) return error.AuthStoreBusy;
+            if (fs.linux.flock(fd, 2 | 4) == 0) return .{ .store = self, .fd = fd };
+            const errno = std.c._errno().*;
+            if (errno != 11 and errno != 4) return fs.osError();
+            try std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake);
+        }
     }
 
     /// 不跟随链接、不阻塞 FIFO；先检查 fd 类型，再读取最多上限加一字节。
@@ -202,6 +252,27 @@ fn testOpen(dir: std.Io.Dir) !Store {
     var path: [4096]u8 = undefined;
     const n = try dir.realPath(std.testing.io, &path);
     return Store.open(std.testing.allocator, std.testing.io, path[0..n]);
+}
+
+test "transaction latest write rejects stale ordinary save" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var first = try testOpen(tmp.dir);
+    defer first.deinit();
+    var second = try testOpen(tmp.dir);
+    defer second.deinit();
+    var stale = try first.loadOrInitialize();
+    defer cfg.release(&stale);
+    var tx = try second.beginTransaction(null, 1000);
+    var latest = try tx.loadLatest();
+    defer cfg.release(&latest);
+    latest.value.registry.?.reasoning_effort = "high";
+    try tx.saveLatest(latest.value);
+    tx.deinit();
+    try std.testing.expectError(error.AuthVersionConflict, first.save(stale.value));
+    var verify = try first.loadExisting();
+    defer cfg.release(&verify);
+    try std.testing.expectEqualStrings("high", verify.value.registry.?.reasoning_effort.?);
 }
 
 test "restore auth loading never creates or initializes configuration" {

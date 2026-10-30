@@ -30,7 +30,6 @@ pub const Options = struct {
     prompt: ?[]const u8 = null,
     restore_selection: ?ids.Id = null,
     resume_session: ?ids.Id = null,
-    logging: bool = true,
     auto_refresh_models: bool = true,
     help: bool = false,
     version: bool = false,
@@ -68,7 +67,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         // --print 要求后面紧跟一个 prompt，且不允许重复指定，避免静默覆盖。
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) result.help = true else if (std.mem.eql(u8, arg, "--version")) result.version = true else if (std.mem.eql(u8, arg, "--no-log")) result.logging = false else if (std.mem.eql(u8, arg, "--no-model-auto-refresh")) result.auto_refresh_models = false else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) result.help = true else if (std.mem.eql(u8, arg, "--version")) result.version = true else if (std.mem.eql(u8, arg, "--no-model-auto-refresh")) result.auto_refresh_models = false else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
             if (result.prompt != null or i + 1 >= args.len) return error.InvalidArguments;
             i += 1;
             result.prompt = args[i];
@@ -183,13 +182,13 @@ fn parseId(value: []const u8) !ids.Id {
 pub const help =
     \\thin - minimal local agent (Linux x86_64, Zig 0.17.0)
     \\
-    \\Usage: thin [--no-log]
-    \\       thin --print "prompt" [--no-log]
-    \\       thin --restore-selection <32-lowerhex-session-id> [--no-log]
-    \\       thin --resume <32-lowerhex-session-id> [--no-log]
-    \\       thin --daemon [--ssh-listen <numeric-address:port>] [--no-log]
-    \\       thin --connect [--no-log]
-    \\       thin --attach <32-lowerhex-session-id> [--takeover] [--no-log]
+    \\Usage: thin
+    \\       thin --print "prompt"
+    \\       thin --restore-selection <32-lowerhex-session-id>
+    \\       thin --resume <32-lowerhex-session-id>
+    \\       thin --daemon [--ssh-listen <numeric-address:port>]
+    \\       thin --connect
+    \\       thin --attach <32-lowerhex-session-id> [--takeover]
     \\       thin --help | --version
     \\
     \\Modes: ordinary local foreground by default; nothing starts a service implicitly.
@@ -243,7 +242,7 @@ pub const help =
     \\Manual edits stop browsing; navigation never submits. Keyboard recall is session-local.
     \\Session diagnostics are separate and still follow the recording settings below.
     \\After normal exit and a successful save, only thin --resume <ID> is printed.
-    \\Empty chats and --no-log exits print no session information or resume command.
+    \\Empty chats print no session information or resume command.
     \\Run the resume command from the same project with the current Thin version on PATH.
     \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning; Shift+Tab cycles supported effort.
     \\/ opens /model and /login choices; Up/Down wraps, Enter confirms (no Tab shortcut).
@@ -262,7 +261,7 @@ pub const help =
     \\Refresh does not change the active budget; cached capacities apply on model selection.
     \\Model changes in an empty chat save defaults to ~/.thin/config.json.
     \\With conversation history, model changes stay in that session only.
-    \\Empty-chat effort changes also save llm.reasoning_effort globally, even with --no-log.
+    \\Empty-chat effort changes also save llm.reasoning_effort globally.
     \\With conversation history, effort changes stay in that session only.
     \\Per-provider models:{raw_id:{context_tokens,protocol,reasoning_effort,reasoning}}
     \\declares local profiles (maximum 64 total); custom IDs need explicit compatible profiles.
@@ -289,7 +288,7 @@ pub const help =
     \\An unsupported saved level is adjusted effectively without rewriting the preference.
     \\Project Memory: <startup directory>/.thin/memory/*.md, changed through memory tools.
     \\Session records: <startup directory>/.thin/sessions/*.jsonl (local plaintext, 0600).
-    \\Recording starts on the first submitted message; --no-log disables it for this run.
+    \\Recording starts automatically on the first submitted message.
     \\Records include messages, tools, stages, usage and errors, not /login input,
     \\hidden reasoning or native replay. The configured key is redacted; other sensitive
     \\content may remain. Records are not restored or automatically sent to the provider.
@@ -305,7 +304,6 @@ pub const help =
     \\It does NOT restore conversation history, tools, native replay or the old session ID.
     \\Missing providers, keys or usable model settings are shown in the dialogue interface.
     \\Use /login or /model before sending. --print cannot restore a selection.
-    \\--no-log disables checkpoint writes, but still allows reading an old checkpoint.
     \\--resume continues that SAME ID and model context, including native provider state.
     \\Loading never sends a request or reruns tools; only new input starts work.
     \\The exit command is printed only after a successful full save. Empty chats create none.
@@ -314,7 +312,6 @@ pub const help =
     \\Changing an API key does not prevent loading. There is no key-bound authentication.
     \\Compacted context stays lossy; discarded pre-compaction history cannot be recovered.
     \\Loading never replays an interrupted tool or grants historical approvals.
-    \\--no-log writes no checkpoint and prints no command for unsaved changes.
     \\Resume uses the startup project's saved conversation, not current global selection defaults.
     \\No model probing or cache warming. Usage is reported when available;
     \\monetary cost is unknown without provider pricing.
@@ -333,9 +330,8 @@ test "CLI help describes global defaults and actual metadata sources" {
 // 交互与 --print 不审批普通工具；危险 bash 逐次明确批准。
 test "CLI selection restore is explicit bounded and interactive only" {
     const id = "0123456789abcdef0123456789abcdef";
-    const options = try parse(&.{ "thin", "--restore-selection", id, "--no-log" });
+    const options = try parse(&.{ "thin", "--restore-selection", id });
     try std.testing.expectEqualStrings(id, &options.restore_selection.?);
-    try std.testing.expect(!options.logging);
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--restore-selection" }));
     try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--restore-selection", "../history" }));
     try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--restore-selection", "0123456789abcdef0123456789abcdeF" }));
@@ -345,9 +341,9 @@ test "CLI selection restore is explicit bounded and interactive only" {
 
 test "CLI resume is distinct same-session interactive selection and rejects conflicts" {
     const id = "0123456789abcdef0123456789abcdef";
-    const options = try parse(&.{ "thin", "--resume", id, "--no-log" });
+    const options = try parse(&.{ "thin", "--resume", id });
     try std.testing.expectEqualStrings(id, &options.resume_session.?);
-    try std.testing.expect(options.restore_selection == null and !options.logging);
+    try std.testing.expect(options.restore_selection == null);
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--resume" }));
     try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--resume", "../invalid" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--resume", id, "--resume", id }));
@@ -363,11 +359,10 @@ test "CLI ordinary tools run directly and print requires a prompt" {
     try std.testing.expect(std.mem.indexOf(u8, help, "No automatic command-risk classifier") == null);
     try std.testing.expect(std.mem.indexOf(u8, help, "High-risk bash is classified") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "requires explicit approval each time") != null);
-    try std.testing.expect((try parse(&.{"thin"})).logging);
     try std.testing.expect((try parse(&.{"thin"})).auto_refresh_models);
     try std.testing.expect(!(try parse(&.{ "thin", "--no-model-auto-refresh" })).auto_refresh_models);
-    try std.testing.expect(!(try parse(&.{ "thin", "--no-log" })).logging);
-    try std.testing.expect(!(try parse(&.{ "thin", "--print", "hello", "--no-log" })).logging);
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "thin", "--no-log" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "thin", "--print", "hello", "--no-log" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--print" }));
     try std.testing.expectError(error.UnknownOption, parse(&.{ "thin", "--config", "other.json" }));
 }
@@ -432,11 +427,6 @@ test "CLI daemon connect attach are exclusive with each other and other run mode
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach" }));
     try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--attach", "../session" }));
     try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--attach", "0123456789abcdef0123456789abcdeF" }));
-
-    // --no-log / 无模式 flag 不会改变模式。
-    const quiet = try parse(&.{ "thin", "--daemon", "--no-log" });
-    try std.testing.expectEqual(Mode.daemon, quiet.mode);
-    try std.testing.expect(!quiet.logging);
 }
 
 test "CLI takeover belongs to attach only" {
@@ -458,13 +448,13 @@ test "CLI internal worker carries endpoint session and owner" {
     const id = "0123456789abcdef0123456789abcdef";
     const socket = "/run/user/1000/thin/workers/session.sock";
 
-    const daemon_side = try parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--no-log" });
+    const daemon_side = try parse(&.{ "thin", "--internal-worker", socket, id, "daemon" });
     try std.testing.expectEqual(Mode.worker, daemon_side.mode);
     try std.testing.expect(!Mode.worker.requiresTty());
     try std.testing.expectEqualStrings(socket, daemon_side.worker_endpoint.?);
     try std.testing.expectEqualStrings(id, &daemon_side.worker_session.?);
     try std.testing.expectEqual(WorkerOwner.daemon, daemon_side.worker_owner);
-    try std.testing.expect(!daemon_side.worker_resume and !daemon_side.logging);
+    try std.testing.expect(!daemon_side.worker_resume);
 
     const foreground_side = try parse(&.{ "thin", "--internal-worker", socket, id, "foreground" });
     try std.testing.expectEqual(WorkerOwner.foreground, foreground_side.worker_owner);

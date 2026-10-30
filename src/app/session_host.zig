@@ -37,6 +37,7 @@ const tui = @import("../ui/tui.zig");
 const session_client = @import("../ui/session_client.zig");
 const activity = @import("../presentation/activity.zig");
 const protocol = @import("../daemon/protocol.zig");
+const codex_login = @import("../core/codex_login.zig");
 
 const Io = std.Io;
 
@@ -54,7 +55,6 @@ pub const Options = struct {
     @"resume": ?ids.Id = null,
     /// Read an old selection into a new empty session (same id as `id`).
     restore_selection: ?ids.Id = null,
-    logging: bool = true,
     auto_refresh_models: bool = false,
     owner: Owner = .daemon,
 };
@@ -472,7 +472,7 @@ pub const SessionHost = struct {
         // second worker activate between the probe and the first save.
         var preflight: ?resume_store.Lease = null;
         defer if (preflight) |*lease| lease.deinit();
-        if (options.@"resume" == null and options.logging) {
+        if (options.@"resume" == null) {
             var root = try fs.Root.open(a, io, project);
             defer root.deinit();
             preflight = resume_store.Lease.create(&root, options.id) catch |err| switch (err) {
@@ -485,11 +485,10 @@ pub const SessionHost = struct {
             .session_id = options.id,
             .resume_session = options.@"resume",
             .restore_selection = options.restore_selection,
-            .logging = options.logging,
             .auto_refresh_models = options.auto_refresh_models,
         });
         errdefer host.session.deinit();
-        if (options.@"resume" != null and options.logging and host.session.read_only) return error.SessionInUse;
+        if (options.@"resume" != null and host.session.read_only) return error.SessionInUse;
         if (host.session.resume_lease == null) {
             // Transfer the already-held write lease to the Session so the first
             // checkpoint save reuses it instead of racing for the same inode.
@@ -564,6 +563,9 @@ pub const SessionHost = struct {
             self.pending_event = null;
         }
         self.reapTask();
+        // A completed login may reload configuration only after the primary
+        // owner has fully joined, not merely after runtime.busy went false.
+        if (self.task == null) _ = self.session.pollCodexLogin() catch false;
         self.dispatchNext();
     }
 
@@ -1110,6 +1112,7 @@ pub const SessionHost = struct {
             .proxy_model => self.handleProxyModel(a, request, connection_id),
             .proxy_address => self.handleProxyAddress(a, request, connection_id),
             .refresh_models => self.handleRefresh(a, request, connection_id),
+            .codex_login => self.handleCodexLogin(a, request, connection_id),
             .poll_metadata => self.handlePollMetadata(a, request, connection_id),
             .close => self.handleClose(a, request, connection_id),
             .shutdown => self.handleShutdown(a, request, owner_authorized),
@@ -1154,6 +1157,12 @@ pub const SessionHost = struct {
     /// slices point at alive; `previews` receives the encoded preview structs.
     /// The returned `Snapshot` borrows both, so it must not outlive the caller
     /// frame that owns them.
+    fn codexView(self: *SessionHost) codex_login.View {
+        var view = self.session.codexLoginView();
+        if (self.task != null and view.status == .succeeded) view.status = .pending;
+        return view;
+    }
+
     fn snapshotFor(self: *SessionHost, connection_id: u64, queue: *const inbox_mod.Snapshot, previews: []protocol.QueuePreview) protocol.Snapshot {
         const state = self.connection.current();
         const is_controller = if (self.controllerFor(connection_id)) |controller| controller.epoch else 0;
@@ -1189,7 +1198,7 @@ pub const SessionHost = struct {
             .context = self.context,
             .model = state.model,
             .provider = if (state.provider) |provider| provider.slug() else null,
-            .logging = self.session.logging,
+            .codex_login = self.codexView(),
             .read_only = self.session.read_only,
             .truncated = self.fatal != null or self.reset_failed != null or self.history.evicted_through != 0 or self.partial_text.truncated or self.partial_reasoning.truncated,
         };
@@ -1264,11 +1273,12 @@ pub const SessionHost = struct {
         revision: u64,
         queue_revision: u64,
         task: u64,
+        codex: codex_login.View,
 
         pub fn eql(left: WatchStamp, right: WatchStamp) bool {
             // sequence is a coverage watermark, not a snapshot invalidation.
             return left.revision == right.revision and
-                left.queue_revision == right.queue_revision and left.task == right.task;
+                left.queue_revision == right.queue_revision and left.task == right.task and std.meta.eql(left.codex, right.codex);
         }
     };
 
@@ -1339,6 +1349,7 @@ pub const SessionHost = struct {
             .revision = self.view_revision,
             .queue_revision = queue.revision,
             .task = if (self.task) |task_| task_.id else 0,
+            .codex = self.codexView(),
         };
     }
 
@@ -1860,7 +1871,6 @@ pub const SessionHost = struct {
         try out.field("decision_enabled", state.decision_enabled);
         try out.field("decision_model", state.decision_model);
         try out.field("global_settings_available", state.global_settings_available);
-        try out.field("logging", state.logging_enabled);
         try out.field("settings_notice", state.settings_notice);
         try out.field("settings_error", if (state.settings_error) |err| @as(?[]const u8, @errorName(err)) else @as(?[]const u8, null));
         try out.field("metadata_notice", state.metadata_notice);
@@ -2097,6 +2107,25 @@ pub const SessionHost = struct {
         return replyFrame(&out);
     }
 
+    fn handleCodexLogin(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
+        const epoch = request.u64Field("epoch") catch return errorReply(a, request.id, error.BadRequest);
+        self.requireControl(connection_id, epoch) catch |err| return errorReply(a, request.id, err);
+        const action = request.stringEnum(codex_login.Action, "action") catch return errorReply(a, request.id, error.BadRequest);
+        const generation = request.u64Field("generation") catch return errorReply(a, request.id, error.BadRequest);
+        switch (action) {
+            .start => {
+                self.ensureIdle() catch |err| return errorReply(a, request.id, err);
+                if (self.fatal != null) return errorReply(a, request.id, error.Unavailable);
+                self.session.startCodexLogin() catch |err| return errorReply(a, request.id, err);
+            },
+            .cancel => self.session.cancelCodexLogin(generation) catch |err| return errorReply(a, request.id, err),
+        }
+        var out = protocol.Out.init(a);
+        defer out.deinit();
+        try out.ok(request.id);
+        return replyFrame(&out);
+    }
+
     fn handleRefresh(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
         self.requireIdleControl(request, connection_id) catch |err| return errorReply(a, request.id, err);
         const callback = self.connection.refresh_models_fn orelse return errorReply(a, request.id, error.Unsupported);
@@ -2198,6 +2227,41 @@ fn dispatchJson(host: *SessionHost, a: std.mem.Allocator, json: []const u8, conn
     return host.dispatch(a, &request, connection, true);
 }
 
+test "codex control rejects invalid and stale actions without starting login" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", path[0..n]);
+    const host = try SessionHost.init(a, io, &env, .{ .project = path[0..n], .id = try ids.generate(io), .owner = .foreground });
+    defer host.deinit();
+    const attach = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\"}", 7);
+    defer a.free(attach);
+    const before = host.watchStamp();
+    const invalid = try dispatchJson(host, a, "{\"v\":2,\"id\":2,\"op\":\"codex_login\",\"epoch\":1,\"action\":\"bogus\",\"generation\":0}", 7);
+    defer a.free(invalid);
+    try std.testing.expect(std.mem.indexOf(u8, invalid, "\"ok\":false") != null);
+    const stale = try dispatchJson(host, a, "{\"v\":2,\"id\":3,\"op\":\"codex_login\",\"epoch\":1,\"action\":\"cancel\",\"generation\":99}", 7);
+    defer a.free(stale);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "\"ok\":false") != null);
+    const after = host.watchStamp();
+    // The generic view revision advances even for rejected mutations, not just login changes.
+    try std.testing.expectEqual(before.revision + 2, after.revision);
+    try std.testing.expect(std.meta.eql(before.codex, after.codex));
+    try std.testing.expectEqual(before.queue_revision, after.queue_revision);
+    try std.testing.expectEqual(before.task, after.task);
+    try std.testing.expectEqual(@as(u64, 0), after.codex.generation);
+    try std.testing.expectEqual(@as(u64, 0), after.task);
+    const frame = try host.watchSnapshot(a, 4, 1);
+    defer a.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"codex_login\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "access_token") == null);
+}
+
 test "watch coverage, bounded admission and epoch bound acknowledgements" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -2208,7 +2272,7 @@ test "watch coverage, bounded admission and epoch bound acknowledgements" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", path_buffer[0..n]);
-    const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .logging = false, .owner = .foreground });
+    const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
     try std.testing.expectError(error.StaleControl, host.watchOwner(1));
     const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\"}", 7);
@@ -2303,7 +2367,7 @@ test "fresh baseline and live pages form one ordered union without duplicate dra
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", path_buffer[0..n]);
-    const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .logging = false, .owner = .foreground });
+    const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
     const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\"}", 7);
     defer a.free(attached);
@@ -2464,7 +2528,7 @@ test "host lifecycle: attach snapshot settings queue and rejection paths" {
     try env.put("HOME", home);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &env, .{ .project = project, .id = id, .logging = false, .owner = .foreground });
+    const host = try SessionHost.init(a, io, &env, .{ .project = project, .id = id, .owner = .foreground });
     defer host.deinit();
 
     {
@@ -2601,7 +2665,7 @@ test "confirming barrier is controller-bound and released with its view" {
     try env.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &env, .{ .project = project, .id = id, .logging = false, .owner = .foreground });
+    const host = try SessionHost.init(a, io, &env, .{ .project = project, .id = id, .owner = .foreground });
     defer host.deinit();
 
     const first = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
@@ -2692,7 +2756,7 @@ test "history reply is valid JSON with truncated outside the entries array" {
     try env.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &env, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &env, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     // Startup canonical rows, exactly as a restored checkpoint publishes them.
@@ -2748,7 +2812,7 @@ test "bridge display metadata is stored and the approval detail survives reconne
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     // A truncated canonical array must keep both flags in the stored ring.
@@ -2792,7 +2856,7 @@ test "long approval detail survives reconnect whole and stays approvable" {
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     // 12 KiB of a real destructive command: far past the old 4096 display
@@ -2847,7 +2911,7 @@ test "a clipped approval detail is never silently allowed" {
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     // Above the Bridge's single-event text budget: the display copy is a prefix.
@@ -2902,7 +2966,7 @@ test "submit receipt nonce is bound to kind and exact content" {
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     // Attach a controller epoch on connection 1.
@@ -2954,7 +3018,7 @@ test "history and event replies are clipped by encoded bytes not ring capacity" 
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     // This fixture isolates per-frame clipping from the live-retention bound.
@@ -2998,7 +3062,7 @@ test "direct input is history-only while queued input is rendered exactly once" 
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     _ = host.noteSubmittedUser("direct prompt");
@@ -3052,7 +3116,7 @@ test "accepted queue entries are kept and paused when no runtime can start them"
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     const attach = try dispatchJson(host, a, "{\"v\":2,\"id\":60,\"op\":\"attach\",\"write\":true}", 1);
@@ -3098,7 +3162,7 @@ test "snapshot reply encodes caller-owned queued previews consistently" {
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     const attach = try dispatchJson(host, a, "{\"v\":2,\"id\":80,\"op\":\"attach\",\"write\":true}", 1);
@@ -3214,7 +3278,7 @@ test "snapshot receipt query is read-only and reports known accepted rejected un
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     const digest = submitDigest(.prompt, "alpha");
@@ -3307,7 +3371,7 @@ test "settings reply publishes the configured cleanup budgets" {
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     // A spawning owner reads these two numbers from the public projection; they
@@ -3363,7 +3427,7 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     {
@@ -3514,7 +3578,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     {
@@ -3614,7 +3678,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
     {
         const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
@@ -3768,7 +3832,7 @@ test "settings reply publishes the proxy allowlist without addresses or secrets"
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     const names = [_][]const u8{ "opencode-go/deepseek-v3", "deepseek/deepseek-chat" };
@@ -3891,7 +3955,7 @@ test "settings reply is one parseable JSON object with complete array elements" 
     try environ.put("HOME", project);
 
     const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .logging = false, .owner = .daemon });
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
     const models = [_]cfg.Model{

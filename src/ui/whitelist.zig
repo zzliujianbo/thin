@@ -5,11 +5,11 @@ const Style = @import("markdown_writer.zig").Style;
 
 pub const max_inline_bytes: usize = 2048;
 const depth_limit = 8;
-const Kind = enum { strong, italic, strike, link };
+const Kind = enum { strong, italic, strike, link, inline_code };
 const Frame = struct {
     kind: Kind = .italic,
     close: usize = 0,
-    close_len: u8 = 0,
+    close_len: usize = 0,
     url_end: usize = 0,
     url: bool = false,
 };
@@ -46,6 +46,7 @@ fn style(s: State) Style {
         .strong => out.bold = true,
         .italic => out.italic = true,
         .strike => out.strike = true,
+        .inline_code => out.tone = .inline_code,
         .link => {
             out.tone = if (frame.url) .link_url else .link;
             out.underline = !frame.url;
@@ -81,10 +82,48 @@ fn escapedAt(source: []const u8, pos: usize, begin: usize) bool {
 fn matchAt(source: []const u8, pos: usize, end: usize, marker: []const u8, begin: usize) bool {
     return pos + marker.len <= end and std.mem.eql(u8, source[pos .. pos + marker.len], marker) and !escapedAt(source, pos, begin);
 }
-fn findMarker(source: []const u8, start: usize, end: usize, marker: []const u8) ?usize {
+fn findRawMarker(source: []const u8, start: usize, end: usize, marker: []const u8) ?usize {
     var i = start;
     while (i + marker.len <= end) : (i += 1) {
         if (matchAt(source, i, end, marker, start)) return i;
+    }
+    return null;
+}
+const CodeSearch = union(enum) { found: usize, missing, partial };
+fn codeClose(source: []const u8, start: usize, end: usize, run: usize, decisive: bool) CodeSearch {
+    var i = start;
+    while (i < end) {
+        if (source[i] != '`') {
+            i += 1;
+            continue;
+        }
+        const begin = i;
+        while (i < end and source[i] == '`') : (i += 1) {}
+        if (i == end and !decisive) return .partial;
+        if (i == end and end < source.len and source[end] == '`') return .missing;
+        if (i - begin == run) return .{ .found = begin };
+    }
+    return if (decisive) .missing else .partial;
+}
+fn findMarker(source: []const u8, start: usize, end: usize, marker: []const u8, decisive: bool) ?usize {
+    var i = start;
+    while (i + marker.len <= end) {
+        if (source[i] == '`') {
+            const begin = i;
+            while (i < end and source[i] == '`') : (i += 1) {}
+            if (i == end and !decisive) return null;
+            if (!escapedAt(source, begin, start)) switch (codeClose(source, i, end, i - begin, decisive)) {
+                .found => |close| {
+                    i = close + (i - begin);
+                    continue;
+                },
+                .partial => return null,
+                .missing => {},
+            };
+            continue;
+        }
+        if (matchAt(source, i, end, marker, start)) return i;
+        i += 1;
     }
     return null;
 }
@@ -159,8 +198,8 @@ pub fn next(source: []const u8, base: usize, offset: usize, state: State, final:
             if (frame.kind == .link) return .{ .token = .{ .text = source[offset .. offset + 1], .start = absolute, .end = absolute + 1, .style = before, .after = s } };
             return token(source, base, offset, frame.close_len, s, "", false);
         }
-        // URL is displayed literally, including parentheses.
-        if (frame.kind == .link and frame.url) return consume(source, base, offset, s);
+        // Code and URL contents are opaque, including escapes and markup.
+        if (frame.kind == .inline_code or (frame.kind == .link and frame.url)) return consume(source, base, offset, s);
     }
     if (s.at_line_start) {
         if (ch == '*') {
@@ -218,7 +257,7 @@ pub fn next(source: []const u8, base: usize, offset: usize, state: State, final:
     if (ch == '<' and offset + 1 < end and std.ascii.isAlphabetic(source[offset + 1])) {
         var name_end = offset + 2;
         while (name_end < end and (std.ascii.isAlphanumeric(source[name_end]) or source[name_end] == '-')) : (name_end += 1) {}
-        if (findMarker(source, name_end, end, ">")) |opening_end| {
+        if (findRawMarker(source, name_end, end, ">")) |opening_end| {
             if (opening_end > offset and source[opening_end - 1] == '/') return literal(source, base, offset, s, opening_end + 1);
             var p = opening_end + 1;
             while (p + 2 + name_end - offset - 1 <= end) : (p += 1) {
@@ -229,27 +268,42 @@ pub fn next(source: []const u8, base: usize, offset: usize, state: State, final:
         if (!bounds.decisive) return .need_more;
         return literal(source, base, offset, s, end);
     }
+    if (ch == '`') {
+        var run: usize = 0;
+        while (offset + run < end and source[offset + run] == '`') : (run += 1) {}
+        if (offset + run == end and !bounds.decisive) return .need_more;
+        switch (codeClose(source, offset + run, end, run, bounds.decisive)) {
+            .partial => return .need_more,
+            .missing => return literal(source, base, offset, s, end),
+            .found => |close| {
+                if (s.depth >= depth_limit) return literal(source, base, offset, s, close + run);
+                s.frames[s.depth] = .{ .kind = .inline_code, .close = base + close, .close_len = run };
+                s.depth += 1;
+                return token(source, base, offset, run, s, "", false);
+            },
+        }
+    }
     // Unsupported constructs are opaque literal regions. A bounded unterminated
     // region is frozen literally, not recursively reinterpreted.
     if (ch == '!' and offset + 1 == source.len and !final) return .need_more;
-    if (ch == '`' or ch == '$' or ch == '<' or (ch == '!' and offset + 1 < source.len and source[offset + 1] == '[') or (ch == '[' and offset + 1 < source.len and source[offset + 1] == '^')) {
+    if (ch == '$' or ch == '<' or (ch == '!' and offset + 1 < source.len and source[offset + 1] == '[') or (ch == '[' and offset + 1 < source.len and source[offset + 1] == '^')) {
         const image = ch == '!';
         const footnote = ch == '[';
         const closing: []const u8 = if (image) ")" else if (footnote) "]" else if (ch == '<') ">" else source[offset .. offset + 1];
         const search = offset + if (image or footnote) @as(usize, 2) else 1;
-        if (findMarker(source, search, end, closing)) |close| return literal(source, base, offset, s, close + closing.len);
+        if (findRawMarker(source, search, end, closing)) |close| return literal(source, base, offset, s, close + closing.len);
         if (!bounds.decisive) return .need_more;
         return literal(source, base, offset, s, end);
     }
     if (ch == '[') {
-        if (findMarker(source, offset + 1, end, "]")) |middle| {
+        if (findMarker(source, offset + 1, end, "]", bounds.decisive)) |middle| {
             // A `]` at the current chunk edge can still be followed by `(`.
             if (middle + 1 == end) {
                 if (!bounds.decisive) return .need_more;
                 return literal(source, base, offset, s, middle + 1);
             }
             if (source[middle + 1] != '(') return literal(source, base, offset, s, middle + 1);
-            if (findMarker(source, middle + 2, end, ")")) |close| {
+            if (findMarker(source, middle + 2, end, ")", bounds.decisive)) |close| {
                 if (s.depth < depth_limit) {
                     s.frames[s.depth] = .{ .kind = .link, .close = base + middle, .close_len = 1, .url_end = base + close };
                     s.depth += 1;
@@ -267,7 +321,7 @@ pub fn next(source: []const u8, base: usize, offset: usize, state: State, final:
         if (ch == '~' and !doubled) return consume(source, base, offset, s);
         const n: usize = if (doubled) 2 else 1;
         const marker = source[offset .. offset + n];
-        if (findMarker(source, offset + n, end, marker)) |close| {
+        if (findMarker(source, offset + n, end, marker, bounds.decisive)) |close| {
             if (close == offset + n) return literal(source, base, offset, s, close + n);
             if (s.depth < depth_limit) {
                 s.frames[s.depth] = .{ .kind = if (ch == '~') .strike else if (doubled) .strong else .italic, .close = base + close, .close_len = @intCast(n) };
@@ -357,9 +411,31 @@ test "list markers and closed brackets preserve subsequent inline styling" {
 }
 
 test "unsupported syntax and tables remain literal" {
-    try expectScan("![**alt**](url) `**raw**` <b>*raw*</b> $**x**$ [^a]\n| a | **b** |\n|---|---|\n", "![**alt**](url) `**raw**` <b>*raw*</b> $**x**$ [^a]\n| a | b |\n|---|---|\n");
+    try expectScan("![**alt**](url) `**raw**` <b>*raw*</b> $**x**$ [^a]\n| a | **b** |\n|---|---|\n", "![**alt**](url) **raw** <b>*raw*</b> $**x**$ [^a]\n| a | b |\n|---|---|\n");
     try expectScan("\\*literal\\* 中文 👩‍💻\n", "\\*literal\\* 中文 👩‍💻\n");
     try expectScan("**unclosed *not styled\nnext\n", "**unclosed *not styled\nnext\n");
+}
+
+test "inline code is opaque and exact run matched" {
+    try expectScan("x `**raw** [a](b) \\x` y", "x **raw** [a](b) \\x y");
+    try expectScan("x ``a`b`` **z `**` q** [a `]` b](url)", "x a`b z ** q a ] b (url)");
+    try expectScan("x `unclosed\nnext", "x `unclosed\nnext");
+    try expectScan("x \\`escaped and `ok`", "x \\`escaped and ok");
+    try expectScan("x `a``b`", "x a``b");
+    const events = try scanTest(std.testing.allocator, "**a `x**y` z** [a `]` b](u)", 1);
+    defer std.testing.allocator.free(events);
+    try std.testing.expect(events[2].bold and events[2].tone == .inline_code);
+    const bracket = for (events) |e| {
+        if (e.byte == ']') break e;
+    } else return error.MissingBracket;
+    try std.testing.expect(bracket.tone == .inline_code and bracket.underline);
+    const a = std.testing.allocator;
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(a);
+    try long.appendSlice(a, "x `");
+    try long.appendNTimes(a, 'a', max_inline_bytes + 10);
+    try long.appendSlice(a, "`\n");
+    try expectScan(long.items, long.items);
 }
 
 test "fences stream literally without a closing block" {
@@ -377,7 +453,7 @@ test "bounded candidate and long ordinary source" {
 }
 
 test "absolute source checkpoints survive retirement" {
-    const input = "**abcdef**";
+    const input = "**ab `cd` ef**";
     var state: State = .{};
     var offset: usize = 0;
     var base: usize = 0;

@@ -29,7 +29,7 @@ test "pending model has no low price marker while global defaults and explicit o
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         try env.put("HOME", home);
-        var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+        var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
         defer session.deinit();
         const state = session.connection().current();
         try std.testing.expectEqual(std.mem.find(u8, limits, "false") == null, session.global_config.?.value.limits.low_price_input);
@@ -49,7 +49,7 @@ test "current model marker needs enabled known price step rather than flat unkno
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try std.testing.expect(session.app != null);
     const active = &session.app.?.config.value;
@@ -149,7 +149,7 @@ test "restored known price history has no L without ready runtime for missing ke
     var missing_env = std.process.Environ.Map.init(a);
     defer missing_env.deinit();
     try missing_env.put("HOME", home);
-    var missing = try Session.initWithOptions(a, io, &missing_env, home, .{}, .{ .resume_session = id, .logging = false });
+    var missing = try Session.initWithOptions(a, io, &missing_env, home, .{}, .{ .resume_session = id });
     defer missing.deinit();
     try expectInactiveHistoryWithoutLowPriceMarker(&missing, false);
 }
@@ -216,10 +216,10 @@ test "publication Session current capability changes do not reject history loadi
         changed.directory.rows[0].output_tokens = 128000;
         _ = try metadata.commit(&source.store.root, metadata.bit(.opencode_go), changed);
     }
-    var selection_only = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .restore_selection = id, .logging = false });
+    var selection_only = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .restore_selection = id });
     defer selection_only.deinit();
     try std.testing.expectEqual(@as(usize, 0), if (selection_only.app) |app| app.runtime.messages().len else 0);
-    var full = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .resume_session = id, .logging = false });
+    var full = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .resume_session = id });
     defer full.deinit();
     const history = full.connection().initial_history_fn.?(full.connection().context);
     try std.testing.expectEqual(@as(usize, 1), history.len);
@@ -272,7 +272,7 @@ test "publication missing alias key isolates claimed official restart and public
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     session.metadata_fetch = PublicationFetch.fetch;
     session.metadata_dev_fetch = PublicationFetch.dev;
@@ -284,14 +284,15 @@ test "publication missing alias key isolates claimed official restart and public
     try PublicationFetch.refresh(&session);
     PublicationFetch.finishOfficial(&session);
     try std.testing.expect(PublicationFetch.poll(&session));
-    const public_generation = session.metadata_job.?.generations[3];
+    const public_index = cfg.providers.Id.all.len;
+    const public_generation = session.metadata_job.?.generations[public_index];
     try std.testing.expectEqual(@as(usize, 0), PublicationFetch.official[1].load(.monotonic));
     try std.testing.expectEqual(@as(usize, 1), PublicationFetch.official[0].load(.monotonic));
     try std.testing.expect(!session.metadata_cache.refresh[1].successful);
     // Restart only the joined official slot while the public claim is live.
     session.metadata_login_pending = metadata.bit(.deepseek) | metadata.bit(.opencode_go);
     try std.testing.expect(PublicationFetch.poll(&session));
-    try std.testing.expectEqual(public_generation, session.metadata_job.?.generations[3]);
+    try std.testing.expectEqual(public_generation, session.metadata_job.?.generations[public_index]);
     PublicationFetch.finishOfficial(&session);
     try std.testing.expect(PublicationFetch.poll(&session));
     try std.testing.expectEqual(@as(usize, 2), PublicationFetch.official[0].load(.monotonic));
@@ -301,13 +302,13 @@ test "publication missing alias key isolates claimed official restart and public
     try std.testing.expect(PublicationFetch.poll(&session));
     try std.testing.expect(session.metadata_job == null);
     try std.testing.expectEqual(@as(usize, 1), PublicationFetch.public_calls.load(.monotonic));
-    try std.testing.expect(session.metadata_cache.refresh[3].successful);
-    try std.testing.expectEqual(public_generation, session.metadata_cache.refresh[3].generation);
+    try std.testing.expect(session.metadata_cache.refresh[public_index].successful);
+    try std.testing.expectEqual(public_generation, session.metadata_cache.refresh[public_index].generation);
     // Only public is due: the missing official key must not even be looked up.
     session.metadata_auto = true;
     session.metadata_awake_ms = 1000000;
     session.metadata_wall_ms = 300000;
-    session.metadata_cache.refresh[3].last_attempt_ms = null;
+    session.metadata_cache.refresh[public_index].last_attempt_ms = null;
     // Persist the same public-only eligibility used by the owner, with official
     // claims fresh and still inside cooldown/TTL.
     const public_claim = try metadata.claimAt(&session.store.root, metadata.dev_bit, true, 0, .{});
@@ -334,7 +335,7 @@ test "llm Session custom aliases select complete connections and only empty hist
     try env.put("HOME", home);
     try env.put("ALPHA_KEY", "fake-alpha");
     try env.put("BETA_KEY", "fake-beta");
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try std.testing.expect(session.app != null);
     try std.testing.expectEqualStrings("alpha", session.app.?.config.value.selected_provider.?);
@@ -370,7 +371,7 @@ test "llm Session retained inline credential never wipes the independent global 
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     for ([_][]const u8{ "m", "alpha/m", "m" }) |selector| {
         try session.connection().selectModel(selector);
@@ -392,7 +393,7 @@ test "llm Session unresolved defaults stay pending and custom unknown rows never
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try std.testing.expect(session.app == null);
     try std.testing.expect(session.pending.?.value.selection_pending);
@@ -426,7 +427,7 @@ test "llm Session directory fields merge per alias and auth preserves all declar
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
     const row = try session.metadata_cache.directory.upsert(.opencode_go, "shared");
@@ -492,7 +493,7 @@ test "llm Session resume without login retains history and activates using curre
     env = std.process.Environ.Map.init(a);
     try env.put("HOME", home);
     try env.put("ALPHA_KEY", "fake-alpha");
-    var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .resume_session = id, .logging = false });
+    var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .resume_session = id });
     defer restored.deinit();
     try std.testing.expect(restored.app == null);
     const connection = restored.connection();
@@ -523,7 +524,7 @@ test "llm Session failed default persistence publishes neither connection nor se
     try env.put("HOME", home);
     try env.put("ALPHA_KEY", "fake-alpha");
     try env.put("BETA_KEY", "fake-beta");
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     var external = try Store.openExisting(a, std.testing.io, home);
     defer external.deinit();
@@ -550,7 +551,7 @@ test "llm Session raw IDs keep unconfigured slash prefixes and qualified IDs kee
     try env.put("HOME", home);
     try env.put("ALPHA_KEY", "fake-alpha");
     try env.put("BETA_KEY", "fake-beta");
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try session.connection().selectModel("vendor/new/model");
     try std.testing.expectEqualStrings("alpha", session.app.?.config.value.selected_provider.?);
@@ -574,7 +575,7 @@ test "llm Session login appends missing official declaration without switching o
     defer env.deinit();
     try env.put("HOME", home);
     try env.put("DS_KEY", "fake-ds");
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-go");
     try std.testing.expectEqualStrings("deepseek", session.app.?.config.value.selected_provider.?);
@@ -614,7 +615,7 @@ test "llm Session login rejects canonical custom name conflicts and ambiguous of
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         try env.put("HOME", home);
-        var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+        var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
         defer session.deinit();
         if (index == 0) try std.testing.expectError(error.ProviderNameConflict, session.connection().configureProvider(.opencode_go, "fake-go")) else try std.testing.expectError(error.AmbiguousProvider, session.connection().configureProvider(.opencode_go, "fake-go"));
         var disk = try session.store.loadExisting();
@@ -651,7 +652,7 @@ test "llm Session manual effort and resolved metadata map stay frozen across sta
     defer env.deinit();
     try env.put("HOME", home);
     try env.put("GO_KEY", "fake-go");
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     try std.testing.expectEqualStrings("high", session.app.?.config.value.model.reasoning_effort.?);
     try std.testing.expectEqualStrings("high", session.app.?.config.value.model.reasoning.?.map.high.?);
@@ -733,7 +734,7 @@ test "llm Session dynamic history loads after lost window and delisting without 
             try std.testing.expectEqualStrings("fake-frozen-go", source.global_config.?.value.registry.?.find("go").?.connection.api_key.?);
         }
         {
-            var selection_only = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .restore_selection = id, .logging = false });
+            var selection_only = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .restore_selection = id });
             defer selection_only.deinit();
             try std.testing.expectEqual(@as(usize, 0), if (selection_only.app) |app| app.runtime.messages().len else 0);
         }
@@ -788,7 +789,7 @@ test "llm Session dynamic history loads after lost window and delisting without 
             unexpected.deinit();
             return error.MalformedHistoryAccepted;
         } else |_| {}
-        if (Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .restore_selection = id, .logging = false })) |value| {
+        if (Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .restore_selection = id })) |value| {
             var unexpected = value;
             unexpected.deinit();
             return error.MalformedHistoryAccepted;

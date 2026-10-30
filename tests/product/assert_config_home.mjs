@@ -26,14 +26,14 @@ function projectKey(project) {
   return createHash('sha256').update(project).digest('hex').slice(0, 32);
 }
 
-async function assertIndexEntry(root, key, checkpoint, canonical) {
+async function assertIndexEntry(root, key, checkpoint, canonical, expectedFiles = [`${checkpoint.id}.json`]) {
   const dir = join(root, 'session-index', key);
   const keyInfo = await lstat(dir);
   assert(keyInfo.isDirectory() && !keyInfo.isSymbolicLink(), `${dir}: not a real directory`);
   assert.equal(keyInfo.mode & 0o777, 0o700, `${dir}: mode`);
 
   const expected = `${checkpoint.id}.json`;
-  assert.deepEqual(await readdir(dir), [expected], `${dir}: unexpected index contents`);
+  assert.deepEqual((await readdir(dir)).sort(), [...expectedFiles].sort(), `${dir}: unexpected index contents`);
 
   const path = join(dir, expected);
   const info = await lstat(path);
@@ -81,23 +81,25 @@ export async function assertConfigHome(home, checkpoint = null) {
   // The optional index is checked below; every other entry must be config.json.
   assert.deepEqual((await readdir(root)).filter(name => name !== 'session-index'), ['config.json'], `${root}: unexpected home state`);
 
-  if (checkpoint != null) {
-    assert(typeof checkpoint === 'object', 'checkpoint: not an object');
-    assert(typeof checkpoint.project === 'string' && checkpoint.project.length > 0, 'checkpoint: project');
-    assert.match(checkpoint.id, /^[0-9a-f]{32}$/, 'checkpoint: id');
+  const arrayMode = Array.isArray(checkpoint);
+  const checkpoints = arrayMode ? checkpoint : checkpoint == null ? [] : [checkpoint];
+  for (const item of checkpoints) {
+    assert(item && typeof item === 'object' && !Array.isArray(item), 'checkpoint: not an object');
+    assert(typeof item.project === 'string' && item.project.length > 0, 'checkpoint: project');
+    assert.match(item.id, /^[0-9a-f]{32}$/, 'checkpoint: id');
   }
 
   const indexPath = join(root, 'session-index');
   let index;
   try { index = await lstat(indexPath); } catch (error) {
     if (error.code !== 'ENOENT') throw error;
-    assert(checkpoint == null, '.thin/session-index: published index missing');
+    assert(checkpoints.length === 0, '.thin/session-index: published index missing');
     return;
   }
   assert(index.isDirectory() && !index.isSymbolicLink(), '.thin/session-index: not a real directory');
   assert.equal(index.mode & 0o777, 0o700, '.thin/session-index: mode');
 
-  if (checkpoint == null) {
+  if (checkpoints.length === 0) {
     for (const key of await readdir(indexPath, {withFileTypes:true})) {
       assert(key.isDirectory() && !key.isSymbolicLink(), `.thin/session-index/${key.name}: not a real directory`);
       const dir = join(indexPath, key.name);
@@ -107,9 +109,38 @@ export async function assertConfigHome(home, checkpoint = null) {
     return;
   }
 
-  const canonical = await realpath(checkpoint.project);
-  const key = projectKey(canonical);
-  assert.deepEqual(await readdir(indexPath), [key], '.thin/session-index: unexpected key directories');
-  await assertIndexEntry(root, key, checkpoint, canonical);
-  await assertCheckpointFile(canonical, checkpoint.id);
+  if (!arrayMode) {
+    const canonical = await realpath(checkpoint.project);
+    const key = projectKey(canonical);
+    assert.deepEqual(await readdir(indexPath), [key], '.thin/session-index: unexpected key directories');
+    await assertIndexEntry(root, key, checkpoint, canonical);
+    await assertCheckpointFile(canonical, checkpoint.id);
+    return;
+  }
+
+  const byKey = new Map();
+  for (const item of checkpoints) {
+    const canonical = await realpath(item.project);
+    const key = projectKey(canonical);
+    const entries = byKey.get(key) ?? [];
+    assert(!entries.some(entry => entry.item.id === item.id), 'checkpoint: duplicate id');
+    entries.push({item, canonical});
+    byKey.set(key, entries);
+    await assertCheckpointFile(canonical, item.id);
+  }
+  const keys = await readdir(indexPath);
+  for (const key of byKey.keys()) assert(keys.includes(key), `${key}: published index missing`);
+  for (const key of keys) {
+    assert.match(key, /^[0-9a-f]{32}$/, `${key}: invalid index directory`);
+    const entries = byKey.get(key);
+    if (!entries) {
+      const dir = join(indexPath, key), info = await lstat(dir);
+      assert(info.isDirectory() && !info.isSymbolicLink(), `${dir}: not a real directory`);
+      assert.equal(info.mode & 0o777, 0o700, `${dir}: mode`);
+      assert.deepEqual(await readdir(dir), [], `${dir}: unexpected index contents`);
+      continue;
+    }
+    const files = entries.map(({item}) => `${item.id}.json`);
+    for (const {item, canonical} of entries) await assertIndexEntry(root, key, item, canonical, files);
+  }
 }

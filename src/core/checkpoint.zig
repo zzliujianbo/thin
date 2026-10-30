@@ -372,6 +372,20 @@ const fixture_config = cfg.Config{
     .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .auto },
 };
 // Tests construct actual requests explicitly; no production combination wrapper.
+test "checkpoint DTO excludes OAuth config and preserves frozen context" {
+    var config = fixture_config;
+    config.provider.codex_oauth = .{ .access_token = "access-canary-private", .refresh_token = "refresh-canary-private", .expires_at_ms = 1 };
+    var state = fixture(.responses);
+    state.context_tokens = config.model.context_tokens;
+    const bytes = try encode(std.testing.allocator, state);
+    defer std.testing.allocator.free(bytes);
+    for ([_][]const u8{ "access-canary-private", "refresh-canary-private", "codex_oauth" }) |secret| try std.testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
+    var decoded = try decode(std.testing.allocator, bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(state.context_tokens, decoded.value.context_tokens);
+    try std.testing.expectEqual(state.selector.selected, decoded.value.selector.selected);
+}
+
 fn fixtureRequest(state: State, config: cfg.Config) p.Request {
     return .{
         .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = if (config.model.protocol == .auto) state.selector.effective() else config.model.protocol },

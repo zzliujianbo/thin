@@ -32,9 +32,8 @@ export async function fullResumeRegressions({app, pty, execute}) {
         const users = history.filter(m => m.role === 'user' && !JSON.stringify(m).includes('[Context material'));
         serverCheck = 'exact user history';
         assert(JSON.stringify(users[0]).includes('remember-resume-marker'));
-        // Request 4 used --no-log, so request 5 resumes the same persisted
-        // two-turn history rather than the discarded read-only continuation.
-        assert.equal(users.length, requests <= 2 ? 1 : requests === 3 ? 2 : 3);
+        // Each accepted continuation persists before the next resume.
+        assert.equal(users.length, requests <= 2 ? 1 : requests - 1);
         if (requests >= 3) assert(JSON.stringify(users.at(-1)).includes('resume-next-turn'));
         if (requests > 1) {
           serverCheck = 'native replay and closed tools';
@@ -144,10 +143,14 @@ export async function fullResumeRegressions({app, pty, execute}) {
         return Promise.all(files.map(async name => [name, createHash('sha256').update(await readFile(join(sessions, name))).digest('hex')]));
       };
       const before = await snapshotTree();
-      assert.equal(await run('resume-readonly', id), undefined);
+      assert.equal(await run('resume-readonly', id), id);
       assert.equal(requests, 4);
-      check = 'no-log changes not published';
-      assert.deepEqual(await snapshotTree(), before);
+      check = 'continuation published automatically';
+      assert.notDeepEqual(await snapshotTree(), before);
+      const thirdState = stateOf(await readFile(snapshotPath));
+      assert.equal(turnsOf(thirdState).length, 8);
+      assert(thirdState.journal_seq > secondState.journal_seq);
+      assert.equal(thirdState.journal_turn, secondState.journal_turn + 1);
       assert.equal(await run('resume-idle', id), id);
       assert.equal(requests, 4, 'loading alone requested the model');
       check = 'tools never replay and preferences untouched';
@@ -191,7 +194,7 @@ export async function fullResumeRegressions({app, pty, execute}) {
       await run('resume-login', id);
       assert.equal(requests,5,'login activation must send exactly one continuation');
       assert.equal(await readFile(join(project,'resume-sentinel.txt'),'utf8'),'once');
-      console.log(`PASS resume/${protocol}: key/marker-independent loading, damaged/truncated refusal, no-key history/login/send, one side effect, no-log unchanged; requests=5`);
+      console.log(`PASS resume/${protocol}: key/marker-independent loading, damaged/truncated refusal, no-key history/login/send, one side effect, automatic continuation persistence; requests=5`);
     } catch {
       const error = new Error('full resume fixture failed');
       error.fixtureCase = `resume/${protocol}`;

@@ -33,6 +33,7 @@ const spawn = @import("spawn.zig");
 const unix = @import("unix.zig");
 const StreamReceiver = @import("stream_receiver.zig").Receiver;
 const remote_action = @import("../ui/remote_action.zig");
+const codex_login = @import("../core/codex_login.zig");
 
 const Io = std.Io;
 const Registry = registry.Registry;
@@ -325,6 +326,7 @@ const max_label_bytes = 64;
 
 const SnapshotCache = struct {
     valid: bool = false,
+    codex_login: codex_login.View = .{},
     busy: bool = false,
     phase: ?r.State = null,
     task: u64 = 0,
@@ -370,7 +372,6 @@ const Pub = struct {
     effort: shared.ReasoningEffort = .unspecified,
     effort_levels: shared.activity.EffortSet = .{},
     configured: u8 = 0,
-    logging: bool = true,
     read_only: bool = false,
     low_price_enabled: bool = true,
     low_price_active: bool = false,
@@ -449,7 +450,6 @@ pub const Client = struct {
     reg: ?Registry = null,
     workers: ?Workers = null,
     dir: ?unix.Directory = null,
-    logging: bool = true,
     auto_refresh: bool = true,
 
     /// Display cursors for the ordered snapshot+delta stream.
@@ -558,6 +558,7 @@ pub const Client = struct {
             .current_fn = currentFn,
             .configure_fn = configureFn,
             .configure_provider_fn = configureProviderFn,
+            .codex_login_fn = codexLoginFn,
             .select_model_fn = selectModelFn,
             .set_effort_fn = setEffortFn,
             .cycle_effort_fn = cycleEffortFn,
@@ -814,6 +815,7 @@ pub const Client = struct {
         const cfg = &self.pubcfg;
         const cache = &self.cache;
         var state: tui.Connection.State = baseState();
+        state.codex_login = cache.codex_login;
         state.available = cfg.available and (self.conn != null or self.control != null);
         state.busy = (cache.valid and cache.busy) or (self.need_history and self.snap.busy);
         state.session_label = if (cache.valid and cache.label_len != 0) try arena.dupe(u8, cache.label[0..cache.label_len]) else null;
@@ -861,7 +863,6 @@ pub const Client = struct {
         state.metadata_notice_ttl_ms = if (cfg.metadata_notice != null) 4000 else 0;
         state.settings_notice = if (cfg.notice) |text| try arena.dupe(u8, text) else null;
         state.base_url = try arena.dupe(u8, cfg.base_url);
-        state.logging_enabled = cfg.logging;
         return state;
     }
 
@@ -884,6 +885,7 @@ pub const Client = struct {
     /// double arena, this may be transferred to another thread and freed there.
     pub const Projection = struct {
         configuration_revision: u64 = 0,
+        task_id: ?u64 = null,
         a: std.mem.Allocator,
         arena: std.heap.ArenaAllocator,
         state: tui.Connection.State,
@@ -899,7 +901,7 @@ pub const Client = struct {
     pub fn exportProjection(self: *Client) !*Projection {
         const view = try self.a.create(Projection);
         errdefer self.a.destroy(view);
-        view.* = .{ .configuration_revision = self.configuration_revision, .a = self.a, .arena = .init(self.a), .state = undefined, .snapshot = undefined };
+        view.* = .{ .configuration_revision = self.configuration_revision, .task_id = if (self.cache.task == 0) null else self.cache.task, .a = self.a, .arena = .init(self.a), .state = undefined, .snapshot = undefined };
         errdefer view.arena.deinit();
         view.state = try self.buildState(view.arena.allocator());
         view.snapshot = try self.buildSnapshot(view.arena.allocator());
@@ -934,6 +936,7 @@ pub const Client = struct {
             .proxy => |v| try proxyFn(self, v.model, v.enabled),
             .proxy_address => |address| try proxyAddressFn(self, address),
             .refresh_models => try refreshModelsFn(self),
+            .codex_login => |v| try codexLoginFn(self, v.action, v.generation),
             .poll_metadata => |wait| return .{ .changed = pollModelsFn(self, wait) },
         }
         return .none;
@@ -1014,6 +1017,26 @@ pub const Client = struct {
             }
         };
         cache.valid = true;
+        if (object.get("codex_login")) |value| {
+            const login_view = switch (value) {
+                .object => |map| map,
+                else => return error.ProtocolError,
+            };
+            cache.codex_login.generation = get.uint(login_view, "generation") orelse return error.ProtocolError;
+            cache.codex_login.status = std.meta.stringToEnum(codex_login.Status, get.text(login_view, "status") orelse return error.ProtocolError) orelse return error.ProtocolError;
+            const code = get.text(login_view, "code") orelse return error.ProtocolError;
+            if (code.len > cache.codex_login.code.len) return error.ProtocolError;
+            for (code) |c| if (c < 0x21 or c > 0x7e) return error.ProtocolError;
+            if (code.len != 0 and cache.codex_login.status != .pending) return error.ProtocolError;
+            @memcpy(cache.codex_login.code[0..code.len], code);
+            cache.codex_login.code_len = @intCast(code.len);
+            const failure = login_view.get("failure") orelse return error.ProtocolError;
+            cache.codex_login.failure = switch (failure) {
+                .null => null,
+                .string => |name| std.meta.stringToEnum(codex_login.Failure, name) orelse return error.ProtocolError,
+                else => return error.ProtocolError,
+            };
+        }
         cache.busy = get.flag(object, "busy");
         cache.phase = if (get.text(object, "phase")) |name| std.meta.stringToEnum(r.State, name) else null;
         cache.task = get.uint(object, "task") orelse 0;
@@ -1077,6 +1100,8 @@ pub const Client = struct {
             self.revokeView();
             return;
         }
+        if (cache.codex_login.status == .succeeded and
+            (self.cache.codex_login.status != .succeeded or self.cache.codex_login.generation != cache.codex_login.generation)) self.dirty = true;
         self.cache = cache;
         if (resp.uint("through")) |through| self.cache_floor = @max(self.cache_floor, through);
     }
@@ -1154,7 +1179,6 @@ pub const Client = struct {
         next.effort = shared.ReasoningEffort.fromName(read.text(view, "effort"));
         if (read.field(view, "effort_levels")) |value| next.effort_levels = parseEfforts(value);
         if (read.field(view, "configured")) |value| next.configured = parseConfigured(value);
-        next.logging = read.flag(view, "logging", next.logging);
         next.read_only = read.flag(view, "read_only", false);
         // `low_price_input` is the active protection marker, not the switch;
         // `low_price_input_enabled` is the configured global switch.
@@ -1981,7 +2005,6 @@ pub const Client = struct {
             .owner = .foreground,
             .@"resume" = resume_id,
             .restore_selection = restore_selection,
-            .logging = self.logging,
             .auto_refresh_models = self.auto_refresh,
         }) catch |err| {
             // The management-UI aliases (Busy/SessionNotFound) are for an
@@ -2037,7 +2060,6 @@ pub const Client = struct {
             var req = try self.controlRequest(.create);
             defer req.deinit();
             try req.put("project", self.launcher);
-            try req.put("logging", self.logging);
             try req.put("auto_refresh_models", self.auto_refresh);
             var resp = try req.exchange(join_timeout_ms);
             defer resp.deinit();
@@ -2292,7 +2314,6 @@ pub const Client = struct {
             var req = try self.controlRequest(.create);
             defer req.deinit();
             try req.put("project", project);
-            try req.put("logging", self.logging);
             try req.put("auto_refresh_models", self.auto_refresh);
             try req.put("resume", id[0..]);
             var resp = try req.exchange(join_timeout_ms);
@@ -2474,6 +2495,20 @@ pub const Client = struct {
     fn configureFn(context: *anyopaque, key: []const u8) anyerror!void {
         const self = fromContext(context);
         try self.login(null, key);
+    }
+
+    fn codexLoginFn(context: *anyopaque, action: codex_login.Action, generation: u64) anyerror!void {
+        const self = fromContext(context);
+        // Authentication belongs to an actual session owner, not daemon setup.
+        if (self.conn == null) try self.ensureSession();
+        var req = try self.settingsRequest(.codex_login);
+        defer req.deinit();
+        try req.put("action", @tagName(action));
+        try req.put("generation", generation);
+        var resp = try req.exchange(quick_timeout_ms);
+        defer resp.deinit();
+        self.refreshSnapshot();
+        self.rebuild();
     }
 
     fn configureProviderFn(context: *anyopaque, provider: core_config.providers.Id, key: []const u8) anyerror!void {
@@ -3019,7 +3054,6 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
     errdefer {
         if (client.ownsAnyWorker()) _ = client.finishForeground();
     }
-    client.logging = options.logging;
     client.auto_refresh = options.auto_refresh_models;
 
     switch (options.mode) {
@@ -3065,7 +3099,8 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
     const code = blk: {
         const frontend = try @import("frontend.zig").Frontend.start(client);
         defer frontend.deinit(); // Join before foreground shutdown or Client teardown.
-        break :blk try tui.run(a, io, frontend.connection(), &bridge, &cancel);
+        const result = tui.run(a, io, frontend.connection(), &bridge, &cancel);
+        break :blk try result;
     };
 
     if (client.ownsAnyWorker()) {
@@ -4129,7 +4164,7 @@ test "snapshot and settings project into the UI state without pointers" {
     defer pair.deinit();
     const client = pair.client;
 
-    try pair.reply(1, "\"available\":true,\"model\":\"m1\",\"provider\":\"deepseek\",\"effort\":\"high\",\"logging\":false,\"configured\":1,\"providers\":[{\"name\":\"deepseek\"}]");
+    try pair.reply(1, "\"available\":true,\"model\":\"m1\",\"provider\":\"deepseek\",\"effort\":\"high\",\"configured\":1,\"providers\":[{\"name\":\"deepseek\"}]");
     var settings = try client.readResponse(1, quick_timeout_ms);
     try client.adoptSettings(settings.object);
     settings.deinit();
@@ -4137,7 +4172,6 @@ test "snapshot and settings project into the UI state without pointers" {
     try std.testing.expectEqual(shared.ReasoningEffort.high, client.pubcfg.effort);
     try std.testing.expectEqual(@as(usize, 1), client.pubcfg.providers.len);
     try std.testing.expectEqual(@as(u8, 1), client.pubcfg.configured);
-    try std.testing.expect(!client.pubcfg.logging);
 
     try pair.reply(2, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":true,\"phase\":\"calling_model\",\"task\":4,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":1,\"follow_up\":0,\"previews\":[{\"id\":5,\"kind\":\"steering\",\"text\":\"next\"}],\"ctx\":{\"tokens\":10,\"limit\":100,\"known\":true}}");
     var snapshot = try client.readResponse(2, quick_timeout_ms);
@@ -4203,7 +4237,7 @@ test "real host settings reply projects providers flags price states and pending
 
     const host_id = try ids.generate(io);
     const session_host = @import("../app/session_host.zig");
-    const host = try session_host.SessionHost.init(a, io, &environ, .{ .project = project, .id = host_id, .logging = false, .owner = .daemon });
+    const host = try session_host.SessionHost.init(a, io, &environ, .{ .project = project, .id = host_id, .owner = .daemon });
     defer host.deinit();
 
     const models = [_]core_config.Model{

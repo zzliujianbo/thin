@@ -62,7 +62,7 @@ test "image Settings default Off exact logged candidates and independent transac
     defer env.deinit();
     try env.put("HOME", home);
     try env.put("VISION_OWN_KEY", "fake-vision-own");
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const app = session.app.?;
     const primary = app.client.authorization.ptr;
@@ -147,7 +147,7 @@ fn contextSurvivesImageSettings(protocol: @import("../core/protocol.zig").Protoc
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         try env.put("HOME", home);
-        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = false });
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .auto_refresh_models = false });
         defer session.deinit();
         const app = session.app.?;
         var reply: Reply = .{ .usage = if (mode == .reported) .{ .total_tokens = 1234 } else .{} };
@@ -202,7 +202,7 @@ test "image Settings stale credential OOM and CAS failure publish nothing" {
     defer env.deinit();
     try env.put("HOME", home);
     try env.put("VISION_OWN_KEY", "fake-vision-own");
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const app = session.app.?;
     const primary = app.client.authorization.ptr;
@@ -265,7 +265,7 @@ test "image official id-only listing authorizes exact availability not invented 
     try env.put("VISION_OWN_KEY", "fake-official-own");
     for ([_][]const u8{ "{\"data\":[{\"id\":\"deepseek-flash\"},{\"id\":\"DeepSeek-Flash\"}]}", "{\"data\":[]}" }, 0..) |body, index| {
         try publish(home, body, 100 + index * 10);
-        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+        var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
         defer session.deinit();
         const state = session.connection().current();
         try std.testing.expectEqual(index == 0, contains(state.image_models, "official/deepseek-flash"));
@@ -305,7 +305,7 @@ test "image official Anthropic base uses the same availability and cached limits
     defer env.deinit();
     try env.put("HOME", home);
     try env.put("VISION_OWN_KEY", "fake-anthropic-own");
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     for ([_][]const u8{ "anthropic/deepseek-flash", "manual/deepseek-flash" }) |name| {
         try std.testing.expect(contains(session.connection().current().image_models, name));
@@ -334,7 +334,7 @@ test "image unavailable own key preserves main startup and fails before file acc
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const app = session.app.?;
     try std.testing.expect(app.image_client == null and app.config.value.imageActive());

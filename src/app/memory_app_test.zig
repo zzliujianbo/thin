@@ -1,4 +1,4 @@
-//! Actual App hooks, no logging and no HTTP: both primary and extractor are owned fakes.
+//! Actual App hooks with automatic recording and no HTTP: primary and extractor are owned fakes.
 const std = @import("std");
 const cfg = @import("../core/config.zig");
 const fs = @import("../platform/filesystem.zig");
@@ -77,7 +77,7 @@ test "App memory root contention initial core skips Busy without blocking startu
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
 }
 
-test "App default automatic memory succeeds without logs or Decision and preserves primary context through Off" {
+test "App default automatic memory succeeds with recording and without Decision and preserves primary context through Off" {
     const a = std.testing.allocator;
     for ([_]p.Protocol{ .chat, .auto }) |protocol| {
         var backend = std.Io.Threaded.init(a, .{});
@@ -108,7 +108,6 @@ test "App default automatic memory succeeds without logs or Decision and preserv
         defer a.free(auth_path);
         const app = try App.initConfiguredAnchoredAuth(a, io, &env, &root, auth_path, .{}, config);
         defer app.deinit();
-        app.journal.setEnabled(false);
         var fake: Fake = .{};
         app.runtime.model = .{ .context = &fake, .call_fn = Fake.main };
         app.memory_coordinator.extractor.?.model_override = .{ .context = &fake, .call_fn = Fake.auxiliary };
@@ -141,6 +140,10 @@ test "App default automatic memory succeeds without logs or Decision and preserv
         const reference = try app.memory_coordinator.retrieve(a, "concise reviews", 1024);
         defer a.free(reference);
         try std.testing.expect(std.mem.find(u8, reference, "concise") != null);
-        try std.testing.expectError(error.FileNotFound, root.read(a, ".thin/logs", 0, 1024));
+        app.journal.flush();
+        try std.testing.expect(app.journal.failure() == null);
+        const record = try root.read(a, app.journal.store.path(), 0, 65536);
+        defer a.free(record.data);
+        try std.testing.expect(std.mem.find(u8, record.data, "concise explanations") != null);
     }
 }

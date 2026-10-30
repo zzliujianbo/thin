@@ -1,6 +1,7 @@
 //! Isolated generative memory extractor. Never touches Runtime/history/accounts,
 //! metadata resolution or Decision/Image selection. Construction does no network.
 const std = @import("std");
+const diag = @import("../core/diagnostics.zig");
 const cfg = @import("../core/config.zig");
 const p = @import("../core/protocol.zig");
 const knowledge = @import("../core/knowledge.zig");
@@ -8,6 +9,7 @@ const codec = @import("../core/knowledge_codec.zig");
 const context = @import("../core/context.zig");
 const thinking = @import("../core/thinking.zig");
 const http = @import("../llm/http.zig");
+const CredentialSource = @import("../core/codex_auth.zig").CredentialSource;
 const common = @import("../llm/common.zig");
 
 pub const Client = struct {
@@ -18,6 +20,7 @@ pub const Client = struct {
     key: ?[]u8 = null,
     transport: ?http.Client = null,
     model_override: ?p.Model = null,
+    diagnostics: diag.Sink = .{},
     calls: u64 = 0,
     last_usage: p.Usage = .{},
     last_http_status: ?u16 = null,
@@ -25,6 +28,10 @@ pub const Client = struct {
     /// config is the actual frozen primary selection (not a declaration to resolve).
     /// Absent credentials/unsupported protocol are lazy extraction failures only.
     pub fn create(a: std.mem.Allocator, io: std.Io, config: cfg.Config, env: *const std.process.Environ.Map) !*Client {
+        return createWithCodexSource(a, io, config, env, null);
+    }
+
+    pub fn createWithCodexSource(a: std.mem.Allocator, io: std.Io, config: cfg.Config, env: *const std.process.Environ.Map, source: ?CredentialSource) !*Client {
         const self = try a.create(Client);
         self.* = .{ .backing = a, .wiping = .{ .backing = a }, .io = io, .source = undefined };
         const owned = self.wiping.allocator();
@@ -38,7 +45,8 @@ pub const Client = struct {
         // framing. Retain validated wire/event limits and codec payload bounds,
         // without imposing a separate helper token allowance.
         const frozen = &self.source.value;
-        self.key = cfg.resolveApiKey(owned, frozen.*, env) catch |err| switch (err) {
+        const codex = frozen.provider.kind == .openai_codex and std.mem.eql(u8, frozen.provider.base_url, cfg.providers.Id.openai_codex.baseUrl());
+        self.key = if (codex) null else cfg.resolveApiKey(owned, frozen.*, env) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
         };
@@ -47,7 +55,12 @@ pub const Client = struct {
         // An auto route may own a transport now, but cannot call until bound to
         // the primary Runtime's actually confirmed protocol on the helper worker.
         if (!frozen.selection_pending and frozen.model.protocol != .systemone) {
-            if (self.key) |key| self.transport = http.Client.initWithEnv(owned, io, frozen, key, env) catch |err| switch (err) {
+            if (codex) {
+                if (source) |credential_source| self.transport = http.Client.initCodexWithEnv(owned, io, frozen, credential_source, env) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => null,
+                };
+            } else if (self.key) |key| self.transport = http.Client.initWithEnv(owned, io, frozen, key, env) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => null,
             };
@@ -137,10 +150,24 @@ pub const Client = struct {
         // Validate the actual frozen request before counting an inference attempt.
         try @import("../core/checkpoint.zig").validateRequestHistory(a, request);
         try self.check(cancel);
+        var hash = std.hash.Wyhash.init(0);
+        hash.update(config.model.name);
+        hash.update(@tagName(config.model.protocol));
+        var span = diag.Span.start(self.diagnostics, self.io, .{ .stage = .memory_request, .protocol = config.model.protocol, .timeout_ms = config.limits.request_timeout_ms, .route_hash = hash.final(), .count = 1 });
+        defer span.finish(.ok);
+        return self.extractAttempt(a, out, material, cancel, model, request, &span) catch |err| {
+            span.fail(err);
+            return err;
+        };
+    }
+
+    fn extractAttempt(self: *Client, a: std.mem.Allocator, out: std.mem.Allocator, material: knowledge.Material, cancel: *const p.Cancellation, model: p.Model, request: p.Request, span: *diag.Span) ![]const knowledge.Candidate {
         self.calls +|= 1;
         // Streamed usage survives even a thrown cancellation/cleanup failure.
         var sink: UsageSink = .{ .client = self, .cancel = cancel };
         const outcome = model.call(a, request, .{ .context = &sink, .emit_fn = UsageSink.emit }) catch |err| {
+            // Record the original local error before preserving public normalization.
+            span.fail(err);
             // Cleanup ownership failure outranks concurrent cancellation.
             if (err == error.CleanupFailed) return err;
             try self.check(cancel);
@@ -151,8 +178,15 @@ pub const Client = struct {
             .failure => |failure| {
                 common.mergeUsage(&self.last_usage, failure.usage);
                 self.last_http_status = failure.http_status;
-                try self.check(cancel);
-                return if (failure.kind == .canceled) error.Canceled else error.MemoryUnavailable;
+                span.record.http_status = failure.http_status;
+                span.record.model_failure = failure.kind;
+                self.check(cancel) catch |err| {
+                    span.fail(err);
+                    return err;
+                };
+                const err: anyerror = if (failure.kind == .canceled) error.Canceled else error.MemoryUnavailable;
+                span.fail(err);
+                return err;
             },
             .success => |success| success,
         };
@@ -392,6 +426,59 @@ test "memory client unrequested proxy transport closes cleanly without a child" 
     const proxy = if (client.transport) |*transport| if (transport.proxy_http) |*value| value else return error.TestUnexpectedResult else return error.TestUnexpectedResult;
     try std.testing.expect(proxy.unreaped_pid == null and !proxy.poisoned);
 }
+test "memory request diagnostics preserve success failure decode and cancellation" {
+    const Capture = struct {
+        records: [32]diag.Record = undefined,
+        len: usize = 0,
+        seq: u64 = 0,
+        fn next(raw: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.seq += 1;
+            return self.seq;
+        }
+        fn emit(raw: ?*anyopaque, record: diag.Record) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.records[self.len] = record;
+            self.len += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const client = try Client.create(a, std.testing.io, testConfig(), &env);
+    defer client.deinit();
+    var capture: Capture = .{};
+    client.diagnostics = .{ .context = &capture, .emit_fn = Capture.emit, .next_fn = Capture.next };
+    var cancel: p.Cancellation = .{};
+    try std.testing.expectError(error.MemoryUnavailable, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
+    var fake: Fake = .{ .client = client };
+    client.model_override = .{ .context = &fake, .call_fn = Fake.invoke };
+    const items = try client.service().extract(a, fixture, &cancel);
+    defer codec.freeCandidates(a, items);
+    try std.testing.expectEqual(diag.Result.ok, capture.records[1].result.?);
+    fake.mode = .failure;
+    try std.testing.expectError(error.MemoryUnavailable, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectEqual(@as(?u16, 429), capture.records[3].http_status);
+    try std.testing.expectEqual(diag.Result.failed, capture.records[3].result.?);
+    fake.mode = .partial;
+    try std.testing.expectError(error.InvalidMemoryOutput, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectEqualStrings("InvalidMemoryOutput", capture.records[5].error_name.?.name());
+    fake.mode = .thrown;
+    try std.testing.expectError(error.CleanupFailed, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectEqualStrings("CleanupFailed", capture.records[7].error_name.?.name());
+    fake.mode = .cancel;
+    try std.testing.expectError(error.Canceled, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectEqual(diag.Result.canceled, capture.records[9].result.?);
+    try std.testing.expectEqual(@as(usize, 10), capture.len);
+    for (0..5) |i| {
+        try std.testing.expectEqual(diag.Phase.begin, capture.records[2 * i].phase);
+        try std.testing.expectEqual(diag.Phase.end, capture.records[2 * i + 1].phase);
+        try std.testing.expectEqual(capture.records[2 * i].span_id, capture.records[2 * i + 1].span_id);
+        try std.testing.expectEqual(@as(?u32, 1), capture.records[2 * i + 1].count);
+    }
+}
+
 test "memory client fake normal request preserves usage cancellation no tools no partial batch" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);

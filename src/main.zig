@@ -108,7 +108,6 @@ fn run(init: std.process.Init) !u8 {
         defer console.deinit();
         const app = try App.init(init.gpa, init.io, init.environ_map, ".", console.host());
         defer app.deinit();
-        app.setLogging(options.logging);
 
         var guard = try interrupt.Guard.install();
         defer guard.deinit();

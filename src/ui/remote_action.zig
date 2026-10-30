@@ -8,6 +8,7 @@ const config = @import("../core/config.zig");
 const settings = @import("../core/settings.zig");
 const activity = @import("../presentation/activity.zig");
 const Choice = @import("decision_picker.zig").Choice;
+const codex_login = @import("../core/codex_login.zig");
 
 pub const Setting = enum { low_price_input, decision_enabled };
 pub const Action = union(enum) {
@@ -21,6 +22,7 @@ pub const Action = union(enum) {
     queue_resume,
     manage: session.Manage,
     configure: struct { provider: ?config.providers.Id, key: []const u8 },
+    codex_login: struct { action: codex_login.Action, generation: u64 },
     model: []const u8,
     effort: activity.ReasoningEffort,
     cycle_effort,

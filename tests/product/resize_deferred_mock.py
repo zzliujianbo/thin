@@ -132,7 +132,7 @@ def run(app):
             # Do it after exec of a single-threaded launcher, not Python
             # preexec_fn after forking the parent's HTTP server thread.
             launcher = 'import fcntl, os, sys, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); os.execv(sys.argv[1], sys.argv[1:])'
-            child = subprocess.Popen([sys.executable, '-c', launcher, app, '--no-log', '--no-model-auto-refresh'], stdin=slave, stdout=slave, stderr=slave, cwd=project, start_new_session=True,
+            child = subprocess.Popen([sys.executable, '-c', launcher, app, '--no-model-auto-refresh'], stdin=slave, stdout=slave, stderr=slave, cwd=project, start_new_session=True,
                                      env={'PATH': '/usr/bin:/bin', 'HOME': str(home), 'XDG_RUNTIME_DIR': str(runtime), 'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_RESIZE_KEY': 'owned-resize-fake-only'})
             capture = bytearray()
 

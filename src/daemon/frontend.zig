@@ -5,6 +5,7 @@ const Client = @import("client.zig").Client;
 const communication = @import("communication.zig");
 const Communication = communication.Communication;
 const action = @import("../ui/remote_action.zig");
+const corecodex = @import("../core/codex_login.zig");
 const session = @import("../ui/session_client.zig");
 const tui = @import("../ui/tui.zig");
 const config = @import("../core/config.zig");
@@ -21,15 +22,15 @@ pub const Frontend = struct {
     revision: u64,
     activity_floor: u64 = 0,
     presentation_changed: bool = false,
-
     pub fn start(client: *Client) !*Frontend {
         const self = try client.a.create(Frontend);
         errdefer client.a.destroy(self);
         const view = try client.exportProjection();
         errdefer view.deinit();
         const revision = client.publication_revision;
+        const allocator = client.a;
         const worker = try Communication.start(client);
-        self.* = .{ .a = client.a, .communication = worker, .view = view, .revision = revision };
+        self.* = .{ .a = allocator, .communication = worker, .view = view, .revision = revision };
         return self;
     }
 
@@ -72,7 +73,8 @@ pub const Frontend = struct {
             view.projection.state.busy = true;
         }
         self.presentation_changed = self.presentation_changed or view.generation != self.generation or
-            view.projection.configuration_revision != self.view.configuration_revision;
+            view.projection.configuration_revision != self.view.configuration_revision or
+            codexViewChanged(self.view.state.codex_login, view.projection.state.codex_login);
         if (self.retired) |retired| retired.deinit();
         self.retired = self.view;
         self.view = view.projection;
@@ -150,6 +152,7 @@ pub const Frontend = struct {
             .current_fn = current,
             .configure_fn = noConfigure,
             .configure_provider_fn = noConfigureProvider,
+            .codex_login_fn = noCodexLogin,
             .select_model_fn = noConfigure,
             .set_effort_fn = noEffort,
             .cycle_effort_fn = noCycle,
@@ -169,6 +172,9 @@ pub const Frontend = struct {
     // Fail closed if any UI path accidentally invokes an old synchronous
     // callback. Never queue a mutation and then pretend it failed/succeeded.
     fn noConfigure(_: *anyopaque, _: []const u8) anyerror!void {
+        return error.AsyncRequired;
+    }
+    fn noCodexLogin(_: *anyopaque, _: corecodex.Action, _: u64) anyerror!void {
         return error.AsyncRequired;
     }
     fn noConfigureProvider(_: *anyopaque, _: config.providers.Id, _: []const u8) anyerror!void {
@@ -249,11 +255,53 @@ pub const Frontend = struct {
     };
 };
 
+fn codexViewChanged(old: corecodex.View, new: corecodex.View) bool {
+    if (old.generation != new.generation or old.status != new.status or old.failure != new.failure or old.code_len != new.code_len) return true;
+    const len = @min(@as(usize, old.code_len), old.code.len);
+    return !std.mem.eql(u8, old.code[0..len], new.code[0..len]);
+}
+
 fn testProjection(busy: bool, model: []const u8) !*Client.Projection {
     const a = std.testing.allocator;
     const projection = try a.create(Client.Projection);
     projection.* = .{ .a = a, .arena = .init(a), .state = .{ .runtime = null, .available = true, .busy = busy, .model = model, .base_url = "" }, .snapshot = .{ .available = true, .attached = true, .busy = busy, .control_epoch = 7 } };
     return projection;
+}
+
+test "synchronous codex login requires async action" {
+    var context: u8 = 0;
+    try std.testing.expectError(error.AsyncRequired, Frontend.noCodexLogin(&context, .start, 1));
+}
+
+test "pending codex code publication wakes once" {
+    var frontend: Frontend = .{ .a = std.testing.allocator, .communication = undefined, .view = try testProjection(false, "model"), .revision = 10 };
+    defer frontend.view.deinit();
+    defer if (frontend.retired) |retired| retired.deinit();
+    frontend.view.state.codex_login = .{ .generation = 3, .status = .pending };
+    const pending = try testProjection(false, "model");
+    pending.state.codex_login = .{ .generation = 3, .status = .pending, .code_len = 4 };
+    @memcpy(pending.state.codex_login.code[0..4], "ABCD");
+    frontend.adopt(.{ .generation = 1, .revision = 11, .watermark = 0, .ordered = false, .projection = pending });
+    try std.testing.expect(Frontend.metadataOwned(&frontend, false));
+    try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
+}
+
+test "identical and stale codex views do not wake" {
+    var frontend: Frontend = .{ .a = std.testing.allocator, .communication = undefined, .view = try testProjection(false, "model"), .revision = 10 };
+    defer frontend.view.deinit();
+    defer if (frontend.retired) |retired| retired.deinit();
+    frontend.view.state.codex_login = .{ .generation = 3, .status = .pending, .code_len = 4 };
+    @memcpy(frontend.view.state.codex_login.code[0..4], "ABCD");
+    const same = try testProjection(false, "model");
+    same.state.codex_login = frontend.view.state.codex_login;
+    same.state.codex_login.code[5] = 42; // Unused array padding is not presentation.
+    frontend.adopt(.{ .generation = 1, .revision = 11, .watermark = 0, .ordered = false, .projection = same });
+    try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
+    const stale = try testProjection(false, "model");
+    stale.state.codex_login = .{ .generation = 2, .status = .failed, .failure = .denied };
+    frontend.adopt(.{ .generation = 1, .revision = 10, .watermark = 0, .ordered = false, .projection = stale });
+    try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
+    try std.testing.expectEqualStrings("ABCD", frontend.view.state.codex_login.userCode());
 }
 
 test "configuration-only publications notify the UI once without polling the owner" {

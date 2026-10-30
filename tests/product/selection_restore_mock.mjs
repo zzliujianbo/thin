@@ -2,7 +2,7 @@
 // real HOME/config, public providers or the user's terminal. Capture stays local.
 import http from 'node:http';
 import {createHash} from 'node:crypto';
-import {mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod, lstat} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import assert from 'node:assert/strict';
@@ -120,12 +120,15 @@ export async function selectionRestoreRegressions({app, pty, execute}) {
     const terminalReason = result.output.match(/^error: ([A-Za-z][A-Za-z0-9_]{0,63})$/m)?.[1] ?? 'unclassified';
     checkpoint = `PTY exit ${result.code} ${terminalReason} requests ${requests} ${serverCheck}`;
     assert.equal(result.code, 0, 'selection PTY failed');
-    checkpoint = 'new identity and no log';
-    assert(!result.output.includes('PTY_SESSION_ID='), 'no-log exit announced a session');
+    checkpoint = 'new identity and automatic persistence';
+    assert(result.output.includes(`PTY_SESSION_ID=${restoredId}`), 'restored session identity not announced');
     assert(restoredId && restoredId !== id, 'restore reused the old wire identity');
     assert.equal(requests, 1);
     assert(!fixtureFailed);
-    assert.deepEqual((await readdir(sessions)).sort(), before, 'no-log restore created an archive');
+    const after = (await readdir(sessions)).sort();
+    assert(before.every(name => after.includes(name)), 'original history removed');
+    assert(after.some(name => name.endsWith('.jsonl') && name.includes(restoredId)), 'new journal missing');
+    assert(after.includes(`${restoredId}.session`), 'new checkpoint missing');
     assert.equal(await readFile(join(home, '.thin', 'config.json'), 'utf8'), config);
     assert.equal(await readFile(join(project, '.thin', 'settings.json'), 'utf8'), settings);
     const emptyHome = join(root, 'empty-home'), emptyProject = join(root, 'empty-project');
@@ -157,13 +160,38 @@ export async function selectionRestoreRegressions({app, pty, execute}) {
       const failed = await execute(pty, [], {...env, THIN_APP_TEST_MODE:expected === 'SelectionNotFound' ? 'restore-failure' : expected === 'no-key-history' ? 'restore-no-key' : 'restore-idle',
         THIN_APP_TEST_RESTORE_ID:expected === 'SelectionNotFound' ? 'f'.repeat(32) : id,
         THIN_APP_TEST_RESTORE_ERROR:expected}, project);
+      if (failed.code !== 0) {
+        const allowed = new Set(['VisibleTextTimeout', 'EarlyExit', 'AcceptanceFailed', 'WorkerEndpointsStillLive', 'OutputLimit', 'WaitFailed', 'DriverInterrupted']);
+        const errors = [...failed.output.matchAll(/^error: ([A-Za-z][A-Za-z0-9_]*)\s*$/gm)]
+          .map(match => match[1]).filter(name => allowed.has(name)).slice(0, 8);
+        const positions = [...failed.output.matchAll(/(?:^|[\/\\])app_pty_test\.zig:(\d{1,6}):(\d{1,6})(?=[:\s]|$)/gm)]
+          .slice(0, 8).map(match => `${Number(match[1])}:${Number(match[2])}`);
+        const diagnostic = failed.output.match(/^RESTORE_IDLE_WAIT text=(true|false) ack=(true|false)\s*$/m);
+        checkpoint += ` exit=${Number.isInteger(failed.code) ? failed.code : -1} errors=${errors.join(',') || 'none'} positions=${positions.join(',') || 'none'}`;
+        if (diagnostic) checkpoint += ` RESTORE_IDLE_WAIT text=${diagnostic[1]} ack=${diagnostic[2]}`;
+      }
       assert.equal(failed.code, 0, 'PTY load/refusal assertion failed');
     }
-    assert.deepEqual((await readdir(sessions)).sort(), before);
+    checkpoint = 'idle session artifacts';
+    const finalEntries = await readdir(sessions);
+    assert(after.every(name => finalEntries.includes(name)), 'post-conversation history removed');
+    for (const name of finalEntries.filter(name => !after.includes(name))) {
+      assert.match(name, /^[a-f0-9]{32}\.resume-lock$/, `${name}: unexpected idle artifact`);
+      const path = join(sessions, name);
+      const info = await lstat(path);
+      assert(info.isFile() && !info.isSymbolicLink(), `${name}: not a regular file`);
+      assert.equal(info.mode & 0o7777, 0o600, `${name}: mode`);
+      assert.equal(info.uid, process.getuid(), `${name}: owner`);
+      assert.equal(info.size, 33, `${name}: size`);
+      const marker = await readFile(path);
+      assert.equal(marker.length, 33, `${name}: marker length`);
+      assert(marker[0] === 0x41 || marker[0] === 0x43, `${name}: marker`);
+      assert(marker.subarray(1).every(byte => byte === 0), `${name}: marker padding`);
+    }
     assert.equal(requests, 1, 'restore failure issued a request');
     assert.equal(await readFile(join(home, '.thin', 'config.json'), 'utf8'), config);
     assert.equal(await readFile(join(project, '.thin', 'settings.json'), 'utf8'), settings);
-    console.log('PASS selection/restore: owned PTY, new history/id, saved protocol/effort, unchanged defaults, no-log, missing-source refusal, no-key/changed-endpoint loading and 4 CLI refusal cases; requests=1');
+    console.log('PASS selection/restore: owned PTY, new history/id, saved protocol/effort, unchanged defaults, automatic persistence, missing-source refusal, no-key/changed-endpoint loading and 4 CLI refusal cases; requests=1');
   } catch {
     const error = new Error('selection restoration fixture failed');
     error.fixtureCase = 'selection/restore';

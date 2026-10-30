@@ -23,6 +23,7 @@ const json_bound = @import("../app/json_bound.zig");
 const task = @import("../core/task.zig");
 const write_preview = @import("../core/write_preview.zig");
 const line_stats = @import("../util/line_stats.zig");
+const codex_login = @import("../core/codex_login.zig");
 
 /// Private daemon/worker IPC version. v2 is the lossless selective-ACK wire
 /// (optional `first` on ACK, `since` resume and the ordered history/live
@@ -212,6 +213,7 @@ pub const Op = enum {
     /// presence of configuration is the only enable state.
     proxy_address,
     refresh_models,
+    codex_login,
     poll_metadata,
     close,
     shutdown,
@@ -992,7 +994,7 @@ pub const Snapshot = struct {
     context: ?r.ContextSnapshot = null,
     model: []const u8 = "",
     provider: ?[]const u8 = null,
-    logging: bool = true,
+    codex_login: codex_login.View = .{},
     read_only: bool = false,
     truncated: bool = false,
 };
@@ -1036,7 +1038,12 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
     } else try out.field("ctx", @as(?u8, null));
     try out.field("model", snapshot.model);
     try out.field("provider", snapshot.provider);
-    try out.field("logging", snapshot.logging);
+    try out.beginObject("codex_login");
+    try out.field("generation", snapshot.codex_login.generation);
+    try out.field("status", @tagName(snapshot.codex_login.status));
+    try out.field("code", snapshot.codex_login.userCode());
+    try out.field("failure", if (snapshot.codex_login.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
+    try out.endObject();
     try out.field("read_only", snapshot.read_only);
     try out.field("truncated", snapshot.truncated);
     try out.endObject();

@@ -468,7 +468,6 @@ server.on('connection', socket => {
 
 function makePlan(spec) {
   return {
-    logging: false,
     childContext: null,
     expectCleanSockets: false,
     legacySwitch: null,
@@ -528,7 +527,7 @@ async function run(plan) {
   plan.childOutput = plan.stages.child.reduce((sum, stage) => sum + stage.usage.output, 0);
 
   active = plan;
-  const args = ['--print', PARENT_PROMPT, '--no-model-auto-refresh', ...(plan.logging ? [] : ['--no-log'])];
+  const args = ['--print', PARENT_PROMPT, '--no-model-auto-refresh'];
   const child = spawn(bin, args, {
     cwd: project,
     env: {PATH: '/usr/bin:/bin', HOME: home, LANG: 'C.UTF-8', TERM: 'xterm-256color'},
@@ -610,7 +609,7 @@ async function assertParentArchive(project) {
 // parent write_file+bash refusal while the child is uncollected and waiting.
 function qnaCase() {
   const plan = makePlan({
-    name: 'chat-subagent-qna', protocol: 'chat', logging: true,
+    name: 'chat-subagent-qna', protocol: 'chat',
     childTask: CHILD_TASK, childContext: CHILD_CONTEXT,
   });
   plan.stages.root = [
@@ -696,7 +695,7 @@ function qnaCase() {
 // sentinel must still hold its original content.
 function steeringCase() {
   const STEER_OLD_CONTENT = 'STEER-OLD-PLAN-CONTENT-must-not-be-written';
-  const plan = makePlan({name: 'chat-subagent-steering', protocol: 'chat', childTask: STEER_TASK, logging: true});
+  const plan = makePlan({name: 'chat-subagent-steering', protocol: 'chat', childTask: STEER_TASK});
   plan.stages.root = [
     {usage: {input: 40, output: 8},
       reply: ctx => ctx.call('subagent', {task: STEER_TASK})},
@@ -822,7 +821,7 @@ function cancelCase() {
     assert(out.includes(ROOT_ANSWER), 'parent final answer missing after cancel');
     assert.equal(plan.roleRequests.root, 4, 'cancel root request count');
     assert.equal(plan.childRequests, 1, 'no child request may follow the cancel');
-    assert(!await exists(join(project, '.thin', 'sessions')), '--no-log created session records');
+    assert(await exists(join(project, '.thin', 'sessions')), 'accepted session not recorded');
   };
   return plan;
 }
@@ -853,7 +852,7 @@ function legacySwitchCase() {
     assert.equal(plan.childRequests, 1, 'delegation must still start one child');
     assert.equal(await readFile(join(home, '.thin', 'config.json'), 'utf8'), plan.configText,
       'the dropped legacy switch was rewritten to disk');
-    assert(!await exists(join(project, '.thin', 'sessions')), '--no-log created session records');
+    assert(await exists(join(project, '.thin', 'sessions')), 'accepted session not recorded');
   };
   return plan;
 }
@@ -928,7 +927,7 @@ function directCase(name, protocol) {
     assert(out.includes(ROOT_ANSWER), 'parent final answer missing');
     assert.equal(plan.roleRequests.root, 3, 'direct root request count');
     assert.equal(plan.childRequests, 1, 'direct child request count');
-    assert(!await exists(join(project, '.thin', 'sessions')), '--no-log created session records');
+    assert(await exists(join(project, '.thin', 'sessions')), 'accepted session not recorded');
   };
   return plan;
 }
@@ -1053,7 +1052,7 @@ function assertParallelComplete(plan, ctx) {
 
 function parallelCase() {
   const plan = makePlan({
-    name: 'chat-subagent-parallel', protocol: 'chat', logging: true, childTask: CHILD_TASK,
+    name: 'chat-subagent-parallel', protocol: 'chat', childTask: CHILD_TASK,
   });
   plan.parallelIds = [];
   plan.parallelEntered = new Set();

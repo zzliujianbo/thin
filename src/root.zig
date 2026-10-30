@@ -64,6 +64,7 @@ test {
     _ = process;
     _ = filesystem;
     _ = memory;
+    _ = @import("core/diagnostics.zig");
     _ = @import("core/knowledge.zig");
     _ = @import("core/knowledge_codec.zig");
     _ = @import("tools/knowledge_store.zig");
@@ -93,6 +94,10 @@ test {
     _ = @import("app/cli.zig");
     _ = @import("main.zig");
     _ = @import("app/auth_store.zig");
+    _ = @import("core/codex_auth.zig");
+    _ = @import("core/codex_login.zig");
+    _ = @import("app/codex_device.zig");
+    _ = @import("app/codex_oauth.zig");
     _ = @import("app/app.zig");
     _ = @import("app/model_resolver.zig");
     _ = @import("app/model_metadata.zig");

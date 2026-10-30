@@ -8,6 +8,7 @@ const thinking = @import("thinking.zig");
 const llm = @import("../llm/llm.zig");
 const context = @import("context.zig");
 const decision = @import("decision.zig");
+const diagnostics = @import("diagnostics.zig");
 const knowledge = @import("knowledge.zig");
 
 /// Owner-thread callbacks. Retrieval returns allocator-owned borrowed reference
@@ -857,6 +858,7 @@ pub const Runtime = struct {
     host: Host,
     /// 可选只读观察者，由应用层在首次 run 前设置；不参与授权和错误传播。
     observer: Observer = .{},
+    diagnostics: diagnostics.Sink = .{},
     inbox: ?*Inbox = null,
     /// Worker-only reservation; kept until the committed batch is paired.
     steering_lease: ?@import("inbox.zig").Lease = null,
@@ -1210,12 +1212,19 @@ pub const Runtime = struct {
         // A failed dirty mark is recorded by the observer before any host-visible
         // tool_started, and it must stop the tool from running.
         if (event == .tool_started) self.tool_blocked = false;
+        const measured = event == .assistant_committed or event == .finished;
+        if (event == .assistant_committed) self.diagnostics.emit(.{ .stage = .assistant_commit });
+        var observer_span = diagnostics.Span.start(if (measured) self.diagnostics else .{}, self.io, .{ .stage = .observer });
         self.observer.notify(.{ .event = event });
+        observer_span.finish(.ok);
         if (event == .tool_started and self.tool_blocked) return error.CheckpointDirtyFailed;
+        var host_span = diagnostics.Span.start(if (measured) self.diagnostics else .{}, self.io, .{ .stage = .host_emit });
         self.host.emit_fn(self.host.context, event, cancel) catch {
-            if (cancel.isRequested()) return error.Canceled;
-            return error.HostDisconnected;
+            const err: anyerror = if (cancel.isRequested()) error.Canceled else error.HostDisconnected;
+            host_span.fail(err);
+            return err;
         };
+        host_span.finish(.ok);
     }
 
     /// 单次 run 的计数与终态；用于限制轮数与工具调用次数。
@@ -1314,11 +1323,16 @@ pub const Runtime = struct {
         // path must run the unified end hook before publishing finished.
         var timer = Io.concurrent(self.io, Watchdog.run, .{&watchdog}) catch |err| {
             var terminal = Terminal{ .status = .failed, .detail = err, .context_snapshot = self.contextSnapshot() };
-            if (self.executor.end_task_fn) |end_task| end_task(self.executor.context, cancel) catch {
+            var end_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .end_task });
+            if (self.executor.end_task_fn) |end_task| end_task(self.executor.context, cancel) catch |cleanup_err| {
+                end_span.fail(cleanup_err);
                 self.poisoned = true;
                 terminal = .{ .status = .failed, .detail = error.CleanupFailed, .context_snapshot = self.contextSnapshot() };
             };
-            self.emit(.{ .finished = terminal }, cancel) catch {};
+            end_span.finish(.ok);
+            var finished_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .finished_emit });
+            self.emit(.{ .finished = terminal }, cancel) catch |emit_err| finished_span.fail(emit_err);
+            finished_span.finish(.ok);
             return terminal;
         };
 
@@ -1338,12 +1352,17 @@ pub const Runtime = struct {
         // Children end before watchdog join, Memory finalization and finished on
         // EVERY accepted path. An end/cleanup failure outranks success, cancel,
         // timeout and paused, and poisons the parent Runtime.
-        if (self.executor.end_task_fn) |end_task| end_task(self.executor.context, cancel) catch {
+        var end_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .end_task });
+        if (self.executor.end_task_fn) |end_task| end_task(self.executor.context, cancel) catch |err| {
+            end_span.fail(err);
             self.poisoned = true;
         };
+        end_span.finish(.ok);
 
         // 先停止看门狗，之后读取 expired 才能反映本次 run 是否超时。
+        var watchdog_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .watchdog_join });
         timer.cancel(self.io);
+        watchdog_span.finish(.ok);
 
         // poisoned 优先级最高：清理失败覆盖取消与超时结果。
         if (self.poisoned) {
@@ -1363,7 +1382,11 @@ pub const Runtime = struct {
         }
         if (task.terminal.status == .success) {
             if (self.memory_capture) |completed| {
-                if (self.memory_hooks) |hooks| hooks.finalize_fn(hooks.context, completed, self.selector.effective(), cancel);
+                if (self.memory_hooks) |hooks| {
+                    var memory_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .memory_finalize });
+                    hooks.finalize_fn(hooks.context, completed, self.selector.effective(), cancel);
+                    memory_span.finish(.ok);
+                }
             }
         }
 
@@ -1371,9 +1394,12 @@ pub const Runtime = struct {
         // disconnected host need not receive it, but the caller still gets it.
         task.terminal.context_snapshot = self.contextSnapshot();
         inbox_success = task.terminal.status == .success;
-        self.emit(.{ .finished = task.terminal }, cancel) catch {
+        var finished_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .finished_emit });
+        self.emit(.{ .finished = task.terminal }, cancel) catch |err| {
+            finished_span.fail(err);
             inbox_success = false;
         };
+        finished_span.finish(.ok);
         return task.terminal;
     }
 

@@ -26,6 +26,29 @@ async function missing(path) {
   await assert.rejects(stat(path), {code:'ENOENT'}, `unexpected file: ${path}`);
 }
 
+async function noSessionRecords(project) {
+  let names;
+  try { names = await readdir(join(project, '.thin/sessions')); }
+  catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  const root = await lstat(join(project, '.thin'));
+  assert(root.isDirectory() && !root.isSymbolicLink() && !(root.mode & 0o077));
+  assert.deepEqual(await readdir(join(project, '.thin')), ['sessions']);
+  const dir = await lstat(join(project, '.thin/sessions'));
+  assert(dir.isDirectory() && !dir.isSymbolicLink());
+  assert.equal(dir.mode & 0o777, 0o700);
+  for (const name of names) {
+    const path = join(project, '.thin/sessions', name), entry = await lstat(path);
+    assert(entry.isFile() && !entry.isSymbolicLink());
+    assert.equal(entry.mode & 0o777, 0o600);
+    if (name === '.gitignore') { assert.equal(await readFile(path, 'utf8'), '*\n'); continue; }
+    assert.match(name, /^[a-f0-9]{32}\.resume-lock$/);
+    const marker = await readFile(path);
+    assert.equal(marker.length, 33);
+    assert(marker[0] === 0x41 || marker[0] === 0x43);
+    assert(marker.subarray(1).every(byte => byte === 0));
+  }
+}
+
 async function run(mode, home, project, url, options = {}) {
   const child = spawn(pty, [], {cwd:project, detached:true, stdio:['ignore','pipe','pipe'], env:{
     PATH:'/usr/bin:/bin', HOME:home, LANG:'C.UTF-8', TERM:'xterm-256color',
@@ -79,11 +102,11 @@ async function run(mode, home, project, url, options = {}) {
     if (failure) throw failure;
     assert.equal(result.signal, null, `${mode}: signalled`);
     assert.equal(result.code, 0, `${mode}: PTY failed\n${output}`);
-    assert(!output.includes('PTY_SESSION_ID='), 'no-log recorded a session');
+    assert(!output.includes('PTY_SESSION_ID='), 'empty session announced a record');
     assert.equal(requests, 0, `${mode}: HTTP requests`);
     assert.equal(connections, 0, `${mode}: unexpected connection`);
     await missing(join(project, '.thin/settings.json'));
-    await missing(join(project, '.thin/sessions'));
+    await noSessionRecords(project);
     scenarios++;
     console.log(`PASS ${mode}: HTTP=${requests}, connections=${connections}`);
   } finally {
@@ -319,7 +342,7 @@ try {
         assert(proxyPhases.includes(name), `${name}: unknown proxy gate`);
         await untouched(proxy.settings, proxyLegacy);
         await missing(join(proxy.project, '.thin/settings.json'));
-        await missing(join(proxy.project, '.thin/sessions'));
+        await noSessionRecords(proxy.project);
         if (proxyStates[name]) {
           expectedProxy = {...expectedProxy, ...proxyStates[name], models:[...proxyStates[name].models]};
           expected = canonicalConfig(proxy, expectedProxy);
@@ -339,7 +362,7 @@ try {
   await savedProxyModels(proxy, expectedProxy);
   await untouched(proxy.settings, proxyLegacy);
   await thinHome(proxy.home, ['config.json','settings.json']);
-  assert.deepEqual((await readdir(proxy.project)).sort(), proxyPhases.map(n => `settings-proxy-release-${n}`).sort());
+  assert.deepEqual((await readdir(proxy.project)).sort(), [...proxyPhases.map(n => `settings-proxy-release-${n}`), ...(await readdir(proxy.project)).includes('.thin') ? ['.thin'] : []].sort());
 
   // Configure from absence, then remove the complete declaration without a toggle.
   const off = await proxyFixture('proxy-unconfigured', url, false);
@@ -367,7 +390,7 @@ try {
         } else await untouched(off.configPath, offLearned);
         await missing(off.settings);
         await missing(join(off.project, '.thin/settings.json'));
-        await missing(join(off.project, '.thin/sessions'));
+        await noSessionRecords(off.project);
       } finally {
         await writeFile(join(off.project, `settings-proxy-release-${name}`), 'release', {flag:'wx', mode:0o600});
       }
@@ -376,7 +399,7 @@ try {
   assert.deepEqual(offOrder, offPhases);
   assert.deepEqual(JSON.parse(await readFile(off.configPath, 'utf8')), canonicalConfig(off), 'final off whole JSON');
   await thinHome(off.home, ['config.json']);
-  assert.deepEqual((await readdir(off.project)).sort(), offPhases.map(n => `settings-proxy-release-${n}`).sort());
+  assert.deepEqual((await readdir(off.project)).sort(), [...offPhases.map(n => `settings-proxy-release-${n}`), ...(await readdir(off.project)).includes('.thin') ? ['.thin'] : []].sort());
 
   for (const x of [f, n, p]) await thinHome(x.home, ['config.json','settings.json']);
   console.log(`PASS test-settings: scenarios=${scenarios}, HTTP requests=${requests}, connections=${connections}`);

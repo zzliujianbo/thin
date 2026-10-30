@@ -4,8 +4,17 @@ const std = @import("std");
 const fs = @import("../platform/filesystem.zig");
 const r = @import("../core/runtime.zig");
 const p = @import("../core/protocol.zig");
+const diagnostics = @import("../core/diagnostics.zig");
 const logs = @import("log_store.zig");
 const selections = @import("selection.zig");
+const decision = @import("../core/decision.zig");
+
+fn safeDiagnosticCause(d: *const decision.Diagnostic) ?[]const u8 {
+    if (d.cause_len == 0 or d.cause_len > d.cause.len) return null;
+    const name = d.causeName();
+    for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return null;
+    return name;
+}
 
 const text_limit = 256 * 1024;
 const record_limit = 2 * 1024 * 1024;
@@ -19,20 +28,25 @@ const SelectionEvent = struct {
     elapsed_ms: i64,
 };
 
+const DiagnosticEvent = struct { record: diagnostics.Record, seq: u64, turn: u64, timestamp_ms: i64, elapsed_ms: i64, dropped_total: u64 };
 const Item = union(enum) {
     record: []u8,
     selection: SelectionEvent,
+    diagnostic: DiagnosticEvent,
 
     fn size(self: Item) usize {
         return switch (self) {
             .record => |bytes| bytes.len,
             .selection => @sizeOf(SelectionEvent),
+            .diagnostic => 0,
         };
     }
 };
 
 pub const Journal = struct {
     const queue_limit = 128;
+    const diagnostic_limit = 64;
+    const physical_limit = queue_limit + diagnostic_limit;
     const byte_limit = 8 * 1024 * 1024;
 
     allocator: std.mem.Allocator,
@@ -47,7 +61,6 @@ pub const Journal = struct {
     /// Owned metadata; never borrows old configuration strings.
     /// Recorded in the diagnostic JSONL only. The session checkpoint owns the durable copy.
     selection: ?selections.Snapshot = null,
-    enabled: bool = true,
     failure_code: std.atomic.Value(u16) = .init(0),
     started: bool = false,
     /// An authenticated existing conversation may change selection before its
@@ -60,8 +73,12 @@ pub const Journal = struct {
     first: bool = false,
 
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    key_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     wake: std.Io.Event = .unset,
-    queue: [queue_limit]Item = undefined,
+    queue: [physical_limit]Item = undefined,
+    diagnostic_outstanding: usize = 0,
+    diagnostic_dropped: std.atomic.Value(u64) = .init(0),
+    diagnostic_span: u64 = 0,
     head: usize = 0,
     count: usize = 0,
     outstanding: usize = 0,
@@ -103,6 +120,7 @@ pub const Journal = struct {
         self.lock();
         self.bytes -= n;
         self.outstanding -= 1;
+        if (data == .diagnostic) self.diagnostic_outstanding -= 1;
         self.unlock();
     }
 
@@ -116,7 +134,7 @@ pub const Journal = struct {
             return null;
         }
         const data = self.queue[self.head];
-        self.head = (self.head + 1) % queue_limit;
+        self.head = (self.head + 1) % physical_limit;
         self.count -= 1;
         return data;
     }
@@ -127,12 +145,12 @@ pub const Journal = struct {
 
     fn enqueueItem(self: *Journal, data: Item) !void {
         self.lock();
-        if (self.stopping or self.outstanding == queue_limit or data.size() > byte_limit - self.bytes) {
+        if (self.stopping or self.outstanding - self.diagnostic_outstanding == queue_limit or data.size() > byte_limit - self.bytes) {
             const stopped = self.stopping;
             self.unlock();
             return if (stopped) error.LogStopped else error.LogQueueFull;
         }
-        self.queue[(self.head + self.count) % queue_limit] = data;
+        self.queue[(self.head + self.count) % physical_limit] = data;
         self.count += 1;
         self.outstanding += 1;
         self.bytes += data.size();
@@ -156,6 +174,30 @@ pub const Journal = struct {
     fn writeItem(self: *Journal, item: Item) !void {
         switch (item) {
             .record => |data| try self.writeRecord(data),
+            .diagnostic => |event| {
+                var buffer: [8192]u8 = undefined;
+                var writer = std.Io.Writer.fixed(&buffer);
+                const v = event.record;
+                try std.json.Stringify.value(.{ .schema = 1, .seq = event.seq, .turn = event.turn, .timestamp_ms = event.timestamp_ms, .elapsed_ms = event.elapsed_ms, .event = "diagnostic", .data = .{
+                    .stage = v.stage,
+                    .phase = v.phase,
+                    .span_id = v.span_id,
+                    .elapsed_ms = v.elapsed_ms,
+                    .result = v.result,
+                    .error_name = v.error_name,
+                    .operation = v.operation,
+                    .protocol = v.protocol,
+                    .backend = v.backend,
+                    .route_hash = v.route_hash,
+                    .timeout_ms = v.timeout_ms,
+                    .http_status = v.http_status,
+                    .model_failure = v.model_failure,
+                    .decision_failure = if (v.decision_failure) |*d| .{ .stage = d.stage, .backend = d.backend, .operation = d.operation, .cause = safeDiagnosticCause(d), .http_status = d.http_status, .model_failure = d.model_failure } else null,
+                    .candidate_index = v.candidate_index,
+                    .count = v.count,
+                }, .dropped_total = event.dropped_total }, .{}, &writer);
+                try self.writeRecord(writer.buffered());
+            },
             .selection => |event| {
                 var buffer: [selections.max_bytes]u8 = undefined;
                 var writer = std.Io.Writer.fixed(&buffer);
@@ -244,12 +286,13 @@ pub const Journal = struct {
         return .{ .allocator = a, .root = root, .key = try a.dupe(u8, key), .store = logs.Store.init(a, root, .{}) };
     }
 
-    /// Owner-only, with no active observer producer. Preparation may extend
-    /// redaction before a save, but never forgets an earlier credential.
+    /// Thread-safe registration; never forget an earlier credential.
     pub fn rememberKey(self: *Journal, key: []const u8) !void {
         if (key.len == 0 or key.len > 16384) return error.InvalidApiKey;
         for (key) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidApiKey;
-        if (self.isKey(key)) return;
+        std.debug.assert(std.c.pthread_mutex_lock(&self.key_mutex) == .SUCCESS);
+        defer std.debug.assert(std.c.pthread_mutex_unlock(&self.key_mutex) == .SUCCESS);
+        if (self.isKeyUnlocked(key)) return;
         if (self.known_key_count == self.known_keys.len) return error.TooManySessionCredentials;
         const owned = try self.allocator.dupe(u8, key);
         self.known_keys[self.known_key_count] = owned;
@@ -263,12 +306,22 @@ pub const Journal = struct {
     }
 
     fn isKey(self: *const Journal, value: []const u8) bool {
+        const mutex = &@constCast(self).key_mutex;
+        std.debug.assert(std.c.pthread_mutex_lock(mutex) == .SUCCESS);
+        defer std.debug.assert(std.c.pthread_mutex_unlock(mutex) == .SUCCESS);
+        return self.isKeyUnlocked(value);
+    }
+
+    fn isKeyUnlocked(self: *const Journal, value: []const u8) bool {
         if (self.key.len != 0 and std.mem.eql(u8, self.key, value)) return true;
         for (self.known_keys[0..self.known_key_count]) |key| if (std.mem.eql(u8, key, value)) return true;
         return false;
     }
     const SecretMatch = struct { at: usize, len: usize };
     fn nextSecret(self: *const Journal, value: []const u8) ?SecretMatch {
+        const mutex = &@constCast(self).key_mutex;
+        std.debug.assert(std.c.pthread_mutex_lock(mutex) == .SUCCESS);
+        defer std.debug.assert(std.c.pthread_mutex_unlock(mutex) == .SUCCESS);
         var found: ?SecretMatch = null;
         for (0..self.known_key_count + 1) |index| {
             const key = if (index == 0) self.key else self.known_keys[index - 1];
@@ -285,6 +338,7 @@ pub const Journal = struct {
         if (!self.done) self.store.deinit(); // No writer ever owned the store.
         std.debug.assert(self.outstanding == 0 and self.bytes == 0);
         std.debug.assert(std.c.pthread_mutex_destroy(&self.mutex) == .SUCCESS);
+        std.debug.assert(std.c.pthread_mutex_destroy(&self.key_mutex) == .SUCCESS);
         std.crypto.secureZero(u8, self.key);
         self.allocator.free(self.key);
         self.key = &.{};
@@ -301,24 +355,19 @@ pub const Journal = struct {
         try self.store.pinSessionID(id);
     }
 
-    /// 仅在 Runtime.run 之前调用，不与生产者并发。
-    pub fn setEnabled(self: *Journal, enabled: bool) void {
-        self.enabled = enabled;
-    }
-
     /// Owner-only, producer joined. No disk I/O or capacity wait after connection
     /// publication. Lazy writer creation can fail but never rolls back a live selection.
     pub fn setSelection(self: *Journal, candidate: anyerror!selections.Snapshot) void {
         const snapshot = candidate catch |err| {
-            if (self.enabled) self.fail(err);
+            self.fail(err);
             return;
         };
         if (self.nextSecret(snapshot.model()) != null) {
-            if (self.enabled) self.fail(error.SensitiveSelection);
+            self.fail(error.SensitiveSelection);
             return;
         }
         self.selection = snapshot;
-        if (!self.enabled or (!self.started and !self.resumed) or self.failure() != null) return;
+        if ((!self.started and !self.resumed) or self.failure() != null) return;
         self.enqueueSelection() catch |err| self.fail(err);
     }
 
@@ -345,13 +394,57 @@ pub const Journal = struct {
         return if (code == 0) null else @errorFromInt(code);
     }
 
+    pub fn diagnosticSink(self: *Journal) diagnostics.Sink {
+        return .{ .context = self, .emit_fn = diagnosticEmit, .next_fn = diagnosticNext };
+    }
+
+    fn diagnosticActive(self: *Journal) bool {
+        return self.started and self.worker != null and self.failure() == null;
+    }
+
+    fn diagnosticNext(ctx: ?*anyopaque) u64 {
+        const self: *Journal = @ptrCast(@alignCast(ctx.?));
+        if (!self.diagnosticActive()) return 0;
+        self.diagnostic_span +|= 1;
+        return self.diagnostic_span;
+    }
+
+    fn diagnosticEmit(ctx: ?*anyopaque, record_: diagnostics.Record) void {
+        const self: *Journal = @ptrCast(@alignCast(ctx.?));
+        if (!self.diagnosticActive()) return;
+        if (std.c.pthread_mutex_trylock(&self.mutex) != .SUCCESS) {
+            _ = self.diagnostic_dropped.fetchAdd(1, .monotonic);
+            return;
+        }
+        if (self.stopping or self.diagnostic_outstanding == diagnostic_limit or self.seq == std.math.maxInt(u64)) {
+            self.unlock();
+            _ = self.diagnostic_dropped.fetchAdd(1, .monotonic);
+            return;
+        }
+        const next = self.seq + 1;
+        self.queue[(self.head + self.count) % physical_limit] = .{ .diagnostic = .{
+            .record = record_,
+            .seq = next,
+            .turn = self.turn,
+            .timestamp_ms = std.Io.Clock.real.now(self.root.io).toMilliseconds(),
+            .elapsed_ms = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() - self.began_ms),
+            .dropped_total = self.diagnostic_dropped.load(.monotonic),
+        } };
+        self.seq = next;
+        self.count += 1;
+        self.outstanding += 1;
+        self.diagnostic_outstanding += 1;
+        self.unlock();
+        self.wake.set(self.root.io);
+    }
+
     pub fn observer(self: *Journal) r.Observer {
         return .{ .context = self, .notify_fn = notify };
     }
 
     fn notify(ctx: ?*anyopaque, observation: r.Observation) void {
         const self: *Journal = @ptrCast(@alignCast(ctx.?));
-        if (!self.enabled or self.failure() != null or !self.accepting()) return;
+        if (self.failure() != null or !self.accepting()) return;
         var wiping = WipingAllocator{ .backing = self.allocator };
         var arena = std.heap.ArenaAllocator.init(wiping.allocator());
         defer arena.deinit();
@@ -463,6 +556,7 @@ pub const Journal = struct {
                 .compacted => |v| try self.record(a, "compacted", v),
                 .compaction_failed => |v| try self.record(a, "compaction_failed", .{ .error_name = @errorName(v) }),
                 .finished => |v| try self.record(a, "finished", .{
+                    .dropped_total = self.diagnostic_dropped.load(.monotonic),
                     .status = v.status,
                     .detail = if (v.detail) |err| @errorName(err) else null,
                     .model_failure = v.model_failure,
@@ -676,20 +770,18 @@ test "selection snapshots are lazy ordered and save the last switch without anot
     try std.testing.expect(std.mem.find(u8, data.data, "prefix-fake-key-suffix") == null);
 }
 
-test "no log selection updates create no snapshot or archive" {
+test "selection before start creates no snapshot or archive" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
     defer journal.deinit();
-    journal.setEnabled(false);
     const config: @import("../core/config.zig").Config = .{
         .provider = .{ .base_url = "https://fixture.invalid/v1" },
         .model = .{ .name = "fixture", .context_tokens = 32768 },
     };
     journal.setSelection(selections.capture(config));
-    journal.observer().notify(.{ .submitted = "not recorded" });
     journal.setSelection(selections.capture(config));
     journal.finish();
     try std.testing.expect(journal.failure() == null);
@@ -1085,27 +1177,23 @@ test "journal structured records redaction turns and first response" {
     try std.testing.expectEqual(@as(i64, 2), turn);
 }
 
-test "journal disabled is lazy and storage failure is sticky" {
+test "journal is lazy and storage failure is sticky" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
     defer journal.deinit();
-    journal.setEnabled(false);
-    journal.observer().notify(.{ .submitted = "ignored" });
     journal.flush();
     try std.testing.expect(journal.worker == null);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
-    journal.setEnabled(true);
     journal.store.limits.record_bytes = 0;
     journal.observer().notify(.{ .submitted = "failure" });
     journal.flush();
     try std.testing.expect(journal.worker == null);
     try std.testing.expectEqual(error.InvalidLimits, journal.failure().?);
-    journal.setEnabled(true);
     journal.store.limits.record_bytes = record_limit;
-    journal.observer().notify(.{ .submitted = "still disabled" });
+    journal.observer().notify(.{ .submitted = "still failed" });
     try std.testing.expectEqual(error.InvalidLimits, journal.failure().?);
     try std.testing.expect(journal.seq <= 2);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
@@ -1176,6 +1264,61 @@ test "journal nested omissions and real filesystem failure are explicit" {
     try std.testing.expectEqualStrings("", journal.store.path());
 }
 
+test "diagnostic admission is isolated and unstarted sink is inert" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
+    defer journal.deinit();
+    const sink = journal.diagnosticSink();
+    try std.testing.expectEqual(@as(u64, 0), sink.next());
+    sink.emit(.{ .stage = .checkpoint });
+    try std.testing.expect(journal.worker == null and !journal.started);
+    journal.test_stall.store(true, .release);
+    journal.observer().notify(.{ .submitted = "test" });
+    journal.lock();
+    sink.emit(.{ .stage = .checkpoint });
+    journal.unlock();
+    try std.testing.expectEqual(@as(u64, 1), journal.diagnostic_dropped.load(.monotonic));
+    try std.testing.expectEqual(null, journal.failure());
+    const before = journal.seq;
+    journal.observer().notify(.{ .event = .{ .state = .calling_model } });
+    try std.testing.expectEqual(before + 1, journal.seq);
+    try std.testing.expectEqual(null, journal.failure());
+    for (0..Journal.diagnostic_limit + 1) |_| sink.emit(.{ .stage = .checkpoint });
+    try std.testing.expectEqual(@as(u64, 2), journal.diagnostic_dropped.load(.monotonic));
+    journal.observer().notify(.{ .event = .{ .state = .calling_model } });
+    try std.testing.expectEqual(null, journal.failure());
+    journal.test_stall.store(false, .release);
+    journal.finish();
+}
+
+test "diagnostic end preserves safe decision timeout cause" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
+    defer journal.deinit();
+    journal.observer().notify(.{ .submitted = "test" });
+    journal.flush();
+    const path = try std.testing.allocator.dupe(u8, journal.store.path());
+    defer std.testing.allocator.free(path);
+    var failure: decision.Diagnostic = .{ .stage = .transport };
+    failure.setError(error.Timeout);
+    journal.diagnosticSink().emit(.{ .stage = .decision_request, .phase = .end, .result = .failed, .error_name = diagnostics.ErrorName.fromError(error.DecisionUnavailable), .decision_failure = failure });
+    journal.flush();
+    const content = try root.read(std.testing.allocator, path, 0, record_limit);
+    defer std.testing.allocator.free(content.data);
+    try std.testing.expect(std.mem.indexOf(u8, content.data, "\"event\":\"diagnostic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content.data, "\"error_name\":\"DecisionUnavailable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content.data, "\"cause\":\"Timeout\"") != null);
+    var invalid = failure;
+    invalid.cause[0] = ' ';
+    try std.testing.expect(safeDiagnosticCause(&invalid) == null);
+}
+
 test "journal flush resumes and finish drains joins and rejects subsequent records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1195,7 +1338,6 @@ test "journal flush resumes and finish drains joins and rejects subsequent recor
     try std.testing.expect(journal.done and journal.worker == null);
     try std.testing.expectEqual(@as(usize, 0), journal.bytes);
     const seq = journal.seq;
-    journal.observer().notify(.{ .submitted = "ignored" });
     try std.testing.expectEqual(seq, journal.seq);
     const content = try root.read(std.testing.allocator, path, 0, record_limit);
     defer std.testing.allocator.free(content.data);

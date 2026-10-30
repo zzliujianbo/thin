@@ -127,21 +127,21 @@ test "flat price current evidence and independent generations preserve post-clai
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     try root.writeMode(m.file_name,
-        \\{"version":14,"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_present":true,"dev_input_price_threshold":200000,"dev_input_price_flat_limit":1000000}],"refresh":[{"generation":11},{"generation":12},{"generation":13},{"generation":14,"last_success_ms":800,"successful":false}]}
+        \\{"version":15,"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_present":true,"dev_input_price_threshold":200000,"dev_input_price_flat_limit":1000000}],"refresh":[{"generation":11},{"generation":12},{"generation":13},{},{"generation":14,"last_success_ms":800,"successful":false}]}
     , true, 0o600);
     const migrated = try m.load(&root);
     try t.expectEqual(@as(?u32, 1000000), migrated.directory.rows[0].dev_input_price_flat_limit);
     try t.expectEqual(@as(?u32, 200000), migrated.directory.rows[0].dev_input_price_threshold);
-    try t.expectEqual(@as(u64, 14), migrated.refresh[3].generation);
-    try t.expectEqual(@as(?u64, 800), migrated.refresh[3].last_success_ms);
+    try t.expectEqual(@as(u64, 14), migrated.refresh[4].generation);
+    try t.expectEqual(@as(?u64, 800), migrated.refresh[4].last_success_ms);
     const claimed = try m.claimAt(&root, m.dev_bit, false, 1000, .{});
     try t.expectEqual(m.dev_bit, claimed.mask);
-    try t.expectEqual(@as(u64, 15), claimed.generations[3]);
+    try t.expectEqual(@as(u64, 15), claimed.generations[4]);
     for (0..3) |index| try t.expectEqual(@as(u64, 11) + index, claimed.generations[index]);
     // No successful publication: the persisted v12 attempt still enforces cooldown.
     try t.expectEqual(@as(u8, 0), (try m.claimAt(&root, m.dev_bit, false, 1001, .{})).mask);
     const public = try priceListing("{\"input\":1,\"output\":2}");
-    const stale = try m.commitClaimedAt(&root, 0, public, .{ 11, 12, 13, 14 }, 1010);
+    const stale = try m.commitClaimedAt(&root, 0, public, .{ 11, 12, 13, 0, 14 }, 1010);
     try t.expectEqual(@as(u8, 0), stale.accepted);
     try t.expectEqual(@as(?u32, 1000000), stale.cache.directory.rows[0].dev_input_price_flat_limit);
     var invalid = public;
@@ -238,18 +238,18 @@ test "price threshold current generation success manual refresh and stale isolat
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     const legacy =
-        \\{"version":14,"directory_mask":4,"models":[{"provider":"opencode_go","id":"claude-haiku-5-5","context_window":1000000,"output_tokens":8192,"dev_output_tokens":16384,"dev_input_price_threshold":123,"protocol":"anthropic","dev_protocol":"anthropic","available":true,"dev_present":true}],"refresh":[{"generation":11,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":12,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":13,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":14,"last_attempt_ms":900,"last_success_ms":900,"successful":true}]}
+        \\{"version":15,"directory_mask":4,"models":[{"provider":"opencode_go","id":"claude-haiku-5-5","context_window":1000000,"output_tokens":8192,"dev_output_tokens":16384,"dev_input_price_threshold":123,"protocol":"anthropic","dev_protocol":"anthropic","available":true,"dev_present":true}],"refresh":[{"generation":11,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":12,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":13,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{},{"generation":14,"last_attempt_ms":900,"last_success_ms":900,"successful":true}]}
     ;
     try root.writeMode(m.file_name, legacy, true, 0o600);
     const migrated = try m.load(&root);
     try t.expectEqual(@as(?u32, 123), migrated.directory.rows[0].dev_input_price_threshold);
     try t.expectEqual(@as(?u32, 8192), migrated.directory.rows[0].output_tokens);
-    try t.expectEqual(@as(?u64, 900), migrated.refresh[3].last_success_ms);
-    try t.expectEqual(@as(u64, 14), migrated.refresh[3].generation);
+    try t.expectEqual(@as(?u64, 900), migrated.refresh[4].last_success_ms);
+    try t.expectEqual(@as(u64, 14), migrated.refresh[4].generation);
     try t.expectEqual(@as(u8, 0), m.eligible(&migrated, m.bit(.opencode_go), 1000, .{}));
     const first = try m.claimAt(&root, m.dev_bit, true, 1000, .{});
     try t.expectEqual(m.dev_bit, first.mask);
-    try t.expectEqual(@as(u64, 15), first.generations[3]);
+    try t.expectEqual(@as(u64, 15), first.generations[4]);
     try t.expectEqual(@as(u64, 11), first.generations[0]);
     try t.expectEqual(@as(u64, 12), first.generations[1]);
     try t.expectEqual(@as(u64, 13), first.generations[2]);
@@ -286,7 +286,7 @@ test "price threshold current strict cache tokens and invalid publication rollba
             if (m.load(&root)) |_| return error.AcceptedInvalidThreshold else |_| {}
         }
     }
-    try root.writeMode(m.file_name, "{\"version\":14}", true, 0o600);
+    try root.writeMode(m.file_name, "{\"version\":15}", true, 0o600);
     const public = try priceListing(price_cost);
     const saved = try m.commitAt(&root, 0, public, 1000);
     var invalid = public;
@@ -332,7 +332,7 @@ test "publication generations reject delayed sources independently and distingui
     try t.expect(result.cache.directory.find(.deepseek, "obsolete") == null);
     try t.expect(result.cache.directory.rows[result.cache.directory.find(.deepseek, "fresh").?].available == true);
     try t.expectEqual(@as(?u64, 1010), result.cache.refresh[0].last_success_ms);
-    try t.expectEqual(@as(?u64, 2000), result.cache.refresh[3].last_success_ms);
+    try t.expectEqual(@as(?u64, 2000), result.cache.refresh[4].last_success_ms);
     // The opposite ordering must not let a stale public result block official.
     const a_claim = try m.claimAt(&root, both, true, 3000, .{});
     const b_claim = try m.claimAt(&root, m.dev_bit, true, 3000, .{});
@@ -345,7 +345,7 @@ test "publication generations reject delayed sources independently and distingui
     const retained_public = independent.cache.directory.rows[independent.cache.directory.find(.deepseek, "fresh").?];
     try t.expectEqual(@as(?u32, 262144), retained_public.dev_context_tokens);
     try t.expectEqual(@as(?u32, 8192), retained_public.dev_output_tokens);
-    try t.expectEqual(@as(?u64, 3010), independent.cache.refresh[3].last_success_ms);
+    try t.expectEqual(@as(?u64, 3010), independent.cache.refresh[4].last_success_ms);
     try t.expectEqual(@as(?u64, 4000), independent.cache.refresh[0].last_success_ms);
 }
 
@@ -355,17 +355,17 @@ test "publication current generation strict tokens exhaustion and durable timing
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     for ([_][]const u8{ "\"1\"", "1.0", "1e3", "-1", "9223372036854775808", "null" }) |token| {
-        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":14,\"refresh\":[{{\"generation\":{s}}},{{}},{{}},{{}}]}}", .{token});
+        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":15,\"refresh\":[{{\"generation\":{s}}},{{}},{{}},{{}},{{}}]}}", .{token});
         defer t.allocator.free(body);
         try root.writeMode(m.file_name, body, true, 0o600);
         if (m.load(&root)) |_| return error.AcceptedInvalidGeneration else |_| {}
     }
-    const exhausted = "{\"version\":14,\"refresh\":[{\"generation\":9223372036854775807},{},{},{}]}";
+    const exhausted = "{\"version\":15,\"refresh\":[{\"generation\":9223372036854775807},{},{},{},{}]}";
     try root.writeMode(m.file_name, exhausted, true, 0o600);
     const before = try m.load(&root);
     try t.expectError(error.MetadataGenerationExhausted, m.claimAt(&root, m.bit(.deepseek) | m.dev_bit, true, 1000, .{}));
     try t.expectEqualDeep(before, try m.load(&root));
-    try root.writeMode(m.file_name, "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":65536,\"available\":true}],\"refresh\":[{\"last_attempt_ms\":100,\"last_success_ms\":110,\"successful\":true},{},{},{}]}", true, 0o600);
+    try root.writeMode(m.file_name, "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":65536,\"available\":true}],\"refresh\":[{\"last_attempt_ms\":100,\"last_success_ms\":110,\"successful\":true},{},{},{},{}]}", true, 0o600);
     const claimed = try m.claimAt(&root, m.bit(.deepseek), true, 120, .{});
     try t.expectEqual(@as(u64, 1), claimed.generations[0]);
     try t.expectEqual(@as(?u64, 110), claimed.cache.refresh[0].last_success_ms);
@@ -415,7 +415,7 @@ test "refresh timing default deadlines and public success are independent" {
     const both = official | m.dev_bit;
     _ = try m.claimAt(&root, both, false, 0, .{});
     const cache = try m.commitAt(&root, 0, .{ .dev_done = true }, 10);
-    try t.expectEqual(@as(?u64, 10), cache.refresh[3].last_success_ms);
+    try t.expectEqual(@as(?u64, 10), cache.refresh[4].last_success_ms);
     try t.expect(cache.refresh[0].last_success_ms == null);
     try t.expectEqual(@as(u8, 0), m.eligible(&cache, both, 299999, .{}));
     try t.expectEqual(official, m.eligible(&cache, both, 300000, .{}));
@@ -429,15 +429,45 @@ test "refresh timing timestamps require bounded nonnegative integer JSON tokens"
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     for ([_][]const u8{ "\"123\"", "1.0", "1e3", "-1", "253402300800000" }) |token| {
-        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":14,\"refresh\":[{{\"last_attempt_ms\":{s}}},{{}},{{}},{{}}]}}", .{token});
+        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":15,\"refresh\":[{{\"last_attempt_ms\":{s}}},{{}},{{}},{{}},{{}}]}}", .{token});
         defer t.allocator.free(body);
         try root.writeMode(m.file_name, body, true, 0o600);
         if (m.load(&root)) |_| return error.AcceptedInvalidTimestamp else |_| {}
     }
-    try root.writeMode(m.file_name, "{\"version\":14,\"refresh\":[{\"last_attempt_ms\":0},{\"last_success_ms\":253402300799999},{},{}]}", true, 0o600);
+    try root.writeMode(m.file_name, "{\"version\":15,\"refresh\":[{\"last_attempt_ms\":0},{\"last_success_ms\":253402300799999},{},{},{}]}", true, 0o600);
     const valid = try m.load(&root);
     try t.expectEqual(@as(?u64, 0), valid.refresh[0].last_attempt_ms);
     try t.expectEqual(@as(?u64, m.max_timestamp_ms), valid.refresh[1].last_success_ms);
+}
+
+test "Codex cache and independent source generation preserve authenticated listing" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try rootFor(tmp.dir);
+    defer root.deinit();
+    const codex = m.bit(.openai_codex);
+    const old = try m.claimAt(&root, codex | m.dev_bit, true, 10, .{});
+    const newer = try m.claimAt(&root, codex, true, 10, .{});
+    const listing = try m.parseListing(t.allocator,
+        \\{"models":[{"slug":"new/id","visibility":"list","supported_in_api":false,"default_reasoning_level":"high","input_modalities":["text","image"],"context_window":0,"max_context_window":64000,"supported_reasoning_levels":[{"effort":"none","description":""},{"effort":"high","description":""},{"effort":"future","description":""}]}]}
+    , .openai_codex);
+    const stale = try m.commitClaimedAt(&root, codex, listing, old.generations, 11);
+    try t.expectEqual(@as(u8, 0), stale.accepted);
+    const saved = try m.commitClaimedAt(&root, codex, listing, newer.generations, 12);
+    const loaded = try m.load(&root);
+    const entry = m.dynamicEntry(&loaded, .openai_codex, "new/id").?;
+    try t.expectEqual(@as(?u32, 64000), m.contextFor(&loaded, entry));
+    try t.expect(m.outputFor(&loaded, entry) == null);
+    try t.expect(m.inputPriceFlatLimitFor(&loaded, entry) == null);
+    const row = loaded.directory.rows[loaded.directory.find(.openai_codex, "new/id").?];
+    try t.expectEqual(@as(?bool, true), row.input_image);
+    try t.expectEqual(@as(?@import("../presentation/activity.zig").ReasoningEffort, .high), row.default_reasoning);
+    try t.expectEqualStrings("none", row.reasoning.?.declaration().map.off.?);
+    try t.expectEqual(@as(?u64, 12), saved.cache.refresh[3].last_success_ms);
+    try t.expectEqual(@as(?u64, null), saved.cache.refresh[4].last_success_ms);
+    const empty = try m.parseListing(t.allocator, "{\"models\":[]}", .openai_codex);
+    const gone = try m.commitAt(&root, codex, empty, 13);
+    try t.expect(m.dynamicEntry(&gone, .openai_codex, "new/id") == null);
 }
 
 fn rootFor(dir: std.Io.Dir) !fs.Root {
@@ -463,12 +493,13 @@ test "output exact public routes roundtrip precedence omission and identity" {
     try t.expectEqual(@as(?u32, 8192), dev.directory.rows[0].dev_output_tokens);
     var cache = try m.commit(&root, m.bit(.deepseek), dev);
     cache = try m.load(&root);
-    for (cfg.providers.Id.all) |id| {
+    for (legacyProviders) |id| {
         const entry = m.restoreEntry(&cache, id, "same").?;
         const expected: u32 = switch (id) {
             .deepseek => 4096,
             .opencode_go => 16384,
             .opencode_zen => 32768,
+            .openai_codex => return error.UnexpectedFixtureProvider,
         };
         try t.expectEqual(@as(?u32, expected), m.outputFor(&cache, entry));
         try t.expectEqual(@as(?u32, expected), entry.model.output_tokens);
@@ -542,7 +573,7 @@ test "output cache current schema rejects unbounded values transactionally" {
     defer root.deinit();
     var buffer: [1024]u8 = undefined;
     for ([_][]const u8{ "0", "1048577", "4294967296", "1.5", "\"100\"", "-1" }) |value| {
-        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":14,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"output_tokens\":{s}}}]}}", .{value});
+        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":15,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"output_tokens\":{s}}}]}}", .{value});
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = body });
         const before = try root.dir.statFile(root.io, m.file_name, .{});
         if (m.commit(&root, 0, .{})) |_| return error.ExpectedInvalidCache else |_| {}
@@ -566,13 +597,16 @@ const public_catalog =
     \\{"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"fresh-deepseek":{}}},"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"fresh-shared":{}}},"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"fresh-shared":{},"fresh-native":{"provider":{"npm":"@ai-sdk/anthropic"}}}}}
 ;
 
+const legacyProviders = [_]cfg.providers.Id{ .deepseek, .opencode_go, .opencode_zen };
+
 fn officialThree() !m.Listing {
     var result: m.Listing = .{};
-    for (cfg.providers.Id.all) |id| {
+    for (legacyProviders) |id| {
         const body: []const u8 = switch (id) {
             .deepseek => "{\"data\":[{\"id\":\"fresh-deepseek\",\"context_window\":65536}]}",
             .opencode_go => "{\"data\":[{\"id\":\"fresh-shared\"}]}",
             .opencode_zen => "{\"data\":[{\"id\":\"fresh-shared\"},{\"id\":\"fresh-native\",\"context_window\":65536,\"effort\":{\"supported_levels\":[\"off\",\"low\",\"high\"]}}]}",
+            .openai_codex => return error.UnexpectedFixtureProvider,
         };
         const listing = try m.parseListing(t.allocator, body, id);
         try m.mergeOfficial(&result, &listing, id);
@@ -706,14 +740,14 @@ test "official row fields survive public-only directory publication" {
     defer root.deinit();
     // Cached declarations still require the only canonical wire spellings.
     for ([_][]const u8{
-        "{\"version\":14,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-level\",\"reasoning\":{\"map\":{\"high\":\"intensive\"}}}]}",
-        "{\"version\":14,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-off\",\"reasoning\":{\"map\":{\"off\":\"disabled\"}}}]}",
-        "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"bad-off\",\"reasoning\":{\"format\":\"deepseek\",\"map\":{\"off\":\"none\"}}}]}",
+        "{\"version\":15,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-level\",\"reasoning\":{\"map\":{\"high\":\"intensive\"}}}]}",
+        "{\"version\":15,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-off\",\"reasoning\":{\"map\":{\"off\":\"disabled\"}}}]}",
+        "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"bad-off\",\"reasoning\":{\"format\":\"deepseek\",\"map\":{\"off\":\"none\"}}}]}",
     }) |invalid| {
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = invalid });
         try t.expectError(error.InvalidMetadata, m.load(&root));
     }
-    const legacy = "{\"version\":14,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true,\"reasoning\":{\"map\":{\"high\":\"high\"}}}]}";
+    const legacy = "{\"version\":15,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true,\"reasoning\":{\"map\":{\"high\":\"high\"}}}]}";
     try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = legacy });
     var cache = try m.commit(&root, 0, try m.parseDev(t.allocator,
         \\{"opencode":{"npm":"@ai-sdk/openai","models":{"gpt-5.2":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
@@ -758,12 +792,13 @@ test "context public exact SDK routes roundtrip official precedence and frozen e
     try t.expectEqual(@as(?u32, 131072), listing.directory.rows[0].dev_context_tokens);
     var cache = try m.commit(&root, m.bit(.deepseek), listing);
     cache = try m.load(&root);
-    for (cfg.providers.Id.all) |id| {
+    for (legacyProviders) |id| {
         const entry = m.restoreEntry(&cache, id, "same/raw").?;
         const expected: u32 = switch (id) {
             .deepseek => 65536,
             .opencode_go => 262144,
             .opencode_zen => 524288,
+            .openai_codex => return error.UnexpectedFixtureProvider,
         };
         try t.expectEqual(@as(?u32, expected), m.contextFor(&cache, entry));
         try t.expectEqual(expected, entry.model.context_tokens);
@@ -863,7 +898,7 @@ test "context public replaces preset fallback but preserves compatible official 
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
-    const legacy = "{\"version\":14,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true}]}";
+    const legacy = "{\"version\":15,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true}]}";
     try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = legacy });
     const public = try m.parseDev(t.allocator,
         \\{"opencode":{"npm":"@ai-sdk/openai","models":{"gpt-5.2":{"limit":{"context":262144}}}}}
@@ -894,7 +929,7 @@ test "context current invalid cache values and invalid commit roll back durable 
     defer root.deinit();
     var buffer: [1024]u8 = undefined;
     for ([_][]const u8{ "0", "16777217", "4294967296", "1.5", "1e5", "\"100\"", "-1", "true", "{}", "[]" }) |value| {
-        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":14,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"dev_context_tokens\":{s}}}]}}", .{value});
+        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":15,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"dev_context_tokens\":{s}}}]}}", .{value});
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = body });
         const before = try root.dir.statFile(root.io, m.file_name, .{});
         if (m.claim(&root, m.dev_bit, false)) |_| return error.ExpectedInvalidCache else |_| {}
@@ -904,7 +939,7 @@ test "context current invalid cache values and invalid commit roll back durable 
         defer t.allocator.free(after.data);
         try t.expectEqualStrings(body, after.data);
     }
-    try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = "{\"version\":14}" });
+    try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = "{\"version\":15}" });
     var listing = try m.parseDev(t.allocator,
         \\{"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"same":{"limit":{"context":65536,"output":4096}}}}}
     );

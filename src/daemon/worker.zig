@@ -113,7 +113,6 @@ fn runInner(a: std.mem.Allocator, io: Io, environ_map: *std.process.Environ.Map,
         .id = session_id,
         .@"resume" = if (options.worker_resume) session_id else null,
         .restore_selection = options.worker_restore_selection,
-        .logging = options.logging,
         .auto_refresh_models = options.auto_refresh_models,
         .owner = options.worker_owner,
     });
@@ -574,7 +573,7 @@ test "watch binds kernel peer and epoch and pushes without events RPC" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", path[0..n]);
-    const host = try SessionHost.init(a, io, &env, .{ .project = path[0..n], .id = try ids.generate(io), .logging = false, .owner = .foreground });
+    const host = try SessionHost.init(a, io, &env, .{ .project = path[0..n], .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
     var slots: [max_connections]?Active = @splat(null);
     defer closeSlots(host, &slots);
@@ -773,7 +772,7 @@ test "watch ACK retires a full ring past its bound while the control channel sta
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", path[0..n]);
-    const host = try SessionHost.init(a, io, &env, .{ .project = path[0..n], .id = try ids.generate(io), .logging = false, .owner = .foreground });
+    const host = try SessionHost.init(a, io, &env, .{ .project = path[0..n], .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
     var slots: [max_connections]?Active = @splat(null);
     defer closeSlots(host, &slots);
@@ -899,7 +898,7 @@ test "a held CR cannot block selectively acknowledged metadata before its LF" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", path[0..n]);
-    const host = try SessionHost.init(a, io, &env, .{ .project = path[0..n], .id = try ids.generate(io), .logging = false, .owner = .foreground });
+    const host = try SessionHost.init(a, io, &env, .{ .project = path[0..n], .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
     var slots: [max_connections]?Active = @splat(null);
     defer closeSlots(host, &slots);

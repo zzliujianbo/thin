@@ -69,7 +69,7 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
     defer listener.deinit();
 
     var ssh_listener: ?ssh.Listener = if (options.ssh_listen) |address|
-        try ssh.Listener.init(a, io, init.environ_map, address, options.logging, options.auto_refresh_models)
+        try ssh.Listener.init(a, io, init.environ_map, address, options.auto_refresh_models)
     else
         null;
     defer if (ssh_listener) |*active| active.deinit();
@@ -82,7 +82,6 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
         .registry = &reg,
         .workers = &workers,
         .listener = &listener,
-        .logging = options.logging,
         .auto_refresh_models = options.auto_refresh_models,
     };
     defer supervisor.deinit();
@@ -124,7 +123,6 @@ const Supervisor = struct {
     workers: *spawn.Workers,
     listener: *unix.Listener,
     ssh_listener: ?*ssh.Listener = null,
-    logging: bool,
     auto_refresh_models: bool,
     created: std.ArrayList(Created) = .empty,
     /// Directory of the first user input this daemon accepted (the first
@@ -486,9 +484,8 @@ const Supervisor = struct {
         const canonical = try self.canonicalProject(project_text);
         defer self.allocator.free(canonical);
 
-        const requested_logging = try request.boolField("logging", self.logging);
+        if (request.field("logging") != null) return error.BadRequest;
         const requested_auto = try request.boolField("auto_refresh_models", self.auto_refresh_models);
-        const logging = self.logging and requested_logging;
         const auto_refresh = self.auto_refresh_models and requested_auto;
 
         const resume_id = try optionalId(request.optionalString("resume"));
@@ -511,7 +508,6 @@ const Supervisor = struct {
             .owner = .daemon,
             .@"resume" = resume_id,
             .restore_selection = restore_id,
-            .logging = logging,
             .auto_refresh_models = auto_refresh,
         });
         self.registry.register(record) catch |err| {
@@ -656,7 +652,6 @@ const Supervisor = struct {
             .id = id,
             .@"resume" = null,
             .restore_selection = null,
-            .logging = false,
             .auto_refresh_models = false,
             .owner = .daemon,
         });
@@ -869,7 +864,6 @@ test "supervisor keeps one private setup host per socket without registering a s
         .registry = &reg,
         .workers = &workers,
         .listener = &listener,
-        .logging = false,
         .auto_refresh_models = false,
     };
     defer supervisor.deinit();
@@ -1096,7 +1090,6 @@ const TestRig = struct {
             .registry = &rig.reg,
             .workers = &rig.workers,
             .listener = &rig.listener,
-            .logging = false,
             .auto_refresh_models = false,
         };
         return rig;

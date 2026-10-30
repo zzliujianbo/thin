@@ -141,11 +141,8 @@ async function run(url) {
     assert.equal(requests, 3, 'two explicit turns plus exactly one denial continuation');
     await missing(join(project, 'absent')); await missing(join(project, 'cancel-executed'));
     assert.deepEqual(await readFile(path), Buffer.from(config), 'config bytes changed');
-    for (const root of [home, project]) {
-      await missing(join(root, '.thin/sessions'));
-      await missing(join(root, '.thin/settings.json'));
-    }
-    assert(!output.includes('PTY_SESSION_ID='));
+    await missing(join(home, '.thin/sessions'));
+    for (const root of [home, project]) await missing(join(root, '.thin/settings.json'));
     console.log('PASS approval-cancel: HTTP=3, one denial continuation, waiting titles=0, retained body unique, no ghosts, draft live, termios restored');
   } finally { clearTimeout(timer); clearTimeout(escalation); stop('SIGTERM'); }
 }

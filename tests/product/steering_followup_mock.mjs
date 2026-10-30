@@ -226,7 +226,7 @@ async function run(mode) {
       else assert.equal(await readFile(join(project,'completed'),'utf8'),'done\n','exactly one uncanceled completion');
     }
     assert.equal(await readFile(configPath,'utf8'),config);
-    await absent(join(home,'.thin/sessions')); await absent(join(project,'.thin/sessions')); await absent(join(project,'.thin/settings.json'));
+    await absent(join(home,'.thin/sessions')); await stat(join(project,'.thin/sessions')); await absent(join(project,'.thin/settings.json'));
     assert(!Buffer.concat(logs).includes(Buffer.from('fixture-secret-never-log')),'secret appeared in driver output');
     console.log(`PASS test-queued-${mode}: HTTP=${requests}, gates=${gateIndex}`);
   } catch (e) {

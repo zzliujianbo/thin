@@ -147,14 +147,14 @@ async function run(mode, url) {
     if(failure) throw failure;
     assert.equal(result.signal,null,`${mode}: signal`);
     assert.equal(result.code,0,`${mode}: driver failed\n${output}`);
-    for(const secret of ['fixture-secret-never-log','PREVIEW_RAW_CONTENT_SECRET','PTY_SESSION_ID=']) assert(!output.includes(secret));
+    for(const secret of ['fixture-secret-never-log','PREVIEW_RAW_CONTENT_SECRET']) assert(!output.includes(secret));
     assert.deepEqual([...f.gates],['header','partial','path-absent',mode==='cancel'?'canceled':'finish','verified']);
     assert.equal(f.requests,mode==='cancel'?1:2); assert.equal(f.earlyAbsence,1);
     assert.equal(f.results,mode==='cancel'?0:2);
     if(mode==='cancel') await absent(join(project,'preview-owned.txt'));
     else assert.equal(await readFile(join(project,'preview-owned.txt'),'utf8'),content);
     assert.equal(await readFile(configPath,'utf8'),config);
-    await absent(join(home,'.thin/sessions'));await absent(join(project,'.thin/sessions'));
+    await absent(join(home,'.thin/sessions')); await stat(join(project,'.thin/sessions'));
     await absent(join(project,'.thin/settings.json'));
     scenarios++;
     console.log(`PASS tool-preview-${mode}: HTTP=${f.requests}, ACK gates=${f.gates.size}, early absence=${f.earlyAbsence}, real results=${f.results}`);

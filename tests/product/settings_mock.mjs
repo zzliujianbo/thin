@@ -1,6 +1,6 @@
 // Owned-process global preference acceptance; loopback only, no user storage.
 import http from 'node:http';
-import {mkdtemp, mkdir, writeFile, readFile, rm, access, stat, readdir} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, access, stat, lstat, readdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import assert from 'node:assert/strict';
@@ -81,21 +81,51 @@ export async function settingsRegressions({app,pty,execute,send}) {
         await writeFile(settingsPath(p),raw,{mode:0o600});
         legacyFixtures.set(p,raw);
       }
+      const submitted = new Map();
+      const checkpoints = [];
+      async function projectState(directory) {
+        const legacy = legacyFixtures.get(directory), root = join(directory,'.thin');
+        assert.deepEqual((await readdir(directory)).sort(), await exists(root) ? ['.thin'] : []);
+        if (!await exists(root)) { assert(!submitted.has(directory)); return; }
+        const info = await lstat(root);
+        assert(info.isDirectory() && !info.isSymbolicLink() && !(info.mode & 0o077));
+        const names = await readdir(root);
+        for (const name of names) assert(name === 'sessions' || (name === 'settings.json' && legacy !== undefined));
+        if (legacy !== undefined) await legacyUnchanged(directory,legacy);
+        if (!names.includes('sessions')) { assert(!submitted.has(directory)); return; }
+        const dir = join(root,'sessions'), ds = await lstat(dir);
+        assert(ds.isDirectory() && !ds.isSymbolicLink());
+        assert.equal(ds.mode & 0o777,0o700);
+        const entries = await readdir(dir);
+        let logs = 0, checkpoints = 0;
+        for (const name of entries) {
+          const path = join(dir,name), entry = await lstat(path);
+          assert(entry.isFile() && !entry.isSymbolicLink());
+          assert.equal(entry.mode & 0o777,0o600);
+          if (name === '.gitignore') { assert.equal(await readFile(path,'utf8'),'*\n'); continue; }
+          if (/^[a-f0-9]{32}\.resume-lock$/.test(name)) {
+            const marker = await readFile(path);
+            assert.equal(marker.length,33);
+            assert(marker[0] === 0x41 || marker[0] === 0x43);
+            if (!submitted.has(directory)) assert(marker.subarray(1).every(byte => byte === 0));
+          } else if (name.endsWith('.jsonl')) { assert(submitted.has(directory)); logs++; }
+          else if (/^[a-f0-9]{32}\.session$/.test(name)) { assert(submitted.has(directory)); checkpoints++; }
+          else assert.fail(`unexpected session artifact: ${name}`);
+        }
+        if (submitted.has(directory)) {
+          assert(logs > 0, 'accepted prompt must create JSONL');
+          if (submitted.get(directory)) assert(checkpoints > 0, 'interactive prompt must create checkpoint');
+        }
+      }
       async function run(mode, levels=[], {p=project, map=sparse, format='standard', headless=false, savedEffort}={}) {
         stage = 'owned process';
         assert.equal(expected.length,0);
         expected = levels.map(level => ({level,wire:map[level] ?? level,format,savedEffort,configPath}));
         const env = {PATH:'/usr/bin:/bin',HOME:home,LANG:'C.UTF-8',TERM:'xterm-256color',THIN_FIXTURE_KEY:KEY,THIN_APP_BIN:app,THIN_APP_TEST_HOME:home,THIN_APP_TEST_PROJECT:p,THIN_APP_TEST_URL:url,THIN_APP_TEST_MODE:mode};
-        // A prior PTY run may already have left a legal empty discovery index in
-        // HOME; record the real pre-run baseline instead of assuming a fresh HOME.
-        let beforeHomeNames, indexPath, beforeIndexKeys;
-        if (headless) {
-          await assertConfigHome(home);
-          beforeHomeNames = (await readdir(join(home,'.thin'))).sort();
-          indexPath = join(home,'.thin/session-index');
-          beforeIndexKeys = await exists(indexPath) ? (await readdir(indexPath)).sort() : null;
-        }
-        const result = await execute(headless?app:pty,headless?['--no-log','--print','settings-task']:[],env,p,undefined,headless?30000:90000);
+        await assertConfigHome(home, checkpoints);
+        const sessionDir = join(p,'.thin/sessions');
+        const beforeRecords = await exists(sessionDir) ? (await readdir(sessionDir)).filter(n => n.endsWith('.jsonl') || n.endsWith('.session')).sort() : [];
+        const result = await execute(headless?app:pty,headless?['--print','settings-task']:[],env,p,undefined,headless?30000:90000);
         if (fixtureError) throw fixtureError;
         const reason = result.output.match(/^error: ([A-Za-z][A-Za-z0-9_]{0,63})$/m)?.[1] ?? 'unclassified';
         const lines = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].map(match => match[1]).slice(0,8).join('-') || 'unknown';
@@ -103,24 +133,19 @@ export async function settingsRegressions({app,pty,execute,send}) {
         assert.equal(result.code,0);
         assert.equal(expected.length,0);
         assert(!result.output.includes(KEY));
-        if (!headless) assert.equal([...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)].length,0);
+        if (!headless) {
+          const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
+          assert.equal(ids.length, levels.length ? 1 : 0);
+          if (ids.length) checkpoints.push({project:p,id:ids[0][1]});
+        }
+        if (levels.length) submitted.set(p, Boolean(submitted.get(p)) || !headless);
+        else {
+          const afterRecords = await exists(sessionDir) ? (await readdir(sessionDir)).filter(n => n.endsWith('.jsonl') || n.endsWith('.session')).sort() : [];
+          assert.deepEqual(afterRecords,beforeRecords,'idle settings must not create history');
+        }
         stage = 'storage assertions';
-        for (const directory of [project,other]) {
-          // Only an explicitly seeded legacy fixture may have a .thin directory.
-          const legacy = legacyFixtures.get(directory);
-          assert.equal(await exists(join(directory,'.thin')),legacy !== undefined);
-          if (legacy !== undefined) {
-            assert.deepEqual(await readdir(join(directory,'.thin')),['settings.json']);
-            await legacyUnchanged(directory,legacy);
-          }
-          assert.deepEqual(await readdir(directory),legacy !== undefined?['.thin']:[]);
-        }
-        await assertConfigHome(home);
-        // A print run must not add index/project keys nor drop existing metadata.
-        if (headless) {
-          assert.deepEqual((await readdir(join(home,'.thin'))).sort(),beforeHomeNames);
-          assert.deepEqual(await exists(indexPath) ? (await readdir(indexPath)).sort() : null,beforeIndexKeys);
-        }
+        for (const directory of [project,other]) await projectState(directory);
+        await assertConfigHome(home, checkpoints);
         return result;
       }
       async function savedGlobal(effort,{login=false}={}) {

@@ -16,14 +16,16 @@ pub const Id = enum {
     deepseek,
     opencode_zen,
     opencode_go,
+    openai_codex,
 
-    pub const all = [_]Id{ .deepseek, .opencode_zen, .opencode_go };
+    pub const all = [_]Id{ .deepseek, .opencode_zen, .opencode_go, .openai_codex };
 
     pub fn label(self: Id) []const u8 {
         return switch (self) {
             .deepseek => "DeepSeek",
             .opencode_zen => "OpenCode Zen",
             .opencode_go => "OpenCode Go",
+            .openai_codex => "OpenAI Codex/ChatGPT",
         };
     }
     pub fn slug(self: Id) []const u8 {
@@ -31,6 +33,7 @@ pub const Id = enum {
             .deepseek => "deepseek",
             .opencode_zen => "opencode-zen",
             .opencode_go => "opencode-go",
+            .openai_codex => "openai-codex",
         };
     }
     pub fn baseUrl(self: Id) []const u8 {
@@ -38,6 +41,7 @@ pub const Id = enum {
             .deepseek => "https://api.deepseek.com",
             .opencode_zen => "https://opencode.ai/zen/v1",
             .opencode_go => "https://opencode.ai/zen/go/v1",
+            .openai_codex => "https://chatgpt.com/backend-api/codex",
         };
     }
     pub fn fromUrl(url: []const u8) ?Id {
@@ -57,7 +61,7 @@ pub const Id = enum {
         return null;
     }
     pub fn usesSessionHeader(self: Id) bool {
-        return self != .deepseek;
+        return self == .opencode_zen or self == .opencode_go;
     }
 };
 

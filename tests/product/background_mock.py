@@ -595,7 +595,7 @@ def run_print(app, workspace, url):
     Model.plan = print_plan(owned, state)
     Model.failed = None
     child = subprocess.Popen(
-        [app, '--print', PRINT_PROMPT, '--no-log', '--no-model-auto-refresh'],
+        [app, '--print', PRINT_PROMPT, '--no-model-auto-refresh'],
         cwd=project, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env={'PATH': '/usr/bin:/bin', 'HOME': str(home), 'LANG': 'C.UTF-8', 'TERM': 'xterm-256color'},
         start_new_session=True)
@@ -614,7 +614,7 @@ def run_print(app, workspace, url):
     assert '\x1b' not in stdout, 'headless output carried terminal escapes'
     assert config_path.read_bytes() == config_bytes, 'background starts rewrote the config'
     assert not (home / '.thin' / 'sessions').exists(), 'headless run created a session'
-    assert not (project / '.thin' / 'sessions').exists(), 'background start created a session'
+    assert list((project / '.thin' / 'sessions').glob('*.jsonl')), 'accepted headless session not recorded'
     # Exit cleanup: every service must be canceled and joined by App.deinit.
     for index in range(SERVICES):
         owned.wait_stopped(str(index))
@@ -642,7 +642,7 @@ def run_pty(app, workspace, url):
         os.setsid()
         fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-    child = subprocess.Popen([app, '--no-log', '--no-model-auto-refresh'], stdin=slave,
+    child = subprocess.Popen([app, '--no-model-auto-refresh'], stdin=slave,
                              stdout=slave, stderr=slave, cwd=project, preexec_fn=child_setup,
                              env={'PATH': '/usr/bin:/bin', 'HOME': str(home),
                                   'XDG_RUNTIME_DIR': str(runtime),
@@ -716,7 +716,7 @@ def run_pty(app, workspace, url):
         output = capture.decode('utf-8', 'replace')
         assert KEY not in output, 'credential leaked to the terminal'
         assert config_path.read_bytes() == config_bytes, 'interactive run rewrote the config'
-        assert not (project / '.thin' / 'sessions').exists(), 'interactive run created a session'
+        assert list((project / '.thin' / 'sessions').glob('*.jsonl')), 'accepted interactive session not recorded'
     finally:
         if child.poll() is None:
             child.terminate()

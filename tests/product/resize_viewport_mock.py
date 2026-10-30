@@ -265,7 +265,7 @@ def run(app, wrap=False, local_command=False):
             _check_editor_helper()
             try:
                 wait(lambda: (root / 'sock').exists(), 'owned emulator startup timed out')
-                tm('new-session', '-d', '-s', 'owned', '-x', '80', '-y', '24', '-c', str(project), shlex.join([app, '--no-log', '--no-model-auto-refresh']))
+                tm('new-session', '-d', '-s', 'owned', '-x', '80', '-y', '24', '-c', str(project), shlex.join([app, '--no-model-auto-refresh']))
                 wait(lambda: visible(80, 24), 'initial composer frame not visible at 80x24')
                 tm('send-keys', '-t', 'owned:0.0', '-l', 'long-viewport-draft-abcdefghijklmnopqrstuvwxyz-世界-END')
                 wait(lambda: visible(80, 24, '世界-END'), 'wide-character draft missing')

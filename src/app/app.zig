@@ -6,6 +6,8 @@ const fs = @import("../platform/filesystem.zig");
 const mem = @import("../tools/memory.zig");
 const tools = @import("../tools/tools.zig");
 const http = @import("../llm/http.zig");
+const codex_auth = @import("../core/codex_auth.zig");
+const CodexManager = @import("codex_oauth.zig").Manager;
 const r = @import("../core/runtime.zig");
 const Journal = @import("journal.zig").Journal;
 const reasoning_defaults = @import("reasoning_defaults.zig");
@@ -33,6 +35,10 @@ fn destroyImageClient(client: *ImageClient) void {
 fn rememberConfiguredKeys(journal: *Journal, config: cfg.Config, environ: *const std.process.Environ.Map) !void {
     if (config.registry) |registry| for (registry.providers) |provider| {
         if (provider.connection.api_key) |key| try journal.rememberKey(key);
+        if (provider.connection.codex_oauth) |credential| {
+            try journal.rememberKey(credential.access_token);
+            try journal.rememberKey(credential.refresh_token);
+        }
         if (provider.connection.api_key_env.len != 0) {
             if (environ.get(provider.connection.api_key_env)) |key| try journal.rememberKey(key);
         }
@@ -69,6 +75,8 @@ pub const App = struct {
     executor: tools.Tools,
     /// LLM HTTP 客户端，初始化时传入 API key。
     client: http.Client,
+    /// Stable source owner shared by Codex clients and their clones.
+    codex_manager: ?*CodexManager = null,
     /// Optional, independently owned auxiliary route. Never archived or inherited
     /// from a restored selection; initialized lazily without startup requests.
     decision_client: ?*DecisionClient = null,
@@ -166,7 +174,12 @@ pub const App = struct {
         };
         errdefer a.free(self.auth_path);
 
-        const key = try cfg.resolveApiKey(a, self.config.value, environ);
+        self.codex_manager = null;
+        errdefer if (self.codex_manager) |manager| manager.deinit();
+        const key = if (isCodex(self.config.value)) blk: {
+            if (self.config.value.provider.codex_oauth == null) return error.ApiKeyNotFound;
+            break :blk try a.alloc(u8, 0);
+        } else try cfg.resolveApiKey(a, self.config.value, environ);
         defer {
             std.crypto.secureZero(u8, key);
             a.free(key);
@@ -208,9 +221,9 @@ pub const App = struct {
             .environment = &self.environment,
         };
         self.executor = .{ .root = &self.root, .memory = &self.memory, .config = &self.config.value, .environment = &self.environment, .auth_path = self.auth_path, .background = self.background.service() };
-        self.client = try http.Client.initWithEnv(a, io, &self.config.value, key, environ);
+        self.client = try self.initPrimaryClient(&self.config.value, key, environ);
         errdefer self.client.deinit();
-        self.decision_client = try DecisionClient.create(a, io, self.config.value, environ);
+        self.decision_client = try self.createDecisionClient(self.config.value, environ);
         errdefer if (self.decision_client) |decision| decision.deinit();
         self.image_client = try image_setup.create(a, io, self.config.value, environ);
         errdefer if (self.image_client) |client| destroyImageClient(client);
@@ -238,8 +251,10 @@ pub const App = struct {
         // runtime itself is the only recursion boundary (subagent = null).
         self.executor.subagent = self.subagent.service();
 
-        self.memory_coordinator = try MemoryCoordinator.create(a, io, &self.root, self.config.value, environ);
+        self.memory_coordinator = try self.createMemoryCoordinator(self.config.value, environ);
         errdefer self.memory_coordinator.deinit();
+        self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
+        if (self.decision_client) |decision| decision.diagnostics = self.journal.diagnosticSink();
         // Only small core is frozen into the initial prefix. Task-local memory
         // is read afresh through bounded hooks, never an ever-growing index.
         var snapshot_wiping: cfg.WipingAllocator = .{ .backing = a };
@@ -258,6 +273,7 @@ pub const App = struct {
             break :blk "";
         } else snapshot;
         self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, safe_snapshot);
+        self.runtime.diagnostics = self.journal.diagnosticSink();
         self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
         self.runtime.session_loader = .{ .context = self, .load_fn = loadSessionPolicy };
         self.runtime.observer = self.journal.observer();
@@ -310,6 +326,54 @@ pub const App = struct {
         const self: *App = @ptrCast(@alignCast(raw));
         const client = self.image_client orelse return error.ImageModelUnavailable;
         return client.service().inspect(a, input, cancel);
+    }
+
+    /// Owner-only lazy creation; callers must join all source borrowers before App deinit.
+    pub fn ensureCodexSource(self: *App, environ: *const std.process.Environ.Map) !codex_auth.CredentialSource {
+        if (self.codex_manager == null) {
+            if (self.home_path.len == 0) return error.MissingHome;
+            self.codex_manager = try CodexManager.init(self.allocator, self.root.io, self.home_path, environ);
+        }
+        return .{ .context = self, .acquire_fn = acquireCodexCredential };
+    }
+
+    fn acquireCodexCredential(ctx: ?*anyopaque, a: std.mem.Allocator, alias: []const u8, cancel: ?*const @import("../core/protocol.zig").Cancellation, timeout: u32) !codex_auth.RequestCredential {
+        const self: *App = @ptrCast(@alignCast(ctx orelse return error.MissingCredentialSource));
+        const manager = self.codex_manager orelse return error.MissingCredentialSource;
+        var credential = try manager.source().acquire(a, alias, cancel, timeout);
+        errdefer credential.deinit(a);
+        try self.journal.rememberKey(credential.access_token);
+        try self.journal.rememberKey(credential.redaction_refresh_token orelse return error.CodexSecretRegistrationUnavailable);
+        return credential;
+    }
+
+    fn initPrimaryClient(self: *App, config: *const cfg.Config, key: []const u8, environ: *const std.process.Environ.Map) !http.Client {
+        if (isCodex(config.*)) return http.Client.initCodexWithEnv(self.allocator, self.root.io, config, try self.ensureCodexSource(environ), environ);
+        return http.Client.initWithEnv(self.allocator, self.root.io, config, key, environ);
+    }
+
+    fn createDecisionClient(self: *App, config: cfg.Config, environ: *const std.process.Environ.Map) !?*DecisionClient {
+        var source: ?codex_auth.CredentialSource = null;
+        if (config.decisionActive()) {
+            const reference = try cfg.splitDefault(config.decision.?.model);
+            if (config.registry) |registry| if (registry.find(reference.provider)) |provider| {
+                if (isCodexProvider(provider.connection) and provider.connection.codex_oauth != null)
+                    source = try self.ensureCodexSource(environ);
+            };
+        }
+        return DecisionClient.createWithCodexSource(self.allocator, self.root.io, config, environ, source);
+    }
+
+    fn createMemoryCoordinator(self: *App, config: cfg.Config, environ: *const std.process.Environ.Map) !*MemoryCoordinator {
+        var needs_source = config.memory.auto and isCodex(config);
+        if (config.memory.auto and config.decisionActive()) {
+            const reference = try cfg.splitDefault(config.decision.?.model);
+            if (config.registry) |registry| if (registry.find(reference.provider)) |provider| {
+                if (isCodexProvider(provider.connection)) needs_source = true;
+            };
+        }
+        const source: ?codex_auth.CredentialSource = if (needs_source) try self.ensureCodexSource(environ) else null;
+        return MemoryCoordinator.createWithCodexSource(self.allocator, self.root.io, &self.root, config, environ, source);
     }
 
     pub const SettingsRefresh = enum { none, decision, image_model, proxy_models };
@@ -388,7 +452,7 @@ pub const App = struct {
             // declaration list instead of reverting to the frozen route.
             var memory_config = result.config.?.value;
             memory_config.proxy = declaration.proxy;
-            result.memory_coordinator = try MemoryCoordinator.create(self.allocator, self.root.io, &self.root, memory_config, environ);
+            result.memory_coordinator = try self.createMemoryCoordinator(memory_config, environ);
         }
         if (result.replace_decision) {
             // Login may have replaced the global declaration since this chat's
@@ -396,7 +460,7 @@ pub const App = struct {
             // without rebinding the primary config/client. Redaction may only
             // expand on a failed prepare/save; never publish an unredacted key.
             try rememberConfiguredKeys(&self.journal, declaration, environ);
-            result.decision = try DecisionClient.create(self.allocator, self.root.io, declaration, environ);
+            result.decision = try self.createDecisionClient(declaration, environ);
         }
         if (result.replace_image) {
             try rememberConfiguredKeys(&self.journal, declaration, environ);
@@ -427,6 +491,7 @@ pub const App = struct {
         if (replacement.replace_decision) {
             const previous = self.decision_client;
             self.decision_client = replacement.decision;
+            if (self.decision_client) |decision| decision.diagnostics = self.journal.diagnosticSink();
             replacement.decision = null;
             self.runtime.decision_service = if (self.decision_client) |client| client.service() else null;
             if (previous) |client| client.deinit();
@@ -439,6 +504,7 @@ pub const App = struct {
         if (replacement.replace_memory) {
             self.memory_coordinator.deinit();
             self.memory_coordinator = replacement.memory_coordinator.?;
+            self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
             replacement.memory_coordinator = null;
         }
         self.executor.image = self.imageService();
@@ -481,25 +547,28 @@ pub const App = struct {
         if (owned.value.model.protocol == .systemone) return error.SystemOneNotChatModel;
         const plan = try self.runtime.planSelection(owned.value, true);
         if (!std.meta.eql(owned.value.limits, self.config.value.limits)) return error.ConnectionLimitsChanged;
-        const key = try cfg.resolveApiKey(self.allocator, owned.value, environ);
+        const key = if (isCodex(owned.value)) blk: {
+            if (owned.value.provider.codex_oauth == null) return error.ApiKeyNotFound;
+            break :blk try self.allocator.alloc(u8, 0);
+        } else try cfg.resolveApiKey(self.allocator, owned.value, environ);
         defer {
             std.crypto.secureZero(u8, key);
             self.allocator.free(key);
         }
-        try self.journal.rememberKey(key);
+        if (key.len != 0) try self.journal.rememberKey(key);
         try rememberConfiguredKeys(&self.journal, owned.value, environ);
         const replacement = try self.allocator.create(ConnectionReplacement);
         errdefer self.allocator.destroy(replacement);
         replacement.owner = self;
         replacement.config = owned;
         replacement.plan = plan;
-        replacement.client = try http.Client.initWithEnv(self.allocator, self.root.io, &replacement.config.value, key, environ);
+        replacement.client = try self.initPrimaryClient(&replacement.config.value, key, environ);
         errdefer replacement.client.deinit();
-        replacement.decision_client = try DecisionClient.create(self.allocator, self.root.io, replacement.config.value, environ);
+        replacement.decision_client = try self.createDecisionClient(replacement.config.value, environ);
         errdefer if (replacement.decision_client) |client| client.deinit();
         replacement.image_client = try image_setup.create(self.allocator, self.root.io, replacement.config.value, environ);
         errdefer if (replacement.image_client) |client| destroyImageClient(client);
-        replacement.memory_coordinator = try MemoryCoordinator.create(self.allocator, self.root.io, &self.root, replacement.config.value, environ);
+        replacement.memory_coordinator = try self.createMemoryCoordinator(replacement.config.value, environ);
         return replacement;
     }
 
@@ -519,8 +588,10 @@ pub const App = struct {
         self.runtime.model = self.client.model();
         self.memory_coordinator.deinit();
         self.memory_coordinator = replacement.memory_coordinator;
+        self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
         const previous_decision = self.decision_client;
         self.decision_client = replacement.decision_client;
+        if (self.decision_client) |decision| decision.diagnostics = self.journal.diagnosticSink();
         self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
         if (previous_decision) |decision| decision.deinit();
         if (self.image_client) |client| destroyImageClient(client);
@@ -565,12 +636,6 @@ pub const App = struct {
         return session_context.load(a, self.root.io, self.home_path, self.session_cwd, self.shell_name);
     }
 
-    /// 只在首次提交前设置；关闭不会读取或删除已有日志。
-    pub fn setLogging(self: *App, enabled: bool) void {
-        std.debug.assert(!self.runtime.busy.load(.acquire));
-        self.journal.setEnabled(enabled);
-    }
-
     /// Owner-only fixed-size publication; no allocation or disk wait after
     /// successful selection publication, and no borrowed old config bytes.
     pub fn recordSelection(self: *App) void {
@@ -594,6 +659,7 @@ pub const App = struct {
         if (self.image_client) |client| destroyImageClient(client);
         self.journal.deinit();
         self.client.deinit();
+        if (self.codex_manager) |manager| manager.deinit();
         self.environment.deinit();
         self.root.deinit();
         a.free(self.session_cwd);
@@ -604,6 +670,15 @@ pub const App = struct {
         a.destroy(self);
     }
 };
+
+fn isCodexProvider(provider: cfg.Provider) bool {
+    return provider.kind == .openai_codex and
+        std.mem.eql(u8, provider.base_url, cfg.providers.Id.openai_codex.baseUrl());
+}
+
+fn isCodex(config: cfg.Config) bool {
+    return isCodexProvider(config.provider);
+}
 
 fn optionalStringEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a) |left| return if (b) |right| std.mem.eql(u8, left, right) else false;
@@ -792,6 +867,12 @@ test "App unavailable decision key never blocks startup and chat replacement kee
     try std.testing.expect(app.decision_client.? != previous);
     try std.testing.expectEqualStrings("judge/mini", app.decision_client.?.source.value.decision.?.model);
     try std.testing.expect(app.runtime.decision_service.?.context == @as(*anyopaque, @ptrCast(app.decision_client.?)));
+    const sink = app.journal.diagnosticSink();
+    try std.testing.expect(app.runtime.diagnostics.context == sink.context);
+    try std.testing.expect(app.decision_client.?.diagnostics.context == sink.context);
+    try std.testing.expect(app.memory_coordinator.diagnostics.context == sink.context);
+    if (app.memory_coordinator.extractor) |extractor| try std.testing.expect(extractor.diagnostics.context == sink.context);
+    if (app.memory_coordinator.reviewer) |reviewer| try std.testing.expect(reviewer.diagnostics.context == sink.context);
     const checkpoint = try app.runtime.checkpoint();
     try std.testing.expect(!@hasField(@TypeOf(checkpoint), "decision"));
     try std.testing.expect(!@hasField(@TypeOf(checkpoint), "decision_service"));

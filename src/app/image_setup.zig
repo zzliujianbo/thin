@@ -13,6 +13,8 @@ pub fn create(a: std.mem.Allocator, io: std.Io, config: cfg.Config, env: *const 
     const ref = cfg.splitDefault(config.image.model.?) catch return null;
     if (!std.mem.eql(u8, ref.model, image.model_id)) return null;
     const provider = (config.registry orelse return null).find(ref.provider) orelse return null;
+    // The dedicated image codec speaks Chat only, never Codex Responses.
+    if (provider.connection.kind == .openai_codex or std.mem.eql(u8, provider.connection.base_url, cfg.providers.Id.openai_codex.baseUrl())) return null;
     const base = selection.baseUrl(provider) catch return null;
     const cache = try a.create(metadata.Cache);
     defer a.destroy(cache);

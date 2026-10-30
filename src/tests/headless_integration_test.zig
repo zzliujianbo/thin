@@ -37,6 +37,9 @@ const Fixture = struct {
     permissions: usize = 0,
     started: usize = 0,
     finished: usize = 0,
+    began_tasks: usize = 0,
+    before_finishes: usize = 0,
+    ended_tasks: usize = 0,
     /// 首轮 system prompt，用于验证后续轮次保持不变（启动时冻结）。
     first_system: ?[]const u8 = null,
 
@@ -47,6 +50,10 @@ const Fixture = struct {
         result.context = self;
         result.prepare_fn = prepare;
         result.execute_fn = execute;
+        result.preview_write_fn = previewWrite;
+        result.begin_task_fn = beginTask;
+        result.before_finish_fn = beforeFinish;
+        result.end_task_fn = endTask;
         return result;
     }
     fn prepare(raw: *anyopaque, a: std.mem.Allocator, call_: p.ToolCall) !r.Prepared {
@@ -60,6 +67,30 @@ const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(raw));
         const delegate = self.tools.executor();
         return delegate.execute_fn(delegate.context, a, prepared, cancel);
+    }
+
+    fn previewWrite(raw: *anyopaque, a: std.mem.Allocator, path: []const u8, cancel: *const p.Cancellation) !?@import("../core/write_preview.zig").Baseline {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        const delegate = self.tools.executor();
+        return delegate.preview_write_fn.?(delegate.context, a, path, cancel);
+    }
+    fn beginTask(raw: *anyopaque, cancel: *const p.Cancellation) void {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        self.began_tasks += 1;
+        const delegate = self.tools.executor();
+        delegate.begin_task_fn.?(delegate.context, cancel);
+    }
+    fn beforeFinish(raw: *anyopaque, a: std.mem.Allocator, cancel: *const p.Cancellation) !?[]const u8 {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        self.before_finishes += 1;
+        const delegate = self.tools.executor();
+        return delegate.before_finish_fn.?(delegate.context, a, cancel);
+    }
+    fn endTask(raw: *anyopaque, cancel: *const p.Cancellation) !void {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        self.ended_tasks += 1;
+        const delegate = self.tools.executor();
+        return delegate.end_task_fn.?(delegate.context, cancel);
     }
 
     /// 把 Fixture 包装为 p.Model 接口。
@@ -187,6 +218,9 @@ fn scenario(allowed: bool) !void {
     try t.expectEqual(r.Status.success, terminal.status);
     try t.expectEqual(@as(usize, if (allowed) 0 else 3), fixture.permissions);
     try t.expectEqual(@as(usize, 1), fixture.finished);
+    try t.expectEqual(@as(usize, 1), fixture.began_tasks);
+    try t.expect(fixture.before_finishes > 0);
+    try t.expectEqual(@as(usize, 1), fixture.ended_tasks);
     try t.expectEqual(@as(usize, if (allowed) 5 else 0), fixture.started);
     try t.expectEqual(@as(?u64, if (allowed) 300 else 200), terminal.usage.normal.input_tokens);
 

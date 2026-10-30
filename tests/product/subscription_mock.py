@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 
-from daemon_mock import Case, ModelFixture, text_answer, write_config
+from daemon_mock import Case, ModelFixture, session_files, text_answer, wait_sessions, write_config
 
 
 class Wire:
@@ -125,6 +125,19 @@ def run(app):
         candidates = list(case.workspace.runtime.rglob('daemon.sock'))
         assert len(candidates) == 1
         supervisor = connect(candidates[0])
+        # Legacy create switches are rejected before allocating a worker or
+        # touching project history; wire maps BadRequest to protocol.
+        before = supervisor.call('list', running_only=False)['sessions']
+        sockets_before = sorted(str(path) for path in case.workspace.runtime.rglob('*.sock'))
+        request_id = supervisor.send('create', project=str(case.workspace.project_a),
+                                     auto_refresh_models=False, logging=False)
+        rejected = supervisor.read()
+        assert rejected['id'] == request_id and not rejected['ok'] and rejected['err'] == 'protocol', rejected
+        assert supervisor.call('list', running_only=False)['sessions'] == before, 'rejected create changed owners'
+        assert sorted(str(path) for path in case.workspace.runtime.rglob('*.sock')) == sockets_before, 'rejected create started a worker'
+        assert not session_files(case.workspace.project_a), 'rejected create wrote history'
+        assert not (case.workspace.project_a / '.thin').exists(), 'rejected create touched project state'
+        assert case.model.count() == 0, 'rejected create reached model'
         created = supervisor.call('create', project=str(case.workspace.project_a), auto_refresh_models=False)
         endpoint = created['endpoint']
         assert Path(endpoint).is_relative_to(case.workspace.runtime)
@@ -214,6 +227,8 @@ s.close()
             raise AssertionError('no terminal then idle snapshot')
         case.model.check()
         assert case.model.count() == 1
+        assert wait_sessions(case.workspace.project_a), 'accepted session missing checkpoint'
+        assert list((case.workspace.project_a / '.thin' / 'sessions').glob('*.jsonl')), 'accepted session missing journal'
         print('PASS subscription wire: ' + json.dumps(dict(updates=updates, requests=1,
               max_control_seconds=round(max(latencies), 4), same_pid=True,
               stream_mutation_rejected=True, takeover=True, terminal_before_idle=True)), flush=True)

@@ -1871,13 +1871,11 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
 
     const interactive_argv = [_:null]?[*:0]const u8{ bin, "--no-model-auto-refresh" };
     const print_argv = [_:null]?[*:0]const u8{ bin, "--print", "large-output" };
-    const no_log_argv = [_:null]?[*:0]const u8{ bin, "--no-log", "--no-model-auto-refresh" };
     const restore_id = try a.dupeSentinel(u8, if (restore_mode or full_resume) try required(init, "THIN_APP_TEST_RESTORE_ID") else "", 0);
-    const restore_argv = [_:null]?[*:0]const u8{ bin, "--restore-selection", restore_id, "--no-log" };
+    const restore_argv = [_:null]?[*:0]const u8{ bin, "--restore-selection", restore_id };
     const resume_argv = [_:null]?[*:0]const u8{ bin, "--resume", restore_id };
-    const resume_no_log_argv = [_:null]?[*:0]const u8{ bin, "--resume", restore_id, "--no-log" };
     // output 模式直接执行 --print 大输出；其余模式启动交互式界面。
-    const argv: [*:null]const ?[*:0]const u8 = if (full_resume) (if (std.mem.eql(u8, mode, "resume-readonly")) &resume_no_log_argv else &resume_argv) else if (restore_mode) &restore_argv else if (std.mem.eql(u8, mode, "output")) &print_argv else if (std.mem.eql(u8, mode, "exit-no-log") or (std.mem.startsWith(u8, mode, "settings-") and !std.mem.eql(u8, mode, "settings-image-model")) or std.mem.startsWith(u8, mode, "tool-preview-") or std.mem.startsWith(u8, mode, "test-queued-")) &no_log_argv else &interactive_argv;
+    const argv: [*:null]const ?[*:0]const u8 = if (full_resume) &resume_argv else if (restore_mode) &restore_argv else if (std.mem.eql(u8, mode, "output")) &print_argv else &interactive_argv;
 
     var master: c_int = undefined;
     var slave: c_int = undefined;
@@ -2200,7 +2198,10 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.send("/login\r");
         try d.waitFrame(start, "Provider> ");
         start = d.used;
-        try d.send("\x1b[A"); // Wrap first row to Go; active sessions omit Current endpoint.
+        try d.send("\x1b[A"); // Wrap first row to Codex; never select its OAuth route.
+        try d.waitFrame(start, ">   OpenAI Codex/ChatGPT");
+        start = d.used;
+        try d.send("\x1b[A");
         try d.waitFrame(start, ">   OpenCode Go");
         login_stage = 3;
         start = d.used;
@@ -2270,7 +2271,16 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             try d.waitIdle(start);
         }
     } else if (std.mem.eql(u8, mode, "restore-idle") or std.mem.eql(u8, mode, "restore-no-key")) {
-        try d.waitFrame(0, if (std.mem.eql(u8, mode, "restore-no-key")) "Not logged in" else "history not restored");
+        const needle = if (std.mem.eql(u8, mode, "restore-no-key")) "Not logged in" else "history not restored";
+        d.waitFrame(0, needle) catch |err| {
+            if (std.mem.eql(u8, mode, "restore-idle")) {
+                const bytes = d.output[0..d.used];
+                const at = std.mem.indexOf(u8, bytes, needle);
+                const ack = if (at) |pos| std.mem.indexOf(u8, bytes[pos + needle.len ..], "\x1b[?25h") != null else false;
+                std.debug.print("RESTORE_IDLE_WAIT text={any} ack={any}\n", .{ at != null, ack });
+            }
+            return err;
+        };
         try check(std.mem.indexOf(u8, d.output[0..d.used], "OLD-HISTORY-MUST-NOT-APPEAR") == null);
         try d.quiet(150);
     } else if (std.mem.eql(u8, mode, "restore-selection")) {
@@ -2287,7 +2297,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.openAuth();
         try d.send("fixture-secret-never-log");
         try d.quiet(100);
-    } else if (std.mem.eql(u8, mode, "exit-no-log")) {
+    } else if (std.mem.eql(u8, mode, "exit-recorded")) {
         const start = d.used;
         try d.send("fixture-task\r");
         try d.waitText(start, "fixture-answer");
@@ -2464,8 +2474,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         // Loopback provider reported 12 input + 90 output = 102 total: 0.3%.
         // Cached9/reasoning30 already belong to those counts, not extra context.
         try check(std.mem.indexOf(u8, &stage.grid[stage.row], "(fixture-model) 0.3%>") != null);
-        // The supported inline semantics retain their own styles; tables and
-        // inline backticks are deliberately literal source, not boxed Markdown.
+        // Supported inline semantics retain their styles; table pipes remain literal.
+        // Confirmed inline code hides its delimiters and uses purple foreground.
         const markdown_output = d.output[start..d.used];
         for ([_][]const u8{ "\x1b[1m\x1b[38;5;220m", "\x1b[4m\x1b[38;5;12m", "\x1b[39m\x1b[2m", "\x1b[1m", "\x1b[38;5;77m", "| Item | State |", "| --- | --- |", "| second-row | verified |", "exit_code=124", "exit_code=0" }, 0..) |part, part_index| {
             const found = std.mem.indexOf(u8, markdown_output, part) != null;
@@ -2474,12 +2484,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         }
         // The independent model-name flow may legitimately contain orange.
         try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;215m\x1b[1mstream-stage-one") == null);
-        const inline_at = std.mem.indexOf(u8, markdown_output, "`inline-marker`") orelse return error.MissingInlineLiteral;
-        const before_inline = markdown_output[0..inline_at];
-        const purple_at = std.mem.lastIndexOf(u8, before_inline, "\x1b[38;5;141m");
-        const reset_at = std.mem.lastIndexOf(u8, before_inline, "\x1b[0m");
-        try check(purple_at == null or (reset_at != null and reset_at.? > purple_at.?));
-        try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;141m`inline-marker`") == null);
+        try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;141minline-marker\x1b[0m") != null);
+        try check(std.mem.indexOf(u8, markdown_output, "`inline-marker`") == null);
         for ([_][]const u8{ "┌", "├", "┼", "└" }) |border| try check(std.mem.indexOf(u8, markdown_output, border) == null);
         try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;2;") == null);
         // Code remains foreground-only and unpadded; user background is separate.
@@ -2640,7 +2646,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         // No prompt, model selection, refresh or inference is submitted here.
         try globalSettings(&d, mode);
     } else if (std.mem.startsWith(u8, mode, "settings-")) {
-        // All settings processes are real owned PTYs with --no-log. Check an
+        // All settings processes are real owned PTYs. Check an
         // acknowledged initial frame before typing; a missing preference is initialized.
         try d.waitIdle(0);
         if (std.mem.eql(u8, mode, "settings-initial")) try settingsColor(&d, 0, "off");
@@ -2965,9 +2971,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     const exit_start = d.used;
     try d.send(if (std.mem.eql(u8, mode, "exit-batched")) "\x04post-quit-must-not-submit\r" else "\x04");
     try d.finish(0);
-    if (std.mem.eql(u8, mode, "resume-readonly")) {
-        try check(std.mem.indexOf(u8, d.output[0..d.used], "thin --resume ") == null);
-    } else if (full_resume or std.mem.eql(u8, mode, "resume-create")) {
+    if (full_resume or std.mem.eql(u8, mode, "resume-create")) {
         const prefix = "thin --resume ";
         const at = (std.mem.indexOf(u8, d.output[0..d.used], prefix) orelse return error.MissingResumeCommand) + prefix.len;
         const id = d.output[at..][0..32].*;

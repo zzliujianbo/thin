@@ -618,8 +618,8 @@ async function scenario(name, protocol, kind, isPty = false) {
 
     if (isPty && !['term','output'].includes(kind)) {
       const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
-      const silentExit = ['exit-no-submit','exit-unconfigured','exit-batched','exit-secret','exit-no-log','auth-missing','auth-empty','menu-navigation','auth-go','model-select-empty'].includes(kind);
-      if (silentExit) assert.equal(ids.length,0, 'empty/no-log exit must not announce a session');
+      const silentExit = ['exit-no-submit','exit-unconfigured','exit-batched','exit-secret','auth-missing','auth-empty','menu-navigation','auth-go','model-select-empty'].includes(kind);
+      if (silentExit) assert.equal(ids.length,0, 'empty exit must not announce a session');
       else if (kind === 'model-select') assert(ids.length <= 1); // Transient unsaved profiles can refuse checkpointing.
       else assert.equal(ids.length,1, 'saved conversation must print exactly one resume command');
       const announced = ids[0]?.[1];
@@ -652,9 +652,9 @@ async function scenario(name, protocol, kind, isPty = false) {
         assert.equal(disk.llm.providers.local.api_key,null, 'Ctrl+D secret exit must not save input');
       }
     }
-    if (kind === 'exit-no-log') {
+    if (kind === 'exit-recorded') {
       assert.equal(requests,1);
-      assert(!await exists(join(project,'.thin/sessions')), 'disabled recording created archives for exit identity');
+      assert((await readdir(join(project,'.thin/sessions'))).some(name => name.endsWith('.jsonl')), 'accepted session missing journal');
     }
     if (['exit-busy','exit-busy-tool'].includes(kind)) {
       assert.equal(requests,1);
@@ -859,7 +859,7 @@ async function watchdogRegression() {
 }
 
 try {
-  if (!process.argv.includes('--streaming-only')) await watchdogRegression();
+  if (!process.argv.includes('--streaming-only') && !process.argv.includes('--selection-restore-only')) await watchdogRegression();
   if (process.argv.includes('--streaming-only')) {
     for (const kind of ['stream-markdown','stream-native-history','architecture-table']) await scenario(`PTY/${kind}`,'chat',kind,true);
   } else if (process.argv.includes('--model-selection-only')) {
@@ -873,6 +873,8 @@ try {
     await decisionModelRegressions({app,pty,execute,send});
   } else if (process.argv.includes('--settings-only')) {
     await settingsRegressions({app,pty,execute,send});
+  } else if (process.argv.includes('--selection-restore-only')) {
+    await selectionRestoreRegressions({app,pty,execute});
   } else if (process.argv.includes('--resume-only')) {
     await fullResumeRegressions({app,pty,execute});
   } else if (process.argv.includes('--tool-presentation-only')) {
@@ -887,7 +889,7 @@ try {
   await scenario('PTY empty model selection responses','responses','model-select-empty',true);
   await scenario('PTY model/effort selection chat','chat','model-select',true);
   await scenario('PTY model/effort selection responses','responses','model-select',true);
-  for (const kind of ['exit-batched','exit-no-submit','exit-no-log','exit-unconfigured','exit-secret','exit-busy','exit-busy-tool']) await scenario(`PTY/${kind}`,'chat',kind,true);
+  for (const kind of ['exit-batched','exit-no-submit','exit-recorded','exit-unconfigured','exit-secret','exit-busy','exit-busy-tool']) await scenario(`PTY/${kind}`,'chat',kind,true);
   await scenario('help without configuration','chat','help');
   await scenario('print without configuration','chat','no-config');
   await scenario('legacy configuration is not loaded','chat','legacy-config');

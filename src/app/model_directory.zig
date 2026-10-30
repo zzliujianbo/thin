@@ -66,6 +66,9 @@ pub const Record = struct {
     /// Verified span with no context input-price increase; not inferred from absence.
     dev_input_price_flat_limit: ?u32 = null,
     available: ?bool = null,
+    /// Null means input modalities were not advertised or were malformed.
+    input_image: ?bool = null,
+    default_reasoning: ?@import("../presentation/activity.zig").ReasoningEffort = null,
     protocol: Protocol = .auto,
     dev_protocol: Protocol = .auto,
     reasoning: ?Profile = null,

@@ -107,9 +107,8 @@ async function run(mode, url) {
       await missing(`/proc/${pid}`);
     }
     assert.equal(await readFile(path,'utf8'), config, 'command changed config');
-    await missing(join(home,'.thin/sessions')); await missing(join(project,'.thin/sessions'));
+    await missing(join(home,'.thin/sessions')); await stat(join(project,'.thin/sessions'));
     await missing(join(project,'.thin/settings.json'));
-    assert(!output.includes('PTY_SESSION_ID='));
     scenarios++;
     console.log(`PASS command-${mode}: command HTTP=0, explicit normal HTTP=${normal}`);
   } finally { clearTimeout(timer); clearTimeout(escalation); stop('SIGTERM'); }

@@ -84,6 +84,7 @@ fn providerName(id: catalog.Id) []const u8 {
         .deepseek => "deepseek",
         .opencode_go => "opencode-go",
         .opencode_zen => "opencode",
+        .openai_codex => "\x00unverified-codex-source",
     };
 }
 
@@ -752,7 +753,10 @@ fn scan(a: std.mem.Allocator, body: []const u8) ![]const Record {
 }
 
 fn providerId(name: []const u8) ?providers.Id {
-    for (providers.Id.all) |id| if (equal(name, providerName(id))) return id;
+    for (providers.Id.all) |id| {
+        if (id == .openai_codex) continue; // No verified public catalog identity.
+        if (equal(name, providerName(id))) return id;
+    }
     return null;
 }
 

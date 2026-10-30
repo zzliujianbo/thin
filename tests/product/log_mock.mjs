@@ -55,7 +55,7 @@ function send(res, text, call) {
 }
 
 // stdout/stderr 分开捕获；所有 watchdog 与输出均有界，只终止尚未回收的自有进程组。
-async function execute(bin, args, env, cwd) {
+async function execute(bin, args, env, cwd, expectRejected = false) {
   const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore','pipe','pipe']});
   let owned = true, size = 0, failed = false, rejectPending;
   const stdout = [], stderr = [];
@@ -78,7 +78,10 @@ async function execute(bin, args, env, cwd) {
       child.once('error', reject); child.once('close', resolve);
     });
     assert(!failed, 'bounded child execution failed');
-    if (code !== 0) {
+    if (expectRejected) {
+      assert.notEqual(code, 0, 'removed flag unexpectedly accepted');
+      assert.match(Buffer.concat(stderr).toString('utf8'), /UnknownOption/, 'removed flag must be rejected');
+    } else if (code !== 0) {
       const diagnostic = Buffer.concat(stderr).toString('utf8').split('\n').find(line => /^(?:thin: (?:(?:failed|canceled)(?:: [A-Za-z0-9_]+)?(?: \/ [a-z_]+)?|[A-Za-z][A-Za-z0-9_]*)|error: [A-Za-z][A-Za-z0-9_]*)$/.test(line));
       const error = new Error('application did not exit successfully');
       error.fixtureCheck = diagnostic ?? 'application did not exit successfully';
@@ -195,7 +198,7 @@ async function scenario(app, pty, kind) {
     const isPty = ['date-pty','failure-pty','idle'].includes(kind);
     const args = kind === 'help' ? ['--help'] : kind === 'version' ? ['--version'] : ['--print',user, ...(kind === 'no-log' ? ['--no-log'] : [])];
     const began = Date.now();
-    const result = await execute(isPty?pty:app, isPty?[]:args, env, project);
+    const result = await execute(isPty?pty:app, isPty?[]:args, env, project, kind === 'no-log');
     const ended = Date.now();
     const announced = isPty ? [...(result.stdout + '\n' + result.stderr).matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)] : [];
     if (isPty) assert.equal(announced.length,kind === 'date-pty' ? 1 : 0,'resume command must reflect a saved nonempty conversation');
@@ -207,10 +210,12 @@ async function scenario(app, pty, kind) {
       // idle 启动由 PTY 驱动持有 Lease root anchor（33 字节 zero-digest resume-lock）；
       // help/version/no-log 仍必须完全没有 sessions 目录。
       if (kind === 'idle') await noSubmissionState(project);
-      else assert(!await exists(join(project,'.thin/sessions')), 'session record created without enabled submission');
+      else {
+        assert(!await exists(join(project,'.thin/sessions')), 'session record created without submission');
+        if (kind === 'no-log') assert(!await exists(join(project,'.thin')), 'rejected flag created project state');
+      }
       assert(!await exists(join(project,'.thin/logs')), 'legacy log directory created');
-      assert(requests === (kind === 'no-log' ? 1 : 0), 'unexpected request count');
-      if (kind === 'no-log') assert(result.stdout.includes(answer), 'no-log changed answer');
+      assert.equal(requests, 0, 'rejected flag or empty invocation reached network');
     } else if (kind === 'failure' || kind === 'failure-pty') {
       // print 路径：记录失败发生在任务受理之后，主结果照常完成。
       if (kind === 'failure') {
@@ -236,7 +241,22 @@ async function scenario(app, pty, kind) {
       assert(events('state').some(d => d.state === 'calling_model'), 'runtime state missing');
       assert(finished.length === 1 && finished[0].status === 'success', 'successful finish missing');
       assert(['detail','model_failure','http_status','usage'].every(k => k in finished[0]), 'finish metadata missing');
-      assert(rows.at(-1).event === 'finished', 'finished must close conversation');
+      const terminalIndex = rows.findIndex(row => row.event === 'finished');
+      assert(rows.filter(row => row.event !== 'diagnostic').at(-1)?.event === 'finished', 'finished must close conversation');
+      for (const row of rows.slice(terminalIndex + 1)) {
+        assert(row.event === 'diagnostic' && row.schema === 1, 'only diagnostics may follow finished');
+        const d = row.data;
+        assert(d && typeof d === 'object' && !Array.isArray(d), 'invalid diagnostic data');
+        const keys = ['stage','phase','span_id','elapsed_ms','result','error_name','operation','protocol','backend','route_hash','timeout_ms','http_status','model_failure','decision_failure','candidate_index','count'];
+        assert(Object.keys(d).length === keys.length && keys.every(k => Object.hasOwn(d,k)), 'invalid diagnostic schema');
+        assert(['observer','checkpoint','host_emit','finished_emit'].includes(d.stage), 'unexpected diagnostic stage');
+        assert(['begin','end'].includes(d.phase) && Number.isSafeInteger(d.span_id) && d.span_id > 0, 'invalid diagnostic span');
+        assert(d.phase === 'begin' ? d.elapsed_ms === null && d.result === null :
+          Number.isSafeInteger(d.elapsed_ms) && d.elapsed_ms >= 0 && ['ok','failed','canceled','skipped'].includes(d.result), 'invalid diagnostic phase');
+        assert(d.error_name === null || (d.phase === 'end' && ['failed','canceled'].includes(d.result) && typeof d.error_name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,95}$/.test(d.error_name)), 'invalid diagnostic error');
+        assert(keys.slice(6).every(k => d[k] === null), 'unexpected diagnostic payload');
+        assert(Number.isSafeInteger(row.dropped_total) && row.dropped_total >= 0, 'invalid diagnostic drop count');
+      }
       assert(events('first_response').length > 0, 'first response metadata missing');
       if (usesTool) {
         const calls = events('tool_call'), results = events('tool_result');

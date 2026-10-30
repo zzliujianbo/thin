@@ -57,7 +57,7 @@ const Fixture = struct {
     }
 
     fn session(self: *Fixture, project: []const u8) !Session {
-        return Session.initWithOptions(a, io, &self.env, project, .{}, .{ .logging = false, .auto_refresh_models = false });
+        return Session.initWithOptions(a, io, &self.env, project, .{}, .{ .auto_refresh_models = false });
     }
 
     fn seed(self: *Fixture, selector: []const u8, preference: ?[]const u8) !void {
@@ -90,10 +90,14 @@ const Fixture = struct {
         try std.testing.expectEqualStrings("low", provider.patchFor("second").?.reasoning_effort.?);
     }
 
-    fn expectNoProjectFiles(self: *Fixture, project: []const u8) !void {
+    fn expectNoProjectSettings(self: *Fixture, project: []const u8) !void {
         const path = try std.fs.path.join(a, &.{ project, ".thin/settings.json" });
         defer a.free(path);
         try std.testing.expectError(error.FileNotFound, self.tmp.dir.statFile(io, path, .{}));
+    }
+
+    fn expectIdle(self: *Fixture, project: []const u8) !void {
+        try self.expectNoProjectSettings(project);
         const sessions = try std.fs.path.join(a, &.{ project, ".thin/sessions" });
         defer a.free(sessions);
         try std.testing.expectError(error.FileNotFound, self.tmp.dir.openDir(io, sessions, .{}));
@@ -155,7 +159,6 @@ test "empty no-log selections persist global logical defaults and restart across
     try first.connection().setEffort(.medium);
     try fixture.expectDefaults("local/second", "medium");
     try activate(&first);
-    try std.testing.expect(!first.connection().current().logging_enabled);
     // Credential save must retain the independently updated defaults.
     try fixture.expectDefaults("local/second", "medium");
     for ([_][]const u8{ fixture.project, fixture.other }) |project| {
@@ -164,7 +167,7 @@ test "empty no-log selections persist global logical defaults and restart across
         try std.testing.expectEqualStrings("second", activeConfig(&restarted).model.name);
         try std.testing.expectEqual(effort.medium, restarted.connection().current().reasoning_effort);
         try std.testing.expectEqual(effort.medium, restarted.preferred_effort.?);
-        try fixture.expectNoProjectFiles(project);
+        try fixture.expectIdle(project);
     }
 }
 
@@ -188,8 +191,8 @@ test "headless and UI share global preference and capability clamp without rewri
     defer a.free(after);
     try std.testing.expectEqualStrings(before, after);
     try fixture.expectDefaults("local/first", "medium");
-    try fixture.expectNoProjectFiles(fixture.project);
-    try fixture.expectNoProjectFiles(fixture.other);
+    try fixture.expectIdle(fixture.project);
+    try fixture.expectIdle(fixture.other);
 }
 
 test "missing global preference uses explicit model option before medium fallback" {
@@ -237,7 +240,8 @@ test "context-only prefix remains an empty conversation for global selection def
     try fixture.expectDefaults("local/second", "low");
     try std.testing.expectEqual(@as(usize, 1), runtime.messages().len);
     try std.testing.expectEqualStrings("owned environment prefix", runtime.messages()[0].blocks[0].text);
-    try fixture.expectNoProjectFiles(fixture.project);
+    try std.testing.expect(!try session.saveOnExit());
+    try fixture.expectIdle(fixture.project);
 }
 
 test "successful or failed first user turn makes later effort and model choices session-local" {
@@ -281,7 +285,14 @@ test "successful or failed first user turn makes later effort and model choices 
         defer restarted.deinit();
         try std.testing.expectEqualStrings("first", activeConfig(&restarted).model.name);
         try std.testing.expectEqual(effort.low, restarted.connection().current().reasoning_effort);
-        try fixture.expectNoProjectFiles(fixture.project);
+        try fixture.expectNoProjectSettings(fixture.project);
+        _ = try session.saveOnExit();
+        const name = try std.fmt.allocPrint(a, "{s}.session", .{session.session_id});
+        defer a.free(name);
+        const path = try std.fs.path.join(a, &.{ fixture.project, ".thin/sessions", name });
+        defer a.free(path);
+        const info = try fixture.tmp.dir.statFile(io, path, .{});
+        try std.testing.expect(info.kind == .file and info.size > 0);
     }
 }
 
@@ -385,7 +396,7 @@ test "pending activation and global saves keep the original project fd anchor" {
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, "project/anchored.txt", .{}));
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, "original/.thin/settings.json", .{}));
     try fixture.expectDefaults("local/first", "max");
-    try fixture.expectNoProjectFiles(fixture.project);
+    try fixture.expectIdle(fixture.project);
 }
 
 test "same name idle selection republishes latest known or unknown actual context" {

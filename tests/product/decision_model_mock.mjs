@@ -5,7 +5,7 @@
 // matching owned project file. No request is allowed while a gate is checked.
 import http from 'node:http';
 import assert from 'node:assert/strict';
-import {mkdtemp, mkdir, writeFile, readFile, readdir, stat, rm} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, readdir, stat, lstat, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {assertConfigHome} from './assert_config_home.mjs';
@@ -234,14 +234,27 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
       }
       assert.equal(result.code,0); assert.equal(result.signal,null);
       for (const key of [MAIN_KEY,AUX_KEY]) assert(!result.output.includes(key));
-      assert(!result.output.includes('PTY_SESSION_ID='));
+      const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([^\r\n]*)\r?$/gm)];
+      assert.equal(ids.length,1); assert.match(ids[0][1],/^[0-9a-f]{32}$/);
+      const id = ids[0][1];
       assert.deepEqual(gates,['opened','canceled','selected']);
       assert.equal(mainPosts,3); assert.equal(auxPosts,1);
       assert.equal(connections,2);
       await saved();
-      await assertConfigHome(home);
+      await assertConfigHome(home,{project,id});
+      const sessionDir = join(project,'.thin/sessions');
+      const journals = (await readdir(sessionDir)).filter(name=>name.endsWith('.jsonl'));
+      assert(journals.length > 0, 'diagnostic journal missing');
+      for (const name of journals) {
+        const path = join(sessionDir,name), info = await lstat(path);
+        assert(info.isFile() && !info.isSymbolicLink());
+        assert.equal(info.mode & 0o777,0o600); assert(info.size > 0 && info.size <= 16*1024*1024);
+        const log = await readFile(path,'utf8');
+        for (const key of [MAIN_KEY,AUX_KEY]) assert(!log.includes(key));
+        for (const line of log.trim().split('\n')) JSON.parse(line);
+      }
       assert.equal(await readFile(join(project,'reviewer-owned.txt'),'utf8'),'decision-shell-proof\n', 'low-risk project write actually executed without approval');
-      assert.deepEqual((await readdir(project)).sort(),[...['opened','canceled','selected'].map(n=>`decision-model-release-${n}`),'reviewer-owned.txt'].sort());
+      assert.deepEqual((await readdir(project)).sort(),['.thin',...['opened','canceled','selected'].map(n=>`decision-model-release-${n}`),'reviewer-owned.txt'].sort());
       console.log(`PASS decision-model/${query}: ${native ? 'SystemOne' : 'Chat'} selected by protocol; primary=3 aux=1; save HTTP=0; warm primary socket retained; canonical bash result verified`);
     } catch (error) {
       // Assertion operands may contain wire/config/terminal secrets: fixed label only.

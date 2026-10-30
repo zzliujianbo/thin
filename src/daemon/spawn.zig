@@ -30,7 +30,6 @@ pub const Params = struct {
     owner: cli.WorkerOwner,
     @"resume": ?ids.Id = null,
     restore_selection: ?ids.Id = null,
-    logging: bool = true,
     auto_refresh_models: bool = false,
 };
 
@@ -782,7 +781,6 @@ fn buildCommand(a: std.mem.Allocator, exe: []const u8, endpoint: []const u8, id:
         try w.writeAll(" --worker-restore-selection ");
         try w.writeAll(selection[0..]);
     }
-    if (!params.logging) try w.writeAll(" --no-log");
     if (!params.auto_refresh_models) try w.writeAll(" --no-model-auto-refresh");
     return a.dupe(u8, out.written());
 }
@@ -857,13 +855,12 @@ test "worker argv quotes paths, selection ids and optional flags" {
         .project = "/tmp/project",
         .owner = .foreground,
         .@"resume" = id,
-        .logging = false,
         .auto_refresh_models = true,
     });
     defer a.free(quoted);
     try testing.expectEqualStrings(
         "exec '/opt/thin bin/thin' --internal-worker '/tmp/a b/it'\\''s.sock' " ++
-            "0123456789abcdef0123456789abcdef foreground --worker-resume --no-log",
+            "0123456789abcdef0123456789abcdef foreground --worker-resume",
         quoted,
     );
 
@@ -871,7 +868,6 @@ test "worker argv quotes paths, selection ids and optional flags" {
         .project = "/tmp/project",
         .owner = .daemon,
         .restore_selection = selection,
-        .logging = true,
         .auto_refresh_models = true,
     });
     defer a.free(restored);

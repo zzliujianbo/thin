@@ -92,7 +92,7 @@ pub const Listener = struct {
     const max_pending = 32;
     const ready_timeout_ms = 15000;
 
-    pub fn init(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, address: []const u8, logging: bool, refresh: bool) !Listener {
+    pub fn init(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, address: []const u8, refresh: bool) !Listener {
         const listen = try a.dupeSentinel(u8, address, 0);
         defer a.free(listen);
         const home = try a.dupeSentinel(u8, env.get("HOME") orelse return error.MissingHome, 0);
@@ -101,8 +101,8 @@ pub const Listener = struct {
         if (fd < 0) return error.SshListenerInitializationFailed;
         errdefer _ = std.c.close(fd);
         const pid = std.os.linux.getpid();
-        const script = try std.fmt.allocPrint(a, "exec '/proc/{d}/exe' --internal-ssh {d}{s}{s}", .{
-            pid, pid, if (logging) @as([]const u8, "") else " --no-log", if (refresh) @as([]const u8, "") else " --no-model-auto-refresh",
+        const script = try std.fmt.allocPrint(a, "exec '/proc/{d}/exe' --internal-ssh {d}{s}", .{
+            pid, pid, if (refresh) @as([]const u8, "") else " --no-model-auto-refresh",
         });
         return .{ .allocator = a, .io = io, .environ = env, .fd = fd, .script = script };
     }

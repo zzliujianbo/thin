@@ -30,7 +30,7 @@ pub const Cache = struct {
     directory: directory.Directory = .{},
     /// A successful official listing (even empty) supersedes offline presets.
     directory_mask: u8 = 0,
-    refresh: [4]Refresh = @splat(.{}),
+    refresh: [providers.Id.all.len + 1]Refresh = @splat(.{}),
 };
 /// Shared cache-only resolution for interactive and headless entry. No network,
 /// capacity mutation or preset capabilities; explicit user overrides stay local.
@@ -174,7 +174,7 @@ fn storedEntry(cache: *const Cache, index: usize) catalog.Entry {
         .selector = cache.directory.selector(index),
         .model = .{
             .name = cache.directory.name(index),
-            .context_tokens = if (known) |value| value.model.context_tokens else 32768,
+            .context_tokens = if (known) |value| value.model.context_tokens else if (row.provider == .openai_codex) 0 else 32768,
             .protocol = resolvedProtocol(cache, index),
             .output_tokens = rowOutput(row, resolvedProtocol(cache, index)),
             .output_source = .metadata,
@@ -233,7 +233,7 @@ pub fn contextFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
         if (row.available == true) {
             if (validContext(row.tokens)) |n| return n;
         }
-        if (row.dev_protocol == protocol) return validContext(row.dev_context_tokens);
+        if (row.provider != .openai_codex and row.dev_protocol == protocol) return validContext(row.dev_context_tokens);
         return null;
     }
     return null;
@@ -249,6 +249,7 @@ fn compatibleRoute(row: directory.Record, protocol: Protocol) bool {
 }
 
 fn rowOutput(row: directory.Record, protocol: Protocol) ?u32 {
+    if (row.provider == .openai_codex) return null;
     if (!compatibleRoute(row, protocol)) return null;
     if (row.protocol == protocol) {
         if (validOutput(row.output_tokens)) |n| return n;
@@ -266,6 +267,7 @@ pub fn outputFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
 /// Independent low-price input policy capability, using the same exact raw ID
 /// and concrete-route compatibility checks as outputFor. Never votes or aliases.
 pub fn inputPriceThresholdFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
+    if (entry.provider == .openai_codex) return null;
     const index = cache.directory.find(entry.provider, entry.model.name) orelse return null;
     const row = cache.directory.rows[index];
     const api = entry.model.protocol;
@@ -277,6 +279,7 @@ pub fn inputPriceThresholdFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
 /// Verified flat span on the exact concrete route. A compatible tier threshold
 /// always takes precedence; absence of a threshold is not evidence of flat cost.
 pub fn inputPriceFlatLimitFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
+    if (entry.provider == .openai_codex) return null;
     const index = cache.directory.find(entry.provider, entry.model.name) orelse return null;
     const row = cache.directory.rows[index];
     const api = entry.model.protocol;
@@ -331,6 +334,7 @@ fn rowDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinki
             return declaration;
         }
     }
+    if (row.provider == .openai_codex) return null;
     if (row.dev_reasoning) |profile| {
         const declaration = profile.declaration();
         if (declaration.format == format) {
@@ -385,7 +389,7 @@ pub fn mergeDev(target: *Listing, source: *const Listing) !void {
         row.dev_present = false;
     }
     for (source.directory.rows[0..source.directory.count], 0..) |source_row, index| {
-        if (!source_row.dev_present) continue;
+        if (!source_row.dev_present or source_row.provider == .openai_codex) continue;
         const row = try merged.upsert(source_row.provider, source.directory.name(index));
         row.dev_protocol = source_row.dev_protocol;
         row.dev_reasoning = source_row.dev_reasoning;
@@ -399,7 +403,7 @@ pub fn mergeDev(target: *Listing, source: *const Listing) !void {
     target.dev_done = true;
 }
 
-pub const Generations = [4]u64;
+pub const Generations = [providers.Id.all.len + 1]u64;
 pub const Claim = struct { cache: Cache, mask: u8, generations: Generations };
 pub const Commit = struct { cache: Cache, accepted: u8 };
 pub const max_generation: u64 = std.math.maxInt(i64);
@@ -483,6 +487,7 @@ fn parseEffort(value: std.json.Value, provider: providers.Id, protocol: @import(
 /// Only context_window denotes the total context; no input/output heuristic.
 /// Legacy capacity-array view; parseListing also retains all discovered IDs.
 pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !Listing {
+    if (id == .openai_codex) return parseCodexListing(a, body);
     try boundJson(body, max_body_bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_body_bytes });
     defer parsed.deinit();
@@ -524,12 +529,181 @@ pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !L
     return result;
 }
 
+/// Codex catalog is authenticated discovery, not a guarantee of entitlement.
+fn parseCodexListing(a: std.mem.Allocator, body: []const u8) !Listing {
+    try boundJson(body, max_body_bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_body_bytes });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidMetadata;
+    const models = parsed.value.object.get("models") orelse return error.InvalidMetadata;
+    if (models != .array or models.array.items.len > 512) return error.InvalidMetadata;
+    var result: Listing = .{ .directory_mask = bit(.openai_codex) };
+    for (models.array.items) |item| {
+        if (item != .object) return error.InvalidMetadata;
+        const slug = item.object.get("slug") orelse return error.InvalidMetadata;
+        if (slug != .string) return error.InvalidMetadata;
+        try directory.validateId(slug.string);
+        if (result.directory.find(.openai_codex, slug.string) != null) return error.InvalidMetadata;
+        const row = try result.directory.upsert(.openai_codex, slug.string);
+        row.protocol = .responses;
+        const visibility = item.object.get("visibility") orelse .null;
+        row.available = visibility == .string and std.mem.eql(u8, visibility.string, "list");
+        if (item.object.get("input_modalities")) |modalities| {
+            if (modalities == .array and modalities.array.items.len <= 32) {
+                var valid = true;
+                var image = false;
+                for (modalities.array.items) |modality| {
+                    if (modality != .string) {
+                        valid = false;
+                        break;
+                    }
+                    if (std.mem.eql(u8, modality.string, "image")) image = true;
+                }
+                if (valid) row.input_image = image;
+            }
+        }
+        const primary = if (item.object.get("context_window")) |v| codexCapacity(v) else null;
+        row.tokens = primary orelse if (item.object.get("max_context_window")) |v| codexCapacity(v) else null;
+        if (item.object.get("supported_reasoning_levels")) |levels| {
+            if (levels != .array or levels.array.items.len > 16) return error.InvalidMetadata;
+            var map: thinking.LevelMap = .{};
+            for (levels.array.items) |level| {
+                if (level != .object) return error.InvalidMetadata;
+                const effort = level.object.get("effort") orelse return error.InvalidMetadata;
+                if (effort != .string or effort.string.len == 0 or effort.string.len > 32) return error.InvalidMetadata;
+                if (std.mem.eql(u8, effort.string, "none") or std.mem.eql(u8, effort.string, "off")) {
+                    if (map.off != null and !std.mem.eql(u8, map.off.?, effort.string)) return error.InvalidMetadata;
+                    map.off = if (std.mem.eql(u8, effort.string, "none")) "none" else "off";
+                }
+                inline for (.{ "minimal", "low", "medium", "high", "xhigh", "max" }) |name| {
+                    if (std.mem.eql(u8, effort.string, name)) @field(map, name) = name;
+                }
+            }
+            const declaration: thinking.Declaration = .{ .format = .standard, .map = map };
+            if (declaration.validate()) |_| row.reasoning = try directory.Profile.from(declaration) else |_| {}
+            if (item.object.get("default_reasoning_level")) |default| {
+                if (default == .string) {
+                    const name = if (std.mem.eql(u8, default.string, "none")) "off" else default.string;
+                    const effort = activity.ReasoningEffort.fromName(name);
+                    if (effort != .unknown and effort != .unspecified) {
+                        var advertised = if (effort == .off) map.off != null and std.mem.eql(u8, map.off.?, default.string) else false;
+                        inline for (.{ "minimal", "low", "medium", "high", "xhigh", "max" }) |field| {
+                            if (std.mem.eql(u8, default.string, field) and @field(map, field) != null) advertised = true;
+                        }
+                        if (advertised) row.default_reasoning = effort;
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
+test "Codex listing uses explicit route, visibility and advertised efforts" {
+    const listing = try parseListing(std.testing.allocator,
+        \\{"models":[{"slug":"sample/raw","visibility":"list","supported_in_api":false,"context_window":12345,"max_context_window":99999,"supported_reasoning_levels":[{"effort":"high","description":""},{"effort":"ultra","description":""}]},{"slug":"hidden","visibility":"hide"}]}
+    , .openai_codex);
+    const row = listing.directory.rows[listing.directory.find(.openai_codex, "sample/raw").?];
+    try std.testing.expectEqual(Protocol.responses, row.protocol);
+    try std.testing.expectEqual(@as(?u32, 12345), row.tokens);
+    try std.testing.expect(row.available == true);
+    try std.testing.expectEqualStrings("high", row.reasoning.?.declaration().map.high.?);
+    try std.testing.expect(row.reasoning.?.declaration().map.off == null);
+    try std.testing.expect(listing.directory.rows[listing.directory.find(.openai_codex, "hidden").?].available == false);
+    const empty = try parseListing(std.testing.allocator, "{\"models\":[]}", .openai_codex);
+    try std.testing.expectEqual(bit(.openai_codex), empty.directory_mask);
+}
+
+fn codexCapacity(value: std.json.Value) ?u32 {
+    return switch (value) {
+        .integer => |n| if (n > 0 and n <= max_tokens) @intCast(n) else null,
+        else => null,
+    };
+}
+
 /// Isolated client, fixed official URL, no redirects or credential discovery.
 /// The borrowed caller key is not mutated; the owned header copy is wiped.
 pub fn fetch(a: std.mem.Allocator, io: std.Io, id: providers.Id, key: ?[]const u8) !Listing {
+    if (id == .openai_codex) return error.CodexCredentialRequired;
     const body = try fetchUrl(a, io, listingUrl(id), listingKey(id, key), max_body_bytes);
     defer a.free(body);
     return parseListing(a, body, id);
+}
+
+const codex_auth = @import("../core/codex_auth.zig");
+const p = @import("../core/protocol.zig");
+const codex_listing_url = providers.Id.openai_codex.baseUrl() ++ "/models?client_version=" ++ @import("version.zig").number;
+
+const CodexJob = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    credential: *const codex_auth.RequestCredential,
+    url: []const u8,
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+fn performCodex(job: *CodexJob) !Listing {
+    defer job.done.store(true, .release);
+    const body = try fetchCodexUrl(job.allocator, job.io, job.url, job.credential);
+    defer job.allocator.free(body);
+    return parseListing(job.allocator, body, .openai_codex);
+}
+
+/// Credential is borrowed only until the worker is joined. Fixed official URL;
+/// no credential discovery, redirects, persisted tokens, or request retries.
+pub fn fetchCodexListing(a: std.mem.Allocator, io: std.Io, credential: *const codex_auth.RequestCredential, cancel: ?*const p.Cancellation, timeout_ms: u32) !Listing {
+    return fetchCodexAt(a, io, credential, cancel, timeout_ms, codex_listing_url);
+}
+
+// Private transport seam, reachable by tests only; production URL is fixed.
+fn fetchCodexAt(a: std.mem.Allocator, io: std.Io, credential: *const codex_auth.RequestCredential, cancel: ?*const p.Cancellation, timeout_ms: u32, url: []const u8) !Listing {
+    if (cancel) |c| if (c.isRequested()) return error.Canceled;
+    if (timeout_ms == 0) return error.RequestTimeout;
+    const start = std.Io.Clock.awake.now(io);
+    var job: CodexJob = .{ .allocator = a, .io = io, .credential = credential, .url = url };
+    var future = try std.Io.concurrent(io, performCodex, .{&job});
+    defer _ = future.cancel(io) catch {};
+    while (!job.done.load(.acquire)) {
+        if (cancel) |c| if (c.isRequested()) return error.Canceled;
+        if (start.untilNow(io, .awake).toMilliseconds() >= timeout_ms) return error.RequestTimeout;
+        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    }
+    if (cancel) |c| if (c.isRequested()) return error.Canceled;
+    if (start.untilNow(io, .awake).toMilliseconds() >= timeout_ms) return error.RequestTimeout;
+    return future.await(io);
+}
+
+fn fetchCodexUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, credential: *const codex_auth.RequestCredential) ![]u8 {
+    for ([_][]const u8{ credential.access_token, credential.account_id }) |value| {
+        if (value.len == 0 or value.len > 8192) return error.InvalidCredential;
+        for (value) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidCredential;
+    }
+    const authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{credential.access_token});
+    defer {
+        std.crypto.secureZero(u8, authorization);
+        a.free(authorization);
+    }
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    var request = try client.request(.GET, try std.Uri.parse(url), .{
+        .redirect_behavior = .unhandled,
+        .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" }, .user_agent = .{ .override = "ThinAgent-metadata-check/1.0" } },
+        .extra_headers = &.{ .{ .name = "Accept", .value = "application/json" }, .{ .name = "chatgpt-account-id", .value = credential.account_id }, .{ .name = "originator", .value = "thin" } },
+    });
+    defer request.deinit();
+    try request.sendBodiless();
+    var head: [8192]u8 = undefined;
+    var response = try request.receiveHead(&head);
+    if (response.head.status != .ok) return error.MetadataHttpStatus;
+    if (response.head.content_length) |size| if (size > max_body_bytes) return error.MetadataTooLarge;
+    var transfer: [8192]u8 = undefined;
+    const body = try response.reader(&transfer).allocRemaining(a, .limited(max_body_bytes));
+    errdefer a.free(body);
+    switch (request.reader.state) {
+        .body_remaining_content_length, .body_remaining_chunk_len => return error.IncompleteMetadata,
+        else => {},
+    }
+    return body;
 }
 
 /// Public catalog: no credentials and no provider listing key. Parsing is the
@@ -549,6 +723,7 @@ fn listingUrl(id: providers.Id) []const u8 {
         .deepseek => comptime providers.Id.deepseek.baseUrl() ++ "/models",
         .opencode_go => "https://opencode.ai/inference/go/v1/models",
         .opencode_zen => "https://opencode.ai/inference/v1/models",
+        .openai_codex => comptime providers.Id.openai_codex.baseUrl() ++ "/models",
     };
 }
 
@@ -603,6 +778,8 @@ const ModelRecord = struct {
     dev_input_price_threshold: ?u32 = null,
     dev_input_price_flat_limit: ?u32 = null,
     available: ?bool = null,
+    input_image: ?bool = null,
+    default_reasoning: ?activity.ReasoningEffort = null,
     protocol: Protocol = .auto,
     dev_protocol: Protocol = .auto,
     reasoning: ?thinking.Declaration = null,
@@ -620,7 +797,12 @@ pub const Refresh = struct {
     last_success_ms: ?u64 = null,
     successful: bool = false,
 };
-const source_bits = [_]u8{ 1, 2, 4, dev_bit };
+const source_bits: [providers.Id.all.len + 1]u8 = blk: {
+    var bits: [providers.Id.all.len + 1]u8 = undefined;
+    for (providers.Id.all, 0..) |id, i| bits[i] = bit(id);
+    bits[providers.Id.all.len] = dev_bit;
+    break :blk bits;
+};
 
 pub fn wallNow(io: std.Io) u64 {
     return @intCast(@max(0, @min(max_timestamp_ms, std.Io.Clock.real.now(io).toMilliseconds())));
@@ -650,13 +832,13 @@ pub fn eligible(cache: *const Cache, requested: u8, now: u64, policy: Policy) u8
 
 /// Only current-schema data loads; older schemas are rebuilt by a refresh
 /// claim, while future and malformed documents stay rejected.
-pub const cache_version: u32 = 14;
+pub const cache_version: u32 = 15;
 
 const Document = struct {
     version: u32 = cache_version,
     directory_mask: u8 = 0,
     models: []const ModelRecord = &.{},
-    refresh: [4]Refresh = @splat(.{}),
+    refresh: [providers.Id.all.len + 1]Refresh = @splat(.{}),
 };
 
 fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
@@ -678,7 +860,7 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
                 if (mask != .integer or mask.integer < 0 or mask.integer > all_mask) return error.InvalidMetadata;
             }
             if (raw.value.object.get("refresh")) |timings| {
-                if (timings != .array or timings.array.items.len != 4) return error.InvalidMetadata;
+                if (timings != .array or timings.array.items.len != providers.Id.all.len + 1) return error.InvalidMetadata;
                 for (timings.array.items) |timing| {
                     if (timing != .object) return error.InvalidMetadata;
                     if (timing.object.get("generation")) |value| switch (value) {
@@ -734,6 +916,9 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
         row.output_tokens = record.output_tokens;
         row.dev_output_tokens = record.dev_output_tokens;
         row.available = record.available;
+        row.input_image = record.input_image;
+        row.default_reasoning = record.default_reasoning;
+        if (row.default_reasoning == .unknown or row.default_reasoning == .unspecified) return error.InvalidMetadata;
         row.protocol = record.protocol;
         row.dev_protocol = record.dev_protocol;
         row.dev_present = record.dev_present;
@@ -783,6 +968,7 @@ fn save(root: *fs.Root, cache: Cache) !void {
         if (timing.last_success_ms) |n| if (n > max_timestamp_ms) return error.InvalidMetadata;
     }
     for (cache.directory.rows[0..cache.directory.count]) |row| {
+        if (row.default_reasoning == .unknown or row.default_reasoning == .unspecified) return error.InvalidMetadata;
         if (row.tokens != null and validContext(row.tokens) == null) return error.InvalidMetadata;
         if (row.dev_context_tokens != null and validContext(row.dev_context_tokens) == null) return error.InvalidMetadata;
         if (row.dev_input_price_threshold != null and validContext(row.dev_input_price_threshold) == null) return error.InvalidMetadata;
@@ -802,6 +988,8 @@ fn save(root: *fs.Root, cache: Cache) !void {
         .dev_input_price_threshold = row.dev_input_price_threshold,
         .dev_input_price_flat_limit = row.dev_input_price_flat_limit,
         .available = row.available,
+        .input_image = row.input_image,
+        .default_reasoning = row.default_reasoning,
         .protocol = row.protocol,
         .dev_protocol = row.dev_protocol,
         .reasoning = if (row.reasoning) |profile| profile.declaration() else null,
@@ -895,6 +1083,8 @@ fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing
     for (cache.directory.rows[0..cache.directory.count]) |*row| {
         if (refreshed & bit(row.provider) != 0) {
             row.available = false;
+            row.input_image = null;
+            row.default_reasoning = null;
             row.tokens = null;
             row.output_tokens = null;
             row.protocol = .auto;
@@ -911,11 +1101,13 @@ fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing
         }
     }
     for (listing.directory.rows[0..listing.directory.count], 0..) |source, index| {
-        const official = refreshed & bit(source.provider) != 0 and source.available == true;
+        const official = refreshed & bit(source.provider) != 0 and source.available != null;
         if (!official and !(listing.dev_done and source.dev_present)) continue;
         const row = try cache.directory.upsert(source.provider, listing.directory.name(index));
         if (official) {
             row.available = source.available;
+            row.input_image = source.input_image;
+            row.default_reasoning = source.default_reasoning;
             row.tokens = source.tokens;
             row.output_tokens = source.output_tokens;
             row.protocol = source.protocol;
@@ -1050,6 +1242,57 @@ fn serveMetadataChecked(io: std.Io, server: *std.Io.net.Server, response: []cons
     try writer.interface.flush();
 }
 
+fn serveCodexFixture(io: std.Io, server: *std.Io.net.Server) !void {
+    var stream = try server.accept(io);
+    defer stream.close(io);
+    var buffer: [8192]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buffer);
+    var reader = stream.reader(io, &buffer);
+    var headers: [8192]u8 = undefined;
+    defer std.crypto.secureZero(u8, &headers);
+    var count: usize = 0;
+    var suffix: u32 = 0;
+    while (suffix != 0x0d0a0d0a) {
+        if (count == headers.len) return error.TestHeadersTooLarge;
+        const byte = try reader.interface.takeByte();
+        headers[count] = std.ascii.toLower(byte);
+        count += 1;
+        suffix = (suffix << 8) | byte;
+    }
+    try std.testing.expect(std.mem.startsWith(u8, headers[0..count], "get /models?client_version=" ++ @import("version.zig").number ++ " http/1.1\r\n"));
+    try std.testing.expect(std.mem.find(u8, headers[0..count], "authorization: bearer fake-token\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, headers[0..count], "chatgpt-account-id: fake-account\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, headers[0..count], "originator: thin\r\n") != null);
+    var out: [1024]u8 = undefined;
+    var writer = stream.writer(io, &out);
+    try writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"models\":[]}");
+    try writer.interface.flush();
+}
+
+test "Codex private fetch seam uses exact headers and fixed production scope" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/models?client_version=" ++ @import("version.zig").number, codex_listing_url);
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/models?client_version={s}", .{ server.socket.address.getPort(), @import("version.zig").number });
+    defer a.free(url);
+    var token = [_]u8{ 'f', 'a', 'k', 'e', '-', 't', 'o', 'k', 'e', 'n' };
+    var account = [_]u8{ 'f', 'a', 'k', 'e', '-', 'a', 'c', 'c', 'o', 'u', 'n', 't' };
+    const credential: codex_auth.RequestCredential = .{ .access_token = &token, .account_id = &account };
+    var server_job = try std.Io.concurrent(io, serveCodexFixture, .{ io, &server });
+    defer server_job.cancel(io) catch {};
+    const listing = try fetchCodexAt(a, io, &credential, null, 5000, url);
+    try server_job.await(io);
+    try std.testing.expectEqual(bit(.openai_codex), listing.directory_mask);
+    try std.testing.expectEqualStrings("fake-token", &token);
+    var canceled: p.Cancellation = .{};
+    canceled.cancel();
+    try std.testing.expectError(error.Canceled, fetchCodexAt(a, io, &credential, &canceled, 5000, url));
+    try std.testing.expectError(error.RequestTimeout, fetchCodexAt(a, io, &credential, null, 0, url));
+}
+
 test "metadata loopback transport success redirects size short body and cleanup" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -1161,7 +1404,7 @@ test "metadata private roundtrip claims once and merges only successful provider
     try std.testing.expectEqual(bit(.deepseek), (try claim(&second, bit(.deepseek), true)).mask);
     var original: Listing = .{};
     for (providers.Id.all) |id| {
-        const source = try parseListing(std.testing.allocator, "{\"data\":[{\"id\":\"raw/id\",\"context_window\":1000}]}", id);
+        const source = try parseListing(std.testing.allocator, if (id == .openai_codex) "{\"models\":[{\"slug\":\"raw/id\",\"visibility\":\"list\",\"context_window\":1000}]}" else "{\"data\":[{\"id\":\"raw/id\",\"context_window\":1000}]}", id);
         try mergeOfficial(&original, &source, id);
     }
     _ = try commit(&first, all_mask, original);
@@ -1184,7 +1427,7 @@ test "metadata rejects old future unknown and malformed cache without writing" {
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const a = std.testing.allocator;
-    for (0..16) |version| {
+    for (0..17) |version| {
         if (version == cache_version) continue;
         const body = try std.fmt.allocPrint(a, "{{\"version\":{d},\"models\":[]}}", .{version});
         defer a.free(body);
@@ -1205,11 +1448,11 @@ test "metadata rejects old future unknown and malformed cache without writing" {
         try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
     }
     for ([_][]const u8{
-        "{\"version\":14,\"attempted\":0}",
-        "{\"version\":14,\"records\":[]}",
-        "{\"version\":14,\"unknown\":false}",
-        "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",\"unknown\":1}]}",
-        "{\"version\":14,\"refresh\":[{\"unknown\":0},{},{},{}]}",
+        "{\"version\":15,\"attempted\":0}",
+        "{\"version\":15,\"records\":[]}",
+        "{\"version\":15,\"unknown\":false}",
+        "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",\"unknown\":1}]}",
+        "{\"version\":15,\"refresh\":[{\"unknown\":0},{},{},{},{}]}",
     }) |body| {
         try root.writeMode(file_name, body, true, 0o600);
         const before = try root.dir.statFile(root.io, file_name, .{});
@@ -1233,7 +1476,7 @@ test "metadata stale document is rebuilt by manual and automatic claims only" {
     const stale = "{\"version\":12,\"attempted\":1750000000000,\"records\":[{\"id\":\"legacy\",\"context_window\":4096}],\"models\":[{\"provider\":\"deepseek\",\"id\":\"legacy\",\"context_window\":4096}]}";
     var listing: Listing = .{};
     for (providers.Id.all) |id| {
-        const source = try parseListing(a, "{\"data\":[{\"id\":\"fresh\",\"context_window\":8192}]}", id);
+        const source = try parseListing(a, if (id == .openai_codex) "{\"models\":[{\"slug\":\"fresh\",\"visibility\":\"list\",\"context_window\":8192}]}" else "{\"data\":[{\"id\":\"fresh\",\"context_window\":8192}]}", id);
         try mergeOfficial(&listing, &source, id);
     }
     for ([_]bool{ true, false }) |manual| {
@@ -1249,13 +1492,13 @@ test "metadata stale document is rebuilt by manual and automatic claims only" {
         const published = try commitClaimedAt(&root, all_mask, listing, rebuilt.generations, 1010);
         try std.testing.expectEqual(all_mask, published.accepted);
         const reloaded = try load(&root);
-        try std.testing.expectEqual(@as(usize, 3), reloaded.directory.count);
+        try std.testing.expectEqual(providers.Id.all.len, reloaded.directory.count);
         try std.testing.expectEqual(@as(?u32, 8192), reloaded.directory.rows[reloaded.directory.find(.deepseek, "fresh").?].tokens);
         // A claim taken before the rebuild can no longer publish.
         const delayed = try commitClaimedAt(&root, all_mask, listing, first.generations, 1020);
         try std.testing.expectEqual(@as(u8, 0), delayed.accepted);
         const after = try load(&root);
-        try std.testing.expectEqual(@as(usize, 3), after.directory.count);
+        try std.testing.expectEqual(providers.Id.all.len, after.directory.count);
         try std.testing.expectEqual(@as(?u32, 8192), after.directory.rows[after.directory.find(.deepseek, "fresh").?].tokens);
     }
 }
@@ -1308,7 +1551,7 @@ test "metadata empty official listing is authoritative and failed refresh preser
     defer root.deinit();
     var listing: Listing = .{};
     for (providers.Id.all) |id| {
-        const source = try parseListing(std.testing.allocator, "{\"data\":[{\"id\":\"raw/id\",\"context_window\":4096}]}", id);
+        const source = try parseListing(std.testing.allocator, if (id == .openai_codex) "{\"models\":[{\"slug\":\"raw/id\",\"visibility\":\"list\",\"context_window\":4096}]}" else "{\"data\":[{\"id\":\"raw/id\",\"context_window\":4096}]}", id);
         try mergeOfficial(&listing, &source, id);
     }
     const original = try commit(&root, all_mask, listing);
@@ -1338,10 +1581,10 @@ test "metadata rejects malformed availability and duplicate cache records withou
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const cases = [_]struct { body: []const u8, err: anyerror }{
-        .{ .body = "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":1}]}", .err = error.UnexpectedToken },
-        .{ .body = "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":\"true\"}]}", .err = error.UnexpectedToken },
-        .{ .body = "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true,\"available\":false}]}", .err = error.DuplicateField },
-        .{ .body = "{\"version\":14,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true},{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":false}]}", .err = error.InvalidMetadata },
+        .{ .body = "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":1}]}", .err = error.UnexpectedToken },
+        .{ .body = "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":\"true\"}]}", .err = error.UnexpectedToken },
+        .{ .body = "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true,\"available\":false}]}", .err = error.DuplicateField },
+        .{ .body = "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true},{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":false}]}", .err = error.InvalidMetadata },
     };
     for (cases) |case| {
         try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = case.body });
@@ -1383,7 +1626,7 @@ test "models.dev profiles persist in current cache and automatic claims observe 
     const reloaded = try load(&root);
     try std.testing.expectEqualStrings("off", reloaded.directory.rows[reloaded.directory.find(.deepseek, "deepseek-flash").?].dev_reasoning.?.declaration().map.off.?);
     try std.testing.expect(reloaded.directory.rows[reloaded.directory.find(.deepseek, "deepseek-flash").?].reasoning == null);
-    try std.testing.expect(reloaded.refresh[3].last_attempt_ms != null);
+    try std.testing.expect(reloaded.refresh[providers.Id.all.len].last_attempt_ms != null);
     try std.testing.expectEqual(@as(u8, 0), (try claim(&root, dev_bit, false)).mask);
     // A failed later models.dev fetch does not erase the last successful profile.
     _ = try commit(&root, 0, .{});
@@ -1436,7 +1679,7 @@ test "models.dev loopback transport parses public catalog and enforces its own s
 
 fn cacheAllocationCheck(a: std.mem.Allocator) !void {
     const cache = try parseCache(a,
-        \\{"version":14,"directory_mask":1,"models":[{"provider":"deepseek","id":"deepseek/raw/id","context_window":131072,"available":true,"protocol":"chat","reasoning":{"format":"deepseek","map":{"off":"off","high":"high"}},"dev_protocol":"chat","dev_present":true,"dev_output_tokens":8192,"dev_context_tokens":262144,"dev_input_price_flat_limit":262144}],"refresh":[{"generation":7,"last_attempt_ms":10,"last_success_ms":11,"successful":true},{},{},{}]}
+        \\{"version":15,"directory_mask":1,"models":[{"provider":"deepseek","id":"deepseek/raw/id","context_window":131072,"available":true,"protocol":"chat","reasoning":{"format":"deepseek","map":{"off":"off","high":"high"}},"dev_protocol":"chat","dev_present":true,"dev_output_tokens":8192,"dev_context_tokens":262144,"dev_input_price_flat_limit":262144}],"refresh":[{"generation":7,"last_attempt_ms":10,"last_success_ms":11,"successful":true},{},{},{},{}]}
     );
     try std.testing.expectEqualStrings("deepseek/raw/id", cache.directory.name(0));
     try std.testing.expectEqual(@as(u64, 7), cache.refresh[0].generation);

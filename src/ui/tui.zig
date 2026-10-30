@@ -13,6 +13,7 @@ const input = @import("input.zig");
 const composer_layout = @import("composer_layout.zig");
 const picker_module = @import("model_picker.zig");
 const provider_picker_module = @import("provider_picker.zig");
+const corecodex = @import("../core/codex_login.zig");
 const command_menu_module = @import("command_menu.zig");
 const settings_menu_module = @import("settings_menu.zig");
 const decision_picker_module = @import("decision_picker.zig");
@@ -435,6 +436,7 @@ pub const Connection = struct {
     /// local; effort saves the project preference, never global defaults.
     select_model_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     configure_provider_fn: ?*const fn (*anyopaque, core_config.providers.Id, []const u8) anyerror!void = null,
+    codex_login_fn: ?*const fn (*anyopaque, corecodex.Action, u64) anyerror!void = null,
     set_effort_fn: ?*const fn (*anyopaque, shared.ReasoningEffort) anyerror!void = null,
     /// Explicit owner-side action may adopt newly discovered missing capability
     /// metadata. Redraw snapshots and existing accepted maps remain frozen.
@@ -486,6 +488,7 @@ pub const Connection = struct {
         provider: ?core_config.providers.Id = null,
         /// Nonsecret configured-status bits; never credential bytes.
         configured_providers: u8 = 0,
+        codex_login: corecodex.View = .{},
         allow_custom_models: bool = true,
         context_limit: u32 = 0,
         /// Owner snapshot: known tiered-price protection active for this model,
@@ -519,7 +522,6 @@ pub const Connection = struct {
         settings_error: ?anyerror = null,
         settings_notice: ?[]const u8 = null,
         base_url: []const u8,
-        logging_enabled: bool = true,
         /// 由应用层以原子状态发布；UI 不读日志文件、不持有其写入器。
         log_error: ?anyerror = null,
     };
@@ -535,6 +537,10 @@ pub const Connection = struct {
         const callback = self.configure_provider_fn orelse return error.SelectionUnavailable;
         try callback(self.context, provider, key);
     }
+    pub fn codexLogin(self: Connection, action: corecodex.Action, generation: u64) !void {
+        const callback = self.codex_login_fn orelse return error.SelectionUnavailable;
+        try callback(self.context, action, generation);
+    }
     pub fn selectModel(self: Connection, name: []const u8) !void {
         const callback = self.select_model_fn orelse return error.SelectionUnavailable;
         try callback(self.context, name);
@@ -544,6 +550,14 @@ pub const Connection = struct {
         try callback(self.context, effort);
     }
 };
+
+fn validCodexCode(view: *const corecodex.View) bool {
+    if (view.code_len > view.code.len) return false;
+    for (view.userCode()) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+    }
+    return true;
+}
 
 /// Configured means a local Runtime exists or a remote session is available;
 /// never infer it from model text or from the absence of a Runtime alone.
@@ -594,8 +608,12 @@ fn finishExit(terminal: *terminal_module.Terminal, result: u8, read_signal: *con
     return if (final_signal != 0) 128 + final_signal else result;
 }
 
+/// Footer placeholder owned by an admitted-but-unaccepted control request.
+/// Only this exact text may be replaced by a later failure/obsolete receipt.
+const pending_session_notice = "Waiting for session...";
+
 /// TUI 的全部状态。只在 UI 线程（run/loop）中访问；后台 Job 只通过 bridge 与之通信。
-const AsyncPurpose = enum { submit, enqueue, withdraw, manage, approve, cancel, cancel_clear, open_stop, release_stop, queue_resume, configure, model, effort, preference, setting, decision, image, proxy, proxy_address, refresh };
+const AsyncPurpose = enum { submit, enqueue, withdraw, manage, approve, cancel, cancel_clear, open_stop, release_stop, queue_resume, configure, codex_login, model, effort, preference, setting, decision, image, proxy, proxy_address, refresh };
 const AsyncPending = struct {
     ticket: u64,
     purpose: AsyncPurpose,
@@ -721,6 +739,14 @@ const Ui = struct {
     model_picker: ?picker_module.Picker = null,
     provider_picker: provider_picker_module.Picker = .{},
     provider_open: bool = false,
+    codex_open: bool = false,
+    /// Start/cancel was admitted to the async channel but the owner has not
+    /// accepted it yet. No panel is displayed until the receipt arrives.
+    codex_opening: bool = false,
+    codex_baseline: u64 = 0,
+    codex_generation: ?u64 = null,
+    codex_cancel_waiting: bool = false,
+    codex_view_hash: u64 = 0,
     settings_open: bool = false,
     decision_open: bool = false,
     image_open: bool = false,
@@ -872,11 +898,9 @@ const Ui = struct {
     mode: ?r.State = null,
     /// 仅必要的错误、设置和隔离提示使用临时hint。
     notice: []const u8 = "Ready",
-    /// Low-priority display-only success; never replaces a foreground notice.
-    metadata_toast: ?struct { text: []const u8, until_ms: u64 } = null,
+    /// Last owner-published advisory string already turned into one display
+    /// record; repeated identical snapshots are never republished.
     memory_notice_seen: ?[]const u8 = null,
-    memory_notice_until_ms: ?u64 = null,
-    memory_notice_expired: bool = false,
     /// 切换思考档位后的短暂确认：在输入框百分比位置显示新档位，2 秒后自动恢复。
     effort_flash: ?struct { level: shared.ReasoningEffort, until_ms: u64 } = null,
     log_warning_seen: bool = false,
@@ -1080,7 +1104,7 @@ const Ui = struct {
         slot.* = .{ .ticket = ticket, .purpose = purpose, .original_editor = original, .editor_revision = self.editor_revision, .epoch = epoch, .permission_id = if (self.permission) |permission| permission.id else null, .previous_effort = self.connection.current().reasoning_effort, .settings_generation = self.settings_menu.generation, .stop_instance = self.stop_instance };
         if (purpose == .open_stop or purpose == .release_stop) self.async_stop_intent = ticket;
         self.parser.stop_feed = true;
-        self.notice = "Waiting for session...";
+        self.notice = pending_session_notice;
         self.requestDraw();
         return &slot.*.?;
     }
@@ -1095,7 +1119,7 @@ const Ui = struct {
         self.editor_pasted = false;
         self.input_history.index = null;
         self.vertical_column = null;
-        self.notice = "Pending message withdrawn as plain draft";
+        self.publishNotice("Pending message withdrawn as plain draft");
     }
 
     fn activateStop(self: *Ui) void {
@@ -1122,12 +1146,41 @@ const Ui = struct {
             };
             var pending = found orelse continue;
             defer pending.deinit(self.allocator);
-            if (completion.obsolete) continue;
+            if (completion.obsolete) {
+                // A superseded login attempt must never strand an opening panel
+                // nor keep a deferred cancellation armed for a dead generation.
+                if (pending.purpose == .codex_login) {
+                    const start = completion.request.action.codex_login.action == .start;
+                    self.codex_opening = false;
+                    self.codex_open = false;
+                    self.codex_generation = null;
+                    self.codex_cancel_waiting = false;
+                    self.codex_view_hash = 0;
+                    if (start and std.mem.eql(u8, self.notice, pending_session_notice)) self.notice = "Ready";
+                    self.requestDraw();
+                }
+                continue;
+            }
             if (pending.purpose == .approve) {
                 const permission = self.permission orelse continue;
                 if (permission.epoch != pending.epoch or permission.id != pending.permission_id) continue;
             }
             if (completion.failure) |err| {
+                if (pending.purpose == .codex_login) {
+                    const start = completion.request.action.codex_login.action == .start;
+                    self.codex_opening = false;
+                    self.codex_cancel_waiting = false;
+                    self.codex_view_hash = 0;
+                    if (start) {
+                        // A rejected start never opened a panel; no generation
+                        // was bound to this request either.
+                        self.codex_open = false;
+                        self.codex_generation = null;
+                        self.notice = "OpenAI Codex device login unavailable";
+                    } else self.notice = "Could not cancel OpenAI Codex login";
+                    self.requestDraw();
+                    continue;
+                }
                 self.notice = if (err == error.PublicationUnavailable) "Operation result unavailable; verify before retrying" else switch (pending.purpose) {
                     .refresh => if (err == error.NoOfficialProvider) "No official provider configured; use /login first" else if (err == error.MetadataRefreshBusy) "Official metadata refresh already running" else "Could not start metadata refresh; previous cache kept",
                     .effort => switch (err) {
@@ -1149,6 +1202,17 @@ const Ui = struct {
         }
     }
 
+    /// Publish a one-shot UI outcome independently of canonical conversation.
+    /// On capacity/allocation failure retain an actionable hint instead of losing it.
+    fn publishNotice(self: *Ui, message: []const u8) void {
+        _ = self.add(.notice, message) catch {
+            self.notice = "Display notice unavailable; inspect operation state";
+            self.requestDraw();
+            return;
+        };
+        self.notice = "Ready";
+    }
+
     fn completeAsync(self: *Ui, pending: *AsyncPending, completion: *remote_action.Completion) void {
         const action = completion.request.action;
         switch (pending.purpose) {
@@ -1160,7 +1224,7 @@ const Ui = struct {
             },
             .enqueue => {
                 self.clearSubmittedEditor(pending);
-                self.notice = if (action.enqueue.kind == .steering) "Steering pending" else "FollowUp pending";
+                self.publishNotice(if (action.enqueue.kind == .steering) "Steering pending" else "FollowUp pending");
             },
             .withdraw => {
                 if (completion.value != .withdrawn) return;
@@ -1179,7 +1243,7 @@ const Ui = struct {
             },
             .approve => {
                 if (self.permission) |permission| if (permission.epoch == pending.epoch and permission.id == action.approve.id) self.clearPermission();
-                self.notice = if (action.approve.decision == .deny) "Request denied" else "Allowed once";
+                self.publishNotice(if (action.approve.decision == .deny) "Request denied" else "Allowed once");
             },
             .cancel, .cancel_clear => {
                 if (self.permission) |permission| if (permission.epoch == pending.epoch and pending.permission_id == permission.id) self.clearPermission();
@@ -1190,10 +1254,8 @@ const Ui = struct {
                     self.invalidateStop();
                 }
                 if (self.last_terminal) |result| {
-                    // A late cancel receipt must not replace a handled terminal
-                    // while the view waits for ordered owner idle.
-                    if (self.remote_terminal_wait) self.notice = terminalNotice(result);
-                } else self.notice = if (pending.purpose == .cancel_clear) "Stop requested; queue cleared; draft kept" else "Cancellation requested; cleaning up, not rolling back effects";
+                    if (std.mem.eql(u8, self.notice, pending_session_notice)) self.notice = terminalNotice(result);
+                } else self.publishNotice(if (pending.purpose == .cancel_clear) "Stop requested; queue cleared; draft kept" else "Cancellation requested; cleaning up, not rolling back effects");
             },
             .open_stop => if (self.async_stop_intent == pending.ticket) {
                 self.activateStop();
@@ -1204,12 +1266,36 @@ const Ui = struct {
             },
             .queue_resume => {
                 self.clearSubmittedEditor(pending);
-                self.notice = "Queue resumed";
+                self.publishNotice("Queue resumed");
             },
             .configure => {
                 if (self.secret_mode) self.endSecret();
                 self.secret_quarantine = false;
-                self.notice = if (action.configure.provider != null) "Key saved locally; use /model to select or activate it" else "Saved locally; send a message to connect";
+                self.publishNotice(if (action.configure.provider != null) "Key saved locally; use /model to select or activate it" else "Saved locally; send a message to connect");
+            },
+            .codex_login => {
+                const request = action.codex_login;
+                self.codex_opening = false;
+                if (request.action == .start) {
+                    // Only the owner's accepted RPC opens the panel; the code
+                    // itself stays ephemeral and is watched by generation.
+                    self.codex_open = true;
+                    self.codex_generation = null;
+                    self.codex_view_hash = 0;
+                    self.notice = "Ready";
+                    self.parser.stop_feed = true;
+                    self.observeCodexLogin();
+                } else {
+                    // A cancel receipt closes only the panel still bound to the
+                    // EXACT generation it targeted; a later attempt keeps its own.
+                    if (self.codex_generation) |bound| if (bound == request.generation) {
+                        self.codex_open = false;
+                        self.codex_generation = null;
+                        self.codex_view_hash = 0;
+                    };
+                    self.codex_cancel_waiting = false;
+                    self.notice = "Ready";
+                }
             },
             .model => {
                 self.finishModelSelection(pending.inherited);
@@ -1235,11 +1321,11 @@ const Ui = struct {
                     .proxy_address => if (self.proxy_address_open) self.backToProxySubmenu(0),
                     else => {},
                 };
-                self.notice = switch (pending.purpose) {
+                self.publishNotice(switch (pending.purpose) {
                     .proxy => "Saved proxy models; main route applies in a new session",
                     .proxy_address => if (action.proxy_address.len == 0) "Empty disables proxy; a new session applies it" else "Saved proxy address; main route applies in a new session",
-                    else => "Ready",
-                };
+                    else => "Settings saved",
+                });
             },
             .refresh => self.notice = "Refreshing official model metadata...",
         }
@@ -2429,7 +2515,6 @@ const Ui = struct {
     /// Only actionable notices/errors use a temporary hint row. Completed,
     /// mode, usage and performance have no rows; the composer owns activity.
     fn hint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
-        self.observeMemoryNotice(state.memory_notice);
         if (self.secret_quarantine) return std.fmt.allocPrint(a, "{s}; Esc closes", .{self.notice});
         if (self.secret_mode) return if (std.mem.eql(u8, self.notice, "Ready")) "" else self.notice;
         if (self.settings_open) {
@@ -2451,12 +2536,12 @@ const Ui = struct {
         if (self.commandMenuVisible()) return "";
         var notice: []const u8 = "";
         var terminal_issue = false;
+        // Ordinary one-shot successes are transcript notices. Only an
+        // unresolved actionable terminal result owns the persistent hint.
         if (self.last_terminal) |result| {
             if (result.status != .success and (result.status != .paused or result.model_failure == .output_limit or r.policyPause(result.detail))) {
                 var formatted: std.Io.Writer.Allocating = .init(a);
                 defer formatted.deinit();
-                // The notice can have been reset by a menu or reconnect. Task
-                // status owns its label; never render "Ready: <failure>".
                 const label = switch (result.status) {
                     .paused => "Paused",
                     .failed => "Failed",
@@ -2487,12 +2572,6 @@ const Ui = struct {
             }
         }
         if (state.log_error) |err| return std.fmt.allocPrint(a, "{s}{s}REC FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
-        if (!state.logging_enabled and !terminal_issue) return std.fmt.allocPrint(a, "{s}{s}recording off", .{ notice, if (notice.len != 0) " | " else "" });
-        // Advisory worker state never replaces failures, approvals or queued input.
-        if (notice.len == 0 and self.permission == null and !self.stop_open and self.queueSnapshot().newest_id == null and !self.queueSnapshot().paused) {
-            if (self.metadata_toast) |toast| return toast.text;
-            if (state.memory_notice) |memory_notice| if (self.presentMemoryNotice(memory_notice)) |visible| return visible;
-        }
         return notice;
     }
 
@@ -3142,7 +3221,7 @@ const Ui = struct {
         };
         self.display.context = self.connection.current().initial_context;
         self.frame_settings_generation = null;
-        self.notice = "Ready";
+        self.publishNotice("Settings saved");
         return true;
     }
     fn settingsValueKey(self: *Ui, event_: input.Event) !void {
@@ -3310,7 +3389,7 @@ const Ui = struct {
         self.display.context = self.connection.current().initial_context;
         const disabled = parsed == null;
         self.backToProxySubmenu(0);
-        self.notice = if (disabled) "Empty disables proxy; a new session applies it" else "Saved proxy address; main route applies in a new session";
+        self.publishNotice(if (disabled) "Empty disables proxy; a new session applies it" else "Saved proxy address; main route applies in a new session");
     }
     fn proxySubKey(self: *Ui, event_: input.Event) !void {
         switch (event_) {
@@ -3447,7 +3526,7 @@ const Ui = struct {
         // The owner publishes; the UI never rewrites its own selected copy.
         self.display.context = self.connection.current().initial_context;
         self.frame_settings_generation = null;
-        self.notice = "Saved proxy models; main route applies in a new session";
+        self.publishNotice("Saved proxy models; main route applies in a new session");
     }
     fn settingsKey(self: *Ui, event_: input.Event) !void {
         if (self.normalAsyncPending() and event_ != .escape and event_ != .cancel and event_ != .left and event_ != .quit) return;
@@ -3622,6 +3701,127 @@ const Ui = struct {
         self.provider_open = true;
         self.notice = "Ready";
     }
+    fn startCodexLogin(self: *Ui) void {
+        const baseline = self.connection.current().codex_login.generation;
+        if (self.connection.async_actions != null) {
+            // Queue admission is not the owner's acceptance: keep the panel
+            // closed until the typed RPC completion arrives.
+            if (self.beginAsync(.{ .codex_login = .{ .action = .start, .generation = 0 } }, .codex_login) == null) return;
+            self.closeProviderPicker();
+            self.codex_baseline = baseline;
+            self.codex_generation = null;
+            self.codex_cancel_waiting = false;
+            self.codex_view_hash = 0;
+            self.codex_opening = true;
+            self.codex_open = false;
+            self.parser.stop_feed = true;
+            self.requestDraw();
+            return;
+        }
+        // Local foreground owner only: the synchronous callback is the owner.
+        self.connection.codexLogin(.start, 0) catch {
+            self.notice = "OpenAI Codex device login unavailable";
+            return;
+        };
+        self.closeProviderPicker();
+        self.codex_baseline = baseline;
+        self.codex_generation = null;
+        self.codex_cancel_waiting = false;
+        self.codex_view_hash = 0;
+        self.codex_opening = false;
+        self.codex_open = true;
+        self.notice = "Ready";
+        self.parser.stop_feed = true;
+        self.observeCodexLogin();
+        self.requestDraw();
+    }
+
+    fn cancelCodexLogin(self: *Ui) void {
+        if (self.codex_generation) |generation| {
+            if (self.connection.current().codex_login.generation != generation) {
+                self.notice = "OpenAI Codex login state changed; cannot cancel";
+                return;
+            }
+            if (self.connection.async_actions != null) {
+                if (self.beginAsync(.{ .codex_login = .{ .action = .cancel, .generation = generation } }, .codex_login) == null) return;
+                // Keep the panel bound to this generation until the RPC is
+                // accepted; the completion closes it, not queue admission.
+                self.parser.stop_feed = true;
+                self.requestDraw();
+                return;
+            }
+            self.connection.codexLogin(.cancel, generation) catch {
+                self.notice = "Could not cancel OpenAI Codex login";
+                return;
+            };
+            self.codex_open = false;
+            self.codex_opening = false;
+            self.codex_generation = null;
+            self.notice = "Ready";
+        } else {
+            // The owner has accepted start but has not published its generation.
+            // Defer cancellation until we can target that exact generation.
+            self.codex_cancel_waiting = true;
+        }
+        self.parser.stop_feed = true;
+        self.requestDraw();
+    }
+
+    fn observeCodexLogin(self: *Ui) void {
+        if (!self.codex_open) return;
+        const view = self.connection.current().codex_login;
+        if (self.codex_generation == null) {
+            if (view.generation == self.codex_baseline or view.status == .idle) return;
+            self.codex_generation = view.generation;
+        }
+        if (view.generation != self.codex_generation.?) return;
+        if (self.codex_cancel_waiting) {
+            // Consume the deferred intent exactly once. A rejected admission is
+            // not retried on every poll, which would repaint the same warning.
+            self.codex_cancel_waiting = false;
+            self.cancelCodexLogin();
+            return;
+        }
+        switch (view.status) {
+            .idle => return,
+            .succeeded => {
+                self.codex_open = false;
+                self.codex_generation = null;
+                self.notice = "Ready";
+                self.publishNotice("OpenAI Codex connected");
+                self.requestDraw();
+            },
+            .canceled => {
+                self.codex_open = false;
+                self.codex_generation = null;
+                self.notice = "Ready";
+                self.requestDraw();
+            },
+            .failed => {
+                self.codex_open = false;
+                self.codex_generation = null;
+                self.notice = switch (view.failure orelse .other) {
+                    .unavailable => "OpenAI Codex login unavailable",
+                    .denied => "OpenAI Codex login denied",
+                    .expired => "OpenAI Codex login expired",
+                    .busy => "OpenAI Codex login busy",
+                    .invalid_response => "OpenAI Codex login response invalid",
+                    .storage => "OpenAI Codex login could not be saved",
+                    .other => "OpenAI Codex login failed",
+                };
+                self.requestDraw();
+            },
+            .pending => {
+                const code = if (validCodexCode(&view)) view.userCode() else "";
+                const hash = std.hash.Wyhash.hash(view.generation, code);
+                if (hash != self.codex_view_hash) {
+                    self.codex_view_hash = hash;
+                    self.requestDraw();
+                }
+            },
+        }
+    }
+
     fn beginSecret(self: *Ui, provider: ?core_config.providers.Id) void {
         self.secret_provider = provider;
         self.secret.wipe();
@@ -3651,6 +3851,10 @@ const Ui = struct {
                     return;
                 };
                 const choice = self.provider_choices.items[@min(self.provider_picker.selected, self.provider_choices.len - 1)];
+                if (choice == .provider and choice.provider == .openai_codex) {
+                    self.startCodexLogin();
+                    return;
+                }
                 self.closeProviderPicker();
                 self.beginSecret(switch (choice) {
                     .current => null,
@@ -3859,12 +4063,12 @@ const Ui = struct {
                     return;
                 };
                 self.wipeEditor();
-                self.notice = "Queue resumed";
+                self.publishNotice("Queue resumed");
                 return;
             }
             self.inbox.@"resume"();
             self.wipeEditor();
-            self.notice = "Queue resumed";
+            self.publishNotice("Queue resumed");
             return;
         }
         if (std.mem.eql(u8, command, "/model --refresh")) {
@@ -3955,9 +4159,10 @@ const Ui = struct {
         }
         if (std.mem.startsWith(u8, command, "/")) {
             const auth = std.mem.eql(u8, command, "/login");
+            const codex = std.mem.eql(u8, command, "/login openai-codex");
             const idle = self.settingsIdle() and !self.editor_pasted;
             self.wipeEditor();
-            if (!auth) {
+            if (!auth and !codex) {
                 self.notice = "Unknown command; use /help, /model, /login, /compact or /settings";
             } else if (!idle) {
                 self.notice = "Setup requires an idle, non-pasted session";
@@ -3966,7 +4171,7 @@ const Ui = struct {
                     self.notice = "Setup requires a drained session bridge";
                     return;
                 };
-                if (self.connection.configure_provider_fn != null) self.openProviderPicker() else if (configured(self.connection.current())) self.notice = "Already configured; /login does not replace this session" else self.beginSecret(null);
+                if (codex) self.startCodexLogin() else if (self.connection.configure_provider_fn != null or self.connection.codex_login_fn != null) self.openProviderPicker() else if (configured(self.connection.current())) self.notice = "Already configured; /login does not replace this session" else self.beginSecret(null);
             }
             return;
         }
@@ -4333,7 +4538,7 @@ const Ui = struct {
             };
             self.wipeEditor();
             self.parser.stop_feed = true;
-            self.notice = if (kind == .steering) "Steering pending" else "FollowUp pending";
+            self.publishNotice(if (kind == .steering) "Steering pending" else "FollowUp pending");
             return;
         }
         if (self.attached_runtime == null) {
@@ -4346,7 +4551,7 @@ const Ui = struct {
         };
         self.wipeEditor();
         self.parser.stop_feed = true;
-        self.notice = if (kind == .steering) "Steering pending" else "FollowUp pending";
+        self.publishNotice(if (kind == .steering) "Steering pending" else "FollowUp pending");
     }
 
     fn dispatchNext(self: *Ui) !void {
@@ -4592,7 +4797,7 @@ const Ui = struct {
                 }
                 self.editor_pasted = false;
                 self.input_history.index = null;
-                self.notice = "Pending message withdrawn as plain draft";
+                self.publishNotice("Pending message withdrawn as plain draft");
                 return;
             }
             self.editor.bytes.ensureTotalCapacity(self.editor.allocator, snapshot.newest_bytes) catch {
@@ -4606,7 +4811,7 @@ const Ui = struct {
                 self.editor.cursor = entry.text.len;
                 self.editor_pasted = false;
                 self.input_history.index = null;
-                self.notice = "Pending message withdrawn as plain draft";
+                self.publishNotice("Pending message withdrawn as plain draft");
             } else self.notice = "Message already consumed; nothing withdrawn";
             return;
         }
@@ -4714,7 +4919,7 @@ const Ui = struct {
                 // endSecret still wipes parser scratch and sets stop_feed.
                 self.secret_quarantine = false;
                 self.wipeEditor();
-                self.notice = if (named) "Key saved locally; use /model to select or activate it" else "Saved locally; send a message to connect";
+                self.publishNotice(if (named) "Key saved locally; use /model to select or activate it" else "Saved locally; send a message to connect");
             },
             else => {},
         }
@@ -4769,8 +4974,8 @@ const Ui = struct {
                 self.parser.stop_feed = true;
                 return;
             };
-            self.notice = if (decision == .deny) "Request denied" else "Allowed once";
-        } else if (self.bridge.decide(permission.id, decision)) self.notice = if (decision == .deny) "Request denied" else "Allowed once" else self.notice = "Permission expired";
+            self.publishNotice(if (decision == .deny) "Request denied" else "Allowed once");
+        } else if (self.bridge.decide(permission.id, decision)) self.publishNotice(if (decision == .deny) "Request denied" else "Allowed once") else self.notice = "Permission expired";
         self.clearPermission();
         self.parser.stop_feed = true;
     }
@@ -4848,6 +5053,10 @@ const Ui = struct {
             return;
         }
 
+        if (self.codex_open or self.codex_opening) {
+            if (event_ == .quit) self.requestQuit() else if (event_ == .escape and !self.parser.pasted and !self.parser.batch_paste) self.cancelCodexLogin();
+            return;
+        }
         if (self.stop_open) {
             if (self.parser.batch_paste and event_ != .quit and event_ != .paste_start) return;
             self.stopKey(event_);
@@ -4985,16 +5194,11 @@ const Ui = struct {
         if (self.model_picker) |*picker| picker.changed();
         self.displayed_model_generation = null;
         if (state.metadata_notice) |notice| {
-            if (state.metadata_notice_ttl_ms != 0) {
-                // Other owner updates (e.g. Memory) must not restart this TTL.
-                if (!std.meta.eql(before.metadata_notice, state.metadata_notice)) {
-                    self.metadata_toast = .{ .text = notice, .until_ms = self.clock_ms +| state.metadata_notice_ttl_ms };
-                    if (std.mem.eql(u8, self.notice, "Refreshing official model metadata...") or
-                        (if (before.metadata_notice) |previous| std.mem.eql(u8, self.notice, previous) else false)) self.notice = "Ready";
-                }
-            } else {
-                self.metadata_toast = null;
-                self.notice = notice;
+            const same = if (before.metadata_notice) |previous| std.mem.eql(u8, previous, notice) else false;
+            if (!same) {
+                // Producer-classified success is a one-shot transcript notice;
+                // an unclassified failure stays actionable in the hint.
+                if (state.metadata_notice_ttl_ms != 0) self.publishNotice(notice) else self.notice = notice;
             }
         }
         self.requestDraw();
@@ -5006,37 +5210,17 @@ const Ui = struct {
         else
             notice == null;
         if (same) return;
-        // Coordinator notices are borrowed static strings. A persistent notice
-        // is observed once, not republished by each owner poll or frame.
+        // Coordinator strings are static; only mark observed after the display
+        // record owns its bytes, so repeated snapshots cannot duplicate it.
+        if (notice) |message| {
+            _ = self.add(.notice, message) catch {
+                self.notice = "Display notice unavailable; inspect operation state";
+                self.requestDraw();
+                return;
+            };
+        }
         self.memory_notice_seen = notice;
-        self.memory_notice_until_ms = null;
-        self.memory_notice_expired = false;
         self.requestDraw();
-    }
-
-    fn presentMemoryNotice(self: *Ui, notice: []const u8) ?[]const u8 {
-        if (!std.mem.eql(u8, notice, "Memory: request outcome uncertain; no automatic replay")) return notice;
-        if (self.memory_notice_expired) return null;
-        // Start only when eligible for presentation, not while another error,
-        // menu or metadata toast is hiding this advisory.
-        if (self.memory_notice_until_ms == null) self.memory_notice_until_ms = self.clock_ms +| 3000;
-        self.expireMemoryNotice();
-        return if (self.memory_notice_expired) null else notice;
-    }
-
-    fn expireMemoryNotice(self: *Ui) void {
-        if (self.memory_notice_until_ms) |until| if (self.clock_ms >= until) {
-            self.memory_notice_until_ms = null;
-            self.memory_notice_expired = true;
-            self.requestDraw();
-        };
-    }
-
-    fn expireMetadataToast(self: *Ui) void {
-        if (self.metadata_toast) |toast| if (self.clock_ms >= toast.until_ms) {
-            self.metadata_toast = null;
-            self.requestDraw();
-        };
     }
 
     /// The only displayed wording for a delivered terminal result. Shared so a
@@ -5239,7 +5423,10 @@ const Ui = struct {
         // preview for a composer pulse sends its title/body again every 80 ms.
         // Keep polling/cancellation alive, but redraw only for actual events,
         // input until the approval is cleared. Never clear dirty here.
-        if (self.permission == null) self.dirty = true;
+        // A static pending preview needs no spinner-only repaint. Real events,
+        // input and tool timing retain their normal independent draw requests.
+        const queue = self.queueSnapshot();
+        if (self.permission == null and (queue.preview_count == 0 or self.active_tool != null)) self.dirty = true;
     }
 
     /// 主事件循环：有界消费、处理按键，然后绘制最新状态；仅动画自身限频。
@@ -5253,8 +5440,6 @@ const Ui = struct {
             // 档位确认到期后自动恢复为上下文百分比，不必等下一次按键。
             // 主循环每轮最多等待 16ms，因此到期后无需额外唤醒。
             self.expireEffortFlash();
-            self.expireMetadataToast();
-            self.expireMemoryNotice();
             self.pumpAsync();
             // Both local and remote output share the bounded event budget;
             // buffered remote deltas must not wait one terminal tick apiece.
@@ -5284,6 +5469,7 @@ const Ui = struct {
 
             self.refreshStop();
             self.pollMetadata();
+            self.observeCodexLogin();
             const dimensions = self.terminal.size();
             self.resize(dimensions);
 
@@ -6022,14 +6208,14 @@ const Ui = struct {
         const compact = (release_idle and self.tail_hint_hash == hint_hash) or
             ((self.compact_composer and self.compact_hint_hash == hint_hash) and
                 !self.busy and self.permission == null and !self.stop_open and !self.settings_open and
-                !self.provider_open and self.model_picker == null and !self.commandMenuVisible() and
+                !self.provider_open and !self.codex_open and self.model_picker == null and !self.commandMenuVisible() and
                 !self.secret_mode and !self.secret_quarantine and thinking == null and composer_rows == 1);
         // The separator row is footprint, so it exists only while there is
         // something above it to separate: mutable body, an approval/secret
         // panel, pending reasoning, a candidate/menu popup, or canonical rows
         // released above this tail. Initial entry has none of these and writes
         // the composer alone at the terminal's existing row.
-        const popup_requested = self.stop_open or self.settings_open or self.provider_open or
+        const popup_requested = self.codex_open or self.stop_open or self.settings_open or self.provider_open or
             self.model_picker != null or (!release_idle and self.commandMenuVisible()) or
             (self.permission == null and queue_snapshot.preview_count != 0);
         const above_content = for (above) |line| {
@@ -6101,8 +6287,11 @@ const Ui = struct {
         const narrow = [_][]const u8{"Resize to confirm (Esc continues)"};
         const stop_fits = self.stop_open and candidate_limit >= stop_popup.len and
             cols >= text.width(stop_title) and cols >= text.width(stop_popup[1]) and cols >= text.width(stop_popup[2]);
-        const popup_lines: []const []const u8 = if (self.stop_open) (if (stop_fits) stop_popup else &narrow) else if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else if (menu_visible) menu_rows.lines else queue_lines.items;
-        const selected_line = if (self.stop_open) @as(?usize, if (self.stop_danger) 2 else 1) else if (self.settings_open) settings_rows.selected_line else if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else menu_rows.selected_line;
+        const codex_view = state.codex_login;
+        const codex_code = if (self.codex_generation != null and codex_view.generation == self.codex_generation.? and codex_view.status == .pending and validCodexCode(&codex_view)) codex_view.userCode() else "";
+        const codex_popup = [_][]const u8{ corecodex.verification_url, if (codex_code.len != 0) codex_code else "Waiting for device code...", "Esc cancels" };
+        const popup_lines: []const []const u8 = if (self.codex_open) &codex_popup else if (self.stop_open) (if (stop_fits) stop_popup else &narrow) else if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else if (menu_visible) menu_rows.lines else queue_lines.items;
+        const selected_line = if (self.codex_open) @as(?usize, null) else if (self.stop_open) @as(?usize, if (self.stop_danger) 2 else 1) else if (self.settings_open) settings_rows.selected_line else if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else menu_rows.selected_line;
         const checked_mask: u16 = if (self.stop_open) 0 else if (self.provider_open) provider_rows.checked_mask else if (self.model_picker != null) picker_rows.checked_mask else 0;
         const popup_gap: usize = @intFromBool(popup_lines.len != 0);
         const content_body_limit = body_limit -| (popup_lines.len + popup_gap);
@@ -6129,9 +6318,11 @@ const Ui = struct {
             self.tail_height != 0 and !self.abandon_tail;
         const show_thinking = thinking != null and !thinking_deferred;
         self.frame_delivery_reasoning = show_thinking;
+        const overlay_visible = self.codex_open or self.permission != null or popup_lines.len != 0 or menu_visible or
+            self.model_picker != null or self.provider_open or self.settings_open;
         const wanted_body = if (self.stop_open) 0 else if (self.permission != null)
             @min(body_limit, 2 + @max(1, approval_lines.lines.len))
-        else if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (show_thinking) @min(thinking_gap + @min(3, thinking_lines.len), content_body_limit) else @min(borrowed.len + lines.items.len, content_body_limit);
+        else if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (show_thinking) @min(thinking_gap + @min(3, thinking_lines.len), content_body_limit) else @min((if (overlay_visible) @as(usize, 0) else borrowed.len) + lines.items.len, content_body_limit);
         const wanted_rows = @min(self.size.rows, footer_rows + popup_lines.len + popup_gap + wanted_body);
         // Reuse the ACKed footprint when content contracts. This keeps the
         // composer's last row at the physical bottom without inventing a
@@ -6147,8 +6338,6 @@ const Ui = struct {
         // Any overlay (permission, candidate menus, pickers) may need rows above
         // the live tail. They are borrowed from ACKed transcript rows so closing
         // the overlay restores them instead of leaving the rows overwritten.
-        const overlay_visible = self.permission != null or popup_lines.len != 0 or menu_visible or
-            self.model_picker != null or self.provider_open or self.settings_open;
         const borrow_count = if (overlay_visible and transcript_rows == 0)
             @min(rows -| self.tail_height, above.len)
         else
@@ -6699,6 +6888,20 @@ fn testAcknowledgeFullFrame(ui: *Ui) void {
     ui.finishFrame();
 }
 
+/// Ordinary one-shot successes live in the display transcript, not the footer.
+/// Keep the wording assertions on that record so an actionable footer can
+/// still own errors, approvals and pending queue state at the same time.
+fn publishedNotice(ui: *const Ui, needle: []const u8) bool {
+    var index = ui.records.items.len;
+    while (index > 0) {
+        index -= 1;
+        const record = ui.records.items[index];
+        if (record.kind != .notice) continue;
+        if (std.mem.find(u8, record.body.items, needle) != null) return true;
+    }
+    return false;
+}
+
 /// Prior shell output with the cursor left on the physical bottom row, so the
 /// floating composer starts where a real terminal prompt stopped. No text
 /// reflow or native-viewport position is inferred from this fixture.
@@ -6712,6 +6915,54 @@ fn seedPriorBottom(screen: *@import("../tests/regular_screen.zig").Screen) !void
 fn rowStartingWith(screen: *const @import("../tests/regular_screen.zig").Screen, prefix: []const u8) !usize {
     for (screen.grid, 0..) |line, row| if (std.mem.startsWith(u8, &line, prefix)) return row;
     return error.MissingRowPrefix;
+}
+
+test "stable pending pulses preserve native history and tail" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try seedPriorBottom(&screen);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    ui.busy = true;
+    _ = try ui.inbox.enqueue(std.testing.allocator, .steering, "hold pending");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    const history = screen.history_len;
+    const height = ui.tail_height;
+    ui.dirty = false;
+    for (1..25) |i| {
+        ui.clock_ms = @intCast(i * 80);
+        ui.animate();
+        try std.testing.expect(!ui.dirty);
+        // Even if independent work requires a redraw, identical pending
+        // snapshots must use owned rows and cannot advance native history.
+        try ui.draw();
+        try screen.replay(ui.frame);
+        testAcknowledgeFullFrame(&ui);
+        try std.testing.expectEqual(history, screen.history_len);
+        try std.testing.expectEqual(height, ui.tail_height);
+        try std.testing.expectEqual(screen.rows - 1, screen.row + ui.tail_cursor_rows_up);
+    }
+}
+
+test "memory notice is display only and repeated snapshot is not duplicated" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.observeMemoryNotice("Memory: saved");
+    ui.observeMemoryNotice("Memory: saved");
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
+    try std.testing.expectEqualStrings("Memory: saved", ui.records.items[0].body.items);
+    try std.testing.expect(ui.future == null and !ui.has_submitted);
 }
 
 test "bottom composer stays anchored across draft and menu frames" {
@@ -9841,6 +10092,8 @@ test "resize at every sparse frame byte drops stale relative edits and cannot re
 fn discardFixtureFrame(ui: *Ui) void {
     // Test-only discard of an unsent preview, NOT an acknowledgement. Legacy
     // tests freed only frame_arena; candidates now own a separate arena too.
+    ui.discardFrameRecords(ui.frame_records);
+    ui.frame_records = &.{};
     if (ui.frame_arena) |*arena| arena.deinit();
     if (ui.frame_tail_snapshot) |*snapshot| snapshot.deinit();
     if (ui.frame_menu_history) |*history| history.deinit();
@@ -10015,7 +10268,6 @@ test "decision pause wins over stale Ready thinking warnings and empty queue pau
     var state = ui.connection.current();
     state.settings_notice = "Saved thinking level not applied: model capabilities unknown";
     state.pending_default_effort = .medium;
-    state.logging_enabled = false;
     ui.notice = "Ready";
     ui.last_terminal = .{ .status = .paused, .detail = error.DecisionUnavailable };
     ui.inbox.pause();
@@ -10040,7 +10292,6 @@ test "decision pause wins over stale Ready thinking warnings and empty queue pau
     try std.testing.expect(std.mem.find(u8, storage, "REC FAILED") != null);
     state.settings_error = null;
     state.log_error = null;
-    state.logging_enabled = true;
     // Cancellation must retain the meaningful side-effect warning even when a
     // later redraw/menu has reset the transient notice to Ready.
     ui.last_terminal = .{ .status = .canceled, .detail = error.Canceled };
@@ -10421,7 +10672,7 @@ test "exit drains final canonical transcript on owned PTY without erasing earlie
         try std.testing.expect(std.mem.find(u8, output, forbidden) == null);
 }
 
-test "application log failure and opt-out remain visible without poisoning runtime" {
+test "application log failure remains visible without poisoning runtime" {
     const ConnectionFixture = struct {
         runtime: r.Runtime = undefined, // 仅借用地址供 ready 状态判断，本测试不调用它。
         failed: bool,
@@ -10432,7 +10683,6 @@ test "application log failure and opt-out remain visible without poisoning runti
                 .runtime = &self.runtime,
                 .model = "fixture",
                 .base_url = "http://unused.invalid",
-                .logging_enabled = self.failed,
                 .log_error = if (self.failed) error.NoSpaceLeft else null,
             };
         }
@@ -10447,7 +10697,7 @@ test "application log failure and opt-out remain visible without poisoning runti
         ui.connection.context = &connection;
         ui.connection.current_fn = ConnectionFixture.current;
         try ui.draw();
-        try std.testing.expect(std.mem.find(u8, ui.frame, if (failed) "REC FAILED: NoSpaceLeft" else "recording off") != null);
+        if (failed) try std.testing.expect(std.mem.find(u8, ui.frame, "REC FAILED: NoSpaceLeft") != null) else try std.testing.expect(std.mem.find(u8, ui.frame, "REC FAILED") == null);
         try std.testing.expect(!ui.poisoned);
         try std.testing.expect(!cancel.isRequested());
     }
@@ -12230,7 +12480,7 @@ test "secret Escape cancels and Left returns to provider without leaking paste t
     for (ui.secret.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
-test "metadata success toast expires without input and owner polls do not renew it" {
+test "metadata success publishes one transcript notice from an owner transition" {
     const Fixture = struct {
         notice: ?[]const u8 = null,
         next: ?[]const u8 = "Official model list refreshed",
@@ -12259,41 +12509,33 @@ test "metadata success toast expires without input and owner polls do not renew 
     ui.notice = "Refreshing official model metadata...";
     ui.clock_ms = 100;
     ui.pollMetadata();
+    // Ordinary success is a one-shot display record; the footer returns to the
+    // actionable default instead of owning a timer.
     try std.testing.expectEqualStrings("Ready", ui.notice);
-    try std.testing.expectEqual(@as(u64, 3100), ui.metadata_toast.?.until_ms);
-    try std.testing.expectEqualStrings(fixture.next.?, try ui.hint(std.testing.allocator, ui.connection.current()));
-    ui.clock_ms = 3099;
-    ui.pollMetadata(); // A Memory/default owner change must not extend the toast.
-    try std.testing.expectEqual(@as(u64, 3100), ui.metadata_toast.?.until_ms);
-    ui.dirty = false;
-    ui.expireMetadataToast();
-    try std.testing.expect(ui.metadata_toast != null and !ui.dirty);
-    ui.clock_ms = 3100;
-    ui.expireMetadataToast();
-    try std.testing.expect(ui.metadata_toast == null and ui.dirty);
-    ui.pollMetadata();
-    try std.testing.expect(ui.metadata_toast == null); // No resurrection.
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
+    try std.testing.expectEqualStrings(fixture.next.?, ui.records.items[0].body.items);
     try std.testing.expectEqualStrings("", try ui.hint(std.testing.allocator, ui.connection.current()));
+    // Repeated identical snapshots, even far in the future, never duplicate the
+    // record, hide the draft or stage a timer-driven frame.
+    ui.pollMetadata();
+    ui.clock_ms = 999_999;
+    ui.pollMetadata();
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     try std.testing.expectEqualStrings("kept draft", ui.editor.bytes.items);
-    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 
-    // A later success is shown again, but never overwrites a foreground error.
+    // A later owner transition publishes exactly one more record.
     fixture.notice = null;
-    ui.notice = "Foreground error";
     ui.clock_ms = 4000;
     ui.pollMetadata();
-    try std.testing.expect(ui.metadata_toast != null);
-    try std.testing.expectEqualStrings("Foreground error", try ui.hint(std.testing.allocator, ui.connection.current()));
-    ui.clock_ms = 7000;
-    ui.expireMetadataToast();
-    try std.testing.expectEqualStrings("Foreground error", ui.notice);
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expectEqual(Kind.notice, ui.records.items[1].kind);
+    // An unclassified failure remains actionable in the footer and adds no record.
     fixture.next = "Official metadata refresh failed; cached/default values kept";
     fixture.ttl = 0;
     ui.pollMetadata();
-    ui.clock_ms = 20000;
-    ui.expireMetadataToast();
-    try std.testing.expect(ui.metadata_toast == null);
     try std.testing.expectEqualStrings(fixture.next.?, ui.notice);
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
 }
 
 test "memory notice owner poll dirties UI without replacing foreground notice" {
@@ -12330,8 +12572,10 @@ test "memory notice owner poll dirties UI without replacing foreground notice" {
         try std.testing.expectEqualStrings("Foreground error", ui.notice);
         ui.dirty = false;
         ui.pollMetadata();
-        try std.testing.expect(!ui.dirty);
+        try std.testing.expect(!ui.dirty); // Identical snapshot is not a transition.
     }
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqualStrings("Memory: updating", ui.records.items[0].body.items);
 }
 
 test "memory notice is advisory and never replaces errors queue or settings" {
@@ -12346,7 +12590,8 @@ test "memory notice is advisory and never replaces errors queue or settings" {
     var state = ui.connection.current();
     state.runtime = &runtime;
     state.memory_notice = "Memory: updating";
-    try std.testing.expectEqualStrings("Memory: updating", try ui.hint(arena.allocator(), state));
+    // Advisory worker notices are display records, never footer hints.
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
     ui.notice = "Approval required";
     try std.testing.expectEqualStrings("Approval required", try ui.hint(arena.allocator(), state));
     ui.notice = "Ready";
@@ -12485,7 +12730,7 @@ test "wrapped composer idle LF debt first obtains a single row fresh ACK" {
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 }
 
-test "uncertain memory notice expires once without replay or hiding newer errors" {
+test "uncertain memory notice is a display record and never a timed hint" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -12496,62 +12741,26 @@ test "uncertain memory notice expires once without replay or hiding newer errors
     state.runtime = &runtime;
     state.memory_notice = "Memory: request outcome uncertain; no automatic replay";
     ui.clock_ms = 100;
-    try std.testing.expectEqualStrings(state.memory_notice.?, try ui.hint(std.testing.allocator, state));
-    try std.testing.expectEqual(@as(u64, 3100), ui.memory_notice_until_ms.?);
-    ui.clock_ms = 3099;
-    ui.observeMemoryNotice(state.memory_notice);
-    try std.testing.expectEqualStrings(state.memory_notice.?, try ui.hint(std.testing.allocator, state));
-    try std.testing.expectEqual(@as(u64, 3100), ui.memory_notice_until_ms.?);
-    ui.notice = "Foreground error";
-    ui.clock_ms = 3100;
-    ui.dirty = false;
-    ui.expireMemoryNotice();
-    try std.testing.expect(ui.dirty and ui.memory_notice_expired);
-    try std.testing.expectEqualStrings("Foreground error", try ui.hint(std.testing.allocator, state));
-    ui.notice = "Ready";
-    ui.clock_ms = 20000;
-    ui.observeMemoryNotice(state.memory_notice);
+    // The advisory never owns the footer; it is published once as a record.
     try std.testing.expectEqualStrings("", try ui.hint(std.testing.allocator, state));
-    try std.testing.expect(ui.memory_notice_until_ms == null);
-    state.memory_notice = "Memory: extraction failed";
-    try std.testing.expectEqualStrings(state.memory_notice.?, try ui.hint(std.testing.allocator, state));
-    ui.clock_ms = 999999;
-    ui.expireMemoryNotice();
-    try std.testing.expectEqualStrings(state.memory_notice.?, try ui.hint(std.testing.allocator, state));
-    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
-    try std.testing.expect(ui.inbox.snapshot().newest_id == null);
-}
-
-test "uncertain memory notice starts when visible and a new transition may show again" {
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    var runtime: r.Runtime = undefined;
-    var state = ui.connection.current();
-    state.runtime = &runtime;
-    state.memory_notice = "Memory: request outcome uncertain; no automatic replay";
-    ui.clock_ms = 100;
-    ui.metadata_toast = .{ .text = "Visible metadata", .until_ms = 5000 };
-    try std.testing.expectEqualStrings("Visible metadata", try ui.hint(std.testing.allocator, state));
-    try std.testing.expect(ui.memory_notice_until_ms == null);
-    ui.clock_ms = 5000;
-    ui.expireMetadataToast();
-    try std.testing.expectEqualStrings(state.memory_notice.?, try ui.hint(std.testing.allocator, state));
-    try std.testing.expectEqual(@as(u64, 8000), ui.memory_notice_until_ms.?);
-    ui.clock_ms = 8000;
-    ui.expireMemoryNotice();
+    ui.observeMemoryNotice(state.memory_notice);
+    ui.observeMemoryNotice(state.memory_notice);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
+    try std.testing.expectEqualStrings(state.memory_notice.?, ui.records.items[0].body.items);
+    // An actionable foreground error is never replaced by the advisory record.
+    ui.notice = "Foreground error";
+    try std.testing.expectEqualStrings("Foreground error", try ui.hint(std.testing.allocator, state));
+    // Neither advanced time nor a new owner transition re-publishes or hides it.
+    ui.notice = "Ready";
+    ui.clock_ms = 999_999;
     try std.testing.expectEqualStrings("", try ui.hint(std.testing.allocator, state));
     ui.observeMemoryNotice(null);
-    try std.testing.expectEqualStrings(state.memory_notice.?, try ui.hint(std.testing.allocator, state));
-    try std.testing.expectEqual(@as(u64, 11000), ui.memory_notice_until_ms.?);
-    // Similar warnings are not accidentally included in this exact TTL policy.
-    state.memory_notice = "Memory: request outcome uncertain; manual action required";
-    try std.testing.expectEqualStrings(state.memory_notice.?, try ui.hint(std.testing.allocator, state));
-    ui.clock_ms = 999999;
-    ui.expireMemoryNotice();
-    try std.testing.expectEqualStrings(state.memory_notice.?, try ui.hint(std.testing.allocator, state));
+    ui.observeMemoryNotice(state.memory_notice);
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expectEqualStrings("", try ui.hint(std.testing.allocator, state));
+    try std.testing.expect(ui.future == null and !ui.has_submitted);
+    try std.testing.expect(ui.inbox.snapshot().newest_id == null);
 }
 
 test "authentication failure hint preserves HTTP status and separates thinking notice" {
@@ -12638,7 +12847,8 @@ test "provider auth Go fresh Enter after pasted key restores ordinary drawn comp
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(fixture.key_matched and fixture.provider_saves == 1);
     try std.testing.expectEqual(core_config.providers.Id.opencode_go, fixture.saved_provider.?);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "saved locally") != null);
+    try std.testing.expect(publishedNotice(&ui, "saved locally"));
+    try std.testing.expectEqualStrings("Ready", ui.notice);
 }
 
 test "provider auth denies partial stale resize reopen and pasted choices" {
@@ -12701,7 +12911,7 @@ test "provider auth requires a visible full label and save failure wipes the key
     ui.connection.configure_provider_fn = SelectionFixture.configureProvider;
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("/login\r", sink);
-    try std.testing.expectEqual(@as(usize, 3), ui.provider_choices.len);
+    try std.testing.expectEqual(core_config.providers.Id.all.len, ui.provider_choices.len);
     ui.size = .{ .columns = 12, .rows = 9 };
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
@@ -12745,7 +12955,7 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = true });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .auto_refresh_models = true });
     defer session.deinit();
     session.metadata_fetch = Fetch.official;
     session.metadata_dev_fetch = Fetch.public;
@@ -14235,8 +14445,8 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
     try std.testing.expectEqualStrings("fixture/one", fixture.proxy_last.?);
     try std.testing.expect(fixture.proxy_last_enabled);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "Saved proxy models") != null);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "new session") != null);
+    try std.testing.expect(publishedNotice(&ui, "Saved proxy models"));
+    try std.testing.expect(publishedNotice(&ui, "new session"));
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
     try ui.draw();
@@ -14327,7 +14537,7 @@ test "proxy picker owns its query while the parent submenu stays marked" {
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_address_saves);
     try std.testing.expect(ui.proxy_open and !ui.proxy_address_open);
     try std.testing.expectEqualStrings("two", ui.editor.bytes.items);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "Saved proxy models") != null);
+    try std.testing.expect(publishedNotice(&ui, "Saved proxy models"));
     // Esc still returns to the parent Models row, keeping the submenu.
     try ui.settingsKey(.escape);
     try std.testing.expect(!ui.proxy_open and ui.proxy_sub_open and !ui.proxy_address_open and ui.settings_open);
@@ -14433,8 +14643,8 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     // A saved address returns to the second level, never to the editor.
     try std.testing.expect(!ui.proxy_address_open and ui.proxy_sub_open and !ui.proxy_open);
     try std.testing.expectEqual(@as(usize, 0), ui.settings_menu.selected);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "Saved proxy address") != null);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "new session") != null);
+    try std.testing.expect(publishedNotice(&ui, "Saved proxy address"));
+    try std.testing.expect(publishedNotice(&ui, "new session"));
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "127.0.0.1:8888") != null);
     testAcknowledgeFullFrame(&ui);
@@ -14485,7 +14695,7 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_len);
     try std.testing.expectEqual(@as(usize, 0), SelectionFixture.current(&fixture).proxy_models.len);
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "Empty disables proxy") != null);
+    try std.testing.expect(publishedNotice(&ui, "Empty disables proxy"));
     try std.testing.expect(!ui.proxy_address_open and ui.proxy_sub_open);
 }
 
@@ -15106,7 +15316,8 @@ test "configure enables same-process submit without sending secrets or commands"
     try ui.parser.feed("/login\r", sink);
     try ui.parser.feed("\x1b[200~sk-fixture-secret\x1b[201~", sink);
     try ui.parser.feed("\rsecret-tail", sink);
-    try std.testing.expectEqualStrings("Saved locally; send a message to connect", ui.notice);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    try std.testing.expect(publishedNotice(&ui, "Saved locally; send a message to connect"));
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Saved locally; send a message to connect") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Esc closes") == null);
@@ -15115,7 +15326,8 @@ test "configure enables same-process submit without sending secrets or commands"
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 1), fixture.saves);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
     for (ui.secret.bytes) |b| try std.testing.expectEqual(@as(u8, 0), b);
     try ui.parser.feed("/login\r", sink);
     try std.testing.expect(!ui.secret_mode);
@@ -15125,7 +15337,7 @@ test "configure enables same-process submit without sending secrets or commands"
     try ui.complete();
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expectEqualStrings("hello", runtime.messages()[0].blocks[0].text);
-    try std.testing.expectEqualStrings("hello", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("hello", ui.records.items[1].body.items);
     for (ui.records.items) |record| try std.testing.expect(std.mem.find(u8, record.body.items, "sk-fixture-secret") == null);
 }
 
@@ -15136,6 +15348,8 @@ test "configure enables same-process submit without sending secrets or commands"
 
 const FakeRemote = struct {
     snapshot: session_client.Snapshot = .{ .available = true, .attached = true, .control_epoch = 1 },
+    /// Owner-published device-login view; display-only, never credentials.
+    codex: corecodex.View = .{},
     item: ?session_client.Item = null,
     buffered_items: []session_client.Item = &.{},
     buffered_index: usize = 0,
@@ -15314,6 +15528,7 @@ const FakeRemote = struct {
             .session_id = self.snapshot.session_id,
             .control_epoch = self.snapshot.control_epoch,
             .model = "fixture",
+            .codex_login = self.codex,
             .base_url = "",
         };
     }
@@ -16920,7 +17135,8 @@ test "async queue reply does not block body delivery or erase typeahead" {
     actions.complete(.none, null, false);
     ui.pumpAsync();
     try std.testing.expectEqualStrings("typeahead", ui.editor.bytes.items);
-    try std.testing.expectEqualStrings("Steering pending", ui.notice);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    try std.testing.expect(publishedNotice(&ui, "Steering pending"));
 }
 
 test "late async approval cannot clear or relabel a newer permission" {
@@ -16961,7 +17177,8 @@ test "remote queue sends bind the current epoch and are never launched locally" 
     try std.testing.expectEqual(@as(u64, 6), fake.last_enqueue_epoch);
     try std.testing.expectEqual(session_client.QueueKind.steering, fake.last_enqueue_kind);
     try std.testing.expectEqualStrings("please continue", fake.text[0..fake.text_len]);
-    try std.testing.expectEqualStrings("Steering pending", ui.notice);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    try std.testing.expect(publishedNotice(&ui, "Steering pending"));
     try std.testing.expectEqual(@as(usize, 0), ui.inbox.snapshot().steering);
 
     ui.busy = false;
@@ -17526,6 +17743,180 @@ test "remote stop requested for a replaced owner is never unbound by a late clos
     try Ui.key(&ui, .escape);
     try std.testing.expectEqual(@as(usize, 2), fake.confirmings);
     try std.testing.expect(!ui.stop_open);
+}
+
+test "Codex device login binds generation and publishes success once" {
+    const Owner = struct {
+        state: Connection.State = .{ .runtime = null, .model = "", .base_url = "" },
+        starts: usize = 0,
+        cancels: usize = 0,
+        canceled_generation: u64 = 0,
+        fn current(raw: *anyopaque) Connection.State {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).state;
+        }
+        fn configure(_: *anyopaque, _: []const u8) !void {}
+        fn login(raw: *anyopaque, action: corecodex.Action, generation: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (action) {
+                .start => {
+                    self.starts += 1;
+                    try std.testing.expectEqual(@as(u64, 0), generation);
+                },
+                .cancel => {
+                    self.cancels += 1;
+                    self.canceled_generation = generation;
+                },
+            }
+        }
+    };
+    var owner: Owner = .{};
+    owner.state.codex_login = .{ .generation = 4, .status = .succeeded };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = .{ .context = &owner, .current_fn = Owner.current, .configure_fn = Owner.configure, .codex_login_fn = Owner.login };
+    ui.startCodexLogin();
+    try std.testing.expect(ui.codex_open and ui.codex_generation == null and owner.starts == 1);
+    ui.observeCodexLogin(); // Previous success cannot complete the new attempt.
+    try std.testing.expect(ui.codex_open and ui.records.items.len == 0);
+    owner.state.codex_login = .{ .generation = 5, .status = .pending };
+    @memcpy(owner.state.codex_login.code[0..7], "ABC-123");
+    owner.state.codex_login.code_len = 7;
+    ui.observeCodexLogin();
+    try std.testing.expectEqual(@as(?u64, 5), ui.codex_generation);
+    ui.dirty = false;
+    ui.display_changed = false;
+    ui.observeCodexLogin();
+    try std.testing.expect(!ui.dirty and !ui.display_changed);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, corecodex.verification_url) != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "ABC-123") != null);
+    discardFixtureFrame(&ui);
+    owner.state.codex_login = .{ .generation = 4, .status = .succeeded };
+    ui.observeCodexLogin();
+    try std.testing.expect(ui.codex_open);
+    owner.state.codex_login = .{ .generation = 5, .status = .succeeded };
+    ui.observeCodexLogin();
+    try std.testing.expect(!ui.codex_open and ui.records.items.len == 1);
+    try std.testing.expectEqualStrings("OpenAI Codex connected", ui.records.items[0].body.items);
+    ui.observeCodexLogin();
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    ui.startCodexLogin();
+    ui.cancelCodexLogin(); // Wait for the new generation before canceling.
+    try std.testing.expectEqual(@as(usize, 0), owner.cancels);
+    owner.state.codex_login = .{ .generation = 6, .status = .pending };
+    ui.observeCodexLogin();
+    try std.testing.expect(!ui.codex_open and owner.cancels == 1 and owner.canceled_generation == 6);
+
+    // Picker confirmation requires a completely acknowledged fresh frame.
+    ui.openProviderPicker();
+    for (ui.provider_choices.items[0..ui.provider_choices.len], 0..) |choice, index| {
+        if (choice == .provider and choice.provider == .openai_codex) ui.provider_picker.selected = index;
+    }
+    try ui.providerKey(.enter);
+    try std.testing.expectEqual(@as(usize, 2), owner.starts);
+    ui.provider_picker.markPaste();
+    try ui.providerKey(.enter);
+    try std.testing.expectEqual(@as(usize, 2), owner.starts);
+    ui.provider_picker.clear();
+    try ui.draw();
+    try ui.providerKey(.enter); // pending frame does not authorize
+    try std.testing.expectEqual(@as(usize, 2), owner.starts);
+    testAcknowledgeFullFrame(&ui);
+    try ui.providerKey(.enter);
+    try std.testing.expect(ui.codex_open and !ui.secret_mode and owner.starts == 3);
+    owner.state.codex_login = .{ .generation = 7, .status = .pending };
+    ui.observeCodexLogin();
+    try Ui.key(&ui, .escape);
+    try std.testing.expectEqual(@as(u64, 7), owner.canceled_generation);
+    _ = try ui.editor.insert("/login openai-codex");
+    try ui.submit();
+    try std.testing.expect(ui.codex_open and !ui.secret_mode and owner.starts == 4);
+}
+
+test "remote codex login opens only after the owner receipt and cancels its exact generation" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6, .session_id = @splat(3) } };
+    // A previous completed login must never open or complete the next attempt.
+    fake.codex = .{ .generation = 4, .status = .succeeded };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    ui.startCodexLogin();
+    // Queue admission is not owner acceptance: no panel, no bound generation.
+    try std.testing.expect(ui.codex_opening and !ui.codex_open and ui.codex_generation == null);
+    try std.testing.expectEqual(@as(usize, 1), actions.next);
+    try std.testing.expectEqual(corecodex.Action.start, actions.requests[0].?.action.codex_login.action);
+    try std.testing.expectEqual(@as(u64, 0), actions.requests[0].?.action.codex_login.generation);
+    ui.observeCodexLogin();
+    try std.testing.expect(!ui.codex_open and ui.records.items.len == 0);
+
+    // Esc before the receipt defers cancellation instead of guessing a generation.
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(ui.codex_cancel_waiting and !ui.codex_open);
+    try std.testing.expectEqual(@as(usize, 1), actions.next);
+
+    // The owner accepts the start and publishes the pending attempt; the
+    // deferred Esc then travels as a typed cancel for that exact generation.
+    fake.codex = .{ .generation = 5, .status = .pending };
+    @memcpy(fake.codex.code[0..7], "ABC-123");
+    fake.codex.code_len = 7;
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expect(ui.codex_open and ui.codex_generation == 5);
+    try std.testing.expect(ui.presentationWaiting());
+    try std.testing.expectEqual(@as(usize, 2), actions.next);
+    try std.testing.expectEqual(corecodex.Action.cancel, actions.requests[1].?.action.codex_login.action);
+    try std.testing.expectEqual(@as(u64, 5), actions.requests[1].?.action.codex_login.generation);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+
+    // Another generation's success is not this attempt's success.
+    fake.codex = .{ .generation = 6, .status = .succeeded };
+    ui.observeCodexLogin();
+    try std.testing.expect(ui.codex_open and ui.codex_generation == 5);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+
+    // A rejected cancel keeps both the panel and its generation.
+    actions.complete(.none, error.Transport, false);
+    ui.pumpAsync();
+    try std.testing.expect(ui.codex_open and ui.codex_generation == 5);
+    try std.testing.expectEqualStrings("Could not cancel OpenAI Codex login", ui.notice);
+
+    // Cancel admission is not closure either: only the receipt for THIS
+    // generation closes the panel, and it never publishes a success.
+    fake.codex = .{ .generation = 5, .status = .pending };
+    try Ui.key(&ui, .escape);
+    try std.testing.expectEqual(@as(usize, 3), actions.next);
+    try std.testing.expect(ui.codex_open and ui.codex_generation == 5);
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expect(!ui.codex_open and ui.codex_generation == null);
+    try std.testing.expect(!ui.presentationWaiting());
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+
+    // A rejected start clears the opening state and never shows a panel.
+    ui.startCodexLogin();
+    try std.testing.expect(ui.codex_opening and !ui.codex_open);
+    actions.complete(.none, error.PublicationUnavailable, false);
+    ui.pumpAsync();
+    try std.testing.expect(!ui.codex_opening and !ui.codex_open and ui.codex_generation == null);
+    try std.testing.expectEqualStrings("OpenAI Codex device login unavailable", ui.notice);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+
+    // A superseded receipt retires the placeholder without a stale success.
+    ui.startCodexLogin();
+    try std.testing.expect(ui.codex_opening and !ui.codex_open);
+    actions.complete(.none, null, true);
+    ui.pumpAsync();
+    try std.testing.expect(!ui.codex_opening and !ui.codex_open and ui.codex_generation == null);
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 }
 
 test "local stop keeps gating the UI inbox without a remote barrier request" {

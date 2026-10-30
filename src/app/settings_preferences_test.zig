@@ -42,7 +42,7 @@ test "memory settings current publishes active pending and global defaults witho
     defer env.deinit();
     try env.put("HOME", home);
     // Missing configuration initializes owned defaults, without activating App.
-    var pending = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = false });
+    var pending = try Session.initWithOptions(a, io, &env, home, .{}, .{ .auto_refresh_models = false });
     defer pending.deinit();
     const connection = pending.connection();
     try std.testing.expect(pending.app == null);
@@ -64,7 +64,7 @@ test "memory settings current publishes active pending and global defaults witho
     try std.testing.expect(!tree.value.object.contains("memory"));
 
     try pending.store.root.writeMode(cfg.file_name, plain, true, 0o600);
-    var active = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false, .auto_refresh_models = false });
+    var active = try Session.initWithOptions(a, io, &env, home, .{}, .{ .auto_refresh_models = false });
     defer active.deinit();
     const app = active.app.?;
     try std.testing.expect(active.connection().current().memory_auto);
@@ -147,7 +147,7 @@ test "preferences preserve frozen primary while only shared request timeout refr
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const app = session.app.?;
     const primary = &app.client;
@@ -207,7 +207,7 @@ test "preferences preserve frozen primary while only shared request timeout refr
     try set(&session, .request_timeout_ms, 56789);
     try std.testing.expect(app.decision_client == null and !session.connection().current().decision_enabled);
     try std.testing.expectEqual(@as(u32, 56789), session.connection().current().limits.request_timeout_ms);
-    var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer restarted.deinit();
     try std.testing.expectEqualDeep(app.config.value.limits, restarted.app.?.config.value.limits);
     try std.testing.expectEqual(@as(u32, 56789), restarted.connection().current().limits.request_timeout_ms);
@@ -222,7 +222,7 @@ test "shared request timeout saves without a decision declaration" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const auth = session.app.?.client.authorization.ptr;
     try set(&session, .request_timeout_ms, 54321);
@@ -245,7 +245,7 @@ test "preferences invalid guards CAS and active validation never publish or save
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     const app = session.app.?;
     const arena = app.config.arena;
@@ -300,7 +300,7 @@ test "preferences no App pending ownership validation and CAS" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{ .logging = false });
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
     try std.testing.expect(session.app == null);
     for (main_edits) |edit| try set(&session, edit.key, edit.value);
@@ -367,7 +367,7 @@ test "preferences restored missing provider preserves pending history while savi
         defer store.deinit();
         try store.root.writeMode(cfg.file_name, replacement, true, 0o600);
     }
-    var restored = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id, .logging = false });
+    var restored = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id });
     defer restored.deinit();
     try std.testing.expect(restored.app == null and !restored.read_only);
     try std.testing.expect(restored.pending.?.value.selection_pending);

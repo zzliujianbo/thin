@@ -1,17 +1,23 @@
 //! Optional auxiliary model. Owns its route/key independently of chat selection;
 //! no startup network, tools, protocol fallback or primary usage calibration.
 const std = @import("std");
+const diag = @import("../core/diagnostics.zig");
 const cfg = @import("../core/config.zig");
 const p = @import("../core/protocol.zig");
 const policy = @import("../core/decision.zig");
 const context = @import("../core/context.zig");
 const thinking = @import("../core/thinking.zig");
 const http = @import("../llm/http.zig");
+const CredentialSource = @import("../core/codex_auth.zig").CredentialSource;
 const systemone = @import("../core/systemone.zig");
 const native_http = @import("../llm/decision_http.zig");
 const resolver = @import("model_resolver.zig");
 const metadata = @import("model_metadata.zig");
 const Store = @import("auth_store.zig").Store;
+
+fn isCodex(provider: cfg.Provider) bool {
+    return provider.kind == .openai_codex and std.mem.eql(u8, provider.base_url, cfg.providers.Id.openai_codex.baseUrl());
+}
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -20,9 +26,11 @@ pub const Client = struct {
     home: []u8,
     transport_env: std.process.Environ.Map,
     key: ?[]u8 = null,
+    codex_source: ?CredentialSource = null,
     resolved: ?*Resolved = null,
     native: ?native_http.Client = null,
     // Auxiliary statistics never enter Runtime.account or its estimator.
+    diagnostics: diag.Sink = .{},
     calls: u64 = 0,
     last_usage: p.Usage = .{},
     last_http_status: ?u16 = null,
@@ -35,6 +43,10 @@ pub const Client = struct {
     };
 
     pub fn create(a: std.mem.Allocator, io: std.Io, config: cfg.Config, env: *const std.process.Environ.Map) !?*Client {
+        return createWithCodexSource(a, io, config, env, null);
+    }
+
+    pub fn createWithCodexSource(a: std.mem.Allocator, io: std.Io, config: cfg.Config, env: *const std.process.Environ.Map, codex_source: ?CredentialSource) !?*Client {
         if (!config.decisionActive()) return null;
         const declaration = config.decision.?;
         const self = try a.create(Client);
@@ -48,7 +60,7 @@ pub const Client = struct {
         var credentials = config;
         credentials.provider = provider.connection;
         // Missing credentials block a decision, not archive viewing/startup.
-        const key = cfg.resolveApiKey(a, credentials, env) catch |err| switch (err) {
+        const key = if (isCodex(provider.connection)) null else cfg.resolveApiKey(a, credentials, env) catch |err| switch (err) {
             error.ApiKeyNotFound, error.InvalidApiKey => null,
             else => return err,
         };
@@ -68,14 +80,14 @@ pub const Client = struct {
         defer a.destroy(cache);
         loadCache(a, io, home, cache);
         const api = resolver.protocolFor(config, cache, reference.provider, reference.model) catch null;
-        const native: ?native_http.Client = if (api == .systemone)
+        const native: ?native_http.Client = if (api == .systemone and !isCodex(provider.connection))
             native_http.Client.initRouted(a, io, env, proxy_url) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => null, // An unusable auxiliary environment cannot block archive viewing.
             }
         else
             null;
-        self.* = .{ .allocator = a, .io = io, .source = owned, .home = home, .transport_env = transport_env, .key = key, .native = native };
+        self.* = .{ .allocator = a, .io = io, .source = owned, .home = home, .transport_env = transport_env, .key = key, .codex_source = codex_source, .native = native };
         return self;
     }
 
@@ -173,8 +185,12 @@ pub const Client = struct {
             if (state.config.value.model.protocol == .systemone) {
                 if (native == null) return error.DecisionUnavailable;
             } else {
-                const frozen_key = key orelse return error.DecisionUnavailable;
-                state.client = try http.Client.initWithEnv(a, io, &state.config.value, frozen_key, &transport_env);
+                if (isCodex(state.config.value.provider)) {
+                    state.client = try http.Client.initCodexWithEnv(a, io, &state.config.value, self.codex_source orelse return error.DecisionUnavailable, &transport_env);
+                } else {
+                    const frozen_key = key orelse return error.DecisionUnavailable;
+                    state.client = try http.Client.initWithEnv(a, io, &state.config.value, frozen_key, &transport_env);
+                }
             }
             resolved = state;
         }
@@ -186,6 +202,7 @@ pub const Client = struct {
             .home = home,
             .transport_env = transport_env,
             .key = key,
+            .codex_source = self.codex_source,
             .resolved = resolved,
             .native = native,
         };
@@ -226,9 +243,18 @@ pub const Client = struct {
         state.client = null;
         if (config.model.protocol != .systemone) {
             self.diagnostic.stage = .credentials;
-            const key = self.key orelse return error.ApiKeyNotFound;
-            self.diagnostic.stage = .resolve;
-            state.client = try http.Client.initWithEnv(a, self.io, config, key, &self.transport_env);
+            if (isCodex(config.provider)) {
+                if (config.provider.codex_oauth == null) return error.ApiKeyNotFound;
+                const source = self.codex_source orelse return error.ApiKeyNotFound;
+                self.diagnostic.stage = .resolve;
+                state.client = try http.Client.initCodexWithEnv(a, self.io, config, source, &self.transport_env);
+            } else {
+                const key = self.key orelse return error.ApiKeyNotFound;
+                self.diagnostic.stage = .resolve;
+                state.client = try http.Client.initWithEnv(a, self.io, config, key, &self.transport_env);
+            }
+        } else if (isCodex(config.provider)) {
+            return error.UnsupportedProtocol;
         } else if (self.native == null) {
             // Metadata can identify the native protocol after creation. Prepare
             // from the frozen auxiliary scope/environment before publishing;
@@ -262,7 +288,10 @@ pub const Client = struct {
         self.last_http_status = null;
         self.last_failure = null;
         self.diagnostic = .{ .stage = .resolve, .operation = input };
-        const output = self.decideInner(a, input, cancel) catch |err| {
+        const before = self.calls;
+        var span = diag.Span.start(self.diagnostics, self.io, .{ .stage = .decision_request, .operation = input, .timeout_ms = self.source.value.limits.request_timeout_ms, .count = 0 });
+        defer span.finish(.ok);
+        const output = self.decideInner(a, input, cancel, &span) catch |err| {
             if (err != error.Canceled) {
                 self.diagnostic.setError(err);
                 self.diagnostic.http_status = self.last_http_status;
@@ -272,27 +301,46 @@ pub const Client = struct {
                 };
                 self.last_failure = self.diagnostic;
             }
+            span.record.count = if (self.calls != before) 1 else 0;
+            span.record.backend = self.diagnostic.backend;
+            span.record.http_status = self.last_http_status;
+            var detail = self.diagnostic;
+            if (err == error.Canceled) detail.setError(err);
+            span.record.decision_failure = detail;
+            if (self.resolved) |resolved| span.record.protocol = resolved.config.value.model.protocol;
+            span.fail(err);
             // Preserve public resolve errors while retaining their local cause.
             // This path never retries a failed or uncertain review.
             if (self.diagnostic.stage == .resolve or self.diagnostic.stage == .credentials)
                 return if (err == error.OutOfMemory or err == error.CleanupFailed or err == error.Canceled) err else error.DecisionUnavailable;
             return err;
         };
+        span.record.count = if (self.calls != before) 1 else 0;
+        span.record.backend = self.diagnostic.backend;
+        if (self.resolved) |resolved| span.record.protocol = resolved.config.value.model.protocol;
         self.last_failure = null;
         return output;
     }
 
-    fn decideInner(self: *Client, a: std.mem.Allocator, input: policy.Input, cancel: *const p.Cancellation) !policy.Output {
+    fn decideInner(self: *Client, a: std.mem.Allocator, input: policy.Input, cancel: *const p.Cancellation, span: *diag.Span) !policy.Output {
         try self.checkCleanup();
         if (cancel.isRequested()) return error.Canceled;
         const ready = try self.resolve();
-        self.diagnostic.backend = if (ready.config.value.model.protocol == .systemone) .systemone else .generative;
-        if (ready.config.value.model.protocol == .systemone)
-            return self.callNative(a, ready.config.value, input, cancel);
-        return self.call(a, ready.config.value, ready.client.?.model(), input, cancel);
+        const config = ready.config.value;
+        self.diagnostic.backend = if (config.model.protocol == .systemone) .systemone else .generative;
+        var hash = std.hash.Wyhash.init(0);
+        hash.update(config.model.name);
+        hash.update(@tagName(config.model.protocol));
+        span.record.protocol = config.model.protocol;
+        span.record.backend = self.diagnostic.backend;
+        span.record.timeout_ms = config.limits.request_timeout_ms;
+        span.record.route_hash = hash.final();
+        if (config.model.protocol == .systemone)
+            return self.callNative(a, config, input, cancel, span);
+        return self.callWithSpan(a, config, ready.client.?.model(), input, cancel, span);
     }
 
-    fn callNative(self: *Client, output_allocator: std.mem.Allocator, config: cfg.Config, input: policy.Input, cancel: *const p.Cancellation) !policy.Output {
+    fn callNative(self: *Client, output_allocator: std.mem.Allocator, config: cfg.Config, input: policy.Input, cancel: *const p.Cancellation, span: *diag.Span) !policy.Output {
         const transport = if (self.native) |*native| native else return error.DecisionUnavailable;
         if (transport.poisoned) return error.CleanupFailed;
         if (cancel.isRequested()) return error.Canceled;
@@ -311,6 +359,7 @@ pub const Client = struct {
         const endpoint = try std.fmt.allocPrint(a, "{s}/systemone", .{std.mem.trimEnd(u8, config.provider.base_url, "/")});
         if (cancel.isRequested()) return error.Canceled;
         self.calls +|= 1;
+        attempt(span);
         self.diagnostic.stage = .transport;
         const response = try transport.post(a, endpoint, key, payload, config.limits.request_timeout_ms, cancel);
         self.last_http_status = response.status;
@@ -327,6 +376,20 @@ pub const Client = struct {
     }
 
     fn call(self: *Client, output_allocator: std.mem.Allocator, config: cfg.Config, model: p.Model, input: policy.Input, cancel: *const p.Cancellation) !policy.Output {
+        return self.callWithSpan(output_allocator, config, model, input, cancel, null);
+    }
+
+    fn attempt(span: ?*diag.Span) void {
+        const s = span orelse return;
+        s.record.count = 1;
+        if (s.record.span_id == 0) return;
+        var point = s.record;
+        point.phase = .point;
+        // An attempted call is not proof that bytes were sent.
+        s.sink.emit(point);
+    }
+
+    fn callWithSpan(self: *Client, output_allocator: std.mem.Allocator, config: cfg.Config, model: p.Model, input: policy.Input, cancel: *const p.Cancellation, span: ?*diag.Span) !policy.Output {
         if (cancel.isRequested()) return error.Canceled;
         var scratch = std.heap.ArenaAllocator.init(output_allocator);
         defer scratch.deinit();
@@ -354,6 +417,7 @@ pub const Client = struct {
         try @import("../core/checkpoint.zig").validateRequestHistory(a, request);
         if (cancel.isRequested()) return error.Canceled;
         self.calls +|= 1;
+        attempt(span);
         self.diagnostic.stage = .transport;
         const result = try model.call(a, request, .{});
         if (cancel.isRequested()) return error.Canceled;
@@ -383,7 +447,7 @@ pub const Client = struct {
     }
 };
 
-test "decision client is optional, lazy and owns route across chat replacement" {
+test "decision diagnostics early failure is count zero and route remains lazy" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -400,16 +464,34 @@ test "decision client is optional, lazy and owns route across chat replacement" 
     try std.testing.expect(client.resolved == null and client.calls == 0);
     try std.testing.expectEqualStrings("judge/mini", client.source.value.decision.?.model);
     try std.testing.expect(client.source.value.model.reasoning_effort == null);
+    const Capture = struct {
+        records: [4]diag.Record = undefined,
+        len: usize = 0,
+        fn next(_: ?*anyopaque) u64 {
+            return 1;
+        }
+        fn emit(raw: ?*anyopaque, record: diag.Record) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.records[self.len] = record;
+            self.len += 1;
+        }
+    };
+    var events: Capture = .{};
+    client.diagnostics = .{ .context = &events, .emit_fn = Capture.emit, .next_fn = Capture.next };
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var cancel = p.Cancellation{};
     try std.testing.expectError(error.DecisionUnavailable, client.service().decide(arena.allocator(), .{ .memory_write = .{ .topic = "style", .content = "Prefer concise reports." } }, &cancel));
     try std.testing.expectEqual(@as(u64, 0), client.calls);
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+    try std.testing.expectEqual(@as(?u32, 0), events.records[1].count);
+    try std.testing.expectEqual(diag.Result.failed, events.records[1].result.?);
+    try std.testing.expect(events.records[1].decision_failure != null);
     cancel.cancel();
     try std.testing.expectError(error.Canceled, client.service().decide(arena.allocator(), .{ .memory_write = .{ .topic = "style", .content = "Prefer concise reports." } }, &cancel));
 }
 
-test "decision client fake wire has own caps no tools and validates output without primary accounting" {
+test "decision diagnostics fake attempts decode failure and clone sink isolation" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -446,13 +528,41 @@ test "decision client fake wire has own caps no tools and validates output witho
     defer arena.deinit();
     const input: policy.Input = .{ .memory_write = .{ .topic = "style", .content = "Prefer concise reports." } };
     var cancel = p.Cancellation{};
-    const result = try client.call(arena.allocator(), ready.config.value, .{ .context = &fake, .call_fn = Fake.call }, input, &cancel);
+    const Capture = struct {
+        records: [8]diag.Record = undefined,
+        len: usize = 0,
+        fn next(_: ?*anyopaque) u64 {
+            return 42;
+        }
+        fn emit(raw: ?*anyopaque, record: diag.Record) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.records[self.len] = record;
+            self.len += 1;
+        }
+    };
+    var capture: Capture = .{};
+    const sink: diag.Sink = .{ .context = &capture, .emit_fn = Capture.emit, .next_fn = Capture.next };
+    client.diagnostics = sink;
+    const child = try client.clone();
+    defer child.deinit();
+    try std.testing.expectEqual(@as(u64, 0), child.diagnostics.next());
+    var span = diag.Span.start(sink, std.testing.io, .{ .stage = .decision_request, .count = 0 });
+    const result = try client.callWithSpan(arena.allocator(), ready.config.value, .{ .context = &fake, .call_fn = Fake.call }, input, &cancel, &span);
+    span.finish(.ok);
+    try std.testing.expectEqual(@as(usize, 3), capture.len);
+    try std.testing.expectEqual(diag.Phase.point, capture.records[1].phase);
+    try std.testing.expectEqual(@as(?u32, 1), capture.records[1].count);
+    try std.testing.expectEqual(capture.records[0].span_id, capture.records[1].span_id);
     try std.testing.expect(result.memory_write);
     try std.testing.expectEqual(@as(u64, 1), client.calls);
     try std.testing.expectEqual(@as(?u64, 100), client.last_usage.input_tokens);
     fake.bad = true;
-    const bad = client.call(arena.allocator(), ready.config.value, .{ .context = &fake, .call_fn = Fake.call }, input, &cancel);
-    if (bad) |_| return error.ExpectedInvalidDecision else |_| {}
+    var bad_span = diag.Span.start(sink, std.testing.io, .{ .stage = .decision_request, .count = 0 });
+    const bad = client.callWithSpan(arena.allocator(), ready.config.value, .{ .context = &fake, .call_fn = Fake.call }, input, &cancel, &bad_span);
+    if (bad) |_| return error.ExpectedInvalidDecision else |err| bad_span.fail(err);
+    try std.testing.expectEqual(diag.Phase.point, capture.records[4].phase);
+    try std.testing.expectEqual(diag.Result.failed, capture.records[5].result.?);
+    try std.testing.expect(capture.records[5].error_name != null);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
 

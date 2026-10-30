@@ -220,7 +220,7 @@ def run(app, width, batched):
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-        child = subprocess.Popen([app, '--no-log', '--no-model-auto-refresh'], stdin=slave, stdout=slave, stderr=slave,
+        child = subprocess.Popen([app, '--no-model-auto-refresh'], stdin=slave, stdout=slave, stderr=slave,
                                  cwd=project, preexec_fn=child_setup,
                                  env={'PATH': '/usr/bin:/bin', 'HOME': str(home), 'XDG_RUNTIME_DIR': str(runtime), 'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_IDLE_KEY': 'idle-fixture-only'})
         screen = Screen(width)
@@ -385,7 +385,7 @@ def run(app, width, batched):
             assert fcntl.fcntl(slave, fcntl.F_GETFL) == original_flags
             assert config_path.read_bytes() == config_bytes
             assert not (home / '.thin/sessions').exists()
-            assert not (project / '.thin/sessions').exists()
+            assert list((project / '.thin/sessions').glob('*.jsonl')), 'submitted session not recorded'
             print(f'PASS idle-enter width={width} batched={batched}: idle HTTP=0 normal HTTP=1, 3 exact native rows, menu/paste/passive-resize/busy/termios')
         finally:
             Service.release.set()
