@@ -499,7 +499,7 @@ pub const Connection = struct {
         image_models: []const core_config.Model = &.{},
         image_model: ?[]const u8 = null,
         memory_auto: bool = true,
-        memory_notice: ?[]const u8 = null,
+        memory: @import("../core/memory_status.zig").View = .{},
         decision_enabled: bool = false,
         /// Owned by the session, resolved with auxiliary rather than chat limits.
         decision_models: []const core_config.Model = &.{},
@@ -900,7 +900,6 @@ const Ui = struct {
     notice: []const u8 = "Ready",
     /// Last owner-published advisory string already turned into one display
     /// record; repeated identical snapshots are never republished.
-    memory_notice_seen: ?[]const u8 = null,
     /// 切换思考档位后的短暂确认：在输入框百分比位置显示新档位，2 秒后自动恢复。
     effort_flash: ?struct { level: shared.ReasoningEffort, until_ms: u64 } = null,
     log_warning_seen: bool = false,
@@ -2561,6 +2560,24 @@ const Ui = struct {
         if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
         if (notice.len == 0 and !configured(state) and (state.settings_notice == null or state.model.len == 0)) notice = "Not configured: /login, then /model";
         if (notice.len == 0 and self.remote() != null and !state.available) notice = "Daemon connection unavailable; /exit and reconnect";
+        if (self.permission == null and !self.stop_open and !terminal_issue and notice.len == 0 and state.memory.enabled and state.settings_error == null and state.log_error == null) {
+            if (state.memory.active) |active| {
+                notice = if (state.memory.queued_count != 0)
+                    try std.fmt.allocPrint(a, "Memory: {s} (queued: {d})", .{ @tagName(active.phase), state.memory.queued_count })
+                else
+                    try std.fmt.allocPrint(a, "Memory: {s}", .{@tagName(active.phase)});
+            } else if (state.memory.queued_count != 0) {
+                notice = try std.fmt.allocPrint(a, "Memory: queued ({d})", .{state.memory.queued_count});
+            } else if (state.memory.last_terminal) |terminal| {
+                notice = try std.fmt.allocPrint(a, "Memory: {s}", .{switch (terminal.result) {
+                    .saved => "saved",
+                    .skipped => "no new durable entries",
+                    .failed => "failed",
+                    .uncertain => "request outcome uncertain",
+                    .canceled => "canceled",
+                }});
+            }
+        }
         if (notice.len == 0 and state.settings_error == null) if (state.pending_default_effort) |effort| {
             notice = try std.fmt.allocPrint(a, "Default thinking: {s}; awaiting model capabilities", .{effort.name() orelse "unknown"});
         };
@@ -2568,7 +2585,10 @@ const Ui = struct {
             notice = try std.fmt.allocPrint(a, "{s}{s}SETTINGS FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
         } else if (!terminal_issue) {
             if (state.settings_notice) |warning| {
-                if (!std.mem.eql(u8, notice, warning)) notice = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ notice, if (notice.len != 0) " | " else "", warning });
+                const same_capability_cause = std.mem.eql(u8, warning, "Saved thinking level not applied: model capabilities unknown") and
+                    (std.mem.eql(u8, notice, "Thinking capabilities are loading; try Shift+Tab again shortly") or
+                        std.mem.eql(u8, notice, "Thinking capabilities unknown: refresh /model or declare reasoning levels in configuration"));
+                if (!same_capability_cause and !std.mem.eql(u8, notice, warning)) notice = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ notice, if (notice.len != 0) " | " else "", warning });
             }
         }
         if (state.log_error) |err| return std.fmt.allocPrint(a, "{s}{s}REC FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
@@ -5182,11 +5202,9 @@ const Ui = struct {
 
     fn pollMetadata(self: *Ui) void {
         const before = self.connection.current();
-        self.observeMemoryNotice(before.memory_notice);
         const poll = self.connection.poll_models_fn orelse return;
         const changed = poll(self.connection.context, self.settingsIdle());
         const state = self.connection.current();
-        self.observeMemoryNotice(state.memory_notice);
         if (!changed) return;
         if (before.pending_default_effort != null and state.pending_default_effort == null and
             state.effort_levels.contains(state.reasoning_effort))
@@ -5201,25 +5219,6 @@ const Ui = struct {
                 if (state.metadata_notice_ttl_ms != 0) self.publishNotice(notice) else self.notice = notice;
             }
         }
-        self.requestDraw();
-    }
-
-    fn observeMemoryNotice(self: *Ui, notice: ?[]const u8) void {
-        const same = if (self.memory_notice_seen) |seen|
-            (if (notice) |current| std.mem.eql(u8, seen, current) else false)
-        else
-            notice == null;
-        if (same) return;
-        // Coordinator strings are static; only mark observed after the display
-        // record owns its bytes, so repeated snapshots cannot duplicate it.
-        if (notice) |message| {
-            _ = self.add(.notice, message) catch {
-                self.notice = "Display notice unavailable; inspect operation state";
-                self.requestDraw();
-                return;
-            };
-        }
-        self.memory_notice_seen = notice;
         self.requestDraw();
     }
 
@@ -6221,7 +6220,11 @@ const Ui = struct {
         const above_content = for (above) |line| {
             if (!std.mem.eql(u8, line, "\x1b[0m\x1b[K")) break true;
         } else false;
-        const body_present = lines.items.len != 0 or borrowed.len != 0 or transcript_rows != 0 or above_content or
+        // Restoring known blank borrowed rows does not create body content.
+        const borrowed_content = for (borrowed) |line| {
+            if (!std.mem.eql(u8, line, "\x1b[0m\x1b[K")) break true;
+        } else false;
+        const body_present = lines.items.len != 0 or borrowed_content or transcript_rows != 0 or above_content or
             self.permission != null or self.secret_mode or thinking != null or popup_requested;
         const separator: usize = @intFromBool(!compact and body_present);
         const footer_rows: usize = if (compact) 1 else composer_rows + separator + @as(usize, @intFromBool(hint_line.len != 0));
@@ -6533,10 +6536,10 @@ const Ui = struct {
                 if (!self.stop_open and menu_visible and menu_rows.can_confirm) self.frame_command_generation = self.command_menu.generation;
             }
 
-            // Footer rows are bottom-up: separator (only while something is
-            // above), the real notice, then the composer itself.
-            if (!compact and hint_line.len != 0) try putToneLine(writer, a, rows - composer_rows - separator, hint_line, cols, theme.muted);
-            if (!compact and separator != 0) try putLine(writer, a, rows - composer_rows, "", cols);
+            // Keep the existing separator above the hint, never between the
+            // hint and the first composer row. With no hint it remains the gap.
+            if (!compact and separator != 0) try putLine(writer, a, rows - composer_rows - @intFromBool(hint_line.len != 0), "", cols);
+            if (!compact and hint_line.len != 0) try putToneLine(writer, a, rows - composer_rows, hint_line, cols, theme.muted);
 
             if (self.secret_mode or self.secret_quarantine) {
                 // Only a bounded mask is copied to the frame; never format secret bytes.
@@ -6951,18 +6954,125 @@ test "stable pending pulses preserve native history and tail" {
     }
 }
 
-test "memory notice is display only and repeated snapshot is not duplicated" {
+test "memory footer stays adjacent to wrapped composer after ACK" {
+    const Fixture = struct {
+        fn current(_: *anyopaque) Connection.State {
+            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .extracting } } };
+        }
+    };
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    ui.observeMemoryNotice("Memory: saved");
-    ui.observeMemoryNotice("Memory: saved");
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
-    try std.testing.expectEqualStrings("Memory: saved", ui.records.items[0].body.items);
-    try std.testing.expect(ui.future == null and !ui.has_submitted);
+    ui.connection.current_fn = Fixture.current;
+    ui.size = .{ .columns = 30, .rows = 12 };
+    _ = try ui.add(.assistant, "body");
+    _ = try ui.editor.insert("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL");
+    var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 30, .rows = 12 };
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expect(ui.frame_composer_rows > 1);
+    const status_row = screen.rows - ui.frame_composer_rows - 1;
+    try std.testing.expectEqualStrings("Memory: extracting", std.mem.trimEnd(u8, screen.grid[status_row][0..30], " "));
+    try std.testing.expectEqualStrings("", std.mem.trimEnd(u8, screen.grid[status_row - 1][0..30], " "));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("Memory:"));
+    testAcknowledgeFullFrame(&ui);
+    const history = screen.history_len;
+    const records = ui.records.items.len;
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(history, screen.history_len);
+    try std.testing.expectEqual(records, ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("Memory:"));
+}
+
+fn expectLongWarningAdjacent(screen: *const @import("../tests/regular_screen.zig").Screen, composer_rows: usize, columns: usize) !void {
+    const warning = "Could not save thinking option; previous option kept | Saved thinking level not applied: model capabilities unknown";
+    const status_row = screen.rows - composer_rows - 1;
+    const clipped = warning[0..@min(warning.len, columns - 1)];
+    try std.testing.expectEqualStrings(clipped, std.mem.trimEnd(u8, screen.grid[status_row][0..columns], " "));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("Could not save thinking option"));
+    const composer_row = try rowStartingWith(screen, "(fixture-old) ");
+    try std.testing.expectEqual(status_row + 1, composer_row);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("(fixture-old) "));
+}
+
+test "long combined warning stays adjacent across acknowledged command menu cycles and wrapped input" {
+    for ([_]usize{ 80, 120 }) |columns| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var fixture = SelectionFixture{ .settings_notice = "Saved thinking level not applied: model capabilities unknown" };
+        defer fixture.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.connection = fixture.connection();
+        ui.size.columns = columns;
+        ui.notice = "Could not save thinking option; previous option kept";
+        var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = columns };
+        try seedPriorBottom(&screen);
+        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+        try ui.draw();
+        try screen.replay(ui.frame);
+        try expectLongWarningAdjacent(&screen, ui.frame_composer_rows, columns);
+        try std.testing.expectEqual(screen.rows - 1, screen.row);
+        testAcknowledgeFullFrame(&ui);
+        var open_history: usize = 0;
+        var closed_history: usize = 0;
+        var open_height: usize = 0;
+        var closed_height: usize = 0;
+        for (0..2) |cycle| {
+            try ui.parser.feed("/", sink);
+            try ui.draw();
+            try screen.replay(ui.frame);
+            try std.testing.expect(ui.commandMenuVisible());
+            try std.testing.expectEqual(@as(usize, 0), screen.count("Could not save thinking option"));
+            try std.testing.expectEqual(@as(usize, 0), screen.count("Saved thinking level not applied"));
+            try std.testing.expectEqual(screen.rows - ui.frame_composer_rows, try rowStartingWith(&screen, "(fixture-old) "));
+            try std.testing.expectEqual(@as(usize, 1), screen.count("(fixture-old) "));
+            try std.testing.expectEqual(screen.rows - 1, screen.row + ui.frame_cursor_rows_up);
+            testAcknowledgeFullFrame(&ui);
+            if (cycle == 0) {
+                open_history = screen.history_len;
+                open_height = ui.tail_height;
+            } else {
+                try std.testing.expectEqual(open_history, screen.history_len);
+                try std.testing.expectEqual(open_height, ui.tail_height);
+            }
+            try ui.parser.feed("\x7f", sink);
+            try ui.draw();
+            try screen.replay(ui.frame);
+            try expectLongWarningAdjacent(&screen, ui.frame_composer_rows, columns);
+            try std.testing.expectEqual(screen.rows - 1, screen.row + ui.frame_cursor_rows_up);
+            testAcknowledgeFullFrame(&ui);
+            if (cycle == 0) {
+                closed_history = screen.history_len;
+                closed_height = ui.tail_height;
+            } else {
+                try std.testing.expectEqual(closed_history, screen.history_len);
+                try std.testing.expectEqual(closed_height, ui.tail_height);
+            }
+        }
+        const draft = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        try ui.parser.feed(draft, sink);
+        try ui.draw();
+        try std.testing.expect(ui.frame_composer_rows >= 2);
+        try screen.replay(ui.frame);
+        try expectLongWarningAdjacent(&screen, ui.frame_composer_rows, columns);
+        try std.testing.expectEqual(screen.rows - 1, screen.row);
+        testAcknowledgeFullFrame(&ui);
+        const wrapped_history = screen.history_len;
+        const wrapped_height = ui.tail_height;
+        try ui.draw();
+        try screen.replay(ui.frame);
+        try expectLongWarningAdjacent(&screen, ui.frame_composer_rows, columns);
+        try std.testing.expectEqual(screen.rows - 1, screen.row);
+        testAcknowledgeFullFrame(&ui);
+        try std.testing.expectEqual(wrapped_history, screen.history_len);
+        try std.testing.expectEqual(wrapped_height, ui.tail_height);
+    }
 }
 
 test "bottom composer stays anchored across draft and menu frames" {
@@ -10300,6 +10410,34 @@ test "decision pause wins over stale Ready thinking warnings and empty queue pau
     try std.testing.expect(std.mem.find(u8, try ui.hint(arena.allocator(), state), "Saved thinking") != null);
 }
 
+test "capability action hint deduplicates only the matching saved warning" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var state = ui.connection.current();
+    state.settings_notice = "Saved thinking level not applied: model capabilities unknown";
+    for ([_][]const u8{
+        "Thinking capabilities are loading; try Shift+Tab again shortly",
+        "Thinking capabilities unknown: refresh /model or declare reasoning levels in configuration",
+    }) |notice| {
+        ui.notice = notice;
+        try std.testing.expectEqualStrings(notice, try ui.hint(arena.allocator(), state));
+        state.settings_error = error.TestSettingsFailure;
+        const failure = try ui.hint(arena.allocator(), state);
+        try std.testing.expect(std.mem.find(u8, failure, notice) != null);
+        try std.testing.expect(std.mem.find(u8, failure, "SETTINGS FAILED: TestSettingsFailure") != null);
+        state.settings_error = null;
+    }
+    ui.notice = "Could not save thinking option; previous option kept";
+    const unrelated = try ui.hint(arena.allocator(), state);
+    try std.testing.expect(std.mem.find(u8, unrelated, ui.notice) != null);
+    try std.testing.expect(std.mem.find(u8, unrelated, state.settings_notice.?) != null);
+}
+
 test "read command errors include a safe reason after error and never display raw results" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -10532,8 +10670,13 @@ test "single composer hides statistics and completion and uses flow and exact br
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("visible-body"));
-    // The actual body and footer use only their owned bottom-anchored rows.
-    for (screen.grid[screen.rows - 2]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
+    // The status is immediately above the composer, with a separator before it.
+    const warning = "Not configured: /login, then /model";
+    try std.testing.expectEqualStrings(warning, std.mem.trimEnd(u8, &screen.grid[screen.rows - 2], " "));
+    var warning_count: usize = 0;
+    for (screen.grid[0..screen.rows]) |row| warning_count += std.mem.count(u8, &row, warning);
+    try std.testing.expectEqual(@as(usize, 1), warning_count);
+    for (screen.grid[screen.rows - 3]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
     try std.testing.expect(std.mem.find(u8, &screen.grid[screen.rows - 1], "(fixture) ?%~ typed-default-color") != null);
     try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
@@ -12540,11 +12683,11 @@ test "metadata success publishes one transcript notice from an owner transition"
 
 test "memory notice owner poll dirties UI without replacing foreground notice" {
     const Fixture = struct {
-        notice: ?[]const u8 = null,
+        view: @import("../core/memory_status.zig").View = .{},
         changed: bool = false,
         fn current(raw: *anyopaque) Connection.State {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return .{ .runtime = null, .model = "fixture", .base_url = "", .memory_notice = self.notice };
+            return .{ .runtime = null, .model = "fixture", .base_url = "", .memory = self.view };
         }
         fn poll(raw: *anyopaque, _: bool) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -12563,8 +12706,8 @@ test "memory notice owner poll dirties UI without replacing foreground notice" {
     ui.connection.current_fn = Fixture.current;
     ui.connection.poll_models_fn = Fixture.poll;
     ui.notice = "Foreground error";
-    inline for (.{ @as(?[]const u8, "Memory: updating"), @as(?[]const u8, null) }) |notice| {
-        fixture.notice = notice;
+    inline for (.{ true, false }) |enabled| {
+        fixture.view = .{ .enabled = enabled, .active = if (enabled) .{ .id = 1, .phase = .extracting } else null };
         fixture.changed = true;
         ui.dirty = false;
         ui.pollMetadata();
@@ -12574,8 +12717,7 @@ test "memory notice owner poll dirties UI without replacing foreground notice" {
         ui.pollMetadata();
         try std.testing.expect(!ui.dirty); // Identical snapshot is not a transition.
     }
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expectEqualStrings("Memory: updating", ui.records.items[0].body.items);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 }
 
 test "memory notice is advisory and never replaces errors queue or settings" {
@@ -12589,9 +12731,9 @@ test "memory notice is advisory and never replaces errors queue or settings" {
     var runtime: r.Runtime = undefined;
     var state = ui.connection.current();
     state.runtime = &runtime;
-    state.memory_notice = "Memory: updating";
-    // Advisory worker notices are display records, never footer hints.
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    state.memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .extracting } };
+    state.pending_default_effort = .medium;
+    try std.testing.expectEqualStrings("Memory: extracting", try ui.hint(arena.allocator(), state));
     ui.notice = "Approval required";
     try std.testing.expectEqualStrings("Approval required", try ui.hint(arena.allocator(), state));
     ui.notice = "Ready";
@@ -12599,20 +12741,20 @@ test "memory notice is advisory and never replaces errors queue or settings" {
     try std.testing.expect(std.mem.find(u8, try ui.hint(arena.allocator(), state), "Memory:") == null);
     state.settings_error = null;
     state.settings_notice = "Settings warning";
-    try std.testing.expectEqualStrings("Settings warning", try ui.hint(arena.allocator(), state));
+    try std.testing.expectEqualStrings("Memory: extracting | Settings warning", try ui.hint(arena.allocator(), state));
     state.settings_notice = null;
     state.log_error = error.TestLogFailure;
     try std.testing.expect(std.mem.find(u8, try ui.hint(arena.allocator(), state), "REC FAILED") != null);
     state.log_error = null;
     ui.permission = .{ .id = 17, .description = try std.testing.allocator.dupe(u8, "owned approval"), .clipped = false };
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    try std.testing.expect(std.mem.find(u8, try ui.hint(arena.allocator(), state), "Memory:") == null);
     std.testing.allocator.free(ui.permission.?.description);
     ui.permission = null;
     ui.stop_open = true;
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    try std.testing.expect(std.mem.find(u8, try ui.hint(arena.allocator(), state), "Memory:") == null);
     ui.stop_open = false;
     _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "queued input");
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    try std.testing.expectEqualStrings("Memory: extracting", try ui.hint(arena.allocator(), state));
     ui.openSettingsMenu();
     try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
 }
@@ -12730,7 +12872,7 @@ test "wrapped composer idle LF debt first obtains a single row fresh ACK" {
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 }
 
-test "uncertain memory notice is a display record and never a timed hint" {
+test "uncertain memory view remains in footer without records" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -12739,26 +12881,17 @@ test "uncertain memory notice is a display record and never a timed hint" {
     var runtime: r.Runtime = undefined;
     var state = ui.connection.current();
     state.runtime = &runtime;
-    state.memory_notice = "Memory: request outcome uncertain; no automatic replay";
+    state.memory = .{ .enabled = true, .last_terminal = .{ .id = 1, .result = .uncertain } };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     ui.clock_ms = 100;
-    // The advisory never owns the footer; it is published once as a record.
-    try std.testing.expectEqualStrings("", try ui.hint(std.testing.allocator, state));
-    ui.observeMemoryNotice(state.memory_notice);
-    ui.observeMemoryNotice(state.memory_notice);
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
-    try std.testing.expectEqualStrings(state.memory_notice.?, ui.records.items[0].body.items);
-    // An actionable foreground error is never replaced by the advisory record.
+    try std.testing.expectEqualStrings("Memory: request outcome uncertain", try ui.hint(arena.allocator(), state));
     ui.notice = "Foreground error";
-    try std.testing.expectEqualStrings("Foreground error", try ui.hint(std.testing.allocator, state));
-    // Neither advanced time nor a new owner transition re-publishes or hides it.
+    try std.testing.expectEqualStrings("Foreground error", try ui.hint(arena.allocator(), state));
     ui.notice = "Ready";
     ui.clock_ms = 999_999;
-    try std.testing.expectEqualStrings("", try ui.hint(std.testing.allocator, state));
-    ui.observeMemoryNotice(null);
-    ui.observeMemoryNotice(state.memory_notice);
-    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
-    try std.testing.expectEqualStrings("", try ui.hint(std.testing.allocator, state));
+    try std.testing.expectEqualStrings("Memory: request outcome uncertain", try ui.hint(arena.allocator(), state));
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     try std.testing.expect(ui.future == null and !ui.has_submitted);
     try std.testing.expect(ui.inbox.snapshot().newest_id == null);
 }

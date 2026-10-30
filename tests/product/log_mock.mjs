@@ -247,7 +247,7 @@ async function scenario(app, pty, kind) {
         assert(row.event === 'diagnostic' && row.schema === 1, 'only diagnostics may follow finished');
         const d = row.data;
         assert(d && typeof d === 'object' && !Array.isArray(d), 'invalid diagnostic data');
-        const keys = ['stage','phase','span_id','elapsed_ms','result','error_name','operation','protocol','backend','route_hash','timeout_ms','http_status','model_failure','decision_failure','candidate_index','count'];
+        const keys = ['stage','phase','span_id','elapsed_ms','result','error_name','operation','protocol','backend','route_hash','timeout_ms','http_status','model_failure','decision_failure','candidate_index','count','origin_turn','memory_job_id'];
         assert(Object.keys(d).length === keys.length && keys.every(k => Object.hasOwn(d,k)), 'invalid diagnostic schema');
         assert(['observer','checkpoint','host_emit','finished_emit'].includes(d.stage), 'unexpected diagnostic stage');
         assert(['begin','end'].includes(d.phase) && Number.isSafeInteger(d.span_id) && d.span_id > 0, 'invalid diagnostic span');

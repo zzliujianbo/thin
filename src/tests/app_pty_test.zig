@@ -289,6 +289,20 @@ const Driver = struct {
         for (view.grid[view.row + 1 ..]) |line| for (line) |byte| try check(byte == ' ');
     }
 
+    fn checkStreamFooter(view: *const regular.Screen) !void {
+        const warning = "Saved thinking level not applied: model capabilities unknown";
+        const prefix = "Saved thinking level not applied";
+        try check(view.columns >= 2 and view.row >= 2 and view.rows <= view.grid.len and view.row < view.rows);
+        const clipped = warning[0..@min(warning.len, view.columns - 1)];
+        try check(std.mem.eql(u8, std.mem.trimEnd(u8, &view.grid[view.row - 1], " "), clipped));
+        var matches: usize = 0;
+        for (view.grid[0..view.rows]) |line| {
+            if (std.mem.indexOf(u8, &line, prefix) != null) matches += 1;
+        }
+        try check(matches == 1);
+        for (view.grid[view.row - 2]) |byte| try check(byte == ' ');
+    }
+
     /// Fixed-size replay only: resize cases check sequences, not terminal reflow.
     /// Each call returns an independent Driver-owned snapshot that stays valid
     /// until Driver.deinit, so before/after comparisons never alias.
@@ -2015,6 +2029,26 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         // A generated disk default is not an activated selection. Do not enter
         // a key or submit a prompt: no public endpoint may be contacted.
         try d.waitText(0, "/login");
+        // The warning owns exactly one row immediately before the first input
+        // row, both at startup and after an acknowledged menu close.
+        const initial = (try d.acknowledgedScreen(0)) orelse return error.MissingStartupFrame;
+        const history_before = initial.history_len;
+        try check(initial.row == initial.rows - 1);
+        try check(std.mem.indexOf(u8, &initial.grid[initial.row - 1], "Not configured:") != null);
+        try check(initial.count("Not configured:") == 1);
+        for (0..2) |_| {
+            const opened = d.used;
+            try d.send("/");
+            try d.waitVisibleFrame(opened, "/model");
+            const closed = d.used;
+            try d.send("\x7f");
+            try d.waitVisibleFrame(closed, "Not configured:");
+            const view = (try d.acknowledgedScreen(closed)) orelse return error.MissingStartupFrame;
+            try check(view.row == view.rows - 1);
+            try check(std.mem.indexOf(u8, &view.grid[view.row - 1], "Not configured:") != null);
+            try check(view.count("Not configured:") == 1);
+            try check(view.history_len == history_before and view.count(regular.prior) == 1);
+        }
         const pending = try d.screen();
         try check(pending.visible("/model"));
         try check(!pending.visible("deepseek-flash") and !pending.visible("?%"));
@@ -2439,7 +2473,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(!stage.visible("reasoning-stage-one") and !stage.visible("thinking-old-two"));
         try Driver.checkGap(stage, "stream-task", "thinking-new-five");
         try check(std.mem.indexOf(u8, &stage.grid[stage.row], "(fixture-model) ") != null and std.mem.indexOf(u8, &stage.grid[stage.row], "%~") != null);
-        for (stage.grid[stage.row - 1]) |byte| try check(byte == ' ');
+        try Driver.checkStreamFooter(stage);
         try check(!stage.visible("TPS:") and !stage.visible("tokens in:"));
         try check(std.mem.indexOf(u8, &stage.grid[stage.row], "(fixture-model) 0.0%~") != null);
         try Driver.checkComposerTail(stage);
@@ -2496,7 +2530,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         }
         try check(std.mem.indexOf(u8, markdown_output, "(\x1b[38;5;75mfixture-model\x1b[0m\x1b[1m) \x1b[38;5;114m0.3%\x1b[0m\x1b[1m>\x1b[0m ") != null); // High model, static green occupancy.
         try check(std.mem.indexOf(u8, markdown_output, "\x1b[38;5;75m>\x1b[0m") == null);
-        for (stage.grid[stage.row - 1]) |byte| try check(byte == ' ');
+        try Driver.checkStreamFooter(stage);
         try Driver.checkComposerTail(stage);
     } else if (std.mem.eql(u8, mode, "architecture-table")) {
         const start = d.used;
@@ -2539,7 +2573,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try Driver.checkComposerTail(first);
         try Driver.checkComposerTail(second);
         try check(std.mem.indexOf(u8, &first.grid[first.row], "(fixture-model) ") != null and std.mem.indexOf(u8, &first.grid[first.row], "%~") != null);
-        for (first.grid[first.row - 1]) |byte| try check(byte == ' ');
+        try Driver.checkStreamFooter(first);
         try d.waitRunningFrame(start, "sleep 0.6; printf ok");
         const next_pending = try d.screen();
         var completed_row: ?usize = null;

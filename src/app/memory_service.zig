@@ -1,8 +1,10 @@
 //! Project-local automatic Memory finalizer. Independent extraction/review
 //! failures are observable but never rewrite an already completed primary task.
-//! Finalization is synchronous: an accepted task cannot publish finished/idle
-//! until Memory reaches a terminal outcome.
+//! Jobs are copied into an owned, heap-stable FIFO and finalized by one owned
+//! asynchronous worker; the Runtime only enqueues before publishing finished;
+//! only headless exit explicitly drains. A parent-side failure never rewrites a job outcome.
 const std = @import("std");
+const builtin = @import("builtin");
 const diag = @import("../core/diagnostics.zig");
 const cfg = @import("../core/config.zig");
 const p = @import("../core/protocol.zig");
@@ -13,8 +15,39 @@ const knowledge = @import("../tools/knowledge_store.zig");
 const Extractor = @import("memory_client.zig").Client;
 const Reviewer = @import("decision_client.zig").Client;
 const codex_auth = @import("../core/codex_auth.zig");
+const memory_status = @import("../core/memory_status.zig");
 
 pub const State = enum(u8) { idle, finalizing, saved, skipped, failed, uncertain, canceled };
+
+/// One job's frozen outcome. The worker reads only this value, never the
+/// parent-visible legacy state/failure atoms that retrieve() and reportFailure()
+/// may update while a job is running.
+const Outcome = struct {
+    state: State = .idle,
+    err: ?anyerror = null,
+
+    fn set(self: *Outcome, state: State, err: ?anyerror) void {
+        self.state = state;
+        self.err = err;
+    }
+};
+
+const Job = struct {
+    next: ?*Job = null,
+    id: u64 = 0,
+    wiping: cfg.WipingAllocator,
+    arena: std.heap.ArenaAllocator,
+    capture: k.Capture,
+    protocol: p.Protocol,
+    cancel: p.Cancellation = .{},
+    sink: diag.Sink,
+    outcome: Outcome = .{},
+
+    fn destroy(self: *Job, a: std.mem.Allocator) void {
+        self.arena.deinit();
+        a.destroy(self);
+    }
+};
 pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -32,12 +65,339 @@ pub const Coordinator = struct {
     failure: std.atomic.Value(u16) = .init(0),
     completed: std.atomic.Value(u64) = .init(0),
     poisoned: std.atomic.Value(bool) = .init(false),
-    accepted_generation: std.atomic.Value(u64) = .init(0),
-    acceptance_valid: std.atomic.Value(bool) = .init(false),
     secrets: [34]?[]u8 = @splat(null),
     secret_count: usize = 0,
     secret_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     secret_registration_failed: bool = false,
+    queue_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    wake: std.Io.Event = .unset,
+    future: ?std.Io.Future(void) = null,
+    head: ?*Job = null,
+    tail: ?*Job = null,
+    active_job: ?*Job = null,
+    stopped: bool = false,
+    next_id: u64 = 0,
+    status: memory_status.View = .{},
+    /// Test-only, gated worker-wait failure seam. Production has no branch.
+    wait_ready: if (builtin.is_test) std.atomic.Value(bool) else void = if (builtin.is_test) .init(false) else {},
+    fail_wait: if (builtin.is_test) std.atomic.Value(bool) else void = if (builtin.is_test) .init(false) else {},
+    /// 0 idle, 1 worker paused after a gated wait failure, 2 released by test.
+    fail_wait_gate: if (builtin.is_test) std.atomic.Value(u8) else void = if (builtin.is_test) .init(0) else {},
+
+    fn lock(self: *Coordinator) void {
+        std.debug.assert(std.c.pthread_mutex_lock(&self.queue_mutex) == .SUCCESS);
+    }
+    fn unlock(self: *Coordinator) void {
+        std.debug.assert(std.c.pthread_mutex_unlock(&self.queue_mutex) == .SUCCESS);
+    }
+
+    pub fn view(self: *const Coordinator) memory_status.View {
+        const mutable = @constCast(self);
+        mutable.lock();
+        defer mutable.unlock();
+        var result = self.status;
+        result.enabled = self.config.value.memory.auto;
+        return result;
+    }
+
+    fn terminal(self: *Coordinator, id: u64, result: memory_status.Result, failure_: ?memory_status.Failure) void {
+        self.status.last_terminal = .{ .id = id, .result = result, .failure = failure_ };
+        self.status.revision +%= 1;
+    }
+
+    fn admissionFailure(self: *Coordinator, id: u64, err: anyerror) void {
+        self.lock();
+        defer self.unlock();
+        self.terminal(id, .failed, classifyFailure(err));
+    }
+
+    /// Safe value-only admission diagnostic: bounded error name, no prompt text
+    /// and no primary-task failure. Emitted for every rejected enqueue.
+    fn emitAdmissionFailure(sink: diag.Sink, id: u64, err: anyerror) void {
+        var local = sink;
+        if (id != 0) local.memory_job_id = id;
+        local.emit(.{
+            .stage = .memory_submit,
+            .phase = .point,
+            .result = .failed,
+            .error_name = diag.ErrorName.fromError(err),
+            .memory_job_id = if (id == 0) null else id,
+        });
+    }
+
+    pub fn enqueueCopy(self: *Coordinator, capture: *const k.Capture, protocol: p.Protocol, sink: diag.Sink) !u64 {
+        self.lock();
+        if (self.stopped or !self.config.value.memory.auto) {
+            self.unlock();
+            self.admissionFailure(0, error.MemoryUnavailable);
+            emitAdmissionFailure(sink, 0, error.MemoryUnavailable);
+            return error.MemoryUnavailable;
+        }
+        // Never wrap an exhausted id to a previously used job id.
+        if (self.next_id == std.math.maxInt(u64)) {
+            self.unlock();
+            self.admissionFailure(0, error.MemoryIdExhausted);
+            emitAdmissionFailure(sink, 0, error.MemoryIdExhausted);
+            return error.MemoryIdExhausted;
+        }
+        self.next_id += 1;
+        const id = self.next_id;
+        self.unlock();
+        if (capture.incomplete) {
+            self.admissionFailure(id, error.IncompleteCapture);
+            emitAdmissionFailure(sink, id, error.IncompleteCapture);
+            return error.IncompleteCapture;
+        }
+        const job = self.allocator.create(Job) catch |err| {
+            self.admissionFailure(id, err);
+            emitAdmissionFailure(sink, id, err);
+            return err;
+        };
+        job.wiping = .{ .backing = self.allocator };
+        job.arena = std.heap.ArenaAllocator.init(job.wiping.allocator());
+        job.next = null;
+        job.id = id;
+        job.protocol = protocol;
+        job.cancel = .{};
+        job.sink = sink;
+        job.sink.memory_job_id = id;
+        job.outcome = .{};
+        job.capture = .{ .allocator = job.arena.allocator(), .bytes = capture.bytes, .omitted_sources = capture.omitted_sources };
+        errdefer job.destroy(self.allocator);
+        for (capture.sources.items) |source| {
+            const text = job.capture.allocator.dupe(u8, source.text) catch |err| {
+                self.admissionFailure(id, err);
+                emitAdmissionFailure(sink, id, err);
+                return err;
+            };
+            job.capture.sources.append(job.capture.allocator, .{ .id = source.id, .kind = source.kind, .text = text }) catch |err| {
+                self.admissionFailure(id, err);
+                emitAdmissionFailure(sink, id, err);
+                return err;
+            };
+        }
+        self.lock();
+        if (self.stopped) {
+            self.terminal(id, .failed, .unavailable);
+            self.unlock();
+            emitAdmissionFailure(sink, id, error.MemoryUnavailable);
+            return error.MemoryUnavailable;
+        }
+        if (self.future == null) {
+            self.future = std.Io.concurrent(self.io, worker, .{self}) catch |err| {
+                self.terminal(id, .failed, classifyFailure(err));
+                self.unlock();
+                emitAdmissionFailure(sink, id, err);
+                return err;
+            };
+        }
+        if (self.tail) |tail| tail.next = job else self.head = job;
+        self.tail = job;
+        self.status.queued_count += 1;
+        self.status.revision +%= 1;
+        self.wake.set(self.io);
+        self.unlock();
+        return id;
+    }
+
+    fn worker(self: *Coordinator) void {
+        while (true) {
+            self.lock();
+            if (self.stopped) {
+                self.unlock();
+                return;
+            }
+            const job = self.head orelse {
+                self.wake.reset();
+                if (builtin.is_test) {
+                    self.wait_ready.store(true, .release);
+                }
+                self.unlock();
+                self.wake.wait(self.io) catch |err| {
+                    self.failPending(err);
+                    return;
+                };
+                if (builtin.is_test) {
+                    if (self.fail_wait.swap(false, .acq_rel)) {
+                        // Gate the failure so a test can queue more than one job
+                        // after the failed wake and before pending publication.
+                        self.fail_wait_gate.store(1, .release);
+                        var spins: usize = 0;
+                        while (self.fail_wait_gate.load(.acquire) == 1 and spins < 2000) : (spins += 1) {
+                            self.lock();
+                            const stopping = self.stopped;
+                            self.unlock();
+                            if (stopping) return;
+                            std.Io.sleep(self.io, .fromMilliseconds(1), .awake) catch |err| {
+                                self.failPending(err);
+                                return;
+                            };
+                        }
+                        if (self.fail_wait_gate.load(.acquire) == 1) {
+                            self.failPending(error.TestWaitGateTimeout);
+                            return;
+                        }
+                        self.failPending(error.TestWaitFailure);
+                        return;
+                    }
+                }
+                continue;
+            };
+            self.head = job.next;
+            if (self.head == null) self.tail = null;
+            self.active_job = job;
+            self.status.queued_count -= 1;
+            self.status.active = .{ .id = job.id, .phase = .extracting };
+            self.status.revision +%= 1;
+            self.unlock();
+            self.diagnostics = job.sink;
+            if (self.extractor) |client| client.diagnostics = job.sink;
+            if (self.reviewer) |client| client.diagnostics = job.sink;
+            var span = diag.Span.start(job.sink, self.io, .{ .stage = .memory_finalize });
+            self.execute(&job.outcome, &job.capture, job.protocol, &job.cancel);
+            const outcome = job.outcome;
+            if (outcome.err) |err| span.fail(err) else span.finish(if (outcome.state == .skipped) .skipped else .ok);
+            const result: memory_status.Result = switch (outcome.state) {
+                .saved => .saved,
+                .skipped => .skipped,
+                .uncertain => .uncertain,
+                .canceled => .canceled,
+                else => .failed,
+            };
+            self.lock();
+            self.active_job = null;
+            self.status.active = null;
+            self.publish(outcome.state, outcome.err);
+            self.terminal(job.id, result, if (outcome.err) |err| classifyFailure(err) else null);
+            self.unlock();
+            job.destroy(self.allocator);
+        }
+    }
+
+    /// The worker can no longer wait. Publish one typed failed terminal for every
+    /// queued job, detach the list, then wipe it outside the queue lock. Never
+    /// leaves drain watching a queue that no worker will ever consume.
+    fn failPending(self: *Coordinator, err: anyerror) void {
+        var pending: ?*Job = null;
+        self.lock();
+        pending = self.head;
+        self.head = null;
+        self.tail = null;
+        self.status.queued_count = 0;
+        self.status.active = null;
+        self.active_job = null;
+        self.stopped = true;
+        self.publish(.failed, err);
+        var cursor = pending;
+        while (cursor) |job| : (cursor = job.next) self.terminal(job.id, .failed, classifyFailure(err));
+        self.status.revision +%= 1;
+        self.wake.set(self.io);
+        self.unlock();
+        cursor = pending;
+        while (cursor) |job| {
+            cursor = job.next;
+            job.destroy(self.allocator);
+        }
+    }
+
+    fn classifyFailure(err: anyerror) memory_status.Failure {
+        return switch (err) {
+            error.Canceled => .canceled,
+            error.CleanupFailed => .cleanup,
+            error.MemoryUnavailable => .unavailable,
+            error.Busy => .busy,
+            error.MemoryConflict, error.VersionConflict, error.GenerationConflict, error.PathAlreadyExists => .conflict,
+            error.InvalidMemoryOutput,
+            error.InvalidMemoryVersion,
+            error.InvalidMemoryEvidence,
+            error.InvalidMemoryCandidate,
+            error.DuplicateMemoryCandidate,
+            error.InvalidMaterial,
+            error.InvalidDecision,
+            error.InvalidDecisionOutput,
+            error.InvalidKnowledgeRecord,
+            error.SensitiveMemoryMaterial,
+            error.TooManySessionCredentials,
+            => .invalid_output,
+            error.FileChanged,
+            error.CoreTooLarge,
+            error.ShardTooLarge,
+            error.IndexTooLarge,
+            error.InvalidGeneration,
+            error.GenerationOverflow,
+            error.NotRegularFile,
+            => .storage,
+            else => .other,
+        };
+    }
+
+    fn phase(self: *Coordinator, value: memory_status.Phase) void {
+        self.lock();
+        defer self.unlock();
+        if (self.status.active) |*active| if (active.phase != value) {
+            active.phase = value;
+            self.status.revision +%= 1;
+        };
+    }
+
+    pub fn drain(self: *Coordinator, cancel: *const p.Cancellation) void {
+        while (true) {
+            if (cancel.isRequested()) {
+                self.cancelAndJoin();
+                return;
+            }
+            self.lock();
+            const done = self.head == null and self.active_job == null;
+            const stopped = self.stopped;
+            self.unlock();
+            if (done) return;
+            // A failed worker or an owner-initiated stop must never leave drain
+            // polling a queue that cannot make progress.
+            if (stopped) {
+                self.cancelAndJoin();
+                return;
+            }
+            std.Io.sleep(self.io, .fromMilliseconds(5), .awake) catch {
+                self.cancelAndJoin();
+                return;
+            };
+        }
+    }
+
+    pub fn cancelAndJoin(self: *Coordinator) void {
+        var pending: ?*Job = null;
+        self.lock();
+        // Idempotent owner-only stop, but still join a finished-but-unawaited
+        // worker future before deinit destroys its owner state.
+        if (self.stopped and self.future == null and self.head == null and self.active_job == null) {
+            self.unlock();
+            return;
+        }
+        self.stopped = true;
+        if (self.active_job) |job| job.cancel.cancel();
+        pending = self.head;
+        self.head = null;
+        self.tail = null;
+        self.status.queued_count = 0;
+        self.status.revision +%= 1;
+        self.wake.set(self.io);
+        self.unlock();
+        // Join before touching pending jobs: the worker may still hold the lock
+        // only for bookkeeping, and no deallocation may happen under it.
+        if (self.future) |*future| future.await(self.io);
+        self.future = null;
+        if (pending) |first| {
+            self.lock();
+            var cursor: ?*Job = first;
+            while (cursor) |job| : (cursor = job.next) self.terminal(job.id, .canceled, .canceled);
+            self.unlock();
+            cursor = first;
+            while (cursor) |job| {
+                cursor = job.next;
+                job.destroy(self.allocator);
+            }
+        }
+    }
 
     pub fn create(a: std.mem.Allocator, io: std.Io, root: *const fs.Root, config: cfg.Config, env: *const std.process.Environ.Map) !*Coordinator {
         return createWithCodexSource(a, io, root, config, env, null);
@@ -57,6 +417,7 @@ pub const Coordinator = struct {
         self.store.wait_for_lock = false;
         errdefer {
             self.releaseSecrets();
+            std.debug.assert(std.c.pthread_mutex_destroy(&self.queue_mutex) == .SUCCESS);
             std.debug.assert(std.c.pthread_mutex_destroy(&self.secret_mutex) == .SUCCESS);
         }
         if (config.provider.api_key) |key| try self.registerSecret(key);
@@ -154,71 +515,63 @@ pub const Coordinator = struct {
     pub fn retrieve(self: *Coordinator, a: std.mem.Allocator, query: []const u8, max_bytes: usize) ![]const u8 {
         if (self.isPoisoned()) return error.CleanupFailed;
         if (self.secret_registration_failed) return error.TooManySessionCredentials;
-        self.acceptance_valid.store(false, .release);
-        const generation = try self.store.generation();
-        self.accepted_generation.store(generation, .release);
-        self.acceptance_valid.store(true, .release);
-        self.publish(.idle, null);
+        // Retrieval can run concurrently with an automatic Memory job. Store has
+        // mutable transaction state, so use a distinct instance on the same root.
+        var store = mem.Store.init(&self.root, self.config.value.limits);
+        store.wait_for_lock = false;
         if (max_bytes == 0) return a.dupe(u8, "");
         var end = @min(query.len, 8192);
         while (end > 0 and end < query.len and query[end] & 0xc0 == 0x80) end -= 1;
-        var repository = knowledge.Repository.init(&self.store);
+        var repository = knowledge.Repository.init(&store);
         var reference_wiping: cfg.WipingAllocator = .{ .backing = a };
         const reference = try repository.retrieve(reference_wiping.allocator(), query[0..end], now(self.io), @min(max_bytes, k.max_retrieval_bytes));
         if (self.containsSecret(reference)) {
             reference_wiping.allocator().free(reference);
-            self.publish(.failed, error.SensitiveMemoryMaterial);
             return error.SensitiveMemoryMaterial;
         }
         return reference;
     }
 
-    /// Finalize one accepted primary task before Runtime publishes finished.
-    /// Auxiliary failure is recorded here and deliberately does not alter the
-    /// primary task's already frozen Terminal.
-    pub fn finalize(self: *Coordinator, capture: *const k.Capture, protocol: p.Protocol, cancel: *const p.Cancellation) void {
+    /// Execute one job into its private outcome. Never reads or writes the
+    /// parent-visible state/failure atoms, so a concurrent retrieve() or
+    /// reportFailure() cannot change this job's terminal classification.
+    fn execute(self: *Coordinator, out: *Outcome, capture: *const k.Capture, protocol: p.Protocol, cancel: *const p.Cancellation) void {
+        out.* = .{};
         if (!self.config.value.memory.auto) return;
         if (self.isPoisoned()) {
-            self.publish(.failed, error.CleanupFailed);
+            out.set(.failed, error.CleanupFailed);
             return;
         }
         if (capture.incomplete or capture.sources.items.len == 0) {
-            self.publish(.skipped, null);
-            return;
-        }
-        if (!self.acceptance_valid.load(.acquire)) {
-            if (self.failure.load(.acquire) == 0) self.publish(.failed, error.MemoryUnavailable);
+            out.set(.skipped, null);
             return;
         }
         if (cancel.isRequested()) {
-            self.publish(.canceled, error.Canceled);
+            out.set(.canceled, error.Canceled);
             return;
         }
         if (self.service_override == null) {
             if (protocol == .auto or protocol == .systemone) {
-                self.publish(.failed, error.MemoryUnavailable);
+                out.set(.failed, error.MemoryUnavailable);
                 return;
             }
             self.extractor.?.bindProtocol(protocol) catch |err| {
-                self.publish(.failed, err);
+                out.set(.failed, err);
                 return;
             };
         }
 
-        self.publish(.finalizing, null);
+        out.set(.finalizing, null);
         var wiping: cfg.WipingAllocator = .{ .backing = self.allocator };
         var scratch = std.heap.ArenaAllocator.init(wiping.allocator());
         defer scratch.deinit();
         const a = scratch.allocator();
-        const generation = self.accepted_generation.load(.acquire);
-        const current_generation = self.store.generation() catch |err| {
-            self.publish(.failed, err);
+        // Capture the generation at processing time, not at prompt retrieval:
+        // an earlier queued job may legitimately have written in the meantime.
+        const generation = self.store.generation() catch |err| {
+            out.set(.failed, err);
             return;
         };
-        if (current_generation != generation) {
-            self.publish(.skipped, null);
-            return;
-        }
         var digest = std.crypto.hash.sha2.Sha256.init(.{});
         var generation_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &generation_bytes, generation, .little);
@@ -232,21 +585,39 @@ pub const Coordinator = struct {
         }
         const id = std.fmt.bytesToHex(digest.finalResult(), .lower);
         const material: k.Material = .{ .id = &id, .generation = generation, .created_ms = now(self.io), .sources = capture.sources.items, .omitted_sources = capture.omitted_sources };
-        self.process(a, material, cancel) catch |err| {
-            if (err == error.Canceled) self.publish(.canceled, err) else if (err == error.MemoryUnavailable) self.publish(.uncertain, err) else self.publish(.failed, err);
+        self.process(a, out, material, cancel) catch |err| {
+            if (err == error.Canceled) out.set(.canceled, err) else if (err == error.MemoryUnavailable) out.set(.uncertain, err) else out.set(.failed, err);
             return;
         };
         _ = self.completed.fetchAdd(1, .acq_rel);
     }
 
+    /// Test helper: run one capture on the caller's thread and publish its
+    /// outcome to the legacy parent-visible atoms. Production App only enqueues.
+    fn finalize(self: *Coordinator, capture: *const k.Capture, protocol: p.Protocol, cancel: *const p.Cancellation) void {
+        var outcome: Outcome = .{};
+        self.execute(&outcome, capture, protocol, cancel);
+        self.publish(outcome.state, outcome.err);
+    }
+
     pub fn reportFailure(self: *Coordinator, err: anyerror) void {
-        self.publish(.failed, err);
+        // Legacy parent-visible atoms remain for notice()/headless completion,
+        // but the worker never reads them: an active job keeps its own outcome.
+        if (err == error.CleanupFailed) self.poisoned.store(true, .release);
+        self.failure.store(@intFromError(err), .release);
+        self.state.store(@backingInt(State.failed), .release);
+        self.lock();
+        defer self.unlock();
+        // A parent failure must never publish over the terminal owned by a job
+        // that is still running (or about to publish its own result).
+        if (self.status.active != null) return;
+        self.terminal(0, .failed, classifyFailure(err));
     }
     fn now(io: std.Io) u64 {
         const value = std.Io.Clock.real.now(io).toMilliseconds();
         return @intCast(@max(0, value));
     }
-    fn process(self: *Coordinator, a: std.mem.Allocator, source: k.Material, cancel: *const p.Cancellation) !void {
+    fn process(self: *Coordinator, a: std.mem.Allocator, out: *Outcome, source: k.Material, cancel: *const p.Cancellation) !void {
         if (cancel.isRequested()) return error.Canceled;
         if (self.secret_registration_failed) return error.TooManySessionCredentials;
         var repository = knowledge.Repository.init(&self.store);
@@ -289,6 +660,7 @@ pub const Coordinator = struct {
                 .created, .updated => {},
             }
             if (self.review_override orelse if (self.reviewer) |client| client.service() else null) |reviewer| {
+                self.phase(.reviewing);
                 var span = diag.Span.start(self.diagnostics, self.io, .{ .stage = .memory_review, .candidate_index = @intCast(@min(index, std.math.maxInt(u32))), .count = @intCast(@min(candidates.len, std.math.maxInt(u32))) });
                 const output = reviewer.decide(a, .{ .memory_write = .{ .topic = candidate.topic, .content = candidate.content, .expected_version = candidate.expected_version } }, cancel) catch |err| {
                     span.fail(err);
@@ -302,6 +674,7 @@ pub const Coordinator = struct {
                 if (!output.memory_write) continue;
             }
             if (cancel.isRequested()) return error.Canceled;
+            self.phase(.saving);
             var span = diag.Span.start(self.diagnostics, self.io, .{ .stage = .memory_write, .candidate_index = @intCast(@min(index, std.math.maxInt(u32))), .count = @intCast(@min(candidates.len, std.math.maxInt(u32))) });
             const result = repository.apply(a, material, candidate) catch |err| {
                 span.fail(err);
@@ -314,10 +687,12 @@ pub const Coordinator = struct {
                 .unchanged, .expired => {},
             }
         }
-        self.publish(if (saved == 0) .skipped else .saved, null);
+        out.set(if (saved == 0) .skipped else .saved, null);
     }
 
     pub fn deinit(self: *Coordinator) void {
+        self.cancelAndJoin();
+        std.debug.assert(std.c.pthread_mutex_destroy(&self.queue_mutex) == .SUCCESS);
         if (self.reviewer) |reviewer| reviewer.deinit();
         if (self.extractor) |client| client.deinit();
         self.releaseSecrets();

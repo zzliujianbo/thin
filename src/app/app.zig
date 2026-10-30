@@ -277,13 +277,26 @@ pub const App = struct {
         self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
         self.runtime.session_loader = .{ .context = self, .load_fn = loadSessionPolicy };
         self.runtime.observer = self.journal.observer();
-        self.runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieveMemory, .finalize_fn = finalizeMemory };
+        self.runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieveMemory, .submit_fn = submitMemory, .check_fn = memorySafe };
         self.recordSelection();
         return self;
     }
 
     pub fn memoryNotice(self: *const App) ?[]const u8 {
         return self.memory_coordinator.notice();
+    }
+
+    pub fn memoryView(self: *const App) @import("../core/memory_status.zig").View {
+        return self.memory_coordinator.view();
+    }
+
+    pub fn drainMemory(self: *App, cancel: *const @import("../core/protocol.zig").Cancellation) void {
+        self.memory_coordinator.drain(cancel);
+    }
+
+    fn memorySafe(raw: *anyopaque) bool {
+        const self: *App = @ptrCast(@alignCast(raw));
+        return !self.memory_coordinator.isPoisoned();
     }
 
     fn retrieveMemory(raw: *anyopaque, a: std.mem.Allocator, query: []const u8, max_bytes: usize) ![]const u8 {
@@ -294,7 +307,7 @@ pub const App = struct {
         };
     }
 
-    fn finalizeMemory(raw: *anyopaque, capture: *const knowledge.Capture, protocol: @import("../core/protocol.zig").Protocol, cancel: *const @import("../core/protocol.zig").Cancellation) void {
+    fn submitMemory(raw: *anyopaque, capture: *const knowledge.Capture, protocol: @import("../core/protocol.zig").Protocol) void {
         const self: *App = @ptrCast(@alignCast(raw));
         if (!self.config.value.memory.auto) return;
         var wiping: cfg.WipingAllocator = .{ .backing = self.allocator };
@@ -308,7 +321,10 @@ pub const App = struct {
             }
             filtered.add(source.kind, source.text);
         }
-        self.memory_coordinator.finalize(&filtered, protocol, cancel);
+        if (capture.incomplete) filtered.incomplete = true;
+        _ = self.memory_coordinator.enqueueCopy(&filtered, protocol, self.journal.memoryDiagnosticSink()) catch |err| {
+            self.memory_coordinator.reportFailure(err);
+        };
     }
 
     fn imageService(self: *App) ?image.Service {
@@ -473,9 +489,11 @@ pub const App = struct {
         return result;
     }
 
-    /// Called only after settings save. Owned, idle publication cannot fail.
+    /// Called only after settings save; joins the replaced Memory owner.
     pub fn installSettings(self: *App, replacement: *SettingsReplacement) void {
         std.debug.assert(!self.runtime.busy.load(.acquire));
+        if (replacement.replace_memory) self.memory_coordinator.cancelAndJoin();
+        const memory_poisoned = self.memory_coordinator.isPoisoned();
         var previous_config = self.config;
         self.config = replacement.config.?;
         replacement.config = null;
@@ -513,6 +531,7 @@ pub const App = struct {
         // keep their frozen cwd/environment and are never touched here.
         self.executor.background = self.background.service();
         self.runtime.executor = self.executor.executor();
+        if (memory_poisoned) self.runtime.poisoned = true;
         // Schema edits affect future estimates, not the latest server-reported
         // primary usage (including fresh-session zero or genuinely unknown).
     }
@@ -544,6 +563,7 @@ pub const App = struct {
     pub fn prepareConnection(self: *App, parsed: std.json.Parsed(cfg.Config), environ: *const std.process.Environ.Map) !*ConnectionReplacement {
         var owned = parsed;
         errdefer cfg.release(&owned);
+        if (self.runtime.poisoned or self.memory_coordinator.isPoisoned()) return error.UnsafeToContinue;
         if (owned.value.model.protocol == .systemone) return error.SystemOneNotChatModel;
         const plan = try self.runtime.planSelection(owned.value, true);
         if (!std.meta.eql(owned.value.limits, self.config.value.limits)) return error.ConnectionLimitsChanged;
@@ -572,10 +592,11 @@ pub const App = struct {
         return replacement;
     }
 
-    /// Owner has joined/drained the worker. There are no allocations, requests,
-    /// storage writes or fallible operations after this publication boundary.
+    /// Publish the saved connection after canceling and joining the old Memory owner.
     pub fn installConnection(self: *App, replacement: *ConnectionReplacement) void {
         std.debug.assert(replacement.owner == self);
+        self.memory_coordinator.cancelAndJoin();
+        const memory_poisoned = self.memory_coordinator.isPoisoned();
         self.runtime.applySelection(replacement.plan);
         var previous = self.config;
         // Never relocate a used pool: destroy it in its original App slot.
@@ -602,6 +623,7 @@ pub const App = struct {
         // services keep their startup cwd/environment and cleanup policy.
         self.executor.background = self.background.service();
         self.runtime.executor = self.executor.executor();
+        if (memory_poisoned) self.runtime.poisoned = true;
         self.recordSelection();
         self.allocator.destroy(replacement);
         cfg.release(&previous);
@@ -646,6 +668,7 @@ pub const App = struct {
     /// 按创建的逆序释放资源，最后销毁自身。
     pub fn deinit(self: *App) void {
         const a = self.allocator;
+        self.memory_coordinator.cancelAndJoin();
         self.subagent.deinit();
         self.runtime.deinit();
         // Foreground tasks and delegated children are joined above. Only then

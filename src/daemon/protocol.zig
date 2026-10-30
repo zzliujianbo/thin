@@ -24,6 +24,7 @@ const task = @import("../core/task.zig");
 const write_preview = @import("../core/write_preview.zig");
 const line_stats = @import("../util/line_stats.zig");
 const codex_login = @import("../core/codex_login.zig");
+const memory_status = @import("../core/memory_status.zig");
 
 /// Private daemon/worker IPC version. v2 is the lossless selective-ACK wire
 /// (optional `first` on ACK, `since` resume and the ordered history/live
@@ -61,6 +62,8 @@ pub const ErrorCode = enum {
     permission_expired,
     no_official_provider,
     metadata_refresh_busy,
+    thinking_capabilities_loading,
+    thinking_capabilities_unknown,
     transport,
     protocol,
     internal,
@@ -93,6 +96,8 @@ pub fn errorCode(err: anyerror) ErrorCode {
         error.PermissionExpired, error.InvalidPermission => .permission_expired,
         error.NoOfficialProvider => .no_official_provider,
         error.MetadataRefreshBusy => .metadata_refresh_busy,
+        error.ThinkingCapabilitiesLoading => .thinking_capabilities_loading,
+        error.ThinkingCapabilitiesUnknown => .thinking_capabilities_unknown,
         error.ConnectionLost, error.ConnectionClosed, error.Transport, error.StreamPoisoned, error.Timeout => .transport,
         error.ProtocolError, error.TruncatedFrame, error.FrameTooLarge, error.DuplicateField, error.UnknownField, error.SyntaxError, error.UnexpectedEndOfInput, error.BufferUnderrun, error.BadRequest => .protocol,
         else => .internal,
@@ -995,6 +1000,7 @@ pub const Snapshot = struct {
     model: []const u8 = "",
     provider: ?[]const u8 = null,
     codex_login: codex_login.View = .{},
+    memory: memory_status.View = .{},
     read_only: bool = false,
     truncated: bool = false,
 };
@@ -1044,8 +1050,30 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
     try out.field("code", snapshot.codex_login.userCode());
     try out.field("failure", if (snapshot.codex_login.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
     try out.endObject();
+    try encodeMemoryView(out, snapshot.memory);
     try out.field("read_only", snapshot.read_only);
     try out.field("truncated", snapshot.truncated);
+    try out.endObject();
+}
+
+pub fn encodeMemoryView(out: *Out, view: memory_status.View) !void {
+    try out.beginObject("memory");
+    try out.field("enabled", view.enabled);
+    try out.field("revision", view.revision);
+    try out.field("queued_count", view.queued_count);
+    if (view.active) |active| {
+        try out.beginObject("active");
+        try out.field("id", active.id);
+        try out.field("phase", @tagName(active.phase));
+        try out.endObject();
+    } else try out.field("active", @as(?u8, null));
+    if (view.last_terminal) |terminal| {
+        try out.beginObject("last_terminal");
+        try out.field("id", terminal.id);
+        try out.field("result", @tagName(terminal.result));
+        try out.field("failure", if (terminal.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
+        try out.endObject();
+    } else try out.field("last_terminal", @as(?u8, null));
     try out.endObject();
 }
 

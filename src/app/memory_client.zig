@@ -41,9 +41,7 @@ pub const Client = struct {
         }
         self.source = if (config.selection_pending) try cfg.clonePendingSettings(owned, config) else try cfg.clone(owned, config);
         errdefer cfg.release(&self.source);
-        // Decoded JSON bounds are independent of provider output length and SSE
-        // framing. Retain validated wire/event limits and codec payload bounds,
-        // without imposing a separate helper token allowance.
+        // Retain validated wire/event limits without a separate helper output cap.
         const frozen = &self.source.value;
         const codex = frozen.provider.kind == .openai_codex and std.mem.eql(u8, frozen.provider.base_url, cfg.providers.Id.openai_codex.baseUrl());
         self.key = if (codex) null else cfg.resolveApiKey(owned, frozen.*, env) catch |err| switch (err) {
@@ -192,17 +190,15 @@ pub const Client = struct {
         };
         common.mergeUsage(&self.last_usage, response.usage);
         try self.check(cancel);
-        if (response.refused or response.finish != .stop or response.message.role != .assistant) return error.InvalidMemoryOutput;
+        if (response.refused or response.unsupported_output or response.finish != .stop or response.message.role != .assistant) return error.InvalidMemoryOutput;
         if (response.message.replay) |replay| {
             if (replay.scope.protocol != request.scope.protocol or
                 !std.mem.eql(u8, replay.scope.connection, request.scope.connection) or
                 !std.mem.eql(u8, replay.scope.model, request.scope.model)) return error.InvalidMemoryOutput;
-            try checkNative(a, replay);
         }
         var text: std.ArrayList(u8) = .empty;
         for (response.message.blocks) |block| switch (block) {
             .text => |part| {
-                if (part.len > codec.max_output_bytes -| text.items.len) return error.InvalidMemoryOutput;
                 try text.appendSlice(a, part);
             },
             .reasoning => {}, // Explicit metadata only; never extraction evidence.
@@ -217,121 +213,15 @@ pub const Client = struct {
         return result;
     }
 };
-// Native replay is never sent back or used as evidence. Inspect only explicit
-// refusal/type metadata: ordinary text/signatures may contain arbitrary words.
-fn checkNative(a: std.mem.Allocator, replay: p.Replay) !void {
-    if (replay.json.len > 32768 or !std.unicode.utf8ValidateSlice(replay.json)) return error.InvalidMemoryOutput;
-    // Refuse pathological native metadata before the recursive JSON parser.
-    var depth: usize = 0;
-    var quoted = false;
-    var escaped = false;
-    for (replay.json) |c| {
-        if (quoted) {
-            if (escaped) escaped = false else if (c == '\\') escaped = true else if (c == '"') quoted = false;
-        } else switch (c) {
-            '"' => quoted = true,
-            '{', '[' => {
-                depth += 1;
-                if (depth > 16) return error.InvalidMemoryOutput;
-            },
-            '}', ']' => {
-                if (depth == 0) return error.InvalidMemoryOutput;
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
-    if (quoted or depth != 0) return error.InvalidMemoryOutput;
-    var parsed = std.json.parseFromSlice(std.json.Value, a, replay.json, .{ .duplicate_field_behavior = .@"error" }) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        return error.InvalidMemoryOutput;
-    };
-    defer parsed.deinit();
-    const value = parsed.value;
-    switch (replay.scope.protocol) {
-        .chat => {
-            if (value != .object) return error.InvalidMemoryOutput;
-            try assistantRole(value);
-            if (value.object.get("refusal")) |refusal| if (refusal != .null) return error.InvalidMemoryOutput;
-            for ([_][]const u8{ "tool_calls", "function_call" }) |key| if (value.object.get(key)) |calls| {
-                if (calls != .null and !(calls == .array and calls.array.items.len == 0)) return error.InvalidMemoryOutput;
-            };
-        },
-        .responses => {
-            if (value != .array) return error.InvalidMemoryOutput;
-            for (value.array.items) |item| {
-                if (item != .object) return error.InvalidMemoryOutput;
-                const typ = item.object.get("type") orelse return error.InvalidMemoryOutput;
-                if (typ != .string) return error.InvalidMemoryOutput;
-                if (item.object.get("status")) |status| {
-                    if (status != .string or !std.mem.eql(u8, status.string, "completed")) return error.InvalidMemoryOutput;
-                }
-                if (std.mem.eql(u8, typ.string, "message")) {
-                    try assistantRole(item);
-                    const parts = item.object.get("content") orelse return error.InvalidMemoryOutput;
-                    if (parts != .array) return error.InvalidMemoryOutput;
-                    for (parts.array.items) |part| {
-                        if (part != .object) return error.InvalidMemoryOutput;
-                        const kind = part.object.get("type") orelse return error.InvalidMemoryOutput;
-                        if (kind != .string or !std.mem.eql(u8, kind.string, "output_text")) return error.InvalidMemoryOutput;
-                    }
-                } else if (!std.mem.eql(u8, typ.string, "reasoning")) return error.InvalidMemoryOutput;
-            }
-        },
-        .anthropic => {
-            if (value != .object) return error.InvalidMemoryOutput;
-            try assistantRole(value);
-            if (value.object.get("stop_reason")) |reason| {
-                if (reason != .string or (!std.mem.eql(u8, reason.string, "end_turn") and !std.mem.eql(u8, reason.string, "stop_sequence"))) return error.InvalidMemoryOutput;
-            }
-            const parts = value.object.get("content") orelse return error.InvalidMemoryOutput;
-            if (parts != .array) return error.InvalidMemoryOutput;
-            for (parts.array.items) |part| {
-                if (part != .object) return error.InvalidMemoryOutput;
-                const typ = part.object.get("type") orelse return error.InvalidMemoryOutput;
-                if (typ != .string or (!std.mem.eql(u8, typ.string, "text") and !std.mem.eql(u8, typ.string, "thinking") and !std.mem.eql(u8, typ.string, "redacted_thinking"))) return error.InvalidMemoryOutput;
-            }
-        },
-        else => return error.InvalidMemoryOutput,
-    }
-}
-test "memory client native metadata rejects tools refusal partial deep duplicates" {
-    const a = std.testing.allocator;
-    const Case = struct { protocol: p.Protocol, json: []const u8 };
-    for ([_]Case{
-        .{ .protocol = .chat, .json = "{\"role\":\"assistant\",\"refusal\":\"no\"}" },
-        .{ .protocol = .chat, .json = "{\"role\":\"assistant\",\"tool_calls\":[{}]}" },
-        .{ .protocol = .chat, .json = "{\"role\":\"assistant\",\"function_call\":{}}" },
-        .{ .protocol = .chat, .json = "{\"role\":\"assistant\",\"role\":\"assistant\"}" },
-        .{ .protocol = .responses, .json = "[{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"incomplete\",\"content\":[]}]" },
-        .{ .protocol = .responses, .json = "[{\"type\":\"function_call\"}]" },
-        .{ .protocol = .responses, .json = "[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\"}]}]" },
-        .{ .protocol = .anthropic, .json = "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\"}]}" },
-        .{ .protocol = .anthropic, .json = "{\"role\":\"assistant\",\"content\":[],\"stop_reason\":\"refusal\"}" },
-    }) |case| try std.testing.expectError(error.InvalidMemoryOutput, checkNative(a, .{ .scope = .{ .connection = "fixture", .model = "fixture", .protocol = case.protocol }, .json = case.json }));
-    var deep: [40]u8 = undefined;
-    @memset(deep[0..20], '[');
-    @memset(deep[20..], ']');
-    try std.testing.expectError(error.InvalidMemoryOutput, checkNative(a, .{ .scope = .{ .connection = "fixture", .model = "fixture", .protocol = .responses }, .json = &deep }));
-}
-fn assistantRole(value: std.json.Value) !void {
-    const role = value.object.get("role") orelse return error.InvalidMemoryOutput;
-    if (role != .string or !std.mem.eql(u8, role.string, "assistant")) return error.InvalidMemoryOutput;
-}
 const UsageSink = struct {
     client: *Client,
     cancel: *const p.Cancellation,
-    text_bytes: usize = 0,
     fn emit(raw: ?*anyopaque, event: p.ModelEvent) !void {
         const self: *UsageSink = @ptrCast(@alignCast(raw.?));
         if (event == .usage) common.mergeUsage(&self.client.last_usage, event.usage);
         try self.client.check(self.cancel);
         switch (event) {
             .tool_delta => return error.InvalidMemoryOutput,
-            .text_delta => |part| {
-                if (part.len > codec.max_output_bytes -| self.text_bytes) return error.InvalidMemoryOutput;
-                self.text_bytes += part.len;
-            },
             else => {},
         }
     }
@@ -340,7 +230,7 @@ const UsageSink = struct {
 const fixture: knowledge.Material = .{ .id = "test", .generation = 1, .created_ms = 100, .sources = &.{.{ .id = 0, .kind = .user, .text = "Prefer Zig." }} };
 const Fake = struct {
     calls: usize = 0,
-    mode: enum { empty, failure, cancel, tool, thrown, canceled_cleanup, partial_usage, partial, reasoning, oversized } = .empty,
+    mode: enum { empty, failure, cancel, tool, thrown, canceled_cleanup, partial_usage, partial, reasoning, oversized, replay, wrong_scope } = .empty,
     client: ?*Client = null,
     fn invoke(raw: *anyopaque, a: std.mem.Allocator, request: p.Request, sink: p.ModelSink) !p.Outcome {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -364,9 +254,16 @@ const Fake = struct {
         const body = if (self.mode == .partial) "{\"items\":[" else "{\"items\":[]}";
         var msg = try p.textMessage(a, .assistant, body);
         if (self.mode == .reasoning) msg.blocks = try a.dupe(p.Block, &.{ .{ .reasoning = "Do not save this thought" }, .{ .text = body } });
+        if (self.mode == .replay or self.mode == .wrong_scope) {
+            var scope = request.scope;
+            if (self.mode == .wrong_scope) scope.model = "wrong";
+            msg.replay = .{ .scope = scope, .json = "\xff not JSON" };
+        }
         if (self.mode == .oversized) {
-            const text = try a.alloc(u8, codec.max_output_bytes + 1);
-            @memset(text, ' ');
+            const padding = try a.alloc(u8, 33000);
+            @memset(padding, ' ');
+            const text = try std.fmt.allocPrint(a, "{s}{{\"items\":[]}}", .{padding});
+            try sink.emit(.{ .text_delta = text });
             msg = try p.textMessage(a, .assistant, text);
         }
         return .{ .success = .{ .message = msg, .usage = if (self.mode == .partial_usage) .{ .output_tokens = 4 } else usage, .finish = .stop } };
@@ -497,10 +394,19 @@ test "memory client fake normal request preserves usage cancellation no tools no
     try std.testing.expectError(error.MemoryUnavailable, client.service().extract(a, fixture, &cancel));
     try std.testing.expectEqual(@as(?u16, 429), client.last_http_status);
     try std.testing.expectEqual(@as(?u64, 3), client.last_usage.output_tokens);
-    for ([_]@TypeOf(fake.mode){ .tool, .partial, .oversized }) |mode| {
+    for ([_]@TypeOf(fake.mode){ .tool, .partial }) |mode| {
         fake.mode = mode;
         try std.testing.expectError(error.InvalidMemoryOutput, client.service().extract(a, fixture, &cancel));
     }
+    fake.mode = .wrong_scope;
+    try std.testing.expectError(error.InvalidMemoryOutput, client.service().extract(a, fixture, &cancel));
+    fake.mode = .replay;
+    const ignored_replay = try client.service().extract(a, fixture, &cancel);
+    defer codec.freeCandidates(a, ignored_replay);
+    fake.mode = .oversized;
+    const large = try client.service().extract(a, fixture, &cancel);
+    defer codec.freeCandidates(a, large);
+    try std.testing.expectEqual(@as(usize, 0), large.len);
     fake.mode = .reasoning;
     const empty = try client.service().extract(a, fixture, &cancel);
     defer codec.freeCandidates(a, empty);
@@ -616,6 +522,7 @@ const WireFake = struct {
     body_override: ?[]const u8 = null,
     reject: bool = false,
     truncated: bool = false,
+    large_reasoning: bool = false,
     calls: usize = 0,
     fn invoke(raw: *anyopaque, a: std.mem.Allocator, req: p.Request, sink: p.ModelSink) !p.Outcome {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -627,6 +534,12 @@ const WireFake = struct {
         switch (req.scope.protocol) {
             .chat => {
                 var stream = @import("../llm/chat.zig").Stream.init(a, req.scope, sink);
+                if (self.large_reasoning) {
+                    const reasoning = try a.alloc(u8, 33000);
+                    @memset(reasoning, 'x');
+                    const encoded = try std.json.Stringify.valueAlloc(a, reasoning, .{});
+                    try stream.feed("", try std.fmt.allocPrint(a, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":{s}}}}}]}}", .{encoded}));
+                }
                 try stream.feed("", try std.fmt.allocPrint(a, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"{s}\":{s}}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":13,\"completion_tokens\":4}}}}", .{ if (self.reject) "refusal" else "content", quoted }));
                 if (!self.truncated) try stream.feed("", "[DONE]");
                 return stream.finish();
@@ -786,6 +699,36 @@ test "memory client rejects Anthropic explicit refusal even with valid evidence 
     defer codec.freeCandidates(a, items);
     try std.testing.expectEqual(@as(usize, 1), items.len);
     try std.testing.expectEqual(@as(u64, 2), client.calls);
+}
+test "memory client real decoders accept large final JSON and Chat large reasoning replay" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const padding = try a.alloc(u8, 33000);
+    defer a.free(padding);
+    @memset(padding, ' ');
+    const body = try std.fmt.allocPrint(a, "{s}{{\"items\":[]}}", .{padding});
+    defer a.free(body);
+    for ([_]p.Protocol{ .chat, .responses, .anthropic }) |protocol| {
+        var config = testConfig();
+        config.model.protocol = protocol;
+        const client = try Client.create(a, std.testing.io, config, &env);
+        defer client.deinit();
+        var fake: WireFake = .{ .body_override = body };
+        client.model_override = .{ .context = &fake, .call_fn = WireFake.invoke };
+        var cancel: p.Cancellation = .{};
+        const items = try client.service().extract(a, fixture, &cancel);
+        defer codec.freeCandidates(a, items);
+        try std.testing.expectEqual(@as(usize, 0), items.len);
+        try std.testing.expectEqual(@as(?u64, 13), client.last_usage.input_tokens);
+        if (protocol == .chat) {
+            fake.body_override = null;
+            fake.large_reasoning = true;
+            const with_reasoning = try client.service().extract(a, fixture, &cancel);
+            defer codec.freeCandidates(a, with_reasoning);
+            try std.testing.expectEqual(@as(usize, 1), with_reasoning.len);
+        }
+    }
 }
 test "memory client actual Chat Responses Anthropic decoders valid refused truncated independent usage" {
     const a = std.testing.allocator;

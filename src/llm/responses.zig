@@ -7,6 +7,34 @@ const j = @import("../util/json.zig");
 const c = @import("common.zig");
 const test_support = @import("../tests/adapter_test_support.zig");
 
+test "responses normalized safety flags preserve native output and known tools" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const outputs = [_][]const u8{
+        "[{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"vendor\":1,\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]",
+        "[{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"\"}]}]",
+        "[{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"future_part\",\"value\":1}]}]",
+        "[{\"id\":\"x\",\"type\":\"future_item\",\"value\":1}]",
+        "[{\"id\":\"f\",\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"f\",\"arguments\":\"{}\"}]",
+        "[{\"id\":\"r\",\"type\":\"reasoning\",\"encrypted_content\":\"secret\"}]",
+    };
+    for (outputs, 0..) |output, i| {
+        var s = Stream.init(a, test_support.response_scope, .{});
+        try s.feed("", try std.fmt.allocPrint(a, "{{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":{s}}}}}", .{output}));
+        const response = (try s.finish()).success;
+        try std.testing.expectEqual(i == 1, response.refused);
+        try std.testing.expectEqual(i == 2 or i == 3, response.unsupported_output);
+        try std.testing.expectEqualStrings(output, response.message.replay.?.json);
+        if (i == 0) try std.testing.expectEqualStrings("ok", response.message.blocks[0].text);
+        if (i == 4) {
+            try std.testing.expect(response.finish == .tool_calls);
+            try std.testing.expectEqualStrings("c", response.message.blocks[0].tool_call.id);
+        }
+        if (i != 4) try std.testing.expect(response.message.replay.?.retain_turn or i == 1);
+    }
+}
+
 test "responses omits all output caps regardless of model capacity and purpose" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -847,6 +875,8 @@ pub const Stream = struct {
 
         var blocks: std.ArrayList(p.Block) = .empty;
         var has_tools = false;
+        var refused = false;
+        var unsupported_output = false;
         var retain_turn = false;
         const output = self.output.?;
         for (try c.list(output)) |item| {
@@ -862,7 +892,12 @@ pub const Stream = struct {
                     const typ = try c.text(part, "type");
                     retain_turn = retain_turn or !c.onlyKeys(part, &.{ "type", "text", "refusal", "annotations", "logprobs" }) or
                         (!c.eq(typ, "output_text") and !c.eq(typ, "refusal"));
-                    if (c.eq(typ, "output_text")) try blocks.append(self.a, .{ .text = try c.text(part, "text") }) else if (c.eq(typ, "refusal")) try blocks.append(self.a, .{ .text = try c.text(part, "refusal") });
+                    if (c.eq(typ, "output_text")) {
+                        try blocks.append(self.a, .{ .text = try c.text(part, "text") });
+                    } else if (c.eq(typ, "refusal")) {
+                        refused = true;
+                        try blocks.append(self.a, .{ .text = try c.text(part, "refusal") });
+                    } else unsupported_output = true;
                 }
             } else if (c.eq(kind, "reasoning")) {
                 // 推理项不透明，必须原样回放，因此总是保留整轮。
@@ -877,11 +912,14 @@ pub const Stream = struct {
                         try blocks.append(self.a, .{ .reasoning = try c.text(part, "text") });
                     };
                 }
-            } else retain_turn = true; // 未知的 output 类型同样保留整轮回放，不做猜测。
+            } else {
+                retain_turn = true; // Preserve unknown native output without interpreting it.
+                unsupported_output = true;
+            }
         }
 
         // 返回成功结果：文本与工具调用来自 output，replay 保存完整的原生 output JSON 与作用域。
-        return .{ .success = .{ .message = .{ .role = .assistant, .blocks = try blocks.toOwnedSlice(self.a), .replay = .{ .scope = try c.scopeCopy(self.a, self.scope), .json = try j.encode(self.a, output), .retain_turn = retain_turn } }, .finish = if (has_tools) .tool_calls else .stop, .usage = self.token_usage, .raw_usage_json = self.raw_usage } };
+        return .{ .success = .{ .message = .{ .role = .assistant, .blocks = try blocks.toOwnedSlice(self.a), .replay = .{ .scope = try c.scopeCopy(self.a, self.scope), .json = try j.encode(self.a, output), .retain_turn = retain_turn } }, .finish = if (has_tools) .tool_calls else .stop, .refused = refused, .unsupported_output = unsupported_output, .usage = self.token_usage, .raw_usage_json = self.raw_usage } };
     }
 };
 

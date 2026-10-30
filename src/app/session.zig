@@ -310,7 +310,7 @@ pub const Session = struct {
     metadata_notice: ?[]const u8 = null,
     /// Identity snapshot only: App publishes process-lifetime static notices.
     /// Never retain or inspect worker-owned mutable Runtime state here.
-    last_memory_notice: ?[]const u8 = null,
+    last_memory_view: @import("../core/memory_status.zig").View = .{},
     active_context_official: bool = false,
     display_origins: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
     display_disabled: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
@@ -473,6 +473,7 @@ pub const Session = struct {
         self.pending = null;
         self.pending_base_model = null;
         self.app = try self.prepareApp(parsed);
+        self.last_memory_view = self.app.?.memoryView();
         self.armInitialDefault();
         self.releaseLoadedHistory();
         self.initial_context = self.app.?.runtime.contextSnapshot();
@@ -838,7 +839,7 @@ pub const Session = struct {
             .proxy_address = if (self.global_config.?.value.proxy) |value| value.address else null,
             .proxy_port = if (self.global_config.?.value.proxy) |value| value.port else 0,
             .memory_auto = config.memory.auto,
-            .memory_notice = if (self.app) |app| app.memoryNotice() else null,
+            .memory = if (self.app) |app| app.memoryView() else .{},
             .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .pending_default_effort = if (self.app != null and self.initial_default_pending and config.model.reasoning_effort == null) self.preferred_effort else null,
@@ -956,6 +957,7 @@ pub const Session = struct {
             self.pending = next;
             if (initial) |app| {
                 self.app = app;
+                self.last_memory_view = app.memoryView();
                 self.pending_base_model = null;
                 self.armInitialDefault();
                 self.initial_context = app.runtime.contextSnapshot();
@@ -1141,17 +1143,20 @@ pub const Session = struct {
         self.metadata_login_pending &= ~claim.mask;
     }
 
-    test "memory notice static identity changes and clears only once" {
-        // Only this field is touched; no App, Runtime, filesystem or network.
+    test "memory view identity revision and clear change only once" {
         var session: Session = undefined;
-        session.last_memory_notice = null;
-        try std.testing.expect(!session.memoryNoticeChanged(null));
-        try std.testing.expect(session.memoryNoticeChanged("Memory: updating"));
-        try std.testing.expect(!session.memoryNoticeChanged("Memory: updating"));
-        try std.testing.expect(session.memoryNoticeChanged("Memory: update failed"));
-        try std.testing.expect(!session.memoryNoticeChanged("Memory: update failed"));
-        try std.testing.expect(session.memoryNoticeChanged(null));
-        try std.testing.expect(!session.memoryNoticeChanged(null));
+        session.last_memory_view = .{};
+        const first: @import("../core/memory_status.zig").View = .{ .enabled = true, .revision = 1, .active = .{ .id = 1, .phase = .extracting } };
+        var next = first;
+        try std.testing.expect(!session.memoryViewChanged(.{}));
+        try std.testing.expect(session.memoryViewChanged(first));
+        try std.testing.expect(!session.memoryViewChanged(first));
+        next.active.?.id = 2;
+        try std.testing.expect(session.memoryViewChanged(next));
+        next.revision = 2;
+        try std.testing.expect(session.memoryViewChanged(next));
+        try std.testing.expect(session.memoryViewChanged(.{}));
+        try std.testing.expect(!session.memoryViewChanged(.{}));
     }
 
     test "memory notice dirty survives busy metadata and cadence early returns" {
@@ -1166,7 +1171,7 @@ pub const Session = struct {
         job.future = null;
         job.dev_future = null;
         session.metadata_job = &job;
-        session.last_memory_notice = "Memory: updating";
+        session.last_memory_view = .{ .enabled = true, .active = .{ .id = 1, .phase = .extracting } };
         try std.testing.expect(pollModels(&session, false));
         try std.testing.expect(!pollModels(&session, false));
         session.metadata_job = null;
@@ -1175,14 +1180,14 @@ pub const Session = struct {
         session.metadata_blocked = false;
         session.metadata_awake_ms = 1;
         session.metadata_next_check_ms = 100;
-        session.last_memory_notice = "Memory: update failed";
+        session.last_memory_view = .{ .enabled = true, .active = .{ .id = 1, .phase = .extracting } };
         try std.testing.expect(pollModels(&session, true));
         try std.testing.expect(!pollModels(&session, true));
     }
 
-    fn memoryNoticeChanged(self: *Session, notice: ?[]const u8) bool {
-        const changed = !std.meta.eql(self.last_memory_notice, notice);
-        self.last_memory_notice = notice;
+    fn memoryViewChanged(self: *Session, view: @import("../core/memory_status.zig").View) bool {
+        const changed = !std.meta.eql(self.last_memory_view, view);
+        self.last_memory_view = view;
         return changed;
     }
 
@@ -1190,7 +1195,8 @@ pub const Session = struct {
     /// presentation; the active Runtime budget stays frozen until selection.
     fn pollModels(raw: *anyopaque, idle: bool) bool {
         const self: *Session = @ptrCast(@alignCast(raw));
-        const memory_changed = self.memoryNoticeChanged(if (self.app) |app| app.memoryNotice() else null);
+        const memory_view = if (self.app) |app| app.memoryView() else @import("../core/memory_status.zig").View{};
+        const memory_changed = self.memoryViewChanged(memory_view);
         const login_changed = self.pollCodexLogin() catch false;
         const default_changed = (self.completeInitialDefault(idle) catch false) or memory_changed or login_changed;
         if (self.metadata_job) |job| {
@@ -1880,6 +1886,7 @@ pub const Session = struct {
             self.pending_base_model = null;
             if (initial) |value| {
                 self.app = value;
+                self.last_memory_view = value.memoryView();
             } else {
                 self.pending = owned;
                 consumed = true;
@@ -1985,6 +1992,7 @@ pub const Session = struct {
             if (self.selected_name) |old| self.allocator.free(old);
             self.selected_name = null;
             self.app = value;
+            self.last_memory_view = value.memoryView();
             self.armInitialDefault();
             if (id) |service| self.active_revision = self.credential_revisions[@intCast(@backingInt(service))] else self.active_custom_revision = self.custom_credential_revision;
             self.initial_context = value.runtime.contextSnapshot();

@@ -37,7 +37,7 @@ const Fake = struct {
         if (self.invalid_return) return &@as([8193]u8, @splat('x'));
         return if (self.reference.len <= maxbytes) self.reference else "";
     }
-    fn finalize(raw: *anyopaque, capture: *const k.Capture, _: p.Protocol, _: *const p.Cancellation) void {
+    fn finalize(raw: *anyopaque, capture: *const k.Capture, _: p.Protocol) void {
         const self: *Fake = @ptrCast(@alignCast(raw));
         self.completes += 1;
         self.source_count = capture.sources.items.len;
@@ -90,7 +90,7 @@ const Fake = struct {
     }
     fn init(self: *Fake, config: *cfg.Config) !r.Runtime {
         var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, config, .{ .context = self, .call_fn = call }, .{ .context = self, .schemas = &.{.{ .name = "probe", .description = "offline", .parameters_json = "{}" }}, .prepare_fn = prepare, .execute_fn = execute }, .{ .context = self, .emit_fn = event, .authorize_fn = authorize }, "stale startup snapshot");
-        runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieve, .finalize_fn = finalize };
+        runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieve, .submit_fn = finalize };
         runtime.inbox = self.box;
         return runtime;
     }

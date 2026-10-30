@@ -1199,6 +1199,7 @@ pub const SessionHost = struct {
             .model = state.model,
             .provider = if (state.provider) |provider| provider.slug() else null,
             .codex_login = self.codexView(),
+            .memory = state.memory,
             .read_only = self.session.read_only,
             .truncated = self.fatal != null or self.reset_failed != null or self.history.evicted_through != 0 or self.partial_text.truncated or self.partial_reasoning.truncated,
         };
@@ -1274,11 +1275,12 @@ pub const SessionHost = struct {
         queue_revision: u64,
         task: u64,
         codex: codex_login.View,
+        memory: @import("../core/memory_status.zig").View = .{},
 
         pub fn eql(left: WatchStamp, right: WatchStamp) bool {
             // sequence is a coverage watermark, not a snapshot invalidation.
             return left.revision == right.revision and
-                left.queue_revision == right.queue_revision and left.task == right.task and std.meta.eql(left.codex, right.codex);
+                left.queue_revision == right.queue_revision and left.task == right.task and std.meta.eql(left.codex, right.codex) and std.meta.eql(left.memory, right.memory);
         }
     };
 
@@ -1350,6 +1352,7 @@ pub const SessionHost = struct {
             .queue_revision = queue.revision,
             .task = if (self.task) |task_| task_.id else 0,
             .codex = self.codexView(),
+            .memory = self.connection.current().memory,
         };
     }
 
@@ -1867,7 +1870,7 @@ pub const SessionHost = struct {
         try out.field("proxy_port", state.proxy_port);
         try encodeProxyModels(&out, state.proxy_models);
         try out.field("memory_auto", state.memory_auto);
-        try out.field("memory_notice", state.memory_notice);
+        try protocol.encodeMemoryView(&out, state.memory);
         try out.field("decision_enabled", state.decision_enabled);
         try out.field("decision_model", state.decision_model);
         try out.field("global_settings_available", state.global_settings_available);

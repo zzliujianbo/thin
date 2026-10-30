@@ -124,6 +124,65 @@ test "streaming chunks and ACK checkpoints match static glyph styles" {
     };
 }
 
+test "Chinese English strong static and every byte split one row ACK" {
+    try @import("../ui/text.zig").initLocale();
+    const a = std.testing.allocator;
+    const inner = "不是三 schema";
+    const cases = [_]struct { source: []const u8, visible: []const u8, start: usize }{
+        .{ .source = "**不是三 schema**", .visible = "不是三 schema\n", .start = 0 },
+        .{ .source = "前**不是三 schema**后", .visible = "前不是三 schema后\n", .start = "前".len },
+    };
+    for (cases) |case| {
+        const wide = try markdown.render(a, case.source, .{ .columns = 80, .max_lines = 256 });
+        defer markdown.release(a, wide);
+        const glyphs = try appearance(a, wide.lines);
+        defer a.free(glyphs);
+        try std.testing.expectEqual(case.visible.len, glyphs.len);
+        for (glyphs, 0..) |glyph, i| {
+            try std.testing.expectEqual(case.visible[i], glyph.byte);
+            try std.testing.expectEqual(i >= case.start and i < case.start + inner.len, glyph.style.bold);
+        }
+        for ([_]usize{ 1, 4, 12, 80 }) |columns| {
+            const reference = try markdown.render(a, case.source, .{ .columns = columns, .max_lines = 256 });
+            defer markdown.release(a, reference);
+            for ([_]usize{ 1, 64 }) |quantum| for (0..case.source.len + 1) |split| {
+                const body = try body_mod.Body.create(a, columns);
+                defer body.destroy();
+                body.max_window_bytes = quantum;
+                var rows: std.ArrayList([]const u8) = .empty;
+                defer freeRows(a, &rows);
+                try body.append(case.source[0..split]);
+                try progressOne(a, body, &rows);
+                try body.append(case.source[split..]);
+                try body.finish();
+                for (0..16384) |_| {
+                    if (body.isDrained()) break;
+                    try progressOne(a, body, &rows);
+                }
+                try std.testing.expect(body.isDrained());
+                try std.testing.expectEqual(body.acceptedSourceEnd(), body.committedSourceEnd());
+                try expectAppearance(a, reference.lines, rows.items);
+            };
+        }
+    }
+}
+
+test "Chinese English strong inline code remains literal purple" {
+    try @import("../ui/text.zig").initLocale();
+    const a = std.testing.allocator;
+    const expected = "**不是三 schema**\n";
+    const rendered = try markdown.render(a, "`**不是三 schema**`", .{ .columns = 80, .max_lines = 16 });
+    defer markdown.release(a, rendered);
+    const glyphs = try appearance(a, rendered.lines);
+    defer a.free(glyphs);
+    try std.testing.expectEqual(expected.len, glyphs.len);
+    for (glyphs, 0..) |glyph, i| {
+        try std.testing.expectEqual(expected[i], glyph.byte);
+        try std.testing.expect(!glyph.style.bold);
+        if (i + 1 < glyphs.len) try std.testing.expectEqual(@as(u16, 141), glyph.style.fg);
+    }
+}
+
 test "inline code static and streaming agree at every split" {
     try @import("../ui/text.zig").initLocale();
     const a = std.testing.allocator;

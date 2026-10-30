@@ -1,4 +1,4 @@
-//! 单生产者本地诊断日志；不参与模型历史、授权或终态决策。
+//! 有界本地诊断日志；不参与模型历史、授权或终态决策。
 //! 明文日志只替换当前已知 key，不是 vault，也不扫描其他秘密。
 const std = @import("std");
 const fs = @import("../platform/filesystem.zig");
@@ -72,13 +72,15 @@ pub const Journal = struct {
     began_ms: i64 = 0,
     first: bool = false,
 
+    producer_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     key_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     wake: std.Io.Event = .unset,
     queue: [physical_limit]Item = undefined,
     diagnostic_outstanding: usize = 0,
     diagnostic_dropped: std.atomic.Value(u64) = .init(0),
-    diagnostic_span: u64 = 0,
+    diagnostic_span: std.atomic.Value(u64) = .init(0),
+    diagnostic_ready: std.atomic.Value(bool) = .init(false),
     head: usize = 0,
     count: usize = 0,
     outstanding: usize = 0,
@@ -98,6 +100,7 @@ pub const Journal = struct {
     }
 
     fn fail(self: *Journal, err: anyerror) void {
+        self.diagnostic_ready.store(false, .release);
         _ = self.failure_code.cmpxchgStrong(0, @intFromError(err), .acq_rel, .acquire);
         self.lock();
         self.stopping = true;
@@ -182,6 +185,8 @@ pub const Journal = struct {
                     .stage = v.stage,
                     .phase = v.phase,
                     .span_id = v.span_id,
+                    .origin_turn = if (v.origin) |origin| origin.turn else null,
+                    .memory_job_id = v.memory_job_id,
                     .elapsed_ms = v.elapsed_ms,
                     .result = v.result,
                     .error_name = v.error_name,
@@ -251,6 +256,7 @@ pub const Journal = struct {
     /// Idempotent stop/drain/join. Cancellation is cooperative: uninterruptible
     /// kernel I/O cannot have an absolute wall-clock bound. Never detaches.
     pub fn finish(self: *Journal) void {
+        self.diagnostic_ready.store(false, .release);
         self.lock();
         self.stopping = true;
         self.unlock();
@@ -337,6 +343,7 @@ pub const Journal = struct {
         self.finish();
         if (!self.done) self.store.deinit(); // No writer ever owned the store.
         std.debug.assert(self.outstanding == 0 and self.bytes == 0);
+        std.debug.assert(std.c.pthread_mutex_destroy(&self.producer_mutex) == .SUCCESS);
         std.debug.assert(std.c.pthread_mutex_destroy(&self.mutex) == .SUCCESS);
         std.debug.assert(std.c.pthread_mutex_destroy(&self.key_mutex) == .SUCCESS);
         std.crypto.secureZero(u8, self.key);
@@ -372,6 +379,8 @@ pub const Journal = struct {
     }
 
     fn enqueueSelection(self: *Journal) !void {
+        std.debug.assert(std.c.pthread_mutex_lock(&self.producer_mutex) == .SUCCESS);
+        defer std.debug.assert(std.c.pthread_mutex_unlock(&self.producer_mutex) == .SUCCESS);
         const snapshot = self.selection orelse return;
         const next = try std.math.add(u64, self.seq, 1);
         if (self.worker == null) {
@@ -398,20 +407,39 @@ pub const Journal = struct {
         return .{ .context = self, .emit_fn = diagnosticEmit, .next_fn = diagnosticNext };
     }
 
+    /// Capture on the Runtime owner thread before the originating turn finishes.
+    pub fn memoryDiagnosticSink(self: *Journal) diagnostics.Sink {
+        std.debug.assert(std.c.pthread_mutex_lock(&self.producer_mutex) == .SUCCESS);
+        defer std.debug.assert(std.c.pthread_mutex_unlock(&self.producer_mutex) == .SUCCESS);
+        var sink = self.diagnosticSink();
+        sink.origin = .{ .turn = self.turn, .began_ms = self.began_ms };
+        return sink;
+    }
+
     fn diagnosticActive(self: *Journal) bool {
-        return self.started and self.worker != null and self.failure() == null;
+        return self.diagnostic_ready.load(.acquire) and self.failure() == null;
     }
 
     fn diagnosticNext(ctx: ?*anyopaque) u64 {
         const self: *Journal = @ptrCast(@alignCast(ctx.?));
         if (!self.diagnosticActive()) return 0;
-        self.diagnostic_span +|= 1;
-        return self.diagnostic_span;
+        var current = self.diagnostic_span.load(.monotonic);
+        while (current != std.math.maxInt(u64)) {
+            if (self.diagnostic_span.cmpxchgWeak(current, current + 1, .monotonic, .monotonic)) |actual| {
+                current = actual;
+            } else return current + 1;
+        }
+        return 0;
     }
 
     fn diagnosticEmit(ctx: ?*anyopaque, record_: diagnostics.Record) void {
         const self: *Journal = @ptrCast(@alignCast(ctx.?));
         if (!self.diagnosticActive()) return;
+        if (std.c.pthread_mutex_trylock(&self.producer_mutex) != .SUCCESS) {
+            _ = self.diagnostic_dropped.fetchAdd(1, .monotonic);
+            return;
+        }
+        defer std.debug.assert(std.c.pthread_mutex_unlock(&self.producer_mutex) == .SUCCESS);
         if (std.c.pthread_mutex_trylock(&self.mutex) != .SUCCESS) {
             _ = self.diagnostic_dropped.fetchAdd(1, .monotonic);
             return;
@@ -422,12 +450,13 @@ pub const Journal = struct {
             return;
         }
         const next = self.seq + 1;
+        const origin = record_.origin orelse diagnostics.Origin{ .turn = self.turn, .began_ms = self.began_ms };
         self.queue[(self.head + self.count) % physical_limit] = .{ .diagnostic = .{
             .record = record_,
             .seq = next,
-            .turn = self.turn,
+            .turn = origin.turn,
             .timestamp_ms = std.Io.Clock.real.now(self.root.io).toMilliseconds(),
-            .elapsed_ms = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() - self.began_ms),
+            .elapsed_ms = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() -| origin.began_ms),
             .dropped_total = self.diagnostic_dropped.load(.monotonic),
         } };
         self.seq = next;
@@ -454,6 +483,8 @@ pub const Journal = struct {
     }
 
     fn record(self: *Journal, a: std.mem.Allocator, event: []const u8, data: anytype) !void {
+        std.debug.assert(std.c.pthread_mutex_lock(&self.producer_mutex) == .SUCCESS);
+        defer std.debug.assert(std.c.pthread_mutex_unlock(&self.producer_mutex) == .SUCCESS);
         var small: [4096]u8 = undefined;
         defer std.crypto.secureZero(u8, &small);
         var large: ?[]u8 = null;
@@ -482,12 +513,18 @@ pub const Journal = struct {
         if (self.worker == null) self.worker = try std.Io.concurrent(self.root.io, runWriter, .{self});
         try self.enqueue(owned);
         self.seq = next;
+        if (self.started and self.failure() == null) self.diagnostic_ready.store(true, .release);
     }
 
     fn observe(self: *Journal, a: std.mem.Allocator, observation: r.Observation) !void {
         if (observation == .submitted) {
-            self.turn = try std.math.add(u64, self.turn, 1);
+            std.debug.assert(std.c.pthread_mutex_lock(&self.producer_mutex) == .SUCCESS);
+            self.turn = std.math.add(u64, self.turn, 1) catch |err| {
+                std.debug.assert(std.c.pthread_mutex_unlock(&self.producer_mutex) == .SUCCESS);
+                return err;
+            };
             self.began_ms = std.Io.Clock.awake.now(self.root.io).toMilliseconds();
+            std.debug.assert(std.c.pthread_mutex_unlock(&self.producer_mutex) == .SUCCESS);
             self.first = false;
             if (!self.started) {
                 self.started = true;
@@ -1264,6 +1301,39 @@ test "journal nested omissions and real filesystem failure are explicit" {
     try std.testing.expectEqualStrings("", journal.store.path());
 }
 
+test "memory diagnostic retains originating turn and drops on producer contention" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
+    defer journal.deinit();
+    journal.test_stall.store(true, .release);
+    defer journal.test_stall.store(false, .release);
+    const observer_ = journal.observer();
+    observer_.notify(.{ .submitted = "first" });
+    var sink = journal.memoryDiagnosticSink();
+    sink.memory_job_id = 42;
+    observer_.notify(.{ .event = .{ .finished = .{ .status = .success } } });
+    observer_.notify(.{ .submitted = "second" });
+    sink.emit(.{ .stage = .memory_finalize });
+    journal.lock();
+    const item = journal.queue[(journal.head + journal.count - 1) % Journal.physical_limit].diagnostic;
+    journal.unlock();
+    try std.testing.expectEqual(@as(u64, 1), item.turn);
+    try std.testing.expectEqual(@as(u64, 42), item.record.memory_job_id.?);
+    try std.testing.expectEqual(sink.origin.?.began_ms, item.record.origin.?.began_ms);
+    try std.testing.expect(item.elapsed_ms >= 0);
+    std.debug.assert(std.c.pthread_mutex_lock(&journal.producer_mutex) == .SUCCESS);
+    sink.emit(.{ .stage = .memory_finalize });
+    std.debug.assert(std.c.pthread_mutex_unlock(&journal.producer_mutex) == .SUCCESS);
+    try std.testing.expectEqual(@as(u64, 1), journal.diagnostic_dropped.load(.monotonic));
+    journal.diagnostic_span.store(std.math.maxInt(u64) - 1, .monotonic);
+    try std.testing.expectEqual(std.math.maxInt(u64), sink.next());
+    try std.testing.expectEqual(@as(u64, 0), sink.next());
+    journal.test_stall.store(false, .release);
+}
+
 test "diagnostic admission is isolated and unstarted sink is inert" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1454,6 +1524,183 @@ test "journal queue budgets include popped inflight bytes and entries" {
     try std.testing.expectEqual(@as(usize, 1), journal.outstanding);
     journal.release(inflight);
     try std.testing.expectEqual(@as(usize, 0), journal.bytes);
+}
+
+const CloseoutProducers = struct {
+    const n = 12;
+    journal: *Journal,
+    sink: diagnostics.Sink,
+    dropped: std.atomic.Value(bool) = .init(false),
+    go: std.atomic.Value(bool) = .init(false),
+    primary_started: std.atomic.Value(bool) = .init(false),
+    aux_started: std.atomic.Value(bool) = .init(false),
+    primary_done: std.atomic.Value(bool) = .init(false),
+    aux_done: std.atomic.Value(bool) = .init(false),
+    aux_ok: bool = false,
+    ids: [n]u64 = undefined,
+
+    // A bounded handshake ensures failures cannot strand a join.
+    fn wait(flag: *std.atomic.Value(bool), io: std.Io) bool {
+        for (0..5000) |_| {
+            if (flag.load(.acquire)) return true;
+            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch return false;
+        }
+        return false;
+    }
+
+    fn run(self: *CloseoutProducers) void {
+        // The primary thread holds producer_mutex throughout this call.
+        self.sink.emit(.{ .stage = .memory_finalize });
+        self.dropped.store(true, .release);
+        if (!wait(&self.go, self.journal.root.io)) return;
+        for (&self.ids, 0..) |*id, i| {
+            id.* = self.sink.next();
+            self.sink.emit(.{ .stage = .memory_finalize, .phase = .begin, .span_id = id.* });
+            self.sink.emit(.{ .stage = .memory_finalize, .phase = .end, .span_id = id.* });
+            if (i == 0) {
+                self.aux_started.store(true, .release);
+                if (!wait(&self.primary_started, self.journal.root.io)) return;
+            }
+        }
+        self.aux_done.store(true, .release);
+        self.aux_ok = wait(&self.primary_done, self.journal.root.io);
+    }
+};
+
+test "Memory closeout journal concurrent producers preserve origin sequences and drop accounting" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    // Writer is stalled while the primary allocates; the auxiliary emits only
+    // value records. After joining, no producer allocates alongside the writer.
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
+    defer journal.deinit();
+    journal.test_stall.store(true, .release);
+    defer journal.test_stall.store(false, .release);
+    const observer_ = journal.observer();
+    observer_.notify(.{ .submitted = "t1" });
+    var old = journal.memoryDiagnosticSink();
+    old.memory_job_id = 42;
+    var other = old;
+    other.memory_job_id = 43;
+    const origin = old.origin.?;
+    var producers: CloseoutProducers = .{ .journal = &journal, .sink = old };
+    std.debug.assert(std.c.pthread_mutex_lock(&journal.producer_mutex) == .SUCCESS);
+    const thread = std.Thread.spawn(.{}, CloseoutProducers.run, .{&producers}) catch |err| {
+        std.debug.assert(std.c.pthread_mutex_unlock(&journal.producer_mutex) == .SUCCESS);
+        return err;
+    };
+    const drop_seen = CloseoutProducers.wait(&producers.dropped, root.io);
+    std.debug.assert(std.c.pthread_mutex_unlock(&journal.producer_mutex) == .SUCCESS);
+    // Both producers remain alive until both have finished their work.
+    producers.go.store(true, .release);
+    observer_.notify(.{ .submitted = "t2" });
+    var primary_ids: [CloseoutProducers.n]u64 = undefined;
+    var overlap_seen = false;
+    for (&primary_ids, 0..) |*id, i| {
+        id.* = other.next();
+        other.emit(.{ .stage = .memory_finalize, .phase = .begin, .span_id = id.* });
+        observer_.notify(.{ .event = .{ .state = .calling_model } });
+        if (i == CloseoutProducers.n / 2) observer_.notify(.{ .submitted = "t3" });
+        other.emit(.{ .stage = .memory_finalize, .phase = .end, .span_id = id.* });
+        if (i == 0) {
+            producers.primary_started.store(true, .release);
+            overlap_seen = CloseoutProducers.wait(&producers.aux_started, root.io);
+        }
+    }
+    producers.primary_done.store(true, .release);
+    const aux_seen = CloseoutProducers.wait(&producers.aux_done, root.io);
+    thread.join();
+    try std.testing.expect(drop_seen and overlap_seen and aux_seen and producers.aux_ok);
+    try std.testing.expectEqual(null, journal.failure());
+    const forced_and_contention_drops = journal.diagnostic_dropped.load(.acquire);
+    try std.testing.expect(forced_and_contention_drops >= 1);
+
+    // With the worker stalled and both producers joined, this marker must be
+    // accepted after turn 3 and provides a bounded check of origin timing.
+    const before = std.Io.Clock.awake.now(root.io).toMilliseconds();
+    const marker = old.next();
+    old.emit(.{ .stage = .memory_finalize, .phase = .point, .span_id = marker });
+    const after = std.Io.Clock.awake.now(root.io).toMilliseconds();
+    observer_.notify(.{ .event = .{ .finished = .{ .status = .success } } });
+    const final_dropped = journal.diagnostic_dropped.load(.acquire);
+    try std.testing.expectEqual(forced_and_contention_drops, final_dropped);
+    journal.test_stall.store(false, .release);
+    journal.flush();
+    try std.testing.expectEqual(null, journal.failure());
+    const content = try root.read(std.testing.allocator, journal.store.path(), 0, record_limit);
+    defer std.testing.allocator.free(content.data);
+    journal.finish();
+
+    var all_ids: [2 * CloseoutProducers.n + 1]u64 = undefined;
+    @memcpy(all_ids[0..CloseoutProducers.n], &primary_ids);
+    @memcpy(all_ids[CloseoutProducers.n .. 2 * CloseoutProducers.n], &producers.ids);
+    all_ids[all_ids.len - 1] = marker;
+    for (all_ids, 0..) |id, i| {
+        try std.testing.expect(id > 0);
+        for (all_ids[0..i]) |previous| try std.testing.expect(id != previous);
+    }
+    var phases: [2 * CloseoutProducers.n]u8 = @splat(0);
+    var lines = std.mem.splitScalar(u8, content.data, '\n');
+    var last_seq: i64 = 0;
+    var last_dropped: i64 = 0;
+    var diagnostic_count: u64 = 0;
+    var saw_new_turn = false;
+    var saw_marker = false;
+    var saw_final = false;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        defer parsed.deinit();
+        const row = parsed.value.object;
+        const seq = row.get("seq").?.integer;
+        try std.testing.expect(seq > last_seq);
+        last_seq = seq;
+        const event = row.get("event").?.string;
+        if (std.mem.eql(u8, event, "user") and row.get("turn").?.integer == 3) saw_new_turn = true;
+        if (std.mem.eql(u8, event, "finished")) {
+            const dropped = row.get("data").?.object.get("dropped_total").?.integer;
+            try std.testing.expect(dropped >= last_dropped);
+            try std.testing.expectEqual(final_dropped, @as(u64, @intCast(dropped)));
+            last_dropped = dropped;
+            saw_final = true;
+        }
+        if (!std.mem.eql(u8, event, "diagnostic")) continue;
+        diagnostic_count += 1;
+        const dropped = row.get("dropped_total").?.integer;
+        try std.testing.expect(dropped >= last_dropped);
+        last_dropped = dropped;
+        const data = row.get("data").?.object;
+        try std.testing.expectEqual(@as(i64, 1), row.get("turn").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), data.get("origin_turn").?.integer);
+        const id: u64 = @intCast(data.get("span_id").?.integer);
+        const job = data.get("memory_job_id").?.integer;
+        if (id == marker) {
+            try std.testing.expect(saw_new_turn);
+            try std.testing.expectEqual(@as(i64, 42), job);
+            try std.testing.expectEqualStrings("point", data.get("phase").?.string);
+            const elapsed = row.get("elapsed_ms").?.integer;
+            try std.testing.expect(elapsed >= @max(0, before -| origin.began_ms));
+            try std.testing.expect(elapsed <= @max(0, after -| origin.began_ms));
+            saw_marker = true;
+        } else {
+            var found = false;
+            for (all_ids[0 .. all_ids.len - 1], 0..) |candidate, i| {
+                if (id != candidate) continue;
+                found = true;
+                try std.testing.expectEqual(@as(i64, if (i < CloseoutProducers.n) 43 else 42), job);
+                const phase = data.get("phase").?.string;
+                const bit: u8 = if (std.mem.eql(u8, phase, "begin")) 1 else if (std.mem.eql(u8, phase, "end")) 2 else return error.UnexpectedPhase;
+                try std.testing.expect(phases[i] & bit == 0);
+                phases[i] |= bit;
+                break;
+            }
+            try std.testing.expect(found);
+        }
+    }
+    try std.testing.expect(saw_new_turn and saw_marker and saw_final);
+    try std.testing.expectEqual(@as(u64, 2 * 2 * CloseoutProducers.n + 2), diagnostic_count + final_dropped);
 }
 
 test "journal allocation failure never escapes observer" {

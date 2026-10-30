@@ -12,12 +12,13 @@ const diagnostics = @import("diagnostics.zig");
 const knowledge = @import("knowledge.zig");
 
 /// Owner-thread callbacks. Retrieval returns allocator-owned borrowed reference
-/// bytes. Finalization runs synchronously before the accepted task publishes its
-/// finished event, and must not retain capture bytes past the callback.
+/// bytes. Submission admits a copied capture before finished; it must not wait
+/// for auxiliary inference or retain borrowed capture bytes.
 pub const MemoryHooks = struct {
     context: *anyopaque,
     retrieve_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, usize) anyerror![]const u8,
-    finalize_fn: *const fn (*anyopaque, *const knowledge.Capture, p.Protocol, *const p.Cancellation) void,
+    submit_fn: *const fn (*anyopaque, *const knowledge.Capture, p.Protocol) void,
+    check_fn: ?*const fn (*anyopaque) bool = null,
 };
 const session_context = @import("session_context.zig");
 const Io = std.Io;
@@ -1383,8 +1384,8 @@ pub const Runtime = struct {
         if (task.terminal.status == .success) {
             if (self.memory_capture) |completed| {
                 if (self.memory_hooks) |hooks| {
-                    var memory_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .memory_finalize });
-                    hooks.finalize_fn(hooks.context, completed, self.selector.effective(), cancel);
+                    var memory_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .memory_submit });
+                    hooks.submit_fn(hooks.context, completed, self.selector.effective());
                     memory_span.finish(.ok);
                 }
             }
@@ -1404,6 +1405,7 @@ pub const Runtime = struct {
     }
 
     fn commandInner(self: *Runtime, text: []const u8, cancel: *p.Cancellation, task: *Task) !void {
+        try self.checkMemorySafety();
         if (self.poisoned) return error.UnsafeToContinue;
         try checkCanceled(cancel);
         const input = std.mem.trimStart(u8, text, " \t\r\n");
@@ -1487,6 +1489,7 @@ pub const Runtime = struct {
     }
 
     fn compactManual(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
+        try self.checkMemorySafety();
         if (self.poisoned) return error.UnsafeToContinue;
         try checkCanceled(cancel);
 
@@ -1799,7 +1802,14 @@ pub const Runtime = struct {
 
     /// 主循环：预检（必要时压缩）→ 调用模型 → stop 则提交返回，否则执行工具批次。
     /// 不变量：模型输出的每个 tool_call 在返回前都会有对应 tool_result（见 executeBatch 的 errdefer）。
+    fn checkMemorySafety(self: *Runtime) !void {
+        if (self.memory_hooks) |hooks| {
+            if (hooks.check_fn) |check| if (!check(hooks.context)) return error.UnsafeToContinue;
+        }
+    }
+
     fn runInner(self: *Runtime, text: []const u8, cancel: *p.Cancellation, task: *Task) !void {
+        try self.checkMemorySafety();
         // poisoned 后拒绝新输入，避免在不一致的历史上继续。
         if (self.poisoned) return error.UnsafeToContinue;
         try checkCanceled(cancel);

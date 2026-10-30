@@ -27,16 +27,19 @@ function reply(res, content, helper, bad = false) {
     return res.write(frame);
   };
   if (helper && !bad) {
-    // Legal empty reasoning deltas have no logical output tokens, but still
-    // carry SSE/JSON framing. A small valid extraction must survive a stream
-    // whose wire size exceeds the independent 32KiB decoded-JSON hard bound.
-    assert(Buffer.byteLength(content) < 32768);
+    // Framing, reasoning, and final logical JSON are independent budgets.
+    // Exercise a long reasoning stream as well as many individually small events.
+    for (let i = 0; i < 40; i++) event({choices: [{index: 0,
+      delta: {reasoning_content: 'r'.repeat(1024)}, finish_reason: null}]});
     for (let i = 0; i < 800; i++) event({choices: [{index: 0,
       delta: {reasoning_content: ''}, finish_reason: null}]});
     assert(wireBytes > 32768 && wireBytes < 256 * 1024);
     fragmentedHelpers++;
   }
-  event({choices: [{index: 0, delta: {content}, finish_reason: null}]});
+  // Keep each SSE event bounded even when the assembled JSON is large.
+  for (let offset = 0; offset < content.length; offset += 1024) {
+    event({choices: [{index: 0, delta: {content: content.slice(offset, offset + 1024)}, finish_reason: null}]});
+  }
   event({choices: [{index: 0, delta: {}, finish_reason: 'stop'}], usage: {
     prompt_tokens: helper ? 300 : 1200, completion_tokens: helper ? 33 : 34,
     total_tokens: helper ? 333 : 1234,
@@ -86,22 +89,24 @@ const server = http.createServer(async (req, res) => {
     assert.equal(material.sources[0].text, current.prompt);
     assert(!JSON.stringify(material).includes(KEY), 'known credential entered material');
     assert(!JSON.stringify(material.sources).includes(ANSWER), 'assistant guess entered sources');
+    // Wait for the complete answer on stdout, not merely the HTTP response.
+    // The watchdog turns a pre-settle deadlock into a deterministic failure.
+    await Promise.race([current.answerGate, new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('answer gate timed out')), 8000);
+      current.answerGate.then(() => clearTimeout(timer));
+    })]);
     if (current.interruptAt === 'helper') {
-      // The primary round is already fully stopped when the auxiliary request
-      // arrives; cancel only the auxiliary and never answer it. The terminal
-      // state is auxiliary-interrupted, not a pretended helper response.
-      assert(current.primaryStopped, 'helper interrupt requires a fully stopped primary round');
+      assert(current.answerSeen, 'helper interrupt requires the observed stdout answer');
       current.interrupted = true;
       current.signalInterrupt();
       return;
     }
-    // Keep the auxiliary request open briefly. Synchronous pre-settle Memory
-    // must prevent the primary answer and process completion from appearing yet.
-    await new Promise(resolve => setTimeout(resolve, 50));
     const items = current.prompt === FIRST ? [{category: 'preferences', topic: 'review-style', content: FACT,
       source_id: material.sources[0].id, quote: 'prefer concise explanations', expected_version: null, expires_at_ms: null}] : [];
     current.helperResponded = true;
-    reply(res, current.bad ? '{' : JSON.stringify({items}), true, current.bad);
+    // Whitespace is legal JSON and leaves the business payload unchanged.
+    const json = JSON.stringify({items});
+    reply(res, current.bad ? '{' : (current.prompt === FIRST ? json + ' '.repeat(33000) : json), true, current.bad);
   } catch {
     fixtureFailed = true;
     if (!res.headersSent) res.writeHead(500);
@@ -114,6 +119,7 @@ async function run(cwd, prompt, {expectFact = false, expectHelper = true, bad = 
   active = {prompt, expectFact, expectHelper: expectHelper && !args, bad, interruptAt, expectExit,
     answerSeen: false, helperResponded: false, primaryStopped: false, interrupted: false,
     answerBeforeHelperObserved: false, signalInterrupt: null};
+  active.answerGate = new Promise(resolve => { active.releaseAnswerGate = resolve; });
   const env = {PATH: '/usr/bin:/bin', HOME: home, LANG: 'C.UTF-8', TERM: 'xterm-256color'};
   const child = spawn(bin, args ?? ['--print', prompt], {cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe']});
   let owned = true, size = 0, expired = false, rejectPending;
@@ -131,12 +137,15 @@ async function run(cwd, prompt, {expectFact = false, expectHelper = true, bad = 
     size += chunk.length;
     if (size > 256 * 1024) { expired = true; kill('SIGTERM'); return; }
     stdout.push(chunk);
-    active.answerSeen = Buffer.concat(stdout).toString('utf8').includes(ANSWER);
+    active.answerSeen = Buffer.concat(stdout).toString('utf8').includes(ANSWER + '\n');
     // An auxiliarily canceled finalization is a distinct terminal state: the
     // primary answer may legitimately appear without any helper response.
-    if (active.answerSeen && active.expectHelper && !active.helperResponded && !active.interrupted && !active.answerBeforeHelperObserved) {
-      active.answerBeforeHelperObserved = true;
-      answerBeforeHelper++;
+    if (active.answerSeen && active.expectHelper && !active.helperResponded) {
+      active.releaseAnswerGate();
+      if (!active.interruptAt && !active.interrupted && !active.answerBeforeHelperObserved) {
+        active.answerBeforeHelperObserved = true;
+        answerBeforeHelper++;
+      }
     }
   });
   child.stderr.on('data', chunk => {
@@ -158,6 +167,10 @@ async function run(cwd, prompt, {expectFact = false, expectHelper = true, bad = 
     if (!args) {
       if (expectExit === 0) assert(out.includes(ANSWER), 'primary success lost to auxiliary failure');
       else assert(!out.includes(ANSWER), 'canceled primary printed an answer');
+    }
+    if (active.expectHelper && !interruptAt) {
+      assert(active.answerBeforeHelperObserved, 'primary answer did not precede helper completion');
+      assert(active.helperResponded, 'headless process exited without draining helper');
     }
     if (expectAuxInterrupted) assert(err.includes('auxiliary Memory finalization did not succeed'), 'auxiliary cancellation was not reported');
     if (args?.includes('--version')) assert(!await exists(join(cwd, '.thin/sessions')), 'version created session records');
@@ -228,15 +241,15 @@ try {
   assert.deepEqual(requests, {primary: 7, helper: 5});
   assert(!await exists(join(cancelProject, '.thin/memory/preferences-review-style.md')), 'canceled primary wrote durable memory');
   await assertNoJobs(cancelProject);
-  assert.equal(answerBeforeHelper, 0);
+  assert.equal(answerBeforeHelper, 4);
   assert.equal(fragmentedHelpers, 2);
   await writeFile(join(root, 'evidence.json'), JSON.stringify({requests, answerBeforeHelper, fragmentedHelpers,
-    defaultOn: true, offRetainsRetrieval: true, noLog: true, synchronousPreSettle: true,
+    defaultOn: true, offRetainsRetrieval: true, noLog: true, headlessDrain: true,
     noDurableJobs: true, oneAttemptPerExplicitTask: true,
     auxiliaryInterruptKeepsPrimarySuccess: true, primaryInterruptKeepsCanceledExit: true,
     noAuxiliaryReplayAfterInterrupt: true,
     wireBudgetIndependentOfDecodedJson: true}, null, 2) + '\n');
-  console.log('PASS memory CLI synchronous pre-settle source/save/retrieve/Off/automatic-logging/no-jobs/interrupt primary=7 helper=5');
+  console.log('PASS memory CLI answer-before-helper/drain source/save/retrieve/Off/automatic-logging/no-jobs/interrupt primary=7 helper=5');
 } finally {
   for (const socket of sockets) socket.destroy();
   if (server.listening) await new Promise(resolve => server.close(resolve));

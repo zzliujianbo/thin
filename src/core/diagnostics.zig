@@ -2,7 +2,7 @@
 const std = @import("std");
 const p = @import("protocol.zig");
 const decision = @import("decision.zig");
-pub const Stage = enum { assistant_commit, observer, checkpoint, host_emit, end_task, watchdog_join, memory_finalize, memory_extract, memory_review, memory_write, memory_request, decision_request, finished_emit };
+pub const Stage = enum { assistant_commit, observer, checkpoint, host_emit, end_task, watchdog_join, memory_submit, memory_finalize, memory_extract, memory_review, memory_write, memory_request, decision_request, finished_emit };
 pub const Phase = enum { begin, end, point };
 pub const Result = enum { ok, failed, canceled, skipped };
 pub const ErrorName = struct {
@@ -23,8 +23,11 @@ pub const ErrorName = struct {
         try jw.write(self.label[0..self.len]);
     }
 };
+pub const Origin = struct { turn: u64, began_ms: i64 };
 pub const Record = struct {
     stage: Stage,
+    origin: ?Origin = null,
+    memory_job_id: ?u64 = null,
     phase: Phase = .point,
     span_id: u64 = 0,
     elapsed_ms: ?u64 = null,
@@ -45,8 +48,13 @@ pub const Sink = struct {
     context: ?*anyopaque = null,
     emit_fn: ?*const fn (?*anyopaque, Record) void = null,
     next_fn: ?*const fn (?*anyopaque) u64 = null,
+    origin: ?Origin = null,
+    memory_job_id: ?u64 = null,
     pub fn emit(self: Sink, record: Record) void {
-        if (self.emit_fn) |f| f(self.context, record);
+        var copy = record;
+        if (self.origin) |origin| copy.origin = origin;
+        if (self.memory_job_id) |id| copy.memory_job_id = id;
+        if (self.emit_fn) |f| f(self.context, copy);
     }
     pub fn next(self: Sink) u64 {
         return if (self.next_fn) |f| f(self.context) else 0;

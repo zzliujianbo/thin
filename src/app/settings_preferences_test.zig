@@ -47,7 +47,7 @@ test "memory settings current publishes active pending and global defaults witho
     const connection = pending.connection();
     try std.testing.expect(pending.app == null);
     try std.testing.expect(connection.current().memory_auto);
-    try std.testing.expect(connection.current().memory_notice == null);
+    try std.testing.expect(!connection.current().memory.enabled);
     try std.testing.expect(!connection.poll_models_fn.?(connection.context, false));
     try set(&pending, .memory_auto, 0);
     try std.testing.expect(!pending.pending.?.value.memory.auto);
@@ -72,7 +72,9 @@ test "memory settings current publishes active pending and global defaults witho
     active.global_config.?.value.memory.auto = true;
     try std.testing.expect(!active.connection().current().memory_auto);
     active.global_config.?.value.memory.auto = false;
-    try std.testing.expectEqual(app.memoryNotice(), active.connection().current().memory_notice);
+    try std.testing.expect(!active.connection().current().memory.enabled);
+    try set(&active, .memory_auto, 1);
+    try std.testing.expect(std.meta.eql(app.memoryView(), active.connection().current().memory));
     try std.testing.expect(active.metadata_job == null and pending.metadata_job == null);
 }
 

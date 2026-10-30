@@ -391,6 +391,25 @@ test "whitelist syntax preserves lines and links" {
     try std.testing.expect(events[6].underline);
 }
 
+test "Chinese English strong hides delimiters and scopes bold" {
+    const a = std.testing.allocator;
+    const inner = "不是三 schema";
+    const cases = [_]struct { source: []const u8, visible: []const u8, start: usize }{
+        .{ .source = "**不是三 schema**", .visible = inner, .start = 0 },
+        .{ .source = "前**不是三 schema**后", .visible = "前不是三 schema后", .start = "前".len },
+    };
+    for (cases) |case| {
+        try expectScan(case.source, case.visible);
+        const events = try scanTest(a, case.source, 1);
+        defer a.free(events);
+        try std.testing.expectEqual(case.visible.len, events.len);
+        for (events, 0..) |event, i| {
+            try std.testing.expectEqual(case.visible[i], event.byte);
+            try std.testing.expectEqual(i >= case.start and i < case.start + inner.len, event.bold);
+        }
+    }
+}
+
 test "list markers and closed brackets preserve subsequent inline styling" {
     const input = "* **b** _i_\n- [x] ~~s~~ [l](u)\n> [ ] **b**\n[text] **b**";
     const expected = "* b i\n- [x] s l (u)\n> [ ] b\n[text] b";

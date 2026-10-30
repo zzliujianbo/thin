@@ -29,6 +29,11 @@ pub fn main(init: std.process.Init) u8 {
 /// 把 bytes 写入 file，但在独立的并发任务中执行阻塞写。主线程轮询中断信号，
 /// 以便终端背压时仍能响应 Ctrl+C 而不被卡死。
 pub fn output(io: std.Io, file: std.Io.File, bytes: []const u8) !void {
+    return outputTracked(io, file, bytes, null);
+}
+
+fn outputTracked(io: std.Io, file: std.Io.File, bytes: []const u8, completed: ?*bool) !void {
+    if (completed) |value| value.* = false;
     // 写任务的状态与借用的 bytes 都位于调用者栈上，因此必须等待任务结束后才能返回。
     const Write = struct {
         io: std.Io,
@@ -57,7 +62,10 @@ pub fn output(io: std.Io, file: std.Io.File, bytes: []const u8) !void {
     var write = Write{ .io = io, .file = file, .bytes = bytes };
     var future = try std.Io.concurrent(io, Write.run, .{&write});
     // Also joins on errors/cancellation before borrowed bytes or stack go away.
-    defer future.cancel(io);
+    defer {
+        future.cancel(io);
+        if (completed) |value| value.* = write.done.load(.acquire) and write.failure == null;
+    }
 
     // 以 5ms 为间隔轮询完成标志与中断信号，兼顾响应速度与 CPU 占用。
     while (!write.done.load(.acquire)) {
@@ -127,13 +135,16 @@ fn run(init: std.process.Init) !u8 {
         }
         future.await(init.io);
 
-        reportLogFailure(init.io, app);
         const terminal = try job.result();
 
         if (terminal.status == .success) {
-            // 辅助 Memory 阶段收到的 SIGINT 已被 finalize 消费为辅助取消，必须先消费掉它才能输出冻结的主结果。
-            if (interrupt.signal() == @backingInt(std.c.SIG.INT) and
-                app.memory_coordinator.failure.load(.acquire) == @intFromError(error.Canceled)) interrupt.clear();
+            // The primary result is frozen. A later SIGINT cancels auxiliary
+            // work; stdout remains cancellable and may be only partly delivered.
+            var auxiliary_cancel: p.Cancellation = .{};
+            if (interrupt.signal() != 0) {
+                auxiliary_cancel.cancel();
+                interrupt.clear();
+            }
             // 提示信息走 stderr，保证 stdout 只包含模型的回答内容。
             if (console.fallback) try output(init.io, .stderr(), "thin: Responses explicitly unsupported; using Chat for this process.\n");
             if (console.denied > 0) try output(init.io, .stderr(), "thin: tool calls were denied by the host.\n");
@@ -141,16 +152,65 @@ fn run(init: std.process.Init) !u8 {
             // 对回答做清洗并限制为 256 KiB，与 Console 中的截断上限保持一致。
             const safe = try text.sanitize(init.gpa, console.answer.items, 256 * 1024);
             defer init.gpa.free(safe);
-            try output(init.io, .stdout(), safe);
-            if (console.clipped) try output(init.io, .stdout(), "\n[display clipped; model history unchanged]");
-            try output(init.io, .stdout(), "\n");
-            if (app.memory_coordinator.failure.load(.acquire) != 0) {
+            const AnswerOutput = struct {
+                fn write(io: std.Io, answer: []const u8, clipped: bool, out_complete: *bool) !void {
+                    try output(io, .stdout(), answer);
+                    if (clipped) try output(io, .stdout(), "\n[display clipped; model history unchanged]");
+                    try outputTracked(io, .stdout(), "\n", out_complete);
+                }
+            };
+            var out_complete = false;
+            AnswerOutput.write(init.io, safe, console.clipped, &out_complete) catch |err| {
+                // Only a complete answer is auxiliary cancellation; backpressure remains an interrupted output.
+                if (err != error.Canceled or interrupt.signal() == 0 or !out_complete) return err;
+                auxiliary_cancel.cancel();
+                interrupt.clear();
+                app.memory_coordinator.cancelAndJoin();
+                app.journal.flush();
+                reportLogFailure(init.io, app);
+                output(init.io, .stderr(), "thin: auxiliary Memory finalization did not succeed; no automatic replay will occur.\n") catch {};
+                return 0;
+            };
+            const Drain = struct {
+                app: *App,
+                cancel: *p.Cancellation,
+                done: std.atomic.Value(bool) = .init(false),
+                fn run(self: *@This()) void {
+                    defer self.done.store(true, .release);
+                    self.app.drainMemory(self.cancel);
+                }
+            };
+            var drain = Drain{ .app = app, .cancel = &auxiliary_cancel };
+            var drain_future = std.Io.concurrent(init.io, Drain.run, .{&drain}) catch {
+                auxiliary_cancel.cancel();
+                app.memory_coordinator.cancelAndJoin();
+                app.journal.flush();
+                reportLogFailure(init.io, app);
+                output(init.io, .stderr(), "thin: auxiliary Memory finalization did not succeed; no automatic replay will occur.\n") catch {};
+                return 0;
+            };
+            defer drain_future.await(init.io);
+            while (!drain.done.load(.acquire)) {
+                if (interrupt.signal() != 0) {
+                    auxiliary_cancel.cancel();
+                    interrupt.clear();
+                }
+                std.Io.sleep(init.io, .fromMilliseconds(5), .awake) catch auxiliary_cancel.cancel();
+            }
+            drain_future.await(init.io);
+            app.journal.flush();
+            reportLogFailure(init.io, app);
+            const memory_terminal = app.memoryView().last_terminal;
+            if (auxiliary_cancel.isRequested() or app.memory_coordinator.failure.load(.acquire) != 0 or
+                (memory_terminal != null and (memory_terminal.?.result == .failed or memory_terminal.?.result == .uncertain or memory_terminal.?.result == .canceled)))
+            {
                 try output(init.io, .stderr(), "thin: auxiliary Memory finalization did not succeed; no automatic replay will occur.\n");
             }
             // 辅助 Memory 取消只影响辅助状态，不改写已完成主任务的成功退出码。
             return 0;
         }
 
+        reportLogFailure(init.io, app);
         // 失败或取消时，把终止状态、错误名与模型失败类型拼成一行写入 stderr。
         var buffer: [512]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);

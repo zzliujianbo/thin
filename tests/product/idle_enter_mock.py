@@ -339,7 +339,13 @@ def run(app, width, batched):
             # Resize is passive: the new dimensions are taken, the old frame
             # authority is dropped and only interrupted controls are released.
             mark = len(capture)
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 40, 0, 0))
+            resized_columns = 40
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, resized_columns, 0, 0))
+            # Resize the bounded canvas, not native history reflow.
+            for row in screen.grid:
+                row[:] = (row[:resized_columns] + [' '] * resized_columns)[:resized_columns]
+            screen.columns = resized_columns
+            screen.col = min(screen.col, resized_columns - 1)
             until = time.monotonic() + .05
             pump_until(lambda: time.monotonic() >= until)
             assert CONTROL_RELEASE.sub(b'', bytes(capture[mark:])) == b'', 'live resize repainted before settling'
@@ -359,7 +365,7 @@ def run(app, width, batched):
             pump_until(lambda: len(capture) > mark and edited(mark, 'z'))
             frame_end = capture.rfind(FRAME_END)
             drawn = bytes(capture[capture.rfind(SYNC_BEGIN, 0, frame_end):frame_end])
-            assert max((cells(line) for line in drawn.replace(b'\r', b'\n').split(b'\n')), default=0) <= 40, 'fresh frame ignored the resized width'
+            assert max((cells(line) for line in drawn.replace(b'\r', b'\n').split(b'\n')), default=0) <= resized_columns, 'fresh frame ignored the resized width'
             # Clearing the edit returns to the same empty ready composer.
             mark = len(capture)
             send(b'\x15')
@@ -376,7 +382,16 @@ def run(app, width, batched):
             pump_until(lambda: len(capture) > mark and capture.endswith(ACK))
             Service.release.set()
             pump_until(lambda: settled(b'idle-answer-proof'))
-            assert screen.row >= 1 and not ''.join(screen.grid[screen.row - 1]).strip(), 'idle line mode removed the normal conversation/composer gap'
+            assert screen.row >= 2 and screen.row == len(screen.grid) - 1, 'composer is not on the physical bottom row'
+            # The pending default can clear asynchronously.
+            statuses = {
+                'Saved thinking level not applied: model capabilities unknown',
+                'Default thinking: medium; awaiting model capabilities | Saved thinking level not applied: model capabilities unknown',
+            }
+            clipped_statuses = {status[:resized_columns - 1] for status in statuses}
+            assert ''.join(screen.grid[screen.row - 1]).rstrip(' ') in clipped_statuses, 'status is not immediately above the composer'
+            assert sum(''.join(row).rstrip(' ') in clipped_statuses for row in screen.grid) == 1, 'status is not unique on screen'
+            assert not ''.join(screen.grid[screen.row - 2]).strip(), 'separator above status is not blank'
             assert len(Service.requests) == 1
             send(b'\x04')
             pump_until(lambda: child.poll() is not None)

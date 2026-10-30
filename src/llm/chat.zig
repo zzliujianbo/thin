@@ -91,6 +91,8 @@ test "chat refusal chunks are visible text and retain native replay" {
     try stream.feed("", "[DONE]");
     const response = (try stream.finish()).success;
     try std.testing.expect(response.finish == .stop);
+    try std.testing.expect(response.refused);
+    try std.testing.expect(!response.unsupported_output);
     try std.testing.expectEqual(@as(usize, 1), response.message.blocks.len);
     try std.testing.expectEqualStrings("Cannot help.", response.message.blocks[0].text);
     try std.testing.expect(response.message.replay.?.retain_turn);
@@ -110,6 +112,29 @@ test "chat nullable refusal does not reject an ordinary answer" {
     try stream.feed("", "[DONE]");
     const response = (try stream.finish()).success;
     try std.testing.expectEqualStrings("hello", response.message.blocks[0].text);
+}
+
+test "chat normalized safety flags retain legacy call and vendor metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "null", "[]", "{}", "[1]", "\"legacy\"" }, 0..) |legacy, i| {
+        var stream = Stream.init(a, test_support.chat_scope, .{});
+        try stream.feed("", try std.fmt.allocPrint(a, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"ok\",\"function_call\":{s},\"vendor\":{{\"x\":1}}}},\"finish_reason\":\"stop\"}}]}}", .{legacy}));
+        try stream.feed("", "[DONE]");
+        const response = (try stream.finish()).success;
+        try std.testing.expectEqual(i >= 2, response.unsupported_output);
+        try std.testing.expect(!response.refused);
+        try std.testing.expectEqualStrings("ok", response.message.blocks[0].text);
+        const native = try j.parse(a, response.message.replay.?.json);
+        try std.testing.expect(j.get(native, "vendor") != null);
+        if (i != 0) try std.testing.expect(j.get(native, "function_call") != null);
+        try std.testing.expect(response.message.replay.?.retain_turn);
+    }
+    var empty = Stream.init(a, test_support.chat_scope, .{});
+    try empty.feed("", "{\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"\"},\"finish_reason\":\"stop\"}]}");
+    try empty.feed("", "[DONE]");
+    try std.testing.expect((try empty.finish()).success.refused);
 }
 
 test "chat non-string refusal fails closed" {
@@ -458,6 +483,8 @@ pub const Stream = struct {
     // 上游报错或结束原因不被接受，最终转为失败结果。
     failed: bool = false,
     output_limited: bool = false,
+    refused: bool = false,
+    unsupported_output: bool = false,
     // 任一 feed 出错后置位，流不可再用。
     poisoned: bool = false,
     // finish 已调用，禁止重复结束。
@@ -567,6 +594,8 @@ pub const Stream = struct {
 
                 // 可选的 content/refusal 等字段允许 null，视为缺失；普通响应常携带 refusal:null。
                 if (val == .null) continue;
+                if (c.eq(key, "refusal")) self.refused = true;
+                if (c.eq(key, "function_call") and !(val == .array and val.array.items.len == 0)) self.unsupported_output = true;
                 // 非空 refusal 必须是可展示的字符串，不能只当作未知结构回放。
                 if ((c.eq(key, "content") or c.eq(key, "reasoning_content") or c.eq(key, "refusal")) and val != .string) return error.InvalidEvent;
                 if (val == .string) {
@@ -765,6 +794,6 @@ pub const Stream = struct {
         }
 
         // 成功结果：携带 usage、结束原因与可回放的 native JSON。
-        return .{ .success = .{ .message = .{ .role = .assistant, .blocks = blocks, .replay = .{ .scope = try c.scopeCopy(self.a, self.scope), .json = try j.encode(self.a, self.native), .retain_turn = retain_turn } }, .finish = self.finish_reason.?, .usage = self.token_usage, .raw_usage_json = self.raw_usage } };
+        return .{ .success = .{ .message = .{ .role = .assistant, .blocks = blocks, .replay = .{ .scope = try c.scopeCopy(self.a, self.scope), .json = try j.encode(self.a, self.native), .retain_turn = retain_turn } }, .finish = self.finish_reason.?, .refused = self.refused, .unsupported_output = self.unsupported_output, .usage = self.token_usage, .raw_usage_json = self.raw_usage } };
     }
 };

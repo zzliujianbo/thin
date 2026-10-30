@@ -1,4 +1,4 @@
-//! Synchronous automatic-Memory settle boundary tests. No network or user state.
+//! Asynchronous automatic-Memory lifecycle tests. No network or user state.
 const std = @import("std");
 const cfg = @import("../core/config.zig");
 const fs = @import("../platform/filesystem.zig");
@@ -22,18 +22,22 @@ const Extractor = struct {
     started: std.atomic.Value(bool) = .init(false),
     release: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(bool) = .init(false),
+    calls: std.atomic.Value(usize) = .init(0),
     fail: bool = false,
+    cleanup_fail: bool = false,
     fn service(self: *@This()) k.Service {
         return .{ .context = self, .extract_fn = extract };
     }
     fn extract(raw: *anyopaque, a: std.mem.Allocator, material: k.Material, cancel: *const p.Cancellation) ![]const k.Candidate {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        _ = self.calls.fetchAdd(1, .acq_rel);
         self.started.store(true, .release);
         defer self.finished.store(true, .release);
         while (!self.release.load(.acquire)) {
             if (cancel.isRequested()) return error.Canceled;
             try std.Io.sleep(self.io, .fromMilliseconds(2), .awake);
         }
+        if (self.cleanup_fail) return error.CleanupFailed;
         if (self.fail) return error.MemoryUnavailable;
         return a.dupe(k.Candidate, &.{.{
             .category = .preferences,
@@ -42,6 +46,25 @@ const Extractor = struct {
             .source_id = material.sources[0].id,
             .quote = "Wait for Memory",
         }});
+    }
+};
+
+const CountingExecutor = struct {
+    prepares: usize = 0,
+    executions: usize = 0,
+
+    fn executor(self: *@This()) r.Executor {
+        return .{ .context = self, .schemas = &.{}, .prepare_fn = prepare, .execute_fn = execute };
+    }
+    fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !r.Prepared {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.prepares += 1;
+        return .{ .payload = self, .description = "owned harmless fixture" };
+    }
+    fn execute(raw: *anyopaque, _: std.mem.Allocator, _: r.Prepared, _: *const p.Cancellation) !r.Execution {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.executions += 1;
+        return .{ .text = "owned harmless fixture" };
     }
 };
 
@@ -89,7 +112,7 @@ fn expectNoJobs(root: *fs.Root) !void {
     try std.testing.expectError(error.FileNotFound, fs.openPath(root.dir.handle, ".thin/memory/jobs-owner"));
 }
 
-test "Runtime cannot publish finished or idle before synchronous Memory finalization" {
+test "Runtime publishes finished and accepts next prompt while Memory is gated" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -117,21 +140,19 @@ test "Runtime cannot publish finished or idle before synchronous Memory finaliza
     var future = try std.Io.concurrent(io, Job.run, .{&job});
     defer future.await(io);
     try waitFlag(io, &extractor.started);
-    try std.testing.expect(!job.done.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), host.finished_events.load(.acquire));
-    try std.testing.expectEqualStrings("Memory: finalizing (separate auxiliary request)", app.memoryNotice().?);
-
-    extractor.release.store(true, .release);
+    try waitFlag(io, &job.done);
     future.await(io);
     try std.testing.expectEqual(r.Status.success, (try job.result()).status);
-    try std.testing.expectEqual(@as(usize, 1), primary.calls);
     try std.testing.expectEqual(@as(usize, 1), host.finished_events.load(.acquire));
-    try std.testing.expect(!host.finished_before_memory.load(.acquire));
-    try std.testing.expectEqualStrings("Memory: saved", app.memoryNotice().?);
+    try std.testing.expect(host.finished_before_memory.load(.acquire));
+    try std.testing.expectEqual(r.Status.success, (try app.runtime.run("A second task", &cancel)).status);
+    try std.testing.expectEqual(@as(usize, 2), primary.calls);
+    extractor.release.store(true, .release);
+    app.drainMemory(&cancel);
     try expectNoJobs(&root);
 }
 
-test "Memory failure and cancellation settle before finished without changing primary success" {
+test "Memory failure and cancellation after finished do not change primary success" {
     const a = std.testing.allocator;
     for (0..2) |mode| {
         var backend = std.Io.Threaded.init(a, .{});
@@ -158,16 +179,122 @@ test "Memory failure and cancellation settle before finished without changing pr
         var future = try std.Io.concurrent(io, Job.run, .{&job});
         defer future.await(io);
         try waitFlag(io, &extractor.started);
-        if (mode == 0) extractor.release.store(true, .release) else cancel.cancel();
+        try waitFlag(io, &job.done);
         future.await(io);
         try std.testing.expectEqual(r.Status.success, (try job.result()).status);
         try std.testing.expectEqual(@as(usize, 1), host.finished_events.load(.acquire));
-        if (mode == 0) {
-            try std.testing.expect(std.mem.find(u8, app.memoryNotice().?, "uncertain") != null);
-            try std.testing.expect(!host.finished_before_memory.load(.acquire));
-        } else {
-            try std.testing.expectEqualStrings("Memory: finalization canceled", app.memoryNotice().?);
-        }
+        try std.testing.expect(host.finished_before_memory.load(.acquire));
+        var drain_cancel: p.Cancellation = .{};
+        if (mode == 0) extractor.release.store(true, .release) else drain_cancel.cancel();
+        app.drainMemory(&drain_cancel);
+        const terminal = app.memoryView().last_terminal orelse return error.MissingMemoryTerminal;
+        try std.testing.expect(terminal.result != .saved);
         try expectNoJobs(&root);
     }
+}
+
+test "Memory closeout CleanupFailed blocks prompt compact and command" {
+    const a = std.testing.allocator;
+    var backend = std.Io.Threaded.init(a, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try openRoot(a, io, tmp.dir);
+    defer root.deinit();
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", root.path);
+    const auth_path = try std.fs.path.join(a, &.{ root.path, "absent-config.json" });
+    defer a.free(auth_path);
+    var extractor: Extractor = .{ .io = io, .cleanup_fail = true };
+    var host: HostState = .{ .extractor = &extractor };
+    const app = try createApp(a, io, &root, &env, auth_path, host.host());
+    defer app.deinit();
+    var primary: Primary = .{};
+    app.runtime.model = .{ .context = &primary, .call_fn = Primary.call };
+    app.memory_coordinator.service_override = extractor.service();
+
+    var cancel: p.Cancellation = .{};
+    var job: Job = .{ .runtime = &app.runtime, .cancel = &cancel, .prompt = "Wait for Memory before publishing idle." };
+    var future = try std.Io.concurrent(io, Job.run, .{&job});
+    defer {
+        cancel.cancel();
+        extractor.release.store(true, .release);
+        future.await(io);
+    }
+    try waitFlag(io, &extractor.started);
+    try waitFlag(io, &job.done);
+    const original = try job.result();
+    try std.testing.expectEqual(r.Status.success, original.status);
+    try std.testing.expectEqual(@as(usize, 1), primary.calls);
+    try std.testing.expectEqual(@as(usize, 1), host.finished_events.load(.acquire));
+    try std.testing.expect(host.finished_before_memory.load(.acquire));
+    try std.testing.expect(!extractor.finished.load(.acquire));
+
+    extractor.release.store(true, .release);
+    app.drainMemory(&cancel);
+    try std.testing.expect(app.memory_coordinator.isPoisoned());
+    const memory_terminal = app.memoryView().last_terminal orelse return error.MissingMemoryTerminal;
+    try std.testing.expect(memory_terminal.result == .failed);
+    try std.testing.expect(memory_terminal.failure != null and memory_terminal.failure.? == .cleanup);
+    try std.testing.expect(!app.runtime.poisoned);
+    try std.testing.expectEqual(r.Status.success, (try job.result()).status);
+    try std.testing.expectEqual(r.Status.success, original.status);
+
+    var executor: CountingExecutor = .{};
+    app.runtime.executor = executor.executor();
+    const primary_baseline = primary.calls;
+    const helper_baseline = extractor.calls.load(.acquire);
+    try std.testing.expectEqual(@as(usize, 1), helper_baseline);
+    for (0..3) |operation| {
+        const terminal = switch (operation) {
+            0 => try app.runtime.run("Another owned prompt", &cancel),
+            1 => try app.runtime.compactContext(&cancel),
+            else => try app.runtime.executeCommand("!owned-no-sideeffects", &cancel),
+        };
+        try std.testing.expectEqual(r.Status.failed, terminal.status);
+        try std.testing.expect(terminal.detail != null and terminal.detail.? == error.UnsafeToContinue);
+        try std.testing.expectEqual(primary_baseline, primary.calls);
+        try std.testing.expectEqual(@as(usize, 0), executor.prepares);
+        try std.testing.expectEqual(@as(usize, 0), executor.executions);
+        app.drainMemory(&cancel);
+        try std.testing.expectEqual(helper_baseline, extractor.calls.load(.acquire));
+        try std.testing.expect(!app.runtime.busy.load(.acquire));
+    }
+    try expectNoJobs(&root);
+}
+
+test "discarded settings replacement leaves live Memory owner accepting work" {
+    const a = std.testing.allocator;
+    var backend = std.Io.Threaded.init(a, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try openRoot(a, io, tmp.dir);
+    defer root.deinit();
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", root.path);
+    const auth_path = try std.fs.path.join(a, &.{ root.path, "absent-config.json" });
+    defer a.free(auth_path);
+    var extractor: Extractor = .{ .io = io };
+    var host: HostState = .{ .extractor = &extractor };
+    const app = try createApp(a, io, &root, &env, auth_path, host.host());
+    defer app.deinit();
+    var primary: Primary = .{};
+    app.runtime.model = .{ .context = &primary, .call_fn = Primary.call };
+    app.memory_coordinator.service_override = extractor.service();
+
+    var replacement = try app.prepareSettingsRefresh(app.config.value, &env, .decision);
+    try std.testing.expect(replacement.replace_memory);
+    replacement.deinit(); // Simulate a failed save: the live owner must survive.
+    var cancel: p.Cancellation = .{};
+    try std.testing.expectEqual(r.Status.success, (try app.runtime.run("Wait for Memory before publishing idle.", &cancel)).status);
+    try waitFlag(io, &extractor.started);
+    try std.testing.expectEqual(@as(usize, 1), primary.calls);
+    extractor.release.store(true, .release);
+    app.drainMemory(&cancel);
+    try expectNoJobs(&root);
 }

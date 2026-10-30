@@ -127,6 +127,9 @@ pub const Response = struct {
     /// Explicit provider refusal metadata for helper consumers. Still a normal
     /// displayable response; deliberately not part of Message/history/replay.
     refused: bool = false,
+    /// Semantic native output not safely represented by normalized blocks.
+    /// Text-only consumers must reject it; primary dialog may preserve native replay.
+    unsupported_output: bool = false,
     usage: Usage = .{},
     /// 提供方原始用量 JSON，仅用于诊断保留。
     raw_usage_json: ?[]const u8 = null,

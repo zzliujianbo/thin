@@ -34,6 +34,7 @@ const unix = @import("unix.zig");
 const StreamReceiver = @import("stream_receiver.zig").Receiver;
 const remote_action = @import("../ui/remote_action.zig");
 const codex_login = @import("../core/codex_login.zig");
+const memory_status = @import("../core/memory_status.zig");
 
 const Io = std.Io;
 const Registry = registry.Registry;
@@ -147,6 +148,8 @@ fn wireError(code: protocol.ErrorCode) anyerror {
         .permission_expired => error.PermissionExpired,
         .no_official_provider => error.NoOfficialProvider,
         .metadata_refresh_busy => error.MetadataRefreshBusy,
+        .thinking_capabilities_loading => error.ThinkingCapabilitiesLoading,
+        .thinking_capabilities_unknown => error.ThinkingCapabilitiesUnknown,
         .transport => error.Transport,
         .internal => error.RemoteFailure,
     };
@@ -243,6 +246,63 @@ fn valueU64(value: std.json.Value) ?u64 {
     };
 }
 
+fn decodeMemoryView(value: std.json.Value) !memory_status.View {
+    const obj = switch (value) {
+        .object => |v| v,
+        else => return error.ProtocolError,
+    };
+    if (obj.count() != 5) return error.ProtocolError;
+    var result: memory_status.View = .{
+        .enabled = valueBool(obj.get("enabled") orelse return error.ProtocolError) orelse return error.ProtocolError,
+        .revision = valueU64(obj.get("revision") orelse return error.ProtocolError) orelse return error.ProtocolError,
+        .queued_count = valueU64(obj.get("queued_count") orelse return error.ProtocolError) orelse return error.ProtocolError,
+    };
+    result.active = switch (obj.get("active") orelse return error.ProtocolError) {
+        .null => null,
+        .object => |active| blk: {
+            if (active.count() != 2) return error.ProtocolError;
+            const phase = switch (active.get("phase") orelse return error.ProtocolError) {
+                .string => |s| std.meta.stringToEnum(memory_status.Phase, s) orelse return error.ProtocolError,
+                else => return error.ProtocolError,
+            };
+            break :blk .{ .id = valueU64(active.get("id") orelse return error.ProtocolError) orelse return error.ProtocolError, .phase = phase };
+        },
+        else => return error.ProtocolError,
+    };
+    result.last_terminal = switch (obj.get("last_terminal") orelse return error.ProtocolError) {
+        .null => null,
+        .object => |terminal| blk: {
+            if (terminal.count() != 3) return error.ProtocolError;
+            const outcome = switch (terminal.get("result") orelse return error.ProtocolError) {
+                .string => |s| std.meta.stringToEnum(memory_status.Result, s) orelse return error.ProtocolError,
+                else => return error.ProtocolError,
+            };
+            const failure: ?memory_status.Failure = switch (terminal.get("failure") orelse return error.ProtocolError) {
+                .null => null,
+                .string => |s| std.meta.stringToEnum(memory_status.Failure, s) orelse return error.ProtocolError,
+                else => return error.ProtocolError,
+            };
+            break :blk .{ .id = valueU64(terminal.get("id") orelse return error.ProtocolError) orelse return error.ProtocolError, .result = outcome, .failure = failure };
+        },
+        else => return error.ProtocolError,
+    };
+    return result;
+}
+
+test "memory view decoder rejects malformed fields" {
+    const a = std.testing.allocator;
+    const valid = "{\"enabled\":true,\"revision\":2,\"queued_count\":1,\"active\":{\"id\":7,\"phase\":\"saving\"},\"last_terminal\":{\"id\":6,\"result\":\"failed\",\"failure\":\"storage\"}}";
+    var doc = try std.json.parseFromSlice(std.json.Value, a, valid, .{});
+    defer doc.deinit();
+    const view = try decodeMemoryView(doc.value);
+    try std.testing.expectEqual(memory_status.Phase.saving, view.active.?.phase);
+    try std.testing.expectEqual(memory_status.Failure.storage, view.last_terminal.?.failure.?);
+    const invalid = "{\"enabled\":true,\"revision\":2,\"queued_count\":1,\"active\":{\"id\":7,\"phase\":\"arbitrary prose\"},\"last_terminal\":null}";
+    var bad = try std.json.parseFromSlice(std.json.Value, a, invalid, .{});
+    defer bad.deinit();
+    try std.testing.expectError(error.ProtocolError, decodeMemoryView(bad.value));
+}
+
 fn valueBool(value: std.json.Value) ?bool {
     return switch (value) {
         .bool => |b| b,
@@ -254,7 +314,7 @@ fn parseObject(a: std.mem.Allocator, bytes: []const u8) !Response {
     if (bytes.len == 0 or bytes.len > protocol.max_response) return error.ProtocolError;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.ProtocolError;
     if (!boundedDepth(bytes)) return error.ProtocolError;
-    const doc = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always }) catch return error.ProtocolError;
+    const doc = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" }) catch return error.ProtocolError;
     errdefer doc.deinit();
     const object = switch (doc.value) {
         .object => |value| value,
@@ -325,6 +385,7 @@ const max_preview_bytes = 96;
 const max_label_bytes = 64;
 
 const SnapshotCache = struct {
+    memory: memory_status.View = .{},
     valid: bool = false,
     codex_login: codex_login.View = .{},
     busy: bool = false,
@@ -806,6 +867,7 @@ pub const Client = struct {
             .newest_bytes = if (cache.valid) cache.newest_bytes else 0,
             .previews = previews,
             .running_sessions = 0,
+            .memory = cache.memory,
         };
     }
 
@@ -816,6 +878,7 @@ pub const Client = struct {
         const cache = &self.cache;
         var state: tui.Connection.State = baseState();
         state.codex_login = cache.codex_login;
+        state.memory = cache.memory;
         state.available = cfg.available and (self.conn != null or self.control != null);
         state.busy = (cache.valid and cache.busy) or (self.need_history and self.snap.busy);
         state.session_label = if (cache.valid and cache.label_len != 0) try arena.dupe(u8, cache.label[0..cache.label_len]) else null;
@@ -1017,6 +1080,7 @@ pub const Client = struct {
             }
         };
         cache.valid = true;
+        cache.memory = try decodeMemoryView(object.get("memory") orelse return error.ProtocolError);
         if (object.get("codex_login")) |value| {
             const login_view = switch (value) {
                 .object => |map| map,
@@ -1102,6 +1166,7 @@ pub const Client = struct {
         }
         if (cache.codex_login.status == .succeeded and
             (self.cache.codex_login.status != .succeeded or self.cache.codex_login.generation != cache.codex_login.generation)) self.dirty = true;
+        if (!std.meta.eql(self.cache.memory, cache.memory)) self.dirty = true;
         self.cache = cache;
         if (resp.uint("through")) |through| self.cache_floor = @max(self.cache_floor, through);
     }
@@ -1143,7 +1208,7 @@ pub const Client = struct {
             // public object into a document this projection keeps.
             const bytes = try std.json.Stringify.valueAlloc(self.a, std.json.Value{ .object = object }, .{});
             defer self.a.free(bytes);
-            break :resp_doc std.json.parseFromSlice(std.json.Value, self.a, bytes, .{ .allocate = .alloc_always }) catch return error.ProtocolError;
+            break :resp_doc std.json.parseFromSlice(std.json.Value, self.a, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" }) catch return error.ProtocolError;
         };
         // A later catalog can fail after an earlier one was already assigned to
         // `next`, so the error path releases the whole partial projection
@@ -3242,7 +3307,7 @@ test "communication delivers real stream frames during a delayed control reply a
     var request_ = try protocol.parseRequest(a, request_bytes);
     defer request_.deinit();
     try testing.expect(request_.op == .cancel or request_.op == .poll_metadata);
-    try stream.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"snapshot\",\"through\":0,\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"phase\":\"calling_model\",\"task\":1}}", .{ .io = io, .timeout_ms = 2000 });
+    try stream.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"snapshot\",\"through\":0,\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"phase\":\"calling_model\",\"task\":1,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2000 });
     try stream.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2000 });
     const event_bytes = try protocol.encodeEvent(a, .{ .text = "delayed-control-live-body" });
     defer a.free(event_bytes);
@@ -3313,7 +3378,7 @@ fn serveControlUntilSnapshot(pair: *Pair, a: std.mem.Allocator) !void {
         switch (request.op) {
             .snapshot => {
                 try testing.expect(saw_settings);
-                try pair.reply(request.id, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true}");
+                try pair.reply(request.id, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
                 return;
             },
             .settings => {
@@ -3455,7 +3520,7 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
     defer watch_request.deinit();
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
     try testing.expect((try watch_request.optionalU64("since")) == null);
-    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
     try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
 
     const first_page = try readyPage(a, 0, 1, &.{1}, "a");
@@ -3578,7 +3643,7 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
 
     // Same viewer: snapshot at the cursor is redundant, the delta continues the
     // owned stream with no synthetic history reset and no duplicate.
-    try resumed.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":3,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true}}", .{ .io = io, .timeout_ms = 2_000 });
+    try resumed.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":3,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
     const delta = try readyPage(a, 3, 4, &.{4}, "d");
     defer a.free(delta);
     try resumed.writeFrame(delta, .{ .io = io, .timeout_ms = 2_000 });
@@ -3630,7 +3695,7 @@ test "new viewer baseline rows precede ordered pages and gaps are surfaced" {
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
     const hello = try protocol.encodeEvent(a, .{ .user_committed = .{ .id = 1, .text = "hello" } });
     defer a.free(hello);
-    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":5,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":5,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
     const baseline = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":2,\"through\":2,\"truncated\":false,\"entries\":[{s}]}}", .{hello});
     defer a.free(baseline);
     try watch.writeFrame(baseline, .{ .io = io, .timeout_ms = 2_000 });
@@ -3708,7 +3773,7 @@ test "coalesced live span is acknowledged as one exact first/last range" {
     var watch_request = try protocol.parseRequest(a, raw_watch);
     defer watch_request.deinit();
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
-    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
     try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
     // Three consecutive raw deltas (positions 4..6) that the display queue
     // coalesces into one payload. Earlier positions were already shortened.
@@ -4173,7 +4238,7 @@ test "snapshot and settings project into the UI state without pointers" {
     try std.testing.expectEqual(@as(usize, 1), client.pubcfg.providers.len);
     try std.testing.expectEqual(@as(u8, 1), client.pubcfg.configured);
 
-    try pair.reply(2, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":true,\"phase\":\"calling_model\",\"task\":4,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":1,\"follow_up\":0,\"previews\":[{\"id\":5,\"kind\":\"steering\",\"text\":\"next\"}],\"ctx\":{\"tokens\":10,\"limit\":100,\"known\":true}}");
+    try pair.reply(2, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":true,\"phase\":\"calling_model\",\"task\":4,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":1,\"follow_up\":0,\"previews\":[{\"id\":5,\"kind\":\"steering\",\"text\":\"next\"}],\"ctx\":{\"tokens\":10,\"limit\":100,\"known\":true},\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     var snapshot = try client.readResponse(2, quick_timeout_ms);
     try client.adoptSnapshot(&snapshot);
     snapshot.deinit();
@@ -4196,6 +4261,69 @@ test "snapshot and settings project into the UI state without pointers" {
     try std.testing.expectEqual(@as(u8, 1), state.configured_providers);
     // The projection copies: mutating the wire bytes later cannot reach the UI.
     try std.testing.expect(state.models.len == 0);
+}
+
+test "Memory closeout nonzero view survives response and client projection lifetime" {
+    const expected: memory_status.View = .{
+        .enabled = true,
+        .revision = 18446744073709551614,
+        .active = .{ .id = 9007199254740993, .phase = .reviewing },
+        .queued_count = 3,
+        .last_terminal = .{ .id = 9007199254740992, .result = .failed, .failure = .storage },
+    };
+    const next: memory_status.View = .{
+        .enabled = true,
+        .revision = 7,
+        .active = .{ .id = 8, .phase = .saving },
+        .queued_count = 1,
+        .last_terminal = .{ .id = 6, .result = .saved },
+    };
+    const exported = blk: {
+        var pair = try pairOf(testing.allocator);
+        defer pair.deinit();
+        const client = pair.client;
+        try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":false,\"phase\":\"calling_model\",\"task\":0,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"previews\":[],\"memory\":{\"enabled\":true,\"revision\":18446744073709551614,\"active\":{\"id\":9007199254740993,\"phase\":\"reviewing\"},\"queued_count\":3,\"last_terminal\":{\"id\":9007199254740992,\"result\":\"failed\",\"failure\":\"storage\"}}}");
+        var response = try client.readResponse(1, quick_timeout_ms);
+        client.adoptSnapshot(&response) catch |err| {
+            response.deinit();
+            return err;
+        };
+        response.deinit();
+        client.rebuild();
+        const state = Client.currentFn(@ptrCast(client));
+        const snapshot = Client.snapshotFn(@ptrCast(client));
+        try testing.expect(std.meta.eql(expected, state.memory));
+        try testing.expect(std.meta.eql(expected, snapshot.memory));
+        try testing.expect(!state.busy and !snapshot.busy);
+        try testing.expectEqual(@as(?r.State, .calling_model), snapshot.mode);
+        try testing.expectEqual(session_client.TaskKind.prompt, snapshot.task_kind);
+        try testing.expectEqual(@as(u64, 5), snapshot.control_epoch);
+        try testing.expectEqual(@as(u64, 5), state.control_epoch);
+        try testing.expectEqual(@as(u64, 9), snapshot.queue_revision);
+        try testing.expectEqual(@as(usize, 2), snapshot.steering);
+        try testing.expectEqual(@as(usize, 1), snapshot.follow_up);
+
+        const projection = try client.exportProjection();
+        errdefer projection.deinit();
+        try testing.expect(std.meta.eql(expected, projection.state.memory));
+        try testing.expect(std.meta.eql(expected, projection.snapshot.memory));
+        try pair.reply(2, "\"snapshot\":{\"busy\":false,\"phase\":\"calling_model\",\"task_kind\":\"prompt\",\"epoch\":5,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"memory\":{\"enabled\":true,\"revision\":7,\"active\":{\"id\":8,\"phase\":\"saving\"},\"queued_count\":1,\"last_terminal\":{\"id\":6,\"result\":\"saved\",\"failure\":null}}}");
+        var updated = try client.readResponse(2, quick_timeout_ms);
+        client.adoptSnapshot(&updated) catch |err| {
+            updated.deinit();
+            return err;
+        };
+        updated.deinit();
+        client.rebuild();
+        try testing.expect(std.meta.eql(next, Client.currentFn(@ptrCast(client)).memory));
+        try testing.expect(std.meta.eql(next, Client.snapshotFn(@ptrCast(client)).memory));
+        try testing.expect(std.meta.eql(expected, projection.state.memory));
+        try testing.expect(std.meta.eql(expected, projection.snapshot.memory));
+        break :blk projection;
+    };
+    defer exported.deinit();
+    try testing.expect(std.meta.eql(expected, exported.state.memory));
+    try testing.expect(std.meta.eql(expected, exported.snapshot.memory));
 }
 
 /// Minimal view over a real owner `Connection`: only the fields this wire
@@ -5015,6 +5143,31 @@ test "refresh wire codes survive a real failing frame without collapsing" {
     try std.testing.expectEqual(error.RemoteFailure, wireError(protocol.codeFromName("not_a_wire_code")));
 }
 
+test "cycle effort preserves closed capability errors through RPC" {
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const cases = [_]struct { expected: anyerror, name: []const u8 }{
+        .{ .expected = error.ThinkingCapabilitiesLoading, .name = "thinking_capabilities_loading" },
+        .{ .expected = error.ThinkingCapabilitiesUnknown, .name = "thinking_capabilities_unknown" },
+    };
+    for (cases) |case| {
+        const code = protocol.errorCode(case.expected);
+        try testing.expectEqualStrings(case.name, code.name());
+        try testing.expectEqual(code, protocol.codeFromName(case.name));
+        try testing.expectEqual(case.expected, wireError(protocol.codeFromName(code.name())));
+        try pair.replyError(pair.nextId(), code.name());
+        try testing.expectError(case.expected, Client.cycleEffortFn(@ptrCast(pair.client)));
+        const request = try readFrameJson(&pair, a);
+        defer request.deinit();
+        try testing.expectEqualStrings("cycle_effort", request.value.object.get("op").?.string);
+        try testing.expectEqual(@as(i64, 5), request.value.object.get("epoch").?.integer);
+    }
+    try testing.expectEqual(protocol.ErrorCode.internal, protocol.codeFromName("not_a_wire_code"));
+    try testing.expectEqual(error.RemoteFailure, wireError(protocol.codeFromName("not_a_wire_code")));
+    try testing.expectEqual(protocol.ErrorCode.internal, protocol.errorCode(error.Unexpected));
+}
+
 test "over-deep or malformed frames are rejected before parsing" {
     const a = testing.allocator;
     try std.testing.expect(boundedDepth("{\"v\":1,\"id\":1,\"ok\":true}"));
@@ -5136,7 +5289,7 @@ test "a replaced controller epoch drops the view and returns to the launcher" {
     const client = pair.client;
     client.session = session_id;
 
-    try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"epoch\":99,\"attached\":true,\"busy\":true}");
+    try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"epoch\":99,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     client.refreshSnapshot();
     // Only this view is released: no shutdown, no cancel, no epoch-0 connection
     // that would make every later input stale forever.
@@ -5177,7 +5330,7 @@ test "a real takeover (owner reports epoch 0) returns to the launcher without to
 
     // The service never hands another console's epoch to the loser: a revoked
     // controller sees `epoch: 0` (still busy, still running).
-    try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"epoch\":0,\"attached\":false,\"busy\":true}");
+    try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"epoch\":0,\"attached\":false,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     client.refreshSnapshot();
 
     const published = Client.snapshotFn(@ptrCast(client));

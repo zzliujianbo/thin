@@ -116,6 +116,7 @@ test "App default automatic memory succeeds with recording and without Decision 
         try std.testing.expectEqual(@as(usize, 0), fake.extracted.load(.acquire));
         var cancel: p.Cancellation = .{};
         const terminal = try app.runtime.run("I prefer concise explanations in all reviews.", &cancel);
+        app.drainMemory(&cancel);
         try std.testing.expectEqual(r.Status.success, terminal.status);
         try std.testing.expectEqual(@as(usize, 1), fake.calls);
         try std.testing.expectEqual(@as(usize, 1), fake.extracted.load(.acquire));

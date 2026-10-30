@@ -74,7 +74,8 @@ pub const Frontend = struct {
         }
         self.presentation_changed = self.presentation_changed or view.generation != self.generation or
             view.projection.configuration_revision != self.view.configuration_revision or
-            codexViewChanged(self.view.state.codex_login, view.projection.state.codex_login);
+            codexViewChanged(self.view.state.codex_login, view.projection.state.codex_login) or
+            !std.meta.eql(self.view.state.memory, view.projection.state.memory);
         if (self.retired) |retired| retired.deinit();
         self.retired = self.view;
         self.view = view.projection;

@@ -203,6 +203,9 @@ pub fn build(b: *std.Build) void {
     const run_idle_enter = fixture(b, "python3", "tests/product/idle_enter_mock.py", &.{exe}, &.{});
     b.step("test-idle-enter", "Run owned idle prompt newline PTYs (requires Python 3)").dependOn(&run_idle_enter.step);
 
+    const run_memory_background = fixture(b, "python3", "tests/product/memory_background_mock.py", &.{exe}, &.{});
+    b.step("test-memory-background", "Run owned PTY background Memory status and lifecycle acceptance").dependOn(&run_memory_background.step);
+
     const run_resize = fixture(b, "python3", "tests/product/resize_deferred_mock.py", &.{exe}, &.{});
     b.step("test-resize-deferred", "Run owned passive size/safety, ACK invalidation and stream-resume PTY checks (no auto repair)").dependOn(&run_resize.step);
 
@@ -269,6 +272,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_proxy.step);
     test_all.dependOn(&run_app.step);
     test_all.dependOn(&run_idle_enter.step);
+    test_all.dependOn(&run_memory_background.step);
     test_all.dependOn(&run_resize.step);
     test_all.dependOn(viewport_step);
     test_all.dependOn(&run_settings.step);

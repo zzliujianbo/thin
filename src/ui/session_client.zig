@@ -272,6 +272,7 @@ pub const QueuePreview = struct {
 /// adapter documents otherwise (normally until the next snapshot update); the
 /// TUI copies what it keeps. No Runtime, socket or callback lives here.
 pub const Snapshot = struct {
+    memory: @import("../core/memory_status.zig").View = .{},
     available: bool = false,
     attached: bool = false,
     busy: bool = false,

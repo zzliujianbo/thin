@@ -347,7 +347,7 @@ const Lifecycle = struct {
     fn retrieve(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: usize) anyerror![]const u8 {
         return try a.dupe(u8, "");
     }
-    fn finalize(raw: *anyopaque, capture: *const knowledge.Capture, _: p.Protocol, _: *const p.Cancellation) void {
+    fn finalize(raw: *anyopaque, capture: *const knowledge.Capture, _: p.Protocol) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.finalized += 1;
         if (self.ends == 0 or self.finished != 0) self.order_violation = true;
@@ -413,7 +413,7 @@ test "normal stop reminder is a context message and not user or memory evidence"
     var life: Lifecycle = .{ .hints = 1 };
     var instance = try runtime.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &model, .call_fn = ModelFake.call }, lifecycleExecutor(&life), .{ .context = &life, .emit_fn = Lifecycle.emit }, "");
     defer instance.deinit();
-    instance.memory_hooks = .{ .context = &life, .retrieve_fn = Lifecycle.retrieve, .finalize_fn = Lifecycle.finalize };
+    instance.memory_hooks = .{ .context = &life, .retrieve_fn = Lifecycle.retrieve, .submit_fn = Lifecycle.finalize };
     var cancel: p.Cancellation = .{};
     const terminal = try instance.run("investigate", &cancel);
     try std.testing.expectEqual(runtime.Status.success, terminal.status);
@@ -448,7 +448,7 @@ test "three stop reminders then SubagentInteractionRequired pauses the root" {
     var life: Lifecycle = .{ .hints = 4 };
     var instance = try runtime.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &model, .call_fn = ModelFake.call }, lifecycleExecutor(&life), .{ .context = &life, .emit_fn = Lifecycle.emit }, "");
     defer instance.deinit();
-    instance.memory_hooks = .{ .context = &life, .retrieve_fn = Lifecycle.retrieve, .finalize_fn = Lifecycle.finalize };
+    instance.memory_hooks = .{ .context = &life, .retrieve_fn = Lifecycle.retrieve, .submit_fn = Lifecycle.finalize };
     var cancel: p.Cancellation = .{};
     const terminal = try instance.run("wait for child", &cancel);
     try std.testing.expectEqual(runtime.Status.paused, terminal.status);
@@ -479,7 +479,7 @@ test "end task runs once on success failure cancel and paused before memory and 
         var life: Lifecycle = if (plan == .paused) .{ .hints = 4 } else .{};
         var instance = try runtime.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &model, .call_fn = ModelFake.call }, lifecycleExecutor(&life), .{ .context = &life, .emit_fn = Lifecycle.emit }, "");
         defer instance.deinit();
-        instance.memory_hooks = .{ .context = &life, .retrieve_fn = Lifecycle.retrieve, .finalize_fn = Lifecycle.finalize };
+        instance.memory_hooks = .{ .context = &life, .retrieve_fn = Lifecycle.retrieve, .submit_fn = Lifecycle.finalize };
         var cancel: p.Cancellation = .{};
         if (plan == .canceled) cancel.cancel();
         const terminal = try instance.run("task", &cancel);
@@ -507,7 +507,7 @@ test "end task cleanup failure poisons and outranks success and cancellation" {
         var life: Lifecycle = .{ .end_error = error.CleanupFailed };
         var instance = try runtime.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &model, .call_fn = ModelFake.call }, lifecycleExecutor(&life), .{ .context = &life, .emit_fn = Lifecycle.emit }, "");
         defer instance.deinit();
-        instance.memory_hooks = .{ .context = &life, .retrieve_fn = Lifecycle.retrieve, .finalize_fn = Lifecycle.finalize };
+        instance.memory_hooks = .{ .context = &life, .retrieve_fn = Lifecycle.retrieve, .submit_fn = Lifecycle.finalize };
         var cancel: p.Cancellation = .{};
         if (pre_canceled) cancel.cancel();
         const terminal = try instance.run("task", &cancel);
