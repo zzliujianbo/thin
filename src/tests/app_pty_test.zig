@@ -2846,11 +2846,11 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitIdle(start);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "fixture-custom") != null);
         start = d.used;
-        try d.send("\x1b[Z");
-        try d.waitFrame(start, "(\x1b[38;5;75mfixture-custom\x1b[0m\x1b[1m) \x1b[38;5;75m");
+        try d.send("\x1b[Z"); // Selected profile off -> minimal.
+        try d.waitFrame(start, "(\x1b[38;5;117mfixture-custom\x1b[0m\x1b[1m) \x1b[38;5;117m");
         try d.waitIdle(start);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;75mfixture-custom\x1b[0m\x1b[1m) \x1b[38;5;75m") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;75m>\x1b[0m") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;117mfixture-custom\x1b[0m\x1b[1m) \x1b[38;5;117m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;117m>\x1b[0m") == null);
         start = d.used;
         try d.send("selection-third\r");
         try d.waitText(start, "selection-answer-three");
@@ -3013,17 +3013,25 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     }
     if (before_exit) |before| {
         const final = try d.screen();
-        try check(final.row == final.rows - 1 and final.col == 0);
+        try check(final.col == 0);
         const after = d.output[exit_start..d.used];
         const leave = "\x18\x1b[0m\x1b[?2004l\x1b[?2026l\x1b[?25h";
         const leave_at = std.mem.lastIndexOf(u8, after, leave) orelse return error.MissingTerminalLeave;
         const cleanup = try d.screens.allocator().create(regular.Screen);
         cleanup.* = before.*;
         try cleanup.replay(after[0..leave_at]);
-        try check(cleanup.history_len == before.history_len);
+        try check(cleanup.history_len == before.history_len and final.history_len == before.history_len);
+        for (0..before.history_len) |i| {
+            try check(std.mem.eql(u8, &before.history[i], &cleanup.history[i]));
+            try check(std.mem.eql(u8, &before.history[i], &final.history[i]));
+        }
         try check(cleanup.col == 0);
-        try check(cleanup.row == cleanup.rows - 1 or cleanup.row == cleanup.rows - 2);
-        try check(final.history_len == before.history_len + @intFromBool(cleanup.row == cleanup.rows - 1));
+        try check(cleanup.row < cleanup.rows / 2 or final.row < 8);
+        try check(final.row == cleanup.row + 1);
+        try check(std.mem.trim(u8, &cleanup.grid[cleanup.row], " ").len != 0);
+        for (final.grid[final.row + 1 .. final.rows]) |line| {
+            try check(std.mem.trim(u8, &line, " ").len == 0);
+        }
         try check(final.count(regular.prior) == 1);
         try check(final.count("Directory:") == 0 and final.count("Time:") == 0 and final.count("Session ID:") == 0);
         try check(final.count("thin --resume") == 0);

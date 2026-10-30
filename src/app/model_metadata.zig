@@ -316,11 +316,22 @@ fn rowDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinki
     const protocol = if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) .chat else config.model.protocol;
     if (protocol == .auto or protocol == .systemone) return null;
     const format: thinking.Format = if (protocol == .anthropic) .anthropic else if (row.provider == .deepseek) .deepseek else .standard;
-    if (protocol != resolvedProtocol(cache, index)) return null;
-    if (row.reasoning) |profile| {
+    // Source authority belongs to the verified provider, not fetch success.
+    const official = switch (row.provider) {
+        .deepseek, .openai_codex => true,
+        .opencode_go, .opencode_zen => false,
+    };
+    const route = if (official) (if (row.protocol != .auto) row.protocol else switch (row.provider) {
+        .deepseek => Protocol.chat,
+        .openai_codex => Protocol.responses,
+        else => unreachable,
+    }) else resolvedProtocol(cache, index);
+    if (protocol != route) return null;
+    if (official) {
+        const profile = row.reasoning orelse return null;
         var declaration = profile.declaration();
-        // Official supported_levels describe logical levels; wire format can
-        // become known later from the independent exact models.dev adapter.
+        // Official supported levels are logical; use the official or verified
+        // provider route to determine their concrete wire format.
         if (row.protocol == .auto and declaration.format != format) {
             declaration.format = format;
             if (declaration.map.off != null) declaration.map.off = switch (format) {
@@ -334,7 +345,8 @@ fn rowDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinki
             return declaration;
         }
     }
-    if (row.provider == .openai_codex) return null;
+    if (official) return null;
+    if (row.dev_protocol != .auto and row.dev_protocol != protocol) return null;
     if (row.dev_reasoning) |profile| {
         const declaration = profile.declaration();
         if (declaration.format == format) {
@@ -1708,6 +1720,125 @@ test "metadata declaration identity never strips a provider prefix inside raw ID
     const exact = restoreEntry(&cache, .opencode_go, "opencode-go/raw/id").?;
     try std.testing.expectEqualStrings("opencode-go/raw/id", exact.model.name);
     try std.testing.expectEqualStrings("opencode-go/raw/id", findEntry(&cache, "opencode-go/opencode-go/raw/id").?.model.name);
+}
+
+test "provider reasoning source is fixed by verified provider" {
+    const t = std.testing;
+    for (providers.Id.all) |id| {
+        var cache: Cache = .{};
+        const row = try cache.directory.upsert(id, "source-test");
+        row.available = true;
+        const protocol: Protocol = if (id == .deepseek) .chat else .responses;
+        const format: thinking.Format = if (id == .deepseek) .deepseek else .standard;
+        row.protocol = protocol;
+        row.dev_protocol = protocol;
+        row.dev_present = true;
+        row.reasoning = try directory.Profile.from(.{ .format = format, .map = .{ .off = if (id == .deepseek) "off" else "none", .high = "high" } });
+        row.dev_reasoning = try directory.Profile.from(.{ .format = format, .map = .{ .off = if (id == .deepseek) "off" else "none", .low = "low" } });
+        row.dev_context_tokens = 123456;
+        row.dev_output_tokens = 8192;
+        row.dev_input_price_flat_limit = 123456;
+        const entry = restoreEntry(&cache, id, "source-test").?;
+        var config: cfg.Config = .{ .provider = catalog.connection(id), .model = entry.model };
+        const official = id == .deepseek or id == .openai_codex;
+        const selected = declarationForConfig(&cache, config).?;
+        const selected_entry = entryDeclaration(&cache, entry).?;
+        if (official) {
+            try t.expectEqualStrings("high", selected.map.high.?);
+            try t.expectEqualStrings("high", selected_entry.map.high.?);
+            try t.expect(selected.map.low == null);
+            row.dev_reasoning = null;
+            try t.expectEqualStrings("high", declarationForConfig(&cache, config).?.map.high.?);
+            row.dev_reasoning = try directory.Profile.from(.{ .format = format, .map = .{ .off = if (id == .deepseek) "off" else "none", .low = "low" } });
+            row.reasoning = null;
+        } else {
+            try t.expectEqualStrings("low", selected.map.low.?);
+            try t.expectEqualStrings("low", selected_entry.map.low.?);
+            try t.expect(selected.map.high == null);
+            row.dev_reasoning = null;
+        }
+        try t.expect(declarationForConfig(&cache, config) == null);
+        try t.expect(entryDeclaration(&cache, entry) == null);
+        config.model.reasoning = .{ .format = format, .map = .{ .off = if (id == .deepseek) "off" else "none", .high = "user-high" } };
+        config.model.reasoning_source = .explicit;
+        applyReasoning(&cache, &config);
+        try t.expectEqualStrings("user-high", config.model.reasoning.?.map.high.?);
+        row.reasoning = try directory.Profile.from(.{ .format = format, .map = .{ .off = if (id == .deepseek) "off" else "none", .high = "high" } });
+        row.dev_reasoning = try directory.Profile.from(.{ .format = format, .map = .{ .off = if (id == .deepseek) "off" else "none", .low = "low" } });
+        try t.expect(declarationForConfig(&cache, config) != null);
+        config.model.name = "wrong-id";
+        try t.expect(declarationForConfig(&cache, config) == null);
+        config.model.name = "source-test";
+        config.provider.base_url = "https://invalid.example/v1";
+        try t.expect(declarationForConfig(&cache, config) == null);
+        config.provider = catalog.connection(id);
+        config.provider.kind = if (id == .deepseek) .opencode_go else .deepseek;
+        try t.expect(declarationForConfig(&cache, config) == null);
+        config.provider = catalog.connection(id);
+        config.model.protocol = if (protocol == .chat) .responses else .chat;
+        try t.expect(declarationForConfig(&cache, config) == null);
+        if (id == .deepseek) {
+            try t.expectEqual(@as(?u32, 123456), contextFor(&cache, entry));
+            try t.expectEqual(@as(?u32, 8192), outputFor(&cache, entry));
+            try t.expectEqual(@as(?u32, 123456), inputPriceFlatLimitFor(&cache, entry));
+        }
+    }
+}
+
+test "provider reasoning source official route ignores public protocol" {
+    const t = std.testing;
+    for ([_]providers.Id{ .deepseek, .openai_codex }) |id| {
+        var cache: Cache = .{};
+        const row = try cache.directory.upsert(id, "route-test");
+        const protocol: Protocol = if (id == .deepseek) .chat else .responses;
+        const format: thinking.Format = if (id == .deepseek) .deepseek else .standard;
+        const official = try directory.Profile.from(.{ .format = format, .map = .{ .off = if (id == .deepseek) "off" else "none", .high = "high" } });
+        row.reasoning = official;
+        row.dev_protocol = .anthropic;
+        row.dev_reasoning = try directory.Profile.from(.{ .format = .anthropic, .map = .{ .off = "disabled", .low = "low" } });
+        var config: cfg.Config = .{ .provider = catalog.connection(id), .model = .{ .name = "route-test", .protocol = protocol, .context_tokens = 65536 } };
+        var selected = declarationForConfig(&cache, config).?;
+        try t.expectEqual(format, selected.format);
+        try t.expectEqualStrings("high", selected.map.high.?);
+        try t.expect(selected.map.low == null);
+        row.dev_protocol = .auto;
+        row.dev_reasoning = null;
+        selected = declarationForConfig(&cache, config).?;
+        try t.expectEqual(format, selected.format);
+        try t.expectEqualStrings("high", selected.map.high.?);
+        row.dev_protocol = .chat;
+        row.dev_reasoning = try directory.Profile.from(.{ .format = if (id == .deepseek) .deepseek else .standard, .map = .{ .off = if (id == .deepseek) "off" else "none", .low = "low" } });
+        row.reasoning = null;
+        try t.expect(declarationForConfig(&cache, config) == null);
+        row.reasoning = official;
+        selected = declarationForConfig(&cache, config).?;
+        try t.expectEqual(format, selected.format);
+        try t.expectEqualStrings("high", selected.map.high.?);
+        config.model.protocol = if (id == .deepseek) .responses else .chat;
+        try t.expect(declarationForConfig(&cache, config) == null);
+    }
+}
+
+test "provider reasoning source ignores stale public cache and public refresh for DeepSeek" {
+    const t = std.testing;
+    const cache = try parseCache(t.allocator,
+        \\{"version":15,"models":[{"provider":"deepseek","id":"refresh-test","protocol":"chat","dev_protocol":"chat","dev_present":true,"dev_reasoning":{"format":"deepseek","map":{"off":"off","low":"low"}}}]}
+    );
+    var listing: Listing = .{ .directory = cache.directory };
+    const entry = restoreEntry(&cache, .deepseek, "refresh-test").?;
+    try t.expect(entryDeclaration(&cache, entry) == null);
+    const row = &listing.directory.rows[listing.directory.find(.deepseek, "refresh-test").?];
+    row.reasoning = try directory.Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } });
+    var public: Listing = .{ .dev_done = true };
+    const fresh = try public.directory.upsert(.deepseek, "refresh-test");
+    fresh.dev_present = true;
+    fresh.dev_protocol = .chat;
+    fresh.dev_reasoning = try directory.Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .max = "max" } });
+    try mergeDev(&listing, &public);
+    const refreshed: Cache = .{ .directory = listing.directory };
+    const declaration = entryDeclaration(&refreshed, entry).?;
+    try t.expectEqualStrings("high", declaration.map.high.?);
+    try t.expect(declaration.map.low == null and declaration.map.max == null);
 }
 
 test {

@@ -744,7 +744,7 @@ test "headless global defaults ignore legacy settings and never create project s
         , .effort = "off" },
         .{ .json =
         \\{"llm":{"default":"fixture/fake","providers":{"fixture":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat","reasoning":{"map":{"off":"none","medium":"medium","high":"high"}}}}}}},"limits":{"low_price_input":false}}
-        , .effort = "medium" },
+        , .effort = "off" },
         .{ .json =
         \\{"llm":{"default":"fixture/fake","reasoning_effort":"high","providers":{"fixture":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat","reasoning_effort":"custom"}}}}},"limits":{"low_price_input":false}}
         , .effort = null },

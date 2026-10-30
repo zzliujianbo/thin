@@ -645,7 +645,10 @@ test "llm Session manual effort and resolved metadata map stay frozen across sta
         const row = try listing.directory.upsert(.opencode_go, "gpt-5.6-luna");
         row.available = true;
         row.protocol = preset.model.protocol;
-        row.reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .standard, .map = .{ .low = "low", .high = "high" } });
+        listing.dev_done = true;
+        row.dev_present = true;
+        row.dev_protocol = preset.model.protocol;
+        row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .standard, .map = .{ .low = "low", .high = "high" } });
         _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
     }
     var env = std.process.Environ.Map.init(a);

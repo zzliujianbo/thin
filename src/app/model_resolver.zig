@@ -241,6 +241,30 @@ test "official context requires an available exact directory row and compatible 
     try std.testing.expect(!officialContext(&cache, entry, entry.model.context_tokens));
 }
 
+test "provider reasoning source resolver uses official and preserves manual override" {
+    const a = std.testing.allocator;
+    var parsed = try cfg.parse(a,
+        \\{"llm":{"default":"ds/fixture","providers":{"ds":{"base_url":"https://api.deepseek.com","models":{"fixture":{"protocol":"chat","context_tokens":65536},"manual":{"protocol":"chat","context_tokens":65536,"reasoning":{"format":"deepseek","map":{"off":"off","high":"user-high"}}}}}}}}
+    );
+    defer cfg.release(&parsed);
+    var cache: metadata.Cache = .{};
+    const row = try cache.directory.upsert(.deepseek, "fixture");
+    row.protocol = .chat;
+    row.dev_protocol = .chat;
+    row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .low = "low" } });
+    var selection = try resolve(parsed.arena.allocator(), parsed.value, &cache, "ds", "fixture", false);
+    try std.testing.expect(selection.model.reasoning == null);
+    row.reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } });
+    selection = try resolve(parsed.arena.allocator(), parsed.value, &cache, "ds", "fixture", false);
+    try std.testing.expectEqualStrings("high", selection.model.reasoning.?.map.high.?);
+    try std.testing.expect(selection.model.reasoning.?.map.low == null);
+    const manual = try cache.directory.upsert(.deepseek, "manual");
+    manual.protocol = .chat;
+    selection = try resolve(parsed.arena.allocator(), parsed.value, &cache, "ds", "manual", false);
+    try std.testing.expectEqualStrings("user-high", selection.model.reasoning.?.map.high.?);
+    try std.testing.expectEqual(cfg.ReasoningSource.explicit, selection.model.reasoning_source);
+}
+
 test "native SystemOne endpoint conflicts fail closed during declaration validation" {
     try std.testing.expectError(error.IncompatibleModelProtocol, cfg.parse(std.testing.allocator,
         \\{"llm":{"default":"custom/reviewer","providers":{"custom":{"base_url":"http://127.0.0.1:1/v1","models":{"reviewer":{"protocol":"systemone"},"jev-is-only-a-name":{"protocol":"chat","context_tokens":32768},"unknown-jev":{}}},"native":{"base_url":"https://opencode.ai/inference/systemone/v1"},"conflict":{"base_url":"https://opencode.ai/inference/systemone/v1","models":{"reviewer":{"protocol":"responses","context_tokens":32768}}}}}}

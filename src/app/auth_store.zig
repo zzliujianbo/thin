@@ -14,7 +14,7 @@ const Digest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const initial: cfg.Config = .{
     .registry = .{
         .default = "deepseek/deepseek-flash",
-        .reasoning_effort = "medium",
+        .reasoning_effort = "off",
         .providers = &.{.{
             .name = "deepseek",
             .connection = .{ .base_url = "https://api.deepseek.com", .kind = .deepseek, .chat_max_tokens = true },
@@ -252,6 +252,34 @@ fn testOpen(dir: std.Io.Dir) !Store {
     var path: [4096]u8 = undefined;
     const n = try dir.realPath(std.testing.io, &path);
     return Store.open(std.testing.allocator, std.testing.io, path[0..n]);
+}
+
+test "default off fresh store and existing config bytes remain unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testOpen(tmp.dir);
+    defer store.deinit();
+    var fresh = try store.loadOrInitialize();
+    defer cfg.release(&fresh);
+    try std.testing.expectEqualStrings("off", fresh.value.registry.?.reasoning_effort.?);
+    var initialized = (try store.read()).?;
+    defer initialized.deinit();
+    var reloaded = try store.loadOrInitialize();
+    defer cfg.release(&reloaded);
+    var after = (try store.read()).?;
+    defer after.deinit();
+    try std.testing.expectEqualStrings(initialized.data(), after.data());
+
+    const existing =
+        \\{"llm":{"default":"local/m","reasoning_effort":"medium","providers":{"local":{"base_url":"https://fixture.invalid/v1","models":{"m":{"protocol":"chat","context_tokens":32768}}}}}}
+    ;
+    try store.root.writeMode(cfg.file_name, existing, true, 0o600);
+    var previous = try store.loadOrInitialize();
+    defer cfg.release(&previous);
+    try std.testing.expectEqualStrings("medium", previous.value.registry.?.reasoning_effort.?);
+    var unchanged = (try store.read()).?;
+    defer unchanged.deinit();
+    try std.testing.expectEqualStrings(existing, unchanged.data());
 }
 
 test "transaction latest write rejects stale ordinary save" {

@@ -145,8 +145,9 @@ test "empty no-log selections persist global logical defaults and restart across
     defer fixture.deinit();
     var first = try fixture.session(fixture.project);
     defer first.deinit();
-    try std.testing.expectEqual(effort.high, first.connection().current().reasoning_effort);
-    try std.testing.expectEqual(effort.medium, first.preferred_effort.?);
+    try std.testing.expectEqual(effort.off, first.connection().current().reasoning_effort);
+    try std.testing.expectEqual(effort.off, first.preferred_effort.?);
+    try expectWire(activeConfig(&first).*, "none");
     // Merely clamping a missing preference must not initialize one on disk.
     try fixture.expectDefaults("local/first", null);
     try first.connection().setEffort(.low);
@@ -195,7 +196,7 @@ test "headless and UI share global preference and capability clamp without rewri
     try fixture.expectIdle(fixture.other);
 }
 
-test "missing global preference uses explicit model option before medium fallback" {
+test "missing global preference uses explicit model option before off fallback" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     try fixture.seed("local/second", null);

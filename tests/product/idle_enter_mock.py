@@ -386,7 +386,7 @@ def run(app, width, batched):
             # The pending default can clear asynchronously.
             statuses = {
                 'Saved thinking level not applied: model capabilities unknown',
-                'Default thinking: medium; awaiting model capabilities | Saved thinking level not applied: model capabilities unknown',
+                'Default thinking: off; awaiting model capabilities | Saved thinking level not applied: model capabilities unknown',
             }
             clipped_statuses = {status[:resized_columns - 1] for status in statuses}
             assert ''.join(screen.grid[screen.row - 1]).rstrip(' ') in clipped_statuses, 'status is not immediately above the composer'

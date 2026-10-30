@@ -48,7 +48,7 @@ pub const Declaration = struct {
     }
 };
 /// New-project default. Only supplied declarations authorize capability clamps.
-pub const default_level: activity.ReasoningEffort = .medium;
+pub const default_level: activity.ReasoningEffort = .off;
 
 pub const Wire = struct { effort: ?[]const u8, thinking: ?bool = null };
 pub const Capabilities = struct {
@@ -58,10 +58,11 @@ pub const Capabilities = struct {
     map: LevelMap = .{},
 
     /// Seed a new project preference from an explicit logical choice, otherwise
-    /// medium. Unknown capabilities still do not authorize sending this option.
+    /// off. Unknown capabilities still do not authorize sending this option.
     pub fn defaultEffort(self: Capabilities, configured: ?[]const u8) activity.ReasoningEffort {
         const logical = activity.ReasoningEffort.fromName(configured);
         const requested = if (logical.name() != null) logical else default_level;
+        if (requested == .off) return .off;
         return self.levels.clamp(requested) orelse requested;
     }
 
@@ -96,16 +97,17 @@ pub fn resolve(_: []const u8, _: []const u8, declaration: ?Declaration) Capabili
     return declared(d);
 }
 
-test "project default uses medium adjusted to known capabilities and explicit logical choice" {
+test "default off shared fallback preserves explicit logical choices" {
     const t = std.testing;
     const standard = resolve("https://api.openai.com/v1", "gpt-5.2", .{ .map = .{ .off = "none", .low = "low", .medium = "medium", .high = "high" } });
-    try t.expectEqual(activity.ReasoningEffort.medium, standard.defaultEffort(null));
+    try t.expectEqual(activity.ReasoningEffort.off, standard.defaultEffort(null));
     try t.expectEqual(activity.ReasoningEffort.low, standard.defaultEffort("low"));
     try t.expectEqual(activity.ReasoningEffort.off, standard.defaultEffort("off"));
-    try t.expectEqual(activity.ReasoningEffort.high, resolve("https://api.deepseek.com", "deepseek-flash", .{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } }).defaultEffort(null));
+    try t.expectEqual(activity.ReasoningEffort.off, resolve("https://api.deepseek.com", "deepseek-flash", .{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } }).defaultEffort(null));
+    try t.expectEqual(activity.ReasoningEffort.off, resolve("https://fixture.invalid", "no-off", .{ .map = .{ .high = "high" } }).defaultEffort(null));
     try t.expectEqual(activity.ReasoningEffort.off, resolve("https://api.openai.com/v1", "gpt-4o", .{ .map = .{ .off = "none" } }).defaultEffort(null));
     const unknown = resolve("https://proxy.invalid", "custom", null);
-    try t.expectEqual(activity.ReasoningEffort.medium, unknown.defaultEffort(null));
+    try t.expectEqual(activity.ReasoningEffort.off, unknown.defaultEffort(null));
     try t.expect(unknown.wire(null).effort == null); // A saved default is not a capability declaration.
 }
 
@@ -129,7 +131,7 @@ test "no builtin capabilities exist for official endpoints or recognized model n
     try t.expectEqualStrings("xhigh", cap.effective("max").?);
     try t.expectEqualStrings("none", cap.wire("none").effort.?);
     try t.expectEqualStrings("none", cap.wire("off").effort.?);
-    try t.expectEqual(activity.ReasoningEffort.high, cap.defaultEffort("none"));
+    try t.expectEqual(activity.ReasoningEffort.off, cap.defaultEffort("none"));
     try t.expect(cap.wire(null).effort == null and cap.wire(null).thinking == null);
     const unknown = resolve("https://api.openai.com/v1", "gpt-4o", null);
     try t.expect(!unknown.known);

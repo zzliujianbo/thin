@@ -876,7 +876,6 @@ const Ui = struct {
     /// 用户请求退出；若任务仍在运行，会等它结束后再退出。
     want_exit: bool = false,
     ctrl_d_exit: bool = false,
-    /// Idle-exit cleanup must never consume a tail from a submitted conversation.
     has_submitted: bool = false,
     /// 清理未确认（CleanupFailed 等），禁止再次提交，只允许退出并检查。
     poisoned: bool = false,
@@ -5804,24 +5803,55 @@ const Ui = struct {
         }
     }
 
-    /// Only an acknowledged, unchanged-size owned tail can be reclaimed. Keep
-    /// the startup transcript and shell history above it; never ED/CUP/scrollback-clear.
+    /// Reclaim only exact ACK-owned blank edges, without replaying transcript
+    /// rows or moving anything into native scrollback.
     fn idleExitBytes(self: *const Ui, writer: *Io.Writer) !bool {
-        if (!self.ctrl_d_exit or self.has_submitted or self.busy or self.future != null or
-            self.frame.len != 0 or self.resize_rescue.len != 0 or !self.frame_fresh or
-            self.abandon_tail or self.tail_snapshot == null or self.tail_height == 0 or
-            (self.menu_history != null and self.menu_history.?.borrowed.len != 0) or
-            self.tail_height > self.size.rows or self.tail_size.rows != self.size.rows or
-            self.tail_size.columns != self.size.columns) return false;
-        try writer.writeAll(terminal_module.sync_begin ++ "\x1b[?25l\r");
-        const top_distance = (self.tail_height - 1) -| self.tail_cursor_rows_up;
-        if (top_distance != 0) try writer.print("\x1b[{d}A", .{top_distance});
-        for (0..self.tail_height) |row| {
-            try writer.writeAll("\x1b[0K");
-            if (row + 1 < self.tail_height) try writer.writeAll("\x1b[1B\r");
+        if (self.busy or self.future != null or self.frame.len != 0 or self.resize_rescue.len != 0 or
+            !self.frame_fresh or self.abandon_tail or !self.tail_bottom or self.tail_snapshot == null or
+            self.menu_history == null or self.tail_height == 0 or self.tail_height > self.size.rows or
+            self.tail_size.rows != self.size.rows or self.tail_size.columns != self.size.columns or
+            self.tail_cursor_rows_up >= self.tail_height or self.tail_composer_rows == 0 or
+            self.tail_composer_rows > self.tail_height or self.editor.bytes.items.len != 0 or
+            self.deferred_submit != null or self.idle_breaks != 0 or self.permission != null or
+            self.stop_open or self.codex_open or self.model_picker != null or self.provider_open or
+            self.settings_open or self.secret_mode or self.secret_quarantine or self.draft != null or
+            self.reasoning != null or self.mode != null or self.active_tool != null) return false;
+        for (self.records.items) |record| {
+            if (record.kind != .reasoning and !record.output) return false;
         }
-        if (self.tail_height > 1) try writer.print("\x1b[{d}A", .{self.tail_height - 1});
-        try writer.writeAll("\r" ++ terminal_module.sync_end);
+        const history = self.menu_history.?;
+        const rows = self.tail_snapshot.?.rows;
+        if (history.borrowed.len != 0 or rows.len != self.tail_height or
+            history.above.len > self.size.rows - self.tail_height) return false;
+        const blank = "\x1b[0m\x1b[K";
+        var above_blank: usize = 0;
+        while (above_blank < history.above.len and std.mem.eql(u8, history.above[above_blank], blank)) : (above_blank += 1) {}
+        const content_end = rows.len - self.tail_composer_rows;
+        var leading: usize = 0;
+        while (leading < content_end and std.mem.eql(u8, rows[leading], blank)) : (leading += 1) {}
+        var end = content_end;
+        while (end > leading and std.mem.eql(u8, rows[end - 1], blank)) : (end -= 1) {}
+        const retained = end - leading;
+        const trailing = rows.len - end;
+        const above_remaining = history.above.len - above_blank;
+        const top_distance = self.tail_height - 1 - self.tail_cursor_rows_up;
+        const up = top_distance + history.above.len;
+        const final_position = self.size.rows - self.tail_height - history.above.len + above_remaining + retained;
+
+        // Stage the entire bounded plan before touching the caller's writer.
+        var bytes: [256]u8 = undefined;
+        var plan = Io.Writer.fixed(&bytes);
+        plan.writeAll(terminal_module.sync_begin ++ "\x1b[?25l\r") catch return false;
+        if (up != 0) plan.print("\x1b[{d}A", .{up}) catch return false;
+        if (above_blank != 0) plan.print("\x1b[{d}M", .{above_blank}) catch return false;
+        if (above_remaining != 0) plan.print("\x1b[{d}B", .{above_remaining}) catch return false;
+        if (leading != 0) plan.print("\x1b[{d}M", .{leading}) catch return false;
+        if (retained != 0) plan.print("\x1b[{d}B", .{retained}) catch return false;
+        if (trailing != 0) plan.print("\x1b[{d}M", .{trailing}) catch return false;
+        if (final_position != 0) plan.writeAll("\x1b[1A") catch return false;
+        plan.writeAll("\r" ++ terminal_module.sync_end) catch return false;
+        if (writer.buffer.len - writer.end < plan.buffered().len) return false;
+        try writer.writeAll(plan.buffered());
         return true;
     }
 
@@ -8326,13 +8356,14 @@ test "Escape protects draft then cancels active task only from empty input" {
     try std.testing.expect(std.mem.startsWith(u8, ui.notice, "Cancellation requested"));
 }
 
-test "idle exit reclaims only acknowledged blank tail and preserves startup and shell history" {
+test "exit blank cleanup reclaims acknowledged edges and preserves startup and shell history" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     _ = try ui.add(.notice, "thin fixture-version\n/fixture\nfixture UTC");
+    ui.notice = "fixture-footer";
     ui.ctrl_d_exit = true;
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay("shell-kept\r\n");
@@ -8346,11 +8377,22 @@ test "idle exit reclaims only acknowledged blank tail and preserves startup and 
     try std.testing.expectEqual(screen.rows - 1, screen.row);
     try std.testing.expectEqual(@as(usize, 3), ui.tail_height);
     try std.testing.expect(try ui.idleExitBytes(&writer));
+    const history_before = try std.testing.allocator.dupe(@TypeOf(screen.history[0]), screen.history[0..screen.history_len]);
+    defer std.testing.allocator.free(history_before);
     try screen.replay(writer.buffered());
+    try std.testing.expectEqualSlices(@TypeOf(screen.history[0]), history_before, screen.history[0..screen.history_len]);
+    var last_content: ?usize = null;
+    for (screen.grid[0..screen.rows], 0..) |line, index| {
+        if (std.mem.indexOf(u8, &line, "fixture-footer") != null) last_content = index;
+    }
+    try std.testing.expect(last_content != null);
+    try std.testing.expect(last_content.? < 8);
     try screen.replay("\r\nshell-next");
+    try std.testing.expect(screen.row < 8);
+    try std.testing.expectEqualSlices(@TypeOf(screen.history[0]), history_before, screen.history[0..screen.history_len]);
     try std.testing.expectEqual(@as(usize, 0), screen.count("Session ID:"));
-    try std.testing.expectEqual(screen.rows - ui.tail_height + 1, screen.row);
-    for ([_][]const u8{ "shell-kept", "thin fixture-version", "/fixture", "fixture UTC", "shell-next" }) |marker|
+    try std.testing.expectEqual(last_content.? + 1, screen.row);
+    for ([_][]const u8{ "shell-kept", "thin fixture-version", "/fixture", "fixture UTC", "fixture-footer", "shell-next" }) |marker|
         try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
 
     const Denied = struct {
@@ -8361,19 +8403,160 @@ test "idle exit reclaims only acknowledged blank tail and preserves startup and 
             try std.testing.expectEqual(@as(usize, 0), out.buffered().len);
         }
     };
-    ui.has_submitted = true;
+    var short: [1]u8 = undefined;
+    var short_writer = Io.Writer.fixed(&short);
+    try std.testing.expect(!try ui.idleExitBytes(&short_writer));
+    try std.testing.expectEqual(@as(usize, 0), short_writer.buffered().len);
+    ui.frame = "pending";
     try Denied.check(&ui);
-    ui.has_submitted = false;
+    ui.frame_offset = 1;
+    try Denied.check(&ui);
+    ui.frame = "";
+    ui.frame_offset = 0;
+    ui.resize_rescue = "partial";
+    try Denied.check(&ui);
+    ui.resize_rescue = "";
+    const borrowed = ui.menu_history.?.borrowed;
+    ui.menu_history.?.borrowed = &.{"borrowed"};
+    try Denied.check(&ui);
+    ui.menu_history.?.borrowed = borrowed;
+    ui.has_submitted = true;
+    var conversation_bytes: [2048]u8 = undefined;
+    var conversation_writer = Io.Writer.fixed(&conversation_bytes);
+    try std.testing.expect(try ui.idleExitBytes(&conversation_writer));
+    ui.stop_open = true;
+    try Denied.check(&ui);
+    ui.stop_open = false;
+    _ = try ui.editor.insert("draft");
+    try Denied.check(&ui);
+    ui.wipeEditor();
     ui.frame_fresh = false;
     try Denied.check(&ui);
     ui.frame_fresh = true;
     ui.abandon_tail = true;
     try Denied.check(&ui);
     ui.abandon_tail = false;
+    const pending = try ui.add(.assistant, "undisplayed");
+    try Denied.check(&ui);
+    ui.removeRecord(pending);
     const old_size = ui.size;
     ui.resize(.{ .columns = 40, .rows = 12 });
+    try Denied.check(&ui);
     ui.resize(old_size);
     try Denied.check(&ui); // ABA cannot resurrect cleanup ownership.
+}
+
+test "exit blank cleanup places shell after completed short conversation" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay("short-prior\r\n");
+    ui.notice = "short-footer";
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    _ = try ui.add(.user, "short-user");
+    ui.has_submitted = true;
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    const answer = try ui.add(.assistant, "short-answer");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[answer].output);
+    const history = try std.testing.allocator.dupe(@TypeOf(screen.history[0]), screen.history[0..screen.history_len]);
+    defer std.testing.allocator.free(history);
+    var bytes: [2048]u8 = undefined;
+    var writer = Io.Writer.fixed(&bytes);
+    try std.testing.expect(try ui.idleExitBytes(&writer));
+    try screen.replay(writer.buffered());
+    try std.testing.expectEqualSlices(@TypeOf(screen.history[0]), history, screen.history[0..screen.history_len]);
+    var last: ?usize = null;
+    for (screen.grid[0..screen.rows], 0..) |line, index| {
+        if (std.mem.indexOf(u8, &line, "short-footer") != null) last = index;
+    }
+    try std.testing.expect(last != null);
+    try std.testing.expectEqual(last.?, screen.row);
+    try screen.replay("\r\nshort-shell");
+    try std.testing.expectEqual(last.? + 1, screen.row);
+    try std.testing.expect(screen.row < screen.rows - 2);
+    for ([_][]const u8{ "short-prior", "short-user", "short-answer", "short-footer", "short-shell" }) |marker|
+        try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
+}
+
+test "exit blank cleanup retains completed long conversation and native history" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay("previous-shell\r\n");
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    _ = try ui.add(.user, "unique-user-marker");
+    ui.has_submitted = true;
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    var body: Io.Writer.Allocating = .init(a);
+    defer body.deinit();
+    for (0..80) |i| try body.writer.print("unique-line-{d:0>3}\n", .{i});
+    try body.writer.writeAll("paragraph-first\n\nparagraph-last");
+    const answer = try ui.add(.assistant, body.written());
+    ui.notice = "footer-error-marker";
+    for (0..128) |_| {
+        try ui.draw();
+        try screen.replay(ui.frame);
+        testAcknowledgeFullFrame(&ui);
+        if (ui.records.items[answer].output) break;
+    }
+    try std.testing.expect(ui.records.items[answer].output);
+    try std.testing.expect(screen.history_len != 0);
+    var before_first: ?usize = null;
+    var before_last: ?usize = null;
+    for (screen.grid[0..screen.rows], 0..) |line, index| {
+        if (std.mem.indexOf(u8, &line, "paragraph-first") != null) before_first = index;
+        if (std.mem.indexOf(u8, &line, "paragraph-last") != null) before_last = index;
+    }
+    try std.testing.expect(before_first != null and before_last != null and before_last.? > before_first.? + 1);
+    const gap_before = screen.grid[before_first.? + 1];
+    const history = try a.dupe(@TypeOf(screen.history[0]), screen.history[0..screen.history_len]);
+    defer a.free(history);
+    var bytes: [2048]u8 = undefined;
+    var writer = Io.Writer.fixed(&bytes);
+    try std.testing.expect(try ui.idleExitBytes(&writer));
+    try screen.replay(writer.buffered());
+    try std.testing.expectEqualSlices(@TypeOf(screen.history[0]), history, screen.history[0..screen.history_len]);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("unique-user-marker"));
+    for (0..80) |i| {
+        var marker: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&marker, "unique-line-{d:0>3}", .{i});
+        try std.testing.expectEqual(@as(usize, 1), screen.count(name));
+    }
+    try std.testing.expectEqual(@as(usize, 1), screen.count("paragraph-first"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("paragraph-last"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("footer-error-marker"));
+    var first: ?usize = null;
+    var last: ?usize = null;
+    var footer: ?usize = null;
+    for (screen.grid[0..screen.rows], 0..) |line, index| {
+        if (std.mem.indexOf(u8, &line, "paragraph-first") != null) first = index;
+        if (std.mem.indexOf(u8, &line, "paragraph-last") != null) last = index;
+        if (std.mem.indexOf(u8, &line, "footer-error-marker") != null) footer = index;
+    }
+    try std.testing.expect(first != null and last != null and footer != null);
+    try std.testing.expect(last.? > first.? + 1);
+    try std.testing.expectEqualSlices(u8, &gap_before, &screen.grid[first.? + 1]);
+    try std.testing.expectEqual(footer.?, screen.row);
+    try screen.replay("\r\nshell-after-conversation");
+    try std.testing.expectEqual(@as(usize, 1), screen.count("shell-after-conversation"));
 }
 
 test "resume startup projects saved text and tool outcomes without replaying reasoning or commands" {
@@ -10777,7 +10960,7 @@ test "resize abandons unknown rows and old completed approval cannot authorize" 
     try std.testing.expectEqual(@as(?u64, 42), ui.displayed_permission);
 }
 
-test "exit drains final canonical transcript on owned PTY without erasing earlier output" {
+test "exit blank cleanup drains and restores completed transcript on owned PTY" {
     const abi = @import("../platform/terminal_abi.zig");
     var master: c_int = undefined;
     var slave: c_int = undefined;
@@ -10794,23 +10977,56 @@ test "exit drains final canonical transcript on owned PTY without erasing earlie
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     ui.terminal = &terminal;
+    ui.notice = "pty-footer";
     try ui.draw(); // A pending frame when Ctrl+D arrives.
     _ = try ui.add(.assistant, "final-exit-reply");
     ui.want_exit = true;
     try ui.drainExit();
     try std.testing.expect(ui.frame.len == 0 and !ui.dirty);
     try std.testing.expect(ui.records.items[0].output);
-    try std.testing.expect(terminal.restore());
+    ui.has_submitted = true;
     var buffer: [16384]u8 = undefined;
     var used: usize = 0;
-    while (used < buffer.len) {
-        const n = std.c.read(master, buffer[used..].ptr, buffer.len - used);
-        if (n <= 0) break;
-        used += @intCast(n);
+    const Capture = struct {
+        fn readAvailable(fd: c_int, bytes: []u8, count: *usize) void {
+            while (count.* < bytes.len) {
+                const n = std.c.read(fd, bytes[count.*..].ptr, bytes.len - count.*);
+                if (n <= 0) break;
+                count.* += @intCast(n);
+            }
+        }
+    };
+    Capture.readAvailable(master, &buffer, &used);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(buffer[0..used]);
+    const history = try std.testing.allocator.dupe(@TypeOf(screen.history[0]), screen.history[0..screen.history_len]);
+    defer std.testing.allocator.free(history);
+    const before_cleanup = used;
+    ui.tidyIdleExit();
+    Capture.readAvailable(master, &buffer, &used);
+    try std.testing.expect(used > before_cleanup);
+    try screen.replay(buffer[before_cleanup..used]);
+    try std.testing.expectEqualSlices(@TypeOf(screen.history[0]), history, screen.history[0..screen.history_len]);
+    var last_content: ?usize = null;
+    for (screen.grid[0..screen.rows], 0..) |line, index| {
+        if (std.mem.indexOf(u8, &line, "pty-footer") != null) last_content = index;
     }
+    try std.testing.expect(last_content != null);
+    try std.testing.expectEqual(last_content.?, screen.row);
+    const before_restore = used;
+    try std.testing.expect(terminal.restore());
+    Capture.readAvailable(master, &buffer, &used);
+    try screen.replay(buffer[before_restore..used]);
+    try screen.replay("pty-shell-next");
+    try std.testing.expectEqual(last_content.? + 1, screen.row);
+    try std.testing.expect(screen.row < 8);
+    for ([_][]const u8{ "prior-shell-output", "final-exit-reply", "pty-footer", "pty-shell-next" }) |marker|
+        try std.testing.expectEqual(@as(usize, 1), screen.count(marker));
+    try std.testing.expectEqualSlices(@TypeOf(screen.history[0]), history, screen.history[0..screen.history_len]);
     const output = buffer[0..used];
     try std.testing.expect(std.mem.find(u8, output, "prior-shell-output") != null);
     try std.testing.expect(std.mem.find(u8, output, "final-exit-reply") != null);
+    try @import("../tests/regular_screen.zig").rejectFullscreen(output);
     for ([_][]const u8{ "1049", "1047", "\x1b[H", "\x1b[2J" }) |forbidden|
         try std.testing.expect(std.mem.find(u8, output, forbidden) == null);
 }
@@ -13116,11 +13332,14 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     if (job.dev_future) |*future| future.await(io);
     job.dev_future = null;
     try std.testing.expect(session.connection().poll_models_fn.?(session.connection().context, true));
-    // A fresh empty conversation initializes its original medium preference,
-    // clamped to this model's high, without cycling or changing request budgets.
+    // A fresh empty conversation initializes and persists off without cycling
+    // or changing request budgets.
     try std.testing.expectEqual(@as(u8, 0x55), session.connection().current().effort_levels.mask);
-    try std.testing.expectEqual(shared.ReasoningEffort.high, session.connection().current().reasoning_effort);
-    try std.testing.expectEqual(shared.ReasoningEffort.medium, shared.ReasoningEffort.fromName(session.global_config.?.value.registry.?.reasoning_effort orelse "medium"));
+    try std.testing.expectEqual(shared.ReasoningEffort.off, session.connection().current().reasoning_effort);
+    try std.testing.expectEqual(shared.ReasoningEffort.off, shared.ReasoningEffort.fromName(session.global_config.?.value.registry.?.reasoning_effort.?));
+    const off_wire = r.withReasoning(session.app.?.config.value, .{ .scope = .{ .connection = "https://api.deepseek.com", .model = "deepseek-flash", .protocol = .chat }, .system = "", .tools = &.{}, .messages = &.{} });
+    try std.testing.expectEqual(@as(?[]const u8, null), off_wire.reasoning_effort);
+    try std.testing.expectEqual(@as(?bool, false), off_wire.thinking);
     const saved_settings = try tmp.dir.readFileAlloc(io, ".thin/config.json", a, .limited(65536));
     defer a.free(saved_settings);
     try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data = "{}" });
@@ -13129,13 +13348,13 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expect(std.mem.find(u8, ui.notice, "Could not save") != null);
     try std.testing.expect(session.app.?.config.value.model.reasoning != null);
-    try std.testing.expectEqual(shared.ReasoningEffort.high, session.connection().current().reasoning_effort);
+    try std.testing.expectEqual(shared.ReasoningEffort.off, session.connection().current().reasoning_effort);
     try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data = saved_settings });
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[Z", sink);
     try std.testing.expectEqualStrings("Ready", ui.notice);
-    try std.testing.expectEqual(shared.ReasoningEffort.max, session.connection().current().reasoning_effort);
+    try std.testing.expectEqual(shared.ReasoningEffort.low, session.connection().current().reasoning_effort);
     try std.testing.expectEqual(before.context_tokens, session.app.?.config.value.model.context_tokens);
     try std.testing.expectEqual(before.output_tokens, session.app.?.config.value.model.output_tokens);
     try std.testing.expectEqual(before.input_price_threshold, session.app.?.config.value.model.input_price_threshold);
@@ -13145,14 +13364,14 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[Z", sink);
-    try std.testing.expectEqual(shared.ReasoningEffort.off, session.connection().current().reasoning_effort);
+    try std.testing.expectEqual(shared.ReasoningEffort.high, session.connection().current().reasoning_effort);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[Z", sink);
-    try std.testing.expectEqual(shared.ReasoningEffort.low, session.connection().current().reasoning_effort);
-    try std.testing.expectEqual(shared.ReasoningEffort.low, shared.ReasoningEffort.fromName(session.global_config.?.value.registry.?.reasoning_effort));
+    try std.testing.expectEqual(shared.ReasoningEffort.max, session.connection().current().reasoning_effort);
+    try std.testing.expectEqual(shared.ReasoningEffort.max, shared.ReasoningEffort.fromName(session.global_config.?.value.registry.?.reasoning_effort));
     const wire = r.withReasoning(session.app.?.config.value, .{ .scope = .{ .connection = "https://api.deepseek.com", .model = "deepseek-flash", .protocol = .chat }, .system = "", .tools = &.{}, .messages = &.{} });
-    try std.testing.expectEqualStrings("low", wire.reasoning_effort.?);
+    try std.testing.expectEqualStrings("max", wire.reasoning_effort.?);
     try std.testing.expect(wire.thinking.?);
     var disk = try session.store.loadExisting();
     defer core_config.release(&disk);

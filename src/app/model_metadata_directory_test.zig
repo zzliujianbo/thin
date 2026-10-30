@@ -594,7 +594,7 @@ test "public output invalid values unknown and no cross provider votes" {
 }
 
 const public_catalog =
-    \\{"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"fresh-deepseek":{}}},"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"fresh-shared":{}}},"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"fresh-shared":{},"fresh-native":{"provider":{"npm":"@ai-sdk/anthropic"}}}}}
+    \\{"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"fresh-deepseek":{}}},"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"fresh-shared":{}}},"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"fresh-shared":{},"fresh-native":{"provider":{"npm":"@ai-sdk/anthropic"},"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low","high"]}]}}}}
 ;
 
 const legacyProviders = [_]cfg.providers.Id{ .deepseek, .opencode_go, .opencode_zen };
@@ -682,7 +682,13 @@ test "dynamic metadata official protocol wins while unknown adapter removes deri
     cache = try m.commit(&root, 0, try m.parseDev(t.allocator, public_catalog));
     const entry = m.findEntry(&cache, "opencode-zen/fresh-native").?;
     try t.expectEqual(.chat, entry.model.protocol);
-    try t.expectEqual(.standard, m.entryDeclaration(&cache, entry).?.format);
+    try t.expect(m.entryDeclaration(&cache, entry) == null);
+    cache = try m.commit(&root, 0, try m.parseDev(t.allocator,
+        \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"fresh-native":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
+    ));
+    const compatible = m.entryDeclaration(&cache, entry).?;
+    try t.expectEqual(.standard, compatible.format);
+    try t.expectEqualStrings("low", compatible.map.low.?);
     const unknown = try m.parseListing(t.allocator, "{\"data\":[{\"id\":\"fresh-native\"}]}", .opencode_zen);
     cache = try m.commit(&root, m.bit(.opencode_zen), unknown);
     cache = try m.commit(&root, 0, try m.parseDev(t.allocator,
@@ -752,30 +758,35 @@ test "official row fields survive public-only directory publication" {
     var cache = try m.commit(&root, 0, try m.parseDev(t.allocator,
         \\{"opencode":{"npm":"@ai-sdk/openai","models":{"gpt-5.2":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
     ));
-    // No official directory was successfully refreshed; a public-only row may
-    // not shadow previously successful official capacity or wire declarations.
+    // Public reasoning is selected while the legacy official capacity and raw
+    // official declaration remain intact in storage.
     try t.expect(!m.hasDirectory(&cache, .opencode_zen));
     const entry = m.findEntry(&cache, "opencode-zen/gpt-5.2").?;
     try t.expectEqual(@as(?u32, 100000), m.capacityFor(&cache, entry));
     const declaration = m.entryDeclaration(&cache, entry).?;
-    try t.expectEqualStrings("high", declaration.map.high.?);
-    try t.expect(declaration.map.low == null);
-    // Conflicting public routing also cannot invalidate the compatible official
-    // declaration bound to the last verified, still-selected legacy route.
+    try t.expectEqualStrings("low", declaration.map.low.?);
+    try t.expect(declaration.map.high == null);
+    try t.expectEqualStrings("high", cache.directory.rows[cache.directory.find(.opencode_zen, "gpt-5.2").?].reasoning.?.declaration().map.high.?);
+    // Conflicting public routing cannot authorize reasoning for the official route.
     cache = try m.commit(&root, 0, try m.parseDev(t.allocator,
         \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"gpt-5.2":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
     ));
-    try t.expectEqualStrings("high", m.entryDeclaration(&cache, entry).?.map.high.?);
+    try t.expect(m.entryDeclaration(&cache, entry) == null);
+    try t.expectEqualStrings("high", cache.directory.rows[cache.directory.find(.opencode_zen, "gpt-5.2").?].reasoning.?.declaration().map.high.?);
     cache = try m.commit(&root, 0, .{});
     cache = try m.load(&root);
+    try t.expect(!m.hasDirectory(&cache, .opencode_zen));
     try t.expectEqual(@as(?u32, 100000), m.capacityFor(&cache, entry));
-    try t.expectEqualStrings("high", m.entryDeclaration(&cache, entry).?.map.high.?);
+    try t.expect(m.entryDeclaration(&cache, entry) == null);
+    try t.expectEqualStrings("high", cache.directory.rows[cache.directory.find(.opencode_zen, "gpt-5.2").?].reasoning.?.declaration().map.high.?);
     // A later successful official refresh supersedes those old values, including
     // clearing omitted capacity/effort rather than reviving legacy metadata.
     const fresh = try m.parseListing(t.allocator, "{\"data\":[{\"id\":\"gpt-5.2\"}]}", .opencode_zen);
     cache = try m.commit(&root, m.bit(.opencode_zen), fresh);
     const updated = m.findEntry(&cache, "opencode-zen/gpt-5.2").?;
+    try t.expect(m.hasDirectory(&cache, .opencode_zen));
     try t.expect(m.capacityFor(&cache, updated) == null);
+    try t.expect(cache.directory.rows[cache.directory.find(.opencode_zen, "gpt-5.2").?].reasoning == null);
     try t.expectEqualStrings("low", m.entryDeclaration(&cache, updated).?.map.low.?);
 }
 

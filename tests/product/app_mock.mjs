@@ -345,7 +345,7 @@ async function scenario(name, protocol, kind, isPty = false) {
         selectionStage = 2;
         assert.equal(body.model, rounds <= 2 ? 'fixture-model' : rounds === 3 ? 'fixture-next' : 'fixture-custom');
         selectionStage = 3;
-        assert.equal(protocol === 'chat' ? body.reasoning_effort : body.reasoning?.effort, rounds <= 2 ? 'none' : rounds === 3 ? 'medium' : 'high');
+        assert.equal(protocol === 'chat' ? body.reasoning_effort : body.reasoning?.effort, rounds <= 2 ? 'none' : rounds === 3 ? 'medium' : 'minimal');
         const serialized = JSON.stringify(protocol === 'chat' ? body.messages : body.input);
         selectionStage = 4;
         assert(serialized.includes(rounds <= 2 ? 'selection-first' : rounds === 3 ? 'selection-second' : 'selection-third'));
@@ -677,7 +677,7 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert(!('provider' in initialized) && !('model' in initialized) && !('credentials' in initialized));
       assert(!('local' in initialized.llm.providers), 'old filename must not supply connection or credentials');
       assert.equal((await stat(path)).mode & 0o777,0o600);
-      assert.equal(initialized.llm.reasoning_effort,'medium');
+      assert.equal(initialized.llm.reasoning_effort,'off');
       const projectThin = join(project,'.thin');
       assert(!await exists(projectThin), 'failed activation created project storage');
       if (kind === 'legacy-config') {
@@ -708,14 +708,14 @@ async function scenario(name, protocol, kind, isPty = false) {
       assert.equal(auth.llm.providers[kind === 'auth-activate' ? 'local' : 'deepseek'].api_key_env ?? '', '');
       if (kind !== 'auth-activate') {
         await noSubmissionState(project);
-        // With no metadata/declaration, persist the logical medium preference
+        // With no metadata/declaration, persist the logical off preference
         // without manufacturing a supported high level before authentication.
         // No submission may create archives or any other project artifact; the
         // host's fixed ownership anchor (.thin/ plus its .resume-lock/.gitignore)
         // is the only tolerated entry, so verify project files excluding .thin.
         assert.deepEqual((await readdir(project)).filter(name => name !== '.thin').sort(), ['seed.txt'], 'unexpected project files');
         assert(!await exists(join(project,'.thin/settings.json')), 'initialization created project settings');
-        assert.equal(auth.llm.reasoning_effort,'medium');
+        assert.equal(auth.llm.reasoning_effort,'off');
         const declared = auth.llm.providers.deepseek.models['deepseek-flash'];
         assert.equal(declared.protocol,'chat');
         assert.equal(declared.context_tokens,1000000);

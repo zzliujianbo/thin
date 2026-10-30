@@ -3381,10 +3381,10 @@ test "initial default adopts late public metadata without cycling or normalizing
     try std.testing.expect(session.metadata_job == null);
     try std.testing.expect(!session.initial_default_pending);
     if (session.settings_notice) |notice| try std.testing.expect(std.mem.find(u8, notice, "not applied") == null);
-    try std.testing.expectEqual(presentation.ReasoningEffort.medium, try persistedEffortForTest(&session));
+    try std.testing.expectEqual(presentation.ReasoningEffort.off, try persistedEffortForTest(&session));
     const config = session.app.?.config.value;
-    const next = session.capabilitiesFor(config).levels.clamp(.medium).?;
-    try std.testing.expectEqual(presentation.ReasoningEffort.medium, session.preferred_effort.?);
+    const next = presentation.ReasoningEffort.off;
+    try std.testing.expectEqual(presentation.ReasoningEffort.off, session.preferred_effort.?);
     try std.testing.expectEqual(cfg.ReasoningSource.metadata, config.model.reasoning_source);
     try std.testing.expectEqualStrings(next.name().?, config.model.reasoning_effort.?);
     try std.testing.expect(session.capabilitiesFor(config).levels.contains(next));
@@ -3400,7 +3400,17 @@ test "initial default adopts late public metadata without cycling or normalizing
     try std.testing.expect(!session.app.?.journal.started);
 }
 
-test "DeepSeek then Go Haiku selection applies global default with early or late capabilities" {
+// These Go fixtures model public reasoning, independently of its listing.
+fn publicReasoningFixture(listing: *metadata.Listing, name: []const u8) void {
+    const row = &listing.directory.rows[listing.directory.find(.opencode_go, name).?];
+    row.dev_protocol = row.protocol;
+    row.dev_reasoning = row.reasoning;
+    row.dev_present = true;
+    row.reasoning = null;
+    listing.dev_done = true;
+}
+
+test "provider reasoning source DeepSeek then Go Haiku applies global default with early or late capabilities" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     for ([_]bool{ false, true }) |late| {
@@ -3424,9 +3434,10 @@ test "DeepSeek then Go Haiku selection applies global default with early or late
             const go_unknown = try metadata.parseListing(a,
                 \\{"data":[{"id":"claude-haiku-5-5","protocol":"anthropic"}]}
             , .opencode_go);
-            const go_known = try metadata.parseListing(a,
+            var go_known = try metadata.parseListing(a,
                 \\{"data":[{"id":"claude-haiku-5-5","protocol":"anthropic","effort":{"format":"anthropic","supported_levels":["off","low","medium","high","max"]}}]}
             , .opencode_go);
+            publicReasoningFixture(&go_known, "claude-haiku-5-5");
             session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), if (late) go_unknown else go_known);
             try session.connection().configureProvider(.opencode_go, "fake-haiku-sequence-go");
             try std.testing.expectEqualStrings("deepseek-flash", session.app.?.config.value.model.name);
@@ -3492,7 +3503,8 @@ test "first activation defaults clamp without changing preference and own late c
             var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
             defer session.deinit();
             try setGlobalEffortForTest(&session, saved);
-            const listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"effort\":{\"supported_levels\":[\"off\",\"low\",\"high\",\"max\"]}}]}", .opencode_go);
+            var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"protocol\":\"responses\",\"effort\":{\"supported_levels\":[\"off\",\"low\",\"high\",\"max\"]}}]}", .opencode_go);
+            publicReasoningFixture(&listing, "gpt-6-luna");
             if (!late) session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), listing);
             try session.connection().configureProvider(.opencode_go, "fake-default-effort");
             const before = session.app.?.config.value.model;
@@ -3551,7 +3563,8 @@ test "initial default stops after journal start and never overwrites an accepted
     try std.testing.expect(try session.completeInitialDefault(true));
     app.journal.started = false;
     try std.testing.expect(!session.initial_default_pending);
-    const listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"effort\":{\"supported_levels\":[\"low\",\"high\"]}}]}", .opencode_go);
+    var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"protocol\":\"responses\",\"effort\":{\"supported_levels\":[\"low\",\"high\"]}}]}", .opencode_go);
+    publicReasoningFixture(&listing, "gpt-6-luna");
     session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), listing);
     try std.testing.expect(!(try session.completeInitialDefault(true)));
     try std.testing.expect(app.config.value.model.reasoning == null);
@@ -4037,8 +4050,8 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     try std.testing.expectEqualStrings("max", session.app.?.config.value.model.reasoning_effort.?);
     try std.testing.expect(session.app.?.runtime.messages().len == 0);
     try std.testing.expectEqual(@as(?u32, 16384), session.app.?.config.value.model.output_tokens);
-    // Explicit manual refresh retries both sources. Official metadata overrides
-    // fallback in picker and applyPreference; refresh alone leaves active options frozen.
+    // Manual refresh retries both sources; Go remains public-authoritative,
+    // and refresh alone leaves active options frozen.
     LayeredMetadataFixture.official_effort.store(true, .release);
     try session.connection().refresh_models_fn.?(session.connection().context);
     MetadataFixture.finish(&session);
@@ -4057,7 +4070,7 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     try std.testing.expectEqual(frozen_capacity, session.app.?.config.value.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 16384), session.app.?.config.value.model.output_tokens);
     try session.connection().selectModel("opencode-go/claude-haiku-5-5");
-    try std.testing.expectEqualStrings("high", session.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqualStrings("max", session.app.?.config.value.model.reasoning_effort.?);
     try std.testing.expectEqual(@as(?u32, 32768), session.app.?.config.value.model.output_tokens);
     // Same protocol/map/capacity is not a no-op if a fresh output limit changed.
     session.metadata_cache.directory.rows[output_row].dev_output_tokens = 65536;
@@ -4366,7 +4379,7 @@ test "derived reasoning stays in cache and cannot revive after a tied refresh or
     }
 }
 
-test "official cached effort metadata overrides the models.dev fallback" {
+test "provider reasoning source Go ignores legacy official effort" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4386,11 +4399,8 @@ test "official cached effort metadata overrides the models.dev fallback" {
     row.available = true;
     row.protocol = .responses;
     row.reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .standard, .map = .{ .low = "low", .high = "high" } });
-    const official = session.capabilitiesFor(config);
-    try std.testing.expectEqualStrings("low", official.map.low.?);
-    try std.testing.expect(official.map.max == null);
-    row.reasoning = null;
-    // Dynamic models.dev profiles are used only when official metadata is absent.
+    try std.testing.expect(!session.capabilitiesFor(config).known);
+    // Go uses public data even if a legacy official profile is present.
     row.dev_present = true;
     row.dev_protocol = .responses;
     row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .standard, .map = .{ .low = "low", .max = "max", .off = "none" } });

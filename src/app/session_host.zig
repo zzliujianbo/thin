@@ -2143,9 +2143,10 @@ pub const SessionHost = struct {
         // Read-only projection poll: socket-bound but never epoch-bound, so a
         // viewer can render its first frame before control is established.
         self.requireIdleSocket(connection_id) catch |err| return errorReply(a, request.id, err);
-        const wait = request.boolField("wait", false) catch return errorReply(a, request.id, error.BadRequest);
+        _ = request.boolField("wait", false) catch return errorReply(a, request.id, error.BadRequest);
         const callback = self.connection.poll_models_fn orelse return errorReply(a, request.id, error.Unsupported);
-        const changed = callback(self.connection.context, wait);
+        // The backend idle guard is authoritative; the client's polling hint is not owner state.
+        const changed = callback(self.connection.context, true);
         var out = protocol.Out.init(a);
         defer out.deinit();
         try out.ok(request.id);
@@ -2228,6 +2229,176 @@ fn dispatchJson(host: *SessionHost, a: std.mem.Allocator, json: []const u8, conn
     var request = try protocol.parseRequest(a, json);
     defer request.deinit();
     return host.dispatch(a, &request, connection, true);
+}
+
+// A boundary spy deliberately models the owner-idle argument, not client wait.
+const MetadataOwnerIdleSpy = struct {
+    count: usize = 0,
+    values: [3]bool = @splat(false),
+
+    fn poll(context: *anyopaque, idle: bool) bool {
+        const self: *MetadataOwnerIdleSpy = @ptrCast(@alignCast(context));
+        if (self.count < self.values.len) self.values[self.count] = idle;
+        self.count += 1;
+        return idle;
+    }
+};
+
+test "metadata owner idle is independent of client wait field" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    const host = try SessionHost.init(a, io, &env, .{ .project = home, .id = try ids.generate(io), .owner = .foreground });
+    defer host.deinit();
+    const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+    defer a.free(attached);
+    try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
+
+    var spy = MetadataOwnerIdleSpy{};
+    const old_context = host.connection.context;
+    const old_poll = host.connection.poll_models_fn;
+    defer {
+        host.connection.context = old_context;
+        host.connection.poll_models_fn = old_poll;
+    }
+    host.connection.context = &spy;
+    host.connection.poll_models_fn = MetadataOwnerIdleSpy.poll;
+    for ([_][]const u8{
+        "{\"v\":2,\"id\":2,\"op\":\"poll_metadata\",\"wait\":false}",
+        "{\"v\":2,\"id\":3,\"op\":\"poll_metadata\"}",
+        "{\"v\":2,\"id\":4,\"op\":\"poll_metadata\",\"wait\":true}",
+    }) |json| {
+        const frame = try dispatchJson(host, a, json, 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 3), spy.count);
+    try std.testing.expectEqual([3]bool{ true, true, true }, spy.values);
+}
+
+test "metadata owner idle rejects malformed wait and pending terminal" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    const host = try SessionHost.init(a, io, &env, .{ .project = home, .id = try ids.generate(io), .owner = .foreground });
+    defer host.deinit();
+    const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+    defer a.free(attached);
+    try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
+
+    var spy = MetadataOwnerIdleSpy{};
+    const old_context = host.connection.context;
+    const old_poll = host.connection.poll_models_fn;
+    defer {
+        host.connection.context = old_context;
+        host.connection.poll_models_fn = old_poll;
+    }
+    host.connection.context = &spy;
+    host.connection.poll_models_fn = MetadataOwnerIdleSpy.poll;
+    const malformed = try dispatchJson(host, a, "{\"v\":2,\"id\":2,\"op\":\"poll_metadata\",\"wait\":\"true\"}", 7);
+    defer a.free(malformed);
+    try std.testing.expect(std.mem.indexOf(u8, malformed, "\"ok\":false") != null);
+    const stale = try dispatchJson(host, a, "{\"v\":2,\"id\":3,\"op\":\"poll_metadata\",\"wait\":true}", 8);
+    defer a.free(stale);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "\"ok\":false") != null);
+    host.pending_terminal = .{ .terminal = .{ .status = .success }, .json = try a.dupe(u8, "pending") };
+    defer {
+        if (host.pending_terminal) |pending| a.free(pending.json);
+        host.pending_terminal = null;
+    }
+    const busy = try dispatchJson(host, a, "{\"v\":2,\"id\":4,\"op\":\"poll_metadata\",\"wait\":true}", 7);
+    defer a.free(busy);
+    try std.testing.expect(std.mem.indexOf(u8, busy, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, busy, "busy") != null);
+    try std.testing.expectEqual(@as(usize, 0), spy.count);
+}
+
+test "metadata owner idle publishes real session capabilities on nonblocking polls" {
+    const Fixture = struct {
+        var official_calls: std.atomic.Value(usize) = .init(0);
+        var dev_calls: std.atomic.Value(usize) = .init(0);
+        fn official(a: std.mem.Allocator, _: Io, id: providers.Id, key: ?[]const u8) !@import("model_metadata.zig").Listing {
+            _ = official_calls.fetchAdd(1, .monotonic);
+            if (id != .deepseek or key == null or !std.mem.eql(u8, key.?, "fake-metadata-key")) return error.InvalidFixture;
+            return @import("model_metadata.zig").parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", id);
+        }
+        fn dev(_: std.mem.Allocator, _: Io) !@import("model_metadata.zig").Listing {
+            _ = dev_calls.fetchAdd(1, .monotonic);
+            return .{ .dev_done = true };
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    {
+        var store = try @import("auth_store.zig").Store.open(a, io, home);
+        defer store.deinit();
+        var initial = try store.loadOrInitialize();
+        defer cfg.release(&initial);
+        var config = try cfg.parse(a, "{\"llm\":{\"default\":\"deepseek/deepseek-flash\",\"reasoning_effort\":\"medium\",\"providers\":{\"deepseek\":{\"base_url\":\"https://api.deepseek.com\",\"kind\":\"deepseek\",\"chat_max_tokens\":true}}}}");
+        defer cfg.release(&config);
+        try store.save(config.value);
+    }
+    Fixture.official_calls.store(0, .monotonic);
+    Fixture.dev_calls.store(0, .monotonic);
+    const host = try SessionHost.init(a, io, &env, .{ .project = home, .id = try ids.generate(io), .owner = .foreground, .auto_refresh_models = true });
+    defer host.deinit();
+    host.session.metadata_fetch = Fixture.official;
+    host.session.metadata_dev_fetch = Fixture.dev;
+    const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+    defer a.free(attached);
+    try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
+    try host.connection.configureProvider(.deepseek, "fake-metadata-key");
+    host.refreshConnection();
+    try std.testing.expect(host.session.initial_default_pending);
+    const poll = "{\"v\":2,\"id\":2,\"op\":\"poll_metadata\",\"wait\":false}";
+    const first = try dispatchJson(host, a, poll, 7);
+    defer a.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"ok\":true") != null);
+    try std.testing.expect(host.session.metadata_job != null);
+    const deadline = Io.Clock.awake.now(io).toMilliseconds() + 5000;
+    while (host.session.metadata_job != null or host.session.initial_default_pending) {
+        if (Io.Clock.awake.now(io).toMilliseconds() >= deadline) return error.FixtureCompletionTimeout;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+        const frame = try dispatchJson(host, a, poll, 7);
+        defer a.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
+    }
+    const state = host.connection.current();
+    try std.testing.expectEqual(@as(usize, 1), Fixture.official_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), Fixture.dev_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 0x55), state.effort_levels.mask);
+    try std.testing.expectEqual(activity.ReasoningEffort.high, state.reasoning_effort);
+    try std.testing.expectEqualStrings("high", host.session.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expect(host.session.app.?.config.value.model.reasoning != null);
+    try std.testing.expect(host.task == null);
+    try std.testing.expectEqual(@as(usize, 0), host.history.items.items.len);
+    try std.testing.expect(!host.session.app.?.journal.started);
+    const cycle = try dispatchJson(host, a, "{\"v\":2,\"id\":3,\"op\":\"cycle_effort\",\"epoch\":1}", 7);
+    defer a.free(cycle);
+    try std.testing.expect(std.mem.indexOf(u8, cycle, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cycle, "\"value\":\"max\"") != null);
+    try std.testing.expectEqual(activity.ReasoningEffort.max, host.connection.current().reasoning_effort);
+    try std.testing.expect(host.task == null);
+    try std.testing.expect(!host.session.app.?.journal.started);
 }
 
 test "codex control rejects invalid and stale actions without starting login" {
