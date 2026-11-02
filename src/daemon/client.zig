@@ -246,6 +246,204 @@ fn valueU64(value: std.json.Value) ?u64 {
     };
 }
 
+fn decodeSubagentView(a: std.mem.Allocator, value: std.json.Value) !@import("../core/subagent_status.zig").View {
+    const obj = switch (value) {
+        .object => |v| v,
+        else => return error.ProtocolError,
+    };
+    if (obj.count() != 12 and obj.count() != 13 and obj.count() != 15) return error.ProtocolError;
+    const read = struct {
+        fn uint(map: std.json.ObjectMap, key: []const u8) !u64 {
+            return valueU64(map.get(key) orelse return error.ProtocolError) orelse error.ProtocolError;
+        }
+    };
+    var view: @import("../core/subagent_status.zig").View = .{
+        .group_id = try read.uint(obj, "group_id"),
+        .revision = try read.uint(obj, "revision"),
+        .total = try read.uint(obj, "total"),
+        .running = try read.uint(obj, "running"),
+        .waiting = try read.uint(obj, "waiting"),
+        .completed = try read.uint(obj, "completed"),
+        .failed = try read.uint(obj, "failed"),
+        .canceled = try read.uint(obj, "canceled"),
+        .paused = try read.uint(obj, "paused"),
+        .elapsed_ms = try read.uint(obj, "elapsed_ms"),
+        .latest_id = try read.uint(obj, "latest_id"),
+    };
+    const text = switch (obj.get("text") orelse return error.ProtocolError) {
+        .string => |s| s,
+        else => return error.ProtocolError,
+    };
+    if (text.len > view.text_buf.len or !std.unicode.utf8ValidateSlice(text)) return error.ProtocolError;
+    for (text, 0..) |b, i| {
+        if (b < 0x20 or b == 0x7f or (b == 0xc2 and i + 1 < text.len and text[i + 1] >= 0x80 and text[i + 1] <= 0x9f)) return error.ProtocolError;
+    }
+    var total: u64 = 0;
+    for ([_]u64{ view.running, view.waiting, view.completed, view.failed, view.canceled, view.paused }) |n| {
+        total = std.math.add(u64, total, n) catch return error.ProtocolError;
+    }
+    if (total != view.total or (view.group_id == 0 and (total != 0 or view.revision != 0 or view.latest_id != 0 or view.elapsed_ms != 0 or text.len != 0)) or (view.group_id != 0 and (total == 0 or view.latest_id == 0))) return error.ProtocolError;
+    view.text_len = @intCast(text.len);
+    @memcpy(view.text_buf[0..text.len], text);
+    if (obj.get("agents")) |value_agents| {
+        const items = switch (value_agents) {
+            .array => |array| array.items,
+            else => return error.ProtocolError,
+        };
+        const Agent = @import("../core/subagent_status.zig").AgentView;
+        if (obj.count() == 15) {
+            const offset = try read.uint(obj, "page_offset");
+            const page_total = try read.uint(obj, "page_total");
+            const end = std.math.add(u64, offset, items.len) catch return error.ProtocolError;
+            if (items.len > 64 or page_total != view.total or offset > page_total or end > page_total or (end < page_total and items.len != 64) or (offset % 64 != 0)) return error.ProtocolError;
+            view.page_offset = offset;
+            view.page_total = page_total;
+        } else if (obj.count() != 13 or items.len != view.total) return error.ProtocolError;
+        const rows: []Agent = if (items.len == 0) &.{} else try a.alloc(Agent, items.len);
+        errdefer if (rows.len != 0) a.free(rows);
+        var counts: [6]u64 = @splat(0);
+        for (items, 0..) |item, i| {
+            const row = switch (item) {
+                .object => |map| map,
+                else => return error.ProtocolError,
+            };
+            if (row.count() != 5) return error.ProtocolError;
+            const id = try read.uint(row, "id");
+            if (id == 0) return error.ProtocolError;
+            for (rows[0..i]) |previous| if (previous.id == id) return error.ProtocolError;
+            const phase = switch (row.get("phase") orelse return error.ProtocolError) {
+                .string => |s| std.meta.stringToEnum(@import("../core/subagent_status.zig").Phase, s) orelse return error.ProtocolError,
+                else => return error.ProtocolError,
+            };
+            const row_text = switch (row.get("text") orelse return error.ProtocolError) {
+                .string => |s| s,
+                else => return error.ProtocolError,
+            };
+            if (row_text.len > 2048 or !std.unicode.utf8ValidateSlice(row_text)) return error.ProtocolError;
+            for (row_text, 0..) |b, j| if (b < 0x20 or b == 0x7f or (b == 0xc2 and j + 1 < row_text.len and row_text[j + 1] >= 0x80 and row_text[j + 1] <= 0x9f)) return error.ProtocolError;
+            const category: usize = switch (phase) {
+                .starting, .running => 0,
+                .waiting => 1,
+                .completed => 2,
+                .failed => 3,
+                .canceled => 4,
+                .paused => 5,
+            };
+            counts[category] += 1;
+            rows[i] = .{ .id = id, .revision = try read.uint(row, "revision"), .phase = phase, .elapsed_ms = try read.uint(row, "elapsed_ms"), .text_len = @intCast(row_text.len) };
+            @memcpy(rows[i].text_buf[0..row_text.len], row_text);
+        }
+        const expected = [_]u64{ view.running, view.waiting, view.completed, view.failed, view.canceled, view.paused };
+        if (view.page_offset == null) {
+            if (!std.mem.eql(u64, &counts, &expected)) return error.ProtocolError;
+        } else {
+            for (counts, expected) |count, max| if (count > max) return error.ProtocolError;
+        }
+        view.agents = rows;
+        view.individual_supported = true;
+    } else if (obj.count() != 12) return error.ProtocolError;
+    return view;
+}
+
+test "grouped subagent progress snapshot encoder decoder roundtrip" {
+    const a = std.testing.allocator;
+    var expected: @import("../core/subagent_status.zig").View = .{ .group_id = 42, .revision = 3, .total = 4, .running = 1, .waiting = 1, .completed = 1, .failed = 1, .elapsed_ms = 99, .latest_id = 7 };
+    const text = "working 中文";
+    expected.text_len = text.len;
+    @memcpy(expected.text_buf[0..text.len], text);
+    var out = protocol.Out.init(a);
+    defer out.deinit();
+    try out.ok(1);
+    try protocol.encodeSnapshot(&out, .{ .session = @splat('a'), .project = "/tmp", .owner = .daemon, .subagents_supported = true, .subagents = expected });
+    const bytes = try out.finish();
+    defer a.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    const decoded = try decodeSubagentView(a, parsed.value.object.get("snapshot").?.object.get("subagents").?);
+    parsed.deinit();
+    try std.testing.expect(std.meta.eql(expected, decoded));
+
+    var old = protocol.Out.init(a);
+    defer old.deinit();
+    try old.ok(2);
+    try protocol.encodeSnapshot(&old, .{ .session = @splat('b'), .project = "/tmp", .owner = .daemon });
+    const old_bytes = try old.finish();
+    defer a.free(old_bytes);
+    const old_parsed = try std.json.parseFromSlice(std.json.Value, a, old_bytes, .{});
+    defer old_parsed.deinit();
+    try std.testing.expect(old_parsed.value.object.get("snapshot").?.object.get("subagents") == null);
+}
+
+test "per-agent status rows survive wire document and owned clone" {
+    const a = std.testing.allocator;
+    var rows = [_]@import("../core/subagent_status.zig").AgentView{
+        .{ .id = 1, .revision = 1, .phase = .starting, .elapsed_ms = 10 },
+        .{ .id = 2, .revision = 2, .phase = .waiting, .elapsed_ms = 20 },
+        .{ .id = 3, .revision = 3, .phase = .completed, .elapsed_ms = 30 },
+        .{ .id = 4, .revision = 4, .phase = .failed, .elapsed_ms = 40 },
+    };
+    for (&rows, [_][]const u8{ "one", "two", "three", "four" }) |*row, text| {
+        row.text_len = @intCast(text.len);
+        @memcpy(row.text_buf[0..text.len], text);
+    }
+    const original: @import("../core/subagent_status.zig").View = .{ .agents = &rows, .individual_supported = true, .group_id = 1, .revision = 4, .total = 4, .running = 1, .waiting = 1, .completed = 1, .failed = 1, .latest_id = 4 };
+    var out = protocol.Out.init(a);
+    defer out.deinit();
+    try out.ok(1);
+    try protocol.encodeSubagentView(&out, original);
+    const bytes = try out.finish();
+    defer a.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    var decoded = try decodeSubagentView(a, parsed.value.object.get("subagents").?);
+    parsed.deinit();
+    defer decoded.deinitOwned(a);
+    try std.testing.expect(@import("../core/subagent_status.zig").View.eql(original, decoded));
+    var projection = try decoded.clone(a);
+    defer projection.deinitOwned(a);
+    decoded.deinitOwned(a);
+    try std.testing.expectEqualStrings("four", projection.agents[3].latestText());
+    try std.testing.expectEqual(@as(u64, 20), projection.agents[1].elapsed_ms);
+    try std.testing.expectEqual(@import("../core/subagent_status.zig").Phase.waiting, projection.agents[1].phase);
+}
+
+test "per-agent status rows reject malformed wire and preserve legacy" {
+    const a = std.testing.allocator;
+    const prefix = "{\"group_id\":1,\"revision\":2,\"total\":2,\"running\":1,\"waiting\":1,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":3,\"latest_id\":9,\"text\":\"working\"";
+    const suffixes = [_][]const u8{
+        ",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"bogus\",\"elapsed_ms\":1,\"text\":\"x\"},{\"id\":2,\"revision\":1,\"phase\":\"waiting\",\"elapsed_ms\":2,\"text\":\"y\"}]}",
+        ",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":1,\"text\":\"x\"},{\"id\":1,\"revision\":1,\"phase\":\"waiting\",\"elapsed_ms\":2,\"text\":\"y\"}]}",
+        ",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":1,\"text\":\"\\n\"},{\"id\":2,\"revision\":1,\"phase\":\"waiting\",\"elapsed_ms\":2,\"text\":\"y\"}]}",
+        ",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":1,\"text\":\"x\"},{\"id\":2,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":2,\"text\":\"y\"}]}",
+        ",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":-1,\"text\":\"x\"},{\"id\":2,\"revision\":1,\"phase\":\"waiting\",\"elapsed_ms\":2,\"text\":\"y\"}]}",
+    };
+    for (suffixes) |suffix| {
+        const bytes = try std.mem.concat(a, u8, &.{ prefix, suffix });
+        defer a.free(bytes);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.ProtocolError, decodeSubagentView(a, parsed.value));
+    }
+    const legacy = try std.mem.concat(a, u8, &.{ prefix, "}" });
+    defer a.free(legacy);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, legacy, .{});
+    defer parsed.deinit();
+    var view = try decodeSubagentView(a, parsed.value);
+    defer view.deinitOwned(a);
+    try std.testing.expect(!view.individual_supported);
+}
+
+test "grouped subagent progress decoder owns text and rejects malformed counts" {
+    const a = std.testing.allocator;
+    const bytes = "{\"group_id\":1,\"revision\":2,\"total\":2,\"running\":1,\"waiting\":1,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":3,\"latest_id\":9,\"text\":\"working\"}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    const view = try decodeSubagentView(a, parsed.value);
+    parsed.deinit();
+    try std.testing.expectEqualStrings("working", view.latestText());
+    const invalid = "{\"group_id\":1,\"revision\":2,\"total\":1,\"running\":1,\"waiting\":1,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":3,\"latest_id\":9,\"text\":\"working\"}";
+    const bad = try std.json.parseFromSlice(std.json.Value, a, invalid, .{});
+    defer bad.deinit();
+    try std.testing.expectError(error.ProtocolError, decodeSubagentView(a, bad.value));
+}
+
 fn decodeMemoryView(value: std.json.Value) !memory_status.View {
     const obj = switch (value) {
         .object => |v| v,
@@ -386,6 +584,8 @@ const max_label_bytes = 64;
 
 const SnapshotCache = struct {
     memory: memory_status.View = .{},
+    subagents: @import("../core/subagent_status.zig").View = .{},
+    subagents_supported: bool = false,
     valid: bool = false,
     codex_login: codex_login.View = .{},
     busy: bool = false,
@@ -529,6 +729,8 @@ pub const Client = struct {
     arena_index: u1 = 0,
 
     cache: SnapshotCache = .{},
+    row_cursor: u64 = 0,
+    row_group: u64 = 0,
     pubcfg: Pub = .{},
     pending: std.ArrayList(session_client.Item) = .empty,
     /// Locators this launcher really published for workers it owns. Kept so a
@@ -594,6 +796,7 @@ pub const Client = struct {
         if (self.dir) |*dir| dir.deinit();
         self.dir = null;
         self.freePub();
+        self.cache.subagents.deinitOwned(self.a);
         self.arenas[0].deinit();
         self.arenas[1].deinit();
         self.pending.deinit(self.a);
@@ -783,6 +986,8 @@ pub const Client = struct {
         self.cursor = 0;
         self.need_history = false;
         self.cache.valid = false;
+        self.cache.subagents.deinitOwned(self.a);
+        self.cache.subagents_supported = false;
         self.rebuild();
     }
 
@@ -816,13 +1021,15 @@ pub const Client = struct {
     // -- published projection ---------------------------------------------
 
     fn rebuild(self: *Client) void {
-        self.publication_revision +%= 1;
         const slot = self.arena_index ^ 1;
         _ = self.arenas[slot].reset(.retain_capacity);
         const arena = self.arenas[slot].allocator();
-        self.snap = self.buildSnapshot(arena) catch self.snap;
-        self.state = self.buildState(arena) catch self.state;
+        const snap = self.buildSnapshot(arena) catch return;
+        const state = self.buildState(arena) catch return;
+        self.snap = snap;
+        self.state = state;
         self.arena_index = slot;
+        self.publication_revision +%= 1;
     }
 
     fn buildSnapshot(self: *Client, arena: std.mem.Allocator) !session_client.Snapshot {
@@ -868,6 +1075,8 @@ pub const Client = struct {
             .previews = previews,
             .running_sessions = 0,
             .memory = cache.memory,
+            .subagents = try cache.subagents.clone(arena),
+            .subagents_supported = cache.subagents_supported,
         };
     }
 
@@ -879,6 +1088,8 @@ pub const Client = struct {
         var state: tui.Connection.State = baseState();
         state.codex_login = cache.codex_login;
         state.memory = cache.memory;
+        state.subagents = try cache.subagents.clone(arena);
+        state.subagents_supported = cache.subagents_supported;
         state.available = cfg.available and (self.conn != null or self.control != null);
         state.busy = (cache.valid and cache.busy) or (self.need_history and self.snap.busy);
         state.session_label = if (cache.valid and cache.label_len != 0) try arena.dupe(u8, cache.label[0..cache.label_len]) else null;
@@ -1043,6 +1254,8 @@ pub const Client = struct {
     fn refreshSnapshot(self: *Client) void {
         var req = self.request(.snapshot) catch return;
         defer req.deinit();
+        req.put("row_cursor", self.row_cursor) catch return;
+        req.put("row_group", self.row_group) catch return;
         var resp = req.exchange(quick_timeout_ms) catch |err| {
             self.poll_error = err;
             return;
@@ -1059,6 +1272,8 @@ pub const Client = struct {
             else => return error.ProtocolError,
         };
         var cache: SnapshotCache = .{};
+        var adopted = false;
+        defer if (!adopted) cache.subagents.deinitOwned(self.a);
         const get = struct {
             fn field(map: std.json.ObjectMap, name: []const u8) ?std.json.Value {
                 return map.get(name);
@@ -1081,6 +1296,39 @@ pub const Client = struct {
         };
         cache.valid = true;
         cache.memory = try decodeMemoryView(object.get("memory") orelse return error.ProtocolError);
+        if (object.get("subagents")) |value| {
+            cache.subagents = try decodeSubagentView(self.a, value);
+            if (cache.subagents.page_offset != null and self.cache.subagents.individual_supported and self.cache.subagents.group_id == cache.subagents.group_id) {
+                const previous = self.cache.subagents;
+                const page = cache.subagents;
+                const Agent = @import("../core/subagent_status.zig").AgentView;
+                var rows: std.ArrayList(Agent) = .empty;
+                defer rows.deinit(self.a);
+                try rows.appendSlice(self.a, previous.agents);
+                for (page.agents) |row| {
+                    var found = false;
+                    for (rows.items) |*old| if (old.id == row.id) {
+                        if (row.revision >= old.revision) old.* = row;
+                        found = true;
+                        break;
+                    };
+                    if (!found) try rows.append(self.a, row);
+                }
+                if (rows.items.len > @max(page.total, previous.total)) return error.ProtocolError;
+                const merged = try rows.toOwnedSlice(self.a);
+                cache.subagents.deinitOwned(self.a);
+                cache.subagents = page;
+                cache.subagents.agents = merged;
+                if (previous.revision > page.revision) {
+                    const merged_rows = cache.subagents.agents;
+                    cache.subagents = previous;
+                    cache.subagents.agents = merged_rows;
+                    cache.subagents.page_offset = page.page_offset;
+                    cache.subagents.page_total = page.page_total;
+                }
+            }
+            cache.subagents_supported = true;
+        }
         if (object.get("codex_login")) |value| {
             const login_view = switch (value) {
                 .object => |map| map,
@@ -1167,7 +1415,19 @@ pub const Client = struct {
         if (cache.codex_login.status == .succeeded and
             (self.cache.codex_login.status != .succeeded or self.cache.codex_login.generation != cache.codex_login.generation)) self.dirty = true;
         if (!std.meta.eql(self.cache.memory, cache.memory)) self.dirty = true;
+        if (cache.subagents.page_offset) |offset| {
+            self.row_group = cache.subagents.group_id;
+            // Merged rows can contain earlier pages; use the decoded page length.
+            const wire_agents = object.get("subagents").?.object.get("agents").?.array.items.len;
+            const page_end = offset + wire_agents;
+            self.row_cursor = if (page_end < cache.subagents.page_total) page_end else 0;
+        } else {
+            self.row_cursor = 0;
+            self.row_group = cache.subagents.group_id;
+        }
+        self.cache.subagents.deinitOwned(self.a);
         self.cache = cache;
+        adopted = true;
         if (resp.uint("through")) |through| self.cache_floor = @max(self.cache_floor, through);
     }
 
@@ -1710,7 +1970,9 @@ pub const Client = struct {
         defer resp.deinit();
         // Keep the public projection fresh, but receipt state is authoritative
         // only from the explicit fields below.
-        self.adoptSnapshot(&resp) catch {};
+        self.adoptSnapshot(&resp) catch |err| {
+            self.poll_error = err;
+        };
         if (!resp.flag("receipt_known", false)) return .unknown;
         if (resp.flag("receipt_accepted", false)) return .{ .accepted = resp.uint("receipt_task") orelse 0 };
         return .rejected;
@@ -1970,6 +2232,7 @@ pub const Client = struct {
         self.need_history = true;
         self.dirty = true;
         // A different session identity invalidates every cached owner field.
+        self.cache.subagents.deinitOwned(self.a);
         self.cache = .{};
         self.rebuild();
     }
@@ -2307,6 +2570,7 @@ pub const Client = struct {
         self.a.free(self.launcher);
         self.launcher = try self.a.dupe(u8, resolved);
         self.session = null;
+        self.cache.subagents.deinitOwned(self.a);
         self.cache = .{};
         self.dirty = true;
         // The launcher readiness belongs to the new directory's setup owner, so
@@ -4263,6 +4527,172 @@ test "snapshot and settings project into the UI state without pointers" {
     try std.testing.expect(state.models.len == 0);
 }
 
+test "grouped subagent progress updates state without dirtying settings" {
+    var pair = try pairOf(testing.allocator);
+    defer pair.deinit();
+    const client = pair.client;
+
+    try pair.reply(1, "\"available\":true,\"model\":\"m1\",\"provider\":\"deepseek\",\"configured\":1");
+    var settings = try client.readResponse(1, quick_timeout_ms);
+    try client.adoptSettings(settings.object);
+    settings.deinit();
+
+    try pair.reply(2, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    var baseline = try client.readResponse(2, quick_timeout_ms);
+    try client.adoptSnapshot(&baseline);
+    baseline.deinit();
+    client.dirty = false;
+
+    try pair.reply(3, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":1,\"total\":2,\"running\":2,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":10,\"latest_id\":1,\"text\":\"working\"}}");
+    var first = try client.readResponse(3, quick_timeout_ms);
+    try client.adoptSnapshot(&first);
+    first.deinit();
+    client.rebuild();
+    try testing.expect(!client.dirty);
+    try testing.expect(client.cache.subagents_supported);
+    try testing.expect(Client.currentFn(@ptrCast(client)).subagents_supported);
+    try testing.expectEqual(@as(u32, 2), client.cache.subagents.running);
+
+    try pair.reply(4, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":2,\"total\":2,\"running\":1,\"waiting\":0,\"completed\":1,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":250,\"latest_id\":1,\"text\":\"working\"}}");
+    var next = try client.readResponse(4, quick_timeout_ms);
+    try client.adoptSnapshot(&next);
+    next.deinit();
+    client.rebuild();
+    const state = Client.currentFn(@ptrCast(client));
+    try testing.expect(!client.dirty);
+    try testing.expectEqual(@as(u32, 1), client.cache.subagents.completed);
+    try testing.expectEqual(@as(u64, 250), client.cache.subagents.elapsed_ms);
+    try testing.expect(std.meta.eql(client.cache.subagents, state.subagents));
+    try testing.expectEqualStrings("m1", state.model);
+}
+
+test "per-agent status rows merge bounded wire pages by id and revision" {
+    const a = testing.allocator;
+    const Agent = @import("../core/subagent_status.zig").AgentView;
+    const rows = try a.alloc(Agent, 513);
+    defer a.free(rows);
+    for (rows, 0..) |*row, i| {
+        row.* = .{ .id = @intCast(i + 1), .revision = 1, .phase = .running, .text_len = 2048 };
+        @memset(&row.text_buf, '"');
+    }
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const Helper = struct {
+        fn send(client: *Client, all: []const @import("../core/subagent_status.zig").AgentView, group: u64, start: usize) !void {
+            const fixture_allocator = testing.allocator;
+            const end = @min(start + 64, all.len);
+            var out = protocol.Out.init(fixture_allocator);
+            defer out.deinit();
+            try out.ok(1);
+            try protocol.encodeSnapshot(&out, .{
+                .session = @splat('a'),
+                .project = "/tmp",
+                .owner = .daemon,
+                .epoch = 5,
+                .subagents_supported = true,
+                .subagents = .{ .group_id = group, .revision = 1, .total = all.len, .running = all.len, .latest_id = if (all.len == 0) 0 else all.len, .individual_supported = true, .page_offset = start, .page_total = all.len, .agents = all[start..end] },
+            });
+            const bytes = try out.finish();
+            defer fixture_allocator.free(bytes);
+            try testing.expect(bytes.len <= protocol.max_response);
+            const doc = try std.json.parseFromSlice(std.json.Value, fixture_allocator, bytes, .{});
+            var response: Response = .{ .doc = doc, .object = doc.value.object, .a = fixture_allocator };
+            defer response.deinit();
+            try client.adoptSnapshot(&response);
+        }
+    };
+    var offset: usize = 0;
+    while (offset < rows.len) : (offset += 64) try Helper.send(pair.client, rows, 1, offset);
+    try testing.expectEqual(rows.len, pair.client.cache.subagents.agents.len);
+    for (pair.client.cache.subagents.agents, 0..) |row, i| try testing.expectEqual(@as(u64, @intCast(i + 1)), row.id);
+    rows[64].revision = 2;
+    rows[64].text_buf[0] = 'x';
+    try Helper.send(pair.client, rows, 1, 64);
+    try testing.expectEqual(@as(u64, 2), pair.client.cache.subagents.agents[64].revision);
+    try testing.expectEqual(@as(u8, '"'), pair.client.cache.subagents.agents[0].text_buf[0]);
+    try Helper.send(pair.client, rows, 2, 0);
+    try testing.expectEqual(@as(usize, 64), pair.client.cache.subagents.agents.len);
+}
+
+test "per-agent status rows reject malformed page bounds" {
+    const a = testing.allocator;
+    const prefix = "{\"group_id\":1,\"revision\":1,\"total\":1,\"running\":1,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":1,\"latest_id\":1,\"text\":\"\",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":1,\"text\":\"x\"}]";
+    for ([_][]const u8{ ",\"page_offset\":64,\"page_total\":1}", ",\"page_offset\":0,\"page_total\":2}", ",\"page_offset\":0,\"page_total\":\"1\"}" }) |suffix| {
+        const bytes = try std.mem.concat(a, u8, &.{ prefix, suffix });
+        defer a.free(bytes);
+        const doc = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer doc.deinit();
+        try testing.expectError(error.ProtocolError, decodeSubagentView(a, doc.value));
+    }
+}
+
+test "per-agent status rows projection survives cache replacement" {
+    var pair = try pairOf(testing.allocator);
+    defer pair.deinit();
+    const client = pair.client;
+    client.dirty = false;
+    try pair.reply(1, "\"snapshot\":{\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":1,\"total\":1,\"running\":1,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":1,\"latest_id\":1,\"text\":\"x\",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":1,\"text\":\"first\"}]}}");
+    var first = try client.readResponse(1, quick_timeout_ms);
+    try client.adoptSnapshot(&first);
+    first.deinit();
+    client.rebuild();
+    const projection = try client.exportProjection();
+    defer projection.deinit();
+    try pair.reply(2, "\"snapshot\":{\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":0,\"revision\":0,\"total\":0,\"running\":0,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":0,\"latest_id\":0,\"text\":\"\",\"agents\":[]}}");
+    var second = try client.readResponse(2, quick_timeout_ms);
+    try client.adoptSnapshot(&second);
+    second.deinit();
+    client.rebuild();
+    try testing.expect(!client.dirty);
+    try testing.expect(client.cache.subagents.individual_supported);
+    try testing.expectEqualStrings("first", projection.state.subagents.agents[0].latestText());
+    try testing.expectEqualStrings("first", projection.snapshot.subagents.agents[0].latestText());
+}
+
+test "per-agent status rows retain published arenas across repeated allocation failures" {
+    var pair = try pairOf(testing.allocator);
+    defer pair.deinit();
+    const client = pair.client;
+    const Agent = @import("../core/subagent_status.zig").AgentView;
+    const rows = try testing.allocator.alloc(Agent, 64);
+    for (rows, 0..) |*row, i| {
+        row.* = .{ .id = @intCast(i + 1), .revision = 1, .phase = .running, .text_len = 3 };
+        @memcpy(row.text_buf[0..3], "old");
+    }
+    client.cache.subagents = .{ .group_id = 1, .individual_supported = true, .agents = rows };
+    client.rebuild();
+    const published_slot = client.arena_index;
+    const published_revision = client.publication_revision;
+    const inactive = published_slot ^ 1;
+    client.arenas[inactive].deinit();
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    client.arenas[inactive] = .init(failing.allocator());
+    for (0..3) |_| {
+        client.rebuild();
+        try testing.expectEqual(published_slot, client.arena_index);
+        try testing.expectEqual(published_revision, client.publication_revision);
+        try testing.expectEqualStrings("old", client.snap.subagents.agents[0].latestText());
+        try testing.expectEqualStrings("old", client.state.subagents.agents[63].latestText());
+    }
+    client.arenas[inactive].deinit();
+    // A large row clone forces a second backing allocation in buildState,
+    // after buildSnapshot has already succeeded in the unpublished arena.
+    var state_failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2, .resize_fail_index = 0 });
+    client.arenas[inactive] = .init(state_failing.allocator());
+    client.rebuild();
+    try testing.expect(state_failing.has_induced_failure);
+    try testing.expectEqual(published_slot, client.arena_index);
+    try testing.expectEqualStrings("old", client.snap.subagents.agents[0].latestText());
+    try testing.expectEqualStrings("old", client.state.subagents.agents[63].latestText());
+    client.arenas[inactive].deinit();
+    client.arenas[inactive] = .init(testing.allocator);
+    rows[0].text_buf[0] = 'n';
+    client.rebuild();
+    try testing.expectEqual(inactive, client.arena_index);
+    try testing.expectEqualStrings("nld", client.snap.subagents.agents[0].latestText());
+    try testing.expectEqualStrings("nld", client.state.subagents.agents[0].latestText());
+}
+
 test "Memory closeout nonzero view survives response and client projection lifetime" {
     const expected: memory_status.View = .{
         .enabled = true,
@@ -4962,6 +5392,7 @@ test "submit receipts are random non-zero and bound to one unconfirmed session" 
     try std.testing.expectEqual(protocol.Op.snapshot, query.op);
     try std.testing.expectEqual(first.req, try query.u64Field("receipt"));
     const retried = try readSubmitFrame(&first_pair, a);
+    try std.testing.expect(first_client.poll_error != null and first_client.poll_error.? == error.ProtocolError);
     try std.testing.expect(retried.req != 0 and retried.req != first.req);
     try std.testing.expect(first_client.receipt == null);
 
@@ -4997,6 +5428,52 @@ test "submit receipts are random non-zero and bound to one unconfirmed session" 
     try std.testing.expectEqual(second_id, second.id);
     try std.testing.expect(second.req != 0 and second.req != changed.req);
     try std.testing.expectEqual(session_a, second_client.receipt.?.session.?);
+}
+
+test "receipt snapshot error preserves accepted receipt and recovers cache" {
+    const a = testing.allocator;
+    const session_id: ids.Id = "0123456789abcdef0123456789abcdef".*;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+    client.session = session_id;
+
+    try pair.reply(1, "\"snapshot\":{\"busy\":false,\"task\":7,\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    client.refreshSnapshot();
+    const initial_frame = try readFrameJson(&pair, a);
+    defer initial_frame.deinit();
+    const old_cache = client.cache;
+
+    try pair.replyError(2, "busy");
+    try testing.expectError(error.Busy, Client.submitFn(@ptrCast(client), client.epoch, .prompt, "hello"));
+    const submit = try readSubmitFrame(&pair, a);
+    try testing.expect(submit.req != 0);
+
+    try pair.reply(3, "\"snapshot\":{\"busy\":true,\"task\":999,\"memory\":null},\"receipt_known\":true,\"receipt_accepted\":true,\"receipt_task\":42");
+    try Client.submitFn(@ptrCast(client), client.epoch, .prompt, "hello");
+    const query = try readFrameJson(&pair, a);
+    defer query.deinit();
+    try testing.expectEqualStrings("snapshot", query.value.object.get("op").?.string);
+    try testing.expectEqual(submit.req, valueU64(query.value.object.get("receipt").?).?);
+    try expectNoFrame(&pair);
+    try testing.expect(client.receipt == null);
+    try testing.expect(client.suppress != null);
+    try testing.expect(client.poll_error != null and client.poll_error.? == error.ProtocolError);
+    // Confirmation intentionally updates task/busy; the invalid projection
+    // must not publish any of its other data.
+    var confirmed = old_cache;
+    confirmed.busy = true;
+    confirmed.task = 42;
+    confirmed.kind = .prompt;
+    try testing.expect(std.meta.eql(confirmed, client.cache));
+
+    try pair.reply(4, "\"snapshot\":{\"busy\":false,\"task\":55,\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    client.refreshSnapshot();
+    const refresh = try readFrameJson(&pair, a);
+    defer refresh.deinit();
+    try testing.expectEqualStrings("snapshot", refresh.value.object.get("op").?.string);
+    try testing.expectEqual(@as(u64, 55), client.cache.task);
+    try testing.expect(!client.cache.busy);
 }
 
 test "accepted pending receipt is confirmed by query instead of resubmitted" {
@@ -5039,6 +5516,7 @@ test "unknown or evicted pending receipt refuses to resubmit" {
     try std.testing.expectEqual(@as(i64, 777777), query.value.object.get("receipt").?.integer);
     try expectNoFrame(&pair);
     try std.testing.expect(client.receipt != null and client.receipt.?.req == 777777);
+    try std.testing.expect(client.poll_error != null and client.poll_error.? == error.ProtocolError);
     try std.testing.expect(std.mem.indexOf(u8, client.pubcfg.notice orelse "", "not resubmitted") != null);
 
     // A failed query is equally uncertain: keep the pending receipt.

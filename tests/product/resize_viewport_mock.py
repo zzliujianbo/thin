@@ -187,12 +187,12 @@ def run(app, wrap=False, local_command=False):
                 return tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()
 
             def visible(width, height, marker=''):
-                """An end-position composer is anchored to the physical bottom."""
+                """Locate the current end-position composer at the real caret."""
                 state = pane_state(width, height)
                 if state is None:
                     return False
                 y, _x, flag, dead = state
-                if flag != 1 or dead != 0 or y != height - 1:
+                if flag != 1 or dead != 0 or not 0 <= y < height:
                     return False
                 lines = lines_now()
                 if len(lines) != height:
@@ -250,15 +250,15 @@ def run(app, wrap=False, local_command=False):
                 The observation is the current editor region at the real cursor,
                 not scrollback or pixels reflowed by the client: the typed Q must
                 appear there and disappear again with the preserved draft still
-                ending on the physical bottom. Older rows are not replayed.
+                at the real caret. Older rows are not replayed.
                 """
                 tm('send-keys', '-t', 'owned:0.0', '-l', 'Q')
-                wait(lambda: (composer(width, height) or '').endswith(marker + 'Q') and caret()[0] == height - 1, f'fresh {width}x{height} editor did not echo the typed cell at bottom')
+                wait(lambda: (composer(width, height) or '').endswith(marker + 'Q'), f'fresh {width}x{height} editor did not echo the typed cell at the caret')
                 tm('send-keys', '-t', 'owned:0.0', 'BSpace')
 
                 def restored():
                     text = composer(width, height)
-                    return text is not None and text.endswith(marker) and 'Q' not in text and caret()[0] == height - 1
+                    return text is not None and text.endswith(marker) and 'Q' not in text
 
                 wait(restored, f'fresh {width}x{height} frame after BSpace lost the draft')
 
@@ -267,6 +267,9 @@ def run(app, wrap=False, local_command=False):
                 wait(lambda: (root / 'sock').exists(), 'owned emulator startup timed out')
                 tm('new-session', '-d', '-s', 'owned', '-x', '80', '-y', '24', '-c', str(project), shlex.join([app, '--no-model-auto-refresh']))
                 wait(lambda: visible(80, 24), 'initial composer frame not visible at 80x24')
+                initial_y, _ = caret()
+                assert initial_y < 23, 'initial composer was forced to the physical bottom'
+                assert all(not line.strip() for line in lines_now()[initial_y + 1:]), 'unexpected cells below initial composer'
                 tm('send-keys', '-t', 'owned:0.0', '-l', 'long-viewport-draft-abcdefghijklmnopqrstuvwxyz-世界-END')
                 wait(lambda: visible(80, 24, '世界-END'), 'wide-character draft missing')
                 if wrap:
@@ -349,13 +352,15 @@ def run(app, wrap=False, local_command=False):
                 # Passive resize stage: the client owns reflow of already displayed
                 # cells. Thin takes the new dimensions, drops old-frame authority
                 # and resumes on real input; no automatic repair or application
-                # reflow of older rows is required. Fresh frames pin the editor.
+                # reflow of older rows is required. Fresh frames follow the caret.
                 marker = '-UNICODE-END' if wrap else '世界-END'
                 for width, height in ((80, 40), (80, 8), (80, 24), (40, 24), (80, 24)):
                     passive_resize(width, height)
                 for width, height in ((40, 8), (100, 40), (80, 24)):
                     passive_resize(width, height)
                     resume(width, height, marker)
+                    if height == 40:
+                        assert caret()[0] < height - 1, 'enlarging forced the fresh editor to the new bottom'
                 expected_requests = 1 if wrap and not local_command else 0
                 assert OwnedService.requests == expected_requests, 'unexpected resize/draft/helper HTTP'
                 assert OwnedService.failed is None, f'owned loopback assertion failed: {OwnedService.failed}'

@@ -274,7 +274,7 @@ def footer_state(screen):
     Never raises: gates must be able to poll. A layout violation simply fails the
     gate, and assert_footer() then reports the exact rows.
     """
-    if screen.row != len(screen.grid) - 1:
+    if not screen.idle() or not 2 <= screen.row < len(screen.grid):
         return None
     rows = [row_text(screen, i) for i in range(len(screen.grid))]
     hint = rows[screen.row - 1]
@@ -291,7 +291,9 @@ def assert_footer(screen, expected):
     """Exactly one Memory hint between the blank separator and composer row."""
     rows = [row_text(screen, i) for i in range(len(screen.grid))]
     row = screen.row
-    assert row == len(screen.grid) - 1, f'idle composer is not on the physical bottom row ({row})'
+    assert 2 <= row < len(screen.grid), f'idle composer row is out of range ({row})'
+    assert screen.idle(), 'current cursor line is not the idle composer'
+    assert all(text == '' for text in rows[row + 1:]), 'visible rows below composer are not blank'
     hint = rows[row - 1]
     assert rows[row - 2] == '', f'blank separator above the Memory hint is missing: {rows[row - 2]!r}'
     hints = [text for text in rows if text.startswith('Memory:')]
@@ -398,22 +400,23 @@ def run(app, columns):
             Frame authority is the real FRAME_END sequence plus the borrowed
             Screen's settled-composer oracle: never a literal '>' or a sleep.
             """
-            end = capture.rfind(FRAME_END)
-            if end < 0:
+            if not capture.endswith(FRAME_END):
                 return False
-            if capture.find(SYNC_BEGIN, end) >= 0:
-                return False  # a newer frame is still unfinished and owns no authority
+            end = len(capture) - len(FRAME_END)
             previous = capture.rfind(FRAME_END, 0, end)
-            start = previous + len(FRAME_END) if previous >= 0 else 0
-            return capture.find(marker, start, end) >= 0 and screen.idle()
+            start = capture.rfind(SYNC_BEGIN, previous + len(FRAME_END) if previous >= 0 else 0, end)
+            return start >= 0 and capture.find(marker, start, end) >= 0 and screen.idle()
 
         def send(data):
             assert child.poll() is None, 'owned child already exited'
             os.write(master, data)
 
         try:
-            pump_until(lambda: fresh(), 'first acknowledged idle composer')
-            assert screen.row == len(screen.grid) - 1, 'initial composer is not on the physical bottom row'
+            pump_until(lambda: fresh() and footer_state(screen) is None, 'first acknowledged idle composer')
+            assert screen.row in (1, 2), f'initial composer is not near entry ({screen.row})'
+            assert screen.row < len(screen.grid) - 1, 'initial composer is on the physical bottom row'
+            assert all(row_text(screen, i) == '' for i in range(screen.row + 1, len(screen.grid))), \
+                'visible rows below initial composer are not blank'
             pgid = os.getpgid(child.pid)
             assert pgid == child.pid, 'owned child does not lead its own process group'
 
@@ -421,7 +424,7 @@ def run(app, columns):
             # held unanswered on a fixture-owned Event.
             control.expect(PROMPTS[0])
             send(PROMPTS[0].encode() + b'\r')
-            pump_until(lambda: b'answer-one-proof' in capture and footer_state(screen) == ACTIVE,
+            pump_until(lambda: b'answer-one-proof' in capture and fresh() and footer_state(screen) == ACTIVE,
                        'round 1 idle primary with an active Memory footer')
             hint = assert_footer(screen, ACTIVE)
             rows = [row_text(screen, i) for i in range(len(screen.grid))]
@@ -436,7 +439,7 @@ def run(app, columns):
             queued_one = ACTIVE + ' (queued: 1)'
             control.expect(PROMPTS[1])
             send(PROMPTS[1].encode() + b'\r')
-            pump_until(lambda: control.primary == 2 and b'answer-two-proof' in capture and screen.idle()
+            pump_until(lambda: control.primary == 2 and b'answer-two-proof' in capture and fresh()
                        and footer_state(screen) == queued_one,
                        'round 2 primary answer while Memory 1 is blocked')
             assert not control.release1.is_set(), 'Memory 1 was released before round 2 settled'
@@ -465,7 +468,7 @@ def run(app, columns):
             # Empty extraction result: the terminal footer is the documented
             # "no new durable entries" label, not a transcript notice.
             control.release2.set()
-            pump_until(lambda: footer_state(screen) == TERMINAL_SKIPPED and screen.idle(),
+            pump_until(lambda: fresh() and footer_state(screen) == TERMINAL_SKIPPED,
                        'terminal Memory footer "no new durable entries"')
             assert_footer(screen, TERMINAL_SKIPPED)
             assert_no_memory_transcript(screen)
@@ -474,7 +477,8 @@ def run(app, columns):
             # the idle composer must not release a valid response for the job.
             control.expect(PROMPTS[2])
             send(PROMPTS[2].encode() + b'\r')
-            pump_until(lambda: control.helper3_arrived.is_set() and footer_state(screen) == ACTIVE,
+            pump_until(lambda: control.helper3_arrived.is_set() and b'answer-three-proof' in capture
+                       and fresh() and footer_state(screen) == ACTIVE,
                        'round 3 active Memory footer after prompt 3')
             assert b'answer-three-proof' in capture, 'round 3 primary answer is missing'
             assert_footer(screen, ACTIVE)

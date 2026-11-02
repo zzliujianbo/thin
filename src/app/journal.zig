@@ -1364,6 +1364,54 @@ test "diagnostic admission is isolated and unstarted sink is inert" {
     journal.finish();
 }
 
+test "memory evidence rejection journal point retains background origin" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(a, &root, "fake-key");
+    defer journal.deinit();
+    const observer_ = journal.observer();
+    observer_.notify(.{ .submitted = "first" });
+    var sink = journal.memoryDiagnosticSink();
+    sink.memory_job_id = 42;
+    observer_.notify(.{ .event = .{ .finished = .{ .status = .success } } });
+    journal.flush();
+    const path = try a.dupe(u8, journal.store.path());
+    defer a.free(path);
+    sink.emit(.{ .stage = .memory_request, .phase = .point, .span_id = 77, .result = .failed, .candidate_index = 1, .error_name = diagnostics.ErrorName.fromError(error.MemoryEvidenceSensitiveContent) });
+    journal.flush();
+    const content = try root.read(a, path, 0, record_limit);
+    defer a.free(content.data);
+    var lines = std.mem.splitScalar(u8, content.data, '\n');
+    var found = false;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, line, .{});
+        defer parsed.deinit();
+        const row = parsed.value.object;
+        if (!std.mem.eql(u8, row.get("event").?.string, "diagnostic")) continue;
+        const data = row.get("data").?.object;
+        for ([_][]const u8{ "text", "content", "quote", "candidates" }) |key| {
+            try std.testing.expect(row.get(key) == null);
+            try std.testing.expect(data.get(key) == null);
+        }
+        try std.testing.expectEqual(@as(i64, 1), row.get("turn").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), data.get("origin_turn").?.integer);
+        try std.testing.expectEqual(@as(i64, 42), data.get("memory_job_id").?.integer);
+        try std.testing.expectEqual(@as(i64, 77), data.get("span_id").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), data.get("candidate_index").?.integer);
+        try std.testing.expectEqualStrings("memory_request", data.get("stage").?.string);
+        try std.testing.expectEqualStrings("point", data.get("phase").?.string);
+        try std.testing.expectEqualStrings("failed", data.get("result").?.string);
+        try std.testing.expectEqualStrings("MemoryEvidenceSensitiveContent", data.get("error_name").?.string);
+        try std.testing.expect(!found);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "diagnostic end preserves safe decision timeout cause" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

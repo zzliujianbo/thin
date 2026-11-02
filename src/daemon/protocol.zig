@@ -844,6 +844,14 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try encodeField(&out, "id", view.fields.id);
             try out.endObject();
             try encodeProgress(&out, "wprog", view.write_progress);
+            if (view.subagent_progress) |progress| {
+                var n = @min(progress.len, 2048);
+                if (n < progress.len) {
+                    while (n > 0 and (progress[n] & 0xc0) == 0x80) n -= 1;
+                    truncated = true;
+                }
+                try out.field("sprog", progress[0..n]);
+            } else try out.field("sprog", @as(?[]const u8, null));
         },
         .permission => |value| {
             try out.field("t", "permission");
@@ -1001,6 +1009,8 @@ pub const Snapshot = struct {
     provider: ?[]const u8 = null,
     codex_login: codex_login.View = .{},
     memory: memory_status.View = .{},
+    subagents: @import("../core/subagent_status.zig").View = .{},
+    subagents_supported: bool = false,
     read_only: bool = false,
     truncated: bool = false,
 };
@@ -1051,8 +1061,43 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
     try out.field("failure", if (snapshot.codex_login.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
     try out.endObject();
     try encodeMemoryView(out, snapshot.memory);
+    if (snapshot.subagents_supported) try encodeSubagentView(out, snapshot.subagents);
     try out.field("read_only", snapshot.read_only);
     try out.field("truncated", snapshot.truncated);
+    try out.endObject();
+}
+
+pub fn encodeSubagentView(out: *Out, view: @import("../core/subagent_status.zig").View) !void {
+    try out.beginObject("subagents");
+    try out.field("group_id", view.group_id);
+    try out.field("revision", view.revision);
+    try out.field("total", view.total);
+    try out.field("running", view.running);
+    try out.field("waiting", view.waiting);
+    try out.field("completed", view.completed);
+    try out.field("failed", view.failed);
+    try out.field("canceled", view.canceled);
+    try out.field("paused", view.paused);
+    try out.field("elapsed_ms", view.elapsed_ms);
+    try out.field("latest_id", view.latest_id);
+    try out.field("text", view.latestText());
+    if (view.individual_supported) {
+        if (view.page_offset) |offset| {
+            try out.field("page_offset", offset);
+            try out.field("page_total", view.page_total);
+        }
+        try out.beginArray("agents");
+        for (view.agents) |agent| {
+            try out.beginObjectElement();
+            try out.field("id", agent.id);
+            try out.field("revision", agent.revision);
+            try out.field("phase", @tagName(agent.phase));
+            try out.field("elapsed_ms", agent.elapsed_ms);
+            try out.field("text", agent.latestText());
+            try out.endObject();
+        }
+        try out.endArray();
+    }
     try out.endObject();
 }
 
@@ -1230,6 +1275,12 @@ fn decodeProgress(object: std.json.ObjectMap, name: []const u8) !?write_preview.
     };
 }
 
+fn decodeSubagentProgress(object: std.json.ObjectMap) !?[]const u8 {
+    const value = try optionalText(object, "sprog");
+    if (value) |text| if (text.len > 2048) return error.BadRequest;
+    return value;
+}
+
 fn decodeFileStats(object: std.json.ObjectMap, name: []const u8) !?line_stats.File {
     const inner = (try optionalObject(object, name)) orelse return null;
     const changes: ?line_stats.Changes = if (try optionalObject(inner, "changes")) |value| .{
@@ -1364,6 +1415,7 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
             .name = try requireText(object, "name"),
             .fields = try decodeFields(object, "fields"),
             .write_progress = try decodeProgress(object, "wprog"),
+            .subagent_progress = try decodeSubagentProgress(object),
             .ready = try optionalBool(object, "ready") orelse false,
         } };
     } else if (std.mem.eql(u8, kind, "tool_started")) {
@@ -1519,6 +1571,44 @@ fn expectEventRoundTrip(a: std.mem.Allocator, event: r.Event) !void {
     const second = try encodeEvent(a, decoded.event);
     defer a.free(second);
     try std.testing.expectEqualStrings(first, second);
+}
+
+test "subagent tool progress roundtrip and malformed wire" {
+    const a = std.testing.allocator;
+    const values = [_]?[]const u8{ null, "", "first\n第二行\t\x01" };
+    for (values) |value| {
+        const event: r.Event = .{ .tool_view = .{
+            .key = .{ .generation = std.math.maxInt(u64), .index = 3 },
+            .name = "subagent",
+            .fields = .{ .id = .{ .text = "job-7" } },
+            .subagent_progress = value,
+        } };
+        const bytes = try encodeEvent(a, event);
+        defer a.free(bytes);
+        var decoded = try decodeEvent(a, bytes);
+        defer decoded.deinit();
+        const view = decoded.event.tool_view;
+        try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), view.key.generation);
+        try std.testing.expectEqual(@as(usize, 3), view.key.index);
+        try std.testing.expectEqualStrings("job-7", view.fields.id.?.text);
+        if (value) |expected| try std.testing.expectEqualStrings(expected, view.subagent_progress.?) else try std.testing.expect(view.subagent_progress == null);
+        try expectEventRoundTrip(a, event);
+    }
+    const long = try a.alloc(u8, 2050);
+    defer a.free(long);
+    @memset(long, 'x');
+    const clipped = try encodeEvent(a, .{ .tool_view = .{ .key = .{ .generation = 1, .index = 0 }, .name = "subagent", .subagent_progress = long } });
+    defer a.free(clipped);
+    var bounded = try decodeEvent(a, clipped);
+    defer bounded.deinit();
+    try std.testing.expect(bounded.display_truncated);
+    try std.testing.expectEqual(@as(usize, 2048), bounded.event.tool_view.subagent_progress.?.len);
+    for ([_][]const u8{
+        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"sprog\":1}",
+        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"sprog\":{}}",
+        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1.0,\"idx\":0,\"sprog\":null}",
+        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0.0,\"sprog\":null}",
+    }) |json| try std.testing.expectError(error.BadRequest, decodeEvent(a, json));
 }
 
 test "every runtime display event round-trips through the wire" {

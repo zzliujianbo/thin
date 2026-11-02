@@ -798,6 +798,150 @@ test "memory reference preserves latest primary usage while input safety estimat
     }
 }
 
+test "canceled context preserves only missing cancellation usage and remains per call" {
+    const Fake = struct {
+        const Mode = enum { thrown_cancel, canceled_empty, canceled_input, canceled_total, canceled_zero, other_error, success_missing };
+        mode: Mode,
+        calls: usize = 0,
+        fn call(raw: *anyopaque, a: std.mem.Allocator, _: p.Request, sink: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls > 2) return error.UnexpectedRequest;
+            if (self.calls == 2) return .{ .success = .{
+                .finish = .stop,
+                .message = try p.textMessage(a, .assistant, "answer"),
+                .usage = .{ .input_tokens = 20, .output_tokens = 7 },
+            } };
+            // Stream usage is deliberately not authoritative.
+            try sink.emit(.{ .usage = .{ .input_tokens = 999 } });
+            return switch (self.mode) {
+                .thrown_cancel => error.Canceled,
+                .other_error => error.UnexpectedRequest,
+                .canceled_empty => .{ .failure = .{ .kind = .canceled, .message = "canceled" } },
+                .canceled_input => .{ .failure = .{ .kind = .canceled, .message = "canceled", .usage = .{ .input_tokens = 50 } } },
+                .canceled_total => .{ .failure = .{ .kind = .canceled, .message = "canceled", .usage = .{ .input_tokens = 10, .output_tokens = 5 } } },
+                .canceled_zero => .{ .failure = .{ .kind = .canceled, .message = "canceled", .usage = .{ .total_tokens = 0 } } },
+                .success_missing => .{ .success = .{ .finish = .stop, .message = try p.textMessage(a, .assistant, "answer") } },
+            };
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !Prepared {
+            return error.UnexpectedTool;
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: Prepared, _: *const p.Cancellation) !Execution {
+            return error.UnexpectedTool;
+        }
+    };
+    for ([_]Fake.Mode{ .thrown_cancel, .canceled_empty, .canceled_input, .canceled_total, .canceled_zero, .other_error, .success_missing }) |mode| {
+        for ([_]?u64{ 1234, 0, null }) |prior| {
+            var fake: Fake = .{ .mode = mode };
+            var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
+            config.limits.low_price_input = false;
+            config.limits.compaction_enabled = false;
+            var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
+            defer runtime.deinit();
+            runtime.last_context_tokens = prior;
+            const before = runtime.estimatedTokens();
+            var cancel: p.Cancellation = .{};
+            const terminal = try runtime.run("A retained user request with enough text to increase the safety estimate independently of the display count.", &cancel);
+            const expected: ?u64 = switch (mode) {
+                .thrown_cancel, .canceled_empty, .canceled_input => prior,
+                .canceled_total => 15,
+                .canceled_zero => 0,
+                .other_error, .success_missing => null,
+            };
+            const status: Status = switch (mode) {
+                .other_error => .failed,
+                .success_missing => .success,
+                else => .canceled,
+            };
+            try std.testing.expectEqual(status, terminal.status);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            try std.testing.expectEqual(expected, runtime.last_context_tokens);
+            try std.testing.expectEqualDeep(runtime.contextSnapshot(), terminal.context_snapshot.?);
+            try std.testing.expectEqual(expected != null, terminal.context_snapshot.?.known);
+            try std.testing.expectEqual(expected orelse 0, terminal.context_snapshot.?.tokens);
+            try std.testing.expect(runtime.estimatedTokens() > before);
+            if (mode == .canceled_input) try std.testing.expectEqual(@as(?u64, 50), terminal.usage.normal.input_tokens);
+            const next = try runtime.run("next request", &cancel);
+            try std.testing.expectEqual(Status.success, next.status);
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            try std.testing.expectEqual(@as(?u64, 27), runtime.last_context_tokens);
+            try std.testing.expectEqualDeep(runtime.contextSnapshot(), next.context_snapshot.?);
+        }
+    }
+}
+
+test "subagent tool progress uses executing key and is absent outside execution" {
+    const Fake = struct {
+        runtime: *Runtime = undefined,
+        calls: usize = 0,
+        starts: usize = 0,
+        results: usize = 0,
+        progress: usize = 0,
+        bad: bool = false,
+        key: ?p.ToolDisplayKey = null,
+        fn call(raw: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{
+                .{ .tool_call = .{ .id = "first", .name = "get_subagent_result", .arguments = "{\"id\":\"child-a\"}" } },
+                .{ .tool_call = .{ .id = "second", .name = "other", .arguments = "{}" } },
+            } }, .finish = .tool_calls } };
+            return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} }, .finish = .stop, .usage = .{ .input_tokens = 30, .output_tokens = 5 } } };
+        }
+        fn prepare(raw: *anyopaque, _: std.mem.Allocator, call_: p.ToolCall) !Prepared {
+            return .{ .payload = raw, .description = call_.name };
+        }
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, prepared: Prepared, cancel: *const p.Cancellation) !Execution {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.runtime.publishSubagentProgress("child-a", if (std.mem.eql(u8, prepared.description, "other")) "wrong" else "working", cancel);
+            return .{ .text = "ok" };
+        }
+        fn emit(raw: ?*anyopaque, event: Event, _: *const p.Cancellation) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (event) {
+                .tool_started => |started| {
+                    self.starts += 1;
+                    if (started.started_ms == null or started.display_key == null) self.bad = true;
+                    if (self.starts == 1) self.key = started.display_key;
+                },
+                .tool_view => |view| if (view.subagent_progress) |text| {
+                    self.progress += 1;
+                    const key = self.key orelse {
+                        self.bad = true;
+                        return;
+                    };
+                    if (self.starts != 1 or self.results != 0 or !view.ready or
+                        !std.mem.eql(u8, view.name, "get_subagent_result") or
+                        !std.mem.eql(u8, text, "working") or view.fields.id == null or
+                        !std.mem.eql(u8, view.fields.id.?.text, "child-a") or
+                        !std.meta.eql(key, view.key)) self.bad = true;
+                },
+                .tool_result => self.results += 1,
+                else => {},
+            }
+        }
+    };
+    var fake: Fake = .{};
+    var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
+    config.limits.low_price_input = false;
+    config.limits.compaction_enabled = false;
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{ .context = &fake, .emit_fn = Fake.emit }, "");
+    defer runtime.deinit();
+    fake.runtime = &runtime;
+    var cancel: p.Cancellation = .{};
+    runtime.publishSubagentProgress("child-a", "outside", &cancel);
+    const terminal = try runtime.run("exercise tools", &cancel);
+    runtime.publishSubagentProgress("child-a", "late", &cancel);
+    try std.testing.expectEqual(Status.success, terminal.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.starts);
+    try std.testing.expectEqual(@as(usize, 2), fake.results);
+    try std.testing.expectEqual(@as(usize, 1), fake.progress);
+    try std.testing.expect(!fake.bad);
+    try std.testing.expectEqualDeep(runtime.contextSnapshot(), terminal.context_snapshot.?);
+    try std.testing.expectEqual(@as(u64, 35), terminal.context_snapshot.?.tokens);
+}
+
 test "system prompt carries approach, completion and UI constraints with quoted startup memory" {
     const Stub = struct {
         fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
@@ -882,6 +1026,8 @@ pub const Runtime = struct {
     permission_id: u64 = 0,
     display_generation: u64 = 0,
     display_links: tool_stream.Links = .{},
+    active_display_tool: ?struct { key: p.ToolDisplayKey, name: []const u8 } = null,
+
     /// 本轮用户输入在 history 中的起始下标，压缩规划时需保护该区段（规则见 context.plan）。
     protected_index: usize = 0,
     /// 存在无法安全继续的状态（清理失败、无法补全 tool_result）；置位后拒绝后续 run。
@@ -1877,7 +2023,7 @@ pub const Runtime = struct {
             task.countRound();
             // 调用模型；协议选择与降级由 selector 处理。
             const result = self.selector.call(self.checkedModel(), result_arena.allocator(), try self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
-                self.last_context_tokens = null;
+                if (err != error.Canceled) self.last_context_tokens = null;
                 return err;
             };
 
@@ -1993,6 +2139,13 @@ pub const Runtime = struct {
         };
     }
 
+    /// Parent control thread only; strings are borrowed until the host returns.
+    pub fn publishSubagentProgress(self: *Runtime, id: []const u8, text: []const u8, cancel: *const p.Cancellation) void {
+        const active = self.active_display_tool orelse return;
+        if (!std.mem.eql(u8, active.name, "get_subagent_result") or text.len > 2048 or !std.unicode.utf8ValidateSlice(text)) return;
+        self.emit(.{ .tool_view = .{ .key = active.key, .name = active.name, .fields = .{ .id = .{ .text = id } }, .ready = true, .subagent_progress = text } }, cancel) catch {};
+    }
+
     fn beginToolViews(self: *Runtime, cancel: *const p.Cancellation) void {
         self.display_generation +%= 1;
         self.display_links = .{ .generation = self.display_generation };
@@ -2077,7 +2230,12 @@ pub const Runtime = struct {
         if (result.calls != 0) {
             // Store the FINAL attempt before any fallible host notification.
             // A fallback's first attempt is accounted, not added to this display.
-            self.last_context_tokens = usage.total();
+            const total = usage.total();
+            const canceled_without_total = purpose == .normal and total == null and switch (result.outcome) {
+                .failure => |failure| failure.kind == .canceled,
+                .success => false,
+            };
+            if (!canceled_without_total) self.last_context_tokens = total;
             task.terminal.usage.add(purpose, usage);
             // 用真实 input_tokens 校准估算。
             self.estimator.observe(raw, usage.input_tokens);
@@ -2575,6 +2733,8 @@ pub const Runtime = struct {
 
                 // 执行错误转为 is_error 结果而不是 run 失败；Canceled 标记为 canceled。
                 started_call = call.id;
+                self.active_display_tool = if (display_key) |key| .{ .key = key, .name = call.name } else null;
+                defer self.active_display_tool = null;
                 result = self.executeCancelable(a, prepared, cancel) catch |err| .{
                     .text = @errorName(err),
                     .is_error = true,

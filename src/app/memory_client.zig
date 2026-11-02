@@ -205,7 +205,27 @@ pub const Client = struct {
             else => return error.InvalidMemoryOutput,
         };
         // Validate into wipeable scratch before publishing a fully owned batch.
-        _ = try codec.parse(a, material, text.items);
+        var rejection: ?knowledge.EvidenceRejection = null;
+        _ = codec.parseWithRejection(a, material, text.items, &rejection) catch |err| {
+            if (err == error.InvalidMemoryEvidence) if (rejection) |report| {
+                const safe_error: anyerror = switch (report.reason) {
+                    .assistant_source => error.MemoryEvidenceAssistantSource,
+                    .quote_mismatch => error.MemoryEvidenceQuoteMismatch,
+                    .sensitive_source => error.MemoryEvidenceSensitiveSource,
+                    .sensitive_content => error.MemoryEvidenceSensitiveContent,
+                    .sensitive_quote => error.MemoryEvidenceSensitiveQuote,
+                };
+                if (span.record.span_id != 0) span.sink.emit(.{
+                    .stage = .memory_request,
+                    .phase = .point,
+                    .span_id = span.record.span_id,
+                    .result = .failed,
+                    .candidate_index = report.candidate_index,
+                    .error_name = diag.ErrorName.fromError(safe_error),
+                });
+            };
+            return err;
+        };
         try self.check(cancel);
         const result = try codec.parse(out, material, text.items);
         errdefer codec.freeCandidates(out, result);
@@ -232,6 +252,7 @@ const Fake = struct {
     calls: usize = 0,
     mode: enum { empty, failure, cancel, tool, thrown, canceled_cleanup, partial_usage, partial, reasoning, oversized, replay, wrong_scope } = .empty,
     client: ?*Client = null,
+    body_override: ?[]const u8 = null,
     fn invoke(raw: *anyopaque, a: std.mem.Allocator, request: p.Request, sink: p.ModelSink) !p.Outcome {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.calls += 1;
@@ -251,7 +272,7 @@ const Fake = struct {
         if (self.mode == .thrown or self.mode == .canceled_cleanup) return error.CleanupFailed;
         if (self.mode == .failure) return .{ .failure = .{ .kind = .output_limit, .message = "synthetic", .usage = usage, .http_status = 429 } };
         if (self.mode == .tool) return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{} }, .finish = .tool_calls, .usage = usage } };
-        const body = if (self.mode == .partial) "{\"items\":[" else "{\"items\":[]}";
+        const body = self.body_override orelse if (self.mode == .partial) "{\"items\":[" else "{\"items\":[]}";
         var msg = try p.textMessage(a, .assistant, body);
         if (self.mode == .reasoning) msg.blocks = try a.dupe(p.Block, &.{ .{ .reasoning = "Do not save this thought" }, .{ .text = body } });
         if (self.mode == .replay or self.mode == .wrong_scope) {
@@ -323,6 +344,72 @@ test "memory client unrequested proxy transport closes cleanly without a child" 
     const proxy = if (client.transport) |*transport| if (transport.proxy_http) |*value| value else return error.TestUnexpectedResult else return error.TestUnexpectedResult;
     try std.testing.expect(proxy.unreaped_pid == null and !proxy.poisoned);
 }
+test "memory evidence rejection client emits safe point only for evidence" {
+    const Capture = struct {
+        records: [16]diag.Record = undefined,
+        len: usize = 0,
+        fn next(_: ?*anyopaque) u64 {
+            return 7;
+        }
+        fn emit(raw: ?*anyopaque, record: diag.Record) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.records[self.len] = record;
+            self.len += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const client = try Client.create(a, std.testing.io, testConfig(), &env);
+    defer client.deinit();
+    var capture: Capture = .{};
+    client.diagnostics = .{ .context = &capture, .emit_fn = Capture.emit, .next_fn = Capture.next, .origin = .{ .turn = 23, .began_ms = 10 }, .memory_job_id = 42 };
+    var fake: Fake = .{ .client = client };
+    client.model_override = .{ .context = &fake, .call_fn = Fake.invoke };
+    var cancel: p.Cancellation = .{};
+    const cases = [_]struct { body: []const u8, label: []const u8, index: u32 }{
+        .{ .body = "{\"items\":[{\"category\":\"preferences\",\"topic\":\"first\",\"content\":\"Prefer Zig\",\"source_id\":0,\"quote\":\"Prefer Zig\"},{\"category\":\"preferences\",\"topic\":\"second\",\"content\":\"Other\",\"source_id\":0,\"quote\":\"missing\"}]}", .label = "MemoryEvidenceQuoteMismatch", .index = 1 },
+        .{ .body = "{\"items\":[{\"category\":\"preferences\",\"topic\":\"first\",\"content\":\"password=synthetic-sensitive-body-sentinel\",\"source_id\":0,\"quote\":\"Prefer Zig\"}]}", .label = "MemoryEvidenceSensitiveContent", .index = 0 },
+    };
+    for (cases, 0..) |case, i| {
+        capture.len = 0;
+        fake.body_override = case.body;
+        try std.testing.expectError(error.InvalidMemoryEvidence, client.service().extract(a, fixture, &cancel));
+        try std.testing.expectEqual(@as(usize, 3), capture.len);
+        const point = capture.records[1];
+        try std.testing.expectEqual(diag.Phase.point, point.phase);
+        try std.testing.expectEqual(diag.Stage.memory_request, point.stage);
+        try std.testing.expectEqual(diag.Result.failed, point.result.?);
+        try std.testing.expectEqual(case.index, point.candidate_index.?);
+        try std.testing.expectEqualStrings(case.label, point.error_name.?.name());
+        try std.testing.expectEqual(capture.records[0].span_id, point.span_id);
+        try std.testing.expectEqual(capture.records[2].span_id, point.span_id);
+        try std.testing.expectEqual(@as(u64, 23), point.origin.?.turn);
+        try std.testing.expectEqual(@as(u64, 42), point.memory_job_id.?);
+        try std.testing.expectEqual(diag.Phase.end, capture.records[2].phase);
+        try std.testing.expectEqualStrings("InvalidMemoryEvidence", capture.records[2].error_name.?.name());
+        try std.testing.expectEqual(@as(?u32, 1), capture.records[0].count);
+        try std.testing.expectEqual(@as(?u32, 1), capture.records[2].count);
+        try std.testing.expect(point.count == null);
+        try std.testing.expectEqual(i + 1, fake.calls);
+        try std.testing.expectEqual(@as(?u64, 17), client.last_usage.input_tokens);
+    }
+    capture.len = 0;
+    fake.body_override = "{\"items\":[]}";
+    const result = try client.service().extract(a, fixture, &cancel);
+    defer codec.freeCandidates(a, result);
+    try std.testing.expectEqual(@as(usize, 2), capture.len);
+    capture.len = 0;
+    fake.body_override = "{";
+    try std.testing.expectError(error.InvalidMemoryOutput, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectEqual(@as(usize, 2), capture.len);
+    capture.len = 0;
+    fake.body_override = null;
+    fake.mode = .cancel;
+    try std.testing.expectError(error.Canceled, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectEqual(@as(usize, 2), capture.len);
+}
+
 test "memory request diagnostics preserve success failure decode and cancellation" {
     const Capture = struct {
         records: [32]diag.Record = undefined,

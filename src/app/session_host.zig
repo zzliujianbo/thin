@@ -1200,9 +1200,26 @@ pub const SessionHost = struct {
             .provider = if (state.provider) |provider| provider.slug() else null,
             .codex_login = self.codexView(),
             .memory = state.memory,
+            .subagents = state.subagents,
+            .subagents_supported = state.subagents_supported,
             .read_only = self.session.read_only,
             .truncated = self.fatal != null or self.reset_failed != null or self.history.evicted_through != 0 or self.partial_text.truncated or self.partial_reasoning.truncated,
         };
+    }
+
+    const SubagentPage = struct { next: u64, group: u64 };
+
+    fn pageSnapshot(snapshot: *protocol.Snapshot, requested: u64, group: ?u64) SubagentPage {
+        const view = &snapshot.subagents;
+        if (!snapshot.subagents_supported or !view.individual_supported) return .{ .next = 0, .group = view.group_id };
+        const total = view.agents.len;
+        const start: usize = if (group != null and group.? != view.group_id) 0 else @intCast(@min(requested, total));
+        const aligned = if (start % 64 == 0 and (start < total or start == 0)) start else 0;
+        const end = @min(total, aligned + 64);
+        view.page_offset = aligned;
+        view.page_total = total;
+        view.agents = view.agents[aligned..end];
+        return .{ .next = if (end < total) end else 0, .group = view.group_id };
     }
 
     /// `snapshot` may carry `receipt:u64` to read the disposition of an earlier
@@ -1218,7 +1235,13 @@ pub const SessionHost = struct {
         // Inbox snapshot supplies the counts, the revision and the preview text.
         const queue = self.inbox.snapshot();
         var previews: [protocol.max_previews]protocol.QueuePreview = undefined;
-        try protocol.encodeSnapshot(&out, self.snapshotFor(connection_id, &queue, previews[0..]));
+        const row_cursor = request.optionalU64("row_cursor") catch return errorReply(a, request.id, error.BadRequest);
+        const row_group = request.optionalU64("row_group") catch return errorReply(a, request.id, error.BadRequest);
+        if ((row_cursor == null) != (row_group == null)) return errorReply(a, request.id, error.BadRequest);
+        if (row_cursor) |cursor| if (cursor % 64 != 0) return errorReply(a, request.id, error.BadRequest);
+        var snapshot = self.snapshotFor(connection_id, &queue, previews[0..]);
+        _ = pageSnapshot(&snapshot, row_cursor orelse 0, row_group);
+        try protocol.encodeSnapshot(&out, snapshot);
         const receipt_id = request.optionalU64("receipt") catch return errorReply(a, request.id, error.BadRequest);
         if (receipt_id) |id| {
             const known = self.receipt(id);
@@ -1276,13 +1299,26 @@ pub const SessionHost = struct {
         task: u64,
         codex: codex_login.View,
         memory: @import("../core/memory_status.zig").View = .{},
+        subagents: @import("../core/subagent_status.zig").View = .{},
+        subagents_supported: bool = false,
+        subagent_rows_hash: u64 = 0,
 
         pub fn eql(left: WatchStamp, right: WatchStamp) bool {
             // sequence is a coverage watermark, not a snapshot invalidation.
             return left.revision == right.revision and
-                left.queue_revision == right.queue_revision and left.task == right.task and std.meta.eql(left.codex, right.codex) and std.meta.eql(left.memory, right.memory);
+                left.queue_revision == right.queue_revision and left.task == right.task and std.meta.eql(left.codex, right.codex) and std.meta.eql(left.memory, right.memory) and @import("../core/subagent_status.zig").View.eql(left.subagents, right.subagents) and left.subagent_rows_hash == right.subagent_rows_hash and left.subagents_supported == right.subagents_supported;
         }
     };
+
+    test "grouped subagent progress changes watch stamp" {
+        const base: WatchStamp = .{ .sequence = 0, .revision = 0, .queue_revision = 0, .task = 0, .codex = .{} };
+        var next = base;
+        next.subagents.group_id = 1;
+        next.subagents.total = 1;
+        next.subagents.running = 1;
+        next.subagents.latest_id = 1;
+        try std.testing.expect(!base.eql(next));
+    }
 
     /// A stream is a view of an EXISTING controller, never a way to acquire it.
     /// The worker must additionally bind the stream's kernel peer PID to the
@@ -1346,13 +1382,28 @@ pub const SessionHost = struct {
 
     pub fn watchStamp(self: *SessionHost) WatchStamp {
         const queue = self.inbox.snapshot();
+        const state = self.connection.current();
+        var subagents = state.subagents;
+        var hash = std.hash.Wyhash.init(0);
+        for (subagents.agents) |row| {
+            hash.update(std.mem.asBytes(&row.id));
+            hash.update(std.mem.asBytes(&row.revision));
+            hash.update(&.{@backingInt(row.phase)});
+            hash.update(std.mem.asBytes(&row.elapsed_ms));
+            hash.update(row.latestText());
+        }
+        const rows_hash = hash.final();
+        subagents.agents = &.{};
         return .{
             .sequence = self.next_seq -| 1,
             .revision = self.view_revision,
             .queue_revision = queue.revision,
             .task = if (self.task) |task_| task_.id else 0,
             .codex = self.codexView(),
-            .memory = self.connection.current().memory,
+            .memory = state.memory,
+            .subagents = subagents,
+            .subagent_rows_hash = rows_hash,
+            .subagents_supported = state.subagents_supported,
         };
     }
 
@@ -1360,6 +1411,12 @@ pub const SessionHost = struct {
     /// snapshot and baseline then describe the same display watermark. Each is
     /// independently bounded by max_response (not an oversized nested frame).
     pub fn watchSnapshot(self: *SessionHost, a: std.mem.Allocator, id: u64, epoch: u64) ![]u8 {
+        return (try self.watchSnapshotPage(a, id, epoch, 0, null)).frame;
+    }
+
+    pub const WatchSnapshotPage = struct { frame: []u8, next: u64, group: u64 };
+
+    pub fn watchSnapshotPage(self: *SessionHost, a: std.mem.Allocator, id: u64, epoch: u64, row_cursor: u64, row_group: ?u64) !WatchSnapshotPage {
         const control_id = try self.watchOwner(epoch);
         var out = protocol.Out.init(a);
         defer out.deinit();
@@ -1369,8 +1426,10 @@ pub const SessionHost = struct {
         try out.field("through", self.next_seq -| 1);
         const queue = self.inbox.snapshot();
         var previews: [protocol.max_previews]protocol.QueuePreview = undefined;
-        try protocol.encodeSnapshot(&out, self.snapshotFor(control_id, &queue, &previews));
-        return replyFrame(&out);
+        var snapshot = self.snapshotFor(control_id, &queue, &previews);
+        const page = pageSnapshot(&snapshot, row_cursor, row_group);
+        try protocol.encodeSnapshot(&out, snapshot);
+        return .{ .frame = try replyFrame(&out), .next = page.next, .group = page.group };
     }
 
     pub fn watchBaseline(self: *SessionHost, a: std.mem.Allocator, id: u64, epoch: u64) ![]u8 {
@@ -1871,6 +1930,7 @@ pub const SessionHost = struct {
         try encodeProxyModels(&out, state.proxy_models);
         try out.field("memory_auto", state.memory_auto);
         try protocol.encodeMemoryView(&out, state.memory);
+        // Dynamic child rows belong to snapshots, not the settings reply.
         try out.field("decision_enabled", state.decision_enabled);
         try out.field("decision_model", state.decision_model);
         try out.field("global_settings_available", state.global_settings_available);
@@ -3315,6 +3375,34 @@ test "accepted queue entries are kept and paused when no runtime can start them"
         if (std.mem.indexOf(u8, entry.json, "next step") != null) rendered += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), rendered);
+}
+
+test "per-agent status rows snapshot pages retain every row" {
+    const a = std.testing.allocator;
+    const Agent = @import("../core/subagent_status.zig").AgentView;
+    const rows = try a.alloc(Agent, 130);
+    defer a.free(rows);
+    for (rows, 0..) |*row, i| row.* = .{ .id = @intCast(i + 1), .phase = .running };
+    const source: protocol.Snapshot = .{ .session = @splat('a'), .project = "/tmp", .owner = .daemon, .subagents_supported = true, .subagents = .{ .group_id = 7, .revision = 1, .total = rows.len, .running = rows.len, .latest_id = rows.len, .agents = rows, .individual_supported = true } };
+    var offset: u64 = 0;
+    var seen: usize = 0;
+    while (true) {
+        var snapshot = source;
+        const page = SessionHost.pageSnapshot(&snapshot, offset, 7);
+        try std.testing.expectEqual(offset, snapshot.subagents.page_offset.?);
+        try std.testing.expect(snapshot.subagents.agents.len <= 64);
+        for (snapshot.subagents.agents) |row| {
+            seen += 1;
+            try std.testing.expectEqual(@as(u64, @intCast(seen)), row.id);
+        }
+        if (page.next == 0) break;
+        offset = page.next;
+    }
+    try std.testing.expectEqual(rows.len, seen);
+    var replacement = source;
+    const restarted = SessionHost.pageSnapshot(&replacement, 64, 6);
+    try std.testing.expectEqual(@as(u64, 0), replacement.subagents.page_offset.?);
+    try std.testing.expectEqual(@as(u64, 64), restarted.next);
 }
 
 // Regression: the snapshot reply used to encode a `Snapshot` whose preview

@@ -387,9 +387,9 @@ async function scenario(name, protocol, kind, isPty = false) {
         assert.equal(protocol, 'chat');
         res.writeHead(200, {'content-type':'text/event-stream', 'cache-control':'no-cache'});
         const chunk = delta => res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta,finish_reason:null}]})}\n\n`);
-        chunk({reasoning_content:'thinking-old-one\n# **thinking-old-two**\n- `thinking-old-three`\nreasoning-stage-one'});
+        chunk({reasoning_content:'thinking-old-one\n# **thinking-old-two**\n- `thinking-old-three`\n# **reasoning-stage-one** with `literal`'});
         await new Promise(resolve=>setTimeout(resolve,450));
-        chunk({reasoning_content:'\nthinking-new-five\nthinking-new-six\nreasoning-stage-two'});
+        chunk({reasoning_content:'\nthinking-new-five\nthinking-new-six\n# **reasoning-stage-two** with `literal`'});
         await new Promise(resolve=>setTimeout(resolve,600));
         chunk({content:'# Orange heading\n\n**stream-stage-one** and [link](https://example.org) with `inline-marker`\n\n> quote-marker\n\n'});
         await new Promise(resolve=>setTimeout(resolve,600));

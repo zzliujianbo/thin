@@ -290,6 +290,10 @@ pub const App = struct {
         return self.memory_coordinator.view();
     }
 
+    pub fn subagentView(self: *App) @import("../core/subagent_status.zig").View {
+        return self.subagent.view();
+    }
+
     pub fn drainMemory(self: *App, cancel: *const @import("../core/protocol.zig").Cancellation) void {
         self.memory_coordinator.drain(cancel);
     }

@@ -12,6 +12,8 @@ pub const View = struct {
     fields: preview.Snapshot = .{},
     write_progress: ?write_preview.Progress = null,
     ready: bool = false,
+    /// Borrowed display-only child activity, at most 2048 UTF-8 bytes.
+    subagent_progress: ?[]const u8 = null,
 };
 pub const Digest = [32]u8;
 pub fn digest(value: []const u8) Digest {

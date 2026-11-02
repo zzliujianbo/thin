@@ -311,6 +311,7 @@ pub const Session = struct {
     /// Identity snapshot only: App publishes process-lifetime static notices.
     /// Never retain or inspect worker-owned mutable Runtime state here.
     last_memory_view: @import("../core/memory_status.zig").View = .{},
+    last_subagent_view: @import("../core/subagent_status.zig").View = .{ .individual_supported = true },
     active_context_official: bool = false,
     display_origins: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
     display_disabled: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
@@ -580,6 +581,7 @@ pub const Session = struct {
 
     /// 必须等 TUI 取消并 join worker 后再释放；Connection 不得比 Session 活得更久。
     pub fn deinit(self: *Session) void {
+        self.last_subagent_view.deinitOwned(self.allocator);
         if (self.codex_job) |job| job.destroy(self.allocator);
         self.codex_job = null;
         self.releaseLoadedHistory();
@@ -840,6 +842,8 @@ pub const Session = struct {
             .proxy_port = if (self.global_config.?.value.proxy) |value| value.port else 0,
             .memory_auto = config.memory.auto,
             .memory = if (self.app) |app| app.memoryView() else .{},
+            .subagents = if (self.app) |app| app.subagentView() else .{ .individual_supported = true },
+            .subagents_supported = true,
             .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .pending_default_effort = if (self.app != null and self.initial_default_pending and config.model.reasoning_effort == null) self.preferred_effort else null,
@@ -1145,6 +1149,7 @@ pub const Session = struct {
 
     test "memory view identity revision and clear change only once" {
         var session: Session = undefined;
+        session.last_subagent_view = .{ .individual_supported = true };
         session.last_memory_view = .{};
         const first: @import("../core/memory_status.zig").View = .{ .enabled = true, .revision = 1, .active = .{ .id = 1, .phase = .extracting } };
         var next = first;
@@ -1162,6 +1167,9 @@ pub const Session = struct {
     test "memory notice dirty survives busy metadata and cadence early returns" {
         // Minimal owner fixture: these paths must not touch App/Runtime or I/O.
         var session: Session = undefined;
+        session.allocator = std.testing.allocator;
+        session.last_subagent_view = .{ .individual_supported = true };
+        defer session.last_subagent_view.deinitOwned(session.allocator);
         session.app = null;
         session.initial_default_pending = false;
         session.codex_job = null;
@@ -1197,8 +1205,16 @@ pub const Session = struct {
         const self: *Session = @ptrCast(@alignCast(raw));
         const memory_view = if (self.app) |app| app.memoryView() else @import("../core/memory_status.zig").View{};
         const memory_changed = self.memoryViewChanged(memory_view);
+        const subagent_view = if (self.app) |app| app.subagentView() else @import("../core/subagent_status.zig").View{ .individual_supported = true };
+        const subagent_changed = !@import("../core/subagent_status.zig").View.eql(self.last_subagent_view, subagent_view);
+        if (subagent_changed) {
+            if (subagent_view.clone(self.allocator)) |copy| {
+                self.last_subagent_view.deinitOwned(self.allocator);
+                self.last_subagent_view = copy;
+            } else |_| {}
+        }
         const login_changed = self.pollCodexLogin() catch false;
-        const default_changed = (self.completeInitialDefault(idle) catch false) or memory_changed or login_changed;
+        const default_changed = (self.completeInitialDefault(idle) catch false) or memory_changed or subagent_changed or login_changed;
         if (self.metadata_job) |job| {
             official_pending: {
                 if (job.future) |*future| {
@@ -4153,6 +4169,28 @@ test "dynamic official IDs select for all providers and reject unknown protocols
     try std.testing.expectEqual(before.context_tokens, session.mutableConfig().model.context_tokens);
     state = session.connection().current();
     try std.testing.expectEqual(before.context_tokens, state.context_limit);
+}
+
+test "per-agent status rows are supported before app creation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(std.testing.io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
+    var session = try Session.init(a, std.testing.io, &env, home, .{});
+    defer session.deinit();
+    try std.testing.expect(session.app == null);
+    const state = session.connection().current();
+    try std.testing.expect(state.subagents_supported);
+    try std.testing.expect(state.subagents.individual_supported);
+    try std.testing.expectEqual(@as(usize, 0), state.subagents.agents.len);
+    try std.testing.expect(session.last_subagent_view.individual_supported);
+    try std.testing.expect(!Session.pollModels(&session, false));
+    try std.testing.expect(!Session.pollModels(&session, true));
 }
 
 test "login refresh opt out remains offline and explicit profiles survive availability filtering" {

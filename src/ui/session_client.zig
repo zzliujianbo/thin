@@ -229,6 +229,7 @@ const Copy = struct {
                 c.fields.topic = self.field(v.fields.topic);
                 c.fields.task = self.field(v.fields.task);
                 c.fields.id = self.field(v.fields.id);
+                c.subagent_progress = if (v.subagent_progress) |progress_text| self.text(progress_text) else null;
                 break :blk .{ .tool_view = c };
             },
             // Never carry a process-local Inbox pointer across the boundary.
@@ -273,6 +274,8 @@ pub const QueuePreview = struct {
 /// TUI copies what it keeps. No Runtime, socket or callback lives here.
 pub const Snapshot = struct {
     memory: @import("../core/memory_status.zig").View = .{},
+    subagents: @import("../core/subagent_status.zig").View = .{},
+    subagents_supported: bool = false,
     available: bool = false,
     attached: bool = false,
     busy: bool = false,
@@ -606,6 +609,33 @@ test "owned events deep-copy text and drop local inbox pointers" {
     try std.testing.expectEqual(@as(u64, 3), item.event.permission.id);
     try std.testing.expectEqualStrings("desc", item.event.permission.description);
     try std.testing.expect(item.event.permission.interrupt == null);
+}
+
+test "subagent tool progress owns decoded text after document release" {
+    const a = std.testing.allocator;
+    var item: Item = undefined;
+    {
+        var frame = "\"进度\\n完成\"".*;
+        var doc = try std.json.parseFromSlice([]const u8, a, &frame, .{ .allocate = .alloc_always });
+        defer doc.deinit();
+        item = try ownEvent(a, 9, .{ .tool_view = .{
+            .key = .{ .generation = 42, .index = 3 },
+            .name = "subagent",
+            .fields = .{ .id = .{ .text = "job-7" } },
+            .subagent_progress = doc.value,
+        } });
+        @memset(&frame, 'x');
+        @memset(@constCast(doc.value), 'x');
+    }
+    defer item.deinit();
+    try std.testing.expectEqualStrings("进度\n完成", item.event.tool_view.subagent_progress.?);
+    try std.testing.expectEqualStrings("job-7", item.event.tool_view.fields.id.?.text);
+    try std.testing.expectEqual(@as(u64, 42), item.event.tool_view.key.generation);
+    try std.testing.expectEqual(@as(usize, 3), item.event.tool_view.key.index);
+
+    var empty = try ownEvent(a, 9, .{ .tool_view = .{ .key = .{ .generation = 1, .index = 0 }, .name = "subagent" } });
+    defer empty.deinit();
+    try std.testing.expect(empty.event.tool_view.subagent_progress == null);
 }
 
 test "owned assistant blocks stay canonical while text is bounded" {

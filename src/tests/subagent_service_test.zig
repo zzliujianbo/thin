@@ -583,11 +583,21 @@ test "cleanup failure outranks encoding OOM and retained owner drops job borrows
     try std.testing.expect(retained.job == null);
     try std.testing.expect(retained.cancel.parent == null);
     try std.testing.expect(retained.tools.parent_channel == null);
+    // A failed close retains the owner while the per-agent snapshot owns a
+    // real cache allocation; retrying cleanup must not invalidate it early.
+    try std.testing.expectEqual(@as(usize, 1), fix.service.view().agents.len);
+    try std.testing.expect(fix.service.aggregate.read_cache.capacity > 0);
     try std.testing.expectError(error.CleanupFailed, fix.service.checkReady());
+    try std.testing.expectEqual(@as(usize, 1), fix.service.view().agents.len);
     // Release the injected fault and retry the retained owner.
     retained.test_cleanup_failed = false;
     fix.service.deinit();
     try std.testing.expect(fix.service.retained_child == null);
+    try std.testing.expect(fix.service.aggregate.first == null);
+    try std.testing.expect(fix.service.aggregate.last == null);
+    try std.testing.expectEqual(@as(usize, 0), fix.service.aggregate.read_cache.capacity);
+    try std.testing.expectEqual(@as(usize, 0), fix.service.aggregate.read_view.agents.len);
+    // Fixture.deinit calls Service.deinit again after this explicit retry.
 }
 
 test "pure encoding OOM is reported as a failure not a success" {
@@ -1350,6 +1360,171 @@ test "send refuses a finished or canceled job that is not collected yet" {
     try waitUncollectedFinished(fix, service, 1_000);
     try std.testing.expectError(error.SubagentFinished, service.send(a, .{ .id = blocked, .message = "still too late" }, &live));
     try fix.endTask();
+}
+
+const GroupProgressModel = struct {
+    io: std.Io,
+    kind: enum { ignored, ordinary, message, passive },
+    entered: std.atomic.Value(bool) = .init(false),
+    command: std.atomic.Value(u8) = .init(0),
+    observed: std.atomic.Value(u8) = .init(0),
+    calls: usize = 0,
+
+    fn make(raw: *anyopaque, _: std.mem.Allocator, _: *const cfg.Config) !p.Model {
+        return .{ .context = raw, .call_fn = call };
+    }
+    fn wait(self: *GroupProgressModel, request: p.Request, target: u8) !void {
+        while (self.command.load(.acquire) < target) {
+            if (request.cancellation.?.isRequested()) return error.Canceled;
+            try std.Io.sleep(self.io, .fromMilliseconds(2), .awake);
+        }
+    }
+    fn call(raw: *anyopaque, a: std.mem.Allocator, request: p.Request, sink: p.ModelSink) !p.Outcome {
+        const self: *GroupProgressModel = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        self.entered.store(true, .release);
+        if (self.calls == 1) {
+            try self.wait(request, 1);
+            switch (self.kind) {
+                .ordinary => try sink.emit(.{ .text_delta = "SECOND" }),
+                .passive => try sink.emit(.{ .text_delta = "THIRD" }),
+                .ignored => {
+                    try sink.emit(.{ .reasoning_delta = "private reasoning" });
+                    try sink.emit(.{ .usage = .{ .total_tokens = 5 } });
+                },
+                else => {},
+            }
+            self.observed.store(1, .release);
+            try self.wait(request, 2);
+            if (self.kind == .message) return .{ .success = .{
+                .message = try toolCallMessage(a, "group-message", "message_parent", "{\"message\":\"queued message\"}"),
+                .finish = .tool_calls,
+            } };
+        } else {
+            self.observed.store(2, .release);
+        }
+        try self.wait(request, 3);
+        return .{ .success = .{ .message = try p.textMessage(a, .assistant, "done"), .finish = .stop } };
+    }
+};
+
+fn waitGroupObserved(io: std.Io, value: *const std.atomic.Value(u8), expected: u8) !void {
+    const began = std.Io.Clock.awake.now(io);
+    while (value.load(.acquire) < expected) {
+        if (began.untilNow(io, .awake).toMilliseconds() > 5000) return error.FixtureTimeout;
+        try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    }
+}
+
+fn waitGroupCompleted(fix: *Fixture, expected: u64) !void {
+    const began = std.Io.Clock.awake.now(fix.io);
+    while (fix.service.view().completed < expected) {
+        if (began.untilNow(fix.io, .awake).toMilliseconds() > 5000) return error.FixtureTimeout;
+        try std.Io.sleep(fix.io, .fromMilliseconds(2), .awake);
+    }
+}
+
+test "per-agent status rows grouped progress four workers without get and ignored events" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var models = [_]GroupProgressModel{
+        .{ .io = io, .kind = .ignored }, .{ .io = io, .kind = .message },
+        .{ .io = io, .kind = .passive }, .{ .io = io, .kind = .ordinary },
+    };
+    defer for (&models) |*model| model.command.store(3, .release);
+    var ids: [4][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    fix.service.beginTask(&fix.parent_cancel);
+    try std.testing.expect(fix.service.view().individual_supported);
+    try std.testing.expectEqual(@as(usize, 0), fix.service.view().agents.len);
+    for (&models, 0..) |*model, i| {
+        fix.service.deps.model_factory = .{ .context = model, .make_fn = GroupProgressModel.make };
+        ids[i] = try fix.runCurrentRoot(.{ .task = "grouped worker" });
+        started += 1;
+    }
+    for (&models) |*model| try waitFlag(io, &model.entered, 5000);
+    var view = fix.service.view();
+    const group = view.group_id;
+    try std.testing.expectEqual(@as(u64, 4), view.running);
+    try std.testing.expectEqual(@as(u64, 4), view.total);
+    try std.testing.expectEqual(@as(usize, 4), view.agents.len);
+    for (view.agents, 0..) |row, i| {
+        try std.testing.expectEqual(@as(u64, @intCast(i + 1)), row.id);
+        try std.testing.expect(row.active());
+        try std.testing.expect(row.latestText().len != 0);
+    }
+    models[2].command.store(1, .release);
+    try waitGroupObserved(io, &models[2].observed, 1);
+    view = fix.service.view();
+    try std.testing.expectEqualStrings("THIRD", view.agents[2].latestText());
+    const third_revision = view.agents[2].revision;
+    models[3].command.store(1, .release);
+    try waitGroupObserved(io, &models[3].observed, 1);
+    view = fix.service.view();
+    try std.testing.expectEqualStrings("SECOND", view.latestText());
+    try std.testing.expectEqualStrings("THIRD", view.agents[2].latestText());
+    try std.testing.expectEqual(third_revision, view.agents[2].revision);
+    try std.testing.expectEqualStrings("SECOND", view.agents[3].latestText());
+    const rev = view.revision;
+    const latest = view.latest_id;
+    models[0].command.store(1, .release);
+    try waitGroupObserved(io, &models[0].observed, 1);
+    view = fix.service.view();
+    try std.testing.expectEqual(rev, view.revision);
+    try std.testing.expectEqual(latest, view.latest_id);
+    try std.testing.expectEqualStrings("SECOND", view.latestText());
+    models[1].command.store(2, .release);
+    try waitGroupObserved(io, &models[1].observed, 2);
+    models[0].command.store(3, .release);
+    try waitGroupCompleted(fix, 1);
+    view = fix.service.view();
+    try std.testing.expect(view.active());
+    try std.testing.expectEqual(@as(u64, 4), view.total);
+    try std.testing.expectEqual(.completed, view.agents[0].phase);
+    try std.testing.expect(view.agents[2].active());
+    const stopped_elapsed = view.agents[0].elapsed_ms;
+    const running_elapsed = view.agents[2].elapsed_ms;
+    try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    view = fix.service.view();
+    try std.testing.expectEqual(stopped_elapsed, view.agents[0].elapsed_ms);
+    try std.testing.expect(view.agents[2].elapsed_ms > running_elapsed);
+    var collected = try fix.get(ids[0], false);
+    defer collected.deinit();
+    view = fix.service.view();
+    try std.testing.expectEqual(@as(usize, 4), view.agents.len);
+    try std.testing.expectEqual(.completed, view.agents[0].phase);
+    _ = fix.service.view();
+    _ = fix.service.view();
+    var message = try fix.get(ids[1], false);
+    defer message.deinit();
+    try std.testing.expectEqualStrings("queued message", message.value.object.get("messages").?.array.items[0].object.get("message").?.string);
+    for (&models) |*model| model.command.store(3, .release);
+    try waitGroupCompleted(fix, 4);
+    try std.testing.expect(!fix.service.view().active());
+    try fix.endTask();
+    fix.service.beginTask(&fix.parent_cancel);
+    try std.testing.expectEqual(@as(u64, 0), fix.service.view().group_id);
+    try std.testing.expectEqual(@as(u64, 0), fix.service.view().total);
+    try std.testing.expect(fix.service.view().individual_supported);
+    try std.testing.expectEqual(@as(usize, 0), fix.service.view().agents.len);
+    var next: FakeModel = .{ .io = io, .hold = .init(true) };
+    defer next.hold.store(false, .release);
+    fix.withModel(&next);
+    const next_id = try fix.runCurrentRoot(.{ .task = "new group" });
+    defer a.free(next_id);
+    try waitFlag(io, &next.entered, 5000);
+    try std.testing.expect(fix.service.view().group_id != group);
+    next.hold.store(false, .release);
+    try fix.endTask();
+    try std.testing.expect(fix.service.aggregate.read_cache.capacity > 0);
+    fix.service.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fix.service.aggregate.read_view.agents.len);
+    try std.testing.expect(fix.service.aggregate.first == null);
+    try std.testing.expect(fix.service.aggregate.last == null);
+    fix.service.deinit();
 }
 
 test "six children run at once and every mutation lands through the shared gate" {

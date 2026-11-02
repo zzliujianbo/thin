@@ -120,6 +120,7 @@ pub const Screen = struct {
                     const args = code.args;
                     const final = code.final;
                     if (final == 'm') continue; // SGR does not change cells/cursor.
+                    if (final == 'n' and std.mem.eql(u8, args, "6")) continue; // Cursor position query is observational.
                     if (final == 'h' or final == 'l') {
                         if (!std.mem.eql(u8, args, "?25") and !std.mem.eql(u8, args, "?2004") and !std.mem.eql(u8, args, "?2026")) return error.UnsupportedMode;
                         // Logical screen only: accept sync mode without claiming
@@ -180,6 +181,26 @@ pub const Screen = struct {
         return total;
     }
 };
+
+test "cursor position query leaves the screen untouched" {
+    var screen: Screen = .{};
+    for (0..25) |_| try screen.replay("history\r\n");
+    try screen.replay(&(@as([80]u8, @splat('x'))));
+    const grid = screen.grid;
+    const row = screen.row;
+    const col = screen.col;
+    const wrap = screen.wrap;
+    const history_len = screen.history_len;
+    try screen.replay("\x1b[6n");
+    try std.testing.expectEqualDeep(grid, screen.grid);
+    try std.testing.expectEqual(row, screen.row);
+    try std.testing.expectEqual(col, screen.col);
+    try std.testing.expectEqual(wrap, screen.wrap);
+    try std.testing.expectEqual(history_len, screen.history_len);
+    for ([_][]const u8{ "\x1b[n", "\x1b[5n", "\x1b[06n", "\x1b[6R" }) |bad|
+        try std.testing.expectError(error.UnsupportedCsi, screen.replay(bad));
+    try std.testing.expectError(error.FullscreenSequence, screen.replay("\x1b[H"));
+}
 
 test "wide PTY replay does not fabricate wrapped approval ghosts" {
     const body: [120]u8 = @splat('x');

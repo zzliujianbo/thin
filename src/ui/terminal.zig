@@ -38,6 +38,40 @@ const enter = "\x1b[?2004h\x1b[0m\x1b[?25l";
 const leave = "\x18\x1b[0m\x1b[?2004l" ++ sync_end ++ "\x1b[?25h\r\n";
 /// 终端尺寸，单位为列数与行数。
 pub const Size = struct { columns: usize, rows: usize };
+/// Cursor row is zero-based; the reported position is untrusted terminal input.
+pub const Entry = struct { size: Size, row: usize };
+
+const Cpr = union(enum) { incomplete, invalid, complete: struct { row: usize, length: usize } };
+
+// Only accept a reply at byte zero, never search through user input or paste.
+fn parseCpr(bytes: []const u8, size_: Size) Cpr {
+    if (bytes.len == 0) return .incomplete;
+    if (bytes[0] != 0x1b) return .invalid;
+    if (bytes.len == 1) return .incomplete;
+    if (bytes[1] != '[') return .invalid;
+    var i: usize = 2;
+    var row: usize = 0;
+    var digits: usize = 0;
+    while (i < bytes.len and bytes[i] >= '0' and bytes[i] <= '9') : (i += 1) {
+        // The previous iteration bounded row by the clamped terminal size.
+        row = row * 10 + (bytes[i] - '0');
+        digits += 1;
+        if (row > size_.rows) return .invalid;
+    }
+    if (i == bytes.len) return .incomplete;
+    if (digits == 0 or row == 0 or bytes[i] != ';') return .invalid;
+    i += 1;
+    var column: usize = 0;
+    digits = 0;
+    while (i < bytes.len and bytes[i] >= '0' and bytes[i] <= '9') : (i += 1) {
+        column = column * 10 + (bytes[i] - '0');
+        digits += 1;
+        if (column > size_.columns) return .invalid;
+    }
+    if (i == bytes.len) return .incomplete;
+    if (digits == 0 or column == 0 or bytes[i] != 'R') return .invalid;
+    return .{ .complete = .{ .row = row - 1, .length = i + 1 } };
+}
 
 /// Optional owner stop check, not used for mandatory terminal restoration.
 /// Once bytes are written they cannot be retracted; check before each attempt.
@@ -67,6 +101,8 @@ pub const Terminal = struct {
     restored: bool = false,
     remote: bool = false,
     notification_fd: c_int = -1,
+    retained: [64]u8 = @splat(0),
+    retained_len: usize = 0,
 
     /// 打开控制终端 /dev/tty。要求 stdin/stdout 均为 tty，且当前进程位于前台进程组，否则后台写终端会被 SIGTTOU 挂起。
     pub fn open() !Terminal {
@@ -136,8 +172,75 @@ pub const Terminal = struct {
         return .{ .columns = if (dimensions.col == 0) 80 else @min(dimensions.col, 512), .rows = if (dimensions.row == 0) 24 else @min(dimensions.row, 200) };
     }
 
+    /// Prove the unclamped physical row count; fallback or unknown sizes are not proof.
+    pub fn exactPhysicalRows(self: Terminal, expected: usize) bool {
+        if (self.remote) {
+            var columns: c_uint = 0;
+            var rows: c_uint = 0;
+            thin_ssh_size(&columns, &rows);
+            return rows != 0 and rows == expected;
+        }
+        var dimensions = std.mem.zeroes(c.winsize);
+        return c.ioctl(self.fd, std.os.linux.T.IOCGWINSZ, &dimensions) == 0 and
+            dimensions.row != 0 and dimensions.row == expected;
+    }
+
+    /// Query once before drawing. All non-CPR input remains in order for read().
+    /// A timeout, short request, stop or geometry change is a conservative miss.
+    pub fn entryPosition(self: *Terminal, io: std.Io, stop: Stop) ?Entry {
+        if (!self.active or self.retained_len != 0 or stop.stopped()) return null;
+        const dimensions = self.size();
+        const start = std.Io.Clock.awake.now(io);
+        const request = "\x1b[6n";
+        var sent: usize = 0;
+        for (0..24) |_| {
+            if (stop.stopped() or start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= 45) return null;
+            sent += self.write(request[sent..]) catch return null;
+            if (sent == request.len) break;
+            self.wait(true, 2) catch return null;
+        }
+        if (sent != request.len) return null;
+        for (0..64) |_| {
+            if (stop.stopped() or start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= 45) return null;
+            const current = self.size();
+            if (current.rows != dimensions.rows or current.columns != dimensions.columns) return null;
+            const n = self.rawRead(self.retained[self.retained_len..]) catch return null;
+            self.retained_len += n;
+            switch (parseCpr(self.retained[0..self.retained_len], dimensions)) {
+                .invalid => return null,
+                .complete => |reply| {
+                    const after = self.size();
+                    if (stop.stopped() or after.rows != dimensions.rows or after.columns != dimensions.columns) return null;
+                    self.discardRetained(reply.length);
+                    return .{ .size = dimensions, .row = reply.row };
+                },
+                .incomplete => {},
+            }
+            if (self.retained_len == self.retained.len) return null;
+            if (n == 0) self.wait(false, 2) catch return null;
+        }
+        return null;
+    }
+
+    fn discardRetained(self: *Terminal, count: usize) void {
+        const remaining = self.retained_len - count;
+        std.mem.copyForwards(u8, self.retained[0..remaining], self.retained[count..self.retained_len]);
+        std.crypto.secureZero(u8, self.retained[remaining..]);
+        self.retained_len = remaining;
+    }
+
     /// Reads without waiting; zero means no data currently, not application EOF.
-    pub fn read(self: Terminal, out: []u8) !usize {
+    pub fn read(self: *Terminal, out: []u8) !usize {
+        if (self.retained_len != 0) {
+            const n = @min(out.len, self.retained_len);
+            @memcpy(out[0..n], self.retained[0..n]);
+            self.discardRetained(n);
+            return n;
+        }
+        return self.rawRead(out);
+    }
+
+    fn rawRead(self: Terminal, out: []u8) !usize {
         if (self.remote) {
             const count = thin_ssh_read(out.ptr, out.len);
             return if (count >= 0) @intCast(count) else error.TerminalDisconnected;
@@ -210,6 +313,8 @@ pub const Terminal = struct {
     /// Restoration must not use a canceled Io context. Bounded even if terminal
     /// output is backpressured; failure is returned, never called success.
     pub fn restore(self: *Terminal) bool {
+        std.crypto.secureZero(u8, &self.retained);
+        self.retained_len = 0;
         if (!self.active) return self.restored;
         self.active = false;
         if (self.remote) {
@@ -271,6 +376,68 @@ pub const Terminal = struct {
     }
 };
 
+test "CPR parser accepts only an in-range complete first reply" {
+    const dimensions = Size{ .columns = 80, .rows = 24 };
+    const reply = "\x1b[12;34R";
+    for (0..reply.len) |i| try std.testing.expect(parseCpr(reply[0..i], dimensions) == .incomplete);
+    const parsed = parseCpr(reply ++ "keys", dimensions);
+    try std.testing.expect(parsed == .complete);
+    try std.testing.expectEqual(@as(usize, 11), parsed.complete.row);
+    try std.testing.expectEqual(reply.len, parsed.complete.length);
+    for ([_][]const u8{ "x\x1b[1;1R", "\x04", "\x1b[200~paste\x1b[1;1R", "\x1b[0;1R", "\x1b[25;1R", "\x1b[1;81R", "\x1b[1;0R", "\x1b[;1R", "\x1b[1;xR" }) |bad|
+        try std.testing.expect(parseCpr(bad, dimensions) == .invalid);
+}
+
+test "entry probe preserves raw suffix and non replies and wipes consumed input" {
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
+    defer _ = c.close(master);
+    defer _ = c.close(slave);
+    var dimensions = std.mem.zeroes(c.winsize);
+    dimensions.col = 80;
+    dimensions.row = 24;
+    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &dimensions));
+    var terminal = try Terminal.fromFd(slave, false);
+    defer terminal.deinit();
+    const input = "\x1b[12;34Rabc";
+    try std.testing.expectEqual(@as(isize, input.len), c.write(master, input.ptr, input.len));
+    const entry = terminal.entryPosition(std.testing.io, .{}) orelse return error.MissingEntry;
+    try std.testing.expectEqual(@as(usize, 11), entry.row);
+    var result: [32]u8 = undefined;
+    const n = try terminal.read(&result);
+    try std.testing.expectEqualStrings("abc", result[0..n]);
+    try std.testing.expectEqualSlices(u8, &@as([64]u8, @splat(0)), &terminal.retained);
+    const paste = "\x1b[200~hello";
+    try std.testing.expectEqual(@as(isize, paste.len), c.write(master, paste.ptr, paste.len));
+    try std.testing.expect(terminal.entryPosition(std.testing.io, .{}) == null);
+    const p = try terminal.read(&result);
+    try std.testing.expectEqualStrings(paste, result[0..p]);
+    terminal.retained[0] = 42;
+    terminal.retained_len = 1;
+    _ = terminal.restore();
+    try std.testing.expectEqualSlices(u8, &@as([64]u8, @splat(0)), &terminal.retained);
+}
+
+test "entry probe timeout and stop are bounded" {
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
+    defer _ = c.close(master);
+    defer _ = c.close(slave);
+    var terminal = try Terminal.fromFd(slave, false);
+    defer terminal.deinit();
+    const start = std.Io.Clock.awake.now(std.testing.io);
+    try std.testing.expect(terminal.entryPosition(std.testing.io, .{}) == null);
+    try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toMilliseconds() < 500);
+    const Always = struct {
+        fn stopped(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    try std.testing.expect(terminal.entryPosition(std.testing.io, .{ .stopped_fn = Always.stopped }) == null);
+}
+
 /// 测试辅助：逐项比较两份 termios 的标志位、控制字符与波特率。
 fn expectAttributes(a: abi.Termios, b: abi.Termios) !void {
     try std.testing.expectEqual(a.iflag, b.iflag);
@@ -280,6 +447,27 @@ fn expectAttributes(a: abi.Termios, b: abi.Termios) !void {
     try std.testing.expectEqualSlices(c.cc_t, &a.cc, &b.cc);
     try std.testing.expectEqual(a.ispeed, b.ispeed);
     try std.testing.expectEqual(a.ospeed, b.ospeed);
+}
+
+test "physical rows require an exact raw PTY size" {
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
+    defer _ = c.close(master);
+    defer _ = c.close(slave);
+    var size = std.mem.zeroes(c.winsize);
+    size.col = 80;
+    size.row = 24;
+    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &size));
+    const terminal: Terminal = .{ .fd = slave, .owned = false, .original = undefined, .original_flags = 0, .active = false };
+    try std.testing.expect(terminal.exactPhysicalRows(24));
+    try std.testing.expect(!terminal.exactPhysicalRows(200));
+    size.row = 500;
+    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &size));
+    try std.testing.expect(!terminal.exactPhysicalRows(200));
+    var invalid = terminal;
+    invalid.fd = -1;
+    try std.testing.expect(!invalid.exactPhysicalRows(24));
 }
 
 // 测试：raw 模式与标志仅作用于 PTY，恢复后属性与标志与原始一致。
@@ -359,24 +547,12 @@ test "post restoration stop on a backpressured retry still restores descriptor f
     defer terminal.deinit();
     try std.testing.expect(terminal.restore());
     const flags = c.fcntl(slave, 3);
-    try std.testing.expect(c.fcntl(slave, 4, flags | nonblock) >= 0);
-    const fill: [4096]u8 = @splat('x');
-    for (0..1024) |_| {
-        const n = c.write(slave, &fill, fill.len);
-        if (n < 0) {
-            try std.testing.expectEqual(@as(c_int, 11), c._errno().*);
-            break;
-        }
-    } else return error.PtyDidNotBackpressure;
-    // Fill even a sub-block remainder before the small announcement attempt.
-    for (0..8192) |_| {
-        const n = c.write(slave, "x", 1);
-        if (n < 0) {
-            try std.testing.expectEqual(@as(c_int, 11), c._errno().*);
-            break;
-        }
-    } else return error.PtyDidNotBackpressure;
-    try std.testing.expect(c.fcntl(slave, 4, flags) >= 0);
+    const Flow = struct {
+        extern "c" fn tcflow(c_int, c_int) c_int;
+    };
+    // Hold output: filling the PTY can race with asynchronous line-discipline draining.
+    try std.testing.expectEqual(@as(c_int, 0), Flow.tcflow(slave, 0));
+    defer _ = Flow.tcflow(slave, 1);
     const Reader = struct {
         fn stopped(ctx: ?*const anyopaque) bool {
             const immutable: *const usize = @ptrCast(@alignCast(ctx.?));

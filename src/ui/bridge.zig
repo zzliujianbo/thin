@@ -120,6 +120,14 @@ const Copy = struct {
                 c.fields.topic = self.field(v.fields.topic);
                 c.fields.task = self.field(v.fields.task);
                 c.fields.id = self.field(v.fields.id);
+                if (v.subagent_progress) |progress_text| {
+                    var n = @min(progress_text.len, 2048);
+                    if (n < progress_text.len) {
+                        while (n > 0 and (progress_text[n] & 0xc0) == 0x80) n -= 1;
+                        self.clipped = true;
+                    }
+                    c.subagent_progress = self.text(progress_text[0..n]);
+                }
                 break :blk .{ .tool_view = c };
             },
             .permission => |v| .{ .permission = .{ .id = v.id, .tool_name = self.text(v.tool_name), .description = self.text(v.description) } },
@@ -518,6 +526,39 @@ pub const Bridge = struct {
         self.* = undefined;
     }
 };
+
+test "subagent tool progress is bounded and owned independently of producer" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, t.io, &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+    {
+        const source = try t.allocator.alloc(u8, 3000);
+        defer t.allocator.free(source);
+        @memset(source, 'a');
+        @memcpy(source[2046..2049], "字");
+        try host_.emit_fn(host_.context, .{ .tool_view = .{
+            .key = .{ .generation = 42, .index = 7 },
+            .name = "subagent",
+            .fields = .{ .id = .{ .text = "job-9" } },
+            .subagent_progress = source,
+        } }, &cancel);
+        @memset(source, 'z');
+    }
+    var item = bridge.pop().?;
+    defer item.deinit();
+    const view = item.event.tool_view;
+    try t.expectEqual(@as(u64, 42), view.key.generation);
+    try t.expectEqual(@as(usize, 7), view.key.index);
+    try t.expectEqualStrings("job-9", view.fields.id.?.text);
+    const text = view.subagent_progress.?;
+    try t.expectEqual(@as(usize, 2046), text.len);
+    try t.expect(item.display_truncated and std.unicode.utf8ValidateSlice(text));
+    try t.expectEqual(@as(u8, 'a'), text[0]);
+    try t.expect(@intFromPtr(text.ptr) >= @intFromPtr(item.storage.ptr));
+    try t.expect(@intFromPtr(text.ptr) + text.len <= @intFromPtr(item.storage.ptr) + item.storage.len);
+}
 
 test "user committed copy owns the entire bounded text including the last byte" {
     var cancel: p.Cancellation = .{};

@@ -59,7 +59,11 @@ pub const Views = struct {
 
         // Build all fallible state first. Neither an OOM during formatting nor
         // append failure may destroy the previously displayed caption/order.
-        const candidate = try presentation.fromToolView(a, event.name, event.fields);
+        const base = try presentation.fromToolView(a, event.name, event.fields);
+        const candidate = if (event.ready and event.subagent_progress != null) blk: {
+            defer base.deinit(a);
+            break :blk try presentation.subagentProgress(a, base, event.subagent_progress.?);
+        } else base;
         errdefer candidate.deinit(a);
         if (index) |i| {
             const entry = &self.entries.items[i];
@@ -171,6 +175,50 @@ fn view(generation: u64, index: usize, label: []const u8, ready: bool) r.ToolVie
         .fields = .{ .path = .{ .text = label } },
         .ready = ready,
     };
+}
+
+fn subagentProgressAllocationScenario(a: Allocator) !void {
+    var views: Views = .{};
+    defer views.deinit(a);
+    views.begin(a, 7);
+    var event: r.ToolView = .{ .key = key(7, 1), .name = "get_subagent_result", .fields = .{ .id = .{ .text = "subagent_1" } }, .ready = true };
+    try views.upsert(a, event);
+    const old = views.get(event.key).?.caption.label;
+    event.subagent_progress = "working";
+    views.upsert(a, event) catch |err| {
+        try std.testing.expect(views.get(event.key).?.caption.label.ptr == old.ptr);
+        try std.testing.expectEqualStrings("subagent_1", views.get(event.key).?.caption.label);
+        return err;
+    };
+}
+
+test "subagent tool progress allocation failure preserves old caption" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, subagentProgressAllocationScenario, .{});
+}
+
+test "subagent tool progress respects generation readiness and ownership" {
+    const a = std.testing.allocator;
+    var views: Views = .{};
+    defer views.deinit(a);
+    views.begin(a, 7);
+    var progress = [_]u8{ 'w', 'o', 'r', 'k' };
+    var event: r.ToolView = .{ .key = key(7, 1), .name = "get_subagent_result", .fields = .{ .id = .{ .text = "subagent_1" } }, .ready = true, .subagent_progress = &progress };
+    try views.upsert(a, event);
+    progress[0] = 'X';
+    try std.testing.expectEqualStrings("subagent_1 · work", views.get(event.key).?.caption.label);
+    event.ready = false;
+    event.subagent_progress = "late";
+    try views.upsert(a, event);
+    try std.testing.expectEqualStrings("subagent_1 · work", views.get(event.key).?.caption.label);
+    event.ready = true;
+    event.key = key(8, 1);
+    try views.upsert(a, event);
+    try std.testing.expect(views.get(event.key) == null);
+    event.key = key(7, 2);
+    event.name = "read_file";
+    event.fields = .{ .path = .{ .text = "file" } };
+    try views.upsert(a, event);
+    try std.testing.expectEqualStrings("file", views.get(event.key).?.caption.label);
 }
 
 test "tool views same key updates in place and same names remain distinct" {

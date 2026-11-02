@@ -115,6 +115,87 @@ const Mutex = struct {
 };
 
 const Phase = enum { running, waiting };
+const StatusView = @import("../core/subagent_status.zig").View;
+const AggregatePhase = enum { running, waiting, completed, failed, canceled, paused };
+var next_group_id: std.atomic.Value(u64) = .init(0);
+
+fn allocateGroupId() !u64 {
+    var old = next_group_id.load(.monotonic);
+    while (true) {
+        if (old == std.math.maxInt(u64)) return error.SubagentGroupIdExhausted;
+        if (next_group_id.cmpxchgWeak(old, old + 1, .monotonic, .monotonic)) |actual| {
+            old = actual;
+        } else return old + 1;
+    }
+}
+
+/// Stable App-owned storage. Workers acquire Job.mutex before this lock;
+/// readers never acquire a Job lock or follow the parent-owned job list.
+const DisplayEntry = struct {
+    view: @import("../core/subagent_status.zig").AgentView,
+    started_ms: i64,
+    finished_ms: i64 = 0,
+    next: ?*DisplayEntry = null,
+};
+
+const Aggregate = struct {
+    mutex: Mutex = .{},
+    first: ?*DisplayEntry = null,
+    last: ?*DisplayEntry = null,
+    read_cache: std.ArrayList(@import("../core/subagent_status.zig").AgentView) = .empty,
+    read_view: StatusView = .{ .individual_supported = true },
+    view: StatusView = .{},
+    started_ms: i64 = 0,
+    finished_ms: i64 = 0,
+
+    fn counter(self: *Aggregate, phase: AggregatePhase) *u64 {
+        return switch (phase) {
+            .running => &self.view.running,
+            .waiting => &self.view.waiting,
+            .completed => &self.view.completed,
+            .failed => &self.view.failed,
+            .canceled => &self.view.canceled,
+            .paused => &self.view.paused,
+        };
+    }
+
+    fn clearEntries(self: *Aggregate, allocator: std.mem.Allocator) void {
+        var node = self.first;
+        while (node) |entry| {
+            node = entry.next;
+            allocator.destroy(entry);
+        }
+        self.first = null;
+        self.last = null;
+    }
+
+    fn snapshot(self: *Aggregate, allocator: std.mem.Allocator, io: std.Io) StatusView {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var count: usize = 0;
+        var node = self.first;
+        while (node) |entry| : (node = entry.next) count += 1;
+        self.read_cache.ensureTotalCapacity(allocator, count) catch return self.read_view;
+        self.read_cache.clearRetainingCapacity();
+        const now = std.Io.Clock.awake.now(io).toMilliseconds();
+        node = self.first;
+        while (node) |entry| : (node = entry.next) {
+            var row = entry.view;
+            const end = if (entry.finished_ms != 0) entry.finished_ms else now;
+            row.elapsed_ms = @intCast(@max(0, end - entry.started_ms));
+            self.read_cache.appendAssumeCapacity(row);
+        }
+        var result = self.view;
+        result.individual_supported = true;
+        result.agents = self.read_cache.items;
+        if (result.group_id != 0) {
+            const end = if (self.finished_ms != 0) self.finished_ms else now;
+            result.elapsed_ms = @intCast(@max(0, end - self.started_ms));
+        }
+        self.read_view = result;
+        return result;
+    }
+};
 
 const ChildMessage = struct { text: []u8, requires_reply: bool };
 
@@ -159,6 +240,11 @@ const Job = struct {
     outbox: [max_unread_child_messages]?ChildMessage = @splat(null),
     outbox_len: usize = 0,
     progress: ?[]u8 = null,
+    display: @import("subagent_progress.zig").Projection = .{},
+    aggregate: *Aggregate,
+    display_id: u64,
+    display_entry: ?*DisplayEntry = null,
+    aggregate_phase: AggregatePhase = .running,
     /// Job-owned, thread-safe steering Inbox. The child Runtime borrows it only
     /// while running; it exists from `run` so a message accepted before the
     /// child session exists can be enqueued immediately.
@@ -202,6 +288,50 @@ const Job = struct {
         return self.done.load(.acquire);
     }
 
+    /// Called under Job.mutex, after registration, never allocates.
+    fn publishDisplay(self: *Job, phase: AggregatePhase) void {
+        const aggregate = self.aggregate;
+        aggregate.mutex.lock();
+        defer aggregate.mutex.unlock();
+        if (self.display_entry == null) return;
+        if (phase != self.aggregate_phase) {
+            aggregate.counter(self.aggregate_phase).* -= 1;
+            aggregate.counter(phase).* += 1;
+            self.aggregate_phase = phase;
+        }
+        const text = if (phase == .waiting) self.display.current() else if (self.display.current().len == 0) switch (phase) {
+            .completed => "Completed",
+            .failed => "Failed",
+            .canceled => "Canceled",
+            .paused => "Paused",
+            else => "",
+        } else self.display.current();
+        aggregate.view.latest_id = self.display_id;
+        @memset(&aggregate.view.text_buf, 0);
+        const prefix = if (phase == .waiting) "Waiting for reply: " else "";
+        @memcpy(aggregate.view.text_buf[0..prefix.len], prefix);
+        var len = @min(text.len, aggregate.view.text_buf.len - prefix.len);
+        while (len != 0 and !std.unicode.utf8ValidateSlice(text[0..len])) len -= 1;
+        @memcpy(aggregate.view.text_buf[prefix.len..][0..len], text[0..len]);
+        aggregate.view.text_len = @intCast(prefix.len + len);
+        const entry = self.display_entry.?;
+        entry.view.phase = switch (phase) {
+            .running => .running,
+            .waiting => .waiting,
+            .completed => .completed,
+            .failed => .failed,
+            .canceled => .canceled,
+            .paused => .paused,
+        };
+        entry.view.text_buf = aggregate.view.text_buf;
+        entry.view.text_len = aggregate.view.text_len;
+        entry.view.revision +|= 1;
+        if (!entry.view.active() and entry.finished_ms == 0)
+            entry.finished_ms = std.Io.Clock.awake.now(self.deps.root.io).toMilliseconds();
+        aggregate.view.revision +|= 1;
+        if (!aggregate.view.active()) aggregate.finished_ms = std.Io.Clock.awake.now(self.deps.root.io).toMilliseconds();
+    }
+
     /// Publication contract: the terminal fields and `done` become visible
     /// together under `Job.mutex`. A parent-side `send` that wins the lock
     /// before this publication sees `done == false`; a `send` that acquires it
@@ -214,6 +344,12 @@ const Job = struct {
         self.terminal = terminal;
         self.report = report;
         self.report_truncated = truncated;
+        self.publishDisplay(switch (terminal.status) {
+            .success => .completed,
+            .failed => .failed,
+            .canceled => .canceled,
+            .paused => .paused,
+        });
         self.done.store(true, .release);
         self.unlock();
     }
@@ -228,6 +364,7 @@ const Job = struct {
         // only looks at one of the two flags.
         self.cleanup_failed = true;
         self.report_truncated = true;
+        self.publishDisplay(.failed);
         self.done.store(true, .release);
         self.unlock();
     }
@@ -242,6 +379,7 @@ const Job = struct {
             self.cleanup_failed = true;
             self.report_truncated = true;
         }
+        self.publishDisplay(.failed);
         self.done.store(true, .release);
         self.unlock();
     }
@@ -282,10 +420,16 @@ pub const SubagentService = struct {
     collected: [max_collected_results]?Collected = @splat(null),
     collected_next: usize = 0,
     next_id: u64 = 0,
+    aggregate: Aggregate = .{},
+    new_group: bool = true,
     /// Shared by every child of this root so concurrent write_file/bash calls
     /// are serialized while model calls and reads stay concurrent.
     mutation_gate: subagent.MutationGate = .{},
     deinit_cancel: p.Cancellation = .{},
+
+    pub fn view(self: *SubagentService) StatusView {
+        return self.aggregate.snapshot(self.deps.allocator, self.deps.root.io);
+    }
 
     pub fn deinit(self: *SubagentService) void {
         // endTask is the broker callback form; pass the Service as its opaque context.
@@ -304,6 +448,11 @@ pub const SubagentService = struct {
         }
         if (failed) @panic("subagent cleanup still failed; refusing to discard an owned child");
         self.retained_child = null;
+        if (self.current != null) @panic("subagent workers still owned during deinit");
+        self.aggregate.clearEntries(self.deps.allocator);
+        self.aggregate.read_cache.deinit(self.deps.allocator);
+        self.aggregate.read_cache = .empty;
+        self.aggregate.read_view = .{ .individual_supported = true };
     }
 
     pub fn service(self: *SubagentService) subagent.Service {
@@ -329,6 +478,13 @@ pub const SubagentService = struct {
     pub fn beginTask(self: *SubagentService, cancel: *const p.Cancellation) void {
         if (self.current != null) @panic("subagent job survived its accepted root task");
         self.clearCollected();
+        self.aggregate.mutex.lock();
+        self.aggregate.clearEntries(self.deps.allocator);
+        self.aggregate.view = .{};
+        self.aggregate.started_ms = 0;
+        self.aggregate.finished_ms = 0;
+        self.aggregate.mutex.unlock();
+        self.new_group = true;
         self.root_cancel = cancel;
     }
 
@@ -424,6 +580,8 @@ pub const SubagentService = struct {
             .allocator = stable,
             .deps = self.deps,
             .root_cancel = root_cancel,
+            .aggregate = &self.aggregate,
+            .display_id = self.next_id,
             .mutation_gate = &self.mutation_gate,
             .test_cleanup_failed = self.deps.test_cleanup_failed,
             .test_encode_oom = self.deps.test_encode_oom,
@@ -468,10 +626,33 @@ pub const SubagentService = struct {
         };
         // A failed spawn leaves no running job, so the receipt must not leak.
         errdefer a.free(receipt);
+        const entry = try stable.create(DisplayEntry);
+        errdefer stable.destroy(entry);
+        entry.* = .{ .view = .{ .id = job.display_id, .phase = .starting, .revision = 1 }, .started_ms = std.Io.Clock.awake.now(job.deps.root.io).toMilliseconds() };
+        job.display_entry = entry;
+        // Block immediate worker publication until registration is complete.
+        const group_id = if (self.new_group) try allocateGroupId() else 0;
+        self.aggregate.mutex.lock();
         job.future = std.Io.concurrent(job.deps.root.io, workerEntry, .{job}) catch |err| {
+            self.aggregate.mutex.unlock();
             try self.closeStartChild(job);
             return err;
         };
+        if (self.new_group) {
+            self.aggregate.view = .{ .group_id = group_id };
+            self.aggregate.started_ms = std.Io.Clock.awake.now(job.deps.root.io).toMilliseconds();
+            self.new_group = false;
+        }
+        if (self.aggregate.last) |last| last.next = entry else self.aggregate.first = entry;
+        self.aggregate.last = entry;
+        self.aggregate.finished_ms = 0;
+        self.aggregate.view.total += 1;
+        self.aggregate.view.running += 1;
+        self.aggregate.view.latest_id = job.display_id;
+        self.aggregate.view.text_len = 0;
+        @memset(&self.aggregate.view.text_buf, 0);
+        self.aggregate.view.revision +|= 1;
+        self.aggregate.mutex.unlock();
         // Link only after a successful spawn: an unlinked job could never be
         // addressed by id, collected or joined.
         job.next = self.current;
@@ -511,9 +692,16 @@ pub const SubagentService = struct {
         }
         const job = try self.find(query.id);
         const io = job.deps.root.io;
+        var last: [2048]u8 = undefined;
+        var last_len: usize = 0;
+        var last_ms: i64 = 0;
+        var published = false;
         while (true) {
             if (cancel.isRequested()) return canceledParent();
             var action: enum { snapshot, terminal, permission, wait } = .wait;
+            var display: [2048]u8 = undefined;
+            var display_len: usize = 0;
+            var urgent = false;
             job.lock();
             if (job.isDone()) {
                 action = .terminal;
@@ -521,6 +709,48 @@ pub const SubagentService = struct {
                 action = .snapshot;
             } else if (job.permission.active and job.emitted_permission_id == null) {
                 action = .permission;
+            }
+            if (job.phase == .waiting and job.question != null) {
+                var question: @import("subagent_progress.zig").Projection = .{};
+                question.feed(job.question.?.text);
+                const value = question.current();
+                const prefix = "Waiting for reply: ";
+                @memcpy(display[0..prefix.len], prefix);
+                var len = @min(value.len, display.len - prefix.len);
+                while (len > 0 and !std.unicode.utf8ValidateSlice(value[0..len])) len -= 1;
+                @memcpy(display[prefix.len..][0..len], value[0..len]);
+                display_len = prefix.len + len;
+                urgent = true;
+            } else {
+                const value = if (action == .terminal and job.display.latest_len == 0) switch (if (job.terminal) |terminal| terminal.status else r.Status.failed) {
+                    .success => "Completed",
+                    .failed => "Failed",
+                    .canceled => "Canceled",
+                    .paused => "Paused",
+                } else job.display.current();
+                @memcpy(display[0..value.len], value);
+                display_len = value.len;
+            }
+            // Copy the projection while locked, but never invoke the parent host
+            // until after unlocking. This does not consume any child messages.
+            const observed_action = action;
+            job.unlock();
+            const now: i64 = @intCast(@max(0, std.Io.Clock.awake.now(io).toMilliseconds()));
+            if (display_len != 0 and (!published or !std.mem.eql(u8, display[0..display_len], last[0..last_len])) and
+                (!published or urgent or action == .terminal or action == .snapshot or now - last_ms >= 80))
+            {
+                self.deps.runtime.publishSubagentProgress(job.id, display[0..display_len], cancel);
+                @memcpy(last[0..display_len], display[0..display_len]);
+                last_len = display_len;
+                last_ms = now;
+                published = true;
+            }
+            job.lock();
+            // Re-evaluate under the lock: worker state may have changed during emit.
+            action = if (job.isDone()) .terminal else if (job.outbox_len != 0 or job.phase == .waiting) .snapshot else if (job.permission.active and job.emitted_permission_id == null) .permission else .wait;
+            if (action != observed_action) {
+                job.unlock();
+                continue;
             }
             if (action == .snapshot) {
                 // Encode under the job lock: worker-side cancellation must not
@@ -611,6 +841,7 @@ pub const SubagentService = struct {
             if (job.question) |question| wipeRelease(job.allocator, question.text);
             job.question = null;
             job.phase = .running;
+            job.publishDisplay(.running);
             job.parent_sent += 1;
             return .{ .text = receipt };
         }
@@ -836,6 +1067,7 @@ pub const SubagentService = struct {
         wipeRelease(job.allocator, job.task);
         if (job.context) |context| wipeRelease(job.allocator, context);
         job.allocator.free(job.id);
+        std.crypto.secureZero(u8, std.mem.asBytes(&job.display));
         job.allocator.destroy(job);
     }
 
@@ -853,7 +1085,7 @@ pub const SubagentService = struct {
             messages[count] = .{ .message = message.text, .requires_reply = message.requires_reply };
             count += 1;
         };
-        var view = SnapshotView{
+        var snapshot_view = SnapshotView{
             .id = job.id,
             .status = if (job.phase == .waiting) "waiting_for_reply" else "running",
             .messages = messages[0..count],
@@ -861,37 +1093,37 @@ pub const SubagentService = struct {
         };
         if (terminal) {
             if (job.terminal) |value| {
-                view.status = switch (value.status) {
+                snapshot_view.status = switch (value.status) {
                     .success => "success",
                     .failed => "failed",
                     .canceled => "canceled",
                     .paused => "paused",
                 };
-                view.report = job.report;
-                view.truncated = job.report_truncated;
-                view.cleanup_failed = job.cleanup_failed;
-                view.detail = if (value.detail) |err| @errorName(err) else null;
-                view.usage = UsageJson{
+                snapshot_view.report = job.report;
+                snapshot_view.truncated = job.report_truncated;
+                snapshot_view.cleanup_failed = job.cleanup_failed;
+                snapshot_view.detail = if (value.detail) |err| @errorName(err) else null;
+                snapshot_view.usage = UsageJson{
                     .normal_calls = value.usage.normal_calls,
                     .summary_calls = value.usage.summary_calls,
                     .normal = usageView(value.usage.normal, value.usage.normal_calls),
                     .summary = usageView(value.usage.summary, value.usage.summary_calls),
                 };
-                view.usage_scope = "normal_and_summary_only";
-                view.auxiliary_usage_excluded = true;
+                snapshot_view.usage_scope = "normal_and_summary_only";
+                snapshot_view.auxiliary_usage_excluded = true;
             } else if (job.failure) |err| {
-                view.status = "failed";
-                view.detail = @errorName(err);
+                snapshot_view.status = "failed";
+                snapshot_view.detail = @errorName(err);
             } else {
-                view.status = "failed";
-                view.detail = "SubagentWorkerFailed";
+                snapshot_view.status = "failed";
+                snapshot_view.detail = "SubagentWorkerFailed";
             }
             if (job.cleanup_failed) {
-                view.report = cleanup_report;
-                view.truncated = true;
+                snapshot_view.report = cleanup_report;
+                snapshot_view.truncated = true;
             }
         }
-        return std.json.Stringify.valueAlloc(a, view, .{});
+        return std.json.Stringify.valueAlloc(a, snapshot_view, .{});
     }
 
     /// Called while holding `job.lock()`, only after a successful encode.
@@ -1425,7 +1657,22 @@ const ChildSession = struct {
 const ChildHost = struct {
     session: *ChildSession,
 
-    fn emit(_: ?*anyopaque, _: r.Event, _: *const p.Cancellation) !void {}
+    fn emit(raw: ?*anyopaque, event: r.Event, _: *const p.Cancellation) !void {
+        const self: *ChildHost = @ptrCast(@alignCast(raw.?));
+        const job = self.session.job orelse return;
+        job.lock();
+        defer job.unlock();
+        // Projection intentionally ignores reasoning, usage and transport
+        // metadata. Compare the job's own visible text, not the group's most
+        // recent publisher: an ignored event must not steal that position.
+        var previous: [2048]u8 = undefined;
+        const before = job.display.current();
+        const previous_len = before.len;
+        @memcpy(previous[0..previous_len], before);
+        job.display.observe(event);
+        if (!std.mem.eql(u8, previous[0..previous_len], job.display.current()))
+            job.publishDisplay(if (job.phase == .waiting) .waiting else .running);
+    }
 
     fn authorize(raw: ?*anyopaque, permission: r.Permission, cancel: *const p.Cancellation) anyerror!r.Decision {
         const self: *ChildHost = @ptrCast(@alignCast(raw.?));
@@ -1569,6 +1816,9 @@ fn postParentMessage(self: *ChildSession, a: std.mem.Allocator, message: subagen
         if (job.progress) |old| wipeRelease(job.allocator, old);
         job.progress = progress;
         job.outbox[job.outbox_len] = .{ .text = copy, .requires_reply = false };
+        job.display.begin();
+        job.display.feed(copy);
+        job.publishDisplay(.running);
         job.outbox_len += 1;
         job.child_sent += 1;
         job.unlock();
@@ -1592,7 +1842,10 @@ fn postParentMessage(self: *ChildSession, a: std.mem.Allocator, message: subagen
     if (job.reply) |old| wipeRelease(job.allocator, old);
     job.reply = null;
     job.question = .{ .text = copy };
+    job.display.begin();
+    job.display.feed(copy);
     job.phase = .waiting;
+    job.publishDisplay(.waiting);
     job.child_sent += 1;
     job.unlock();
 
@@ -1610,6 +1863,7 @@ fn postParentMessage(self: *ChildSession, a: std.mem.Allocator, message: subagen
                 job.question = null;
             }
             job.phase = .running;
+            job.publishDisplay(.running);
             job.unlock();
             wipeRelease(job.allocator, reply);
             return .{ .text = text };
@@ -1634,6 +1888,7 @@ fn endQuestionWait(job: *Job) subagent.Result {
         job.question = null;
     }
     job.phase = .running;
+    job.publishDisplay(.running);
     job.unlock();
     return .{ .text = canceled_channel_text, .is_error = true };
 }
@@ -1666,9 +1921,14 @@ test "send maps a sealed run and a published terminal to SubagentFinished" {
     // Only the fields `send` actually reads are initialized: no Runtime, no
     // worker and no child session participate in this path.
     var service: SubagentService = .{ .deps = undefined };
+    var aggregate: Aggregate = .{ .view = .{ .group_id = 1, .total = 1, .running = 1 } };
+    var root: fs.Root = undefined;
+    root.io = std.testing.io;
+    var deps: Deps = undefined;
+    deps.root = &root;
     const job = try a.create(Job);
     defer a.destroy(job);
-    job.* = .{ .allocator = a, .deps = undefined, .root_cancel = &root_token };
+    job.* = .{ .allocator = a, .deps = deps, .root_cancel = &root_token, .aggregate = &aggregate, .display_id = 1 };
     defer job.inbox.deinit();
     job.id = try a.dupe(u8, "subagent_1");
     defer a.free(job.id);

@@ -253,39 +253,31 @@ const Driver = struct {
         for (line) |byte| try check(byte == ' ');
     }
 
-    /// The first owned frame establishes one blank viewport, preserving prior
-    /// output in native history, with the composer at the physical bottom.
-    /// Only a single owned hint may occupy the row immediately above it.
+    /// The seeded prior line remains visible, followed by one blank row and
+    /// the natural first frame: optionally one hint, then the composer.
     fn checkStartupFootprint(view: *const regular.Screen) !void {
-        try check(view.rows > 0 and view.rows <= view.grid.len);
-        try check(view.history_len == view.rows);
-        try check(view.count(regular.prior) == 1);
-        var prior_in_history = false;
-        for (view.history[0..view.history_len]) |line| {
-            if (std.mem.indexOf(u8, &line, regular.prior) != null) prior_in_history = true;
-        }
-        try check(prior_in_history);
+        try check(view.rows > 3 and view.rows <= view.grid.len);
+        try check(view.history_len == 0 and view.count(regular.prior) == 1);
+        try check(std.mem.indexOf(u8, &view.grid[0], regular.prior) != null);
+        for (view.grid[1]) |byte| try check(byte == ' ');
+        try check((view.row == 2 or view.row == 3) and view.col < view.columns);
         var composers: usize = 0;
-        for (0..view.history_len + view.grid.len) |i| {
-            const line = if (i < view.history_len) &view.history[i] else &view.grid[i - view.history_len];
-            if (std.mem.indexOf(u8, line, "%> ") != null or std.mem.startsWith(u8, line, "> ")) {
+        for (view.grid, 0..) |line, row| {
+            if (std.mem.indexOf(u8, &line, "%> ") != null or std.mem.startsWith(u8, &line, "> ")) {
                 composers += 1;
-                try check(i == view.history_len + view.rows - 1);
+                try check(row == view.row);
             }
         }
-        try check(composers == 1 and view.row == view.rows - 1 and view.col < view.columns);
-        for (view.grid[0 .. view.rows - 1], 0..) |line, row| {
-            if (row + 2 == view.rows) continue; // Optional single hint row.
-            for (line) |byte| try check(byte == ' ');
-        }
-        for (view.grid[view.rows..]) |line| for (line) |byte| try check(byte == ' ');
+        try check(composers == 1);
+        if (view.row == 3) try check(std.mem.trim(u8, &view.grid[2], " ").len != 0);
+        try checkComposerTail(view);
     }
 
-    /// At an end-position snapshot the composer cursor is on the physical
-    /// bottom row; previously acknowledged viewport padding may remain above.
+    /// A fresh end-position snapshot ends at the composer, with no owned rows
+    /// below it. Short frames do not imply the physical bottom was reached.
     fn checkComposerTail(view: *const regular.Screen) !void {
         try check(view.rows > 0 and view.rows <= view.grid.len);
-        try check(view.row == view.rows - 1 and view.col < view.columns);
+        try check(view.row < view.rows and view.col < view.columns);
         for (view.grid[view.row + 1 ..]) |line| for (line) |byte| try check(byte == ' ');
     }
 
@@ -1186,8 +1178,7 @@ fn checkApprovalCancelRestored(view: *const regular.Screen) !void {
         if (view.visible(text)) visible_prior += 1;
     }
     try check(view.count("Approval #") == 0 and view.count("GHOST-CANCEL-ONLY") == 0);
-    // The composer ends at the physical bottom; the closed panel must not
-    // leave stale rows below it.
+    // The closed panel must not leave stale rows below the composer.
     try Driver.checkComposerTail(view);
     const composer = &view.grid[view.row];
     try check(std.mem.indexOf(u8, composer, "%> ") != null);
@@ -2033,8 +2024,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         // row, both at startup and after an acknowledged menu close.
         const initial = (try d.acknowledgedScreen(0)) orelse return error.MissingStartupFrame;
         const history_before = initial.history_len;
-        try check(initial.row == initial.rows - 1);
-        try check(std.mem.indexOf(u8, &initial.grid[initial.row - 1], "Not configured:") != null);
+        try Driver.checkComposerTail(initial);
+        try check(initial.row >= 1 and std.mem.indexOf(u8, &initial.grid[initial.row - 1], "Not configured:") != null);
         try check(initial.count("Not configured:") == 1);
         for (0..2) |_| {
             const opened = d.used;
@@ -2044,8 +2035,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             try d.send("\x7f");
             try d.waitVisibleFrame(closed, "Not configured:");
             const view = (try d.acknowledgedScreen(closed)) orelse return error.MissingStartupFrame;
-            try check(view.row == view.rows - 1);
-            try check(std.mem.indexOf(u8, &view.grid[view.row - 1], "Not configured:") != null);
+            try Driver.checkComposerTail(view);
+            try check(view.row >= 1 and std.mem.indexOf(u8, &view.grid[view.row - 1], "Not configured:") != null);
             try check(view.count("Not configured:") == 1);
             try check(view.history_len == history_before and view.count(regular.prior) == 1);
         }
@@ -2421,6 +2412,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitFrame(start, "native-row-039");
         var stage = try d.screen();
         if (stage.history_len < 8) return error.NativeHistoryMissing;
+        try check(stage.row == stage.rows - 1);
         const top = stage.history_len - 8;
         const old_history = stage.history_len;
         var pinned: [24]@TypeOf(stage.grid[0]) = undefined;
@@ -2456,22 +2448,31 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         var stage = try d.screen();
         // Check the actual streamed reasoning on the logical terminal, not
         // only Record.layout: Markdown punctuation must remain literal.
-        if (!stage.visible("# **thinking-old-two**") or !stage.visible("- `thinking-old-three`")) return error.ThinkingMarkupNotLiteral;
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;103m# **thinking-old-two**") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;103m- `thinking-old-three`") != null);
-        try check(stage.visible("reasoning-stage-one"));
+        if (!stage.visible("# **reasoning-stage-one** with `literal`")) return error.ThinkingMarkupNotLiteral;
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;103m# **reasoning-stage-one** with `literal`") != null);
+        var reasoning_rows: usize = 0;
+        for (stage.grid[0..stage.rows]) |line| if (std.mem.indexOf(u8, &line, "reasoning-stage-") != null or std.mem.indexOf(u8, &line, "thinking-") != null) {
+            reasoning_rows += 1;
+        };
+        try check(reasoning_rows == 1 and stage.count("reasoning-stage-one") == 1);
+        for (stage.history[0..stage.history_len]) |line| try check(std.mem.indexOf(u8, &line, "reasoning-stage-") == null and std.mem.indexOf(u8, &line, "thinking-") == null);
         try Driver.checkComposerTail(stage);
-        try Driver.checkGap(stage, "stream-task", "thinking-old-two");
+        try Driver.checkGap(stage, "stream-task", "reasoning-stage-one");
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Thinking") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "thin |") == null);
-        try check(!stage.visible("thinking-old-one"));
-        try check(stage.visible("thinking-old-two") and stage.visible("thinking-old-three"));
+        for ([_][]const u8{ "thinking-old-one", "thinking-old-two", "thinking-old-three", "thinking-new-five", "thinking-new-six" }) |marker| try check(!stage.visible(marker));
         try d.waitText(start, "reasoning-stage-two");
         try d.quiet(100);
         stage = try d.screen();
-        try check(stage.visible("thinking-new-five") and stage.visible("thinking-new-six") and stage.visible("reasoning-stage-two"));
-        try check(!stage.visible("reasoning-stage-one") and !stage.visible("thinking-old-two"));
-        try Driver.checkGap(stage, "stream-task", "thinking-new-five");
+        try check(stage.visible("# **reasoning-stage-two** with `literal`") and stage.count("reasoning-stage-two") == 1);
+        reasoning_rows = 0;
+        for (stage.grid[0..stage.rows]) |line| if (std.mem.indexOf(u8, &line, "reasoning-stage-") != null or std.mem.indexOf(u8, &line, "thinking-") != null) {
+            reasoning_rows += 1;
+        };
+        try check(reasoning_rows == 1);
+        for ([_][]const u8{ "reasoning-stage-one", "thinking-old-one", "thinking-old-two", "thinking-old-three", "thinking-new-five", "thinking-new-six" }) |marker| try check(!stage.visible(marker));
+        for (stage.history[0..stage.history_len]) |line| try check(std.mem.indexOf(u8, &line, "reasoning-stage-") == null and std.mem.indexOf(u8, &line, "thinking-") == null);
+        try Driver.checkGap(stage, "stream-task", "reasoning-stage-two");
         try check(std.mem.indexOf(u8, &stage.grid[stage.row], "(fixture-model) ") != null and std.mem.indexOf(u8, &stage.grid[stage.row], "%~") != null);
         try Driver.checkStreamFooter(stage);
         try check(!stage.visible("TPS:") and !stage.visible("tokens in:"));
@@ -2998,7 +2999,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     const no_submit_exit = std.mem.eql(u8, mode, "exit-no-submit") or std.mem.eql(u8, mode, "exit-unconfigured") or std.mem.eql(u8, mode, "exit-batched");
     const before_exit = if (no_submit_exit) try d.screen() else null;
     if (before_exit) |before| {
-        try check(before.row == before.rows - 1);
+        try Driver.checkStartupFootprint(before);
         try check(before.count(regular.prior) == 1);
     }
     // Remainder of the SAME read after Ctrl+D must not submit anything.

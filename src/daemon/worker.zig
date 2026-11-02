@@ -48,6 +48,9 @@ const Watch = struct {
     stamp: SessionHost.WatchStamp,
     /// Frozen second baseline frame; first (snapshot) is the outgoing frame.
     baseline: ?[]u8,
+    row_cursor: u64 = 0,
+    row_group: u64 = 0,
+    repeat_first: bool = false,
 };
 
 pub fn run(init: std.process.Init, options: cli.Options) !u8 {
@@ -465,15 +468,20 @@ fn startWatch(host: *SessionHost, a: std.mem.Allocator, io: Io, active: *Active,
     const cursor = try host.watchResume(epoch, resume_cursor);
     const stamp = host.watchStamp();
     // Both encoders run at one owner turn, with no pump/wait in between.
-    const snapshot = try host.watchSnapshot(a, request.id, epoch);
+    const snapshot = try host.watchSnapshotPage(a, request.id, epoch, 0, null);
     defer {
-        std.crypto.secureZero(u8, snapshot);
-        a.free(snapshot);
+        std.crypto.secureZero(u8, snapshot.frame);
+        a.free(snapshot.frame);
     }
     const baseline: ?[]u8 = if (resume_cursor == null) try host.watchBaseline(a, request.id, epoch) else null;
     errdefer if (baseline) |bytes| a.free(bytes);
-    try active.conn.queueFrame(snapshot);
+    try active.conn.queueFrame(snapshot.frame);
     active.write_started_ms = nowMs(io);
+    // The reconnect client deliberately ignores the first snapshot while it
+    // catches up ordered events. Repeat page zero after that catch-up.
+    active.watch.?.row_cursor = if (resume_cursor != null) 0 else snapshot.next;
+    active.watch.?.repeat_first = resume_cursor != null;
+    active.watch.?.row_group = snapshot.group;
     active.watch.?.stamp = stamp;
     active.watch.?.cursor = cursor;
     active.watch.?.baseline = baseline;
@@ -501,13 +509,17 @@ fn advanceWatch(host: *SessionHost, a: std.mem.Allocator, io: Io, active: *Activ
         watch.cursor = page.through;
     } else {
         const stamp = host.watchStamp();
-        if (stamp.eql(watch.stamp)) return;
-        // Snapshot is published only after all events through this watermark
-        // have been queued in order; idle can never overtake a terminal event.
-        const frame = try host.watchSnapshot(a, watch.request_id, watch.epoch);
-        defer a.free(frame);
-        try active.conn.queueFrame(frame);
-        watch.stamp = stamp;
+        if (stamp.eql(watch.stamp) and watch.row_cursor == 0 and !watch.repeat_first) return;
+        // Drain all ordered events first, then continue the current group page
+        // sequence. A new group restarts at zero in watchSnapshotPage.
+        const starting = watch.row_cursor == 0;
+        const page = try host.watchSnapshotPage(a, watch.request_id, watch.epoch, watch.row_cursor, watch.row_group);
+        defer a.free(page.frame);
+        try active.conn.queueFrame(page.frame);
+        watch.row_cursor = page.next;
+        watch.row_group = page.group;
+        watch.repeat_first = false;
+        if (starting) watch.stamp = stamp;
     }
     active.write_started_ms = nowMs(io);
 }

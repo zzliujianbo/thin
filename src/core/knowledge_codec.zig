@@ -101,6 +101,11 @@ fn preflight(text: []const u8) !void {
 /// then release it even when Service returns an error after extraction. This
 /// codec's ownership must not be assumed for borrowed results from fake services.
 pub fn parse(a: std.mem.Allocator, material: k.Material, text: []const u8) ![]const k.Candidate {
+    return parseWithRejection(a, material, text, null);
+}
+
+pub fn parseWithRejection(a: std.mem.Allocator, material: k.Material, text: []const u8, rejection: ?*?k.EvidenceRejection) ![]const k.Candidate {
+    if (rejection) |report| report.* = null;
     try materialValid(material);
     try preflight(text);
     // Typed std.json integers also accept quoted numbers; forbid those before
@@ -135,7 +140,7 @@ pub fn parse(a: std.mem.Allocator, material: k.Material, text: []const u8) ![]co
     };
     defer decoded.deinit();
     const items = decoded.value.items;
-    try k.validate(material, items);
+    try k.validateWithRejection(material, items, rejection);
     for (items, 0..) |item, i| {
         if (!slug(item.topic) or !std.unicode.utf8ValidateSlice(item.quote)) return error.InvalidMemoryOutput;
         for (items[0..i]) |prior| if (prior.category == item.category and std.mem.eql(u8, prior.topic, item.topic)) return error.DuplicateMemoryCandidate;
@@ -295,6 +300,37 @@ test "knowledge codec CAS wrong version malformed versions and whole batch rejec
         material.related = &.{related};
         try std.testing.expectError(error.InvalidMemoryVersion, parse(a, material, batch));
     }
+}
+
+test "memory evidence rejection codec reasons batch and reset" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, reason: k.EvidenceRejection.Reason, index: u32, source: u16 }{
+        .{ .body = "{\"items\":[" ++ test_item ++ ",{\"category\":\"project\",\"topic\":\"other\",\"content\":\"Zig\",\"source_id\":0,\"quote\":\"absent\"}]}", .reason = .quote_mismatch, .index = 1, .source = 0 },
+        .{ .body = "{\"items\":[{\"category\":\"project\",\"topic\":\"other\",\"content\":\"Zig\",\"source_id\":1,\"quote\":\"invented\"}]}", .reason = .assistant_source, .index = 0, .source = 1 },
+        .{ .body = "{\"items\":[{\"category\":\"project\",\"topic\":\"other\",\"content\":\"password=sentinel\",\"source_id\":0,\"quote\":\"Use Zig\"}]}", .reason = .sensitive_content, .index = 0, .source = 0 },
+    };
+    var report: ?k.EvidenceRejection = null;
+    for (cases) |case| {
+        try std.testing.expectError(error.InvalidMemoryEvidence, parseWithRejection(a, test_material, case.body, &report));
+        try std.testing.expectEqual(case.reason, report.?.reason);
+        try std.testing.expectEqual(case.index, report.?.candidate_index);
+        try std.testing.expectEqual(case.source, report.?.source_id);
+    }
+    try std.testing.expectError(error.InvalidMemoryOutput, parseWithRejection(a, test_material, "{\"items\":[", &report));
+    try std.testing.expect(report == null);
+    report = .{ .reason = .quote_mismatch, .candidate_index = 9, .source_id = 0 };
+    try std.testing.expectError(error.InvalidMemoryOutput, parseWithRejection(a, test_material, "{\"items\":[{\"category\":\"project\",\"topic\":\"language\",\"content\":\"Zig\",\"source_id\":\"0\",\"quote\":\"Use Zig\"}]}", &report));
+    try std.testing.expect(report == null);
+    const items = try parseWithRejection(a, test_material, test_valid, &report);
+    defer freeCandidates(a, items);
+    try std.testing.expect(report == null);
+    const sensitive_material: k.Material = .{ .id = "test", .generation = 1, .created_ms = 100, .sources = &.{.{ .id = 8, .kind = .user, .text = "Use Zig password=synthetic" }} };
+    try std.testing.expectError(error.InvalidMemoryEvidence, parseWithRejection(a, sensitive_material, "{\"items\":[{\"category\":\"project\",\"topic\":\"language\",\"content\":\"Zig\",\"source_id\":8,\"quote\":\"Use Zig\"}]}", &report));
+    try std.testing.expectEqual(k.EvidenceRejection.Reason.sensitive_source, report.?.reason);
+    try std.testing.expectEqual(@as(u16, 8), report.?.source_id);
+    const ordinary = try parseWithRejection(a, test_material, "{\"items\":[{\"category\":\"project\",\"topic\":\"ordinary\",\"content\":\"Use my-task and os.environ\",\"source_id\":0,\"quote\":\"Use Zig\"}]}", &report);
+    defer freeCandidates(a, ordinary);
+    try std.testing.expect(report == null);
 }
 
 test "knowledge codec rejects coerced integers fields slugs and malformed evidence" {

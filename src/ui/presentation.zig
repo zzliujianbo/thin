@@ -117,6 +117,59 @@ pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
     return .{ .kind = kind, .label = try singleLineImpl(a, detail, 512, call.truncated) };
 }
 
+/// Add display-only subagent progress without changing the borrowed caption.
+/// Strip terminal escape sequences before the common single-line sanitizer.
+pub fn subagentProgress(a: std.mem.Allocator, value: Caption, progress: []const u8) !Caption {
+    var result = value;
+    if (value.kind != .subagent and value.kind != .subagent_id) {
+        result.label = try a.dupe(u8, value.label);
+        return result;
+    }
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < progress.len and len < buf.len) {
+        if (progress[i] == 0x1b) {
+            i += 1;
+            if (i == progress.len) break;
+            const kind = progress[i];
+            i += 1;
+            if (kind == '[') {
+                while (i < progress.len) {
+                    const c = progress[i];
+                    i += 1;
+                    if (c >= 0x40 and c <= 0x7e) break;
+                }
+            } else if (kind == ']') {
+                while (i < progress.len) {
+                    if (progress[i] == 7) {
+                        i += 1;
+                        break;
+                    }
+                    if (progress[i] == 0x1b and i + 1 < progress.len and progress[i + 1] == '\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        buf[len] = progress[i];
+        len += 1;
+        i += 1;
+    }
+    const note = std.mem.trim(u8, buf[0..len], " \t\r\n\x0b\x0c");
+    if (note.len == 0) {
+        result.label = try a.dupe(u8, value.label);
+        return result;
+    }
+    const joined = try std.mem.concat(a, u8, &.{ value.label, " · ", note });
+    defer a.free(joined);
+    result.label = try singleLineImpl(a, joined, 512, i < progress.len);
+    return result;
+}
+
 /// Numeric observations survive Bridge text clipping. Missing is ?, not zero.
 /// This helper is called for successful results only; failures retain the path
 /// but must not claim any uncompleted read/write or requested-content line count.
@@ -486,6 +539,29 @@ fn contextLabel(a: std.mem.Allocator, snapshot: ?shared.ContextSnapshot) ![]cons
     const ratio = shared.state.contextRatio(snapshot orelse return a.dupe(u8, "?%")) orelse return a.dupe(u8, "?%");
     if (snapshot.?.tokens > snapshot.?.limit) return a.dupe(u8, ">100%");
     return std.fmt.allocPrint(a, "{d}.{d}%", .{ ratio / 10, ratio % 10 });
+}
+
+test "subagent tool progress sanitizes and bounds borrowed captions" {
+    const a = std.testing.allocator;
+    const base: Caption = .{ .kind = .subagent_id, .label = "subagent_1", .failure_reason = "reason" };
+    const value = try subagentProgress(a, base, " \x1b[2J中文\nnext\tline\x1b]0;secret\x07 ");
+    defer value.deinit(a);
+    try std.testing.expectEqualStrings("subagent_1 · 中文 next line", value.label);
+    try std.testing.expectEqualStrings("reason", value.failure_reason.?);
+    const empty = try subagentProgress(a, base, " \n\t");
+    defer empty.deinit(a);
+    try std.testing.expectEqualStrings(base.label, empty.label);
+    const other = try subagentProgress(a, .{ .kind = .read, .label = "file" }, "ignored");
+    defer other.deinit(a);
+    try std.testing.expectEqualStrings("file", other.label);
+    const long_input: [1200]u8 = @splat('x');
+    const long = try subagentProgress(a, base, &long_input);
+    defer long.deinit(a);
+    try std.testing.expect(long.label.len <= 512 and text.width(long.label) <= 512);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(long.label));
+    const tiny = try singleLine(a, long.label, 2);
+    defer a.free(tiny);
+    try std.testing.expect(text.width(tiny) <= 2);
 }
 
 test "normal preview captions show names until reliable typed fields arrive" {
