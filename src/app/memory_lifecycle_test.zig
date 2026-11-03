@@ -28,7 +28,7 @@ const Extractor = struct {
     fn service(self: *@This()) k.Service {
         return .{ .context = self, .extract_fn = extract };
     }
-    fn extract(raw: *anyopaque, a: std.mem.Allocator, material: k.Material, cancel: *const p.Cancellation) ![]const k.Candidate {
+    fn extract(raw: *anyopaque, a: std.mem.Allocator, _: k.Material, cancel: *const p.Cancellation) ![]const k.Candidate {
         const self: *@This() = @ptrCast(@alignCast(raw));
         _ = self.calls.fetchAdd(1, .acq_rel);
         self.started.store(true, .release);
@@ -43,8 +43,6 @@ const Extractor = struct {
             .category = .preferences,
             .topic = "settle-order",
             .content = "Wait for Memory before publishing idle.",
-            .source_id = material.sources[0].id,
-            .quote = "Wait for Memory",
         }});
     }
 };

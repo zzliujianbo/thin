@@ -58,7 +58,6 @@ fn makeClient(a: std.mem.Allocator, io: Io, scenario: []const u8, timeout_ms: u3
 }
 
 const command: decision.Input = .{ .command = .{ .command = "printf fixture", .proposed_timeout_ms = 120000, .max_timeout_ms = 300000 } };
-const memory: decision.Input = .{ .memory_write = .{ .topic = "style/original-id", .content = "Prefer explicit bounded ownership and concise reports.", .expected_version = "v-original-7" } };
 
 fn independent(client: *Client, calls: u64) !void {
     const resolved = client.resolved orelse return error.MissingNativeResolution;
@@ -119,14 +118,6 @@ test "SystemOne owned HTTP app decisions conservative policy and independent rou
         }
         try usage(client);
     }
-    for ([_][]const u8{ "memory-positive", "memory-negative" }) |scenario| {
-        const client = try makeClient(a, io, scenario, 3000, .direct);
-        defer client.deinit();
-        const out = try client.service().decide(a, memory, &cancel);
-        try t.expectEqual(std.mem.eql(u8, scenario, "memory-positive"), out.memory_write);
-        try usage(client);
-    }
-
     // More than 2KiB, with a critical middle error, operational metadata and
     // hundreds of progress lines. Only exact trivial middle lines may disappear.
     var original: std.Io.Writer.Allocating = .init(a);
@@ -213,11 +204,11 @@ test "SystemOne real curl CONNECT TLS CA and hostname verification" {
         defer client.deinit();
         var cancel = p.Cancellation{};
         if (trust == .trusted_proxy) {
-            const out = try client.service().decide(t.allocator, memory, &cancel);
-            try t.expect(out.memory_write);
+            const out = try client.service().decide(t.allocator, command, &cancel);
+            try t.expect(out.command.ask);
             try usage(client);
         } else {
-            if (client.service().decide(t.allocator, memory, &cancel)) |out| {
+            if (client.service().decide(t.allocator, command, &cancel)) |out| {
                 decision.freeOutput(t.allocator, out);
                 return error.ExpectedCertificateFailure;
             } else |_| {}

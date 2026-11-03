@@ -102,7 +102,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const items = current.prompt === FIRST ? [{category: 'preferences', topic: 'review-style', content: FACT,
-      source_id: material.sources[0].id, quote: 'prefer concise explanations', expected_version: null, expires_at_ms: null}] : [];
+      expected_version: null, expires_at_ms: null}] : [];
     current.helperResponded = true;
     // Whitespace is legal JSON and leaves the business payload unchanged.
     const json = JSON.stringify({items});

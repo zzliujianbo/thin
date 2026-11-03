@@ -60,9 +60,7 @@ PROMPTS = (
 )
 ANSWERS = ('answer-one-proof', 'answer-two-proof', 'answer-three-proof')
 FACT = 'Prefers concise code reviews.'
-QUOTE = 'prefer concise code reviews'
 ACTIVE = 'Memory: extracting'
-TERMINAL_SKIPPED = 'Memory: no new durable entries'
 SAVED_PATH = '.thin/memory/preferences-review-style.md'
 RETIRED_PATHS = ('.thin/memory/jobs', '.thin/memory/jobs-owner', '.thin/mem-jobs', '.thin/mem-jobs-owner')
 CONTEXT_PREFIX = '[Context material'
@@ -108,6 +106,7 @@ class Control:
         self.release1 = threading.Event()
         self.helper2_arrived = threading.Event()
         self.release2 = threading.Event()
+        self.helper2_responded = threading.Event()
         self.helper3_arrived = threading.Event()
         self.release3 = threading.Event()
         self.helper3_canceled = threading.Event()
@@ -208,10 +207,7 @@ class MemoryService(http.server.BaseHTTPRequestHandler):
         if index == 0:
             control.helper1_arrived.set()
             assert control.release1.wait(30), 'Memory 1 gate timed out'
-            text = sources[0]['text']
-            assert QUOTE in text, f'fixture quote is not a literal source substring: {text!r}'
             items = [{'category': 'preferences', 'topic': 'review-style', 'content': FACT,
-                      'source_id': sources[0]['id'], 'quote': QUOTE,
                       'expected_version': None, 'expires_at_ms': None}]
             self.sse(json.dumps({'items': items}))
             return
@@ -222,6 +218,7 @@ class MemoryService(http.server.BaseHTTPRequestHandler):
                 f'queued Memory 2 material lacks the committed fact/version: {material.get("related")!r}'
             assert control.release2.wait(30), 'Memory 2 gate timed out'
             self.sse(json.dumps({'items': []}))
+            control.helper2_responded.set()
             return
         control.helper3_arrived.set()
         while not control.release3.wait(0.02):
@@ -320,7 +317,7 @@ def assert_no_memory_transcript(screen):
     assert 'Memory:' in rows[screen.row - 1], 'Memory notice outside the footer'
 
 
-def run(app, columns):
+def run(app, columns, observe_saved=False):
     control = Control()
     MemoryService.control = control
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), MemoryService)
@@ -429,10 +426,36 @@ def run(app, columns):
             hint = assert_footer(screen, ACTIVE)
             rows = [row_text(screen, i) for i in range(len(screen.grid))]
             assert any(marker in text for text in rows for marker in WARNING_MARKERS), \
-                f'expected the benign capability warning to be visible: {rows!r}'
+                'expected the benign capability warning to be visible'
             assert control.helper1_arrived.wait(12), 'Memory 1 request did not arrive'
             assert control.helper == 1 and control.primary == 1
             assert_no_memory_transcript(screen)
+
+            if observe_saved:
+                # Separate owned run: no queued successor can mask the saved
+                # terminal status. Inspect the current screen, never old PTY bytes.
+                before = len(capture)
+                control.release1.set()
+                pump_until(lambda: len(capture) > before and fresh() and
+                           any(row_text(screen, i).startswith('Memory: saved') and
+                               FACT in row_text(screen, i) for i in range(len(screen.grid))),
+                           'fresh saved footer containing the actual fact')
+                rows = [row_text(screen, i) for i in range(len(screen.grid))]
+                assert sum('Memory:' in row for row in rows) == 1
+                assert rows[screen.row - 1].startswith('Memory: saved')
+                assert FACT in rows[screen.row - 1]
+                assert control.primary == 1 and control.helper == 1
+                saved_text = (project / SAVED_PATH).read_text(encoding='utf-8')
+                assert FACT in saved_text and KEY not in saved_text
+                for retired in RETIRED_PATHS:
+                    assert not (project / retired).exists(), 'retired Memory jobs path recreated'
+                assert config_path.read_bytes() == config_bytes
+                send(b'\x04')
+                pump_until(lambda: child.poll() is not None, 'saved-case Ctrl-D exit', timeout=10)
+                assert child.wait(timeout=5) == 0
+                assert termios.tcgetattr(slave) == original
+                assert fcntl.fcntl(slave, fcntl.F_GETFL) == original_flags
+                return
 
             # Round 2 while Memory 1 is still unanswered: the primary must be
             # admitted, answer and settle without releasing Memory 1.
@@ -465,13 +488,18 @@ def run(app, columns):
             saved_text = saved.read_text(encoding='utf-8')
             assert FACT in saved_text and KEY not in saved_text, 'committed fact file content mismatch'
 
-            # Empty extraction result: the terminal footer is the documented
-            # "no new durable entries" label, not a transcript notice.
+            # Observe the second job active in an acknowledged frame before
+            # releasing its empty response. A newer acknowledged idle frame with
+            # the active row gone is the completion transition, not a sleep or
+            # merely an absence observed before the result was processed.
+            pump_until(lambda: fresh() and footer_state(screen) == ACTIVE,
+                       'second Memory job active before empty result')
+            before = len(capture)
             control.release2.set()
-            pump_until(lambda: fresh() and footer_state(screen) == TERMINAL_SKIPPED,
-                       'terminal Memory footer "no new durable entries"')
-            assert_footer(screen, TERMINAL_SKIPPED)
-            assert_no_memory_transcript(screen)
+            pump_until(lambda: control.helper2_responded.is_set() and len(capture) > before
+                       and fresh() and all('Memory:' not in row_text(screen, i)
+                                           for i in range(len(screen.grid))),
+                       'acknowledged empty-result completion without Memory notice')
 
             # Round 3 then exit while its Memory request is unanswered: Ctrl-D from
             # the idle composer must not release a valid response for the job.
@@ -553,5 +581,6 @@ if __name__ == '__main__':
     app = str(Path(sys.argv[1]).resolve(strict=True))
     for columns in COLUMNS:
         run(app, columns)
-    print(f'PASS test-memory-background: {len(COLUMNS)} owned PTYs, primary=6 helper=6, '
+    run(app, COLUMNS[0], observe_saved=True)
+    print(f'PASS test-memory-background: {len(COLUMNS) + 1} owned PTYs, primary=7 helper=7, '
           'next prompt admitted while owned Memory runs')

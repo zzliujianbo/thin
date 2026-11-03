@@ -1,4 +1,4 @@
-//! Project-local automatic Memory finalizer. Independent extraction/review
+//! Project-local automatic Memory finalizer. Independent extraction
 //! failures are observable but never rewrite an already completed primary task.
 //! Jobs are copied into an owned, heap-stable FIFO and finalized by one owned
 //! asynchronous worker; the Runtime only enqueues before publishing finished;
@@ -13,7 +13,6 @@ const fs = @import("../platform/filesystem.zig");
 const mem = @import("../tools/memory.zig");
 const knowledge = @import("../tools/knowledge_store.zig");
 const Extractor = @import("memory_client.zig").Client;
-const Reviewer = @import("decision_client.zig").Client;
 const codex_auth = @import("../core/codex_auth.zig");
 const memory_status = @import("../core/memory_status.zig");
 
@@ -25,6 +24,8 @@ pub const State = enum(u8) { idle, finalizing, saved, skipped, failed, uncertain
 const Outcome = struct {
     state: State = .idle,
     err: ?anyerror = null,
+    saved_count: u32 = 0,
+    summary: memory_status.Summary = .{},
 
     fn set(self: *Outcome, state: State, err: ?anyerror) void {
         self.state = state;
@@ -56,10 +57,8 @@ pub const Coordinator = struct {
     config: std.json.Parsed(cfg.Config),
     diagnostics: diag.Sink = .{},
     extractor: ?*Extractor = null,
-    reviewer: ?*Reviewer = null,
     /// Test-only provider-independent seam. No fake behavior in production.
     service_override: ?k.Service = null,
-    review_override: ?@import("../core/decision.zig").Service = null,
     codex_source: ?codex_auth.CredentialSource = null,
     state: std.atomic.Value(u8) = .init(@backingInt(State.idle)),
     failure: std.atomic.Value(u16) = .init(0),
@@ -252,7 +251,6 @@ pub const Coordinator = struct {
             self.unlock();
             self.diagnostics = job.sink;
             if (self.extractor) |client| client.diagnostics = job.sink;
-            if (self.reviewer) |client| client.diagnostics = job.sink;
             var span = diag.Span.start(job.sink, self.io, .{ .stage = .memory_finalize });
             self.execute(&job.outcome, &job.capture, job.protocol, &job.cancel);
             const outcome = job.outcome;
@@ -269,6 +267,8 @@ pub const Coordinator = struct {
             self.status.active = null;
             self.publish(outcome.state, outcome.err);
             self.terminal(job.id, result, if (outcome.err) |err| classifyFailure(err) else null);
+            self.status.last_terminal.?.saved_count = outcome.saved_count;
+            self.status.last_terminal.?.summary = outcome.summary;
             self.unlock();
             job.destroy(self.allocator);
         }
@@ -438,8 +438,6 @@ pub const Coordinator = struct {
             const guarded_source: ?codex_auth.CredentialSource = if (source != null) .{ .context = self, .acquire_fn = acquireGuardedCodex } else null;
             self.extractor = try Extractor.createWithCodexSource(a, io, config, env, guarded_source);
             errdefer if (self.extractor) |client| client.deinit();
-            self.reviewer = try Reviewer.createWithCodexSource(a, io, config, env, guarded_source);
-            errdefer if (self.reviewer) |client| client.deinit();
         }
         return self;
     }
@@ -459,7 +457,6 @@ pub const Coordinator = struct {
     pub fn bindDiagnostics(self: *Coordinator, sink: diag.Sink) void {
         self.diagnostics = sink;
         if (self.extractor) |client| client.diagnostics = sink;
-        if (self.reviewer) |client| client.diagnostics = sink;
     }
 
     fn registerSecret(self: *Coordinator, key: []const u8) !void {
@@ -505,7 +502,7 @@ pub const Coordinator = struct {
             .idle => null,
             .finalizing => "Memory: finalizing (separate auxiliary request)",
             .saved => "Memory: saved",
-            .skipped => "Memory: no new durable entries",
+            .skipped => null,
             .failed => "Memory: finalization failed",
             .uncertain => "Memory: request outcome uncertain; no automatic replay",
             .canceled => "Memory: finalization canceled",
@@ -622,17 +619,24 @@ pub const Coordinator = struct {
         if (self.secret_registration_failed) return error.TooManySessionCredentials;
         var repository = knowledge.Repository.init(&self.store);
         var query: std.ArrayList(u8) = .empty;
-        for (source.sources) |evidence| if (evidence.kind == .user) {
-            if (query.items.len + evidence.text.len <= 8192) {
+        var sources: std.ArrayList(k.Evidence) = .empty;
+        for (source.sources) |evidence| {
+            if (self.containsSecret(evidence.text) or k.sensitiveMaterial(evidence.text)) continue;
+            try sources.append(a, evidence);
+            if (evidence.kind == .user and query.items.len + evidence.text.len + 1 <= 8192) {
                 try query.appendSlice(a, evidence.text);
                 try query.append(a, '\n');
             }
-        };
+        }
+        if (sources.items.len == 0) {
+            out.set(.skipped, null);
+            return;
+        }
         var material = source;
-        for (source.sources) |evidence| if (self.containsSecret(evidence.text) or k.sensitiveMaterial(evidence.text)) return error.SensitiveMemoryMaterial;
+        material.sources = sources.items;
         var related: std.ArrayList(k.Related) = .empty;
         for (try repository.related(a, query.items, now(self.io))) |entry| {
-            if (self.containsSecret(entry.content) or self.containsSecret(entry.topic) or k.sensitiveMaterial(entry.content)) continue;
+            if (self.containsSecret(entry.content) or self.containsSecret(entry.topic) or k.sensitiveMaterial(entry.content) or k.sensitiveMaterial(entry.topic)) continue;
             try related.append(a, entry);
         }
         material.related = related.items;
@@ -648,31 +652,9 @@ pub const Coordinator = struct {
             break :blk result;
         };
         if (cancel.isRequested()) return error.Canceled;
-        for (candidates) |candidate| {
-            if (self.containsSecret(candidate.topic) or self.containsSecret(candidate.content) or self.containsSecret(candidate.quote)) return error.SensitiveMemoryMaterial;
-        }
-        var saved: usize = 0;
         for (candidates, 0..) |candidate, index| {
             if (cancel.isRequested()) return error.Canceled;
-            switch (try repository.inspect(a, material, candidate)) {
-                .unchanged, .expired => continue,
-                .conflict => return error.MemoryConflict,
-                .created, .updated => {},
-            }
-            if (self.review_override orelse if (self.reviewer) |client| client.service() else null) |reviewer| {
-                self.phase(.reviewing);
-                var span = diag.Span.start(self.diagnostics, self.io, .{ .stage = .memory_review, .candidate_index = @intCast(@min(index, std.math.maxInt(u32))), .count = @intCast(@min(candidates.len, std.math.maxInt(u32))) });
-                const output = reviewer.decide(a, .{ .memory_write = .{ .topic = candidate.topic, .content = candidate.content, .expected_version = candidate.expected_version } }, cancel) catch |err| {
-                    span.fail(err);
-                    return err;
-                };
-                if (output != .memory_write) {
-                    span.fail(error.InvalidDecision);
-                    return error.InvalidDecision;
-                }
-                span.finish(if (output.memory_write) .ok else .skipped);
-                if (!output.memory_write) continue;
-            }
+            if (self.containsSecret(candidate.topic) or self.containsSecret(candidate.content)) continue;
             if (cancel.isRequested()) return error.Canceled;
             self.phase(.saving);
             var span = diag.Span.start(self.diagnostics, self.io, .{ .stage = .memory_write, .candidate_index = @intCast(@min(index, std.math.maxInt(u32))), .count = @intCast(@min(candidates.len, std.math.maxInt(u32))) });
@@ -680,20 +662,21 @@ pub const Coordinator = struct {
                 span.fail(err);
                 return err;
             };
-            if (result == .conflict) span.fail(error.MemoryConflict) else span.finish(if (result == .unchanged or result == .expired) .skipped else .ok);
+            span.finish(if (result == .unchanged or result == .expired or result == .conflict) .skipped else .ok);
             switch (result) {
-                .created, .updated => saved += 1,
-                .conflict => return error.MemoryConflict,
-                .unchanged, .expired => {},
+                .created, .updated => {
+                    out.saved_count +|= 1;
+                    out.summary.append(std.mem.trim(u8, candidate.content, " \t\r\n"));
+                },
+                .conflict, .unchanged, .expired => {},
             }
         }
-        out.set(if (saved == 0) .skipped else .saved, null);
+        out.set(if (out.saved_count == 0) .skipped else .saved, null);
     }
 
     pub fn deinit(self: *Coordinator) void {
         self.cancelAndJoin();
         std.debug.assert(std.c.pthread_mutex_destroy(&self.queue_mutex) == .SUCCESS);
-        if (self.reviewer) |reviewer| reviewer.deinit();
         if (self.extractor) |client| client.deinit();
         self.releaseSecrets();
         std.debug.assert(std.c.pthread_mutex_destroy(&self.secret_mutex) == .SUCCESS);
@@ -703,7 +686,7 @@ pub const Coordinator = struct {
     }
 };
 
-test "coordinator diagnostics pair extraction reviews and writes" {
+test "coordinator diagnostics pair extraction and writes" {
     const Capture = struct {
         records: [32]diag.Record = undefined,
         len: usize = 0,
@@ -722,8 +705,7 @@ test "coordinator diagnostics pair extraction reviews and writes" {
     const Fake = struct {
         fail: bool = false,
         cancel: bool = false,
-        reviews: usize = 0,
-        fn extract(raw: *anyopaque, a: std.mem.Allocator, material: k.Material, cancellation: *const p.Cancellation) ![]const k.Candidate {
+        fn extract(raw: *anyopaque, a: std.mem.Allocator, _: k.Material, cancellation: *const p.Cancellation) ![]const k.Candidate {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.cancel) {
                 @constCast(cancellation).cancel();
@@ -731,14 +713,9 @@ test "coordinator diagnostics pair extraction reviews and writes" {
             }
             if (self.fail) return error.MemoryUnavailable;
             return a.dupe(k.Candidate, &.{
-                .{ .category = .preferences, .topic = "first", .content = "Prefers concise explanations.", .source_id = material.sources[0].id, .quote = "prefer concise explanations" },
-                .{ .category = .preferences, .topic = "second", .content = "Prefers concise reviews.", .source_id = material.sources[0].id, .quote = "prefer concise explanations" },
+                .{ .category = .preferences, .topic = "first", .content = "Prefers concise explanations." },
+                .{ .category = .preferences, .topic = "second", .content = "Prefers concise reviews." },
             });
-        }
-        fn review(raw: *anyopaque, _: std.mem.Allocator, _: @import("../core/decision.zig").Input, _: *const p.Cancellation) !@import("../core/decision.zig").Output {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.reviews += 1;
-            return .{ .memory_write = self.reviews == 1 };
         }
     };
     const a = std.testing.allocator;
@@ -760,7 +737,6 @@ test "coordinator diagnostics pair extraction reviews and writes" {
     owner.bindDiagnostics(.{ .context = &events, .emit_fn = Capture.emit, .next_fn = Capture.next });
     var fake: Fake = .{};
     owner.service_override = .{ .context = &fake, .extract_fn = Fake.extract };
-    owner.review_override = .{ .context = &fake, .decide_fn = Fake.review };
     const text = "I prefer concise explanations in all code reviews.";
     var cancel: p.Cancellation = .{};
     const reference = try owner.retrieve(a, text, 8192);
@@ -771,12 +747,11 @@ test "coordinator diagnostics pair extraction reviews and writes" {
     capture.add(.user, text);
     owner.finalize(&capture, .chat, &cancel);
     try std.testing.expectEqualStrings("Memory: saved", owner.notice().?);
-    try std.testing.expectEqual(@as(usize, 8), events.len);
+    try std.testing.expectEqual(@as(usize, 6), events.len);
     try std.testing.expectEqual(diag.Stage.memory_extract, events.records[0].stage);
     try std.testing.expectEqual(@as(?u32, 0), events.records[2].candidate_index);
     try std.testing.expectEqual(diag.Stage.memory_write, events.records[4].stage);
-    try std.testing.expectEqual(@as(?u32, 1), events.records[6].candidate_index);
-    try std.testing.expectEqual(diag.Result.skipped, events.records[7].result.?);
+    try std.testing.expectEqual(@as(?u32, 1), events.records[4].candidate_index);
     events.len = 0;
     fake.fail = true;
     const again = try owner.retrieve(a, text, 8192);

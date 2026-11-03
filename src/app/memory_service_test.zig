@@ -4,7 +4,6 @@ const diag = @import("../core/diagnostics.zig");
 const fs = @import("../platform/filesystem.zig");
 const k = @import("../core/knowledge.zig");
 const p = @import("../core/protocol.zig");
-const decision = @import("../core/decision.zig");
 const Coordinator = @import("memory_service.zig").Coordinator;
 
 fn fixtureConfig(a: std.mem.Allocator) !std.json.Parsed(cfg.Config) {
@@ -18,18 +17,13 @@ fn fixtureConfig(a: std.mem.Allocator) !std.json.Parsed(cfg.Config) {
 const input = "I prefer concise explanations in all code reviews.";
 const Fake = struct {
     calls: usize = 0,
-    reviews: usize = 0,
-    approve: bool = true,
     fail: bool = false,
     bad_candidates: bool = false,
     cancel_during_extract: bool = false,
     fn service(self: *@This()) k.Service {
         return .{ .context = self, .extract_fn = extract };
     }
-    fn review(self: *@This()) decision.Service {
-        return .{ .context = self, .decide_fn = decide };
-    }
-    fn extract(raw: *anyopaque, a: std.mem.Allocator, material: k.Material, cancel: *const p.Cancellation) ![]const k.Candidate {
+    fn extract(raw: *anyopaque, a: std.mem.Allocator, _: k.Material, cancel: *const p.Cancellation) ![]const k.Candidate {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.calls += 1;
         if (self.cancel_during_extract) {
@@ -38,13 +32,8 @@ const Fake = struct {
         }
         if (self.fail) return error.MemoryUnavailable;
         // Deliberately invalid topic: Service.extract owns the only validation.
-        if (self.bad_candidates) return a.dupe(k.Candidate, &.{.{ .category = .preferences, .topic = "Bad Topic", .content = "prefers concise reviews", .source_id = material.sources[0].id, .quote = "prefer concise explanations" }});
-        return a.dupe(k.Candidate, &.{.{ .category = .preferences, .topic = "response-style", .content = "Prefers concise code-review explanations.", .source_id = material.sources[0].id, .quote = "prefer concise explanations" }});
-    }
-    fn decide(raw: *anyopaque, _: std.mem.Allocator, _: decision.Input, _: *const p.Cancellation) !decision.Output {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        self.reviews += 1;
-        return .{ .memory_write = self.approve };
+        if (self.bad_candidates) return a.dupe(k.Candidate, &.{.{ .category = .preferences, .topic = "Bad Topic", .content = "prefers concise reviews" }});
+        return a.dupe(k.Candidate, &.{.{ .category = .preferences, .topic = "response-style", .content = "Prefers concise code-review explanations." }});
     }
 };
 fn openRoot(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !fs.Root {
@@ -68,7 +57,7 @@ fn expectNoJobs(root: *fs.Root) !void {
     try std.testing.expectError(error.FileNotFound, fs.openPath(root.dir.handle, ".thin/memory/jobs-owner"));
 }
 
-test "automatic Memory synchronously extracts reviews saves and creates no jobs" {
+test "automatic Memory extracts once saves and creates no jobs" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -85,7 +74,6 @@ test "automatic Memory synchronously extracts reviews saves and creates no jobs"
     defer owner.deinit();
     var fake: Fake = .{};
     owner.service_override = fake.service();
-    owner.review_override = fake.review();
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
 
@@ -93,9 +81,10 @@ test "automatic Memory synchronously extracts reviews saves and creates no jobs"
     var cancel: p.Cancellation = .{};
     finalize(owner, a, input, &cancel);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(usize, 1), fake.reviews);
     try std.testing.expectEqual(@as(u64, 1), owner.completed.load(.acquire));
     try std.testing.expectEqualStrings("Memory: saved", owner.notice().?);
+    try std.testing.expectEqual(@as(u32, 1), owner.view().last_terminal.?.saved_count);
+    try std.testing.expectEqualStrings("Prefers concise code-review explanations.", owner.view().last_terminal.?.summary.text());
     const entry = try owner.store.read(a, "preferences-response-style");
     defer a.free(entry.content);
     defer a.free(entry.version);
@@ -105,8 +94,8 @@ test "automatic Memory synchronously extracts reviews saves and creates no jobs"
     try begin(owner, a, "Again: concise code reviews.");
     finalize(owner, a, "Again: I prefer concise explanations in all code reviews.", &cancel);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expectEqual(@as(usize, 1), fake.reviews);
-    try std.testing.expectEqualStrings("Memory: no new durable entries", owner.notice().?);
+    try std.testing.expect(owner.notice() == null);
+    try std.testing.expectEqual(@as(u32, 0), owner.view().last_terminal.?.saved_count);
     try expectNoJobs(&root);
 }
 
@@ -224,8 +213,8 @@ test "invalid service candidates never reach storage" {
     var cancel: p.Cancellation = .{};
     finalize(owner, a, input, &cancel);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(u16, @intFromError(error.InvalidMemoryCandidate)), owner.failure.load(.acquire));
-    try std.testing.expectEqualStrings("Memory: finalization failed", owner.notice().?);
+    try std.testing.expectEqual(@as(u16, 0), owner.failure.load(.acquire));
+    try std.testing.expect(owner.notice() == null);
     // The rejected batch is never persisted, and no index shard is created.
     try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-response-style"));
     try expectNoJobs(&root);
@@ -253,8 +242,8 @@ test "known secret source is rejected before any auxiliary request" {
     // The fixture provider key is known to this Coordinator only, not to Capture.
     finalize(owner, a, "deploy with owned-memory-fixture-key please", &cancel);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expectEqual(@as(u16, @intFromError(error.SensitiveMemoryMaterial)), owner.failure.load(.acquire));
-    try std.testing.expectEqualStrings("Memory: finalization failed", owner.notice().?);
+    try std.testing.expectEqual(@as(u16, 0), owner.failure.load(.acquire));
+    try std.testing.expect(owner.notice() == null);
     try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-response-style"));
     try expectNoJobs(&root);
 }
@@ -274,7 +263,7 @@ test "Auto Memory Off has no helper clients or storage side effects" {
     defer env.deinit();
     const owner = try Coordinator.create(a, backend.io(), &root, config.value, &env);
     defer owner.deinit();
-    try std.testing.expect(owner.extractor == null and owner.reviewer == null);
+    try std.testing.expect(owner.extractor == null);
     var capture_arena = std.heap.ArenaAllocator.init(a);
     defer capture_arena.deinit();
     var capture: k.Capture = .{ .allocator = capture_arena.allocator() };
@@ -303,12 +292,6 @@ const Gated = struct {
 
     fn service(self: *@This()) k.Service {
         return .{ .context = self, .extract_fn = extract };
-    }
-    fn review(self: *@This()) decision.Service {
-        return .{ .context = self, .decide_fn = decide };
-    }
-    fn decide(_: *anyopaque, _: std.mem.Allocator, _: decision.Input, _: *const p.Cancellation) !decision.Output {
-        return .{ .memory_write = true };
     }
     fn extract(raw: *anyopaque, a: std.mem.Allocator, material: k.Material, cancel: *const p.Cancellation) ![]const k.Candidate {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -346,8 +329,6 @@ const Gated = struct {
             .category = .preferences,
             .topic = topic,
             .content = text,
-            .quote = text,
-            .source_id = material.sources[0].id,
         }});
     }
 };
@@ -405,7 +386,6 @@ test "queued jobs run FIFO from owned capture copies with a fresh generation" {
     defer owner.deinit();
     var gated: Gated = .{ .io = io };
     owner.service_override = gated.service();
-    owner.review_override = gated.review();
 
     // Each caller arena dies immediately after enqueue; the job must own copies.
     try std.testing.expectEqual(@as(u64, 1), try enqueueText(owner, a, "fifo alpha fact"));
@@ -452,7 +432,6 @@ test "primary retrieve and parent reportFailure never rewrite an active job outc
     defer owner.deinit();
     var gated: Gated = .{ .io = io };
     owner.service_override = gated.service();
-    owner.review_override = gated.review();
 
     try std.testing.expectEqual(@as(u64, 1), try enqueueText(owner, a, "active job evidence"));
     try waitFlag(io, &gated.started);
@@ -498,7 +477,6 @@ test "cancelAndJoin wakes and joins the worker without extracting queued jobs" {
     defer owner.deinit();
     var gated: Gated = .{ .io = io };
     owner.service_override = gated.service();
-    owner.review_override = gated.review();
 
     _ = try enqueueText(owner, a, "active canceled job");
     try waitFlag(io, &gated.started);
@@ -539,7 +517,6 @@ test "worker wait failure fails every queued job and releases drain" {
     defer owner.deinit();
     var gated: Gated = .{ .io = io };
     owner.service_override = gated.service();
-    owner.review_override = gated.review();
 
     gated.release.store(true, .release);
     _ = try enqueueText(owner, a, "warmup before wait fault");
@@ -606,4 +583,65 @@ test "exhausted job ids are rejected without reuse and stay observable" {
     try std.testing.expectError(error.MemoryIdExhausted, owner.enqueueCopy(&capture, .chat, sink));
     try std.testing.expectEqual(std.math.maxInt(u64), owner.next_id);
     try expectNoJobs(&root);
+}
+
+test "mixed sources and candidates save only committed safe entries" {
+    const a = std.testing.allocator;
+    var backend = std.Io.Threaded.init(a, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try openRoot(a, io, tmp.dir);
+    defer root.deinit();
+    var config = try fixtureConfig(a);
+    defer cfg.release(&config);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const owner = try Coordinator.create(a, io, &root, config.value, &env);
+    defer owner.deinit();
+    const existing = try owner.store.write(a, "preferences-conflict", "existing independent fact", null);
+    defer a.free(existing.content);
+    defer a.free(existing.version);
+    const Mixed = struct {
+        calls: usize = 0,
+        fn extract(raw: *anyopaque, alloc: std.mem.Allocator, material: k.Material, _: *const p.Cancellation) ![]const k.Candidate {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), material.sources.len);
+            try std.testing.expectEqualStrings("Useful source", material.sources[0].text);
+            return alloc.dupe(k.Candidate, &.{
+                .{ .category = .preferences, .topic = "bad topic", .content = "invalid" },
+                .{ .category = .preferences, .topic = "conflict", .content = "must not overwrite" },
+                .{ .category = .preferences, .topic = "secret", .content = "owned-memory-fixture-key" },
+                .{ .category = .preferences, .topic = "bearer-secret", .content = "Bearer abc.def" },
+                .{ .category = .preferences, .topic = "good", .content = "  A useful fact.  " },
+            });
+        }
+    };
+    var mixed: Mixed = .{};
+    owner.service_override = .{ .context = &mixed, .extract_fn = Mixed.extract };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var capture: k.Capture = .{ .allocator = arena.allocator() };
+    capture.add(.user, "Useful source");
+    capture.add(.tool, "owned-memory-fixture-key");
+    _ = try owner.enqueueCopy(&capture, .chat, .{});
+    var cancel: p.Cancellation = .{};
+    owner.drain(&cancel);
+    const terminal = owner.view().last_terminal.?;
+    try std.testing.expectEqual(@as(usize, 1), mixed.calls);
+    try std.testing.expectEqual(@as(u32, 1), terminal.saved_count);
+    try std.testing.expectEqualStrings("A useful fact.", terminal.summary.text());
+    try std.testing.expect(terminal.result == .saved);
+    const saved = try owner.store.read(a, "preferences-good");
+    defer a.free(saved.content);
+    defer a.free(saved.version);
+    try std.testing.expect(std.mem.indexOf(u8, saved.content, "owned-memory-fixture-key") == null);
+    try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-secret"));
+    try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-bearer-secret"));
+    const conflict = try owner.store.read(a, "preferences-conflict");
+    defer a.free(conflict.content);
+    defer a.free(conflict.version);
+    try std.testing.expectEqualStrings("existing independent fact", conflict.content);
 }

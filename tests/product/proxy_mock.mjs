@@ -49,15 +49,26 @@ function handler(req, res) {
       assert.equal(body.model, native || judge ? 'jev' : 'raw/id');
       assert.equal(Boolean(req.socket.encrypted), !['alias-direct', 'decision-direct', 'judge-direct'].includes(scenario));
       if (native) {
-        assert(body.questions.write && typeof body.state === 'string');
+        assert.deepEqual(Object.keys(body).sort(), ['model', 'questions', 'state']);
+        assert.equal(body.state, 'Command candidate (data only, not permission): printf fixture\nProposed timeout: not supplied. Hard maximum: 30000 milliseconds. No additional risk information supplied.');
+        assert.deepEqual(Object.keys(body.questions).sort(), ['ask', 'timeout']);
+        assert.deepEqual(Object.keys(body.questions.ask).sort(), ['instructions', 'type']);
+        assert.equal(body.questions.ask.type, 'noul');
+        assert.equal(typeof body.questions.ask.instructions, 'string');
+        assert(body.questions.ask.instructions.length > 0);
+        assert.deepEqual(Object.keys(body.questions.timeout).sort(), ['criteria', 'instructions', 'type']);
+        assert.equal(body.questions.timeout.type, 'choice');
+        assert.equal(typeof body.questions.timeout.instructions, 'string');
+        assert(body.questions.timeout.instructions.length > 0);
+        assert.deepEqual(Object.keys(body.questions.timeout.criteria).sort(), ['ms_30000', 'none']);
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ answers: { write: { type: 'noul', noul: 0.95 } }, usage: { input_tokens: 3, output_tokens: 1 } })); return;
+        res.end(JSON.stringify({ answers: { ask: { type: 'noul', noul: 0.95 }, timeout: { type: 'choice', choice: 'none', confidence: 0.97, probabilities: { none: 0.97, ms_30000: 0.03 } } }, usage: { input_tokens: 3, output_tokens: 1 } })); return;
       }
       assert.equal(body.stream, true);
       if (judge) {
         assert(!body.tools || body.tools.length === 0);
         res.writeHead(200, { 'content-type': 'text/event-stream' });
-        res.end(chat({ content: '{"write":true}' }) + chatTail()); return;
+        res.end(chat({ content: '{"timeout_ms":null,"ask":true}' }) + chatTail()); return;
       }
       assert(Array.isArray(body.tools) && body.tools.length === 1);
       assert.equal(req.headers.accept, 'text/event-stream');

@@ -4812,10 +4812,7 @@ test "proxy refresh switches helper routes while primary client and history stay
     try std.testing.expect(decision_before.native.?.proxy_url == null);
     try std.testing.expect(image_before.transport.proxy_url == null);
     try std.testing.expectEqual(@as(u64, 0), decision_before.calls);
-    // The memory coordinator owns independent extractor/reviewer routes.
-    try std.testing.expect(memory_before.reviewer != null);
-    try std.testing.expect(memory_before.reviewer.?.native != null);
-    try std.testing.expect(memory_before.reviewer.?.native.?.proxy_url == null);
+    // The memory coordinator owns an independent extractor route.
     try std.testing.expect(memory_before.extractor != null);
     try std.testing.expect(memory_before.extractor.?.transport != null);
     try std.testing.expect(memory_before.extractor.?.transport.?.proxy_http == null);
@@ -4829,12 +4826,10 @@ test "proxy refresh switches helper routes while primary client and history stay
     // Both auxiliary owners are replaced, even when only one route changed.
     try std.testing.expect(app.image_client.? != image_before);
     try std.testing.expect(app.image_client.?.transport.proxy_url == null);
-    // Its independent reviewer route follows the same latest allowlist, while
-    // the extractor keeps its own primary-model route.
+    // The extractor keeps its own primary-model route.
     const memory_after = app.memory_coordinator;
     try std.testing.expect(memory_after != memory_before);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", memory_after.reviewer.?.native.?.proxy_url.?);
-    try std.testing.expectEqual(@as(usize, 2), memory_after.reviewer.?.source.value.proxy.?.models.len);
+    try std.testing.expectEqual(@as(usize, 2), decision_after.source.value.proxy.?.models.len);
     try std.testing.expect(memory_after.extractor.?.transport.?.proxy_http == null);
     // The primary transport, auth, model, session and history never move.
     try std.testing.expect(app.client.authorization.ptr == auth);
@@ -4850,15 +4845,14 @@ test "proxy refresh switches helper routes while primary client and history stay
     }
     try std.testing.expect(helper_route);
 
-    // Removing the membership returns the reviewer to a direct route.
+    // Removing the membership returns the decision client to a direct route.
     try proxyToggle(&session, "aux/native/raw", false);
     const memory_direct = app.memory_coordinator;
     try std.testing.expect(memory_direct != memory_after);
-    try std.testing.expect(memory_direct.reviewer.?.native.?.proxy_url == null);
-    try std.testing.expectEqual(@as(usize, 1), memory_direct.reviewer.?.source.value.proxy.?.models.len);
+    try std.testing.expect(app.decision_client.?.native.?.proxy_url == null);
+    try std.testing.expectEqual(@as(usize, 1), app.decision_client.?.source.value.proxy.?.models.len);
     try std.testing.expect(memory_direct.extractor.?.transport.?.proxy_http == null);
     try proxyToggle(&session, "aux/native/raw", true);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.reviewer.?.native.?.proxy_url.?);
 
     try proxyToggle(&session, "img/deepseek-flash", true);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
@@ -4885,9 +4879,8 @@ test "proxy refresh switches helper routes while primary client and history stay
     try std.testing.expect(app.memory_coordinator != memory_now);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.reviewer.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
-    try std.testing.expectEqual(@as(usize, 4), app.memory_coordinator.reviewer.?.source.value.proxy.?.models.len);
+    try std.testing.expectEqual(@as(usize, 4), app.decision_client.?.source.value.proxy.?.models.len);
     try std.testing.expect(app.client.authorization.ptr == auth);
     try std.testing.expect(app.client.config == &app.config.value);
     try std.testing.expect(app.client.proxy_http == null);
@@ -4984,7 +4977,6 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try proxyToggle(&session, "main/chat", true);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.reviewer.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
 
     const saved = try readSessionConfigBytes(fixture.tmp.dir);
@@ -5006,9 +4998,8 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     // Auxiliary owners follow the new endpoint with the same exact members.
     try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.image_client.?.transport.proxy_url.?);
-    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.memory_coordinator.reviewer.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
-    try std.testing.expectEqual(@as(usize, 4), app.memory_coordinator.reviewer.?.source.value.proxy.?.models.len);
+    try std.testing.expectEqual(@as(usize, 4), app.decision_client.?.source.value.proxy.?.models.len);
 
     // The primary client, auth, identity and history never move; its frozen
     // declaration keeps the original endpoint and allowlist.
@@ -5030,7 +5021,6 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try std.testing.expect(app.decision_client.? == decision_now);
     try std.testing.expect(app.image_client.? == image_now);
     try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.decision_client.?.native.?.proxy_url.?);
-    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.memory_coordinator.reviewer.?.native.?.proxy_url.?);
     try std.testing.expect(!app.config.value.limits.compaction_enabled);
     try std.testing.expect(app.client.authorization.ptr == auth);
 
@@ -5057,7 +5047,6 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try std.testing.expectEqual(@as(usize, 0), state.proxy_models.len);
     try std.testing.expect(app.decision_client.?.native.?.proxy_url == null);
     try std.testing.expect(app.image_client.?.transport.proxy_url == null);
-    try std.testing.expect(app.memory_coordinator.reviewer.?.native.?.proxy_url == null);
     try std.testing.expect(app.memory_coordinator.extractor.?.transport.?.proxy_http == null);
     try std.testing.expect(app.client.authorization.ptr == auth);
     try std.testing.expect(app.client.config == &app.config.value);

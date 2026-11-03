@@ -2796,13 +2796,22 @@ const Ui = struct {
             } else if (state.memory.queued_count != 0) {
                 notice = try std.fmt.allocPrint(a, "Memory: queued ({d})", .{state.memory.queued_count});
             } else if (state.memory.last_terminal) |terminal| {
-                notice = try std.fmt.allocPrint(a, "Memory: {s}", .{switch (terminal.result) {
-                    .saved => "saved",
-                    .skipped => "no new durable entries",
-                    .failed => "failed",
-                    .uncertain => "request outcome uncertain",
-                    .canceled => "canceled",
-                }});
+                notice = switch (terminal.result) {
+                    .saved => if (terminal.summary.text().len == 0) "Memory: saved" else try std.fmt.allocPrint(a, "Memory: saved — {s}", .{terminal.summary.text()}),
+                    .skipped => "",
+                    .failed, .uncertain, .canceled => blk: {
+                        const label: []const u8 = switch (terminal.result) {
+                            .failed => "Memory: failed",
+                            .uncertain => "Memory: request outcome uncertain",
+                            .canceled => "Memory: canceled",
+                            else => unreachable,
+                        };
+                        break :blk if (terminal.saved_count > 0 and terminal.summary.text().len != 0)
+                            try std.fmt.allocPrint(a, "{s}; saved — {s}", .{ label, terminal.summary.text() })
+                        else
+                            label;
+                    },
+                };
             }
         }
         if (notice.len == 0 and state.settings_error == null) if (state.pending_default_effort) |effort| {
@@ -14049,6 +14058,44 @@ test "memory notice is advisory and never replaces errors queue or settings" {
     try std.testing.expectEqualStrings("Memory: extracting", try ui.hint(arena.allocator(), state));
     ui.openSettingsMenu();
     try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+}
+
+test "memory saved summary is single line and skipped is silent" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime: r.Runtime = undefined;
+    var state = ui.connection.current();
+    state.runtime = &runtime;
+    state.memory = .{ .enabled = true, .last_terminal = .{ .id = 1, .result = .skipped } };
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    state.memory.last_terminal.?.result = .saved;
+    try std.testing.expectEqualStrings("Memory: saved", try ui.hint(arena.allocator(), state));
+    state.memory.last_terminal.?.summary.append("偏好中文\n下一行\x1b]unsafe\x07");
+    const long: [512]u8 = @splat('x');
+    state.memory.last_terminal.?.summary.append(&long);
+    const hint = try ui.hint(arena.allocator(), state);
+    try std.testing.expect(std.mem.startsWith(u8, hint, "Memory: saved — 偏好中文 下一行"));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(hint));
+    try std.testing.expect(std.mem.indexOfScalar(u8, hint, '\x1b') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, hint, '\n') == null);
+    try std.testing.expectEqualStrings(hint, try ui.hint(arena.allocator(), state));
+    state.memory.last_terminal.?.result = .failed;
+    try std.testing.expectEqualStrings("Memory: failed", try ui.hint(arena.allocator(), state));
+    state.memory.last_terminal.?.saved_count = 1;
+    inline for (.{ .{ .failed, "Memory: failed; saved — " }, .{ .canceled, "Memory: canceled; saved — " }, .{ .uncertain, "Memory: request outcome uncertain; saved — " } }) |case| {
+        state.memory.last_terminal.?.result = case[0];
+        try std.testing.expect(std.mem.startsWith(u8, try ui.hint(arena.allocator(), state), case[1]));
+    }
+    state.memory.last_terminal.?.summary.len = 0;
+    try std.testing.expectEqualStrings("Memory: request outcome uncertain", try ui.hint(arena.allocator(), state));
+    ui.openSettingsMenu();
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 }
 
 test "wrapped composer cursor is ACK owned across sparse redraws" {

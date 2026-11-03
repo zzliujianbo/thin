@@ -470,7 +470,7 @@ fn decodeMemoryView(value: std.json.Value) !memory_status.View {
     result.last_terminal = switch (obj.get("last_terminal") orelse return error.ProtocolError) {
         .null => null,
         .object => |terminal| blk: {
-            if (terminal.count() != 3) return error.ProtocolError;
+            if (terminal.count() < 3 or terminal.count() > 5) return error.ProtocolError;
             const outcome = switch (terminal.get("result") orelse return error.ProtocolError) {
                 .string => |s| std.meta.stringToEnum(memory_status.Result, s) orelse return error.ProtocolError,
                 else => return error.ProtocolError,
@@ -480,11 +480,59 @@ fn decodeMemoryView(value: std.json.Value) !memory_status.View {
                 .string => |s| std.meta.stringToEnum(memory_status.Failure, s) orelse return error.ProtocolError,
                 else => return error.ProtocolError,
             };
-            break :blk .{ .id = valueU64(terminal.get("id") orelse return error.ProtocolError) orelse return error.ProtocolError, .result = outcome, .failure = failure };
+            const saved_count: u32 = if (terminal.get("saved_count")) |count_value|
+                std.math.cast(u32, valueU64(count_value) orelse return error.ProtocolError) orelse return error.ProtocolError
+            else
+                0;
+            var summary: memory_status.Summary = .{};
+            if (terminal.get("summary")) |summary_value| {
+                const text = switch (summary_value) {
+                    .string => |s| s,
+                    else => return error.ProtocolError,
+                };
+                if (text.len > summary.buf.len or !std.unicode.utf8ValidateSlice(text)) return error.ProtocolError;
+                summary.append(text);
+                if (!std.mem.eql(u8, summary.text(), text)) return error.ProtocolError;
+            }
+            const known_count: usize = 3 + @as(usize, @intFromBool(terminal.contains("saved_count"))) + @as(usize, @intFromBool(terminal.contains("summary")));
+            if (terminal.count() != known_count) return error.ProtocolError;
+            break :blk .{ .id = valueU64(terminal.get("id") orelse return error.ProtocolError) orelse return error.ProtocolError, .result = outcome, .failure = failure, .saved_count = saved_count, .summary = summary };
         },
         else => return error.ProtocolError,
     };
     return result;
+}
+
+test "memory summary wire roundtrip legacy and strict bounds" {
+    const a = std.testing.allocator;
+    var view: memory_status.View = .{ .enabled = true, .last_terminal = .{ .id = 4, .result = .saved, .saved_count = 2 } };
+    view.last_terminal.?.summary.append("中文\n记忆");
+    var out = protocol.Out.init(a);
+    defer out.deinit();
+    try out.ok(1);
+    try protocol.encodeMemoryView(&out, view);
+    const bytes = try out.finish();
+    defer a.free(bytes);
+    var doc = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer doc.deinit();
+    const decoded = try decodeMemoryView(doc.value.object.get("memory").?);
+    try std.testing.expect(std.meta.eql(view, decoded));
+    const invalid = [_][]const u8{
+        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"summary\":42}}",
+        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":4294967296}}",
+        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"summary\":\"bad\\u001b\"}}",
+    };
+    for (invalid) |text| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.ProtocolError, decodeMemoryView(parsed.value));
+    }
+    const long: [257]u8 = @splat('x');
+    const oversized = try std.fmt.allocPrint(a, "{{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{{\"id\":1,\"result\":\"saved\",\"failure\":null,\"summary\":\"{s}\"}}}}", .{&long});
+    defer a.free(oversized);
+    var large = try std.json.parseFromSlice(std.json.Value, a, oversized, .{});
+    defer large.deinit();
+    try std.testing.expectError(error.ProtocolError, decodeMemoryView(large.value));
 }
 
 test "memory view decoder rejects malformed fields" {
@@ -4693,11 +4741,36 @@ test "per-agent status rows retain published arenas across repeated allocation f
     try testing.expectEqualStrings("nld", client.state.subagents.agents[0].latestText());
 }
 
+test "memory summary-only snapshot publishes once without settings dirtiness" {
+    var pair = try pairOf(testing.allocator);
+    defer pair.deinit();
+    const client = pair.client;
+    const first = "\"snapshot\":{\"memory\":{\"enabled\":true,\"revision\":1,\"active\":null,\"queued_count\":0,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":1,\"summary\":\"first\"}}}";
+    const second = "\"snapshot\":{\"memory\":{\"enabled\":true,\"revision\":1,\"active\":null,\"queued_count\":0,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":1,\"summary\":\"second\"}}}";
+    try pair.reply(1, first);
+    var response = try client.readResponse(1, quick_timeout_ms);
+    try client.adoptSnapshot(&response);
+    response.deinit();
+    client.dirty = false;
+    try pair.reply(2, second);
+    var changed = try client.readResponse(2, quick_timeout_ms);
+    try client.adoptSnapshot(&changed);
+    changed.deinit();
+    try testing.expect(client.dirty);
+    try testing.expectEqualStrings("second", client.cache.memory.last_terminal.?.summary.text());
+    client.dirty = false;
+    try pair.reply(3, second);
+    var repeated = try client.readResponse(3, quick_timeout_ms);
+    try client.adoptSnapshot(&repeated);
+    repeated.deinit();
+    try testing.expect(!client.dirty);
+}
+
 test "Memory closeout nonzero view survives response and client projection lifetime" {
     const expected: memory_status.View = .{
         .enabled = true,
         .revision = 18446744073709551614,
-        .active = .{ .id = 9007199254740993, .phase = .reviewing },
+        .active = .{ .id = 9007199254740993, .phase = .extracting },
         .queued_count = 3,
         .last_terminal = .{ .id = 9007199254740992, .result = .failed, .failure = .storage },
     };
@@ -4712,7 +4785,7 @@ test "Memory closeout nonzero view survives response and client projection lifet
         var pair = try pairOf(testing.allocator);
         defer pair.deinit();
         const client = pair.client;
-        try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":false,\"phase\":\"calling_model\",\"task\":0,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"previews\":[],\"memory\":{\"enabled\":true,\"revision\":18446744073709551614,\"active\":{\"id\":9007199254740993,\"phase\":\"reviewing\"},\"queued_count\":3,\"last_terminal\":{\"id\":9007199254740992,\"result\":\"failed\",\"failure\":\"storage\"}}}");
+        try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":false,\"phase\":\"calling_model\",\"task\":0,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"previews\":[],\"memory\":{\"enabled\":true,\"revision\":18446744073709551614,\"active\":{\"id\":9007199254740993,\"phase\":\"extracting\"},\"queued_count\":3,\"last_terminal\":{\"id\":9007199254740992,\"result\":\"failed\",\"failure\":\"storage\"}}}");
         var response = try client.readResponse(1, quick_timeout_ms);
         client.adoptSnapshot(&response) catch |err| {
             response.deinit();

@@ -52,9 +52,6 @@ function checkWire(req, body, scenario) {
     assert(Buffer.byteLength(view.data[0].text) >= 2048);
     assert(view.data[0].text.includes('ERROR src/worker.zig:417 unresolved: checksum mismatch'));
     assert.deepEqual(sortedKeys(questions), ['retain_0', 'retain_1']);
-  } else if (scenario.startsWith('memory-') || scenario.endsWith('_proxy')) {
-    assert.equal(state, 'Explicit memory.write candidate (data only):\nTopic: style/original-id\nContent: Prefer explicit bounded ownership and concise reports.\nThis is an update candidate. Expected version (data only): v-original-7');
-    assert.deepEqual(sortedKeys(questions), ['write']);
   } else {
     assert.equal(state, 'Command candidate (data only, not permission): printf fixture\nProposed timeout: 120000 milliseconds. Hard maximum: 300000 milliseconds. No additional risk information supplied.');
     assert.deepEqual(sortedKeys(questions), ['ask', 'timeout']);
@@ -74,7 +71,6 @@ function response(body, scenario) {
     } else {
       let score = 0.1;
       if (id === 'ask') score = scenario === 'command-none' ? 0.15 : 0.6;
-      if (id === 'write') score = scenario === 'memory-negative' ? 0.79 : 0.8;
       if (id === 'retain_0') score = 0.35;
       if (id === 'retain_1') score = 0.36;
       answers[id] = { type: 'noul', noul: score };
@@ -176,7 +172,7 @@ try {
   // close means Node has already reaped the leader: never signal its old ID.
   child = undefined;
   // Always validate coverage, even when the child failed. No skipped scenario is accepted.
-  const scenarios = ['command-none', 'command-finite', 'command-uncertain', 'memory-positive', 'memory-negative', 'refine', 'invalid-json', 'invalid-score', 'missing-answers', 'forbidden', 'server-error', 'redirect', 'oversized', 'truncated', 'stalled', 'cancel', 'trusted_proxy'];
+  const scenarios = ['command-none', 'command-finite', 'command-uncertain', 'refine', 'invalid-json', 'invalid-score', 'missing-answers', 'forbidden', 'server-error', 'redirect', 'oversized', 'truncated', 'stalled', 'cancel', 'trusted_proxy'];
   const actual = [...counts].sort(([a], [b]) => a.localeCompare(b));
   const expected = scenarios.map(name => [name, 1]).sort(([a], [b]) => a.localeCompare(b));
   assert.deepEqual(actual, expected, 'all origin scenarios must run exactly once without fallback/retry');

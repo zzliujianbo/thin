@@ -76,7 +76,6 @@ fn validateDecisionOutput(input: decision.Input, output: decision.Output) !void 
                 .milliseconds => |ms| if (ms == 0 or ms > command.max_timeout_ms) return error.InvalidDecision,
             }
         },
-        .memory_write => if (output != .memory_write) return error.InvalidDecision,
         .refine_outputs => |items| {
             if (output != .refine_outputs or items.len == 0 or items.len > 8 or output.refine_outputs.len != items.len)
                 return error.InvalidDecision;
@@ -2666,15 +2665,6 @@ pub const Runtime = struct {
                             "Decision requires explicit approval; command was not executed."
                         else
                             null;
-                    },
-                    .memory_write => if (!output.memory_write) {
-                        const skipped: Execution = .{ .text = "Skipped: decision review found this memory write unnecessary; nothing was written." };
-                        try self.appendResult(call.id, skipped);
-                        next_block += 1;
-                        display_ordinal += 1;
-                        try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = skipped, .display_key = display_key } }, cancel);
-                        try self.emitContext(cancel);
-                        continue;
                     },
                     .refine_outputs => return error.DecisionUnavailable,
                 }

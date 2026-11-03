@@ -23,8 +23,6 @@ pub const Candidate = struct {
     category: Category,
     topic: []const u8,
     content: []const u8,
-    source_id: u16,
-    quote: []const u8,
     expected_version: ?[]const u8 = null,
     expires_at_ms: ?u64 = null,
 };
@@ -40,235 +38,140 @@ pub const Service = struct {
         if (cancel.isRequested()) return error.Canceled;
         const result = try self.extract_fn(self.context, a, material, cancel);
         if (cancel.isRequested()) return error.Canceled;
-        try validate(material, result);
-        return result;
+        if (material.sources.len > max_sources or result.len > max_candidates) return error.InvalidMemoryCandidate;
+        var filtered: std.ArrayList(Candidate) = .empty;
+        for (result) |candidate| {
+            validateCandidate(material, candidate) catch continue;
+            var duplicate = false;
+            for (filtered.items) |prior| if (prior.category == candidate.category and std.mem.eql(u8, prior.topic, candidate.topic)) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) try filtered.append(a, candidate);
+        }
+        if (cancel.isRequested()) return error.Canceled;
+        return filtered.toOwnedSlice(a);
     }
 };
-pub const EvidenceRejection = struct {
-    pub const Reason = enum { assistant_source, quote_mismatch, sensitive_source, sensitive_content, sensitive_quote };
-    reason: Reason,
-    candidate_index: u32,
-    source_id: u16,
-};
-
-pub fn validate(material: Material, candidates: []const Candidate) !void {
-    return validateWithRejection(material, candidates, null);
+pub fn validateCandidate(material: Material, candidate: Candidate) !void {
+    if (candidate.topic.len == 0 or candidate.topic.len > 40 or candidate.topic[candidate.topic.len - 1] == '-' or std.mem.trim(u8, candidate.content, " \t\r\n").len == 0 or candidate.content.len > max_content_bytes or !std.unicode.utf8ValidateSlice(candidate.content) or std.mem.findScalar(u8, candidate.content, 0) != null or sensitiveMaterial(candidate.topic) or sensitiveMaterial(candidate.content)) return error.InvalidMemoryCandidate;
+    for (candidate.topic, 0..) |c, i| {
+        if (!(c >= 'a' and c <= 'z') and !(c >= '0' and c <= '9') and !(i != 0 and c == '-' and candidate.topic[i - 1] != '-')) return error.InvalidMemoryCandidate;
+    }
+    if (candidate.expected_version) |expected| {
+        if (expected.len != 64) return error.InvalidMemoryVersion;
+        for (expected) |c| if (!std.ascii.isHex(c)) return error.InvalidMemoryVersion;
+        var authorized = false;
+        for (material.related) |related| {
+            if (related.category == candidate.category and std.mem.eql(u8, related.topic, candidate.topic) and std.mem.eql(u8, related.version, expected)) {
+                authorized = true;
+                break;
+            }
+        }
+        if (!authorized) return error.InvalidMemoryVersion;
+    }
+    if (candidate.expires_at_ms) |end| if (end <= material.created_ms) return error.InvalidMemoryCandidate;
 }
 
-pub fn validateWithRejection(material: Material, candidates: []const Candidate, rejection: ?*?EvidenceRejection) !void {
-    if (rejection) |out| out.* = null;
-    if (material.sources.len > max_sources or candidates.len > max_candidates) return error.InvalidMemoryCandidate;
-    for (candidates, 0..) |candidate, index| {
-        for (candidates[0..index]) |prior| if (prior.category == candidate.category and std.mem.eql(u8, prior.topic, candidate.topic)) return error.DuplicateMemoryCandidate;
-        if (candidate.topic.len == 0 or candidate.topic.len > 40 or candidate.content.len == 0 or candidate.content.len > max_content_bytes or
-            !std.unicode.utf8ValidateSlice(candidate.content) or std.mem.findScalar(u8, candidate.content, 0) != null or
-            candidate.quote.len == 0 or candidate.quote.len > 1024 or !std.unicode.utf8ValidateSlice(candidate.quote) or
-            std.mem.findScalar(u8, candidate.quote, 0) != null) return error.InvalidMemoryCandidate;
-        for (candidate.topic, 0..) |c, i| if (!(c >= 'a' and c <= 'z') and !(c >= '0' and c <= '9') and !(i != 0 and c == '-')) return error.InvalidMemoryCandidate;
-        var evidence: ?Evidence = null;
-        for (material.sources) |source| if (source.id == candidate.source_id) {
-            evidence = source;
-            break;
-        };
-        const source = evidence orelse return error.InvalidMemoryCandidate;
-        const reason: ?EvidenceRejection.Reason = if (source.kind == .assistant)
-            .assistant_source
-        else if (std.mem.find(u8, source.text, candidate.quote) == null)
-            .quote_mismatch
-        else if (sensitiveMaterial(source.text))
-            .sensitive_source
-        else if (sensitiveMaterial(candidate.content))
-            .sensitive_content
-        else if (sensitiveMaterial(candidate.quote))
-            .sensitive_quote
-        else
-            null;
-        if (reason) |why| {
-            if (rejection) |out| out.* = .{ .reason = why, .candidate_index = @intCast(index), .source_id = candidate.source_id };
-            return error.InvalidMemoryEvidence;
-        }
-        if (candidate.expected_version) |expected| {
-            // Store versions are SHA-256 hex. Fake services must obey the same
-            // syntax as the codec, even if malformed related data matches.
-            if (expected.len != 64) return error.InvalidMemoryVersion;
-            for (expected) |c| if (!std.ascii.isHex(c)) return error.InvalidMemoryVersion;
-            // A version from another topic/category is never overwrite authority.
-            var authorized = false;
-            for (material.related) |related| {
-                if (related.category == candidate.category and std.mem.eql(u8, related.topic, candidate.topic) and
-                    std.mem.eql(u8, related.version, expected))
-                {
-                    authorized = true;
-                    break;
+/// Screen obvious credentials; the coordinator also rejects known secrets.
+pub fn sensitiveMaterial(text: []const u8) bool {
+    if (std.ascii.findIgnoreCase(text, "-----BEGIN ") != null and std.ascii.findIgnoreCase(text, "PRIVATE KEY-----") != null) return true;
+    for ([_][]const u8{ "password", "api_key", "api-key", "access_token", "refresh_token", "client_secret", "token", "authorization" }) |key| {
+        var start: usize = 0;
+        while (std.ascii.findIgnoreCase(text[start..], key)) |relative| {
+            const pos = start + relative;
+            var i = pos + key.len;
+            if ((pos > 0 and keyChar(text[pos - 1])) or (i < text.len and keyChar(text[i]))) {
+                start = i;
+                continue;
+            }
+            while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\"' or text[i] == '\'')) : (i += 1) {}
+            if (i < text.len and (text[i] == '=' or text[i] == ':')) {
+                i += 1;
+                while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\"' or text[i] == '\'')) : (i += 1) {}
+                if (i < text.len and text[i] != '\n' and text[i] != ',' and text[i] != '}') {
+                    var end = i;
+                    while (end < text.len and keyChar(text[end])) : (end += 1) {}
+                    var schema_type = false;
+                    for ([_][]const u8{ "string", "integer", "number", "boolean", "null", "optional", "required", "str", "int", "bool" }) |name| {
+                        if (std.ascii.eqlIgnoreCase(text[i..end], name) and (end == text.len or std.ascii.isWhitespace(text[end]) or text[end] == ',' or text[end] == '}' or text[end] == '"' or text[end] == '\'')) {
+                            schema_type = true;
+                            break;
+                        }
+                    }
+                    if (!schema_type) return true;
                 }
             }
-            if (!authorized) return error.InvalidMemoryVersion;
+            start = pos + key.len;
         }
-        if (candidate.expires_at_ms) |end| if (end <= material.created_ms) return error.InvalidMemoryCandidate;
     }
-}
-/// Pure conservative screening; the App additionally rejects journal-known keys.
-/// Whole sources are omitted, never partially redacted into misleading quotes.
-pub fn sensitiveMaterial(text: []const u8) bool {
-    const markers = [_][]const u8{
-        "-----BEGIN ",      "PRIVATE KEY", "authorization:", "bearer ",
-        "api_key",          "api-key",     "access_token",   "refresh_token",
-        "client_secret",    "password=",   "password:",      "\"password\"",
-        "ghp_",             "github_pat_", "/.ssh/",         "/.aws/",
-        "/.config/gcloud/", "/auth.json",  "/credentials",   "/sessions/",
-        "/history/",        "/.thin/",     "session_cookie",
-    };
-    for (markers) |marker| if (std.ascii.findIgnoreCase(text, marker) != null) return true;
-    return sensitiveSk(text) or sensitiveEnv(text);
-}
-
-fn identifierByte(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_';
-}
-
-fn sensitiveSk(text: []const u8) bool {
-    var offset: usize = 0;
-    while (std.ascii.findIgnoreCase(text[offset..], "sk-")) |relative| {
-        const pos = offset + relative;
-        if (pos == 0 or !identifierByte(text[pos - 1])) return true;
-        const suffix = text[pos + 3 ..];
-        var count: usize = 0;
-        while (count < suffix.len and count < 20 and (identifierByte(suffix[count]) or suffix[count] == '-')) : (count += 1) {}
-        if (count == 20) return true;
-        offset = pos + 3;
+    for ([_][]const u8{ "sk-", "ghp_", "github_pat_", "bearer " }) |prefix| {
+        var start: usize = 0;
+        while (std.ascii.findIgnoreCase(text[start..], prefix)) |relative| {
+            const pos = start + relative;
+            var i = pos + prefix.len;
+            if (std.mem.eql(u8, prefix, "bearer ")) {
+                if (pos == 0 or !keyChar(text[pos - 1])) {
+                    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) : (i += 1) {}
+                    if (i < text.len and (keyChar(text[i]) or text[i] == '.' or text[i] == '~' or text[i] == '+' or text[i] == '/' or text[i] == '=')) return true;
+                }
+            } else {
+                while (i < text.len and keyChar(text[i])) : (i += 1) {}
+                if (i - (pos + prefix.len) >= 20) return true;
+            }
+            start = pos + prefix.len;
+        }
     }
     return false;
 }
 
-fn sensitiveEnv(text: []const u8) bool {
-    var offset: usize = 0;
-    while (std.ascii.findIgnoreCase(text[offset..], ".env")) |relative| {
-        const pos = offset + relative;
-        const end = pos + 4;
-        if (!(pos > 0 and identifierByte(text[pos - 1]) and end < text.len and std.ascii.isAlphabetic(text[end]))) return true;
-        offset = end;
-    }
-    return false;
+fn keyChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
 }
 
-test "knowledge direct and fake Service exact CAS syntax authority and whole batch rejection" {
-    const v = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const other = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    var material: Material = .{ .id = "synthetic", .generation = 1, .created_ms = 100, .sources = &.{.{ .id = 0, .kind = .user, .text = "Prefer Zig." }} };
-    const create: Candidate = .{ .category = .preferences, .topic = "editor", .content = "Prefer Zig.", .source_id = 0, .quote = "Prefer Zig." };
-    var update = create;
-    update.topic = "language";
-    update.expected_version = v;
+test "service filters borrowed candidates without mutation" {
     const Fake = struct {
-        items: []const Candidate,
-        calls: usize = 0,
-        fn extract(raw: *anyopaque, _: std.mem.Allocator, _: Material, _: *const p.Cancellation) ![]const Candidate {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            return self.items;
+        fn extract(_: *anyopaque, _: std.mem.Allocator, _: Material, _: *const p.Cancellation) ![]const Candidate {
+            return &.{
+                .{ .category = .project, .topic = "invalid slug", .content = "bad" },
+                .{ .category = .project, .topic = "blank", .content = "   \t\r\n" },
+                .{ .category = .project, .topic = "sk-abcdefghijklmnopqrstuvwxyz", .content = "ordinary content" },
+                .{ .category = .project, .topic = "bearer-secret", .content = "Bearer abc.def" },
+                .{ .category = .project, .topic = "config", .content = "Store configuration in .env; api_key is optional." },
+                .{ .category = .project, .topic = "secret", .content = "password=secret" },
+                .{ .category = .project, .topic = "config", .content = "duplicate" },
+            };
         }
     };
-    var batch = [_]Candidate{ create, update };
-    var fake: Fake = .{ .items = &batch };
-    const service: Service = .{ .context = &fake, .extract_fn = Fake.extract };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dummy: u8 = 0;
+    const service: Service = .{ .context = &dummy, .extract_fn = Fake.extract };
+    const material: Material = .{ .id = "test", .generation = 0, .created_ms = 1, .sources = &.{} };
     var cancel: p.Cancellation = .{};
-    const related: Related = .{ .category = .preferences, .topic = "language", .content = "Old", .version = v };
-    material.related = &.{related};
-    try validate(material, &batch);
-    try std.testing.expectEqual(@as(usize, 2), (try service.extract(std.testing.allocator, material, &cancel)).len);
-    // Keep each negative unauthorized; a valid first item must not escape.
-    for (0..7) |case| {
-        var r = related;
-        batch[1] = update;
-        switch (case) {
-            0 => material.related = &.{},
-            1 => r.category = .project,
-            2 => r.topic = "other",
-            3 => r.version = other,
-            4 => batch[1].expected_version = "",
-            5 => batch[1].expected_version = "abc",
-            6 => batch[1].expected_version = "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            else => unreachable,
-        }
-        // Malformed matching related data must not grant fake-Service authority.
-        if (case >= 4) r.version = batch[1].expected_version.?;
-        if (case != 0) material.related = &.{r};
-        try std.testing.expectError(error.InvalidMemoryVersion, validate(material, &batch));
-        try std.testing.expectError(error.InvalidMemoryVersion, service.extract(std.testing.allocator, material, &cancel));
-    }
-    try std.testing.expectEqual(@as(usize, 8), fake.calls);
-}
-
-test "memory evidence rejection reports ordered reasons and resets" {
-    var sources = [_]Evidence{
-        .{ .id = 3, .kind = .user, .text = "valid evidence" },
-        .{ .id = 42, .kind = .user, .text = "ordinary evidence" },
-    };
-    const material: Material = .{ .id = "test", .generation = 1, .created_ms = 1, .sources = &sources };
-    const first: Candidate = .{ .category = .project, .topic = "first", .content = "valid", .source_id = 3, .quote = "valid" };
-    const second: Candidate = .{ .category = .project, .topic = "second", .content = "ordinary", .source_id = 42, .quote = "ordinary" };
-    var batch = [_]Candidate{ first, second };
-    var report: ?EvidenceRejection = null;
-    const reasons = [_]EvidenceRejection.Reason{ .assistant_source, .quote_mismatch, .sensitive_source, .sensitive_content, .sensitive_quote };
-    for (reasons) |reason| {
-        sources[1] = .{ .id = 42, .kind = .user, .text = "ordinary evidence" };
-        batch[1] = second;
-        switch (reason) {
-            .assistant_source => sources[1].kind = .assistant,
-            .quote_mismatch => batch[1].quote = "absent",
-            .sensitive_source => sources[1].text = "ordinary password=secret",
-            .sensitive_content => batch[1].content = "password=secret",
-            .sensitive_quote => {
-                sources[1].text = "task-runner";
-                batch[1].quote = "sk-runner";
-            },
-        }
-        try std.testing.expectError(error.InvalidMemoryEvidence, validateWithRejection(material, &batch, &report));
-        try std.testing.expectEqual(reason, report.?.reason);
-        try std.testing.expectEqual(@as(u32, 1), report.?.candidate_index);
-        try std.testing.expectEqual(@as(u16, 42), report.?.source_id);
-        try std.testing.expectError(error.InvalidMemoryEvidence, validate(material, &batch));
-    }
-    batch[1] = second;
-    sources[1].text = "ordinary evidence";
-    try validateWithRejection(material, &batch, &report);
-    try std.testing.expect(report == null);
-    report = .{ .reason = .sensitive_source, .candidate_index = 1, .source_id = 42 };
-    batch[1].source_id = 99;
-    try std.testing.expectError(error.InvalidMemoryCandidate, validateWithRejection(material, &batch, &report));
-    try std.testing.expect(report == null);
-    try validate(material, batch[0..1]);
-}
-
-test "memory evidence rejection bounded sensitive boundaries apply to capture and candidates" {
-    const safe = [_][]const u8{ "task-runner", "mask-helper", "os.environ", "os.environb", "std.process.Environ.Map" };
-    const unsafe = [_][]const u8{ "sk-token", "'sk-token'", "key=sk-token", " sk-token", "中sk-token", "ask-abcdefghijklmnopqrst", ".env", "/repo/.env", "foo.env", ".env.local", ".env-prod", ".env_dev", ".envrc", "/.envBackup", "process.env" };
-    var capture: Capture = .{ .allocator = std.testing.allocator };
-    defer {
-        for (capture.sources.items) |source| std.testing.allocator.free(source.text);
-        capture.sources.deinit(std.testing.allocator);
-    }
-    for (safe) |text| {
-        try std.testing.expect(!sensitiveMaterial(text));
-        capture.add(.user, text);
-        const source = [_]Evidence{.{ .id = 7, .kind = .user, .text = text }};
-        const material: Material = .{ .id = "test", .generation = 1, .created_ms = 1, .sources = &source };
-        const candidate: Candidate = .{ .category = .project, .topic = "safe", .content = text, .source_id = 7, .quote = text };
-        try validate(material, &.{candidate});
-    }
-    try std.testing.expectEqual(safe.len, capture.sources.items.len);
-    for (unsafe) |text| {
-        try std.testing.expect(sensitiveMaterial(text));
-        capture.add(.user, text);
-        const source = [_]Evidence{.{ .id = 7, .kind = .user, .text = "ordinary" }};
-        const material: Material = .{ .id = "test", .generation = 1, .created_ms = 1, .sources = &source };
-        const candidate: Candidate = .{ .category = .project, .topic = "unsafe", .content = text, .source_id = 7, .quote = "ordinary" };
-        var report: ?EvidenceRejection = null;
-        try std.testing.expectError(error.InvalidMemoryEvidence, validateWithRejection(material, &.{candidate}, &report));
-        try std.testing.expectEqual(EvidenceRejection.Reason.sensitive_content, report.?.reason);
-    }
-    try std.testing.expectEqual(safe.len, capture.sources.items.len);
-    try std.testing.expectEqual(unsafe.len, capture.omitted_sources);
+    const items = try service.extract(arena.allocator(), material, &cancel);
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("config", items[0].topic);
+    var capture: Capture = .{ .allocator = arena.allocator() };
+    capture.add(.user, "Bearer abc.def");
+    capture.add(.user, "ordinary source");
+    try std.testing.expectEqual(@as(usize, 1), capture.sources.items.len);
+    try std.testing.expectEqualStrings("ordinary source", capture.sources.items[0].text);
+    try std.testing.expectEqual(@as(usize, 1), capture.omitted_sources);
+    try std.testing.expect(sensitiveMaterial("Bearer abc.def"));
+    try std.testing.expect(sensitiveMaterial("Bearer  secret"));
+    try std.testing.expect(!sensitiveMaterial("auth_scheme: Bearer"));
+    try std.testing.expect(!sensitiveMaterial("Bearer "));
+    try std.testing.expect(!sensitiveMaterial("notbearer abc.def"));
+    try std.testing.expect(!sensitiveMaterial("Use .env and api_key when configuring /.thin/"));
+    try std.testing.expect(sensitiveMaterial("password=secret"));
+    try std.testing.expect(sensitiveMaterial("ghp_abcdefghijklmnopqrstuvwxyz"));
+    try std.testing.expect(!sensitiveMaterial("token: integer, api_key: string, access_token: boolean, client_secret: optional"));
+    try std.testing.expect(!sensitiveMaterial("max_token=4096 and custom_api_key=value"));
+    try std.testing.expect(sensitiveMaterial("token=actualvalue"));
+    try std.testing.expect(sensitiveMaterial("api_key: actualvalue"));
+    try std.testing.expect(sensitiveMaterial("sk-abcdefghijklmnopqrstuvwxyz"));
+    try std.testing.expect(sensitiveMaterial("-----BEGIN PRIVATE KEY-----"));
 }
 
 pub const Capture = struct {

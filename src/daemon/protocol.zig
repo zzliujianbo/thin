@@ -1117,6 +1117,8 @@ pub fn encodeMemoryView(out: *Out, view: memory_status.View) !void {
         try out.field("id", terminal.id);
         try out.field("result", @tagName(terminal.result));
         try out.field("failure", if (terminal.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
+        try out.field("saved_count", terminal.saved_count);
+        try out.field("summary", terminal.summary.text());
         try out.endObject();
     } else try out.field("last_terminal", @as(?u8, null));
     try out.endObject();

@@ -5,7 +5,19 @@ const knowledge = @import("../core/knowledge.zig");
 const fs = @import("../platform/filesystem.zig");
 pub const Apply = enum { created, updated, unchanged, conflict, expired };
 const Record = struct {
-    schema: u8 = 1,
+    schema: u8 = 2,
+    source: []const u8,
+    generation: u64,
+    created_ms: u64,
+    expires_at_ms: ?u64,
+    category: knowledge.Category,
+    topic: []const u8,
+    content: []const u8,
+};
+const marker = "\n<!-- thin-knowledge-v2 -->\n";
+const marker_v1 = "\n<!-- thin-knowledge-v1 -->\n";
+const RecordV1 = struct {
+    schema: u8,
     source: []const u8,
     source_id: u16,
     source_kind: knowledge.EvidenceKind,
@@ -17,27 +29,21 @@ const Record = struct {
     topic: []const u8,
     content: []const u8,
 };
-const marker = "\n<!-- thin-knowledge-v1 -->\n";
 pub const Repository = struct {
     store: *mem.Store,
     pub fn init(store: *mem.Store) Repository {
         return .{ .store = store };
     }
-    /// Advisory only: shares apply's exact validation and conflict policy, but
-    /// does not write or authorize a later overwrite. Apply repeats every check.
-    pub fn inspect(self: *Repository, a: std.mem.Allocator, material: knowledge.Material, candidate: knowledge.Candidate) !Apply {
-        return self.applyImpl(a, material, candidate, false);
-    }
     pub fn apply(self: *Repository, a: std.mem.Allocator, material: knowledge.Material, candidate: knowledge.Candidate) !Apply {
-        return self.applyImpl(a, material, candidate, true);
-    }
-    fn applyImpl(self: *Repository, a: std.mem.Allocator, material: knowledge.Material, candidate: knowledge.Candidate, commit: bool) !Apply {
-        try knowledge.validate(material, &.{candidate});
+        try mem.validTopic(candidate.topic);
+        if (candidate.topic.len > 40 or candidate.topic[candidate.topic.len - 1] == '-' or std.mem.indexOf(u8, candidate.topic, "--") != null or candidate.content.len > knowledge.max_content_bytes) return error.InvalidMemoryCandidate;
         try fs.validateText(candidate.content);
-        try fs.validateText(candidate.quote);
         if (!validId(material.id)) return error.InvalidMaterial;
         const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(self.store.root.io).toMilliseconds()));
-        if (candidate.expires_at_ms) |end| if (end <= now) return .expired;
+        if (candidate.expires_at_ms) |end| {
+            if (end <= now) return .expired;
+            if (end <= material.created_ms) return error.InvalidMemoryCandidate;
+        }
         if (try self.store.generation() != material.generation) return .conflict;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -55,15 +61,7 @@ pub const Repository = struct {
             }
             if (candidate.expected_version == null or !std.mem.eql(u8, candidate.expected_version.?, entry.version)) return .conflict;
         } else if (candidate.expected_version != null) return .conflict;
-        if (!commit) return if (old == null) .created else .updated;
-        var source_kind: knowledge.EvidenceKind = undefined;
-        for (material.sources) |source| {
-            if (source.id == candidate.source_id) {
-                source_kind = source.kind;
-                break;
-            }
-        }
-        const record: Record = .{ .source = material.id, .source_id = candidate.source_id, .source_kind = source_kind, .quote = candidate.quote, .generation = material.generation, .created_ms = material.created_ms, .expires_at_ms = candidate.expires_at_ms, .category = candidate.category, .topic = candidate.topic, .content = normalized };
+        const record: Record = .{ .source = material.id, .generation = material.generation, .created_ms = material.created_ms, .expires_at_ms = candidate.expires_at_ms, .category = candidate.category, .topic = candidate.topic, .content = normalized };
         const json = try std.json.Stringify.valueAlloc(temp, record, .{});
         // A small content preview makes the bounded index useful without reading
         // every complete JSON shard. Never index the source body or evidence quote.
@@ -171,15 +169,33 @@ fn validId(id: []const u8) bool {
     return true;
 }
 fn decode(a: std.mem.Allocator, key: []const u8, text: []const u8) !?Record {
-    const pos = std.mem.find(u8, text, marker) orelse return null;
+    const pos_v2 = std.mem.find(u8, text, marker);
+    const pos_v1 = std.mem.find(u8, text, marker_v1);
+    if (pos_v2 == null and pos_v1 == null) return null;
+    if (pos_v2 != null and pos_v1 != null) return error.InvalidKnowledgeRecord;
+    const pos = pos_v2 orelse pos_v1.?;
     if (pos > 400 or text.len > 16384) return error.InvalidKnowledgeRecord;
-    const parsed = std.json.parseFromSlice(Record, a, text[pos + marker.len ..], .{ .allocate = .alloc_always }) catch return error.InvalidKnowledgeRecord;
-    const r = parsed.value;
+    const r: Record = if (pos_v2 != null) blk: {
+        const parsed = std.json.parseFromSlice(Record, a, text[pos + marker.len ..], .{ .allocate = .alloc_always }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.InvalidKnowledgeRecord;
+        };
+        if (parsed.value.schema != 2) return error.InvalidKnowledgeRecord;
+        break :blk parsed.value;
+    } else blk: {
+        const parsed = std.json.parseFromSlice(RecordV1, a, text[pos + marker_v1.len ..], .{ .allocate = .alloc_always }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.InvalidKnowledgeRecord;
+        };
+        const old = parsed.value;
+        if (old.schema != 1 or old.source_kind == .assistant or old.quote.len == 0 or old.quote.len > 1024) return error.InvalidKnowledgeRecord;
+        try fs.validateText(old.quote);
+        break :blk .{ .source = old.source, .generation = old.generation, .created_ms = old.created_ms, .expires_at_ms = old.expires_at_ms, .category = old.category, .topic = old.topic, .content = old.content };
+    };
     const expected = try std.fmt.allocPrint(a, "{s}-{s}", .{ @tagName(r.category), r.topic });
-    if (r.schema != 1 or !validId(r.source) or !std.mem.eql(u8, key, expected) or r.content.len == 0 or r.content.len > knowledge.max_content_bytes) return error.InvalidKnowledgeRecord;
+    if (!validId(r.source) or !std.mem.eql(u8, key, expected) or r.content.len == 0 or r.content.len > knowledge.max_content_bytes) return error.InvalidKnowledgeRecord;
     try mem.validTopic(r.topic);
-    if (r.topic.len > 40 or r.source_kind == .assistant or r.quote.len == 0 or r.quote.len > 1024) return error.InvalidKnowledgeRecord;
-    try fs.validateText(r.quote);
+    if (r.topic.len > 40) return error.InvalidKnowledgeRecord;
     try fs.validateText(r.content);
     if (r.expires_at_ms) |end| if (end <= r.created_ms) return error.InvalidKnowledgeRecord;
     return r;

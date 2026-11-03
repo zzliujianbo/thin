@@ -96,7 +96,7 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
           assert(!system.content.includes('uncertainty requires ask=true'));
           assert(system.content.includes('Do not infer authorization from the timeout choice.'));
           assert(system.content.includes('For command:'));
-          assert(!system.content.includes('For memory_write:') && !system.content.includes('For refine_outputs:'));
+          assert(!system.content.includes('For refine_outputs:'));
           assert.notDeepEqual([system],primarySystem);
           assert.equal(input.role,'user');
           assert.equal(typeof input.content,'string');

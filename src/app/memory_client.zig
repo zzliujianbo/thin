@@ -153,13 +153,13 @@ pub const Client = struct {
         hash.update(@tagName(config.model.protocol));
         var span = diag.Span.start(self.diagnostics, self.io, .{ .stage = .memory_request, .protocol = config.model.protocol, .timeout_ms = config.limits.request_timeout_ms, .route_hash = hash.final(), .count = 1 });
         defer span.finish(.ok);
-        return self.extractAttempt(a, out, material, cancel, model, request, &span) catch |err| {
+        return self.extractAttempt(a, out, cancel, model, request, &span) catch |err| {
             span.fail(err);
             return err;
         };
     }
 
-    fn extractAttempt(self: *Client, a: std.mem.Allocator, out: std.mem.Allocator, material: knowledge.Material, cancel: *const p.Cancellation, model: p.Model, request: p.Request, span: *diag.Span) ![]const knowledge.Candidate {
+    fn extractAttempt(self: *Client, a: std.mem.Allocator, out: std.mem.Allocator, cancel: *const p.Cancellation, model: p.Model, request: p.Request, span: *diag.Span) ![]const knowledge.Candidate {
         self.calls +|= 1;
         // Streamed usage survives even a thrown cancellation/cleanup failure.
         var sink: UsageSink = .{ .client = self, .cancel = cancel };
@@ -204,30 +204,7 @@ pub const Client = struct {
             .reasoning => {}, // Explicit metadata only; never extraction evidence.
             else => return error.InvalidMemoryOutput,
         };
-        // Validate into wipeable scratch before publishing a fully owned batch.
-        var rejection: ?knowledge.EvidenceRejection = null;
-        _ = codec.parseWithRejection(a, material, text.items, &rejection) catch |err| {
-            if (err == error.InvalidMemoryEvidence) if (rejection) |report| {
-                const safe_error: anyerror = switch (report.reason) {
-                    .assistant_source => error.MemoryEvidenceAssistantSource,
-                    .quote_mismatch => error.MemoryEvidenceQuoteMismatch,
-                    .sensitive_source => error.MemoryEvidenceSensitiveSource,
-                    .sensitive_content => error.MemoryEvidenceSensitiveContent,
-                    .sensitive_quote => error.MemoryEvidenceSensitiveQuote,
-                };
-                if (span.record.span_id != 0) span.sink.emit(.{
-                    .stage = .memory_request,
-                    .phase = .point,
-                    .span_id = span.record.span_id,
-                    .result = .failed,
-                    .candidate_index = report.candidate_index,
-                    .error_name = diag.ErrorName.fromError(safe_error),
-                });
-            };
-            return err;
-        };
-        try self.check(cancel);
-        const result = try codec.parse(out, material, text.items);
+        const result = try codec.parse(out, text.items);
         errdefer codec.freeCandidates(out, result);
         try self.check(cancel);
         return result;
@@ -344,72 +321,6 @@ test "memory client unrequested proxy transport closes cleanly without a child" 
     const proxy = if (client.transport) |*transport| if (transport.proxy_http) |*value| value else return error.TestUnexpectedResult else return error.TestUnexpectedResult;
     try std.testing.expect(proxy.unreaped_pid == null and !proxy.poisoned);
 }
-test "memory evidence rejection client emits safe point only for evidence" {
-    const Capture = struct {
-        records: [16]diag.Record = undefined,
-        len: usize = 0,
-        fn next(_: ?*anyopaque) u64 {
-            return 7;
-        }
-        fn emit(raw: ?*anyopaque, record: diag.Record) void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.records[self.len] = record;
-            self.len += 1;
-        }
-    };
-    const a = std.testing.allocator;
-    var env = std.process.Environ.Map.init(a);
-    defer env.deinit();
-    const client = try Client.create(a, std.testing.io, testConfig(), &env);
-    defer client.deinit();
-    var capture: Capture = .{};
-    client.diagnostics = .{ .context = &capture, .emit_fn = Capture.emit, .next_fn = Capture.next, .origin = .{ .turn = 23, .began_ms = 10 }, .memory_job_id = 42 };
-    var fake: Fake = .{ .client = client };
-    client.model_override = .{ .context = &fake, .call_fn = Fake.invoke };
-    var cancel: p.Cancellation = .{};
-    const cases = [_]struct { body: []const u8, label: []const u8, index: u32 }{
-        .{ .body = "{\"items\":[{\"category\":\"preferences\",\"topic\":\"first\",\"content\":\"Prefer Zig\",\"source_id\":0,\"quote\":\"Prefer Zig\"},{\"category\":\"preferences\",\"topic\":\"second\",\"content\":\"Other\",\"source_id\":0,\"quote\":\"missing\"}]}", .label = "MemoryEvidenceQuoteMismatch", .index = 1 },
-        .{ .body = "{\"items\":[{\"category\":\"preferences\",\"topic\":\"first\",\"content\":\"password=synthetic-sensitive-body-sentinel\",\"source_id\":0,\"quote\":\"Prefer Zig\"}]}", .label = "MemoryEvidenceSensitiveContent", .index = 0 },
-    };
-    for (cases, 0..) |case, i| {
-        capture.len = 0;
-        fake.body_override = case.body;
-        try std.testing.expectError(error.InvalidMemoryEvidence, client.service().extract(a, fixture, &cancel));
-        try std.testing.expectEqual(@as(usize, 3), capture.len);
-        const point = capture.records[1];
-        try std.testing.expectEqual(diag.Phase.point, point.phase);
-        try std.testing.expectEqual(diag.Stage.memory_request, point.stage);
-        try std.testing.expectEqual(diag.Result.failed, point.result.?);
-        try std.testing.expectEqual(case.index, point.candidate_index.?);
-        try std.testing.expectEqualStrings(case.label, point.error_name.?.name());
-        try std.testing.expectEqual(capture.records[0].span_id, point.span_id);
-        try std.testing.expectEqual(capture.records[2].span_id, point.span_id);
-        try std.testing.expectEqual(@as(u64, 23), point.origin.?.turn);
-        try std.testing.expectEqual(@as(u64, 42), point.memory_job_id.?);
-        try std.testing.expectEqual(diag.Phase.end, capture.records[2].phase);
-        try std.testing.expectEqualStrings("InvalidMemoryEvidence", capture.records[2].error_name.?.name());
-        try std.testing.expectEqual(@as(?u32, 1), capture.records[0].count);
-        try std.testing.expectEqual(@as(?u32, 1), capture.records[2].count);
-        try std.testing.expect(point.count == null);
-        try std.testing.expectEqual(i + 1, fake.calls);
-        try std.testing.expectEqual(@as(?u64, 17), client.last_usage.input_tokens);
-    }
-    capture.len = 0;
-    fake.body_override = "{\"items\":[]}";
-    const result = try client.service().extract(a, fixture, &cancel);
-    defer codec.freeCandidates(a, result);
-    try std.testing.expectEqual(@as(usize, 2), capture.len);
-    capture.len = 0;
-    fake.body_override = "{";
-    try std.testing.expectError(error.InvalidMemoryOutput, client.service().extract(a, fixture, &cancel));
-    try std.testing.expectEqual(@as(usize, 2), capture.len);
-    capture.len = 0;
-    fake.body_override = null;
-    fake.mode = .cancel;
-    try std.testing.expectError(error.Canceled, client.service().extract(a, fixture, &cancel));
-    try std.testing.expectEqual(@as(usize, 2), capture.len);
-}
-
 test "memory request diagnostics preserve success failure decode and cancellation" {
     const Capture = struct {
         records: [32]diag.Record = undefined,
@@ -434,25 +345,25 @@ test "memory request diagnostics preserve success failure decode and cancellatio
     var capture: Capture = .{};
     client.diagnostics = .{ .context = &capture, .emit_fn = Capture.emit, .next_fn = Capture.next };
     var cancel: p.Cancellation = .{};
-    try std.testing.expectError(error.MemoryUnavailable, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.MemoryUnavailable, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(@as(usize, 0), capture.len);
     var fake: Fake = .{ .client = client };
     client.model_override = .{ .context = &fake, .call_fn = Fake.invoke };
-    const items = try client.service().extract(a, fixture, &cancel);
+    const items = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, items);
     try std.testing.expectEqual(diag.Result.ok, capture.records[1].result.?);
     fake.mode = .failure;
-    try std.testing.expectError(error.MemoryUnavailable, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.MemoryUnavailable, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(@as(?u16, 429), capture.records[3].http_status);
     try std.testing.expectEqual(diag.Result.failed, capture.records[3].result.?);
     fake.mode = .partial;
-    try std.testing.expectError(error.InvalidMemoryOutput, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.InvalidMemoryOutput, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqualStrings("InvalidMemoryOutput", capture.records[5].error_name.?.name());
     fake.mode = .thrown;
-    try std.testing.expectError(error.CleanupFailed, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.CleanupFailed, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqualStrings("CleanupFailed", capture.records[7].error_name.?.name());
     fake.mode = .cancel;
-    try std.testing.expectError(error.Canceled, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.Canceled, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(diag.Result.canceled, capture.records[9].result.?);
     try std.testing.expectEqual(@as(usize, 10), capture.len);
     for (0..5) |i| {
@@ -473,46 +384,46 @@ test "memory client fake normal request preserves usage cancellation no tools no
     var fake: Fake = .{ .client = client };
     client.model_override = .{ .context = &fake, .call_fn = Fake.invoke };
     var cancel: p.Cancellation = .{};
-    const items = try client.service().extract(a, fixture, &cancel);
+    const items = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, items);
     try std.testing.expectEqual(@as(usize, 0), items.len);
     try std.testing.expectEqual(@as(?u64, 17), client.last_usage.input_tokens);
     fake.mode = .failure;
-    try std.testing.expectError(error.MemoryUnavailable, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.MemoryUnavailable, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(@as(?u16, 429), client.last_http_status);
     try std.testing.expectEqual(@as(?u64, 3), client.last_usage.output_tokens);
     for ([_]@TypeOf(fake.mode){ .tool, .partial }) |mode| {
         fake.mode = mode;
-        try std.testing.expectError(error.InvalidMemoryOutput, client.service().extract(a, fixture, &cancel));
+        try std.testing.expectError(error.InvalidMemoryOutput, Client.extract(client, a, fixture, &cancel));
     }
     fake.mode = .wrong_scope;
-    try std.testing.expectError(error.InvalidMemoryOutput, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.InvalidMemoryOutput, Client.extract(client, a, fixture, &cancel));
     fake.mode = .replay;
-    const ignored_replay = try client.service().extract(a, fixture, &cancel);
+    const ignored_replay = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, ignored_replay);
     fake.mode = .oversized;
-    const large = try client.service().extract(a, fixture, &cancel);
+    const large = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, large);
     try std.testing.expectEqual(@as(usize, 0), large.len);
     fake.mode = .reasoning;
-    const empty = try client.service().extract(a, fixture, &cancel);
+    const empty = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, empty);
     fake.mode = .thrown;
-    try std.testing.expectError(error.CleanupFailed, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.CleanupFailed, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(@as(?u64, 17), client.last_usage.input_tokens);
     fake.mode = .partial_usage;
-    const partial_usage = try client.service().extract(a, fixture, &cancel);
+    const partial_usage = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, partial_usage);
     try std.testing.expectEqual(@as(?u64, 17), client.last_usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 4), client.last_usage.output_tokens);
     fake.mode = .canceled_cleanup;
-    try std.testing.expectError(error.CleanupFailed, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.CleanupFailed, Client.extract(client, a, fixture, &cancel));
     cancel = .{};
     fake.mode = .cancel;
-    try std.testing.expectError(error.Canceled, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.Canceled, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(@as(?u64, 17), client.last_usage.input_tokens);
     const prior = client.calls;
-    try std.testing.expectError(error.Canceled, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.Canceled, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(prior, client.calls);
 }
 test "memory client rejects unknown or zero Anthropic capacity before counting calls" {
@@ -540,7 +451,7 @@ test "memory client rejects unknown or zero Anthropic capacity before counting c
         var fake: FakeCapacity = .{};
         client.model_override = .{ .context = &fake, .call_fn = FakeCapacity.invoke };
         var cancel: p.Cancellation = .{};
-        const outcome = client.service().extract(a, fixture, &cancel);
+        const outcome = Client.extract(client, a, fixture, &cancel);
         if (capacity == null or capacity.? == 0) {
             try std.testing.expectError(if (capacity == null) error.UnknownModelOutputCapacity else error.InvalidModelOutputCapacity, outcome);
             try std.testing.expectEqual(@as(usize, 0), fake.calls);
@@ -564,18 +475,18 @@ test "memory client refuses unresolved native absent credentials and input polic
     const client = try Client.create(a, std.testing.io, testConfig(), &env);
     defer client.deinit();
     var cancel: p.Cancellation = .{};
-    try std.testing.expectError(error.MemoryUnavailable, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.MemoryUnavailable, Client.extract(client, a, fixture, &cancel));
     client.source.value.model.protocol = .auto;
-    try std.testing.expectError(error.UnknownModelProtocol, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.UnknownModelProtocol, Client.extract(client, a, fixture, &cancel));
     client.source.value.model.protocol = .systemone;
-    try std.testing.expectError(error.UnsupportedProtocol, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.UnsupportedProtocol, Client.extract(client, a, fixture, &cancel));
     client.source.value.model.protocol = .chat;
     var fake: Fake = .{ .client = client };
     client.model_override = .{ .context = &fake, .call_fn = Fake.invoke };
     client.source.value.model.input_price_flat_limit = null;
-    try std.testing.expectError(error.UnknownInputPriceThreshold, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.UnknownInputPriceThreshold, Client.extract(client, a, fixture, &cancel));
     client.source.value.model.input_price_flat_limit = 1;
-    try std.testing.expectError(error.InputBudgetExceeded, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.InputBudgetExceeded, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(@as(u64, 0), client.calls);
 }
 
@@ -595,12 +506,12 @@ test "memory client complete request exact input boundary without output clamp" 
     client.source.value.limits.max_input_tokens = estimated + client.source.value.limits.input_margin_tokens;
     client.source.value.model.context_tokens = estimated + client.source.value.limits.safety_tokens + 1;
     var cancel: p.Cancellation = .{};
-    const empty = try client.service().extract(a, fixture, &cancel);
+    const empty = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, empty);
     try context.checkInput(client.source.value, estimated);
     try std.testing.expectEqual(testConfig().model.output_tokens, client.source.value.model.output_tokens);
     client.source.value.limits.max_input_tokens.? -= 1;
-    try std.testing.expectError(error.InputBudgetExceeded, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.InputBudgetExceeded, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(@as(u64, 1), client.calls);
 }
 
@@ -616,7 +527,7 @@ const WireFake = struct {
         self.calls += 1;
         try std.testing.expectEqual(@as(usize, 0), req.tools.len);
         try std.testing.expectEqual(testConfig().model.output_tokens, req.model_output_tokens);
-        const body = self.body_override orelse "{\"items\":[{\"category\":\"preferences\",\"topic\":\"language\",\"content\":\"Prefer Zig.\",\"source_id\":0,\"quote\":\"Prefer Zig.\"}]}";
+        const body = self.body_override orelse "{\"items\":[{\"category\":\"preferences\",\"topic\":\"language\",\"content\":\"Prefer Zig.\"}]}";
         const quoted = try std.json.Stringify.valueAlloc(a, body, .{});
         switch (req.scope.protocol) {
             .chat => {
@@ -653,7 +564,7 @@ const WireFake = struct {
     }
 };
 const cas_version = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const cas_body = "{\"items\":[{\"category\":\"preferences\",\"topic\":\"editor\",\"content\":\"Prefer Zig.\",\"source_id\":0,\"quote\":\"Prefer Zig.\"},{\"category\":\"preferences\",\"topic\":\"language\",\"content\":\"Prefer Zig.\",\"source_id\":0,\"quote\":\"Prefer Zig.\",\"expected_version\":\"" ++ cas_version ++ "\"}]}";
+const cas_body = "{\"items\":[{\"category\":\"preferences\",\"topic\":\"editor\",\"content\":\"Prefer Zig.\"},{\"category\":\"preferences\",\"topic\":\"language\",\"content\":\"Prefer Zig.\",\"expected_version\":\"" ++ cas_version ++ "\"}]}";
 fn casClientCase(out: std.mem.Allocator, protocol: p.Protocol) !void {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
@@ -668,8 +579,8 @@ fn casClientCase(out: std.mem.Allocator, protocol: p.Protocol) !void {
     var material = fixture;
     const related: knowledge.Related = .{ .category = .preferences, .topic = "language", .content = "Old", .version = cas_version };
     material.related = &.{related};
-    // Both scratch validation and final owned parse must succeed before return.
-    const items = try client.service().extract(out, material, &cancel);
+    // The returned candidates are owned by the caller.
+    const items = try Client.extract(client, out, material, &cancel);
     defer codec.freeCandidates(out, items);
     try std.testing.expectEqual(@as(usize, 2), items.len);
     try std.testing.expectEqualStrings(cas_version, items[1].expected_version.?);
@@ -684,20 +595,15 @@ fn casClientCase(out: std.mem.Allocator, protocol: p.Protocol) !void {
             else => unreachable,
         }
         material.related = if (case == 0) &.{} else &.{r};
-        // A fully valid create precedes the unauthorized update. No prefix is
-        // returned from either parse or the Service's second validation.
-        const result = client.service().extract(out, material, &cancel);
-        if (result) |partial| {
-            codec.freeCandidates(out, partial);
-            return error.TestUnexpectedResult;
-        } else |err| {
-            if (err == error.OutOfMemory) return err;
-            try std.testing.expectEqual(error.InvalidMemoryVersion, err);
-        }
+        var task_arena = std.heap.ArenaAllocator.init(out);
+        defer task_arena.deinit();
+        const filtered = try client.service().extract(task_arena.allocator(), material, &cancel);
+        try std.testing.expectEqual(@as(usize, 1), filtered.len);
+        try std.testing.expectEqualStrings("editor", filtered[0].topic);
     }
     try std.testing.expectEqual(@as(usize, 5), fake.calls);
 }
-test "memory client decoder CAS authorized update unauthorized whole batch and double parse OOM" {
+test "memory client decoder CAS authorized update filters unauthorized candidate and OOM" {
     for ([_]p.Protocol{ .chat, .responses, .anthropic }) |protocol| {
         try casClientCase(std.testing.allocator, protocol);
         // Includes allocation failures in final parse after scratch validation;
@@ -722,7 +628,7 @@ test "memory client binds only primary confirmed auto protocol without startup r
         var fake: WireFake = .{};
         client.model_override = .{ .context = &fake, .call_fn = WireFake.invoke };
         var cancel: p.Cancellation = .{};
-        try std.testing.expectError(error.UnknownModelProtocol, client.service().extract(a, fixture, &cancel));
+        try std.testing.expectError(error.UnknownModelProtocol, Client.extract(client, a, fixture, &cancel));
         try std.testing.expectError(error.UnsupportedProtocol, client.bindProtocol(.auto));
         try std.testing.expectError(error.UnsupportedProtocol, client.bindProtocol(.systemone));
         try client.bindProtocol(protocol);
@@ -734,7 +640,7 @@ test "memory client binds only primary confirmed auto protocol without startup r
         const different: p.Protocol = if (protocol == .chat) .responses else .chat;
         try std.testing.expectError(error.ProtocolBindingMismatch, client.bindProtocol(different));
         try std.testing.expectEqual(protocol, client.source.value.model.protocol);
-        const items = try client.service().extract(a, fixture, &cancel);
+        const items = try Client.extract(client, a, fixture, &cancel);
         defer codec.freeCandidates(a, items);
         try std.testing.expectEqual(@as(usize, 1), items.len);
         try std.testing.expectEqual(@as(usize, 1), fake.calls);
@@ -757,7 +663,7 @@ test "memory client auto binding absent credentials pending selection remain laz
     try client.bindProtocol(.anthropic);
     try std.testing.expect(client.key == null and client.transport == null);
     var cancel: p.Cancellation = .{};
-    try std.testing.expectError(error.MemoryUnavailable, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.MemoryUnavailable, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(@as(u64, 0), client.calls);
     config.provider.base_url = "";
     config.selection_pending = true;
@@ -778,11 +684,11 @@ test "memory client rejects Anthropic explicit refusal even with valid evidence 
     client.model_override = .{ .context = &fake, .call_fn = WireFake.invoke };
     var cancel: p.Cancellation = .{};
     // The exact same JSON is accepted when the stop reason is end_turn.
-    try std.testing.expectError(error.InvalidMemoryOutput, client.service().extract(a, fixture, &cancel));
+    try std.testing.expectError(error.InvalidMemoryOutput, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(@as(?u64, 13), client.last_usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 4), client.last_usage.output_tokens);
     fake.reject = false;
-    const items = try client.service().extract(a, fixture, &cancel);
+    const items = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, items);
     try std.testing.expectEqual(@as(usize, 1), items.len);
     try std.testing.expectEqual(@as(u64, 2), client.calls);
@@ -804,14 +710,14 @@ test "memory client real decoders accept large final JSON and Chat large reasoni
         var fake: WireFake = .{ .body_override = body };
         client.model_override = .{ .context = &fake, .call_fn = WireFake.invoke };
         var cancel: p.Cancellation = .{};
-        const items = try client.service().extract(a, fixture, &cancel);
+        const items = try Client.extract(client, a, fixture, &cancel);
         defer codec.freeCandidates(a, items);
         try std.testing.expectEqual(@as(usize, 0), items.len);
         try std.testing.expectEqual(@as(?u64, 13), client.last_usage.input_tokens);
         if (protocol == .chat) {
             fake.body_override = null;
             fake.large_reasoning = true;
-            const with_reasoning = try client.service().extract(a, fixture, &cancel);
+            const with_reasoning = try Client.extract(client, a, fixture, &cancel);
             defer codec.freeCandidates(a, with_reasoning);
             try std.testing.expectEqual(@as(usize, 1), with_reasoning.len);
         }
@@ -829,17 +735,17 @@ test "memory client actual Chat Responses Anthropic decoders valid refused trunc
         var fake: WireFake = .{};
         client.model_override = .{ .context = &fake, .call_fn = WireFake.invoke };
         var cancel: p.Cancellation = .{};
-        const items = try client.service().extract(a, fixture, &cancel);
+        const items = try Client.extract(client, a, fixture, &cancel);
         defer codec.freeCandidates(a, items);
         try std.testing.expectEqual(@as(usize, 1), items.len);
         try std.testing.expectEqualStrings("Prefer Zig.", items[0].content);
         try std.testing.expectEqual(@as(?u64, 13), client.last_usage.input_tokens);
         try std.testing.expectEqual(@as(?u64, 4), client.last_usage.output_tokens);
         fake.reject = true;
-        try std.testing.expectError(error.InvalidMemoryOutput, client.service().extract(a, fixture, &cancel));
+        try std.testing.expectError(error.InvalidMemoryOutput, Client.extract(client, a, fixture, &cancel));
         fake.reject = false;
         fake.truncated = true;
-        try std.testing.expectError(error.MemoryUnavailable, client.service().extract(a, fixture, &cancel));
+        try std.testing.expectError(error.MemoryUnavailable, Client.extract(client, a, fixture, &cancel));
         try std.testing.expectEqual(@as(usize, 3), fake.calls);
         try std.testing.expectEqual(@as(u64, 3), client.calls);
     }

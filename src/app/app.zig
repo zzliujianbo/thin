@@ -899,7 +899,6 @@ test "App unavailable decision key never blocks startup and chat replacement kee
     try std.testing.expect(app.decision_client.?.diagnostics.context == sink.context);
     try std.testing.expect(app.memory_coordinator.diagnostics.context == sink.context);
     if (app.memory_coordinator.extractor) |extractor| try std.testing.expect(extractor.diagnostics.context == sink.context);
-    if (app.memory_coordinator.reviewer) |reviewer| try std.testing.expect(reviewer.diagnostics.context == sink.context);
     const checkpoint = try app.runtime.checkpoint();
     try std.testing.expect(!@hasField(@TypeOf(checkpoint), "decision"));
     try std.testing.expect(!@hasField(@TypeOf(checkpoint), "decision_service"));

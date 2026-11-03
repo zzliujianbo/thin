@@ -481,14 +481,14 @@ test "decision diagnostics early failure is count zero and route remains lazy" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var cancel = p.Cancellation{};
-    try std.testing.expectError(error.DecisionUnavailable, client.service().decide(arena.allocator(), .{ .memory_write = .{ .topic = "style", .content = "Prefer concise reports." } }, &cancel));
+    try std.testing.expectError(error.DecisionUnavailable, client.service().decide(arena.allocator(), .{ .command = .{ .command = "printf fixture", .max_timeout_ms = 1000 } }, &cancel));
     try std.testing.expectEqual(@as(u64, 0), client.calls);
     try std.testing.expectEqual(@as(usize, 2), events.len);
     try std.testing.expectEqual(@as(?u32, 0), events.records[1].count);
     try std.testing.expectEqual(diag.Result.failed, events.records[1].result.?);
     try std.testing.expect(events.records[1].decision_failure != null);
     cancel.cancel();
-    try std.testing.expectError(error.Canceled, client.service().decide(arena.allocator(), .{ .memory_write = .{ .topic = "style", .content = "Prefer concise reports." } }, &cancel));
+    try std.testing.expectError(error.Canceled, client.service().decide(arena.allocator(), .{ .command = .{ .command = "printf fixture", .max_timeout_ms = 1000 } }, &cancel));
 }
 
 test "decision diagnostics fake attempts decode failure and clone sink isolation" {
@@ -516,17 +516,17 @@ test "decision diagnostics fake attempts decode failure and clone sink isolation
             try std.testing.expectEqualStrings("judge", request.scope.model);
             try std.testing.expectEqual(@as(usize, 0), request.tools.len);
             try std.testing.expect(request.model_output_tokens == null);
-            try std.testing.expectEqualStrings(policy.instruction(.{ .memory_write = .{ .topic = "style", .content = "Prefer concise reports." } }), request.system);
-            try std.testing.expect(std.mem.indexOf(u8, request.system, policy.ReviewRules.memory_value) != null);
-            try std.testing.expect(std.mem.indexOf(u8, request.system, "For command:") == null);
+            try std.testing.expectEqualStrings(policy.instruction(.{ .command = .{ .command = "printf fixture", .max_timeout_ms = 1000 } }), request.system);
+            try std.testing.expect(std.mem.indexOf(u8, request.system, policy.ReviewRules.command_risk) != null);
+            try std.testing.expect(std.mem.indexOf(u8, request.system, "For command:") != null);
             try std.testing.expect(std.mem.indexOf(u8, request.system, "For refine_outputs:") == null);
-            return .{ .success = .{ .message = try p.textMessage(alloc, .assistant, if (self.bad) "{\"write\":true,\"extra\":false}" else "{\"write\":true}"), .usage = .{ .input_tokens = 100, .output_tokens = 5 }, .finish = .stop } };
+            return .{ .success = .{ .message = try p.textMessage(alloc, .assistant, if (self.bad) "{\"timeout_ms\":null,\"ask\":true,\"extra\":false}" else "{\"timeout_ms\":null,\"ask\":true}"), .usage = .{ .input_tokens = 100, .output_tokens = 5 }, .finish = .stop } };
         }
     };
     var fake = Fake{};
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const input: policy.Input = .{ .memory_write = .{ .topic = "style", .content = "Prefer concise reports." } };
+    const input: policy.Input = .{ .command = .{ .command = "printf fixture", .max_timeout_ms = 1000 } };
     var cancel = p.Cancellation{};
     const Capture = struct {
         records: [8]diag.Record = undefined,
@@ -553,7 +553,7 @@ test "decision diagnostics fake attempts decode failure and clone sink isolation
     try std.testing.expectEqual(diag.Phase.point, capture.records[1].phase);
     try std.testing.expectEqual(@as(?u32, 1), capture.records[1].count);
     try std.testing.expectEqual(capture.records[0].span_id, capture.records[1].span_id);
-    try std.testing.expect(result.memory_write);
+    try std.testing.expect(result.command.ask and result.command.timeout == .none);
     try std.testing.expectEqual(@as(u64, 1), client.calls);
     try std.testing.expectEqual(@as(?u64, 100), client.last_usage.input_tokens);
     fake.bad = true;
@@ -589,21 +589,21 @@ test "decision client rejects unknown or zero Anthropic capacity before counting
                 const json = try std.json.parseFromSlice(std.json.Value, alloc, wire, .{});
                 defer json.deinit();
                 try std.testing.expectEqual(@as(i64, 8192), json.value.object.get("max_tokens").?.integer);
-                return .{ .success = .{ .message = try p.textMessage(alloc, .assistant, "{\"write\":true}"), .finish = .stop, .usage = .{ .input_tokens = 7, .output_tokens = 1 } } };
+                return .{ .success = .{ .message = try p.textMessage(alloc, .assistant, "{\"timeout_ms\":null,\"ask\":true}"), .finish = .stop, .usage = .{ .input_tokens = 7, .output_tokens = 1 } } };
             }
         };
         var fake: FakeCapacity = .{};
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         var cancel: p.Cancellation = .{};
-        const outcome = client.call(arena.allocator(), config, .{ .context = &fake, .call_fn = FakeCapacity.invoke }, .{ .memory_write = .{ .topic = "style", .content = "Keep concise." } }, &cancel);
+        const outcome = client.call(arena.allocator(), config, .{ .context = &fake, .call_fn = FakeCapacity.invoke }, .{ .command = .{ .command = "printf fixture", .max_timeout_ms = 1000 } }, &cancel);
         if (capacity == null or capacity.? == 0) {
             try std.testing.expectError(if (capacity == null) error.UnknownModelOutputCapacity else error.InvalidModelOutputCapacity, outcome);
             try std.testing.expectEqual(@as(usize, 0), fake.calls);
             try std.testing.expectEqual(@as(u64, 0), client.calls);
             try std.testing.expect(client.last_usage.input_tokens == null and client.last_http_status == null);
         } else {
-            try std.testing.expect((try outcome).memory_write);
+            try std.testing.expect((try outcome).command.ask);
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
             try std.testing.expectEqual(@as(u64, 1), client.calls);
             try std.testing.expectEqual(@as(?u64, 7), client.last_usage.input_tokens);
@@ -688,14 +688,14 @@ test "SystemOne creation stays lazy without capabilities or key and never passes
     defer missing.deinit();
     try std.testing.expect(missing.resolved == null and missing.native != null);
     var cancel = p.Cancellation{};
-    const input: policy.Input = .{ .memory_write = .{ .topic = "style", .content = "concise" } };
+    const input: policy.Input = .{ .command = .{ .command = "printf fixture", .max_timeout_ms = 1000 } };
     try std.testing.expectError(error.DecisionUnavailable, missing.service().decide(a, input, &cancel));
     try std.testing.expectEqual(p.Protocol.systemone, missing.resolved.?.config.value.model.protocol);
     try std.testing.expect(missing.resolved.?.client == null);
     const diagnostic = missing.last_failure.?;
     try std.testing.expectEqual(policy.Diagnostic.Stage.credentials, diagnostic.stage);
     try std.testing.expectEqual(policy.Diagnostic.Backend.systemone, diagnostic.backend);
-    try std.testing.expectEqual(policy.Diagnostic.Operation.memory_write, diagnostic.operation);
+    try std.testing.expectEqual(policy.Diagnostic.Operation.command, diagnostic.operation);
     try std.testing.expectEqualStrings("ApiKeyNotFound", diagnostic.causeName());
     try std.testing.expect(diagnostic.http_status == null and diagnostic.transport_exit_code == null);
     const empty = try missing.service().decide(a, .{ .refine_outputs = &.{} }, &cancel);

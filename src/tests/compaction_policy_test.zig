@@ -218,7 +218,7 @@ const LongTurn = struct {
                 self.cancel.cancel();
                 return error.Canceled;
             },
-            .variant => return .{ .memory_write = true },
+            .variant => return .{ .command = .{ .timeout = .none, .ask = false } },
             else => {},
         }
         const items = try alloc.alloc(decision.RefineItem, input.refine_outputs.len);

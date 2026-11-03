@@ -82,11 +82,9 @@ const background_schema: p.ToolSchema = .{
     \\{"type":"object","properties":{"action":{"type":"string","enum":["list","status","logs","stop"]},"id":{"type":"string","minLength":1,"maxLength":64},"after":{"type":"integer","minimum":0},"stdout_offset":{"type":"integer","minimum":0},"stderr_offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["action"],"additionalProperties":false}
     ,
 };
-const decision_memory_description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Only write candidates are reviewed for durable value; skipped writes make no change, and a useful candidate is not authorization. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.";
 const reviewed_schemas = blk: {
     var result = schemas;
     result[2].description = decision_bash_description;
-    result[3].description = decision_memory_description;
     break :blk result;
 };
 fn schemasForDecision(enabled: bool) []const p.ToolSchema {
@@ -751,11 +749,6 @@ pub const Tools = struct {
                 .max_timeout_ms = self.config.limits.command_max_timeout_ms,
                 .risk = if (command_risk.classify(b.command)) |finding| finding.label else null,
             } },
-            .memory => |m| if (m.action == .write) .{ .memory_write = .{
-                .topic = m.topic.?,
-                .content = m.content.?,
-                .expected_version = m.expected_version,
-            } } else null,
             else => null,
         };
         return .{ .payload = action, .description = description, .explicit_denial = denial, .decision_input = review };
@@ -1116,13 +1109,51 @@ test "tool descriptions distinguish configured decision review from legacy appro
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=true requires approval for this call") != null);
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=false removes the extra command-approval prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "Unavailable or invalid review pauses without executing") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reviewed[3].description, "a useful candidate is not authorization") != null);
-    for ([_]usize{ 0, 1 }) |i| try std.testing.expectEqualStrings(plain[i].description, reviewed[i].description);
+    for ([_]usize{ 0, 1, 3 }) |i| try std.testing.expectEqualStrings(plain[i].description, reviewed[i].description);
     for ([_]bool{ false, true }) |review| {
         const selected = schemasForDecision(review);
         try std.testing.expect(std.mem.indexOf(u8, selected[0].description, "next_offset as the next call's offset") != null);
         try std.testing.expect(std.mem.indexOf(u8, selected[3].description, "read's version as expected_version") != null);
     }
+}
+
+test "decision enabled prepares memory without review and preserves bash review" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, io, buffer[0..n]);
+    defer root.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 }, .decision = .{ .model = "local/fixture" } };
+    var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = undefined };
+    const selected = tools.executor().schemas;
+    try std.testing.expect(std.mem.indexOf(u8, selected[2].description, "ask=true requires approval") != null);
+    try std.testing.expectEqualStrings(schemas[3].description, selected[3].description);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const calls = [_][]const u8{
+        "{\"action\":\"write\",\"topic\":\"notes\",\"content\":\"durable fact\"}",
+        "{\"action\":\"read\",\"topic\":\"notes\"}",
+        "{\"action\":\"delete\",\"topic\":\"notes\",\"expected_version\":\"v1\"}",
+        "{\"action\":\"list\"}",
+    };
+    for (calls) |arguments| {
+        const prepared = try Tools.prepare(&tools, a, .{ .id = "m", .name = "memory", .arguments = arguments });
+        try std.testing.expect(prepared.decision_input == null);
+        const action: *const Action = @ptrCast(@alignCast(prepared.payload));
+        try std.testing.expect(action.* == .memory);
+        if (action.memory.action == .write) {
+            try std.testing.expectEqualStrings("notes", action.memory.topic.?);
+            try std.testing.expectEqualStrings("durable fact", action.memory.content.?);
+        }
+    }
+    try std.testing.expectError(error.MissingMemoryVersion, Tools.prepare(&tools, a, .{ .id = "invalid", .name = "memory", .arguments = "{\"action\":\"delete\",\"topic\":\"notes\"}" }));
+    const bash = try Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"true\"}" });
+    try std.testing.expect(bash.decision_input != null);
+    try std.testing.expect(bash.decision_input.? == .command);
+    try std.testing.expectEqualStrings("true", bash.decision_input.?.command.command);
 }
 
 // 参数必须严格校验（路径越界、版本缺失、未知字段等），保留动作类型。

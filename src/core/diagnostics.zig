@@ -2,7 +2,7 @@
 const std = @import("std");
 const p = @import("protocol.zig");
 const decision = @import("decision.zig");
-pub const Stage = enum { assistant_commit, observer, checkpoint, host_emit, end_task, watchdog_join, memory_submit, memory_finalize, memory_extract, memory_review, memory_write, memory_request, decision_request, finished_emit };
+pub const Stage = enum { assistant_commit, observer, checkpoint, host_emit, end_task, watchdog_join, memory_submit, memory_finalize, memory_extract, memory_write, memory_request, decision_request, finished_emit };
 pub const Phase = enum { begin, end, point };
 pub const Result = enum { ok, failed, canceled, skipped };
 pub const ErrorName = struct {

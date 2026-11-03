@@ -411,7 +411,7 @@ test "decision failure invalid fake variant timeout and cancellation stop withou
             .decision_input = .{ .command = .{ .command = "fixture", .max_timeout_ms = 1000 } },
             .decision_failure = if (mode == 0) error.FixtureUnavailable else if (mode == 5) error.CleanupFailed else null,
             .decision_output = switch (mode) {
-                1 => .{ .memory_write = true },
+                1 => .{ .refine_outputs = &.{} },
                 2 => .{ .command = .{ .timeout = .{ .milliseconds = 0 }, .ask = false } },
                 3 => .{ .command = .{ .timeout = .{ .milliseconds = 1001 }, .ask = false } },
                 else => .{ .command = .{ .timeout = .none, .ask = false } },
@@ -514,29 +514,6 @@ test "automatic no candidate is quiet below normal budget and manual no candidat
     try std.testing.expectEqual(error.NoCompactionCandidate, empty.compaction_error.?);
     try std.testing.expectEqual(@as(u32, 0), empty.normal_calls + empty.summary_calls + empty.compactions);
     try std.testing.expectEqualDeep(before, other.messages());
-}
-
-test "decision memory usefulness skip is nonerror and allow preserves authorization" {
-    for ([_]bool{ false, true }) |write| {
-        var fake: Fake = .{
-            .decision_input = .{ .memory_write = .{ .topic = "fixture", .content = "candidate", .expected_version = "version" } },
-            .decision_output = .{ .memory_write = write },
-            .decision = .deny,
-        };
-        var config = configuration();
-        var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
-        defer runtime.deinit();
-        runtime.decision_service = fake.service();
-        fake.current_runtime = &runtime;
-        var cancel: p.Cancellation = .{};
-        const result = try runtime.run("remember", &cancel);
-        try std.testing.expectEqual(r.Status.success, result.status);
-        try std.testing.expectEqual(@as(usize, 1), fake.decision_calls);
-        try std.testing.expectEqual(@as(u32, if (write) 1 else 0), fake.permissions);
-        try std.testing.expectEqual(@as(u32, 0), fake.executions);
-        try std.testing.expectEqual(write, runtime.messages()[2].blocks[0].tool_result.is_error);
-        if (!write) try std.testing.expect(std.mem.indexOf(u8, fake.last_result, "nothing was written") != null);
-    }
 }
 
 test "checkpoint runtime restores owned context without replaying tools or authorization" {

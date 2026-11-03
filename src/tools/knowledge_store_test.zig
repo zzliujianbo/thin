@@ -26,7 +26,7 @@ test "classified CAS category separation generation tombstones expiration and bo
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
     var repository = repo.Repository.init(&store);
     var material: knowledge.Material = .{ .id = id, .generation = 0, .created_ms = 1, .sources = &.{.{ .id = 0, .kind = .user, .text = "中文 rust" }} };
-    var c: knowledge.Candidate = .{ .category = .project, .topic = "language", .content = " 中文 rust ", .source_id = 0, .quote = "rust" };
+    var c: knowledge.Candidate = .{ .category = .project, .topic = "language", .content = " 中文 rust " };
     try std.testing.expectEqual(repo.Apply.created, try repository.apply(a, material, c));
     try std.testing.expectEqual(repo.Apply.unchanged, try repository.apply(a, material, c));
     try std.testing.expectEqual(@as(u64, 0), try store.generation());
@@ -85,10 +85,10 @@ test "related budget hard cap preserves complete conditions before extractor" {
     for (0..8) |i| {
         text[head.len] = @as(u8, @intCast(i)) + '0';
         const topic = try std.fmt.allocPrint(a, "long-condition-{d}", .{i});
-        try std.testing.expectEqual(repo.Apply.created, try repository.apply(a, material, .{ .category = .project, .topic = topic, .content = text, .source_id = 0, .quote = "durable condition" }));
+        try std.testing.expectEqual(repo.Apply.created, try repository.apply(a, material, .{ .category = .project, .topic = topic, .content = text }));
     }
     const small = "long condition short rule with complete exception";
-    try std.testing.expectEqual(repo.Apply.created, try repository.apply(a, material, .{ .category = .project, .topic = "z-long-condition-small", .content = small, .source_id = 0, .quote = "durable condition" }));
+    try std.testing.expectEqual(repo.Apply.created, try repository.apply(a, material, .{ .category = .project, .topic = "z-long-condition-small", .content = small }));
     material.related = try repository.related(a, "long condition", 100);
     var bytes: usize = 0;
     var large_count: usize = 0;
@@ -124,12 +124,12 @@ test "indexed retrieval reads only selected bodies always includes core and pers
     _ = try store.write(a, "core", "CORE 中文", null);
     var repository = repo.Repository.init(&store);
     const material: knowledge.Material = .{ .id = id, .generation = try store.generation(), .created_ms = 1, .sources = &.{.{ .id = 7, .kind = .tool, .text = "PRIVATE FULL SOURCE rust 中文" }} };
-    const candidate: knowledge.Candidate = .{ .category = .project, .topic = "compiler", .content = "rust 中文编译器", .source_id = 7, .quote = "rust" };
+    const candidate: knowledge.Candidate = .{ .category = .project, .topic = "compiler", .content = "rust 中文编译器" };
     try std.testing.expectEqual(repo.Apply.created, try repository.apply(a, material, candidate));
     const entry = try store.read(a, "project-compiler");
-    try std.testing.expect(std.mem.find(u8, entry.content, "\"source_id\":7") != null);
-    try std.testing.expect(std.mem.find(u8, entry.content, "\"source_kind\":\"tool\"") != null);
-    try std.testing.expect(std.mem.find(u8, entry.content, "\"quote\":\"rust\"") != null);
+    try std.testing.expect(std.mem.find(u8, entry.content, "\"source_id\"") == null);
+    try std.testing.expect(std.mem.find(u8, entry.content, "\"source_kind\"") == null);
+    try std.testing.expect(std.mem.find(u8, entry.content, "\"quote\"") == null);
     try std.testing.expect(std.mem.find(u8, entry.content, "PRIVATE FULL SOURCE") == null);
     const binary = "other\n\x00";
     for (0..20) |i| {
@@ -156,7 +156,7 @@ test "indexed retrieval reads only selected bodies always includes core and pers
     try std.testing.expect(std.mem.find(u8, ranked, "ranked-15") == null);
 }
 
-test "inspect is side effect free and apply rechecks generation and CAS" {
+test "apply writes only on matching generation and CAS" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -167,37 +167,60 @@ test "inspect is side effect free and apply rechecks generation and CAS" {
     var store = memory.Store.init(&root, .{});
     var repository = repo.Repository.init(&store);
     var material: knowledge.Material = .{ .id = id, .generation = 0, .created_ms = 1, .sources = &.{.{ .id = 7, .kind = .tool, .text = "PRIVATE FULL SOURCE rust 中文" }} };
-    var candidate: knowledge.Candidate = .{ .category = .project, .topic = "preflight", .content = "rust", .source_id = 7, .quote = "rust" };
-    try std.testing.expectEqual(repo.Apply.created, try repository.inspect(a, material, candidate));
-    try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
+    var candidate: knowledge.Candidate = .{ .category = .project, .topic = "preflight", .content = "rust" };
     try std.testing.expectEqual(repo.Apply.created, try repository.apply(a, material, candidate));
     const before = try store.read(a, "project-preflight");
-    try std.testing.expectEqual(repo.Apply.unchanged, try repository.inspect(a, material, candidate));
+    try std.testing.expectEqual(repo.Apply.unchanged, try repository.apply(a, material, candidate));
     candidate.content = "new rust";
-    try std.testing.expectEqual(repo.Apply.conflict, try repository.inspect(a, material, candidate));
-    candidate.expected_version = before.version;
-    material.related = &.{.{ .category = .project, .topic = "preflight", .content = "rust", .version = before.version }};
-    try std.testing.expectEqual(repo.Apply.updated, try repository.inspect(a, material, candidate));
+    try std.testing.expectEqual(repo.Apply.conflict, try repository.apply(a, material, candidate));
     try std.testing.expectEqualStrings(before.version, (try store.read(a, "project-preflight")).version);
+    candidate.expected_version = before.version;
+    try std.testing.expectEqual(repo.Apply.updated, try repository.apply(a, material, candidate));
+    const updated = try store.read(a, "project-preflight");
+    try std.testing.expect(!std.mem.eql(u8, before.version, updated.version));
+    try std.testing.expect(std.mem.find(u8, updated.content, "new rust") != null);
     var competing = candidate;
     competing.content = "competing rust";
+    competing.expected_version = updated.version;
     try std.testing.expectEqual(repo.Apply.updated, try repository.apply(a, material, competing));
+    const competing_entry = try store.read(a, "project-preflight");
     try std.testing.expectEqual(repo.Apply.conflict, try repository.apply(a, material, candidate));
-    candidate.expected_version = (try store.read(a, "project-preflight")).version;
-    material.related = &.{.{ .category = .project, .topic = "preflight", .content = "competing rust", .version = candidate.expected_version.? }};
-    try std.testing.expectEqual(repo.Apply.updated, try repository.inspect(a, material, candidate));
+    try std.testing.expectEqualStrings(competing_entry.version, (try store.read(a, "project-preflight")).version);
+    candidate.expected_version = competing_entry.version;
     const manual = try store.write(a, "manual", "user edit", null);
     try std.testing.expectEqual(repo.Apply.conflict, try repository.apply(a, material, candidate));
     material.generation = try store.generation();
-    try std.testing.expectEqual(repo.Apply.updated, try repository.inspect(a, material, candidate));
     try store.delete("manual", manual.version);
     try std.testing.expectEqual(repo.Apply.conflict, try repository.apply(a, material, candidate));
     material.generation = try store.generation();
     candidate.expires_at_ms = 2;
-    try std.testing.expectEqual(repo.Apply.expired, try repository.inspect(a, material, candidate));
+    try std.testing.expectEqual(repo.Apply.expired, try repository.apply(a, material, candidate));
+    try std.testing.expectEqualStrings(competing_entry.version, (try store.read(a, "project-preflight")).version);
     candidate.expires_at_ms = null;
-    candidate.quote = "invented quote";
-    try std.testing.expectError(error.InvalidMemoryEvidence, repository.inspect(a, material, candidate));
+    try std.testing.expectEqual(repo.Apply.updated, try repository.apply(a, material, candidate));
+}
+
+test "v1 records remain retrievable and CAS updates write v2" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try rootFor(a, std.testing.io, tmp.dir);
+    defer root.deinit();
+    var store = memory.Store.init(&root, .{});
+    const old = "project: language Zig old\n\n<!-- thin-knowledge-v1 -->\n{\"schema\":1,\"source\":\"" ++ id ++ "\",\"source_id\":0,\"source_kind\":\"user\",\"quote\":\"Zig\",\"generation\":0,\"created_ms\":1,\"expires_at_ms\":null,\"category\":\"project\",\"topic\":\"language\",\"content\":\"Zig old\"}\n";
+    _ = try store.write(a, "project-language", old, null);
+    var repository = repo.Repository.init(&store);
+    const related = try repository.related(a, "Zig", 1);
+    try std.testing.expectEqual(@as(usize, 1), related.len);
+    try std.testing.expect(std.mem.find(u8, try repository.retrieve(a, "Zig", 1, 8192), "Zig old") != null);
+    const material: knowledge.Material = .{ .id = id, .generation = try store.generation(), .created_ms = 1, .sources = &.{}, .related = related };
+    const candidate: knowledge.Candidate = .{ .category = .project, .topic = "language", .content = "Zig new", .expected_version = related[0].version };
+    try std.testing.expectEqual(repo.Apply.updated, try repository.apply(a, material, candidate));
+    const entry = try store.read(a, "project-language");
+    try std.testing.expect(std.mem.find(u8, entry.content, "thin-knowledge-v2") != null);
+    try std.testing.expect(std.mem.find(u8, entry.content, "\"quote\"") == null);
 }
 
 test "strict persisted knowledge records reject unknown and duplicate schema fields" {
@@ -211,7 +234,7 @@ test "strict persisted knowledge records reject unknown and duplicate schema fie
     var store = memory.Store.init(&root, .{});
     var repository = repo.Repository.init(&store);
     const material: knowledge.Material = .{ .id = id, .generation = 0, .created_ms = 1, .sources = &.{.{ .id = 7, .kind = .tool, .text = "PRIVATE FULL SOURCE rust 中文" }} };
-    const candidate: knowledge.Candidate = .{ .category = .project, .topic = "strict", .content = "rust", .source_id = 7, .quote = "rust" };
+    const candidate: knowledge.Candidate = .{ .category = .project, .topic = "strict", .content = "rust" };
     _ = try repository.apply(a, material, candidate);
     const entry = try store.read(a, "project-strict");
     for ([_][]const u8{ "\"unknown\":1,", "\"schema\":1," }) |injection| {

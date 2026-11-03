@@ -377,24 +377,24 @@ test "automatic Memory expected version requires same topic category Related and
     const sources = [_]k.Evidence{.{ .id = 0, .kind = .user, .text = "Use focused offline tests" }};
     const version = "1111111111111111111111111111111111111111111111111111111111111111";
     var material = k.Material{ .id = "offline", .generation = 1, .created_ms = 1, .sources = &sources, .related = &.{.{ .category = .project, .topic = "testing", .content = "old fact", .version = version }} };
-    var candidate = k.Candidate{ .category = .project, .topic = "testing", .content = "Use focused offline tests", .source_id = 0, .quote = "focused offline tests", .expected_version = version };
-    try k.validate(material, &.{candidate});
+    var candidate = k.Candidate{ .category = .project, .topic = "testing", .content = "Use focused offline tests", .expected_version = version };
+    try k.validateCandidate(material, candidate);
     candidate.topic = "other-topic";
-    try std.testing.expectError(error.InvalidMemoryVersion, k.validate(material, &.{candidate}));
+    try std.testing.expectError(error.InvalidMemoryVersion, k.validateCandidate(material, candidate));
     candidate.topic = "testing";
     candidate.category = .preferences;
-    try std.testing.expectError(error.InvalidMemoryVersion, k.validate(material, &.{candidate}));
+    try std.testing.expectError(error.InvalidMemoryVersion, k.validateCandidate(material, candidate));
     candidate.category = .project;
     candidate.expected_version = "2222222222222222222222222222222222222222222222222222222222222222";
-    try std.testing.expectError(error.InvalidMemoryVersion, k.validate(material, &.{candidate}));
+    try std.testing.expectError(error.InvalidMemoryVersion, k.validateCandidate(material, candidate));
     candidate.expected_version = "unknown";
-    try std.testing.expectError(error.InvalidMemoryVersion, k.validate(material, &.{candidate}));
+    try std.testing.expectError(error.InvalidMemoryVersion, k.validateCandidate(material, candidate));
     candidate.expected_version = null;
     candidate.content = "Authorization: Bearer credential";
-    try std.testing.expectError(error.InvalidMemoryEvidence, k.validate(material, &.{candidate}));
+    try std.testing.expectError(error.InvalidMemoryCandidate, k.validateCandidate(material, candidate));
     candidate.content = "safe fact";
     material.related = &.{};
-    try k.validate(material, &.{candidate});
+    try k.validateCandidate(material, candidate);
 }
 
 test "automatic Memory Capture bounded omitted UTF8 assistant sensitive and OOM" {
@@ -407,8 +407,10 @@ test "automatic Memory Capture bounded omitted UTF8 assistant sensitive and OOM"
     capture.add(.tool, "\xff");
     capture.add(.tool, &@as([4097]u8, @splat('x')));
     capture.add(.user, "verified durable fact");
-    try std.testing.expectEqual(@as(usize, 1), capture.sources.items.len);
-    try std.testing.expectEqual(@as(usize, 5), capture.omitted_sources);
+    try std.testing.expectEqual(@as(usize, 2), capture.sources.items.len);
+    try std.testing.expectEqual(@as(usize, 4), capture.omitted_sources);
+    try std.testing.expectEqualStrings("read /home/user/.ssh/id_rsa", capture.sources.items[0].text);
+    try std.testing.expectEqualStrings("verified durable fact", capture.sources.items[1].text);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var oom = k.Capture{ .allocator = failing.allocator() };
     oom.add(.user, "fact");

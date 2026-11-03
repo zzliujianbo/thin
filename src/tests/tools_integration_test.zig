@@ -50,7 +50,7 @@ test "executor selects decision-aware descriptions without changing tool paramet
             try std.testing.expectEqualStrings(old.parameters_json, current.parameters_json);
         }
         try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=false removes") != null);
-        try std.testing.expect(std.mem.indexOf(u8, reviewed[3].description, "write candidates are reviewed") != null);
+        try std.testing.expectEqualStrings(plain[3].description, reviewed[3].description);
     }
     config.decision = null;
     try std.testing.expectEqualStrings(plain[2].description, tools.executor().schemas[2].description);
@@ -628,7 +628,9 @@ test "tools prepare decision inputs without side effects and honor explicit no d
         .name = "memory",
         .arguments = "{\"action\":\"write\",\"topic\":\"style\",\"content\":\"Prefer concise reports.\"}",
     });
-    try std.testing.expectEqualStrings("style", write.decision_input.?.memory_write.topic);
+    try std.testing.expect(write.decision_input == null);
+    const action: *const t.Action = @ptrCast(@alignCast(write.payload));
+    try std.testing.expectEqualStrings("style", action.memory.topic.?);
     try std.testing.expect(write.explicit_denial == null);
     try std.testing.expectError(error.FileNotFound, store.read(alloc, "style"));
     const list = try executor.prepare_fn(executor.context, alloc, .{ .id = "list", .name = "memory", .arguments = "{\"action\":\"list\"}" });
