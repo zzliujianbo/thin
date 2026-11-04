@@ -158,7 +158,7 @@ export async function fullResumeRegressions({app, pty, execute}) {
       assert.equal(await readFile(configPath, 'utf8'), config);
       assert.equal(await readFile(settingsPath, 'utf8'), settings);
       const clean = await readFile(snapshotPath), cleanMarker = await readFile(markerPath);
-      const put = async (bytes, marker = Buffer.concat([Buffer.from('C'), createHash('sha256').update(bytes).digest()])) => {
+      const put = async (bytes, marker = cleanMarker) => {
         await writeFile(snapshotPath, bytes); await writeFile(markerPath, marker);
       };
       check = 'missing checkpoint refusal';
@@ -167,7 +167,7 @@ export async function fullResumeRegressions({app, pty, execute}) {
       await run('resume-idle', id); // Rotation is not a history-load refusal.
       assert.equal(requests,4);
       await writeFile(configPath, config);
-      await put(clean, Buffer.from('A')); // Active/stale marker is not authentication.
+      await put(clean, Buffer.from('A')); // Legacy marker bytes do not gate loading.
       await run('resume-idle', id);
       assert.equal(requests,4);
       await put(clean.subarray(0, clean.length - 1), cleanMarker);
@@ -182,7 +182,7 @@ export async function fullResumeRegressions({app, pty, execute}) {
       versioned[versionAt + '"version":'.length] = '1'.charCodeAt(0);
       await put(versioned);
       await run('resume-failure', id, 'UnsupportedVersion');
-      const activeMarker = Buffer.from(cleanMarker); activeMarker[0] = 'A'.charCodeAt(0);
+      const activeMarker = Buffer.from('Aobsolete legacy digest');
       await put(clean, activeMarker);
       await run('resume-idle', id);
       assert.equal(requests,4);

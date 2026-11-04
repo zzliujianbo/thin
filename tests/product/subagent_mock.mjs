@@ -15,8 +15,8 @@
 // truncated fields at the same level; send/cancel return bounded receipts.
 //
 // Request choreography per case (root/child model requests):
-//   chat-subagent-qna        R: start, get(wait)=waiting, write_file(denied),
-//                               bash(denied), send(reply), get(wait)=success, answer
+//   chat-subagent-qna        R: start, get(wait)=waiting, write_file, bash,
+//                               send(reply), get(wait)=success, answer
 //                            C: ask(wait), read_file, report
 //   chat-subagent-steering   R: start, get(wait=false), send(steering),
 //                               get(wait)=progress, get(wait)=success, answer
@@ -25,8 +25,6 @@
 //                               in the same history) -> progress message, report
 //   chat-subagent-cancel     R: start, get(wait)=waiting, cancel, answer
 //                            C: ask(wait) and never answered
-//   chat-legacy-false        R: start, get(wait)=success, answer
-//                            C: report  (config carried the old subagent.enabled:false)
 //   chat-subagent-unknown-id R: start, get(wait)=success,
 //                               get/send/cancel(foreign id)=rejected, answer
 //                            C: report
@@ -102,6 +100,21 @@ const exists = path => access(path).then(() => true, () => false);
 
 const sockets = new Set();
 let workspace = null, server = null, url = null, active = null, fixtureFailed = false;
+let ownedProcess = null;
+
+function releaseToolBarrier(plan, success) {
+  if (!plan?.toolBarrier || plan.toolBarrier.done) return;
+  const barrier = plan.toolBarrier;
+  barrier.done = true;
+  clearTimeout(barrier.timer);
+  for (const response of barrier.responses) {
+    if (!response.destroyed) {
+      response.writeHead(success ? 200 : 503, {'content-type': 'text/plain'});
+      response.end(success ? 'barrier-open' : 'barrier-failed');
+    }
+  }
+  barrier.responses.length = 0;
+}
 
 // ---------------------------------------------------------------------------
 // Wire helpers
@@ -414,6 +427,18 @@ server = http.createServer(async (req, res) => {
   try {
     const plan = active;
     assert(plan, 'request without an owned run');
+    if (req.method === 'GET' && req.url?.startsWith('/tool-barrier/')) {
+      const barrier = plan.toolBarrier;
+      assert(barrier && !barrier.done, 'unexpected tool barrier request');
+      const participant = req.url.slice('/tool-barrier/'.length);
+      assert(barrier.expected.includes(participant), 'unknown barrier participant');
+      assert(!barrier.arrived.has(participant), 'duplicate barrier participant');
+      barrier.arrived.add(participant);
+      barrier.responses.push(res);
+      if (barrier.arrived.size === barrier.expected.length) releaseToolBarrier(plan, true);
+      return;
+    }
+    assert.equal(req.method, 'POST', 'model requests must be POST');
     assert.equal(req.url, endpoint[plan.protocol], 'endpoint must match the declared protocol');
     if (plan.protocol === 'anthropic') {
       assert.equal(req.headers['x-api-key'], KEY, 'Anthropic key header');
@@ -429,7 +454,8 @@ server = http.createServer(async (req, res) => {
     // Role identity comes from the fixed tool sets, never from prompt text.
     const role = tools.includes('message_parent') ? 'child' : 'root';
     assert(role === 'child' ? !tools.includes('get_subagent_result') : true, 'ambiguous request role');
-    const stage = plan.stages[role][plan.seq[role]];
+    const stage = role === 'child' && plan.childStageByRound
+      ? plan.childStageByRound[history.calls.length] : plan.stages[role][plan.seq[role]];
     assert(stage, `unexpected extra ${role} model request`);
     plan.seq[role] += 1;
     plan.requests += 1;
@@ -453,6 +479,7 @@ server = http.createServer(async (req, res) => {
     sendReplies(plan.protocol, res, value, stage.usage);
   } catch {
     fixtureFailed = true;
+    releaseToolBarrier(active, false);
     if (!res.headersSent) res.writeHead(500);
     res.end('owned subagent fixture failed');
   }
@@ -470,7 +497,6 @@ function makePlan(spec) {
   return {
     childContext: null,
     expectCleanSockets: false,
-    legacySwitch: null,
     stages: {root: [], child: []},
     signals: new Map(),
     seq: {root: 0, child: 0},
@@ -495,8 +521,11 @@ async function run(plan) {
   const home = join(dir, 'home'), project = join(dir, 'project');
   plan.project = project;
   plan.sentinelFile = join(project, 'sentinel-dir', 'sentinel.txt');
+  plan.approvalSentinel = join(project, '.ssh', 'fixture-marker');
   await mkdir(join(home, '.thin'), {recursive: true});
   await mkdir(join(project, 'sentinel-dir'), {recursive: true});
+  await mkdir(join(project, '.ssh'), {recursive: true});
+  await writeFile(plan.approvalSentinel, SENTINEL, {mode: 0o600});
   await writeFile(plan.sentinelFile, SENTINEL, {mode: 0o600});
   await writeFile(join(project, PROBE_FILE), `${PROBE_CONTENT}\n`, {mode: 0o600});
   const declaration = {
@@ -507,10 +536,6 @@ async function run(plan) {
     }}},
     limits: {low_price_input: false, safety_tokens: 100, request_timeout_ms: 10000, task_timeout_ms: 25000},
   };
-  // Older preview builds could persist a top-level switch; the legacy case
-  // proves a saved false no longer disables delegation. Default cases ship no
-  // subagent key at all.
-  if (plan.legacySwitch) declaration.subagent = {enabled: plan.legacySwitch.enabled};
   plan.configText = JSON.stringify(declaration);
   await writeFile(join(home, '.thin', 'config.json'), plan.configText, {mode: 0o600});
 
@@ -534,7 +559,14 @@ async function run(plan) {
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  ownedProcess = child;
   let owned = true, size = 0, expired = false;
+  if (plan.toolBarrier) {
+    plan.toolBarrier.timer = setTimeout(() => {
+      fixtureFailed = true;
+      releaseToolBarrier(plan, false);
+    }, 12000);
+  }
   const out = [], err = [];
   const kill = signal => { if (owned && child.pid) { try { process.kill(-child.pid, signal); } catch {} } };
   const capture = chunks => chunk => {
@@ -554,11 +586,19 @@ async function run(plan) {
   let code;
   try {
     code = await new Promise((res, rej) => { child.once('error', rej); child.once('close', value => res(value)); });
+  } catch (error) {
+    for (const socket of sockets) socket.destroy();
+    sockets.clear();
+    active = null;
+    throw error;
   } finally {
     clearTimeout(timer);
     clearTimeout(escalator);
+    releaseToolBarrier(plan, false);
+    for (const signal of plan.signals.values()) signal.resolve();
     kill('SIGKILL');
     owned = false;
+    ownedProcess = null;
   }
   try {
     assert(!expired, 'owned subagent run exceeded its bounded lifetime');
@@ -606,7 +646,7 @@ async function assertParentArchive(project) {
 // ---------------------------------------------------------------------------
 
 // Chat Q&A: start/get(wait)/ask/reply/read_file/terminal in one run, plus the
-// parent write_file+bash refusal while the child is uncollected and waiting.
+// parent write_file+bash execution while the child is uncollected and waiting.
 function qnaCase() {
   const plan = makePlan({
     name: 'chat-subagent-qna', protocol: 'chat',
@@ -631,17 +671,18 @@ function qnaCase() {
         assert(snap.messages[0].message.includes(CHILD_QUESTION), 'child question text');
         assert.equal(snap.messages[0].requires_reply, true, 'question must request a reply');
       },
-      reply: ctx => ctx.call('write_file', {path: 'sentinel-dir/sentinel.txt', content: 'PARENT-OVERWRITE'})},
+      reply: ctx => ctx.call('write_file', {path: 'sentinel-dir/sentinel.txt', content: 'PARENT-OVERWRITE', overwrite: true})},
     {usage: {input: 95, output: 10},
       check: ctx => {
-        const text = callText(ctx.history, 'write_file');
-        assert(text.includes('SubagentActive'), `parent write must be refused while a child is uncollected, got ${JSON.stringify(text.slice(0, 80))}`);
+        const result = callJson(ctx.history, 'write_file');
+        assert.equal(result.path, 'sentinel-dir/sentinel.txt', 'parent write result path');
+        assert.equal(result.written_bytes, Buffer.byteLength('PARENT-OVERWRITE'), 'parent write byte count');
       },
-      reply: ctx => ctx.call('bash', {command: `rm -rf ${plan.project}/sentinel-dir`})},
+      reply: ctx => ctx.call('bash', {command: 'printf parent-bash-proof > parent-bash.txt'})},
     {usage: {input: 96, output: 10},
       check: ctx => {
-        const text = callText(ctx.history, 'bash');
-        assert(text.includes('SubagentActive'), `parent bash must be refused while a child is uncollected, got ${JSON.stringify(text.slice(0, 80))}`);
+        const result = callJson(ctx.history, 'bash');
+        assert.equal(result.exit_code, 0, 'parent bash must succeed while child is uncollected');
       },
       reply: ctx => ctx.call('send_subagent_message', {id: plan.childId, message: PARENT_REPLY})},
     {usage: {input: 100, output: 10},
@@ -678,8 +719,9 @@ function qnaCase() {
     assert.equal(plan.roleRequests.root, 7, 'qna root request count');
     assert.equal(plan.childRequests, 3, 'qna child request count');
     assert(!out.includes('Subagent mode:'), 'child mode note leaked to stdout');
-    assert.equal(await readFile(plan.sentinelFile, 'utf8'), SENTINEL, 'refused parent write_file changed the sentinel');
-    assert(await exists(join(project, 'sentinel-dir')), 'refused parent bash removed the sentinel directory');
+    assert.equal(await readFile(plan.sentinelFile, 'utf8'), 'PARENT-OVERWRITE', 'parent write_file must change the sentinel');
+    assert.equal(await readFile(join(project, 'parent-bash.txt'), 'utf8'), 'parent-bash-proof', 'parent bash side effect');
+    assert(await exists(join(project, 'sentinel-dir')), 'parent bash must preserve the sentinel directory');
     await assertParentArchive(project);
     assert.equal(await readFile(join(home, '.thin', 'config.json'), 'utf8'), plan.configText);
   };
@@ -826,37 +868,6 @@ function cancelCase() {
   return plan;
 }
 
-// Legacy compatibility: a saved preview switch (subagent.enabled:false) is
-// dropped, not honored; delegation still runs and the file is not rewritten.
-function legacySwitchCase() {
-  const plan = makePlan({
-    name: 'chat-legacy-switch-false', protocol: 'chat', childTask: CHILD_TASK, legacySwitch: {enabled: false},
-  });
-  plan.stages.root = [
-    {usage: {input: 40, output: 8},
-      reply: ctx => ctx.call('subagent', {task: CHILD_TASK, context: CHILD_CONTEXT})},
-    {usage: {input: 60, output: 10},
-      check: ctx => { plan.childId = startResult(ctx.history).id; },
-      reply: ctx => ctx.call('get_subagent_result', {id: plan.childId, wait: true})},
-    {usage: {input: 70, output: 12},
-      expectedCalls: ['subagent', 'get_subagent_result'],
-      check: ctx => { assertTerminal(plan, getResult(ctx.history)); },
-      reply: ctx => ctx.text(ROOT_ANSWER)},
-  ];
-  plan.stages.child = [
-    {expectedCalls: [], usage: {input: 150, output: 30}, reply: ctx => ctx.text(CHILD_REPORT)},
-  ];
-  plan.verify = async ({code, out, project, home}) => {
-    assert.equal(code, 0, 'legacy subagent.enabled:false must not break delegation');
-    assert(out.includes(ROOT_ANSWER), 'parent final answer missing');
-    assert.equal(plan.childRequests, 1, 'delegation must still start one child');
-    assert.equal(await readFile(join(home, '.thin', 'config.json'), 'utf8'), plan.configText,
-      'the dropped legacy switch was rewritten to disk');
-    assert(await exists(join(project, '.thin', 'sessions')), 'accepted session not recorded');
-  };
-  return plan;
-}
-
 // Foreign identities: an id this Service never issued must fail explicitly for
 // get/send/cancel and must not start or revive a child request. A previously
 // collected id may stay queryable from the App's bounded result cache, so it is
@@ -950,12 +961,12 @@ function childApprovalDenialCase() {
   ];
   plan.stages.child = [
     {expectedCalls: [], usage: {input: 120, output: 10},
-      reply: ctx => ctx.call(CHILD_BASH_NAME, {command: `rm -rf ${plan.project}/sentinel-dir`})},
+      reply: ctx => ctx.call(CHILD_BASH_NAME, {command: 'rm -f .ssh/fixture-marker'})},
     {expectedCalls: ['bash'], usage: {input: 200, output: 25},
       check: ctx => {
         const text = callText(ctx.history, CHILD_BASH_NAME);
         assert(text.includes('Dangerous bash command was not executed'), 'child dangerous command was not denied');
-        assert(text.includes('recursive delete'), 'risk classification detail missing');
+        assert(text.includes('delete of a sensitive path'), 'risk classification detail missing');
         plan.denialText = text;
       },
       reply: ctx => ctx.text(CHILD_REPORT)},
@@ -967,7 +978,7 @@ function childApprovalDenialCase() {
     assert.equal(plan.childRequests, 2, 'approval child request count');
     assert(err.includes('tool calls were denied by the host.'), 'print host denial notice missing');
     assert.equal(await readFile(plan.sentinelFile, 'utf8'), SENTINEL, 'sentinel content changed');
-    assert(await exists(join(plan.project, 'sentinel-dir')), 'denied child dangerous command executed');
+    assert.equal(await readFile(plan.approvalSentinel, 'utf8'), SENTINEL, 'denied child dangerous command executed');
   };
   return plan;
 }
@@ -1143,15 +1154,116 @@ function parallelCase() {
   return plan;
 }
 
+// Actual tool execution barrier: all four bash processes must reach the owned
+// server before any response is sent. Each worker writes its own file first.
+function toolParallelCase() {
+  const names = ['child-a', 'child-b', 'child-c'];
+  const participants = [...names, 'parent'];
+  const task = name => `${CHILD_TASK} tool-participant-${name}`;
+  const report = name => `tool-report-${name}`;
+  const plan = makePlan({name: 'chat-tool-parallel', protocol: 'chat', childTask: CHILD_TASK});
+  plan.toolBarrier = {expected: participants, arrived: new Set(), responses: [], done: false, timer: null};
+  plan.toolIds = [];
+  plan.toolCollected = new Set();
+  const usage = {input: 140, output: 18};
+  const childName = ctx => {
+    const matches = names.filter(name => userTexts('chat', ctx.body).some(text => text.includes(task(name))));
+    assert.equal(matches.length, 1, 'child must have exactly one owned participant task');
+    return matches[0];
+  };
+  const command = name => {
+    const target = `${new URL(url).origin}/tool-barrier/${name}`;
+    const code = `import urllib.request; r=urllib.request.urlopen("${target}",timeout=15); assert r.status == 200 and r.read() == b"barrier-open"; print("barrier-ok-${name}")`;
+    return `python3 -c '${code}'`;
+  };
+  const checkBash = (ctx, name) => {
+    const result = callJson(ctx.history, 'bash');
+    assert.equal(result.exit_code, 0, `${name} bash exit`);
+    assert.equal(result.stdout.trim(), `barrier-ok-${name}`, `${name} barrier response`);
+  };
+  plan.stages.root = [];
+  for (let index = 0; index < names.length; index++) {
+    plan.stages.root.push({usage, check: ctx => {
+      if (index > 0) plan.toolIds.push(startResult(ctx.history).id);
+    }, reply: ctx => ctx.call('subagent', {task: task(names[index])})});
+  }
+  plan.stages.root.push({usage, check: ctx => {
+    plan.toolIds.push(startResult(ctx.history).id);
+    assert.equal(new Set(plan.toolIds).size, 3, 'three distinct child IDs');
+    assert.equal(parallelCallArgs(ctx.history, 'get_subagent_result').length, 0, 'no child collected before parent write');
+  }, reply: ctx => ctx.call('write_file', {path: 'tool-parent.txt', content: 'file-parent'})});
+  plan.stages.root.push({usage, check: ctx => {
+    assert(!callText(ctx.history, 'write_file').includes('SubagentActive'), 'parent write blocked');
+    assert.equal(parallelCallArgs(ctx.history, 'get_subagent_result').length, 0, 'no child collected before parent bash');
+  }, reply: ctx => ctx.call('bash', {command: command('parent')})});
+  plan.stages.root.push({usage, check: ctx => {
+    checkBash(ctx, 'parent');
+    assert.deepEqual([...plan.toolBarrier.arrived].sort(), [...participants].sort(), 'all tool processes reached barrier before parent returned');
+  }, reply: ctx => ctx.call('get_subagent_result', {id: plan.toolIds[0], wait: true})});
+  for (let index = 0; index < names.length; index++) {
+    plan.stages.root.push({usage, check: ctx => {
+      const snap = getResult(ctx.history);
+      assert.equal(snap.id, plan.toolIds[index], 'collected child identity');
+      assert.equal(snap.status, 'success', 'child tool execution must succeed');
+      assert.equal(snap.report, report(names[index]), 'distinct child report');
+      assert.equal(snap.truncated, false);
+      assert.equal(snap.cleanup_failed, false);
+      assert.equal(snap.usage.normal_calls, 3);
+      assert.equal(snap.usage.summary_calls, 0);
+      assert.equal(snap.usage.normal.input_tokens, usage.input * 3);
+      assert.equal(snap.usage.normal.output_tokens, usage.output * 3);
+      assert(!plan.toolCollected.has(index));
+      plan.toolCollected.add(index);
+    }, reply: ctx => index === names.length - 1 ? ctx.text(ROOT_ANSWER) :
+      ctx.call('get_subagent_result', {id: plan.toolIds[index + 1], wait: true})});
+  }
+  plan.childStageByRound = [
+    {usage, expectedCalls: [], reply: ctx => {
+      const name = childName(ctx);
+      return ctx.call('write_file', {path: `tool-${name}.txt`, content: `file-${name}`});
+    }},
+    {usage, expectedCalls: ['write_file'], check: ctx => {
+      assert(!callText(ctx.history, 'write_file').includes('SubagentActive'), 'child write blocked');
+    }, reply: ctx => ctx.call('bash', {command: command(childName(ctx))})},
+    {usage, expectedCalls: ['write_file', 'bash'], check: ctx => checkBash(ctx, childName(ctx)),
+      reply: ctx => ctx.text(report(childName(ctx)))},
+  ];
+  // Exact aggregate model count remains separate from the four GET requests.
+  plan.stages.child = Array.from({length: 9}, (_, index) => plan.childStageByRound[index % 3]);
+  plan.verify = async ({code, out, project}) => {
+    assert.equal(code, 0, 'tool parallel root exit');
+    assert(out.includes(ROOT_ANSWER), 'root summary missing');
+    assert.equal(plan.roleRequests.root, 9, 'tool parallel root model POST count');
+    assert.equal(plan.roleRequests.child, 9, 'tool parallel child model POST count');
+    assert.equal(plan.requests, 18, 'tool parallel total model POST count');
+    assert.equal(plan.toolBarrier.arrived.size, 4, 'four distinct tool GETs');
+    assert.equal(plan.toolCollected.size, 3, 'all children collected');
+    for (const name of participants)
+      assert.equal(await readFile(join(project, `tool-${name}.txt`), 'utf8'), `file-${name}`, `${name} real write`);
+    await assertParentArchive(project);
+  };
+  return plan;
+}
+
 // ---------------------------------------------------------------------------
 
 function stop() {
+  releaseToolBarrier(active, false);
+  if (ownedProcess?.pid) { try { process.kill(-ownedProcess.pid, 'SIGKILL'); } catch {} }
   for (const socket of sockets) socket.destroy();
   if (!server.listening) return;
 }
 
-process.once('SIGINT', () => { stop(); process.exit(130); });
-process.once('SIGTERM', () => { stop(); process.exit(143); });
+async function interrupted(code) {
+  const child = ownedProcess;
+  stop();
+  if (child && child.exitCode === null && child.signalCode === null)
+    await new Promise(resolveValue => child.once('close', resolveValue));
+  if (server.listening) await new Promise(resolveValue => server.close(resolveValue));
+  process.exit(code);
+}
+process.once('SIGINT', () => { void interrupted(130); });
+process.once('SIGTERM', () => { void interrupted(143); });
 
 try {
   workspace = await mkdtemp(join(tmpdir(), 'thin-subagent-owned-'));
@@ -1159,11 +1271,12 @@ try {
   url = `http://127.0.0.1:${server.address().port}/v1`;
 
   const cases = [
-    qnaCase(), steeringCase(), cancelCase(), legacySwitchCase(), unknownIdCase(),
+    qnaCase(), steeringCase(), cancelCase(), unknownIdCase(),
     directCase('responses-subagent-direct', 'responses'),
     directCase('anthropic-subagent-direct', 'anthropic'),
     childApprovalDenialCase(),
     parallelCase(),
+    toolParallelCase(),
   ];
   const results = [];
   for (const plan of cases) {
@@ -1179,7 +1292,8 @@ try {
     fixedChildTools: CHILD_TOOLS,
     dynamicIdsFromStartResult: true,
     childQuestionAnsweredByParentSend: true,
-    parentWriteAndBashRefusedWhileChildUncollected: true,
+    parentWriteAndBashSucceedWhileChildUncollected: true,
+    concurrentToolBarrierParticipants: 4,
     steeringDeliveredWhileChildModelRequestInFlight: true,
     progressMessageSnapshot: true,
     cancelLeavesRootCompletedAndChildExited: true,
@@ -1187,7 +1301,6 @@ try {
     parallelChildrenHeldOnOneArrivalBarrier: true,
     parallelChildrenCollectedInNonStartOrder: PARALLEL_ORDER,
     parallelChildrenCollectedExactlyOnce: true,
-    legacySubagentEnabledFalseStillDelegates: true,
     foreignIdsRejectedForGetSendCancel: true,
     childFreshContext: true,
     childToolLoop: true,
@@ -1196,7 +1309,7 @@ try {
     parentOnlySessionArchive: true,
     memoryAutoOffNoAuxiliaryRequest: true,
   }, null, 2) + '\n');
-  console.log('PASS subagent owned loopback acceptance: 9 cases (Q&A, steering, cancel, legacy switch, foreign ids, 2 wires, child approval denial, 6-way same-root parallel)');
+  console.log('PASS subagent owned loopback acceptance: 9 cases (including 6-way model and 4-way tool barriers)');
 } catch (error) {
   // Assertion messages only; never dump headers, bodies or configuration.
   console.error(`Subagent owned loopback FAIL: ${error?.message ?? 'runner'}`);

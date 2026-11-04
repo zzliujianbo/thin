@@ -297,7 +297,11 @@ pub const Snapshot = struct {
 
 /// Session-management request. `id`, `cd` and `close` arguments are borrowed for
 /// the duration of `manage` only; the adapter must copy anything it retains.
+pub const SavedSession = @import("../core/session_metadata.zig").SavedSession;
+
 pub const Manage = union(enum) {
+    saved_sessions: void,
+    @"resume": []const u8,
     list: struct { running_only: bool = false, page: usize = 0 },
     cd: []const u8,
     attach: struct { id: []const u8, takeover: bool = false },
@@ -313,12 +317,14 @@ pub const Manage = union(enum) {
 pub const Outcome = struct {
     notice: ?[]u8 = null,
     listing: ?[]u8 = null,
+    saved_sessions: ?[]SavedSession = null,
     switched: bool = false,
     exit: bool = false,
 
     pub fn deinit(self: *Outcome, a: std.mem.Allocator) void {
         if (self.notice) |value| a.free(value);
         if (self.listing) |value| a.free(value);
+        if (self.saved_sessions) |value| a.free(value);
         self.* = undefined;
     }
 };

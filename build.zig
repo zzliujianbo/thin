@@ -184,7 +184,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-memory-app", "Run owned loopback automatic-memory CLI lifecycle acceptance").dependOn(&run_memory_app.step);
 
     // Foreground subagent acceptance: real in-process child Runtime over owned
-    // loopback Chat/Responses/Anthropic wires plus default-off and denial cases.
+    // loopback Chat/Responses/Anthropic wires plus denial cases.
     const run_subagent = fixture(b, "node", "tests/product/subagent_mock.mjs", &.{exe}, &.{});
     b.step("test-subagent", "Run owned-loopback interactive subagent Runtime acceptance").dependOn(&run_subagent.step);
 
@@ -202,6 +202,8 @@ pub fn build(b: *std.Build) void {
 
     const run_idle_enter = fixture(b, "python3", "tests/product/idle_enter_mock.py", &.{exe}, &.{});
     b.step("test-idle-enter", "Run owned idle prompt newline PTYs (requires Python 3)").dependOn(&run_idle_enter.step);
+    const run_resume_menu = fixture(b, "python3", "tests/product/resume_menu_mock.py", &.{exe}, &.{});
+    b.step("test-resume-menu", "Run owned saved-session menu and continuation PTYs").dependOn(&run_resume_menu.step);
 
     const run_memory_background = fixture(b, "python3", "tests/product/memory_background_mock.py", &.{exe}, &.{});
     b.step("test-memory-background", "Run owned PTY background Memory status and lifecycle acceptance").dependOn(&run_memory_background.step);
@@ -243,6 +245,7 @@ pub fn build(b: *std.Build) void {
 
     const interaction = b.step("test-interaction", "Run selected interaction PTY fixtures");
     interaction.dependOn(&run_idle_enter.step);
+    interaction.dependOn(&run_resume_menu.step);
     interaction.dependOn(&run_resize.step);
     interaction.dependOn(viewport_step);
     interaction.dependOn(&run_approval_cancel.step);
@@ -272,6 +275,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_proxy.step);
     test_all.dependOn(&run_app.step);
     test_all.dependOn(&run_idle_enter.step);
+    test_all.dependOn(&run_resume_menu.step);
     test_all.dependOn(&run_memory_background.step);
     test_all.dependOn(&run_resize.step);
     test_all.dependOn(viewport_step);

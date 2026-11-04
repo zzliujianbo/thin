@@ -217,10 +217,10 @@ try {
   await assertNoJobs(project);
   delete declaration.memory;
   await writeFile(config, JSON.stringify(declaration));
-  // A local legacy core is not automatic evidence and must not bypass the
+  // A local core is not automatic evidence and must not bypass the
   // known-key guard by being frozen into the initial primary prefix.
-  await mkdir(join(failureProject, '.thin/mem'), {recursive: true, mode: 0o700});
-  await writeFile(join(failureProject, '.thin/mem/core.md'), `Legacy private core ${KEY}`, {mode: 0o600});
+  await mkdir(join(failureProject, '.thin/memory'), {recursive: true, mode: 0o700});
+  await writeFile(join(failureProject, '.thin/memory/core.md'), `Private core ${KEY}`, {mode: 0o600});
   const failedPrompt = 'I prefer careful explanations of code changes.';
   await run(failureProject, failedPrompt, {bad: true});
   assert.deepEqual(requests, {primary: 4, helper: 3});

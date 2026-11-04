@@ -484,10 +484,6 @@ fn appendInt(buf: *std.ArrayList(u8), a: std.mem.Allocator, value: anytype) !voi
     try buf.appendSlice(a, text);
 }
 
-pub fn appendId(buf: *std.ArrayList(u8), a: std.mem.Allocator, id: ids.Id) !void {
-    try appendString(buf, a, &id);
-}
-
 // ---------------------------------------------------------------------------
 // Response assembly
 // ---------------------------------------------------------------------------
@@ -728,10 +724,6 @@ fn encodeFileStats(out: *Out, name: []const u8, value: ?line_stats.File) !void {
 /// Only display-safe fields cross the wire; ids/keys are display association
 /// only and never transport authority. No `permission.interrupt` pointer, no
 /// native replay and no raw provider configuration is ever serialized.
-pub fn appendEvent(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event) !void {
-    try appendEventWith(buf, a, event, null);
-}
-
 fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event, meta: ?EventMeta) !void {
     var out = Out{ .a = a, .buf = buf.* };
     // The builder appends into the caller's list; publish it on every exit.
@@ -1081,23 +1073,21 @@ pub fn encodeSubagentView(out: *Out, view: @import("../core/subagent_status.zig"
     try out.field("elapsed_ms", view.elapsed_ms);
     try out.field("latest_id", view.latest_id);
     try out.field("text", view.latestText());
-    if (view.individual_supported) {
-        if (view.page_offset) |offset| {
-            try out.field("page_offset", offset);
-            try out.field("page_total", view.page_total);
-        }
-        try out.beginArray("agents");
-        for (view.agents) |agent| {
-            try out.beginObjectElement();
-            try out.field("id", agent.id);
-            try out.field("revision", agent.revision);
-            try out.field("phase", @tagName(agent.phase));
-            try out.field("elapsed_ms", agent.elapsed_ms);
-            try out.field("text", agent.latestText());
-            try out.endObject();
-        }
-        try out.endArray();
+    if (view.page_offset) |offset| {
+        try out.field("page_offset", offset);
+        try out.field("page_total", view.page_total);
     }
+    try out.beginArray("agents");
+    for (view.agents) |agent| {
+        try out.beginObjectElement();
+        try out.field("id", agent.id);
+        try out.field("revision", agent.revision);
+        try out.field("phase", @tagName(agent.phase));
+        try out.field("elapsed_ms", agent.elapsed_ms);
+        try out.field("text", agent.latestText());
+        try out.endObject();
+    }
+    try out.endArray();
     try out.endObject();
 }
 
@@ -1537,12 +1527,6 @@ fn decodeDecisionDiagnostic(object: std.json.ObjectMap) !@import("../core/decisi
         value.transport_exit_code = std.math.cast(u8, code) orelse return error.BadRequest;
     }
     return value;
-}
-
-/// Compatibility wrapper for callers that already validated the frame; the
-/// decode path itself uses `decodeTerminalChecked` and rejects bad frames.
-pub fn decodeTerminal(object: std.json.ObjectMap) r.Terminal {
-    return decodeTerminalChecked(object) catch r.Terminal{ .status = .failed, .detail = error.RemoteFailure };
 }
 
 // ---------------------------------------------------------------------------

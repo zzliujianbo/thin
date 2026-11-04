@@ -14,8 +14,7 @@
 //! - Parent-side callbacks (run/get/send/cancel/beforeFinish/endTask) are
 //!   serialized by the parent Runtime and are the only writers of the Service
 //!   job list, parent permission ids and emitted approval events. The job list
-//!   is therefore never locked; only child mutations are serialized, through
-//!   the shared `subagent.MutationGate` handed to every child Tools.
+//!   is therefore never locked; child tool executions are independent.
 //! - Owned job state lives on App's stable allocator. Request/message/report
 //!   bytes are always copied, never borrowed from a child or tool arena.
 //!
@@ -143,7 +142,7 @@ const Aggregate = struct {
     first: ?*DisplayEntry = null,
     last: ?*DisplayEntry = null,
     read_cache: std.ArrayList(@import("../core/subagent_status.zig").AgentView) = .empty,
-    read_view: StatusView = .{ .individual_supported = true },
+    read_view: StatusView = .{},
     view: StatusView = .{},
     started_ms: i64 = 0,
     finished_ms: i64 = 0,
@@ -186,7 +185,6 @@ const Aggregate = struct {
             self.read_cache.appendAssumeCapacity(row);
         }
         var result = self.view;
-        result.individual_supported = true;
         result.agents = self.read_cache.items;
         if (result.group_id != 0) {
             const end = if (self.finished_ms != 0) self.finished_ms else now;
@@ -269,10 +267,6 @@ const Job = struct {
     /// is collected or the root ends, so `get`/`send`/`cancel` can address any
     /// of them by id.
     next: ?*Job = null,
-    /// Shared child-mutation gate owned by the Service. Only write_file/bash
-    /// execution inside a child Tools acquires it; model calls and reads stay
-    /// truly concurrent.
-    mutation_gate: ?*subagent.MutationGate = null,
     test_cleanup_failed: bool = false,
     test_encode_oom: bool = false,
 
@@ -422,9 +416,6 @@ pub const SubagentService = struct {
     next_id: u64 = 0,
     aggregate: Aggregate = .{},
     new_group: bool = true,
-    /// Shared by every child of this root so concurrent write_file/bash calls
-    /// are serialized while model calls and reads stay concurrent.
-    mutation_gate: subagent.MutationGate = .{},
     deinit_cancel: p.Cancellation = .{},
 
     pub fn view(self: *SubagentService) StatusView {
@@ -452,7 +443,7 @@ pub const SubagentService = struct {
         self.aggregate.clearEntries(self.deps.allocator);
         self.aggregate.read_cache.deinit(self.deps.allocator);
         self.aggregate.read_cache = .empty;
-        self.aggregate.read_view = .{ .individual_supported = true };
+        self.aggregate.read_view = .{};
     }
 
     pub fn service(self: *SubagentService) subagent.Service {
@@ -464,7 +455,6 @@ pub const SubagentService = struct {
             .get_fn = get,
             .send_fn = send,
             .cancel_fn = cancelCallback,
-            .active_fn = active,
             .before_finish_fn = beforeFinish,
             .end_task_fn = endTask,
         };
@@ -582,7 +572,6 @@ pub const SubagentService = struct {
             .root_cancel = root_cancel,
             .aggregate = &self.aggregate,
             .display_id = self.next_id,
-            .mutation_gate = &self.mutation_gate,
             .test_cleanup_failed = self.deps.test_cleanup_failed,
             .test_encode_oom = self.deps.test_encode_oom,
         };
@@ -886,11 +875,6 @@ pub const SubagentService = struct {
         const truncated = job.reportWasTruncated();
         self.collectJob(job, text, failed);
         return .{ .text = text, .is_error = failed, .truncated = truncated, .cleanup_failed = cleanup };
-    }
-
-    fn active(raw: *anyopaque) bool {
-        const self: *SubagentService = @ptrCast(@alignCast(raw));
-        return self.current != null;
     }
 
     /// Bounded host-state hint only: no reasoning, no Runtime re-entry. The
@@ -1551,11 +1535,6 @@ const ChildSession = struct {
             .auth_path = deps.auth_path,
             .image = if (self.image) |client| client.service() else null,
             .subagent = null,
-            // Shared per-root mutation gate: every child write_file/bash of this
-            // root serializes through it, while model calls and reads stay
-            // concurrent. The gate is borrowed from the Service, never owned by
-            // the child, and is not held across an approval or the job lifetime.
-            .subagent_mutation_gate = job.mutation_gate,
             .allow_memory = false,
             .parent_channel = .{ .context = self, .message_fn = parentMessage },
         };
@@ -1602,11 +1581,8 @@ const ChildSession = struct {
         self.job = null;
         self.cancel = .{};
         if (self.tools_ready) {
-            // Both borrows must be dropped before a retained owner outlives the
-            // job: the channel points at this session and the mutation gate at
-            // the Service, so neither may survive into retention.
+            // Drop the channel before a retained owner outlives its job.
             self.tools.parent_channel = null;
-            self.tools.subagent_mutation_gate = null;
         }
         var failed = self.test_cleanup_failed;
         if (self.decision) |client| {

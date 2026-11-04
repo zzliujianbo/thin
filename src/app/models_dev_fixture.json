@@ -10,6 +10,7 @@
       "claude-haiku-5-5": {
         "provider": { "npm": "@ai-sdk/anthropic" },
         "reasoning": true,
+        "reasoning_options": [{ "type": "toggle" }, { "type": "effort", "values": ["low", "high", "max"] }],
         "limit": { "context": 1000000, "output": 16384 },
         "cost": { "input": 0.1, "output": 0.5, "tiers": [{ "input": 0.5, "output": 2.5, "tier": { "type": "context", "size": 100000 } }] }
       }

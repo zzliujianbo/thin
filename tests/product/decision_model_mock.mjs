@@ -76,9 +76,9 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
             assert(keys.includes('ms_30000'));
             const probabilities = Object.fromEntries(keys.map(k=>[k,k === 'ms_30000' ? 0.97 : 0.03/(keys.length-1)]));
             res.writeHead(200,{'content-type':'application/json'});
-            res.end(JSON.stringify({answers:{ask:{type:'noul',noul:0.1},
-              timeout:{type:'choice',choice:'ms_30000',confidence:0.97,probabilities}},
-              usage:{input_tokens:321,output_tokens:12}}));
+            res.end(JSON.stringify({answers:{ask:{type:'noul',noul:0.1,metadata:'ignored'},
+              timeout:{type:'choice',choice:'ms_30000',confidence:0.97,probabilities,metadata:'ignored'},metadata:'ignored'},
+              usage:{input_tokens:321,output_tokens:12},metadata:'ignored'}));
             return;
           }
           assert.equal(body.stream,true);
@@ -111,7 +111,7 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
           assert(!('state' in body) && !('questions' in body));
           res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});
           const event = value => res.write(`data: ${JSON.stringify({id:'owned-review',object:'chat.completion.chunk',...value})}\n\n`);
-          event({choices:[{index:0,delta:{role:'assistant',content:'{"timeout_ms":1000,"ask":false}'},finish_reason:null}]});
+          event({choices:[{index:0,delta:{role:'assistant',content:'{"timeout_ms":1000,"ask":false,"reason":"safe"}'},finish_reason:null}]});
           event({choices:[{index:0,delta:{},finish_reason:'stop'}]});
           // include_usage emits its own final chunk before [DONE]; the generic
           // adapter must retain these auxiliary statistics, not chat accounting.

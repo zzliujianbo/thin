@@ -1,5 +1,5 @@
 //! Offline regressions for the in-process subagent seam: request/message
-//! validation, bounded reports, the root mutation gate, service wrappers, the
+//! validation, bounded reports, service wrappers, the
 //! ParentChannel, accepted-task hooks and the Runtime child-lifecycle contracts
 //! (stop reminder, context-not-user, 3-reminder pause, end-task ordering and
 //! cleanup domination). No network, App, UI or filesystem.
@@ -74,30 +74,6 @@ test "report bounding is utf8 aligned and explicit" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(bounded.text));
 }
 
-test "mutation gate owns exclusivity and cancellation never steals or frees it" {
-    const io = std.testing.io;
-    var gate: sub.MutationGate = .{};
-
-    // Uncontended acquire then release is visible in the shared flag.
-    var token: p.Cancellation = .{};
-    try gate.acquire(io, &token);
-    try std.testing.expect(gate.held.load(.acquire));
-    gate.release();
-    try std.testing.expect(!gate.held.load(.acquire));
-
-    // An already-canceled caller returns before taking the gate.
-    var canceled: p.Cancellation = .{ .requested = .init(true) };
-    try std.testing.expectError(error.Canceled, gate.acquire(io, &canceled));
-    try std.testing.expect(!gate.held.load(.acquire));
-
-    // A canceled waiter must not clear another owner's lock.
-    gate.held.store(true, .release);
-    try std.testing.expectError(error.Canceled, gate.acquire(io, &canceled));
-    try std.testing.expect(gate.held.load(.acquire));
-    gate.release();
-    try std.testing.expect(!gate.held.load(.acquire));
-}
-
 const FakeService = struct {
     begins: usize = 0,
     checks: usize = 0,
@@ -107,7 +83,6 @@ const FakeService = struct {
     cancels: usize = 0,
     before_calls: usize = 0,
     ends: usize = 0,
-    running: bool = false,
     fail_get_cleanup: bool = false,
     end_error: ?anyerror = null,
 
@@ -139,10 +114,6 @@ const FakeService = struct {
         self.cancels += 1;
         return .{ .text = try a.dupe(u8, request.id) };
     }
-    fn active(raw: *anyopaque) bool {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        return self.running;
-    }
     fn before(raw: *anyopaque, a: std.mem.Allocator, _: *const p.Cancellation) anyerror!?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.before_calls += 1;
@@ -163,7 +134,6 @@ const FakeService = struct {
             .get_fn = get,
             .send_fn = send,
             .cancel_fn = cancel,
-            .active_fn = active,
             .before_finish_fn = before,
             .end_task_fn = end,
         };
@@ -188,7 +158,6 @@ test "service wrappers are optional and cleanup outranks cancellation" {
     const bare = sub.Service{ .context = &fake, .run_fn = FakeService.run };
     bare.beginTask(&token);
     try bare.checkReady();
-    try std.testing.expect(!bare.active());
     try std.testing.expect((try bare.beforeFinish(std.testing.allocator, &token)) == null);
     try bare.endTask(&token);
     const bare_result = try bare.run(std.testing.allocator, .{ .task = "x" }, &token);
@@ -203,10 +172,6 @@ test "service wrappers are optional and cleanup outranks cancellation" {
     const full = fake.full();
     full.beginTask(&token);
     try full.checkReady();
-    fake.running = true;
-    try std.testing.expect(full.active());
-    fake.running = false;
-    try std.testing.expect(!full.active());
     const run_result = try full.run(std.testing.allocator, .{ .task = "x" }, &token);
     defer std.testing.allocator.free(run_result.text);
     const get_result = try full.get(std.testing.allocator, .{ .id = "j", .wait = false }, &token);

@@ -51,6 +51,7 @@ pub const Diagnostic = struct {
 
 pub const Service = struct {
     context: *anyopaque,
+    /// Host callbacks must return owned typed results conforming to the input semantics.
     decide_fn: *const fn (*anyopaque, std.mem.Allocator, Input, *const p.Cancellation) anyerror!Output,
     /// Optional pure lifecycle guard; must never launch work. Lets an owner
     /// expose sticky cleanup failure even for a pre-canceled call.
@@ -180,7 +181,7 @@ pub fn encodeInput(a: std.mem.Allocator, input: Input) ![]const u8 {
 }
 
 fn fields(value: std.json.Value, names: []const []const u8) !std.json.ObjectMap {
-    if (value != .object or value.object.count() != names.len) return error.InvalidDecisionOutput;
+    if (value != .object) return error.InvalidDecisionOutput;
     for (names) |name| if (!value.object.contains(name)) return error.InvalidDecisionOutput;
     return value.object;
 }
@@ -303,13 +304,12 @@ test "strict decisions command encoding and bounds" {
     const command: Input = .{ .command = .{ .command = "sleep 1", .max_timeout_ms = 1000 } };
     const out = try parseOutput(a, command, "{\"timeout_ms\":1000,\"ask\":true}");
     try t.expect(out.command.ask and out.command.timeout.milliseconds == 1000);
-    try t.expect((try parseOutput(a, command, "{\"timeout_ms\":null,\"ask\":false}")).command.timeout == .none);
+    try t.expect((try parseOutput(a, command, "{\"timeout_ms\":null,\"ask\":false,\"reason\":\"safe\"}")).command.timeout == .none);
     for ([_][]const u8{
-        "{\"timeout_ms\":0,\"ask\":false}",                "{\"timeout_ms\":1001,\"ask\":false}",
-        "{\"timeout_ms\":1.0,\"ask\":false}",              "{\"timeout_ms\":1,\"ask\":0}",
-        "{\"timeout_ms\":null,\"ask\":false,\"extra\":0}", "{\"timeout_ms\":null,\"ask\":false,\"ask\":true}",
-        "```json\n{}\n```",                                "{}",
-        "[]",
+        "{\"timeout_ms\":0,\"ask\":false}",                 "{\"timeout_ms\":1001,\"ask\":false}",
+        "{\"timeout_ms\":1.0,\"ask\":false}",               "{\"timeout_ms\":1,\"ask\":0}",
+        "{\"timeout_ms\":null,\"ask\":false,\"ask\":true}", "```json\n{}\n```",
+        "{}",                                               "[]",
     }) |bad| {
         if (parseOutput(a, command, bad)) |_| return error.ExpectedRejection else |_| {}
     }
@@ -324,7 +324,7 @@ test "refinement exact IDs owned strings all-or-nothing validation" {
     const t = std.testing;
     const a = t.allocator;
     const input: Input = .{ .refine_outputs = &.{ .{ .id = "a", .text = "original a" }, .{ .id = "b", .text = "original b" } } };
-    const output = try parseOutput(a, input, "{\"items\":[{\"id\":\"b\",\"text\":\"short b\"},{\"id\":\"a\",\"text\":\"短\"}]}");
+    const output = try parseOutput(a, input, "{\"items\":[{\"id\":\"b\",\"text\":\"short b\",\"extra\":0},{\"id\":\"a\",\"text\":\"短\"}],\"metadata\":true}");
     defer freeOutput(a, output);
     try t.expectEqualStrings("b", output.refine_outputs[0].id);
     try t.expectEqualStrings("短", output.refine_outputs[1].text);
@@ -334,7 +334,6 @@ test "refinement exact IDs owned strings all-or-nothing validation" {
         "{\"items\":[{\"id\":\"a\",\"text\":\"x\"},{\"id\":\"unknown\",\"text\":\"x\"}]}",
         "{\"items\":[{\"id\":\"a\",\"text\":\"\"},{\"id\":\"b\",\"text\":\"x\"}]}",
         "{\"items\":[{\"id\":\"a\",\"text\":\"much longer than original\"},{\"id\":\"b\",\"text\":\"x\"}]}",
-        "{\"items\":[{\"id\":\"a\",\"text\":\"x\",\"extra\":0},{\"id\":\"b\",\"text\":\"x\"}]}",
     }) |bad| {
         if (parseOutput(a, input, bad)) |unexpected| {
             freeOutput(a, unexpected);

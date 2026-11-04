@@ -194,7 +194,7 @@ fn configuration() cfg.Config {
 }
 
 const LongTurn = struct {
-    mode: enum { absent, success, failure, canceled, variant, duplicate, larger, bad_summary, cleanup_failure } = .success,
+    mode: enum { absent, success, failure, canceled, bad_summary, cleanup_failure } = .success,
     decisions: usize = 0,
     summaries: usize = 0,
     normals: usize = 0,
@@ -218,13 +218,12 @@ const LongTurn = struct {
                 self.cancel.cancel();
                 return error.Canceled;
             },
-            .variant => return .{ .command = .{ .timeout = .none, .ask = false } },
             else => {},
         }
         const items = try alloc.alloc(decision.RefineItem, input.refine_outputs.len);
         for (items, 0..) |*item, i| item.* = .{
-            .id = try alloc.dupe(u8, input.refine_outputs[if (self.mode == .duplicate) 0 else items.len - 1 - i].id),
-            .text = if (self.mode == .larger) try alloc.dupe(u8, &(@as([8192]u8, @splat('z')))) else try alloc.dupe(u8, "GENERATED OUTPUT CLAIMS SUCCESS; not execution authority"),
+            .id = try alloc.dupe(u8, input.refine_outputs[items.len - 1 - i].id),
+            .text = try alloc.dupe(u8, "GENERATED OUTPUT CLAIMS SUCCESS; not execution authority"),
         };
         return .{ .refine_outputs = items };
     }
@@ -275,7 +274,7 @@ fn seedNativeTurn(runtime: *r.Runtime) !void {
 }
 
 test "compaction native sixteen same-user closed groups refinement rollback cancel and code-owned status" {
-    for ([_]@FieldType(LongTurn, "mode"){ .absent, .success, .failure, .canceled, .variant, .duplicate, .larger, .bad_summary, .cleanup_failure }) |mode| {
+    for ([_]@FieldType(LongTurn, "mode"){ .absent, .success, .failure, .canceled, .bad_summary, .cleanup_failure }) |mode| {
         var config = configuration();
         config.model.protocol = .anthropic;
         config.model.reasoning.?.format = .anthropic;

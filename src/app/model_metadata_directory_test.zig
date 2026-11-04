@@ -127,7 +127,7 @@ test "flat price current evidence and independent generations preserve post-clai
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     try root.writeMode(m.file_name,
-        \\{"version":15,"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_present":true,"dev_input_price_threshold":200000,"dev_input_price_flat_limit":1000000}],"refresh":[{"generation":11},{"generation":12},{"generation":13},{},{"generation":14,"last_success_ms":800,"successful":false}]}
+        \\{"version":16,"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_present":true,"dev_input_price_threshold":200000,"dev_input_price_flat_limit":1000000}],"refresh":[{"generation":11},{"generation":12},{"generation":13},{},{"generation":14,"last_success_ms":800,"successful":false}]}
     , true, 0o600);
     const migrated = try m.load(&root);
     try t.expectEqual(@as(?u32, 1000000), migrated.directory.rows[0].dev_input_price_flat_limit);
@@ -238,7 +238,7 @@ test "price threshold current generation success manual refresh and stale isolat
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     const legacy =
-        \\{"version":15,"directory_mask":4,"models":[{"provider":"opencode_go","id":"claude-haiku-5-5","context_window":1000000,"output_tokens":8192,"dev_output_tokens":16384,"dev_input_price_threshold":123,"protocol":"anthropic","dev_protocol":"anthropic","available":true,"dev_present":true}],"refresh":[{"generation":11,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":12,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":13,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{},{"generation":14,"last_attempt_ms":900,"last_success_ms":900,"successful":true}]}
+        \\{"version":16,"directory_mask":4,"models":[{"provider":"opencode_go","id":"claude-haiku-5-5","context_window":1000000,"output_tokens":8192,"dev_output_tokens":16384,"dev_input_price_threshold":123,"protocol":"anthropic","dev_protocol":"anthropic","available":true,"dev_present":true}],"refresh":[{"generation":11,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":12,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":13,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{},{"generation":14,"last_attempt_ms":900,"last_success_ms":900,"successful":true}]}
     ;
     try root.writeMode(m.file_name, legacy, true, 0o600);
     const migrated = try m.load(&root);
@@ -286,7 +286,7 @@ test "price threshold current strict cache tokens and invalid publication rollba
             if (m.load(&root)) |_| return error.AcceptedInvalidThreshold else |_| {}
         }
     }
-    try root.writeMode(m.file_name, "{\"version\":15}", true, 0o600);
+    try root.writeMode(m.file_name, "{\"version\":16}", true, 0o600);
     const public = try priceListing(price_cost);
     const saved = try m.commitAt(&root, 0, public, 1000);
     var invalid = public;
@@ -355,17 +355,17 @@ test "publication current generation strict tokens exhaustion and durable timing
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     for ([_][]const u8{ "\"1\"", "1.0", "1e3", "-1", "9223372036854775808", "null" }) |token| {
-        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":15,\"refresh\":[{{\"generation\":{s}}},{{}},{{}},{{}},{{}}]}}", .{token});
+        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":16,\"refresh\":[{{\"generation\":{s}}},{{}},{{}},{{}},{{}}]}}", .{token});
         defer t.allocator.free(body);
         try root.writeMode(m.file_name, body, true, 0o600);
         if (m.load(&root)) |_| return error.AcceptedInvalidGeneration else |_| {}
     }
-    const exhausted = "{\"version\":15,\"refresh\":[{\"generation\":9223372036854775807},{},{},{},{}]}";
+    const exhausted = "{\"version\":16,\"refresh\":[{\"generation\":9223372036854775807},{},{},{},{}]}";
     try root.writeMode(m.file_name, exhausted, true, 0o600);
     const before = try m.load(&root);
     try t.expectError(error.MetadataGenerationExhausted, m.claimAt(&root, m.bit(.deepseek) | m.dev_bit, true, 1000, .{}));
     try t.expectEqualDeep(before, try m.load(&root));
-    try root.writeMode(m.file_name, "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":65536,\"available\":true}],\"refresh\":[{\"last_attempt_ms\":100,\"last_success_ms\":110,\"successful\":true},{},{},{},{}]}", true, 0o600);
+    try root.writeMode(m.file_name, "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":65536,\"available\":true}],\"refresh\":[{\"last_attempt_ms\":100,\"last_success_ms\":110,\"successful\":true},{},{},{},{}]}", true, 0o600);
     const claimed = try m.claimAt(&root, m.bit(.deepseek), true, 120, .{});
     try t.expectEqual(@as(u64, 1), claimed.generations[0]);
     try t.expectEqual(@as(?u64, 110), claimed.cache.refresh[0].last_success_ms);
@@ -429,12 +429,12 @@ test "refresh timing timestamps require bounded nonnegative integer JSON tokens"
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     for ([_][]const u8{ "\"123\"", "1.0", "1e3", "-1", "253402300800000" }) |token| {
-        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":15,\"refresh\":[{{\"last_attempt_ms\":{s}}},{{}},{{}},{{}},{{}}]}}", .{token});
+        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":16,\"refresh\":[{{\"last_attempt_ms\":{s}}},{{}},{{}},{{}},{{}}]}}", .{token});
         defer t.allocator.free(body);
         try root.writeMode(m.file_name, body, true, 0o600);
         if (m.load(&root)) |_| return error.AcceptedInvalidTimestamp else |_| {}
     }
-    try root.writeMode(m.file_name, "{\"version\":15,\"refresh\":[{\"last_attempt_ms\":0},{\"last_success_ms\":253402300799999},{},{},{}]}", true, 0o600);
+    try root.writeMode(m.file_name, "{\"version\":16,\"refresh\":[{\"last_attempt_ms\":0},{\"last_success_ms\":253402300799999},{},{},{}]}", true, 0o600);
     const valid = try m.load(&root);
     try t.expectEqual(@as(?u64, 0), valid.refresh[0].last_attempt_ms);
     try t.expectEqual(@as(?u64, m.max_timestamp_ms), valid.refresh[1].last_success_ms);
@@ -573,7 +573,7 @@ test "output cache current schema rejects unbounded values transactionally" {
     defer root.deinit();
     var buffer: [1024]u8 = undefined;
     for ([_][]const u8{ "0", "1048577", "4294967296", "1.5", "\"100\"", "-1" }) |value| {
-        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":15,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"output_tokens\":{s}}}]}}", .{value});
+        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":16,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"output_tokens\":{s}}}]}}", .{value});
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = body });
         const before = try root.dir.statFile(root.io, m.file_name, .{});
         if (m.commit(&root, 0, .{})) |_| return error.ExpectedInvalidCache else |_| {}
@@ -746,14 +746,14 @@ test "official row fields survive public-only directory publication" {
     defer root.deinit();
     // Cached declarations still require the only canonical wire spellings.
     for ([_][]const u8{
-        "{\"version\":15,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-level\",\"reasoning\":{\"map\":{\"high\":\"intensive\"}}}]}",
-        "{\"version\":15,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-off\",\"reasoning\":{\"map\":{\"off\":\"disabled\"}}}]}",
-        "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"bad-off\",\"reasoning\":{\"format\":\"deepseek\",\"map\":{\"off\":\"none\"}}}]}",
+        "{\"version\":16,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-level\",\"reasoning\":{\"map\":{\"high\":\"intensive\"}}}]}",
+        "{\"version\":16,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-off\",\"reasoning\":{\"map\":{\"off\":\"disabled\"}}}]}",
+        "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"bad-off\",\"reasoning\":{\"format\":\"deepseek\",\"map\":{\"off\":\"none\"}}}]}",
     }) |invalid| {
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = invalid });
         try t.expectError(error.InvalidMetadata, m.load(&root));
     }
-    const legacy = "{\"version\":15,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true,\"reasoning\":{\"map\":{\"high\":\"high\"}}}]}";
+    const legacy = "{\"version\":16,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true,\"reasoning\":{\"map\":{\"high\":\"high\"}}}]}";
     try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = legacy });
     var cache = try m.commit(&root, 0, try m.parseDev(t.allocator,
         \\{"opencode":{"npm":"@ai-sdk/openai","models":{"gpt-5.2":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
@@ -909,7 +909,7 @@ test "context public replaces preset fallback but preserves compatible official 
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
-    const legacy = "{\"version\":15,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true}]}";
+    const legacy = "{\"version\":16,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true}]}";
     try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = legacy });
     const public = try m.parseDev(t.allocator,
         \\{"opencode":{"npm":"@ai-sdk/openai","models":{"gpt-5.2":{"limit":{"context":262144}}}}}
@@ -940,7 +940,7 @@ test "context current invalid cache values and invalid commit roll back durable 
     defer root.deinit();
     var buffer: [1024]u8 = undefined;
     for ([_][]const u8{ "0", "16777217", "4294967296", "1.5", "1e5", "\"100\"", "-1", "true", "{}", "[]" }) |value| {
-        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":15,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"dev_context_tokens\":{s}}}]}}", .{value});
+        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":16,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"dev_context_tokens\":{s}}}]}}", .{value});
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = body });
         const before = try root.dir.statFile(root.io, m.file_name, .{});
         if (m.claim(&root, m.dev_bit, false)) |_| return error.ExpectedInvalidCache else |_| {}
@@ -950,7 +950,7 @@ test "context current invalid cache values and invalid commit roll back durable 
         defer t.allocator.free(after.data);
         try t.expectEqualStrings(body, after.data);
     }
-    try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = "{\"version\":15}" });
+    try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = "{\"version\":16}" });
     var listing = try m.parseDev(t.allocator,
         \\{"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"same":{"limit":{"context":65536,"output":4096}}}}}
     );
@@ -961,7 +961,7 @@ test "context current invalid cache values and invalid commit roll back durable 
     try t.expectEqualDeep(saved, try m.load(&root));
 }
 
-test "reasoning-only preset vote survives reload but cannot defeat an authoritative empty listing" {
+test "foreign profile cannot manufacture a preset across reload or empty listing" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
@@ -975,10 +975,9 @@ test "reasoning-only preset vote survives reload but cannot defeat an authoritat
     const empty = try m.parseListing(t.allocator, "{\"data\":[]}", .opencode_go);
     _ = try m.commitAt(&root, m.bit(.opencode_go), empty, 1100);
     const reloaded = try m.load(&root);
-    const row = reloaded.directory.rows[reloaded.directory.find(.opencode_go, "claude-haiku-5-5").?];
-    try t.expectEqualStrings("high", row.dev_reasoning.?.declaration().map.high.?);
+    try t.expect(reloaded.directory.find(.opencode_go, "claude-haiku-5-5") == null);
     try t.expect(m.hasDirectory(&reloaded, .opencode_go));
-    try t.expect(row.available != true);
+    try t.expect(m.entryDeclaration(&reloaded, entry) == null);
     try t.expect(m.dynamicEntry(&reloaded, .opencode_go, "claude-haiku-5-5") == null);
     try t.expect(m.contextFor(&reloaded, entry) == null);
     try t.expect(m.outputFor(&reloaded, entry) == null);

@@ -13,7 +13,7 @@ const native = 'native-wire-marker-not-conversation';
 const exists = p => access(p).then(() => true, () => false);
 
 // 未提交的 idle 启动只允许 Lease.create 的私有命名空间与固定 inode owner anchor
-// (sessions/<32hex>.resume-lock = 33 字节 'A'|'C'+32 个零)；checkpoint、
+// (sessions/<32hex>.resume-lock 为空文件)；checkpoint、
 // .session/.jsonl、其他文件或 symlink 仍失败。.thin 来自 mkdirat(0o700)，只要求
 // 无 group/other 位（umask 只会更严），不硬猜精确 mode。
 async function noSubmissionState(project) {
@@ -33,10 +33,7 @@ async function noSubmissionState(project) {
     assert.equal(entry.mode & 0o777, 0o600, `${name}: mode`);
     if (name === '.gitignore') { assert.equal(await readFile(path,'utf8'), '*\n'); continue; }
     assert.match(name, /^[a-f0-9]{32}\.resume-lock$/, `${name}: unexpected project state`);
-    const marker = await readFile(path);
-    assert.equal(marker.length, 33, `${name}: marker length`);
-    assert(marker[0] === 0x41 || marker[0] === 0x43, `${name}: marker`);
-    assert(marker.subarray(1).every(byte => byte === 0), `${name}: marker padding`);
+    assert.equal((await readFile(path)).length, 0, `${name}: lock length`);
   }
   // 一次前台启动只持有一个 Root session lease；多个需实际 producer 证据。
   assert(entries.filter(name => name.endsWith('.resume-lock')).length <= 1, 'more than one worker anchor');
@@ -207,7 +204,7 @@ async function scenario(app, pty, kind) {
       assert(result.stdout.includes('.thin/sessions/*.jsonl') && !result.stdout.includes('.thin/logs'), 'session path missing from help');
     }
     if (['help','version','idle','no-log'].includes(kind)) {
-      // idle 启动由 PTY 驱动持有 Lease root anchor（33 字节 zero-digest resume-lock）；
+      // idle 启动由 PTY 驱动持有 Lease root anchor（空 resume-lock）；
       // help/version/no-log 仍必须完全没有 sessions 目录。
       if (kind === 'idle') await noSubmissionState(project);
       else {

@@ -67,16 +67,17 @@ function response(body, scenario) {
       const keys = Object.keys(question.criteria);
       const probability = uncertain ? 0.7 : 0.97;
       const probabilities = Object.fromEntries(keys.map(k => [k, k === choice ? probability : (1 - probability) / (keys.length - 1)]));
-      answers[id] = { type: 'choice', choice, confidence: uncertain ? 0.7 : 0.97, probabilities };
+      answers[id] = { type: 'choice', choice, confidence: uncertain ? 0.7 : 0.97, probabilities, metadata: 'ignored' };
     } else {
       let score = 0.1;
       if (id === 'ask') score = scenario === 'command-none' ? 0.15 : 0.6;
       if (id === 'retain_0') score = 0.35;
       if (id === 'retain_1') score = 0.36;
-      answers[id] = { type: 'noul', noul: score };
+      answers[id] = { type: 'noul', noul: score, metadata: 'ignored' };
     }
   }
-  return { answers, usage: { input_tokens: 37, output_tokens: 4 } };
+  answers.metadata = 'ignored';
+  return { answers, usage: { input_tokens: 37, output_tokens: 4 }, metadata: 'ignored' };
 }
 try {
   watchdog = setTimeout(() => { console.error('SystemOne owned fixture watchdog expired'); interrupt(); }, 120000);

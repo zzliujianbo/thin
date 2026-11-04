@@ -36,7 +36,7 @@ const server = createServer(async (req, res) => {
     assert.equal(call.function.name, 'bash');
     assert.equal(messages[i - 1].role, 'user');
     assert(messages[i - 1].content.startsWith('  !'), 'local command preserves original user input');
-    assert.equal(JSON.parse(call.function.arguments).command, "printf 'OUT\\n'; printf 'ERR\\n' >&2; touch marker; rm -rf absent; exit 7");
+    assert.equal(JSON.parse(call.function.arguments).command, "printf 'OUT\\n'; printf 'ERR\\n' >&2; touch marker; rm -f .ssh/fixture-marker; exit 7");
     const result = messages[i + 1];
     assert.equal(result.role, 'tool'); assert.equal(result.tool_call_id, call.id);
     const value = JSON.parse(result.content);

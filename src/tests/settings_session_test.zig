@@ -456,7 +456,8 @@ test "anchored auth protects original credentials after HOME and project path re
     var cancel: p.Cancellation = .{};
     for ([_][]const u8{ ".thin/config.json", ".thin//./config.json", app.auth_path }) |path| {
         const arguments = try std.fmt.allocPrint(arena.allocator(), "{{\"path\":\"{s}\"}}", .{path});
-        try std.testing.expectError(error.ProtectedAuthFile, executor.prepare_fn(executor.context, arena.allocator(), .{ .id = "owned-auth-guard", .name = "read_file", .arguments = arguments }));
+        const prepared = try executor.prepare_fn(executor.context, arena.allocator(), .{ .id = "owned-auth-guard", .name = "read_file", .arguments = arguments });
+        try std.testing.expectError(error.ProtectedAuthFile, executor.execute_fn(executor.context, arena.allocator(), prepared, &cancel));
         try std.testing.expectError(error.ProtectedAuthFile, app.executor.execute(arena.allocator(), .{ .read_file = .{ .path = path } }, &cancel));
         try std.testing.expectError(error.ProtectedAuthFile, app.executor.execute(arena.allocator(), .{ .write_file = .{ .path = path, .content = "not written", .overwrite = true } }, &cancel));
     }

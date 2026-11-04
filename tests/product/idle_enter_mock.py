@@ -672,8 +672,7 @@ def first_entry(app, origin, width, auto, response='normal'):
                     assert path.read_bytes() == b'*\n', 'gitignore-content'
                 else:
                     assert re.fullmatch(r'[a-f0-9]{32}\.resume-lock', path.name), 'session-file-name'
-                    marker = path.read_bytes()
-                    assert len(marker) == 33 and marker[:1] in (b'A', b'C') and marker[1:] == bytes(32), 'lock-content'
+                    assert path.read_bytes() == b'', 'lock-content'
                     locks += 1
             assert locks <= 1, 'lock-count'
 

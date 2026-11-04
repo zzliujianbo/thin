@@ -143,7 +143,7 @@ test "automatic Memory excludes errored canceled truncated cleanup and sensitive
         .{ .text = "error detail", .is_error = true },
         .{ .text = "partial cancellation", .canceled = true },
         .{ .text = "fragment", .truncated = true },
-        .{ .text = "Authorization: Bearer hidden" },
+        .{ .text = "-----BEGIN PRIVATE KEY-----" },
     }) |output| {
         var fake = Fake{ .tool = true, .output = output };
         var config = configValue();
@@ -391,6 +391,8 @@ test "automatic Memory expected version requires same topic category Related and
     try std.testing.expectError(error.InvalidMemoryVersion, k.validateCandidate(material, candidate));
     candidate.expected_version = null;
     candidate.content = "Authorization: Bearer credential";
+    try k.validateCandidate(material, candidate);
+    candidate.content = "-----BEGIN PRIVATE KEY-----";
     try std.testing.expectError(error.InvalidMemoryCandidate, k.validateCandidate(material, candidate));
     candidate.content = "safe fact";
     material.related = &.{};

@@ -73,60 +73,16 @@ pub fn validateCandidate(material: Material, candidate: Candidate) !void {
     if (candidate.expires_at_ms) |end| if (end <= material.created_ms) return error.InvalidMemoryCandidate;
 }
 
-/// Screen obvious credentials; the coordinator also rejects known secrets.
+/// Only explicit PEM private-key headers are recognized here. The coordinator
+/// separately filters exact host-known credentials.
 pub fn sensitiveMaterial(text: []const u8) bool {
-    if (std.ascii.findIgnoreCase(text, "-----BEGIN ") != null and std.ascii.findIgnoreCase(text, "PRIVATE KEY-----") != null) return true;
-    for ([_][]const u8{ "password", "api_key", "api-key", "access_token", "refresh_token", "client_secret", "token", "authorization" }) |key| {
-        var start: usize = 0;
-        while (std.ascii.findIgnoreCase(text[start..], key)) |relative| {
-            const pos = start + relative;
-            var i = pos + key.len;
-            if ((pos > 0 and keyChar(text[pos - 1])) or (i < text.len and keyChar(text[i]))) {
-                start = i;
-                continue;
-            }
-            while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\"' or text[i] == '\'')) : (i += 1) {}
-            if (i < text.len and (text[i] == '=' or text[i] == ':')) {
-                i += 1;
-                while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\"' or text[i] == '\'')) : (i += 1) {}
-                if (i < text.len and text[i] != '\n' and text[i] != ',' and text[i] != '}') {
-                    var end = i;
-                    while (end < text.len and keyChar(text[end])) : (end += 1) {}
-                    var schema_type = false;
-                    for ([_][]const u8{ "string", "integer", "number", "boolean", "null", "optional", "required", "str", "int", "bool" }) |name| {
-                        if (std.ascii.eqlIgnoreCase(text[i..end], name) and (end == text.len or std.ascii.isWhitespace(text[end]) or text[end] == ',' or text[end] == '}' or text[end] == '"' or text[end] == '\'')) {
-                            schema_type = true;
-                            break;
-                        }
-                    }
-                    if (!schema_type) return true;
-                }
-            }
-            start = pos + key.len;
-        }
-    }
-    for ([_][]const u8{ "sk-", "ghp_", "github_pat_", "bearer " }) |prefix| {
-        var start: usize = 0;
-        while (std.ascii.findIgnoreCase(text[start..], prefix)) |relative| {
-            const pos = start + relative;
-            var i = pos + prefix.len;
-            if (std.mem.eql(u8, prefix, "bearer ")) {
-                if (pos == 0 or !keyChar(text[pos - 1])) {
-                    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) : (i += 1) {}
-                    if (i < text.len and (keyChar(text[i]) or text[i] == '.' or text[i] == '~' or text[i] == '+' or text[i] == '/' or text[i] == '=')) return true;
-                }
-            } else {
-                while (i < text.len and keyChar(text[i])) : (i += 1) {}
-                if (i - (pos + prefix.len) >= 20) return true;
-            }
-            start = pos + prefix.len;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.ascii.findIgnoreCase(line, "-----BEGIN ")) |start| {
+            if (std.ascii.findIgnoreCase(line[start + "-----BEGIN ".len ..], "PRIVATE KEY-----") != null) return true;
         }
     }
     return false;
-}
-
-fn keyChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
 }
 
 test "service filters borrowed candidates without mutation" {
@@ -150,28 +106,35 @@ test "service filters borrowed candidates without mutation" {
     const material: Material = .{ .id = "test", .generation = 0, .created_ms = 1, .sources = &.{} };
     var cancel: p.Cancellation = .{};
     const items = try service.extract(arena.allocator(), material, &cancel);
-    try std.testing.expectEqual(@as(usize, 1), items.len);
-    try std.testing.expectEqualStrings("config", items[0].topic);
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expectEqualStrings("sk-abcdefghijklmnopqrstuvwxyz", items[0].topic);
+    try std.testing.expectEqualStrings("bearer-secret", items[1].topic);
+    try std.testing.expectEqualStrings("config", items[2].topic);
+    try std.testing.expectEqualStrings("secret", items[3].topic);
     var capture: Capture = .{ .allocator = arena.allocator() };
     capture.add(.user, "Bearer abc.def");
     capture.add(.user, "ordinary source");
-    try std.testing.expectEqual(@as(usize, 1), capture.sources.items.len);
-    try std.testing.expectEqualStrings("ordinary source", capture.sources.items[0].text);
-    try std.testing.expectEqual(@as(usize, 1), capture.omitted_sources);
-    try std.testing.expect(sensitiveMaterial("Bearer abc.def"));
-    try std.testing.expect(sensitiveMaterial("Bearer  secret"));
-    try std.testing.expect(!sensitiveMaterial("auth_scheme: Bearer"));
-    try std.testing.expect(!sensitiveMaterial("Bearer "));
-    try std.testing.expect(!sensitiveMaterial("notbearer abc.def"));
-    try std.testing.expect(!sensitiveMaterial("Use .env and api_key when configuring /.thin/"));
-    try std.testing.expect(sensitiveMaterial("password=secret"));
-    try std.testing.expect(sensitiveMaterial("ghp_abcdefghijklmnopqrstuvwxyz"));
-    try std.testing.expect(!sensitiveMaterial("token: integer, api_key: string, access_token: boolean, client_secret: optional"));
-    try std.testing.expect(!sensitiveMaterial("max_token=4096 and custom_api_key=value"));
-    try std.testing.expect(sensitiveMaterial("token=actualvalue"));
-    try std.testing.expect(sensitiveMaterial("api_key: actualvalue"));
-    try std.testing.expect(sensitiveMaterial("sk-abcdefghijklmnopqrstuvwxyz"));
+    try std.testing.expectEqual(@as(usize, 2), capture.sources.items.len);
+    try std.testing.expectEqualStrings("Bearer abc.def", capture.sources.items[0].text);
+    try std.testing.expectEqualStrings("ordinary source", capture.sources.items[1].text);
+    try std.testing.expectEqual(@as(usize, 0), capture.omitted_sources);
+    for ([_][]const u8{
+        "Use Bearer authentication for HTTP requests",
+        "token = nextToken()",
+        "password: minimum 8 characters",
+        "Use .env and api_key when configuring /.thin/",
+        "Bearer abc.def",
+        "ghp_abcdefghijklmnopqrstuvwxyz",
+        "sk-abcdefghijklmnopqrstuvwxyz",
+    }) |text| {
+        try std.testing.expect(!sensitiveMaterial(text));
+        try validateCandidate(material, .{ .category = .project, .topic = "ordinary", .content = text });
+        capture.add(.user, text);
+    }
+    try std.testing.expectEqual(@as(usize, 9), capture.sources.items.len);
     try std.testing.expect(sensitiveMaterial("-----BEGIN PRIVATE KEY-----"));
+    try std.testing.expect(sensitiveMaterial("-----BEGIN RSA PRIVATE KEY-----"));
+    try std.testing.expect(!sensitiveMaterial("-----BEGIN CERTIFICATE-----\nPRIVATE KEY-----"));
 }
 
 pub const Capture = struct {

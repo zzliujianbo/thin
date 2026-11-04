@@ -42,10 +42,7 @@ async function noSessionRecords(project) {
     assert.equal(entry.mode & 0o777, 0o600);
     if (name === '.gitignore') { assert.equal(await readFile(path, 'utf8'), '*\n'); continue; }
     assert.match(name, /^[a-f0-9]{32}\.resume-lock$/);
-    const marker = await readFile(path);
-    assert.equal(marker.length, 33);
-    assert(marker[0] === 0x41 || marker[0] === 0x43);
-    assert(marker.subarray(1).every(byte => byte === 0));
+    assert.equal((await readFile(path)).length, 0);
   }
 }
 

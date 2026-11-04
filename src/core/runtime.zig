@@ -65,39 +65,6 @@ pub const Prepared = struct {
     command_timeout: ?decision.Timeout = null,
 };
 
-/// Validate even injected/fake callbacks before publishing any policy. The
-/// auxiliary parser is not a trust boundary for Runtime's embedding API.
-fn validateDecisionOutput(input: decision.Input, output: decision.Output) !void {
-    switch (input) {
-        .command => |command| {
-            if (output != .command) return error.InvalidDecision;
-            switch (output.command.timeout) {
-                .none => {},
-                .milliseconds => |ms| if (ms == 0 or ms > command.max_timeout_ms) return error.InvalidDecision,
-            }
-        },
-        .refine_outputs => |items| {
-            if (output != .refine_outputs or items.len == 0 or items.len > 8 or output.refine_outputs.len != items.len)
-                return error.InvalidDecision;
-            var bytes: usize = 0;
-            for (output.refine_outputs, 0..) |item, i| {
-                if (item.text.len == 0 or item.text.len > 8192 or !std.unicode.utf8ValidateSlice(item.text) or !std.unicode.utf8ValidateSlice(item.id)) return error.InvalidDecision;
-                bytes +|= item.text.len +| item.id.len;
-                if (bytes > 65536) return error.InvalidDecision;
-                for (output.refine_outputs[0..i]) |previous|
-                    if (std.mem.eql(u8, previous.id, item.id)) return error.InvalidDecision;
-                var found = false;
-                for (items) |original| {
-                    if (!std.mem.eql(u8, original.id, item.id)) continue;
-                    if (item.text.len > original.text.len) return error.InvalidDecision;
-                    found = true;
-                }
-                if (!found) return error.InvalidDecision;
-            }
-        },
-    }
-}
-
 /// 工具执行器接口（上下文指针 + 函数指针），由宿主注入；Runtime 不关心具体工具。
 pub const Executor = struct {
     /// 执行器的上下文指针，由宿主保证在 run 期间有效。
@@ -1040,10 +1007,6 @@ pub const Runtime = struct {
     /// A byte-for-byte snapshot match is not enough after compaction: the live
     /// messages must still contain that preface.
     applied_policy: ?AppliedPolicy = null,
-    /// Set by the session observer when a clean checkpoint cannot be marked
-    /// dirty. The following tool must not run, or resume could replay a clean
-    /// generation over side effects that were never recorded.
-    tool_blocked: bool = false,
 
     /// 创建 Runtime：校验配置，并把启动时的 Memory 快照以 JSON 字符串嵌入系统提示词。
     pub fn init(a: std.mem.Allocator, io: Io, config: *const cfg.Config, model: p.Model, executor: Executor, host: Host, startup_memory: []const u8) !Runtime {
@@ -1355,15 +1318,11 @@ pub const Runtime = struct {
     /// 向宿主发送事件。宿主报错时：若已取消返回 Canceled，否则视为宿主断开。
     fn emit(self: *Runtime, event: Event, cancel: *const p.Cancellation) !void {
         // 先观察，再交给可能背压/断开的显示宿主；诊断不依赖 UI 队列被消费。
-        // A failed dirty mark is recorded by the observer before any host-visible
-        // tool_started, and it must stop the tool from running.
-        if (event == .tool_started) self.tool_blocked = false;
         const measured = event == .assistant_committed or event == .finished;
         if (event == .assistant_committed) self.diagnostics.emit(.{ .stage = .assistant_commit });
         var observer_span = diagnostics.Span.start(if (measured) self.diagnostics else .{}, self.io, .{ .stage = .observer });
         self.observer.notify(.{ .event = event });
         observer_span.finish(.ok);
-        if (event == .tool_started and self.tool_blocked) return error.CheckpointDirtyFailed;
         var host_span = diagnostics.Span.start(if (measured) self.diagnostics else .{}, self.io, .{ .stage = .host_emit });
         self.host.emit_fn(self.host.context, event, cancel) catch {
             const err: anyerror = if (cancel.isRequested()) error.Canceled else error.HostDisconnected;
@@ -2482,7 +2441,6 @@ pub const Runtime = struct {
             return; // Quality failure: whole original scratch remains available.
         };
         try checkCanceled(cancel);
-        validateDecisionOutput(input, output) catch return;
         var replacements: [8][]const p.Block = undefined;
         for (items[0..count], 0..) |item, i| {
             var summary: []const u8 = undefined;
@@ -2652,12 +2610,6 @@ pub const Runtime = struct {
                 };
                 try checkCanceled(cancel);
                 if (kind == .normal and self.reserveSteering()) break :calls;
-                validateDecisionOutput(input, output) catch |err| {
-                    var diagnostic: decision.Diagnostic = .{ .stage = .validate, .operation = input };
-                    diagnostic.setError(err);
-                    task.terminal.decision_failure = diagnostic;
-                    return error.DecisionUnavailable;
-                };
                 switch (input) {
                     .command => {
                         prepared.command_timeout = output.command.timeout;

@@ -1258,7 +1258,17 @@ fn approvalCancel(d: *Driver) !void {
     std.debug.print("APPROVAL_CANCEL_GATE=verified\n", .{});
 }
 
-fn localCommand(d: *Driver, mode: []const u8) !void {
+extern "c" fn mkdir([*:0]const u8, c_uint) c_int;
+const approval_marker_content = "owned approval sentinel\n";
+
+fn checkApprovalMarker(init: std.process.Init, project: []const u8) !void {
+    const a = init.arena.allocator();
+    const path = try std.fmt.allocPrint(a, "{s}/.ssh/fixture-marker", .{project});
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(approval_marker_content.len + 1));
+    try check(std.mem.eql(u8, bytes, approval_marker_content));
+}
+
+fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: []const u8) !void {
     // Do not materialize another large Screen on this history driver's stack.
     errdefer std.debug.print("command PTY tail: {s}\n", .{d.output[d.used -| 3000..d.used]});
     try d.waitIdle(0);
@@ -1268,10 +1278,16 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
     const timeout = std.mem.eql(u8, mode, "settings-command-timeout");
     const stable = std.mem.eql(u8, mode, "settings-command-stable");
     try check(accept or deny or cancel or timeout or stable);
+    const a = init.arena.allocator();
+    const dir = try std.fmt.allocPrintSentinel(a, "{s}/.ssh", .{project}, 0);
+    if (mkdir(dir, 0o700) != 0) try check(c._errno().* == 17); // EEXIST
+    const marker = try std.fmt.allocPrint(a, "{s}/fixture-marker", .{dir});
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = marker, .data = approval_marker_content });
+    try checkApprovalMarker(init, project);
     if (stable) {
         var source: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer source.deinit();
-        try source.writer.writeAll("  !rm -rf absent; touch stable-executed; #");
+        try source.writer.writeAll("  !rm -f .ssh/fixture-marker; touch stable-executed; #");
         for (0..125) |i| try source.writer.print(" synthetic-step-{d}: 中文注释 abcdefghijklmnopqrstuvwxyz", .{i});
         try source.writer.writeByte('\r');
         const submitted = d.used;
@@ -1301,6 +1317,7 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         const denied = d.used;
         try d.send("\r");
         try d.waitIdle(denied);
+        try checkApprovalMarker(init, project);
         return;
     }
     // Empty command, bracketed paste and submit batch tail must not execute.
@@ -1315,9 +1332,9 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         try d.send("\x15");
         try d.quiet(100);
     }
-    // Ordinary CLI tools need no approval. A recursive deletion of an
-    // absent owned relative target deliberately exercises mandatory approval.
-    const command = if (accept) "printf 'OUT\\n'; printf 'ERR\\n' >&2; touch marker; rm -rf absent; exit 7" else if (deny) "rm -rf absent; touch denied" else "rm -rf absent; sleep 30 & echo $! > child; touch started; wait";
+    // The rm operation targets the owned relative sentinel and deliberately
+    // exercises mandatory approval.
+    const command = if (accept) "printf 'OUT\\n'; printf 'ERR\\n' >&2; touch marker; rm -f .ssh/fixture-marker; exit 7" else if (deny) "rm -f .ssh/fixture-marker; touch denied" else "rm -f .ssh/fixture-marker; sleep 30 & echo $! > child; touch started; wait";
     var line: [256]u8 = undefined;
     const start = d.used;
     // Prefix whitespace follows the same dispatch semantics as the composer.
@@ -1368,8 +1385,9 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
         try d.waitIdle(normal);
     }
     if (deny) {
+        try checkApprovalMarker(init, project);
         const batch = d.used;
-        try d.send("!rm -rf absent; touch batch-first\r!touch batch-tail\r");
+        try d.send("!rm -f .ssh/fixture-marker; touch batch-first\r!touch batch-tail\r");
         try d.waitFrame(batch, "Approval #");
         const title = "Approval #";
         const number_start = batch + (std.mem.lastIndexOf(u8, d.output[batch..d.used], title) orelse return error.AcceptanceFailed) + title.len;
@@ -1396,6 +1414,7 @@ fn localCommand(d: *Driver, mode: []const u8) !void {
             for (settled.grid) |row| std.debug.print("denial row: {s}\n", .{std.mem.trimEnd(u8, &row, " ")});
         }
         try check(!settled.visible(title));
+        try checkApprovalMarker(init, project);
     }
 }
 
@@ -2675,7 +2694,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     } else if (std.mem.eql(u8, mode, "settings-approval-cancel")) {
         try approvalCancel(&d);
     } else if (std.mem.startsWith(u8, mode, "settings-command-")) {
-        try localCommand(&d, mode);
+        try localCommand(&d, mode, init, project);
     } else if (std.mem.startsWith(u8, mode, "settings-global")) {
         // Handle before the historical thinking-level settings-* dispatcher.
         // No prompt, model selection, refresh or inference is submitted here.

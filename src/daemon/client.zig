@@ -251,7 +251,7 @@ fn decodeSubagentView(a: std.mem.Allocator, value: std.json.Value) !@import("../
         .object => |v| v,
         else => return error.ProtocolError,
     };
-    if (obj.count() != 12 and obj.count() != 13 and obj.count() != 15) return error.ProtocolError;
+    if (obj.count() != 13 and obj.count() != 15) return error.ProtocolError;
     const read = struct {
         fn uint(map: std.json.ObjectMap, key: []const u8) !u64 {
             return valueU64(map.get(key) orelse return error.ProtocolError) orelse error.ProtocolError;
@@ -285,7 +285,8 @@ fn decodeSubagentView(a: std.mem.Allocator, value: std.json.Value) !@import("../
     if (total != view.total or (view.group_id == 0 and (total != 0 or view.revision != 0 or view.latest_id != 0 or view.elapsed_ms != 0 or text.len != 0)) or (view.group_id != 0 and (total == 0 or view.latest_id == 0))) return error.ProtocolError;
     view.text_len = @intCast(text.len);
     @memcpy(view.text_buf[0..text.len], text);
-    if (obj.get("agents")) |value_agents| {
+    {
+        const value_agents = obj.get("agents") orelse return error.ProtocolError;
         const items = switch (value_agents) {
             .array => |array| array.items,
             else => return error.ProtocolError,
@@ -340,14 +341,17 @@ fn decodeSubagentView(a: std.mem.Allocator, value: std.json.Value) !@import("../
             for (counts, expected) |count, max| if (count > max) return error.ProtocolError;
         }
         view.agents = rows;
-        view.individual_supported = true;
-    } else if (obj.count() != 12) return error.ProtocolError;
+    }
     return view;
 }
 
 test "grouped subagent progress snapshot encoder decoder roundtrip" {
     const a = std.testing.allocator;
-    var expected: @import("../core/subagent_status.zig").View = .{ .group_id = 42, .revision = 3, .total = 4, .running = 1, .waiting = 1, .completed = 1, .failed = 1, .elapsed_ms = 99, .latest_id = 7 };
+    const rows = [_]@import("../core/subagent_status.zig").AgentView{
+        .{ .id = 1, .phase = .running },   .{ .id = 2, .phase = .waiting },
+        .{ .id = 3, .phase = .completed }, .{ .id = 7, .phase = .failed },
+    };
+    var expected: @import("../core/subagent_status.zig").View = .{ .group_id = 42, .revision = 3, .total = 4, .running = 1, .waiting = 1, .completed = 1, .failed = 1, .elapsed_ms = 99, .latest_id = 7, .agents = &rows };
     const text = "working 中文";
     expected.text_len = text.len;
     @memcpy(expected.text_buf[0..text.len], text);
@@ -358,9 +362,10 @@ test "grouped subagent progress snapshot encoder decoder roundtrip" {
     const bytes = try out.finish();
     defer a.free(bytes);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
-    const decoded = try decodeSubagentView(a, parsed.value.object.get("snapshot").?.object.get("subagents").?);
+    var decoded = try decodeSubagentView(a, parsed.value.object.get("snapshot").?.object.get("subagents").?);
     parsed.deinit();
-    try std.testing.expect(std.meta.eql(expected, decoded));
+    defer decoded.deinitOwned(a);
+    try std.testing.expect(@import("../core/subagent_status.zig").View.eql(expected, decoded));
 
     var old = protocol.Out.init(a);
     defer old.deinit();
@@ -385,7 +390,7 @@ test "per-agent status rows survive wire document and owned clone" {
         row.text_len = @intCast(text.len);
         @memcpy(row.text_buf[0..text.len], text);
     }
-    const original: @import("../core/subagent_status.zig").View = .{ .agents = &rows, .individual_supported = true, .group_id = 1, .revision = 4, .total = 4, .running = 1, .waiting = 1, .completed = 1, .failed = 1, .latest_id = 4 };
+    const original: @import("../core/subagent_status.zig").View = .{ .agents = &rows, .group_id = 1, .revision = 4, .total = 4, .running = 1, .waiting = 1, .completed = 1, .failed = 1, .latest_id = 4 };
     var out = protocol.Out.init(a);
     defer out.deinit();
     try out.ok(1);
@@ -405,7 +410,7 @@ test "per-agent status rows survive wire document and owned clone" {
     try std.testing.expectEqual(@import("../core/subagent_status.zig").Phase.waiting, projection.agents[1].phase);
 }
 
-test "per-agent status rows reject malformed wire and preserve legacy" {
+test "per-agent status rows reject malformed wire and missing agents" {
     const a = std.testing.allocator;
     const prefix = "{\"group_id\":1,\"revision\":2,\"total\":2,\"running\":1,\"waiting\":1,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":3,\"latest_id\":9,\"text\":\"working\"";
     const suffixes = [_][]const u8{
@@ -426,19 +431,18 @@ test "per-agent status rows reject malformed wire and preserve legacy" {
     defer a.free(legacy);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, legacy, .{});
     defer parsed.deinit();
-    var view = try decodeSubagentView(a, parsed.value);
-    defer view.deinitOwned(a);
-    try std.testing.expect(!view.individual_supported);
+    try std.testing.expectError(error.ProtocolError, decodeSubagentView(a, parsed.value));
 }
 
 test "grouped subagent progress decoder owns text and rejects malformed counts" {
     const a = std.testing.allocator;
-    const bytes = "{\"group_id\":1,\"revision\":2,\"total\":2,\"running\":1,\"waiting\":1,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":3,\"latest_id\":9,\"text\":\"working\"}";
+    const bytes = "{\"group_id\":1,\"revision\":2,\"total\":2,\"running\":1,\"waiting\":1,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":3,\"latest_id\":9,\"text\":\"working\",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":1,\"text\":\"x\"},{\"id\":9,\"revision\":1,\"phase\":\"waiting\",\"elapsed_ms\":2,\"text\":\"y\"}]}";
     const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
-    const view = try decodeSubagentView(a, parsed.value);
+    var view = try decodeSubagentView(a, parsed.value);
     parsed.deinit();
+    defer view.deinitOwned(a);
     try std.testing.expectEqualStrings("working", view.latestText());
-    const invalid = "{\"group_id\":1,\"revision\":2,\"total\":1,\"running\":1,\"waiting\":1,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":3,\"latest_id\":9,\"text\":\"working\"}";
+    const invalid = "{\"group_id\":1,\"revision\":2,\"total\":1,\"running\":1,\"waiting\":1,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":3,\"latest_id\":9,\"text\":\"working\",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":1,\"text\":\"x\"}]}";
     const bad = try std.json.parseFromSlice(std.json.Value, a, invalid, .{});
     defer bad.deinit();
     try std.testing.expectError(error.ProtocolError, decodeSubagentView(a, bad.value));
@@ -470,7 +474,7 @@ fn decodeMemoryView(value: std.json.Value) !memory_status.View {
     result.last_terminal = switch (obj.get("last_terminal") orelse return error.ProtocolError) {
         .null => null,
         .object => |terminal| blk: {
-            if (terminal.count() < 3 or terminal.count() > 5) return error.ProtocolError;
+            if (terminal.count() != 5) return error.ProtocolError;
             const outcome = switch (terminal.get("result") orelse return error.ProtocolError) {
                 .string => |s| std.meta.stringToEnum(memory_status.Result, s) orelse return error.ProtocolError,
                 else => return error.ProtocolError,
@@ -480,22 +484,15 @@ fn decodeMemoryView(value: std.json.Value) !memory_status.View {
                 .string => |s| std.meta.stringToEnum(memory_status.Failure, s) orelse return error.ProtocolError,
                 else => return error.ProtocolError,
             };
-            const saved_count: u32 = if (terminal.get("saved_count")) |count_value|
-                std.math.cast(u32, valueU64(count_value) orelse return error.ProtocolError) orelse return error.ProtocolError
-            else
-                0;
+            const saved_count = std.math.cast(u32, valueU64(terminal.get("saved_count") orelse return error.ProtocolError) orelse return error.ProtocolError) orelse return error.ProtocolError;
             var summary: memory_status.Summary = .{};
-            if (terminal.get("summary")) |summary_value| {
-                const text = switch (summary_value) {
-                    .string => |s| s,
-                    else => return error.ProtocolError,
-                };
-                if (text.len > summary.buf.len or !std.unicode.utf8ValidateSlice(text)) return error.ProtocolError;
-                summary.append(text);
-                if (!std.mem.eql(u8, summary.text(), text)) return error.ProtocolError;
-            }
-            const known_count: usize = 3 + @as(usize, @intFromBool(terminal.contains("saved_count"))) + @as(usize, @intFromBool(terminal.contains("summary")));
-            if (terminal.count() != known_count) return error.ProtocolError;
+            const text = switch (terminal.get("summary") orelse return error.ProtocolError) {
+                .string => |s| s,
+                else => return error.ProtocolError,
+            };
+            if (text.len > summary.buf.len or !std.unicode.utf8ValidateSlice(text)) return error.ProtocolError;
+            summary.append(text);
+            if (!std.mem.eql(u8, summary.text(), text)) return error.ProtocolError;
             break :blk .{ .id = valueU64(terminal.get("id") orelse return error.ProtocolError) orelse return error.ProtocolError, .result = outcome, .failure = failure, .saved_count = saved_count, .summary = summary };
         },
         else => return error.ProtocolError,
@@ -503,7 +500,7 @@ fn decodeMemoryView(value: std.json.Value) !memory_status.View {
     return result;
 }
 
-test "memory summary wire roundtrip legacy and strict bounds" {
+test "memory summary wire roundtrip and strict bounds" {
     const a = std.testing.allocator;
     var view: memory_status.View = .{ .enabled = true, .last_terminal = .{ .id = 4, .result = .saved, .saved_count = 2 } };
     view.last_terminal.?.summary.append("中文\n记忆");
@@ -518,9 +515,11 @@ test "memory summary wire roundtrip legacy and strict bounds" {
     const decoded = try decodeMemoryView(doc.value.object.get("memory").?);
     try std.testing.expect(std.meta.eql(view, decoded));
     const invalid = [_][]const u8{
-        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"summary\":42}}",
-        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":4294967296}}",
-        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"summary\":\"bad\\u001b\"}}",
+        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":42}}",
+        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"summary\":\"\"}}",
+        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0}}",
+        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":4294967296,\"summary\":\"\"}}",
+        "{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"bad\\u001b\"}}",
     };
     for (invalid) |text| {
         var parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
@@ -528,7 +527,7 @@ test "memory summary wire roundtrip legacy and strict bounds" {
         try std.testing.expectError(error.ProtocolError, decodeMemoryView(parsed.value));
     }
     const long: [257]u8 = @splat('x');
-    const oversized = try std.fmt.allocPrint(a, "{{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{{\"id\":1,\"result\":\"saved\",\"failure\":null,\"summary\":\"{s}\"}}}}", .{&long});
+    const oversized = try std.fmt.allocPrint(a, "{{\"enabled\":true,\"revision\":0,\"queued_count\":0,\"active\":null,\"last_terminal\":{{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"{s}\"}}}}", .{&long});
     defer a.free(oversized);
     var large = try std.json.parseFromSlice(std.json.Value, a, oversized, .{});
     defer large.deinit();
@@ -537,7 +536,7 @@ test "memory summary wire roundtrip legacy and strict bounds" {
 
 test "memory view decoder rejects malformed fields" {
     const a = std.testing.allocator;
-    const valid = "{\"enabled\":true,\"revision\":2,\"queued_count\":1,\"active\":{\"id\":7,\"phase\":\"saving\"},\"last_terminal\":{\"id\":6,\"result\":\"failed\",\"failure\":\"storage\"}}";
+    const valid = "{\"enabled\":true,\"revision\":2,\"queued_count\":1,\"active\":{\"id\":7,\"phase\":\"saving\"},\"last_terminal\":{\"id\":6,\"result\":\"failed\",\"failure\":\"storage\",\"saved_count\":0,\"summary\":\"\"}}";
     var doc = try std.json.parseFromSlice(std.json.Value, a, valid, .{});
     defer doc.deinit();
     const view = try decodeMemoryView(doc.value);
@@ -1346,7 +1345,7 @@ pub const Client = struct {
         cache.memory = try decodeMemoryView(object.get("memory") orelse return error.ProtocolError);
         if (object.get("subagents")) |value| {
             cache.subagents = try decodeSubagentView(self.a, value);
-            if (cache.subagents.page_offset != null and self.cache.subagents.individual_supported and self.cache.subagents.group_id == cache.subagents.group_id) {
+            if (cache.subagents.page_offset != null and self.cache.subagents_supported and self.cache.subagents.group_id == cache.subagents.group_id) {
                 const previous = self.cache.subagents;
                 const page = cache.subagents;
                 const Agent = @import("../core/subagent_status.zig").AgentView;
@@ -2559,6 +2558,8 @@ pub const Client = struct {
     fn manageFn(context: *anyopaque, a: std.mem.Allocator, options: session_client.Manage) anyerror!session_client.Outcome {
         const self = fromContext(context);
         return switch (options) {
+            .saved_sessions => self.manageSavedSessions(a),
+            .@"resume" => |id| self.manageResume(a, id),
             .list => |args| self.manageList(a, args.running_only, args.page),
             .cd => |path| self.manageCd(path),
             .attach => |args| self.manageAttach(args.id, args.takeover),
@@ -2566,6 +2567,22 @@ pub const Client = struct {
             .exit => .{ .exit = true },
             .close => |args| self.manageClose(args.id, args.force),
         };
+    }
+
+    fn manageSavedSessions(self: *Client, a: std.mem.Allocator) !session_client.Outcome {
+        var root = try fs.Root.open(a, self.io, self.launcher);
+        defer root.deinit();
+        return .{ .saved_sessions = try resume_store.list(&root, a) };
+    }
+
+    fn manageResume(self: *Client, a: std.mem.Allocator, text: []const u8) !session_client.Outcome {
+        if (text.len != 32) return error.SessionNotFound;
+        const id: ids.Id = text[0..32].*;
+        if (!ids.valid(id)) return error.SessionNotFound;
+        if (self.conn != null) if (self.session) |current| {
+            if (std.mem.eql(u8, &current, &id)) return .{ .notice = try a.dupe(u8, "Already attached") };
+        };
+        return self.resumeSession(a, self.launcher, id);
     }
 
     fn manageList(self: *Client, a: std.mem.Allocator, running_only: bool, page: usize) !session_client.Outcome {
@@ -2659,7 +2676,7 @@ pub const Client = struct {
             // No index entry: only this launcher project's own checkpoint may
             // locate the history. A missing one keeps the current view as is.
             if (!hasCheckpoint(self.a, self.io, self.launcher, id)) return error.SessionNotFound;
-            return self.resumeSession(self.launcher, id);
+            return self.resumeSession(self.a, self.launcher, id);
         }
         var found = record.?;
         defer registry.freeRecord(self.a, &found);
@@ -2680,13 +2697,17 @@ pub const Client = struct {
         if (!hasCheckpoint(self.a, self.io, found.project, id)) return error.SessionNotFound;
         const project = try self.a.dupe(u8, found.project);
         defer self.a.free(project);
-        return self.resumeSession(project, id);
+        return self.resumeSession(self.a, project, id);
     }
 
     /// Restore one history into a brand-new worker without submitting anything.
     /// The `.resume-lock` inside that project stays the final authority: a busy
     /// lease refuses the resume and leaves the current view untouched.
-    fn resumeSession(self: *Client, project: []const u8, id: ids.Id) !session_client.Outcome {
+    fn resumeSession(self: *Client, result_allocator: std.mem.Allocator, project: []const u8, id: ids.Id) !session_client.Outcome {
+        // Reserve the caller-owned result before starting or joining anything:
+        // an allocation failure must never follow a successful view switch.
+        const notice = try result_allocator.dupe(u8, "Restored session history");
+        errdefer result_allocator.free(notice);
         if (self.worksFromDaemon()) {
             var req = try self.controlRequest(.create);
             defer req.deinit();
@@ -2701,7 +2722,7 @@ pub const Client = struct {
             const session: ids.Id = raw[0..32].*;
             if (!ids.valid(session) or !std.mem.eql(u8, &session, &id)) return error.ProtocolError;
             try self.joinWorker(endpoint, id, false);
-            return .{ .switched = true, .notice = try self.a.dupe(u8, "Restored session history") };
+            return .{ .switched = true, .notice = notice };
         }
         // Local mode keeps the same ownership rule as `--resume`: this launcher
         // owns the restored worker and publishes its locator.
@@ -2712,7 +2733,7 @@ pub const Client = struct {
             }
             return err;
         };
-        return .{ .switched = true, .notice = try self.a.dupe(u8, "Restored session history") };
+        return .{ .switched = true, .notice = notice };
     }
 
     fn manageAttach(self: *Client, id_text: []const u8, takeover: bool) !session_client.Outcome {
@@ -4591,7 +4612,7 @@ test "grouped subagent progress updates state without dirtying settings" {
     baseline.deinit();
     client.dirty = false;
 
-    try pair.reply(3, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":1,\"total\":2,\"running\":2,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":10,\"latest_id\":1,\"text\":\"working\"}}");
+    try pair.reply(3, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":1,\"total\":2,\"running\":2,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":10,\"latest_id\":1,\"text\":\"working\",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":10,\"text\":\"working\"},{\"id\":2,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":10,\"text\":\"working\"}]}}");
     var first = try client.readResponse(3, quick_timeout_ms);
     try client.adoptSnapshot(&first);
     first.deinit();
@@ -4601,7 +4622,7 @@ test "grouped subagent progress updates state without dirtying settings" {
     try testing.expect(Client.currentFn(@ptrCast(client)).subagents_supported);
     try testing.expectEqual(@as(u32, 2), client.cache.subagents.running);
 
-    try pair.reply(4, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":2,\"total\":2,\"running\":1,\"waiting\":0,\"completed\":1,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":250,\"latest_id\":1,\"text\":\"working\"}}");
+    try pair.reply(4, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":2,\"total\":2,\"running\":1,\"waiting\":0,\"completed\":1,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":250,\"latest_id\":1,\"text\":\"working\",\"agents\":[{\"id\":1,\"revision\":2,\"phase\":\"completed\",\"elapsed_ms\":250,\"text\":\"working\"},{\"id\":2,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":250,\"text\":\"working\"}]}}");
     var next = try client.readResponse(4, quick_timeout_ms);
     try client.adoptSnapshot(&next);
     next.deinit();
@@ -4610,7 +4631,7 @@ test "grouped subagent progress updates state without dirtying settings" {
     try testing.expect(!client.dirty);
     try testing.expectEqual(@as(u32, 1), client.cache.subagents.completed);
     try testing.expectEqual(@as(u64, 250), client.cache.subagents.elapsed_ms);
-    try testing.expect(std.meta.eql(client.cache.subagents, state.subagents));
+    try testing.expect(@import("../core/subagent_status.zig").View.eql(client.cache.subagents, state.subagents));
     try testing.expectEqualStrings("m1", state.model);
 }
 
@@ -4638,7 +4659,7 @@ test "per-agent status rows merge bounded wire pages by id and revision" {
                 .owner = .daemon,
                 .epoch = 5,
                 .subagents_supported = true,
-                .subagents = .{ .group_id = group, .revision = 1, .total = all.len, .running = all.len, .latest_id = if (all.len == 0) 0 else all.len, .individual_supported = true, .page_offset = start, .page_total = all.len, .agents = all[start..end] },
+                .subagents = .{ .group_id = group, .revision = 1, .total = all.len, .running = all.len, .latest_id = if (all.len == 0) 0 else all.len, .page_offset = start, .page_total = all.len, .agents = all[start..end] },
             });
             const bytes = try out.finish();
             defer fixture_allocator.free(bytes);
@@ -4692,7 +4713,7 @@ test "per-agent status rows projection survives cache replacement" {
     second.deinit();
     client.rebuild();
     try testing.expect(!client.dirty);
-    try testing.expect(client.cache.subagents.individual_supported);
+    try testing.expect(client.cache.subagents_supported);
     try testing.expectEqualStrings("first", projection.state.subagents.agents[0].latestText());
     try testing.expectEqualStrings("first", projection.snapshot.subagents.agents[0].latestText());
 }
@@ -4707,7 +4728,7 @@ test "per-agent status rows retain published arenas across repeated allocation f
         row.* = .{ .id = @intCast(i + 1), .revision = 1, .phase = .running, .text_len = 3 };
         @memcpy(row.text_buf[0..3], "old");
     }
-    client.cache.subagents = .{ .group_id = 1, .individual_supported = true, .agents = rows };
+    client.cache.subagents = .{ .group_id = 1, .agents = rows };
     client.rebuild();
     const published_slot = client.arena_index;
     const published_revision = client.publication_revision;
@@ -4785,7 +4806,7 @@ test "Memory closeout nonzero view survives response and client projection lifet
         var pair = try pairOf(testing.allocator);
         defer pair.deinit();
         const client = pair.client;
-        try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":false,\"phase\":\"calling_model\",\"task\":0,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"previews\":[],\"memory\":{\"enabled\":true,\"revision\":18446744073709551614,\"active\":{\"id\":9007199254740993,\"phase\":\"extracting\"},\"queued_count\":3,\"last_terminal\":{\"id\":9007199254740992,\"result\":\"failed\",\"failure\":\"storage\"}}}");
+        try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":false,\"phase\":\"calling_model\",\"task\":0,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"previews\":[],\"memory\":{\"enabled\":true,\"revision\":18446744073709551614,\"active\":{\"id\":9007199254740993,\"phase\":\"extracting\"},\"queued_count\":3,\"last_terminal\":{\"id\":9007199254740992,\"result\":\"failed\",\"failure\":\"storage\",\"saved_count\":0,\"summary\":\"\"}}}");
         var response = try client.readResponse(1, quick_timeout_ms);
         client.adoptSnapshot(&response) catch |err| {
             response.deinit();
@@ -4810,7 +4831,7 @@ test "Memory closeout nonzero view survives response and client projection lifet
         errdefer projection.deinit();
         try testing.expect(std.meta.eql(expected, projection.state.memory));
         try testing.expect(std.meta.eql(expected, projection.snapshot.memory));
-        try pair.reply(2, "\"snapshot\":{\"busy\":false,\"phase\":\"calling_model\",\"task_kind\":\"prompt\",\"epoch\":5,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"memory\":{\"enabled\":true,\"revision\":7,\"active\":{\"id\":8,\"phase\":\"saving\"},\"queued_count\":1,\"last_terminal\":{\"id\":6,\"result\":\"saved\",\"failure\":null}}}");
+        try pair.reply(2, "\"snapshot\":{\"busy\":false,\"phase\":\"calling_model\",\"task_kind\":\"prompt\",\"epoch\":5,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"memory\":{\"enabled\":true,\"revision\":7,\"active\":{\"id\":8,\"phase\":\"saving\"},\"queued_count\":1,\"last_terminal\":{\"id\":6,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}}}");
         var updated = try client.readResponse(2, quick_timeout_ms);
         client.adoptSnapshot(&updated) catch |err| {
             updated.deinit();
@@ -5908,6 +5929,61 @@ test "a real takeover (owner reports epoch 0) returns to the launcher without to
     if (try pair.server.readFrame(.{ .io = std.testing.io, .timeout_ms = 100 })) |extra| {
         defer a.free(extra);
         return error.TestUnexpectedResult;
+    }
+}
+
+test "resuming the attached session is a no-op with a caller-owned notice" {
+    const a = testing.allocator;
+    const session_id: ids.Id = "0123456789abcdef0123456789abcdef".*;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+    client.session = session_id;
+    const revision = client.publication_revision;
+    var caller = testing.FailingAllocator.init(a, .{});
+    {
+        var outcome = try Client.manageFn(@ptrCast(client), caller.allocator(), .{ .@"resume" = &session_id });
+        defer outcome.deinit(caller.allocator());
+        try testing.expectEqualStrings("Already attached", outcome.notice.?);
+        try testing.expect(!outcome.switched);
+        try testing.expectEqual(@as(usize, 1), caller.allocations);
+        try testing.expectEqual(@as(usize, "Already attached".len), caller.allocated_bytes);
+    }
+    try testing.expectEqual(caller.allocated_bytes, caller.freed_bytes);
+    try testing.expect(client.conn != null);
+    try testing.expectEqualDeep(@as(?ids.Id, session_id), client.session);
+    try testing.expectEqual(@as(u64, 5), client.epoch);
+    try testing.expectEqual(revision, client.publication_revision);
+    try testing.expect(client.workers == null and client.reg == null and client.control == null);
+    try expectNoFrame(&pair);
+}
+
+test "resume notice allocation failure precedes local restore and daemon create" {
+    const a = testing.allocator;
+    const current_id: ids.Id = "fedcbafedcbafedcbafedcbafedcbafe".*;
+    const requested_id: ids.Id = "0123456789abcdef0123456789abcdef".*;
+    for ([_]bool{ false, true }) |daemon| {
+        var pair = if (daemon) try connectClientWithControl(a) else try pairOf(a);
+        defer pair.deinit();
+        const client = pair.client;
+        if (!daemon) client.session = current_id;
+        const session = client.session;
+        const epoch = client.epoch;
+        const revision = client.publication_revision;
+        // A regression may reach the stub control socket, but must never
+        // start a process or wait for a real daemon/API response.
+        if (daemon) try pair.replyError(1, "busy");
+        var caller = testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        try testing.expectError(error.OutOfMemory, Client.manageFn(@ptrCast(client), caller.allocator(), .{ .@"resume" = &requested_id }));
+        try testing.expect(caller.has_induced_failure);
+        try testing.expectEqual(caller.allocated_bytes, caller.freed_bytes);
+        try testing.expectEqualDeep(session, client.session);
+        try testing.expectEqual(epoch, client.epoch);
+        try testing.expectEqual(revision, client.publication_revision);
+        try testing.expectEqual(!daemon, client.conn != null);
+        try testing.expectEqual(daemon, client.control != null);
+        try testing.expect(client.workers == null and client.reg == null);
+        try expectNoFrame(&pair);
     }
 }
 

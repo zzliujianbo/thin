@@ -862,13 +862,6 @@ pub fn connect(allocator: std.mem.Allocator, path: []const u8, expected_uid: u32
     return Connection.init(allocator, fd, peer);
 }
 
-/// Convenience: join the directory and connect, trusting only `dir.uid`.
-pub fn connectDirectory(allocator: std.mem.Allocator, dir: *const Directory, name: []const u8, wait: Wait) !Connection {
-    const path = try dir.join(allocator, name);
-    defer allocator.free(path);
-    return connect(allocator, path, dir.uid, wait);
-}
-
 // ---------------------------------------------------------------------------
 // bounded length-prefixed frames
 // ---------------------------------------------------------------------------

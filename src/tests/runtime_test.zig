@@ -403,20 +403,14 @@ test "decision command allow clears classifier ask forces approval and timeout i
     };
 }
 
-test "decision failure invalid fake variant timeout and cancellation stop without continuation and pair calls" {
-    for (0..6) |mode| {
+test "decision failure and cancellation stop without continuation and pair calls" {
+    for (0..3) |mode| {
         var cancel: p.Cancellation = .{};
         var fake: Fake = .{
             .calls_per_response = 2,
             .decision_input = .{ .command = .{ .command = "fixture", .max_timeout_ms = 1000 } },
-            .decision_failure = if (mode == 0) error.FixtureUnavailable else if (mode == 5) error.CleanupFailed else null,
-            .decision_output = switch (mode) {
-                1 => .{ .refine_outputs = &.{} },
-                2 => .{ .command = .{ .timeout = .{ .milliseconds = 0 }, .ask = false } },
-                3 => .{ .command = .{ .timeout = .{ .milliseconds = 1001 }, .ask = false } },
-                else => .{ .command = .{ .timeout = .none, .ask = false } },
-            },
-            .decision_cancel = if (mode == 4) &cancel else null,
+            .decision_failure = if (mode == 0) error.FixtureUnavailable else if (mode == 2) error.CleanupFailed else null,
+            .decision_cancel = if (mode == 1) &cancel else null,
         };
         var config = configuration();
         var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
@@ -424,14 +418,14 @@ test "decision failure invalid fake variant timeout and cancellation stop withou
         runtime.decision_service = fake.service();
         fake.current_runtime = &runtime;
         const result = try runtime.run("command batch", &cancel);
-        try std.testing.expectEqual(if (mode == 5) r.Status.failed else if (mode == 4) r.Status.canceled else r.Status.paused, result.status);
-        try std.testing.expectEqual(if (mode == 5) error.CleanupFailed else if (mode == 4) error.Canceled else error.DecisionUnavailable, result.detail.?);
-        try std.testing.expectEqual(mode == 5, runtime.poisoned);
-        if (mode < 4) {
+        try std.testing.expectEqual(if (mode == 2) r.Status.failed else if (mode == 1) r.Status.canceled else r.Status.paused, result.status);
+        try std.testing.expectEqual(if (mode == 2) error.CleanupFailed else if (mode == 1) error.Canceled else error.DecisionUnavailable, result.detail.?);
+        try std.testing.expectEqual(mode == 2, runtime.poisoned);
+        if (mode == 0) {
             const diagnostic = result.decision_failure.?;
             try std.testing.expectEqual(auxiliary.Diagnostic.Operation.command, diagnostic.operation);
-            try std.testing.expectEqual(if (mode == 0) auxiliary.Diagnostic.Stage.review else .validate, diagnostic.stage);
-            if (mode == 0) try std.testing.expectEqualStrings("FixtureUnavailable", diagnostic.causeName());
+            try std.testing.expectEqual(auxiliary.Diagnostic.Stage.review, diagnostic.stage);
+            try std.testing.expectEqualStrings("FixtureUnavailable", diagnostic.causeName());
             try std.testing.expect(diagnostic.http_status == null and result.http_status == null);
         } else try std.testing.expect(result.decision_failure == null);
         try std.testing.expectEqual(@as(u32, 1), fake.normal_calls);
@@ -1084,29 +1078,6 @@ test "Runtime round pause after compaction retains the remapped explicit goal" {
     try std.testing.expectEqual(p.Role.context, runtime.messages()[0].role);
     fake.stop_after = 0;
     try std.testing.expectEqual(r.Status.success, (try runtime.run("short", &cancel)).status);
-}
-
-fn blockDirtyMark(ctx: ?*anyopaque, observation: r.Observation) void {
-    const runtime: *r.Runtime = @ptrCast(@alignCast(ctx.?));
-    if (observation == .event and observation.event == .tool_started) runtime.tool_blocked = true;
-}
-
-test "dirty checkpoint failure prevents tool execution" {
-    var fake = Fake{ .stop_after = 1, .explicit_denial = null };
-    const config = configuration();
-    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
-    defer runtime.deinit();
-    fake.current_runtime = &runtime;
-    runtime.observer = .{ .context = &runtime, .notify_fn = blockDirtyMark };
-    var cancel = p.Cancellation{};
-    const terminal = try runtime.run("Do the task", &cancel);
-    try std.testing.expectEqual(r.Status.failed, terminal.status);
-    try std.testing.expectEqual(error.CheckpointDirtyFailed, terminal.detail.?);
-    try std.testing.expectEqual(@as(u32, 0), fake.executions);
-    try std.testing.expectEqual(@as(?u64, null), fake.last_started_ms);
-    try std.testing.expect(!runtime.poisoned);
-    try std.testing.expectEqual(@as(usize, 3), runtime.messages().len);
-    try std.testing.expect(std.mem.indexOf(u8, runtime.messages()[2].blocks[0].tool_result.text, "Not executed") != null);
 }
 
 test "permission ids do not wrap into a non-monotonic host id" {

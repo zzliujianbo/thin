@@ -13,6 +13,7 @@ const Journal = @import("journal.zig").Journal;
 const reasoning_defaults = @import("reasoning_defaults.zig");
 const metadata = @import("model_metadata.zig");
 const session_context = @import("../core/session_context.zig");
+const Title = @import("../core/session_metadata.zig").Title;
 const model_resolver = @import("model_resolver.zig");
 const DecisionClient = @import("decision_client.zig").Client;
 const image = @import("../core/image.zig");
@@ -93,6 +94,16 @@ pub const App = struct {
 
     /// Agent 运行时，最后初始化，依赖前面所有字段。
     runtime: r.Runtime,
+
+    /// Enable only during Session initialization, before restoring a checkpoint.
+    /// Restore compares the actual schema fingerprint and resets native replay
+    /// when necessary; regular settings/connection rebinds retain this value.
+    pub fn enableSessionTitle(self: *App, initial: Title) void {
+        std.debug.assert(!self.runtime.busy.load(.acquire));
+        std.debug.assert(self.runtime.messages().len == 0);
+        self.executor.session_title = initial;
+        self.runtime.executor = self.executor.executor();
+    }
 
     /// Heap placement is intentional: Store, Tools, Client and Runtime refer to
     /// these fields, so returning a self-referential value would invalidate them.
@@ -187,7 +198,6 @@ pub const App = struct {
 
         self.root = if (anchored) |root| try root.duplicate() else try fs.Root.open(a, io, project);
         errdefer self.root.deinit();
-        try mem.migrateLayout(&self.root);
         self.home_path = if (environ.get("HOME")) |home| try a.dupe(u8, home) else try a.dupe(u8, "");
         errdefer a.free(self.home_path);
         self.shell_name = try a.dupe(u8, session_context.shellName(environ.get("SHELL")));
@@ -811,6 +821,69 @@ test "headless global defaults ignore legacy settings and never create project s
     };
 }
 
+test "App ignores retired memory layout and preserves its artifacts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var config_store = try @import("auth_store.zig").Store.open(a, io, home);
+    defer config_store.deinit();
+    try config_store.root.writeMode(cfg.file_name,
+        \\{"llm":{"default":"fixture/fake","providers":{"fixture":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat"}}}}},"memory":{"auto":false}}
+    , false, 0o600);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(tmp.dir.handle, "project", 0o700));
+    const project = try std.fs.path.join(a, &.{ home, "project" });
+    defer a.free(project);
+    var root = try fs.Root.open(a, io, project);
+    defer root.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(root.dir.handle, ".thin", 0o700));
+    const thin = try fs.openDirectory(root.dir.handle, ".thin");
+    defer fs.closeFd(thin);
+    for ([_][:0]const u8{ "mem", "memory", "mem-jobs" }) |name| {
+        try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(thin, name, 0o700));
+    }
+    for ([_][:0]const u8{ "mem", "memory" }) |name| {
+        const dir = try fs.openDirectory(thin, name);
+        defer fs.closeFd(dir);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(dir, "jobs", 0o700));
+    }
+    const markers = [_][]const u8{
+        ".thin/mem/core.md",      ".thin/mem/jobs/item",     ".thin/mem/jobs-owner",
+        ".thin/memory/jobs/item", ".thin/memory/jobs-owner", ".thin/mem-jobs/item",
+        ".thin/mem-jobs-owner",
+    };
+    for (markers) |path| try root.writeMode(path, "retired marker", false, 0o600);
+    try root.writeMode(".thin/memory/core.md", "current core", false, 0o600);
+    // A held retired owner lock must not gate initialization or Store access.
+    const owner = fs.linux.openat(thin, "mem-jobs-owner", 2 | fs.linux.nofollow | fs.linux.cloexec, 0);
+    try std.testing.expect(owner >= 0);
+    defer fs.closeFd(owner);
+    try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(owner, 2 | 4));
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    const app = try App.init(a, io, &env, project, .{});
+    defer app.deinit();
+    const current = try app.memory.read(a, "core");
+    defer a.free(current.content);
+    defer a.free(current.version);
+    try std.testing.expectEqualStrings("current core", current.content);
+    const updated = try app.memory.write(a, "core", "updated core", current.version);
+    defer a.free(updated.content);
+    defer a.free(updated.version);
+    const reread = try app.memory.read(a, "core");
+    defer a.free(reread.content);
+    defer a.free(reread.version);
+    try std.testing.expectEqualStrings("updated core", reread.content);
+    for (markers) |path| {
+        const marker = try root.read(a, path, 0, 1024);
+        defer a.free(marker.data);
+        try std.testing.expectEqualStrings("retired marker", marker.data);
+    }
+}
+
 // 配置加载可经由符号链接，但文件工具必须保护最终实际文件，而非 HOME 的词法别名。
 test {
     _ = @import("llm_app_test.zig");
@@ -852,14 +925,82 @@ test "App protects actual configuration behind HOME and file symlinks" {
             const allocator = arena.allocator();
             const executor = app.executor.executor();
             const arguments = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\"}}", .{target});
-            try std.testing.expectError(error.ProtectedAuthFile, executor.prepare_fn(executor.context, allocator, .{ .id = "read-config", .name = "read_file", .arguments = arguments }));
+            const prepared = try executor.prepare_fn(executor.context, allocator, .{ .id = "read-config", .name = "read_file", .arguments = arguments });
             var cancel = @import("../core/protocol.zig").Cancellation{};
+            try std.testing.expectError(error.ProtectedAuthFile, executor.execute_fn(executor.context, allocator, prepared, &cancel));
             for ([_][]const u8{ target, app.auth_path }) |path| {
                 try std.testing.expectError(error.ProtectedAuthFile, app.executor.execute(allocator, .{ .read_file = .{ .path = path } }, &cancel));
                 try std.testing.expectError(error.ProtectedAuthFile, app.executor.execute(allocator, .{ .write_file = .{ .path = path, .content = "not written", .overwrite = true } }, &cancel));
             }
         }
     }
+}
+
+fn expectSessionTitleSchema(app: *const App, expected: usize) !void {
+    var count: usize = 0;
+    for (app.runtime.executor.schemas) |schema| {
+        if (std.mem.eql(u8, schema.name, "set_session_title")) count += 1;
+    }
+    try std.testing.expectEqual(expected, count);
+}
+
+test "App session title capability survives settings and connection rebinds" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(a, io, buffer[0..n]);
+    defer root.deinit();
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", root.path);
+    const fixture =
+        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"context_tokens":32768,"protocol":"chat"},"alternate":{"context_tokens":32768,"protocol":"chat"}}}}},"memory":{"auto":false}}
+    ;
+    var parsed = try cfg.parse(a, fixture);
+    model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &.{}) catch |err| {
+        cfg.release(&parsed);
+        return err;
+    };
+    const app = try App.initConfiguredAnchoredAuth(a, io, &env, &root, "/unused/private/config.json", .{}, parsed);
+    defer app.deinit();
+    try std.testing.expect(app.executor.session_title == null);
+    try expectSessionTitleSchema(app, 0);
+    // Runtime.init keeps its system prompt separately from canonical history.
+    try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
+    const title = Title.fromText("保留标题");
+    app.enableSessionTitle(title);
+    try std.testing.expect(Title.eql(title, app.executor.session_title.?));
+    try expectSessionTitleSchema(app, 1);
+
+    var declaration = app.config.value;
+    declaration.limits.request_timeout_ms += 1;
+    var settings = try app.prepareSettings(declaration, &env);
+    defer settings.deinit();
+    app.installSettings(&settings);
+    try std.testing.expect(Title.eql(title, app.executor.session_title.?));
+    try expectSessionTitleSchema(app, 1);
+
+    var candidate = try cfg.clone(a, app.config.value);
+    candidate.value.model.name = "alternate";
+    const connection = try app.prepareConnection(candidate, &env);
+    app.installConnection(connection);
+    try std.testing.expectEqualStrings("alternate", app.config.value.model.name);
+    try std.testing.expect(Title.eql(title, app.executor.session_title.?));
+    try expectSessionTitleSchema(app, 1);
+
+    // A separately initialized App does not inherit the parent's capability.
+    var child_config = try cfg.parse(a, fixture);
+    model_resolver.applyDefault(child_config.arena.allocator(), &child_config.value, &.{}) catch |err| {
+        cfg.release(&child_config);
+        return err;
+    };
+    const child = try App.initConfiguredAnchoredAuth(a, io, &env, &root, "/unused/private/config.json", .{}, child_config);
+    defer child.deinit();
+    try std.testing.expect(child.executor.session_title == null);
+    try expectSessionTitleSchema(child, 0);
 }
 
 test "App unavailable decision key never blocks startup and chat replacement keeps independent reference" {

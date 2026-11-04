@@ -24,14 +24,13 @@ function checkpointBytes(snapshot) {
   bytes.writeUInt32LE(payload.length, 13);
   selection.copy(bytes, 17);
   payload.copy(bytes, 17 + selection.length);
-  const marker = Buffer.concat([Buffer.from('C'), createHash('sha256').update(bytes).digest()]);
-  return {bytes, marker};
+  return bytes;
 }
 
 async function writeCheckpoint(sessionPath, lockPath, snapshot) {
   const file = checkpointBytes(snapshot);
-  await writeFile(sessionPath, file.bytes, {mode:0o600});
-  await writeFile(lockPath, file.marker, {mode:0o600});
+  await writeFile(sessionPath, file, {mode:0o600});
+  await writeFile(lockPath, Buffer.alloc(0), {mode:0o600});
   await chmod(sessionPath, 0o600);
   await chmod(lockPath, 0o600);
 }
@@ -182,11 +181,8 @@ export async function selectionRestoreRegressions({app, pty, execute}) {
       assert(info.isFile() && !info.isSymbolicLink(), `${name}: not a regular file`);
       assert.equal(info.mode & 0o7777, 0o600, `${name}: mode`);
       assert.equal(info.uid, process.getuid(), `${name}: owner`);
-      assert.equal(info.size, 33, `${name}: size`);
-      const marker = await readFile(path);
-      assert.equal(marker.length, 33, `${name}: marker length`);
-      assert(marker[0] === 0x41 || marker[0] === 0x43, `${name}: marker`);
-      assert(marker.subarray(1).every(byte => byte === 0), `${name}: marker padding`);
+      assert.equal(info.size, 0, `${name}: size`);
+      assert.equal((await readFile(path)).length, 0, `${name}: lock length`);
     }
     assert.equal(requests, 1, 'restore failure issued a request');
     assert.equal(await readFile(join(home, '.thin', 'config.json'), 'utf8'), config);

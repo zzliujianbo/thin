@@ -16,6 +16,7 @@ const catalog = @import("provider_catalog.zig");
 const ProviderId = cfg.providers.Id;
 const selections = @import("selection.zig");
 const resume_store = @import("resume_store.zig");
+const session_metadata = @import("../core/session_metadata.zig");
 const resume_codec = @import("resume_codec.zig");
 const checkpoint = @import("../core/checkpoint.zig");
 const metadata = @import("model_metadata.zig");
@@ -311,12 +312,13 @@ pub const Session = struct {
     /// Identity snapshot only: App publishes process-lifetime static notices.
     /// Never retain or inspect worker-owned mutable Runtime state here.
     last_memory_view: @import("../core/memory_status.zig").View = .{},
-    last_subagent_view: @import("../core/subagent_status.zig").View = .{ .individual_supported = true },
+    last_subagent_view: @import("../core/subagent_status.zig").View = .{},
     active_context_official: bool = false,
     display_origins: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
     display_disabled: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
 
     resume_lease: ?resume_store.Lease = null,
+    saved_title: session_metadata.Title = .{},
     resumed: bool = false,
     /// Another writer or a read-only checkpoint store never blocks viewing.
     read_only: bool = false,
@@ -388,6 +390,7 @@ pub const Session = struct {
             .store = auth_store,
             .project_root = project_root,
             .resume_lease = lease,
+            .saved_title = if (lease) |*owned| owned.getTitle(&project_root) else .{},
             .resumed = options.resume_session != null,
             // Logging never buys write rights: a non-writable lease can only
             // view history and never activates an App or publishes state.
@@ -535,12 +538,12 @@ pub const Session = struct {
         var state = loaded.value;
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        // Legacy archives cannot prove their tool prefix. A current decision
-        // declaration must not replay old signed thinking under changed tools.
+        // A missing schema hash cannot prove the saved tool prefix. Current
+        // tool declarations must not replay old signed thinking under changed tools.
         // Normalize display data before restore, even for a poisoned archive;
         // loading history itself must not require permission to run a task.
         if (state.tool_schema_hash == null and
-            (self.global_config.?.value.decision != null or self.global_config.?.value.imageActive()))
+            (self.global_config.?.value.decision != null or self.global_config.?.value.imageActive() or candidate.executor.session_title != null))
         {
             const messages = try scratch.allocator().alloc(@import("../core/protocol.zig").Message, state.messages.len);
             for (state.messages, 0..) |message, i|
@@ -575,6 +578,10 @@ pub const Session = struct {
         // Pin while the fresh journal still has zero counters. Imported sequence
         // numbers belong to the archive, not to a second pin operation.
         try candidate.pinSessionID(self.session_id);
+        if (!self.read_only) {
+            const title = if (self.app) |app| app.executor.session_title orelse self.saved_title else self.saved_title;
+            candidate.enableSessionTitle(title);
+        }
         try self.prepareLoadedHistory(candidate);
         return candidate;
     }
@@ -654,28 +661,12 @@ pub const Session = struct {
         }
         switch (observation) {
             .event => |event| switch (event) {
-                // Dirty only once a tool can have side effects. Model calls and
-                // compaction keep the previous clean checkpoint resumable.
-                .tool_started => self.markCheckpointDirty(),
                 .user_committed, .assistant_committed, .compacted, .finished => self.persistBestEffort(true),
                 else => {},
             },
             .tool_completed => self.persistBestEffort(true),
             else => {},
         }
-    }
-
-    fn markCheckpointDirty(self: *Session) void {
-        const lease = &(self.resume_lease orelse return);
-        if (!lease.writable) return;
-        lease.activate(&self.project_root) catch |err| {
-            self.setCheckpointFailure(err);
-            // The runtime checks this before execute. Leaving the previous clean
-            // generation in place while the tool runs would let resume replay
-            // over side effects it never recorded.
-            if (self.app) |app| app.runtime.tool_blocked = true;
-            return;
-        };
     }
 
     fn persistBestEffort(self: *Session, during_run: bool) void {
@@ -698,7 +689,7 @@ pub const Session = struct {
         return if (code == 0) null else @errorFromInt(code);
     }
 
-    /// Reinstall the runtime observer, then publish a clean checkpoint when this
+    /// Reinstall the runtime observer, then publish a checkpoint when this
     /// chat already has history. Idle selection changes are not a model turn.
     fn publishCheckpoint(self: *Session) void {
         self.installObserver();
@@ -727,6 +718,35 @@ pub const Session = struct {
         try self.ensureWritableLease();
         try self.resume_lease.?.save(&self.project_root, bytes);
         self.clearCheckpointFailure();
+        self.persistTitleBestEffort();
+    }
+
+    fn persistTitleBestEffort(self: *Session) void {
+        const lease = if (self.resume_lease) |*value| value else return;
+        if (!lease.writable or lease.expected == null) return;
+        var title = if (self.app) |app| app.executor.session_title orelse self.saved_title else self.saved_title;
+        if (title.text().len == 0) {
+            for (initialHistory(self)) |message| {
+                if (message.role != .user) continue;
+                for (message.blocks) |block| switch (block) {
+                    .text => |text| {
+                        title = session_metadata.Title.fromText(text);
+                        if (title.text().len != 0) break;
+                    },
+                    else => {},
+                };
+                break;
+            }
+            if (self.app) |app| if (app.executor.session_title != null) {
+                app.executor.session_title = title;
+            };
+        }
+        if (title.text().len == 0 or session_metadata.Title.eql(title, self.saved_title)) return;
+        lease.saveTitle(&self.project_root, title) catch |err| {
+            self.setCheckpointFailure(err);
+            return;
+        };
+        self.saved_title = title;
     }
 
     fn ensureWritableLease(self: *Session) !void {
@@ -842,7 +862,7 @@ pub const Session = struct {
             .proxy_port = if (self.global_config.?.value.proxy) |value| value.port else 0,
             .memory_auto = config.memory.auto,
             .memory = if (self.app) |app| app.memoryView() else .{},
-            .subagents = if (self.app) |app| app.subagentView() else .{ .individual_supported = true },
+            .subagents = if (self.app) |app| app.subagentView() else .{},
             .subagents_supported = true,
             .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
@@ -1149,7 +1169,7 @@ pub const Session = struct {
 
     test "memory view identity revision and clear change only once" {
         var session: Session = undefined;
-        session.last_subagent_view = .{ .individual_supported = true };
+        session.last_subagent_view = .{};
         session.last_memory_view = .{};
         const first: @import("../core/memory_status.zig").View = .{ .enabled = true, .revision = 1, .active = .{ .id = 1, .phase = .extracting } };
         var next = first;
@@ -1168,7 +1188,7 @@ pub const Session = struct {
         // Minimal owner fixture: these paths must not touch App/Runtime or I/O.
         var session: Session = undefined;
         session.allocator = std.testing.allocator;
-        session.last_subagent_view = .{ .individual_supported = true };
+        session.last_subagent_view = .{};
         defer session.last_subagent_view.deinitOwned(session.allocator);
         session.app = null;
         session.initial_default_pending = false;
@@ -1205,7 +1225,7 @@ pub const Session = struct {
         const self: *Session = @ptrCast(@alignCast(raw));
         const memory_view = if (self.app) |app| app.memoryView() else @import("../core/memory_status.zig").View{};
         const memory_changed = self.memoryViewChanged(memory_view);
-        const subagent_view = if (self.app) |app| app.subagentView() else @import("../core/subagent_status.zig").View{ .individual_supported = true };
+        const subagent_view = if (self.app) |app| app.subagentView() else @import("../core/subagent_status.zig").View{};
         const subagent_changed = !@import("../core/subagent_status.zig").View.eql(self.last_subagent_view, subagent_view);
         if (subagent_changed) {
             if (subagent_view.clone(self.allocator)) |copy| {
@@ -2276,6 +2296,96 @@ const SessionTestFixture = struct {
     }
 };
 
+test "session title fallback model update and resume follow successful checkpoints" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    var id: ids.Id = undefined;
+    {
+        var session = try fixture.open(.{});
+        defer session.deinit();
+        try session.connection().configure("fake-title-test");
+        const app = session.app.?;
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .context, .blocks = &.{.{ .text = "environment is not a title" }} });
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{ .{ .text = "  \n " }, .{ .text = "  首条\n问题 " } } });
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "old-title-tool", .name = "write_file", .arguments = "{\"path\":\"must-not-run.txt\",\"content\":\"no\"}" } }} });
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "old-title-tool", .text = "old result" } }} });
+        try session.persistCheckpointInner(false);
+        try std.testing.expectEqualStrings("首条 问题", session.saved_title.text());
+        app.executor.session_title = session_metadata.Title.fromText("概括标题");
+        try session.persistCheckpointInner(false);
+        try std.testing.expectEqualStrings("概括标题", session.saved_title.text());
+        try std.testing.expect(try session.saveOnExit());
+        id = session.session_id;
+    }
+    {
+        var restored = try fixture.open(.{ .resume_session = id });
+        defer restored.deinit();
+        try std.testing.expectEqualStrings("概括标题", restored.saved_title.text());
+        try restored.connection().configure("fake-title-resume");
+        try std.testing.expectEqualStrings("概括标题", restored.app.?.executor.session_title.?.text());
+        try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, "must-not-run.txt", .{}));
+    }
+}
+
+test "title is not created without conversation or a checkpoint" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    var session = try fixture.open(.{});
+    defer session.deinit();
+    try session.connection().configure("fake-title-empty");
+    session.app.?.executor.session_title = session_metadata.Title.fromText("model title");
+    session.publishCheckpoint();
+    try std.testing.expect(!try session.saveOnExit());
+    try std.testing.expect(session.resume_lease == null);
+    var buffer: [100]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buffer, ".thin/sessions/{s}.title", .{session.session_id});
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, path, .{}));
+}
+
+test "title write failure preserves checkpoint and surfaces recording warning" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    var id: ids.Id = undefined;
+    {
+        var session = try fixture.open(.{});
+        defer session.deinit();
+        try session.connection().configure("fake-title-failure");
+        try seedSessionTestHistory(&session);
+        try session.ensureWritableLease();
+        id = session.session_id;
+        var buffer: [100]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, ".thin/sessions/{s}.title", .{id});
+        try fixture.tmp.dir.createDir(std.testing.io, path, .default_dir);
+        try session.persistCheckpointInner(false);
+        try std.testing.expect(session.checkpointError() != null);
+        try std.testing.expectEqual(session.checkpointError().?, session.connection().current().log_error.?);
+        try expectSessionTestHistory(&session);
+        try std.testing.expect(try session.saveOnExit());
+    }
+    var restored = try fixture.open(.{ .resume_session = id });
+    defer restored.deinit();
+    try expectSessionTestHistory(&restored);
+}
+
+test "failed checkpoint does not create a title" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    var session = try fixture.open(.{});
+    defer session.deinit();
+    try session.connection().configure("fake-title-checkpoint-failure");
+    try seedSessionTestHistory(&session);
+    session.app.?.executor.session_title = session_metadata.Title.fromText("model title");
+    try session.ensureWritableLease();
+    var checkpoint_buffer: [100]u8 = undefined;
+    const checkpoint_path = try std.fmt.bufPrint(&checkpoint_buffer, ".thin/sessions/{s}.session", .{session.session_id});
+    try fixture.tmp.dir.createDir(std.testing.io, checkpoint_path, .default_dir);
+    session.publishCheckpoint();
+    try std.testing.expect(session.checkpointError() != null);
+    var title_buffer: [100]u8 = undefined;
+    const title_path = try std.fmt.bufPrint(&title_buffer, ".thin/sessions/{s}.title", .{session.session_id});
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, title_path, .{}));
+}
+
 test "checkpoint persistence ignores machine-only context but retains prior conversation" {
     const Message = @import("../core/protocol.zig").Message;
     const summary_marker = @import("../core/context.zig").summary_marker;
@@ -2958,7 +3068,7 @@ test "pending model publication saves new archive selection without key" {
     try expectSessionTestHistory(&reopened);
 }
 
-/// Read selection out of a clean checkpoint. A missing lease is the old
+/// Read selection out of a checkpoint. A missing lease is the old
 /// "no snapshot" error so restore callers keep a stable name.
 fn loadSelectionBytes(root: *fs.Root, id: ids.Id) ![]u8 {
     var lease = resume_store.Lease.open(root, id, false) catch |err| switch (err) {
@@ -3045,11 +3155,110 @@ test "Anthropic displayable session resume preserves signed replay and never exe
         const actual = try Wire.encode(a, &restored);
         defer a.free(actual);
         try std.testing.expectEqualStrings(expected.?, actual);
-        try std.testing.expect(!restored.resume_lease.?.active);
+        try std.testing.expect(restored.resume_lease.?.writable);
         try std.testing.expect(!restored.read_only);
         try std.testing.expect(try restored.saveOnExit());
         try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "must-not-run.txt", .{}));
     }
+}
+
+test "Anthropic session resume invalidates null-hash replay when title tools are enabled" {
+    const a = std.testing.allocator;
+    const adapter = @import("../llm/anthropic.zig");
+    const native = "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"private null-hash plan\",\"signature\":\"signed null-hash fixture\"},{\"type\":\"redacted_thinking\",\"data\":\"opaque null-hash fixture\"},{\"type\":\"tool_use\",\"id\":\"saved-call\",\"name\":\"write_file\",\"input\":{\"path\":\"must-not-run.txt\",\"content\":\"no\"}}]}";
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    try writeSessionTestConfig(fixture.tmp.dir,
+        \\{"llm":{"default":"opencode-go/claude-haiku-5-5","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","api_key":"fake-null-hash-resume","models":{"claude-haiku-5-5":{"protocol":"anthropic","context_tokens":32768,"output_tokens":4096}}}}},"limits":{"low_price_input":false}}
+    );
+    var id: ids.Id = undefined;
+    {
+        var source = try fixture.open(.{});
+        defer source.deinit();
+        id = source.session_id;
+        const state: checkpoint.State = .{
+            .version = 2,
+            .tool_schema_hash = null,
+            .system = "frozen Anthropic system",
+            .selector = .{ .configured = .anthropic, .selected = .anthropic, .initial_attempted = true },
+            .estimator = .{ .per_mille = 1200 },
+            .last_context_tokens = 77,
+            .context_tokens = 32768,
+            .permission_id = 19,
+            .messages = &.{
+                .{ .role = .user, .blocks = &.{.{ .text = "original question" }} },
+                .{ .role = .assistant, .blocks = &.{
+                    .{ .reasoning = "private null-hash plan" },
+                    .{ .tool_call = .{ .id = "saved-call", .name = "write_file", .arguments = "{\"path\":\"must-not-run.txt\",\"content\":\"no\"}" } },
+                }, .replay = .{ .scope = .{ .connection = ProviderId.opencode_go.baseUrl(), .model = "claude-haiku-5-5", .protocol = .anthropic }, .json = native } },
+                .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "saved-call", .text = "prior result" } }} },
+                .{ .role = .assistant, .blocks = &.{.{ .text = "original answer" }} },
+            },
+        };
+        // Save the nullable-hash DTO directly: Runtime export/saveOnExit would
+        // replace null with the current schema hash and miss this restore path.
+        const payload = try checkpoint.encode(a, state);
+        defer a.free(payload);
+        const selection = try selections.capture(source.app.?.config.value);
+        const bytes = try resume_codec.encode(a, id, &selection, payload);
+        defer a.free(bytes);
+        var lease = try resume_store.Lease.create(&source.project_root, id);
+        defer lease.deinit();
+        try lease.save(&source.project_root, bytes);
+    }
+    var restored = try fixture.open(.{ .resume_session = id });
+    defer restored.deinit();
+    const app = restored.app.?;
+    try std.testing.expectEqual(id, restored.session_id);
+    try std.testing.expect(restored.resume_lease.?.writable and !restored.read_only);
+    try std.testing.expect(restored.global_config.?.value.decision == null);
+    try std.testing.expect(!restored.global_config.?.value.imageActive());
+    try std.testing.expect(app.executor.session_title != null);
+    var title_schemas: usize = 0;
+    for (app.runtime.executor.schemas) |schema| {
+        if (std.mem.eql(u8, schema.name, "set_session_title")) title_schemas += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), title_schemas);
+    try std.testing.expect(app.runtime.last_context_tokens == null);
+    try std.testing.expect(!restored.initial_context.?.known);
+    try std.testing.expectEqual(@as(u64, 0), app.runtime.permission_id);
+    try std.testing.expect(!app.journal.started);
+    const expected: []const p.Message = &.{
+        .{ .role = .user, .blocks = &.{.{ .text = "original question" }} },
+        .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "saved-call", .name = "write_file", .arguments = "{\"path\":\"must-not-run.txt\",\"content\":\"no\"}" } }} },
+        .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "saved-call", .text = "prior result" } }} },
+        .{ .role = .assistant, .blocks = &.{.{ .text = "original answer" }} },
+    };
+    try std.testing.expectEqualDeep(expected, app.runtime.messages());
+    const wire = try adapter.encode(a, .{
+        .scope = .{ .connection = app.config.value.provider.base_url, .model = app.config.value.model.name, .protocol = .anthropic },
+        .system = app.runtime.system,
+        .messages = app.runtime.messages(),
+        .tools = app.runtime.executor.schemas,
+        .model_output_tokens = app.config.value.model.output_tokens,
+    });
+    defer a.free(wire);
+    for ([_][]const u8{ "signed null-hash fixture", "opaque null-hash fixture", "private null-hash plan", "\"thinking\"", "\"redacted_thinking\"" }) |stale| {
+        try std.testing.expect(std.mem.indexOf(u8, wire, stale) == null);
+    }
+    const encoded = try std.json.parseFromSlice(std.json.Value, a, wire, .{});
+    defer encoded.deinit();
+    const wire_tools = encoded.value.object.get("tools").?.array.items;
+    try std.testing.expectEqual(app.runtime.executor.schemas.len, wire_tools.len);
+    try std.testing.expectEqualStrings("set_session_title", wire_tools[wire_tools.len - 1].object.get("name").?.string);
+    const messages = encoded.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
+    try std.testing.expectEqualStrings("original question", messages[0].object.get("content").?.array.items[0].object.get("text").?.string);
+    const call = messages[1].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("tool_use", call.get("type").?.string);
+    try std.testing.expectEqualStrings("saved-call", call.get("id").?.string);
+    try std.testing.expectEqualStrings("write_file", call.get("name").?.string);
+    const result = messages[2].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("tool_result", result.get("type").?.string);
+    try std.testing.expectEqualStrings("saved-call", result.get("tool_use_id").?.string);
+    try std.testing.expectEqualStrings("prior result", result.get("content").?.string);
+    try std.testing.expectEqualStrings("original answer", messages[3].object.get("content").?.array.items[0].object.get("text").?.string);
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, "must-not-run.txt", .{}));
 }
 
 test "closed turn checkpoint is resumable before exit" {
@@ -3082,7 +3291,7 @@ test "closed turn checkpoint is resumable before exit" {
         source.app.?.runtime.observer.notify(.{ .event = .{ .assistant_committed = &.{.{ .text = "incremental answer" }} } });
         try std.testing.expect(source.checkpointError() == null);
         try std.testing.expect(source.resume_lease != null);
-        try std.testing.expect(!source.resume_lease.?.active);
+        try std.testing.expect(source.resume_lease.?.writable);
         var selection_path: [80]u8 = undefined;
         const relative = try std.fmt.bufPrint(&selection_path, ".thin/sessions/{s}.selection.json", .{id});
         try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, relative, .{}));
@@ -3094,7 +3303,7 @@ test "closed turn checkpoint is resumable before exit" {
         try std.testing.expectEqual(@as(usize, 2), resumed.app.?.runtime.messages().len);
         try std.testing.expectEqualStrings("incremental question", resumed.app.?.runtime.messages()[0].blocks[0].text);
         try std.testing.expectEqualStrings("incremental answer", resumed.app.?.runtime.messages()[1].blocks[0].text);
-        try std.testing.expect(!resumed.resume_lease.?.active);
+        try std.testing.expect(resumed.resume_lease.?.writable);
     }
 }
 
@@ -4186,9 +4395,8 @@ test "per-agent status rows are supported before app creation" {
     try std.testing.expect(session.app == null);
     const state = session.connection().current();
     try std.testing.expect(state.subagents_supported);
-    try std.testing.expect(state.subagents.individual_supported);
     try std.testing.expectEqual(@as(usize, 0), state.subagents.agents.len);
-    try std.testing.expect(session.last_subagent_view.individual_supported);
+    try std.testing.expectEqual(@as(usize, 0), session.last_subagent_view.agents.len);
     try std.testing.expect(!Session.pollModels(&session, false));
     try std.testing.expect(!Session.pollModels(&session, true));
 }
@@ -4342,7 +4550,7 @@ test "explicit user reasoning overrides metadata and survives default persistenc
     try std.testing.expectEqualStrings("user-intensive", clone.value.model.reasoning.?.map.high.?);
 }
 
-test "derived reasoning stays in cache and cannot revive after a tied refresh or restart" {
+test "derived reasoning stays frozen and foreign profiles cannot revive it after refresh or restart" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4376,10 +4584,12 @@ test "derived reasoning stays in cache and cannot revive after a tied refresh or
         try std.testing.expect(disk.value.registry.?.find("opencode-go").?.patchFor("gpt-6-luna") == null);
         try std.testing.expect(disk.value.model.reasoning == null and disk.value.model.reasoning_effort == null);
     }
-    const tied =
-        \\{"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"gpt-6-luna":{"reasoning":true,"provider":{"npm":"@ai-sdk/openai"}}}},"one":{"npm":"@ai-sdk/openai","models":{"gpt-6-luna":{"reasoning_options":[{"type":"effort","values":["high"]}]}}},"two":{"npm":"@ai-sdk/openai","models":{"gpt-6-luna":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
+    const foreign_only =
+        \\{"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"gpt-6-luna":{"reasoning":true,"provider":{"npm":"@ai-sdk/openai"}}}},"one":{"npm":"@ai-sdk/openai","models":{"gpt-6-luna":{"reasoning_options":[{"type":"effort","values":["high"]}]}}},"two":{"npm":"@ai-sdk/openai","models":{"gpt-6-luna":{"reasoning_options":[{"type":"effort","values":["high"]}]}}}}
     ;
-    source.metadata_cache = try metadata.commit(&source.store.root, 0, try metadata.parseDev(a, tied));
+    source.metadata_cache = try metadata.commit(&source.store.root, 0, try metadata.parseDev(a, foreign_only));
+    const public_row = LayeredMetadataFixture.row(&source.metadata_cache.directory, .opencode_go, "gpt-6-luna");
+    try std.testing.expect(public_row.dev_present and public_row.dev_reasoning == null);
     {
         var candidate_arena = std.heap.ArenaAllocator.init(a);
         defer candidate_arena.deinit();

@@ -57,6 +57,7 @@ pub const Action = union(enum) {
                 .model => |name| .{ .model = try text(a, name) },
             } },
             .manage => |v| .{ .manage = switch (v) {
+                .@"resume" => |id| .{ .@"resume" = try text(a, id) },
                 .cd => |path| .{ .cd = try text(a, path) },
                 .attach => |value| .{ .attach = .{ .id = try text(a, value.id), .takeover = value.takeover } },
                 .close => |value| .{ .close = .{ .id = try text(a, value.id), .force = value.force } },
@@ -139,6 +140,14 @@ pub const Channel = struct {
         return self.poll_fn(self.context);
     }
 };
+
+test "resume management request owns its selected id" {
+    var id = "0123456789abcdef0123456789abcdef".*;
+    const request = try Owned.create(std.testing.allocator, 1, 2, 3, .{ .manage = .{ .@"resume" = &id } });
+    defer request.deinit();
+    @memset(&id, 'f');
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", request.action.manage.@"resume");
+}
 
 test "asynchronous commands own text independently of the editor and retain identity" {
     var draft: [5]u8 = @splat('x');

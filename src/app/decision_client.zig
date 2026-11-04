@@ -520,7 +520,7 @@ test "decision diagnostics fake attempts decode failure and clone sink isolation
             try std.testing.expect(std.mem.indexOf(u8, request.system, policy.ReviewRules.command_risk) != null);
             try std.testing.expect(std.mem.indexOf(u8, request.system, "For command:") != null);
             try std.testing.expect(std.mem.indexOf(u8, request.system, "For refine_outputs:") == null);
-            return .{ .success = .{ .message = try p.textMessage(alloc, .assistant, if (self.bad) "{\"timeout_ms\":null,\"ask\":true,\"extra\":false}" else "{\"timeout_ms\":null,\"ask\":true}"), .usage = .{ .input_tokens = 100, .output_tokens = 5 }, .finish = .stop } };
+            return .{ .success = .{ .message = try p.textMessage(alloc, .assistant, if (self.bad) "{\"timeout_ms\":null,\"ask\":\"invalid\"}" else "{\"timeout_ms\":null,\"ask\":true,\"reason\":\"metadata\"}"), .usage = .{ .input_tokens = 100, .output_tokens = 5 }, .finish = .stop } };
         }
     };
     var fake = Fake{};

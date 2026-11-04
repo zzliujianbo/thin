@@ -246,8 +246,11 @@ fn scenario(allowed: bool) !void {
 
 // 危险 bash 逐次审批；拒绝不执行；普通命令不询问。
 test "runtime asks before dangerous bash and runs ordinary bash without asking" {
-    try bashApproval("rm -rf marker", .deny, true, false);
-    try bashApproval("rm -rf marker", .allow_once, true, true);
+    try bashApproval("rm -f .ssh/fixture-marker", .deny, true, false);
+    try bashApproval("rm -f .ssh/fixture-marker", .allow_once, true, true);
+    try bashApproval("find absent -delete", .deny, false, true);
+    try bashApproval("git clean -f -- build/generated", .deny, false, true);
+    try bashApproval("rm -rf build", .deny, false, true);
     try bashApproval("printf ok > safe.txt", .deny, false, true);
 }
 
@@ -317,7 +320,8 @@ fn bashApproval(command: []const u8, decision: r.Decision, ask: bool, run: bool)
     try source.put("HOME", root.path);
     var environment = try tools_module.commandEnvironment(a, &source, config.provider.api_key_env);
     defer environment.deinit();
-    try root.write("marker", "keep", false);
+    try tmp.dir.createDirPath(io, ".ssh");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ssh/fixture-marker", .data = "keep" });
 
     var tools = tools_module.Tools{ .root = &root, .memory = &memory, .config = &config, .environment = &environment };
     var probe = BashProbe{ .command = command, .decision = decision };
@@ -328,19 +332,19 @@ fn bashApproval(command: []const u8, decision: r.Decision, ask: bool, run: bool)
     try t.expectEqual(r.Status.success, terminal.status);
     try t.expectEqual(@as(usize, if (ask) 1 else 0), probe.permissions);
     try t.expectEqual(@as(usize, if (run) 1 else 0), probe.started);
-    const removes_marker = std.mem.startsWith(u8, command, "rm ");
+    const removes_marker = std.mem.eql(u8, command, "rm -f .ssh/fixture-marker");
     if (run and removes_marker) {
-        try t.expectError(error.FileNotFound, root.read(a, "marker", 0, 16));
+        try t.expectError(error.FileNotFound, root.read(a, ".ssh/fixture-marker", 0, 16));
         try t.expect(!probe.is_error);
     } else {
-        const kept = try root.read(a, "marker", 0, 16);
+        const kept = try root.read(a, ".ssh/fixture-marker", 0, 16);
         defer a.free(kept.data);
         try t.expectEqualStrings("keep", kept.data);
     }
     if (!run) {
         try t.expect(probe.is_error);
         try t.expect(std.mem.indexOf(u8, probe.result[0..probe.result_len], "Dangerous bash command was not executed") != null);
-        try t.expect(std.mem.indexOf(u8, probe.result[0..probe.result_len], "recursive delete") != null);
+        try t.expect(std.mem.indexOf(u8, probe.result[0..probe.result_len], "delete of a sensitive path") != null);
     }
     if (std.mem.indexOf(u8, command, "safe.txt") != null) {
         const written = try root.read(a, "safe.txt", 0, 16);

@@ -41,6 +41,57 @@ fn readFile(root: *fs.Root, dir: c_int, id: ids.Id) !?[]u8 {
     return try root.allocator.dupe(u8, bytes[0..n]);
 }
 
+const session_metadata = @import("../core/session_metadata.zig");
+pub const Summary = session_metadata.SavedSession;
+
+fn readTitle(root: *fs.Root, dir: c_int, id: ids.Id) session_metadata.Title {
+    var filename: [64]u8 = undefined;
+    const path = name(&filename, id, ".title") catch return .{};
+    const fd = fs.linux.openat(dir, path, fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0);
+    if (fd < 0) return .{};
+    defer fs.closeFd(fd);
+    const file = fs.fileFromFd(fd);
+    const stat = file.stat(root.io) catch return .{};
+    if (stat.kind != .file or stat.size == 0 or stat.size > 256) return .{};
+    var bytes: [257]u8 = undefined;
+    const n = file.readPositionalAll(root.io, &bytes, 0) catch return .{};
+    if (n != stat.size) return .{};
+    return session_metadata.Title.fromText(bytes[0..n]);
+}
+
+/// List checkpoint metadata in this project only. No checkpoint content is read,
+/// and a missing namespace stays missing. Candidate metadata is inspected
+/// relative to the validated directory without following final symlinks.
+pub fn list(root: *fs.Root, allocator: std.mem.Allocator) ![]Summary {
+    const fd = logs.openExistingDirectory(root) catch |err| switch (err) {
+        error.FileNotFound => return allocator.alloc(Summary, 0),
+        else => return err,
+    };
+    defer fs.closeFd(fd);
+    const dir: std.Io.Dir = .{ .handle = fd };
+    var iterator = dir.iterate();
+    var items: std.ArrayList(Summary) = .empty;
+    errdefer items.deinit(allocator);
+    while (try iterator.next(root.io)) |entry| {
+        if (entry.name.len != 40 or !std.mem.endsWith(u8, entry.name, ".session")) continue;
+        const id: ids.Id = entry.name[0..32].*;
+        if (!ids.valid(id)) continue;
+        const stat = dir.statFile(root.io, entry.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (stat.kind != .file) continue;
+        try items.append(allocator, .{ .id = id, .modified_ms = @intCast(stat.mtime.toMilliseconds()), .title = readTitle(root, fd, id) });
+    }
+    std.mem.sort(Summary, items.items, {}, struct {
+        fn less(_: void, a: Summary, b: Summary) bool {
+            if (a.modified_ms != b.modified_ms) return a.modified_ms > b.modified_ms;
+            return std.mem.order(u8, &a.id, &b.id) == .lt;
+        }
+    }.less);
+    return items.toOwnedSlice(allocator);
+}
+
 /// Fixed checkpoint names only. Do not relax the general file tool's UTF-8
 /// contract just to store authenticated binary framing.
 fn atomicWrite(root: *fs.Root, dir: c_int, path: [:0]const u8, bytes: []const u8, replace: bool) !void {
@@ -74,7 +125,6 @@ pub const Lease = struct {
     id: ids.Id,
     expected: ?[32]u8,
     writable: bool,
-    active: bool = false,
 
     pub fn deinit(self: *Lease) void {
         if (self.lock_fd >= 0) fs.closeFd(self.lock_fd);
@@ -113,11 +163,7 @@ pub const Lease = struct {
         errdefer fs.closeFd(fd);
         if (std.c.fchmod(fd, 0o600) != 0) return fs.osError();
         if (fs.linux.flock(fd, 2 | 4) != 0) return error.SessionInUse;
-        var marker: [33]u8 = @splat(0);
-        marker[0] = 'A';
-        try fs.fileFromFd(fd).writePositionalAll(root.io, &marker, 0);
-        try fsyncFd(fd);
-        return .{ .directory_fd = dir, .lock_fd = fd, .id = id, .expected = null, .writable = true, .active = true };
+        return .{ .directory_fd = dir, .lock_fd = fd, .id = id, .expected = null, .writable = true };
     }
 
     pub fn load(self: *Lease, root: *fs.Root) ![]u8 {
@@ -128,17 +174,22 @@ pub const Lease = struct {
         return bytes;
     }
 
-    pub fn activate(self: *Lease, root: *fs.Root) !void {
-        if (!self.writable or self.active) return;
-        // Legacy marker bytes are neither authorization nor a loading gate.
-        _ = root;
-        self.active = true;
+    pub fn getTitle(self: *const Lease, root: *fs.Root) session_metadata.Title {
+        return readTitle(root, self.directory_fd, self.id);
+    }
+
+    /// Only a successfully saved or loaded checkpoint may acquire a sidecar.
+    pub fn saveTitle(self: *Lease, root: *fs.Root, title: session_metadata.Title) !void {
+        if (!self.writable) return error.ResumeReadOnly;
+        if (self.expected == null) return error.ResumeNotFound;
+        var buffer: [64]u8 = undefined;
+        const path = try name(&buffer, self.id, ".title");
+        try atomicWrite(root, self.directory_fd, path, title.text(), true);
     }
 
     pub fn save(self: *Lease, root: *fs.Root, bytes: []const u8) !void {
         if (!self.writable) return error.ResumeReadOnly;
         if (bytes.len == 0 or bytes.len > codec.max_file_bytes) return error.InvalidResumeLength;
-        try self.activate(root);
         const old = try readFile(root, self.directory_fd, self.id);
         defer if (old) |value| root.allocator.free(value);
         if (self.expected) |expected| {
@@ -151,16 +202,7 @@ pub const Lease = struct {
         try atomicWrite(root, self.directory_fd, path, bytes, self.expected != null);
         var digest: [32]u8 = undefined;
         Hash.hash(bytes, &digest, .{});
-        // Remember this generation before the clean marker so a failed `C`
-        // write can retry the same bytes instead of reporting a conflict.
         self.expected = digest;
-        const lock = fs.fileFromFd(self.lock_fd);
-        // Digest first, while the marker is still A. A crash here stays dirty.
-        try lock.writePositionalAll(root.io, &digest, 1);
-        try fsyncFd(self.lock_fd);
-        try lock.writePositionalAll(root.io, "C", 0);
-        try fsyncFd(self.lock_fd);
-        self.active = false;
     }
 };
 
@@ -205,7 +247,7 @@ pub fn saveFinal(root: *fs.Root, id: ids.Id, existing: ?*Lease, bytes: []const u
         try std.Io.sleep(root.io, .fromMilliseconds(2), .awake);
     }
     // Join before classifying. await does not request cancellation, so a slow
-    // write that outlasts the poll still publishes `C` and is success.
+    // write that outlasts the poll can still publish successfully.
     // ResumeSaveTimeout is only when the worker is still unfinished after that join.
     future.await(root.io);
     return classifySave(work.done.load(.acquire), work.failure);
@@ -225,6 +267,101 @@ fn testRoot(dir: std.Io.Dir) !fs.Root {
     return fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
 }
 const test_id: ids.Id = "0123456789abcdef0123456789abcdef".*;
+test "resume listing is read only sorted and ignores invalid entries" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const empty = try list(&root, a);
+    defer a.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
+
+    const second: ids.Id = "fedcba9876543210fedcba9876543210".*;
+    var first_lease = try Lease.create(&root, test_id);
+    defer first_lease.deinit();
+    try first_lease.save(&root, "first");
+    var second_lease = try Lease.create(&root, second);
+    defer second_lease.deinit();
+    try second_lease.save(&root, "second");
+    const dir = first_lease.directory_fd;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("0123456789abcdef0123456789abcdef.session", dir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.session"));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(dir, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.session", 0o700));
+    try std.testing.expectEqual(@as(c_int, 0), mkfifoat(dir, "cccccccccccccccccccccccccccccccc.session", 0o600));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("missing", dir, "dddddddddddddddddddddddddddddddd.session"));
+    const equal_times = [2]std.c.timespec{ .{ .sec = 100, .nsec = 0 }, .{ .sec = 100, .nsec = 0 } };
+    try std.testing.expectEqual(@as(c_int, 0), std.c.utimensat(dir, test_id ++ ".session", &equal_times, 0));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.utimensat(dir, second ++ ".session", &equal_times, 0));
+    const unreadable = fs.linux.openat(dir, test_id ++ ".session", fs.linux.nofollow | fs.linux.cloexec, 0);
+    if (unreadable < 0) return fs.osError();
+    defer fs.closeFd(unreadable);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(unreadable, 0));
+    const junk = fs.linux.openat(dir, "INVALID.session", 1 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec, 0o600);
+    if (junk < 0) return fs.osError();
+    fs.closeFd(junk);
+    const result = try list(&root, a);
+    defer a.free(result);
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqual(@as(i64, 100_000), result[0].modified_ms);
+    try std.testing.expectEqual(result[0].modified_ms, result[1].modified_ms);
+    try std.testing.expectEqualSlices(u8, &test_id, &result[0].id);
+    try std.testing.expectEqualSlices(u8, &second, &result[1].id);
+    const later_times = [2]std.c.timespec{ .{ .sec = 200, .nsec = 0 }, .{ .sec = 200, .nsec = 0 } };
+    try std.testing.expectEqual(@as(c_int, 0), std.c.utimensat(dir, second ++ ".session", &later_times, 0));
+    const later = try list(&root, a);
+    defer a.free(later);
+    try std.testing.expectEqual(@as(usize, 2), later.len);
+    try std.testing.expectEqualSlices(u8, &second, &later[0].id);
+    try std.testing.expectEqual(@as(i64, 200_000), later[0].modified_ms);
+    try std.testing.expectEqualSlices(u8, &test_id, &later[1].id);
+}
+
+test "title sidecars are optional bounded and do not change checkpoint order" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const second: ids.Id = "fedcba9876543210fedcba9876543210".*;
+    var first = try Lease.create(&root, test_id);
+    defer first.deinit();
+    try std.testing.expectError(error.ResumeNotFound, first.saveTitle(&root, session_metadata.Title.fromText("early")));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(root.io, ".thin/sessions/" ++ test_id ++ ".title", .{}));
+    try first.save(&root, "one");
+    var other = try Lease.create(&root, second);
+    defer other.deinit();
+    try other.save(&root, "two");
+    const before = try list(&root, a);
+    defer a.free(before);
+    try std.testing.expectEqualStrings("", first.getTitle(&root).text());
+    try first.saveTitle(&root, session_metadata.Title.fromText("中文标题"));
+    var reader = try Lease.open(&root, test_id, false);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("中文标题", reader.getTitle(&root).text());
+    try std.testing.expectError(error.ResumeReadOnly, reader.saveTitle(&root, session_metadata.Title.fromText("no")));
+    try std.testing.expectEqualStrings("中文标题", first.getTitle(&root).text());
+    const after = try list(&root, a);
+    defer a.free(after);
+    try std.testing.expectEqualSlices(u8, &before[0].id, &after[0].id);
+    try std.testing.expectEqualSlices(u8, &before[1].id, &after[1].id);
+    try std.testing.expectEqual(before[0].modified_ms, after[0].modified_ms);
+    for (after) |item| {
+        try std.testing.expectEqualStrings(if (std.mem.eql(u8, &item.id, &test_id)) "中文标题" else "", item.title.text());
+    }
+    try tmp.dir.writeFile(root.io, .{ .sub_path = ".thin/sessions/" ++ test_id ++ ".title", .data = "\xff" });
+    try std.testing.expectEqualStrings("", reader.getTitle(&root).text());
+    const invalid = try list(&root, a);
+    defer a.free(invalid);
+    for (invalid) |item| try std.testing.expectEqualStrings("", item.title.text());
+    try tmp.dir.deleteFile(root.io, ".thin/sessions/" ++ test_id ++ ".title");
+    const missing = try list(&root, a);
+    defer a.free(missing);
+    for (missing) |item| try std.testing.expectEqualStrings("", item.title.text());
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("missing", first.directory_fd, test_id ++ ".title"));
+    try std.testing.expectEqualStrings("", reader.getTitle(&root).text());
+}
+
 test "resume store atomic private writes concurrent read-only view and interrupted owner" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -235,7 +372,9 @@ test "resume store atomic private writes concurrent read-only view and interrupt
     {
         var lease = try Lease.create(&root, test_id);
         defer lease.deinit();
+        try std.testing.expectEqual(@as(u64, 0), (try fs.fileFromFd(lease.lock_fd).stat(root.io)).size);
         try lease.save(&root, "fake authenticated bytes\x00\xff");
+        try std.testing.expectEqual(@as(u64, 0), (try fs.fileFromFd(lease.lock_fd).stat(root.io)).size);
         try std.testing.expectError(error.SessionInUse, Lease.open(&root, test_id, true));
         var view = try Lease.open(&root, test_id, false);
         defer view.deinit();
@@ -250,8 +389,7 @@ test "resume store atomic private writes concurrent read-only view and interrupt
         const bytes = try lease.load(&root);
         defer root.allocator.free(bytes);
         try std.testing.expectEqualSlices(u8, "fake authenticated bytes\x00\xff", bytes);
-        try lease.activate(&root); // read-only, zero mutations
-        try std.testing.expect(!lease.active);
+        try std.testing.expect(!lease.writable);
         try std.testing.expectError(error.ResumeReadOnly, lease.save(&root, "different"));
     }
     for ([_][]const u8{ ".session", ".resume-lock" }) |suffix| {
@@ -263,8 +401,8 @@ test "resume store atomic private writes concurrent read-only view and interrupt
     {
         var lease = try Lease.open(&root, test_id, true);
         defer lease.deinit();
-        try lease.activate(&root);
-        // Simulate death, without a final save.
+        try std.testing.expect(lease.writable);
+        // Release ownership without a final save.
     }
     var recovered = try Lease.open(&root, test_id, true);
     defer recovered.deinit();
@@ -298,7 +436,7 @@ test "resume store detects changed snapshot and refuses unsafe paths" {
     if (mkfifoat(lease.directory_fd, test_id ++ ".session", 0o600) != 0) return error.FixtureFailed;
     try std.testing.expectError(error.UnsafeResumeFile, lease.load(&root));
 }
-test "resume store ignores stale A marker digest and legacy permission bits at load" {
+test "resume store ignores arbitrary legacy markers and permission bits at load" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
@@ -316,10 +454,16 @@ test "resume store ignores stale A marker digest and legacy permission bits at l
     }
     var resumed = try Lease.open(&root, test_id, true);
     defer resumed.deinit();
-    const bytes = try resumed.load(&root);
-    defer root.allocator.free(bytes);
-    try std.testing.expectEqualStrings("complete JSON-shaped history", bytes);
+    for ([_][]const u8{ "Aobsolete digest", "Cwrong digest", "arbitrary marker" }) |marker| {
+        try fs.fileFromFd(resumed.lock_fd).writePositionalAll(root.io, marker, 0);
+        const bytes = try resumed.load(&root);
+        defer root.allocator.free(bytes);
+        try std.testing.expectEqualStrings("complete JSON-shaped history", bytes);
+    }
     try resumed.save(&root, "next complete history");
+    const updated = try resumed.load(&root);
+    defer root.allocator.free(updated);
+    try std.testing.expectEqualStrings("next complete history", updated);
     const stat = try tmp.dir.statFile(root.io, ".thin/sessions/" ++ test_id ++ ".session", .{});
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
 }

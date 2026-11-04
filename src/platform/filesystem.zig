@@ -222,20 +222,6 @@ pub const Root = struct {
         }
     };
 
-    /// Preparation probes metadata only, not contents or special-device I/O.
-    /// A missing leaf is allowed; callers may also defer missing parents.
-    pub fn probeExternalRead(self: *Root, path: []const u8, guard: ReadGuard) !void {
-        var parent_ = try self.readParent(path);
-        defer parent_.deinit();
-        try guard.check(parent_, null);
-        const fd = openPath(parent_.fd, parent_.name) catch |err| switch (err) {
-            error.FileNotFound => return,
-            else => return err,
-        };
-        defer closeFd(fd);
-        try guard.check(parent_, fd);
-    }
-
     /// Consumes an independent directory fd, closing it on every failure.
     fn walkParent(self: *Root, owned_fd: c_int, rel: []const u8) !Parent {
         var fd = owned_fd;

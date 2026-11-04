@@ -13,10 +13,13 @@ const base = await mkdtemp(join(tmpdir(), 'thin-approval-cancel-'));
 const home = join(base, 'home'), project = join(base, 'project');
 let requests = 0, connections = 0, failure;
 const sockets = new Set();
-const command = 'rm -rf absent; touch cancel-executed; # ' + 'synthetic-padding '.repeat(8) +
+const command = 'rm -f .ssh/fixture-marker; touch cancel-executed; # ' + 'synthetic-padding '.repeat(8) +
   'GHOST-CANCEL-ONLY ' + '合成注释 synthetic-step abcdefghijklmnopqrstuvwxyz; '.repeat(170);
 assert(Buffer.byteLength(command) >= 9000 && Buffer.byteLength(command) <= 11000);
 const callId = 'call_approval_cancel_owned_unique';
+const marker = join(project, '.ssh', 'fixture-marker');
+const markerContent = 'owned approval sentinel\n';
+async function markerUnchanged() { assert.equal(await readFile(marker, 'utf8'), markerContent, 'approval sentinel changed'); }
 async function missing(path) { await assert.rejects(stat(path), {code:'ENOENT'}); }
 const server = createServer(async (req, res) => {
   const number = ++requests;
@@ -57,9 +60,9 @@ const server = createServer(async (req, res) => {
       const results = body.messages.filter(m => m.role === 'tool' && m.tool_call_id === callId);
       assert.equal(calls.length, 1, 'denial continuation retains exactly one canonical call');
       assert.equal(results.length, 1, 'denial continuation retains exactly one canonical result');
-      assert.equal(results[0].content, 'Dangerous bash command was not executed (recursive delete). High-risk bash needs an explicit user allow each time.');
+      assert.equal(results[0].content, 'Dangerous bash command was not executed (delete of a sensitive path). High-risk bash needs an explicit user allow each time.');
     }
-    await missing(join(project, 'absent')); await missing(join(project, 'cancel-executed'));
+    await markerUnchanged(); await missing(join(project, 'cancel-executed'));
     res.writeHead(200, {'content-type':'text/event-stream', 'cache-control':'no-cache'});
     const event = (delta, finish_reason = null) => res.write('data: ' + JSON.stringify({
       choices:[{index:0, delta, finish_reason}],
@@ -87,8 +90,9 @@ const server = createServer(async (req, res) => {
 });
 server.on('connection', socket => { connections++; sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
 async function run(url) {
-  await mkdir(join(home, '.thin'), {recursive:true}); await mkdir(project, {recursive:true});
-  await missing(join(project, 'absent')); await missing(join(project, 'cancel-executed'));
+  await mkdir(join(home, '.thin'), {recursive:true}); await mkdir(join(project, '.ssh'), {recursive:true});
+  await writeFile(marker, markerContent);
+  await markerUnchanged(); await missing(join(project, 'cancel-executed'));
   const config = JSON.stringify({
     memory:{auto:false},
     llm:{default:'local/fixture-model', providers:{local:{base_url:url, api_key_env:'THIN_FIXTURE_KEY', models:{'fixture-model':{protocol:'chat', context_tokens:32768}}}}},
@@ -139,7 +143,7 @@ async function run(url) {
     assert(output.includes('APPROVAL_CANCEL_WAIT repeated_titles=0'));
     assert(output.includes('APPROVAL_CANCEL_GATE=verified'));
     assert.equal(requests, 3, 'two explicit turns plus exactly one denial continuation');
-    await missing(join(project, 'absent')); await missing(join(project, 'cancel-executed'));
+    await markerUnchanged(); await missing(join(project, 'cancel-executed'));
     assert.deepEqual(await readFile(path), Buffer.from(config), 'config bytes changed');
     await missing(join(home, '.thin/sessions'));
     for (const root of [home, project]) await missing(join(root, '.thin/settings.json'));

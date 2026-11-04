@@ -64,7 +64,7 @@ fn version(s: []const u8) bool {
 }
 
 // Preflight before allocating/parser recursion; typed decoding below owns syntax,
-// duplicate-key and unknown-field checks (including escaped aliases).
+// duplicate-key checks (including escaped aliases).
 fn preflight(text: []const u8) !void {
     if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidMemoryOutput;
     var depth: usize = 0;
@@ -105,7 +105,7 @@ pub fn parse(a: std.mem.Allocator, text: []const u8) ![]const k.Candidate {
         return error.InvalidMemoryOutput;
     };
     defer tree.deinit();
-    if (tree.value != .object or tree.value.object.count() != 1) return error.InvalidMemoryOutput;
+    if (tree.value != .object) return error.InvalidMemoryOutput;
     const array = tree.value.object.get("items") orelse return error.InvalidMemoryOutput;
     if (array != .array) return error.InvalidMemoryOutput;
     if (array.array.items.len > k.max_candidates) return error.InvalidMemoryCandidate;
@@ -179,7 +179,7 @@ fn codecCase(a: std.mem.Allocator) !void {
 test "codec filters invalid items and preserves allocation rollback" {
     try codecCase(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, codecCase, .{});
-    const empty = try parse(std.testing.allocator, "{\"items\":[]}");
+    const empty = try parse(std.testing.allocator, "{\"items\":[],\"note\":\"metadata\"}");
     defer freeCandidates(std.testing.allocator, empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
     try std.testing.expectError(error.InvalidMemoryOutput, parse(std.testing.allocator, "{\"items\":[],\"items\":[]}"));
@@ -187,7 +187,7 @@ test "codec filters invalid items and preserves allocation rollback" {
 
 test "codec strict outer syntax bounds and per-item validation" {
     const a = std.testing.allocator;
-    for ([_][]const u8{ "{\"items\":[],\"items\":[]}", "{\"items\":[],\"it\\u0065ms\":[]}", "{\"items\":[[[[[]]]]]}", "{\"items\":[]}\xff", "{\"items\":{}}" }) |bad| {
+    for ([_][]const u8{ "{\"items\":[],\"items\":[]}", "{\"items\":[],\"it\\u0065ms\":[]}", "{\"items\":[[[[[]]]]]}", "{\"items\":[]}\xff", "{\"items\":{}}", "{\"note\":0}", "[]" }) |bad| {
         try std.testing.expectError(error.InvalidMemoryOutput, parse(a, bad));
     }
     const mixed = "{\"items\":[{\"category\":\"project\",\"topic\":\"blank\",\"content\":\"   \\t\\r\\n\"}," ++ test_item ++ ",{\"category\":\"project\",\"topic\":\"bad\",\"content\":\"password=secret\"},{\"category\":\"project\",\"topic\":\"expiry\",\"content\":\"x\",\"expires_at_ms\":\"101\"}]}";
@@ -215,7 +215,7 @@ test "service filters decoded semantic failures and retains later valid items" {
             return parse(a, "{\"items\":[" ++
                 "{\"category\":\"project\",\"topic\":\"bad slug\",\"content\":\"x\"}," ++
                 "{\"category\":\"project\",\"topic\":\"blank\",\"content\":\"   \"}," ++
-                "{\"category\":\"project\",\"topic\":\"secret\",\"content\":\"password=secret\"}," ++
+                "{\"category\":\"project\",\"topic\":\"secret\",\"content\":\"-----BEGIN PRIVATE KEY-----\"}," ++
                 "{\"category\":\"project\",\"topic\":\"expired\",\"content\":\"x\",\"expires_at_ms\":100}," ++
                 "{\"category\":\"project\",\"topic\":\"cas\",\"content\":\"x\",\"expected_version\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}," ++
                 test_item ++ "," ++ test_item ++ ",{}]}");

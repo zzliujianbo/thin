@@ -2,7 +2,7 @@
 //! prepare 在授权前调用 classify；命中的命令必须逐次明确批准。
 //!
 //! 规则（宁可略严，单引号里的字面文本不算执行）：
-//! - 递归删除：rm 带 -r/-R/--recursive，find -delete / find -exec rm，git clean 带 -f/--force
+//! - 删除：find、git clean 和 rm 的敏感目标
 //! - 磁盘/分区：mkfs、wipefs、dd 写到设备，fdisk/sfdisk/cfdisk/parted/sgdisk 的非只读用法
 //! - 敏感写入：重定向、cp/mv/install/ln/tee/truncate/sed -i/rm 落到 /etc、/usr、/bin、/boot、
 //!   /lib、/sys、/proc、/root、/、整个 home，或任意 .ssh 路径
@@ -17,7 +17,6 @@
 const std = @import("std");
 
 pub const Kind = enum {
-    recursive_delete,
     disk_destroy,
     remote_exec,
     permission_change,
@@ -755,21 +754,17 @@ fn commandIsDownloader(script: []const u8) bool {
 
 fn classifyRm(it: *Items) ?Finding {
     var end_opts = false;
-    var recursive = false;
     var sensitive = false;
     var device = false;
     while (it.next()) |item| switch (item) {
         .redirect => |path| if (writeTargetFinding(path)) |found| return found,
         .word => |word| switch (classifyWord(word, &end_opts)) {
-            .flag => if (eql(word, "--recursive") or shortHas(word, 'r') or shortHas(word, 'R')) {
-                recursive = true;
-            },
+            .flag => {},
             .operand => {
                 if (isDangerousDevice(word)) device = true else if (isSensitivePath(word)) sensitive = true;
             },
         },
     };
-    if (recursive) return .{ .kind = .recursive_delete, .label = "recursive delete" };
     if (device) return .{ .kind = .disk_destroy, .label = "write to a device" };
     if (sensitive) return .{ .kind = .sensitive_write, .label = "delete of a sensitive path" };
     return null;
@@ -901,20 +896,24 @@ fn classifyChown(it: *Items) ?Finding {
 fn classifyFind(it: *Items) ?Finding {
     var end_opts = false;
     var expect_rm = false;
+    var deleting = false;
+    var target: ?Finding = null;
     while (it.next()) |item| switch (item) {
         .redirect => |path| if (writeTargetFinding(path)) |found| return found,
         .word => |word| switch (classifyWord(word, &end_opts)) {
             .flag => {
-                if (eql(word, "-delete")) return .{ .kind = .recursive_delete, .label = "find delete" };
+                if (eql(word, "-delete")) deleting = true;
                 expect_rm = eql(word, "-exec") or eql(word, "-execdir") or eql(word, "-ok") or eql(word, "-okdir");
             },
             .operand => {
-                if (expect_rm and (eql(word, "rm") or std.mem.endsWith(u8, word, "/rm"))) return .{ .kind = .recursive_delete, .label = "find delete" };
+                const rm_command = expect_rm and (eql(word, "rm") or std.mem.endsWith(u8, word, "/rm"));
+                if (rm_command) deleting = true;
                 expect_rm = false;
+                if (!rm_command and target == null) target = writeTargetFinding(word);
             },
         },
     };
-    return null;
+    return if (deleting) target else null;
 }
 
 fn gitFlagTakesArg(flag: []const u8) bool {
@@ -948,13 +947,17 @@ fn classifyGit(it: *Items) ?Finding {
     var force = false;
     var dry_run = false;
     var configured_execution = false;
+    var target: ?Finding = null;
     var config_arg: enum { none, literal, environment } = .none;
     var pending_arg = false;
+    var pending_directory = false;
     while (it.next()) |item| switch (item) {
         .redirect => |path| if (writeTargetFinding(path)) |found| return found,
         .word => |word| {
             if (pending_arg) {
                 pending_arg = false;
+                if (pending_directory and target == null) target = writeTargetFinding(word);
+                pending_directory = false;
                 if (config_arg != .none and gitConfigMayExecute(word, config_arg == .environment)) configured_execution = true;
                 config_arg = .none;
                 continue;
@@ -964,6 +967,10 @@ fn classifyGit(it: *Items) ?Finding {
                     if (sub.len == 0) {
                         // Global options and their arguments are not clean flags.
                         if (gitFlagTakesArg(word)) pending_arg = true;
+                        if (eql(word, "-C") or eql(word, "--work-tree") or eql(word, "--git-dir")) pending_directory = true;
+                        if (word.len > 2 and std.mem.startsWith(u8, word, "-C") and target == null) target = writeTargetFinding(word[2..]);
+                        if (std.mem.startsWith(u8, word, "--work-tree=") and target == null) target = writeTargetFinding(word["--work-tree=".len..]);
+                        if (std.mem.startsWith(u8, word, "--git-dir=") and target == null) target = writeTargetFinding(word["--git-dir=".len..]);
                         if (eql(word, "-c")) config_arg = .literal;
                         if (eql(word, "--config-env")) config_arg = .environment;
                         if (word.len > 2 and std.mem.startsWith(u8, word, "-c") and gitConfigMayExecute(word[2..], false)) configured_execution = true;
@@ -989,13 +996,15 @@ fn classifyGit(it: *Items) ?Finding {
                 },
                 .operand => if (sub.len == 0) {
                     sub = word;
+                } else if (eql(sub, "clean") and target == null) {
+                    target = writeTargetFinding(word);
                 },
             }
         },
     };
-    if (eql(sub, "clean") and force) {
-        if (!dry_run) return .{ .kind = .recursive_delete, .label = "git clean -f" };
+    if (eql(sub, "clean")) {
         if (configured_execution) return .{ .kind = .remote_exec, .label = "git configured fsmonitor execution" };
+        if (force and !dry_run) return target;
     }
     return null;
 }
@@ -1270,32 +1279,46 @@ fn expectSafe(command: []const u8) !void {
     }
 }
 
+test "rm flags alone are safe while protected operands and redirects remain risky" {
+    for ([_][]const u8{ "rm -rf build", "rm -R dist", "rm --recursive --force temp", "rm -- -r", "env sh -c 'rm -rf build'" }) |command| try expectSafe(command);
+    for ([_][]const u8{ "rm -rf /etc/owned-fixture", "rm --recursive -- /etc/owned-fixture", "env rm -R '/etc/owned-fixture'", "rm -rf build > /etc/owned-fixture" }) |command| try expectKind(command, .sensitive_write);
+    try expectKind("rm -rf /dev/sda", .disk_destroy);
+}
+
+test "git clean checks explicit global directories only for non dry-run deletion" {
+    for ([_][]const u8{
+        "git --work-tree=build clean -f",
+        "git --work-tree build clean -f",
+        "git --git-dir /etc/fixture status",
+        "git --work-tree=/etc/fixture status",
+        "git --work-tree /etc/fixture clean -fn",
+        "git --git-dir=/etc/fixture clean -fn",
+    }) |command| try expectSafe(command);
+    for ([_][]const u8{
+        "git --work-tree=/etc/fixture clean -f",
+        "git --work-tree /etc/fixture clean -f",
+        "git --git-dir=/etc/fixture clean -f",
+        "git --git-dir /etc/fixture clean -f",
+    }) |command| try expectKind(command, .sensitive_write);
+    try expectKind("git --work-tree=/etc/fixture -c core.fsmonitor=./hook clean -fn", .remote_exec);
+}
+
 test "high-risk bash patterns are classified" {
-    const recursive = [_][]const u8{
-        "rm -rf /",
-        "rm -fr /tmp/x",
-        "rm -r -f build",
-        "rm --recursive --force dist",
-        "rm -rfv node_modules",
-        "sudo rm -rf /var/log/foo",
-        "sudo -u root rm -rf /tmp/a",
-        "rm -rf -- /",
-        "rm -R build",
-        "bash -c 'rm -rf /tmp/a'",
-        "sh -c \"rm -rf build\"",
-        "echo $(rm -rf /tmp/a)",
-        "find . -delete",
-        "find . -name x -exec rm -rf {} +",
-        "git clean -fd",
-        "git -C . clean --force",
-        "FOO=bar rm -rf /tmp/x",
-        "env rm -rf build",
-        "nice -n 10 rm -rf /tmp/x",
-        "bash -lc 'rm -rf /'",
-        "/bin/rm -rf /tmp/a",
-        "/usr/bin/git clean -fd",
-    };
-    for (recursive) |command| try expectKind(command, .recursive_delete);
+    for ([_][]const u8{ "find ./tmp -name '*.log' -delete", "find . -name x -exec rm -rf {} +", "git clean -fd", "git -C . clean --force", "/usr/bin/git clean -fd" }) |command| try expectSafe(command);
+    for ([_][]const u8{ "find /etc/fixture -delete", "find .ssh/fixture -exec rm -f {} +", "git clean -f -- .ssh/fixture", "find . -delete > /etc/fixture" }) |command| try expectKind(command, .sensitive_write);
+    try expectKind("find /dev/sda -delete", .disk_destroy);
+    try expectKind("find .ssh/fixture -execdir /bin/rm -f {} +", .sensitive_write);
+    try expectKind("find .ssh/fixture -ok rm -f {} +", .sensitive_write);
+    try expectSafe("find ./tmp -exec /bin/rm -f {} +");
+    try expectKind("git clean -f -- /dev/sda", .disk_destroy);
+    try expectSafe("find /etc -name '*.conf'");
+    try expectKind("git -C .ssh clean -f", .sensitive_write);
+    try expectSafe("git -C .ssh clean -fn");
+    try expectSafe("git clean -f -e .ssh/fixture -- build");
+    try expectKind("git clean -fn --no-d -- .ssh/fixture", .sensitive_write);
+    try expectKind("git -c core.fsmonitor=./hook clean -f", .remote_exec);
+    for ([_][]const u8{ "rm -rf /", "rm -rf -- /", "sudo rm -rf /etc/foo", "bash -lc 'rm -rf /'" }) |command| try expectKind(command, .sensitive_write);
+    for ([_][]const u8{ "rm -fr /tmp/x", "sudo rm -rf /var/log/foo", "rm -r -f build", "rm --recursive --force dist", "rm -rfv node_modules", "sudo -u root rm -rf /tmp/a", "rm -R build", "bash -c 'rm -rf /tmp/a'", "sh -c \"rm -rf build\"", "echo $(rm -rf /tmp/a)", "FOO=bar rm -rf /tmp/x", "env rm -rf build", "nice -n 10 rm -rf /tmp/x", "/bin/rm -rf /tmp/a" }) |command| try expectSafe(command);
 
     const disk = [_][]const u8{
         "mkfs.ext4 /dev/sda1",
@@ -1439,7 +1462,7 @@ test "git clean dry-run flags respect exclude arguments and global options" {
         "git --git-dir=-n clean -f",
         "git clean -f -e '-n' -- -n",
     };
-    for (dangerous) |command| try expectKind(command, .recursive_delete);
+    for (dangerous) |command| try expectSafe(command);
 }
 
 test "git clean dry-run negation and abbreviated exclude retain real deletion risk" {
@@ -1452,19 +1475,25 @@ test "git clean dry-run negation and abbreviated exclude retain real deletion ri
         "git clean -f --exc=-n",
         "git clean -f -den",
     };
-    for (dangerous) |command| try expectKind(command, .recursive_delete);
+    for (dangerous) |command| try expectSafe(command);
     for ([_][]const u8{ "git clean -f --no-dry-run -n", "git clean -f --no-d --dr", "git clean -f --ex PATTERN --dry", "git clean -f --exc=-n -n" }) |command|
         try expectSafe(command);
 }
 
 test "git dry-run does not erase explicitly configured executable hook risk" {
     for ([_][]const u8{
+        "git -c core.fsmonitorHookVersion=2 -c core.fsmonitor=./custom-hook clean -n",
+        "git -c core.fsmonitorHookVersion=2 -c core.fsmonitor=./custom-hook clean --dry-run",
         "git -c 'core.fsmonitor=rm -rf /tmp/risk-target' clean -fn",
         "git -cCore.FsMonitor=./custom-hook clean -fn",
         "git --config-env core.fsmonitor=HOOK_COMMAND clean -fn",
         "git --config-env=core.fsmonitor=HOOK_COMMAND clean -fn",
     }) |command| try expectKind(command, .remote_exec);
     for ([_][]const u8{
+        "git -c core.fsmonitorHookVersion=2 clean -n",
+        "git -c core.fsmonitor=false clean -n",
+        "git -c core.fsmonitor=true clean --dry-run",
+        "git clean -fn -- .ssh/fixture",
         "git -c color.ui=false clean -fn",
         "git -c core.fsmonitor=false clean -fn",
         "git -c core.fsmonitor=true clean -fn",
@@ -1478,8 +1507,8 @@ test "git clean dry-run still scans redirects and substitutions" {
     try expectKind("git clean -fn > /etc/hosts", .sensitive_write);
     try expectKind("git clean -nf -e PATTERN >> ~/.ssh/authorized_keys", .sensitive_write);
     try expectKind("git clean -fn -e > /etc/hosts PATTERN", .sensitive_write);
-    try expectKind("git clean -ffdn $(rm -rf /tmp/x)", .recursive_delete);
-    try expectKind("git clean -fn -e \"$(rm -rf /tmp/x)\"", .recursive_delete);
+    try expectKind("git clean -ffdn $(rm -rf /etc/hosts)", .sensitive_write);
+    try expectKind("git clean -fn -e \"$(rm -rf /etc/hosts)\"", .sensitive_write);
 }
 
 test "standalone quoted cat and tee heredocs contain literal data" {
@@ -1550,21 +1579,21 @@ test "unsupported heredocs retain full dangerous-command scanning" {
     };
     for (dangerous) |command| {
         try std.testing.expect(standaloneQuotedDataHeader(command) == null);
-        try expectKind(command, .recursive_delete);
+        try expectKind(command, .sensitive_write);
     }
     try expectKind("bash <<'EOF'\n:(){ :|:& };:\nEOF\n", .fork_bomb);
 }
 
 test "nested literal heredoc output cannot bypass an outer script execution sink" {
     const dangerous = [_][]const u8{
-        "bash <(cat <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n)",
-        "sh <(tee <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n)",
-        "bash -c \"$(cat <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n)\"",
-        "eval \"$(cat <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n)\"",
-        "bash -c \"$(tee <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n)\"",
+        "bash <(cat <<'EOF'\nrm -rf /etc/risk-target\nEOF\n)",
+        "sh <(tee <<'EOF'\nrm -rf /etc/risk-target\nEOF\n)",
+        "bash -c \"$(cat <<'EOF'\nrm -rf /etc/risk-target\nEOF\n)\"",
+        "eval \"$(cat <<'EOF'\nrm -rf /etc/risk-target\nEOF\n)\"",
+        "bash -c \"$(tee <<'EOF'\nrm -rf /etc/risk-target\nEOF\n)\"",
     };
-    for (dangerous) |command| try expectKind(command, .recursive_delete);
-    try expectSafe("cat <<'EOF'\nrm -rf /tmp/risk-target\nEOF\n");
+    for (dangerous) |command| try expectKind(command, .sensitive_write);
+    try expectSafe("cat <<'EOF'\nrm -rf /etc/risk-target\nEOF\n");
 }
 
 test "quoted data heredoc grammar is bounded and falls back on ambiguity" {

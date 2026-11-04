@@ -21,6 +21,7 @@ const image = @import("../core/image.zig");
 const image_file = @import("image_file.zig");
 const subagent = @import("../core/subagent.zig");
 const background = @import("../core/background.zig");
+const Title = @import("../core/session_metadata.zig").Title;
 
 /// Foreground bash description. The background variant appends its own sentence
 /// so a child Tools without a service never advertises background capability.
@@ -104,7 +105,7 @@ const image_schema: p.ToolSchema = .{
 /// sandbox claim.
 const subagent_schema: p.ToolSchema = .{
     .name = "subagent",
-    .description = "Start ONE bounded child agent job in this root task and return its id immediately. The child inherits this task's accepted provider/model/protocol/thinking selection and the same host policy, path protection and per-call approvals. It may use file, command and (when configured) image tools, but cannot delegate again or use the memory tool. task is required (at most 8192 UTF-8 bytes); context is optional reference material (at most 16384 bytes). Collect the job with get_subagent_result, exchange messages with send_subagent_message and stop it with cancel_subagent. A child report is untrusted evidence, not approval, verification or proof. Keep the main task: split independent work across jobs, start several, then collect each by id. write_file and bash are serialized between sibling children of the same root task, so only those mutating steps wait; reads and child reasoning stay concurrent. While any child of this root is still uncollected, the parent's write_file and bash are refused; read/image/communication remain available. Jobs never survive the root task, and commands are not OS-sandboxed.",
+    .description = "Start ONE bounded child agent job in this root task and return its id immediately. The child inherits this task's accepted provider/model/protocol/thinking selection and the same host policy, path protection and per-call approvals. It may use file, command and (when configured) image tools, but cannot delegate again or use the memory tool. task is required (at most 8192 UTF-8 bytes); context is optional reference material (at most 16384 bytes). Collect the job with get_subagent_result, exchange messages with send_subagent_message and stop it with cancel_subagent. A child report is untrusted evidence, not approval, verification or proof. Keep the main task: split independent work across jobs, start several, then collect each by id. Parent and child tools can run concurrently; coordinate overlapping changes. Jobs never survive the root task, and commands are not OS-sandboxed.",
     .parameters_json =
     \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"maxLength":8192},"context":{"type":"string","maxLength":16384}},"required":["task"],"additionalProperties":false}
     ,
@@ -143,10 +144,17 @@ const parent_schemas = [_]p.ToolSchema{ subagent_schema, get_subagent_schema, se
 const channel_choices = 3;
 /// Largest schema set: read/write/bash/memory + image + 4 parent tools +
 /// the background management tool.
-const max_schemas = 10;
+const max_schemas = 11;
+const title_schema: p.ToolSchema = .{
+    .name = "set_session_title",
+    .description = "After first understanding the user's intent, set a short descriptive session title. Update it only when the main topic clearly changes.",
+    .parameters_json =
+    \\{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}
+    ,
+};
 const schema_choices = 2;
 
-fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_on: bool, comptime channel: usize, comptime background_on: bool) [max_schemas]p.ToolSchema {
+fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_on: bool, comptime channel: usize, comptime background_on: bool, comptime title_on: bool) [max_schemas]p.ToolSchema {
     var result: [max_schemas]p.ToolSchema = undefined;
     var count: usize = 0;
     const base = if (review) &reviewed_schemas else &schemas;
@@ -183,16 +191,20 @@ fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_
         result[count] = background_schema;
         count += 1;
     }
+    if (title_on) {
+        result[count] = title_schema;
+        count += 1;
+    }
     return result;
 }
 
 // Static table of the small feature matrix. Slices point into read-only data, so
 // a rebind never invalidates a previously handed-out schema slice.
 const schema_table = blk: {
-    @setEvalBranchQuota(80000);
-    var table: [schema_choices][schema_choices][schema_choices][schema_choices][channel_choices][max_schemas]p.ToolSchema = undefined;
-    for (0..schema_choices) |background_on| for (0..schema_choices) |review| for (0..schema_choices) |image_on| for (0..schema_choices) |memory_on| for (0..channel_choices) |channel| {
-        table[background_on][review][image_on][memory_on][channel] = buildSchemas(review == 1, image_on == 1, memory_on == 1, channel, background_on == 1);
+    @setEvalBranchQuota(160000);
+    var table: [schema_choices][schema_choices][schema_choices][schema_choices][schema_choices][channel_choices][max_schemas]p.ToolSchema = undefined;
+    for (0..schema_choices) |title_on| for (0..schema_choices) |background_on| for (0..schema_choices) |review| for (0..schema_choices) |image_on| for (0..schema_choices) |memory_on| for (0..channel_choices) |channel| {
+        table[title_on][background_on][review][image_on][memory_on][channel] = buildSchemas(review == 1, image_on == 1, memory_on == 1, channel, background_on == 1, title_on == 1);
     };
     break :blk table;
 };
@@ -207,10 +219,12 @@ fn schemaCount(image_on: bool, memory_on: bool, channel: usize, background_on: b
 }
 
 fn schemasFor(review: bool, image_on: bool, memory_on: bool, channel: usize, background_on: bool) []const p.ToolSchema {
-    // Explicit pointer to read-only static storage: the slice address stays
-    // valid for the whole process, independent of any host/executor move.
-    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(background_on)][@intFromBool(review)][@intFromBool(image_on)][@intFromBool(memory_on)][channel];
-    return set[0..schemaCount(image_on, memory_on, channel, background_on)];
+    return schemasWithTitle(review, image_on, memory_on, channel, background_on, false);
+}
+
+fn schemasWithTitle(review: bool, image_on: bool, memory_on: bool, channel: usize, background_on: bool, title_on: bool) []const p.ToolSchema {
+    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(title_on)][@intFromBool(background_on)][@intFromBool(review)][@intFromBool(image_on)][@intFromBool(memory_on)][channel];
+    return set[0 .. schemaCount(image_on, memory_on, channel, background_on) + @as(usize, @intFromBool(title_on))];
 }
 
 fn schemasForServices(review: bool, enabled: bool) []const p.ToolSchema {
@@ -256,6 +270,7 @@ pub const Action = union(enum) {
     send_subagent_message: subagent.Send,
     cancel_subagent: subagent.Cancel,
     message_parent: subagent.Message,
+    set_session_title: Title,
 
     /// 生成展示给用户的授权描述；写入 memory 时附带完整内容，便于用户审阅后再批准。
     pub fn description(self: Action, a: std.mem.Allocator) ![]const u8 {
@@ -287,6 +302,7 @@ pub const Action = union(enum) {
             // Child status only; the parent must not see the message body in a
             // generic row and no separate panel is introduced here.
             .message_parent => try a.dupe(u8, "Message parent"),
+            .set_session_title => |title| try std.fmt.allocPrint(a, "Set session title: {s}", .{title.text()}),
         };
     }
 };
@@ -306,6 +322,12 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
     if (arguments.len > limits.max_response_bytes) return error.ArgumentsTooLarge;
     // 严格模式：拒绝未知字段（如伪造的 trust），并让字符串复制进 arena，不借用输入缓冲。
     const opts: std.json.ParseOptions = .{ .allocate = .alloc_always, .ignore_unknown_fields = false };
+    if (std.mem.eql(u8, name, "set_session_title")) {
+        const args = try std.json.parseFromSliceLeaky(struct { title: []const u8 }, a, arguments, opts);
+        const title = Title.fromText(args.title);
+        if (title.text().len == 0) return error.InvalidSessionTitle;
+        return .{ .set_session_title = title };
+    }
     if (std.mem.eql(u8, name, "read_image")) {
         const args = try std.json.parseFromSliceLeaky(ReadImage, a, arguments, opts);
         try validateReadImage(args);
@@ -456,17 +478,13 @@ pub const Tools = struct {
     /// service and no child channel exposes bash background=true and the
     /// management tool. It is a separate capability from subagents.
     background: ?background.Service = null,
-    /// Root-shared write/bash serialization. All children of one root task
-    /// borrow the same gate, so concurrent jobs can reason and read in parallel
-    /// while mutating tools wait. The parent is refused instead of sharing it:
-    /// its write/command stops while any child is uncollected. It is not a
-    /// recursive service and grants no capability. Null leaves writes unordered.
-    subagent_mutation_gate: ?*subagent.MutationGate = null,
     /// Child-only channel. It exposes exactly the message_parent tool; it cannot
     /// reach parent jobs, permissions, Runtime or Memory.
     parent_channel: ?subagent.ParentChannel = null,
     /// False hides the memory schema and rejects forged memory calls (child Tools).
     allow_memory: bool = true,
+    /// Only a Session-owned root App enables the title capability.
+    session_title: ?Title = null,
 
     /// Hidden capabilities are an execution boundary, not only a schema detail.
     /// The parent surface exists exactly when the host supplied a service; there
@@ -493,16 +511,6 @@ pub const Tools = struct {
     fn isParentTool(name: []const u8) bool {
         return std.mem.eql(u8, name, "subagent") or std.mem.eql(u8, name, "get_subagent_result") or
             std.mem.eql(u8, name, "send_subagent_message") or std.mem.eql(u8, name, "cancel_subagent");
-    }
-
-    /// Parent write/bash are refused while any child of this root is running or
-    /// uncollected, in BOTH prepare and execute. Reads, images and communication
-    /// stay available. This is not an OS sandbox claim.
-    fn checkParentConflict(self: *Tools, action: Action) !void {
-        const blocked = action == .write_file or action == .bash;
-        if (!blocked) return;
-        const service = self.subagent orelse return;
-        if (service.active()) return error.SubagentActive;
     }
 
     fn channelChoice(self: *Tools) usize {
@@ -536,6 +544,10 @@ pub const Tools = struct {
                 try subagent.validateMessage(message);
             },
             .memory => if (!self.allow_memory) return error.MemoryDisabled,
+            .set_session_title => |title| {
+                if (self.session_title == null or self.parent_channel != null) return error.SessionTitleDisabled;
+                if (title.text().len == 0) return error.InvalidSessionTitle;
+            },
             else => {},
         }
     }
@@ -649,7 +661,7 @@ pub const Tools = struct {
     pub fn executor(self: *Tools) runtime.Executor {
         return .{
             .context = self,
-            .schemas = schemasFor(self.config.decisionActive(), self.image != null, self.allow_memory, self.channelChoice(), self.backgroundActive()),
+            .schemas = schemasWithTitle(self.config.decisionActive(), self.image != null, self.allow_memory, self.channelChoice(), self.backgroundActive(), self.session_title != null and self.parent_channel == null),
             .prepare_fn = prepare,
             .execute_fn = executePrepared,
             .preview_write_fn = previewWrite,
@@ -710,35 +722,23 @@ pub const Tools = struct {
         const self: *Tools = @ptrCast(@alignCast(context_));
         // Names the model was never offered must not become executable actions.
         // Reject before parsing or allocating anything.
+        if (std.mem.eql(u8, call.name, "set_session_title") and (self.session_title == null or self.parent_channel != null)) return error.SessionTitleDisabled;
         if (!self.allow_memory and std.mem.eql(u8, call.name, "memory")) return error.MemoryDisabled;
         if (!self.subagentActive() and isParentTool(call.name)) return error.SubagentDisabled;
         if (!self.parentChannelActive() and std.mem.eql(u8, call.name, "message_parent")) return error.SubagentMessageDisabled;
         // Pure availability boundary: a child Tools (parent channel) and any
         // Tools without a registry must reject the management tool before parse.
         if (isBackgroundManaged(call.name) and !self.backgroundActive()) return error.BackgroundDisabled;
-        // Double guard: an active/uncollected child must not race a parent write
-        // or command. Pure check, so prepare stays side-effect free.
-        if (std.mem.eql(u8, call.name, "write_file") or std.mem.eql(u8, call.name, "bash")) {
-            if (self.subagent) |service| if (service.active()) return error.SubagentActive;
-        }
         const action = try a.create(Action);
         action.* = try parse(a, call.name, call.arguments, self.config.limits);
         // Forged background arguments fail here as well as in direct execute.
         try self.checkAvailableActions(action.*);
         try self.checkImageAction(action.*);
         try self.checkFileAction(a, action.*);
-        if (action.* == .read_file) {
-            self.root.probeExternalRead(action.read_file.path, self.textReadGuard()) catch |err| switch (err) {
-                // Another call in this batch may create the file or its parent.
-                // Execution resolves afresh and guards the descriptor it reads.
-                error.FileNotFound => {},
-                else => return err,
-            };
-        }
         // 危险 bash 在授权前打标。Runtime 看到 explicit_denial 后逐次询问。
         var description = try action.description(a);
-        const denial: ?[]const u8 = if (action.* == .bash) blk: {
-            const finding = command_risk.classify(action.bash.command) orelse break :blk null;
+        const risk = if (action.* == .bash) command_risk.classify(action.bash.command) else null;
+        const denial: ?[]const u8 = if (risk) |finding| blk: {
             description = try std.fmt.allocPrint(a, "DANGEROUS bash ({s}). Explicit approval is required each time; choose Allow once or Deny in the confirmation popup.\n{s}", .{ finding.label, description });
             break :blk try std.fmt.allocPrint(a, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow each time.", .{finding.label});
         } else null;
@@ -747,7 +747,7 @@ pub const Tools = struct {
                 .command = b.command,
                 .proposed_timeout_ms = b.timeout_ms,
                 .max_timeout_ms = self.config.limits.command_max_timeout_ms,
-                .risk = if (command_risk.classify(b.command)) |finding| finding.label else null,
+                .risk = if (risk) |finding| finding.label else null,
             } },
             else => null,
         };
@@ -776,9 +776,6 @@ pub const Tools = struct {
         // tool execution, not only background calls: side effects are no longer
         // known-safe. The service health check never stops a handed-off job.
         if (self.backgroundActive()) if (self.background) |service| try service.checkReady();
-        // Second half of the double guard: a direct forged execute must not
-        // bypass the parent write/bash conflict rule.
-        try self.checkParentConflict(action);
         // 执行前已取消则直接返回，不触碰磁盘或子进程。
         if (cancel.isRequested()) return .{ .text = "Canceled before execution", .is_error = true, .canceled = true };
 
@@ -786,18 +783,14 @@ pub const Tools = struct {
         // 不在这里重复拒绝：能进入 execute 说明本次调用已经过明确批准。bash 仍不是沙箱。
         try self.checkFileAction(a, action);
 
-        // Mutating side effects of the whole root task serialize here, after the
-        // pure guards and outside any approval wait. A canceled or failed
-        // acquire returns before the defer is registered, so no lock leaks and
-        // no command or disk write runs. Every later return, OOM and command
-        // cleanup failure releases through the defer.
-        const mutation_gate = if (action == .write_file or action == .bash) self.subagent_mutation_gate else null;
-        if (mutation_gate) |gate| try gate.acquire(self.root.io, cancel);
-        defer if (mutation_gate) |gate| gate.release();
-        if (cancel.isRequested()) return .{ .text = "Canceled before execution", .is_error = true, .canceled = true };
-
         var value = j.object(a);
         switch (action) {
+            .set_session_title => |title| {
+                try j.put(a, &value, "title", j.str(title.text()));
+                const encoded = try j.encode(a, value);
+                self.session_title = title;
+                return .{ .text = encoded };
+            },
             .read_image => |r| {
                 if (cancel.isRequested()) return error.Canceled;
                 const picture = try image_file.load(a, self.root, r.path);
@@ -1189,7 +1182,7 @@ test "command environment excludes fake credentials even under a normally allowe
     try std.testing.expectEqualStrings("C.UTF-8", filtered.get("LANG").?);
 }
 
-test "project settings exact aliases protected at prepare and direct execute" {
+test "project settings exact aliases protected at prepared and direct execute" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1210,15 +1203,14 @@ test "project settings exact aliases protected at prepare and direct execute" {
         // Read authorization is descriptor-based so aliases and hard links are
         // rejected against the same opened inode, not guessed during prepare.
         try tools.checkFileAction(a, .{ .read_file = .{ .path = path } });
-        if (tools.execute(a, .{ .read_file = .{ .path = path } }, &cancel)) |_| return error.ExpectedProtectedRead else |err| {
-            try std.testing.expect(err == error.ProtectedSettingsFile or err == error.NotDir or err == error.FileNotFound);
-        }
+        const direct_error = if (tools.execute(a, .{ .read_file = .{ .path = path } }, &cancel)) |_| return error.ExpectedProtectedRead else |err| err;
+        try std.testing.expect(direct_error == error.ProtectedSettingsFile or direct_error == error.NotDir or direct_error == error.FileNotFound);
         try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .write_file = .{ .path = path, .content = "x" } }, &cancel));
         const read_args = try std.fmt.allocPrint(a, "{{\"path\":\"{s}\"}}", .{path});
         const write_args = try std.fmt.allocPrint(a, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
-        if (Tools.prepare(&tools, a, .{ .id = "r", .name = "read_file", .arguments = read_args })) |_| return error.ExpectedProtectedRead else |err| {
-            try std.testing.expect(err == error.ProtectedSettingsFile or err == error.NotDir or err == error.FileNotFound);
-        }
+        const executor = tools.executor();
+        const prepared = try executor.prepare_fn(executor.context, a, .{ .id = "r", .name = "read_file", .arguments = read_args });
+        try std.testing.expectError(direct_error, executor.execute_fn(executor.context, a, prepared, &cancel));
         try std.testing.expectError(error.ProtectedSettingsFile, Tools.prepare(&tools, a, .{ .id = "w", .name = "write_file", .arguments = write_args }));
     }
     for ([_][]const u8{ ".thin/settings.jsonfoo", ".thin/sub/settings.json", "settings.json", ".thin/settings.json/child" }) |path| {
@@ -1281,13 +1273,13 @@ test "dangerous bash is marked for explicit approval and ordinary bash is not" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const dangerous = try Tools.prepare(&tools, a, .{ .id = "d", .name = "bash", .arguments = "{\"command\":\"rm -rf build\"}" });
+    const dangerous = try Tools.prepare(&tools, a, .{ .id = "d", .name = "bash", .arguments = "{\"command\":\"rm -f .ssh/fixture-marker\"}" });
     try std.testing.expect(dangerous.explicit_denial != null);
-    try std.testing.expect(std.mem.indexOf(u8, dangerous.explicit_denial.?, "recursive delete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dangerous.explicit_denial.?, "sensitive") != null);
     try std.testing.expect(std.mem.indexOf(u8, dangerous.explicit_denial.?, "explicit user allow each time") != null);
     try std.testing.expect(std.mem.indexOf(u8, dangerous.description, "DANGEROUS bash") != null);
 
-    const safe = try Tools.prepare(&tools, a, .{ .id = "s", .name = "bash", .arguments = "{\"command\":\"printf ok\"}" });
+    const safe = try Tools.prepare(&tools, a, .{ .id = "s", .name = "bash", .arguments = "{\"command\":\"rm -rf build\"}" });
     try std.testing.expect(safe.explicit_denial == null);
     try std.testing.expect(std.mem.indexOf(u8, safe.description, "DANGEROUS") == null);
 }
@@ -1434,12 +1426,47 @@ fn fakeParentMessage(_: *anyopaque, _: std.mem.Allocator, _: subagent.Message, _
     return .{ .text = "{}" };
 }
 
-fn fakeSubagentRun(_: *anyopaque, _: std.mem.Allocator, _: subagent.Request, _: *const p.Cancellation) anyerror!subagent.Result {
-    return .{ .text = "{}" };
+test "session title schema is appended across the static matrix" {
+    for ([_]bool{ false, true }) |review| for ([_]bool{ false, true }) |image_on| for ([_]bool{ false, true }) |memory_on| for ([_]bool{ false, true }) |background_on| for (0..channel_choices) |channel| {
+        const old = schemasFor(review, image_on, memory_on, channel, background_on);
+        const with_title = schemasWithTitle(review, image_on, memory_on, channel, background_on, true);
+        try std.testing.expectEqual(old.len + 1, with_title.len);
+        for (old, with_title[0..old.len]) |before, after| try std.testing.expectEqualStrings(before.name, after.name);
+        try std.testing.expectEqualStrings("set_session_title", with_title[old.len].name);
+    };
+    try std.testing.expectEqual(@as(usize, 11), schemasWithTitle(true, true, true, 1, true, true).len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, title_schema.parameters_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
 }
 
-fn fakeSubagentActive(_: *anyopaque) bool {
-    return true;
+test "session title prepare execution and capability boundaries" {
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tools: Tools = .{ .root = undefined, .memory = undefined, .config = &config, .environment = &env };
+    var cancel: p.Cancellation = .{};
+    const call: p.ToolCall = .{ .id = "t", .name = "set_session_title", .arguments = "{\"title\":\"中文标题\"}" };
+    try std.testing.expectError(error.SessionTitleDisabled, Tools.prepare(&tools, a, call));
+    try std.testing.expectError(error.SessionTitleDisabled, tools.execute(a, .{ .set_session_title = Title.fromText("标题") }, &cancel));
+    tools.session_title = Title.fromText("原题");
+    try std.testing.expectEqualStrings("set_session_title", tools.executor().schemas[tools.executor().schemas.len - 1].name);
+    try std.testing.expectError(error.InvalidSessionTitle, Tools.prepare(&tools, a, .{ .id = "t", .name = "set_session_title", .arguments = "{\"title\":\"\"}" }));
+    const prepared = try Tools.prepare(&tools, a, call);
+    try std.testing.expect(prepared.explicit_denial == null and prepared.decision_input == null);
+    try std.testing.expectEqualStrings("原题", tools.session_title.?.text());
+    cancel.cancel();
+    const canceled = try Tools.executePrepared(&tools, a, prepared, &cancel);
+    try std.testing.expect(canceled.canceled);
+    try std.testing.expectEqualStrings("原题", tools.session_title.?.text());
+    cancel = .{};
+    const result = try Tools.executePrepared(&tools, a, prepared, &cancel);
+    try std.testing.expectEqualStrings("中文标题", tools.session_title.?.text());
+    const json = try std.json.parseFromSlice(std.json.Value, a, result.text, .{});
+    try std.testing.expectEqualStrings("中文标题", json.value.object.get("title").?.string);
 }
 
 test "background schema is appended last and old schemas keep indexes" {
@@ -1523,7 +1550,7 @@ test "background capability is root-only approved and never re-encoded" {
 
     // Root service: prepare stays pure but still carries risk/review metadata.
     tools.background = fake.service();
-    const prepared = try Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"rm -rf build\",\"background\":true}" });
+    const prepared = try Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"rm -f .ssh/fixture-marker\",\"background\":true}" });
     try std.testing.expect(prepared.explicit_denial != null);
     try std.testing.expect(std.mem.indexOf(u8, prepared.description, "DANGEROUS bash") != null);
     try std.testing.expect(std.mem.indexOf(u8, prepared.description, "background service") != null);
@@ -1607,13 +1634,6 @@ test "background capability is root-only approved and never re-encoded" {
     try std.testing.expect(std.mem.indexOf(u8, child_schemas[2].parameters_json, "background") == null);
     tools.allow_memory = true;
     tools.parent_channel = null;
-
-    // The existing parent/child mutation guard still refuses background bash.
-    var sub_marker: u8 = 0;
-    tools.subagent = .{ .context = &sub_marker, .run_fn = fakeSubagentRun, .active_fn = fakeSubagentActive };
-    try std.testing.expectError(error.SubagentActive, Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"true\",\"background\":true}" }));
-    try std.testing.expectError(error.SubagentActive, tools.execute(a, .{ .bash = .{ .command = "true", .background = true } }, &cancel));
-    tools.subagent = null;
 
     // Default foreground bash is unchanged and never calls the background service.
     var tmp = std.testing.tmpDir(.{});

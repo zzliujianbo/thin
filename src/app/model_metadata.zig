@@ -844,7 +844,7 @@ pub fn eligible(cache: *const Cache, requested: u8, now: u64, policy: Policy) u8
 
 /// Only current-schema data loads; older schemas are rebuilt by a refresh
 /// claim, while future and malformed documents stay rejected.
-pub const cache_version: u32 = 15;
+pub const cache_version: u32 = 16;
 
 const Document = struct {
     version: u32 = cache_version,
@@ -1439,7 +1439,7 @@ test "metadata rejects old future unknown and malformed cache without writing" {
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const a = std.testing.allocator;
-    for (0..17) |version| {
+    for (0..18) |version| {
         if (version == cache_version) continue;
         const body = try std.fmt.allocPrint(a, "{{\"version\":{d},\"models\":[]}}", .{version});
         defer a.free(body);
@@ -1460,11 +1460,11 @@ test "metadata rejects old future unknown and malformed cache without writing" {
         try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
     }
     for ([_][]const u8{
-        "{\"version\":15,\"attempted\":0}",
-        "{\"version\":15,\"records\":[]}",
-        "{\"version\":15,\"unknown\":false}",
-        "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",\"unknown\":1}]}",
-        "{\"version\":15,\"refresh\":[{\"unknown\":0},{},{},{},{}]}",
+        "{\"version\":16,\"attempted\":0}",
+        "{\"version\":16,\"records\":[]}",
+        "{\"version\":16,\"unknown\":false}",
+        "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",\"unknown\":1}]}",
+        "{\"version\":16,\"refresh\":[{\"unknown\":0},{},{},{},{}]}",
     }) |body| {
         try root.writeMode(file_name, body, true, 0o600);
         const before = try root.dir.statFile(root.io, file_name, .{});
@@ -1474,6 +1474,12 @@ test "metadata rejects old future unknown and malformed cache without writing" {
         defer a.free(bytes.data);
         try std.testing.expectEqualStrings(body, bytes.data);
     }
+}
+
+test "version 15 ambiguous public profiles are outdated rather than migrated" {
+    try std.testing.expectError(error.OutdatedMetadataCache, parseCache(std.testing.allocator,
+        \\{"version":15,"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_present":true,"dev_reasoning":{"format":"anthropic","map":{"high":"high"}}}]}
+    ));
 }
 
 test "metadata stale document is rebuilt by manual and automatic claims only" {
@@ -1593,10 +1599,10 @@ test "metadata rejects malformed availability and duplicate cache records withou
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const cases = [_]struct { body: []const u8, err: anyerror }{
-        .{ .body = "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":1}]}", .err = error.UnexpectedToken },
-        .{ .body = "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":\"true\"}]}", .err = error.UnexpectedToken },
-        .{ .body = "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true,\"available\":false}]}", .err = error.DuplicateField },
-        .{ .body = "{\"version\":15,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true},{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":false}]}", .err = error.InvalidMetadata },
+        .{ .body = "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":1}]}", .err = error.UnexpectedToken },
+        .{ .body = "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":\"true\"}]}", .err = error.UnexpectedToken },
+        .{ .body = "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true,\"available\":false}]}", .err = error.DuplicateField },
+        .{ .body = "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true},{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":false}]}", .err = error.InvalidMetadata },
     };
     for (cases) |case| {
         try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = case.body });
@@ -1691,7 +1697,7 @@ test "models.dev loopback transport parses public catalog and enforces its own s
 
 fn cacheAllocationCheck(a: std.mem.Allocator) !void {
     const cache = try parseCache(a,
-        \\{"version":15,"directory_mask":1,"models":[{"provider":"deepseek","id":"deepseek/raw/id","context_window":131072,"available":true,"protocol":"chat","reasoning":{"format":"deepseek","map":{"off":"off","high":"high"}},"dev_protocol":"chat","dev_present":true,"dev_output_tokens":8192,"dev_context_tokens":262144,"dev_input_price_flat_limit":262144}],"refresh":[{"generation":7,"last_attempt_ms":10,"last_success_ms":11,"successful":true},{},{},{},{}]}
+        \\{"version":16,"directory_mask":1,"models":[{"provider":"deepseek","id":"deepseek/raw/id","context_window":131072,"available":true,"protocol":"chat","reasoning":{"format":"deepseek","map":{"off":"off","high":"high"}},"dev_protocol":"chat","dev_present":true,"dev_output_tokens":8192,"dev_context_tokens":262144,"dev_input_price_flat_limit":262144}],"refresh":[{"generation":7,"last_attempt_ms":10,"last_success_ms":11,"successful":true},{},{},{},{}]}
     );
     try std.testing.expectEqualStrings("deepseek/raw/id", cache.directory.name(0));
     try std.testing.expectEqual(@as(u64, 7), cache.refresh[0].generation);
@@ -1822,7 +1828,7 @@ test "provider reasoning source official route ignores public protocol" {
 test "provider reasoning source ignores stale public cache and public refresh for DeepSeek" {
     const t = std.testing;
     const cache = try parseCache(t.allocator,
-        \\{"version":15,"models":[{"provider":"deepseek","id":"refresh-test","protocol":"chat","dev_protocol":"chat","dev_present":true,"dev_reasoning":{"format":"deepseek","map":{"off":"off","low":"low"}}}]}
+        \\{"version":16,"models":[{"provider":"deepseek","id":"refresh-test","protocol":"chat","dev_protocol":"chat","dev_present":true,"dev_reasoning":{"format":"deepseek","map":{"off":"off","low":"low"}}}]}
     );
     var listing: Listing = .{ .directory = cache.directory };
     const entry = restoreEntry(&cache, .deepseek, "refresh-test").?;

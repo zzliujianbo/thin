@@ -274,12 +274,12 @@ pub const help =
     \\No trial inference requests or automatic changes to global defaults.
     \\Ordinary tool calls run without approval prompts.
     \\Commands run with your account permissions; bash is NOT a sandbox.
-    \\High-risk bash is classified before it runs and requires explicit approval each time.
-    \\Patterns: recursive rm, find -delete, git clean -f, mkfs and dd onto devices,
-    \\writes or chmod/chown of /etc, /usr, /bin, /root or ~/.ssh, curl|bash and wget|sh, and fork bombs.
-    \\The confirmation popup uses arrows, Enter and Esc; the next dangerous command asks again.
-    \\On denial the model gets an error and nothing runs.
-    \\--print cannot approve dangerous bash, so those calls are denied.
+    \\Bash risk checks include sensitive-target deletion or writes, device destruction,
+    \\sensitive chmod/chown, remote script execution, and fork bombs.
+    \\Without Decision, static risk matches require approval each time; with Decision,
+    \\approval follows its ask result, and a failed decision does not allow execution.
+    \\The confirmation popup uses arrows, Enter and Esc; on denial nothing runs.
+    \\--print cannot approve a command, so calls requiring approval are denied.
     \\--print returns the final committed visible answer with the same tool policy.
     \\
     \\Model and logical thinking defaults share ~/.thin/config.json (0600).
@@ -357,8 +357,9 @@ test "CLI ordinary tools run directly and print requires a prompt" {
     try std.testing.expectEqualStrings("hello", options.prompt.?);
     try std.testing.expect(std.mem.indexOf(u8, help, "run without approval prompts") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "No automatic command-risk classifier") == null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "High-risk bash is classified") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "requires explicit approval each time") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Without Decision, static risk matches require approval each time; with Decision,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "approval follows its ask result, and a failed decision does not allow execution.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Patterns: recursive rm, find -delete, git clean -f") == null);
     try std.testing.expect((try parse(&.{"thin"})).auto_refresh_models);
     try std.testing.expect(!(try parse(&.{ "thin", "--no-model-auto-refresh" })).auto_refresh_models);
     try std.testing.expectError(error.UnknownOption, parse(&.{ "thin", "--no-log" }));

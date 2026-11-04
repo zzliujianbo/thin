@@ -240,7 +240,8 @@ test "session and log reads retain file safety and credential guards without per
     try std.testing.expectError(error.InvalidUtf8, tools.execute(temp, .{ .read_file = .{ .path = ".thin/sessions/invalid.session" } }, &cancel));
     try std.testing.expectError(error.NotRegularFile, tools.execute(temp, .{ .read_file = .{ .path = ".thin/sessions" } }, &cancel));
     try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(temp, .{ .read_file = .{ .path = ".thin/sessions/../settings.json" } }, &cancel));
-    try std.testing.expectError(error.ProtectedSettingsFile, executor.prepare_fn(executor.context, temp, .{ .id = "escape", .name = "read_file", .arguments = "{\"path\":\".thin/sessions/../settings.json\"}" }));
+    const escape = try executor.prepare_fn(executor.context, temp, .{ .id = "escape", .name = "read_file", .arguments = "{\"path\":\".thin/sessions/../settings.json\"}" });
+    try std.testing.expectError(error.ProtectedSettingsFile, executor.execute_fn(executor.context, temp, escape, &cancel));
     try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("fake.jsonl", root.dir.handle, ".thin/logs/link.jsonl"));
     try std.testing.expectError(error.SymlinkNotAllowed, tools.execute(temp, .{ .read_file = .{ .path = ".thin/logs/link.jsonl" } }, &cancel));
     try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("sessions", root.dir.handle, ".thin/linked"));
@@ -254,7 +255,8 @@ test "session and log reads retain file safety and credential guards without per
         const alias = try std.fmt.allocPrint(temp, "./{s}", .{canonical});
         for ([_][]const u8{ canonical, alias, tools.auth_path.? }) |path| {
             const args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\"}}", .{path});
-            try std.testing.expectError(error.ProtectedAuthFile, executor.prepare_fn(executor.context, temp, .{ .id = "key", .name = "read_file", .arguments = args }));
+            const prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "key", .name = "read_file", .arguments = args });
+            try std.testing.expectError(error.ProtectedAuthFile, executor.execute_fn(executor.context, temp, prepared, &cancel));
             try std.testing.expectError(error.ProtectedAuthFile, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
             const denied: anyerror = if (std.mem.startsWith(u8, canonical, ".thin/sessions/")) error.ProtectedSessionFile else error.ProtectedAuthFile;
             const write_args = try std.fmt.allocPrint(temp, "{{\"path\":\"{s}\",\"content\":\"not written\",\"overwrite\":true}}", .{path});
@@ -312,7 +314,8 @@ test "external text reads allow absolute and parent paths without opening write 
     try std.testing.expectEqualStrings("sibling\n", j.string(j.get(try j.parse(temp, other.text), "content")).?);
     for ([_][]const u8{ tools.auth_path.?, "../auth.json", "../project/../auth.json" }) |path| {
         const args = try std.json.Stringify.valueAlloc(temp, .{ .path = path }, .{});
-        try std.testing.expectError(error.ProtectedAuthFile, executor.prepare_fn(executor.context, temp, .{ .id = "auth", .name = "read_file", .arguments = args }));
+        const prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "auth", .name = "read_file", .arguments = args });
+        try std.testing.expectError(error.ProtectedAuthFile, executor.execute_fn(executor.context, temp, prepared, &cancel));
         try std.testing.expectError(error.ProtectedAuthFile, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
     }
     try std.testing.expectError(error.InvalidReadLimit, tools.execute(temp, .{ .read_file = .{ .path = outside, .limit = 0 } }, &cancel));
@@ -365,22 +368,24 @@ test "migrated text read guards prepare and execute" {
     try std.testing.expectError(error.ProtectedAuthFile, executor.execute_fn(executor.context, temp, pending, &cancel));
     for ([_][]const u8{ "../auth.json", "./../auth.json", tools.auth_path.? }) |path| {
         const args = try std.json.Stringify.valueAlloc(temp, .{ .path = path }, .{});
-        try std.testing.expectError(error.ProtectedAuthFile, executor.prepare_fn(executor.context, temp, .{ .id = "migrated-auth", .name = "read_file", .arguments = args }));
+        const prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "migrated-auth", .name = "read_file", .arguments = args });
+        try std.testing.expectError(error.ProtectedAuthFile, executor.execute_fn(executor.context, temp, prepared, &cancel));
         try std.testing.expectError(error.ProtectedAuthFile, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
     }
     const moved_settings = try std.fs.path.join(temp, &.{ home, "stage/project/.thin/settings.json" });
     for ([_][]const u8{ ".thin/settings.json", "../project/.thin/settings.json", moved_settings }) |path| {
         const args = try std.json.Stringify.valueAlloc(temp, .{ .path = path }, .{});
-        try std.testing.expectError(error.ProtectedSettingsFile, executor.prepare_fn(executor.context, temp, .{ .id = "migrated-settings", .name = "read_file", .arguments = args }));
+        const prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "migrated-settings", .name = "read_file", .arguments = args });
+        try std.testing.expectError(error.ProtectedSettingsFile, executor.execute_fn(executor.context, temp, prepared, &cancel));
         try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
     }
-    // Metadata-only leaf identity also denies hardlink aliases without reading
-    // auth/settings contents, both before approval and at the actual read.
+    // Descriptor identity denies hardlink aliases without reading protected contents.
     try std.testing.expectEqual(@as(c_int, 0), std.c.linkat(tmp.dir.handle, "stage/auth.json", root.dir.handle, "auth-alias.txt", 0));
     try std.testing.expectEqual(@as(c_int, 0), std.c.linkat(root.dir.handle, ".thin/settings.json", root.dir.handle, "settings-alias.txt", 0));
     for ([_][]const u8{ "auth-alias.txt", "settings-alias.txt" }, [_]anyerror{ error.ProtectedAuthFile, error.ProtectedSettingsFile }) |path, expected| {
         const args = try std.json.Stringify.valueAlloc(temp, .{ .path = path }, .{});
-        try std.testing.expectError(expected, executor.prepare_fn(executor.context, temp, .{ .id = "identity", .name = "read_file", .arguments = args }));
+        const prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "identity", .name = "read_file", .arguments = args });
+        try std.testing.expectError(expected, executor.execute_fn(executor.context, temp, prepared, &cancel));
         try std.testing.expectError(expected, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
     }
 }
@@ -458,13 +463,15 @@ test "absolute read aliases anchor without folding symlink parents" {
         try std.fmt.allocPrint(temp, "{s}/outer-link/../project/anchor.txt", .{home}),
     }) |path| {
         const args = try std.json.Stringify.valueAlloc(temp, .{ .path = path }, .{});
-        try std.testing.expectError(error.NotDir, executor.prepare_fn(executor.context, temp, .{ .id = "link-parent", .name = "read_file", .arguments = args }));
+        const prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "link-parent", .name = "read_file", .arguments = args });
+        try std.testing.expectError(error.NotDir, executor.execute_fn(executor.context, temp, prepared, &cancel));
         try std.testing.expectError(error.NotDir, tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel));
     }
     // Settings remain protected even when the final file does not exist yet.
     const settings_alias = try std.fmt.allocPrint(temp, "{s}//./project/.thin/settings.json", .{home});
     const settings_args = try std.json.Stringify.valueAlloc(temp, .{ .path = settings_alias }, .{});
-    try std.testing.expectError(error.ProtectedSettingsFile, executor.prepare_fn(executor.context, temp, .{ .id = "settings-alias", .name = "read_file", .arguments = settings_args }));
+    const settings_prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "settings-alias", .name = "read_file", .arguments = settings_args });
+    try std.testing.expectError(error.ProtectedSettingsFile, executor.execute_fn(executor.context, temp, settings_prepared, &cancel));
     try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(temp, .{ .read_file = .{ .path = settings_alias } }, &cancel));
 }
 
@@ -635,6 +642,31 @@ test "tools prepare decision inputs without side effects and honor explicit no d
     try std.testing.expectError(error.FileNotFound, store.read(alloc, "style"));
     const list = try executor.prepare_fn(executor.context, alloc, .{ .id = "list", .name = "memory", .arguments = "{\"action\":\"list\"}" });
     try std.testing.expect(list.decision_input == null);
+    for ([_]struct { args: []const u8, label: ?[]const u8 }{
+        .{ .args = "{\"command\":\"printf hello\"}", .label = null },
+        .{ .args = "{\"command\":\"rm -rf example\"}", .label = null },
+        .{ .args = "{\"command\":\"find example -delete\"}", .label = null },
+        .{ .args = "{\"command\":\"git clean -f -- build/generated\"}", .label = null },
+        .{ .args = "{\"command\":\"rm -f .ssh/fixture-marker\"}", .label = "delete of a sensitive path" },
+        .{ .args = "{\"command\":\"mkfs /dev/example\"}", .label = "filesystem format" },
+    }) |case| {
+        const prepared = try executor.prepare_fn(executor.context, alloc, .{
+            .id = "risk",
+            .name = "bash",
+            .arguments = case.args,
+        });
+        const risk = prepared.decision_input.?.command.risk;
+        if (case.label) |label| {
+            try std.testing.expectEqualStrings(label, risk.?);
+            const approval = try std.fmt.allocPrint(alloc, "DANGEROUS bash ({s}). Explicit approval is required each time", .{label});
+            const denial = try std.fmt.allocPrint(alloc, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow each time.", .{label});
+            try std.testing.expect(std.mem.indexOf(u8, prepared.description, approval) != null);
+            try std.testing.expectEqualStrings(denial, prepared.explicit_denial.?);
+        } else {
+            try std.testing.expect(risk == null);
+            try std.testing.expect(prepared.explicit_denial == null);
+        }
+    }
     var cancel = p.Cancellation{};
     for ([_]@import("../core/decision.zig").Timeout{ .none, .{ .milliseconds = 1000 } }) |timeout| {
         var prepared = try executor.prepare_fn(executor.context, alloc, .{

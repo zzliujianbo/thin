@@ -320,8 +320,8 @@ test "chat refuses truncation length malformed arguments duplicate IDs and unkno
     try std.testing.expect(std.mem.indexOf(u8, failure.message, "secret-key") == null);
 }
 
-// 正常请求与摘要均省略输出上限，旧兼容选项也不能重新引入。
-test "chat omits all output caps even with legacy option and known model capacity" {
+// 正常请求与摘要均省略输出上限。
+test "chat omits all output caps with varying model capacity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -330,24 +330,15 @@ test "chat omits all output caps even with legacy option and known model capacit
         req.model_output_tokens = capacity;
         for ([_]p.Purpose{ .normal, .summary }) |purpose| {
             req.purpose = purpose;
-            for ([_]bool{ false, true }) |legacy| {
-                const wire = try j.parse(a, try encodeWithOptions(a, req, legacy));
-                inline for (.{ "max_tokens", "max_completion_tokens", "max_output_tokens" }) |key|
-                    try std.testing.expect(j.get(wire, key) == null);
-            }
+            const wire = try j.parse(a, try encode(a, req));
+            inline for (.{ "max_tokens", "max_completion_tokens", "max_output_tokens" }) |key|
+                try std.testing.expect(j.get(wire, key) == null);
         }
     }
 }
 
 /// 将 p.Request 编码为 Chat Completions 请求体 JSON，结果由调用方的 allocator 拥有。
 pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
-    return encodeWithOptions(a, req, false);
-}
-
-/// Compatibility entry point only: the legacy option is ignored.
-/// Chat never emits max_tokens, max_completion_tokens or max_output_tokens.
-pub fn encodeWithOptions(a: std.mem.Allocator, req: p.Request, use_max_tokens: bool) ![]u8 {
-    _ = use_max_tokens;
     try c.validateRequest(req, .chat);
 
     // 中间 JSON 树放在临时 arena 中；最终结果通过 j.encode 复制到调用方的 a 中。

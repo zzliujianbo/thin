@@ -104,12 +104,17 @@ export async function settingsRegressions({app,pty,execute,send}) {
           assert.equal(entry.mode & 0o777,0o600);
           if (name === '.gitignore') { assert.equal(await readFile(path,'utf8'),'*\n'); continue; }
           if (/^[a-f0-9]{32}\.resume-lock$/.test(name)) {
-            const marker = await readFile(path);
-            assert.equal(marker.length,33);
-            assert(marker[0] === 0x41 || marker[0] === 0x43);
-            if (!submitted.has(directory)) assert(marker.subarray(1).every(byte => byte === 0));
+            assert.equal((await readFile(path)).length,0);
           } else if (name.endsWith('.jsonl')) { assert(submitted.has(directory)); logs++; }
           else if (/^[a-f0-9]{32}\.session$/.test(name)) { assert(submitted.has(directory)); checkpoints++; }
+          else if (/^[a-f0-9]{32}\.title$/.test(name)) {
+            assert(submitted.get(directory), 'title requires an interactive submitted session');
+            assert(entries.includes(name.replace(/\.title$/, '.session')), 'title without matching checkpoint');
+            assert(entry.size > 0 && entry.size <= 256, 'title size');
+            const bytes = await readFile(path);
+            const title = new TextDecoder('utf-8', {fatal:true}).decode(bytes);
+            assert([...title].length <= 64, 'title codepoint limit');
+          }
           else assert.fail(`unexpected session artifact: ${name}`);
         }
         if (submitted.has(directory)) {
@@ -124,7 +129,7 @@ export async function settingsRegressions({app,pty,execute,send}) {
         const env = {PATH:'/usr/bin:/bin',HOME:home,LANG:'C.UTF-8',TERM:'xterm-256color',THIN_FIXTURE_KEY:KEY,THIN_APP_BIN:app,THIN_APP_TEST_HOME:home,THIN_APP_TEST_PROJECT:p,THIN_APP_TEST_URL:url,THIN_APP_TEST_MODE:mode};
         await assertConfigHome(home, checkpoints);
         const sessionDir = join(p,'.thin/sessions');
-        const beforeRecords = await exists(sessionDir) ? (await readdir(sessionDir)).filter(n => n.endsWith('.jsonl') || n.endsWith('.session')).sort() : [];
+        const beforeRecords = await exists(sessionDir) ? (await readdir(sessionDir)).filter(n => n.endsWith('.jsonl') || n.endsWith('.session') || n.endsWith('.title')).sort() : [];
         const result = await execute(headless?app:pty,headless?['--print','settings-task']:[],env,p,undefined,headless?30000:90000);
         if (fixtureError) throw fixtureError;
         const reason = result.output.match(/^error: ([A-Za-z][A-Za-z0-9_]{0,63})$/m)?.[1] ?? 'unclassified';
@@ -138,9 +143,13 @@ export async function settingsRegressions({app,pty,execute,send}) {
           assert.equal(ids.length, levels.length ? 1 : 0);
           if (ids.length) checkpoints.push({project:p,id:ids[0][1]});
         }
+        if (headless) {
+          const afterTitles = await exists(sessionDir) ? (await readdir(sessionDir)).filter(n => n.endsWith('.title')).sort() : [];
+          assert.deepEqual(afterTitles, beforeRecords.filter(n => n.endsWith('.title')), 'headless must not create titles');
+        }
         if (levels.length) submitted.set(p, Boolean(submitted.get(p)) || !headless);
         else {
-          const afterRecords = await exists(sessionDir) ? (await readdir(sessionDir)).filter(n => n.endsWith('.jsonl') || n.endsWith('.session')).sort() : [];
+          const afterRecords = await exists(sessionDir) ? (await readdir(sessionDir)).filter(n => n.endsWith('.jsonl') || n.endsWith('.session') || n.endsWith('.title')).sort() : [];
           assert.deepEqual(afterRecords,beforeRecords,'idle settings must not create history');
         }
         stage = 'storage assertions';

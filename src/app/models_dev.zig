@@ -2,8 +2,8 @@
 //! Exact provider/model IDs are retained. Protocol comes from the declared AI SDK
 //! adapter (`npm`) or exact native API URL, never from model names;
 //! `reasoning: true` is not a profile.
-//! Structural JSON errors fail the whole document; an unusable or unknown option
-//! only makes that one model's profile unusable.
+//! Structural JSON errors fail the whole document; malformed recognized options
+//! make only that model's profile unusable, while unknown option kinds are ignored.
 const std = @import("std");
 const thinking = @import("../core/thinking.zig");
 const activity = @import("../presentation/activity.zig");
@@ -17,15 +17,8 @@ pub const url = "https://models.dev/api.json";
 pub const max_body_bytes = 16 * 1024 * 1024;
 pub const max_structural_nodes = 2_000_000;
 pub const max_value_bytes = 2048;
-/// Includes third-party rows used for complete-profile majority voting.
-/// Separate from the smaller by-value output directory limit.
+/// Supported provider rows only; independent of the smaller output directory.
 pub const max_records = 65536;
-
-const Source = enum { exact, majority };
-const Resolution = struct {
-    declaration: ?thinking.Declaration = null,
-    source: ?Source = null,
-};
 
 const Profile = struct {
     map: thinking.LevelMap = .{},
@@ -148,7 +141,12 @@ fn parseLevels(scanner: *std.json.Scanner, allocator: std.mem.Allocator, profile
     var count: usize = 0;
     while (!(try at(scanner, .array_end))) : (count += 1) {
         if (try at(scanner, .string)) {
-            addLevel(profile, try nextString(scanner, allocator));
+            const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, max_body_bytes);
+            const value = switch (token) {
+                .string, .allocated_string => |v| v,
+                else => unreachable,
+            };
+            addLevel(profile, value);
         } else {
             try scanner.skipValue();
             profile.unsupported = true;
@@ -163,6 +161,7 @@ fn parseOption(scanner: *std.json.Scanner, allocator: std.mem.Allocator, profile
     var kind: ?[]const u8 = null;
     var saw_kind = false;
     var values: ?Profile = null;
+    var duplicate_values = false;
     while (!(try at(scanner, .object_end))) {
         const key = try nextString(scanner, allocator);
         if (equal(key, "type")) {
@@ -170,10 +169,14 @@ fn parseOption(scanner: *std.json.Scanner, allocator: std.mem.Allocator, profile
             saw_kind = true;
             kind = try optionalString(scanner, allocator);
         } else if (equal(key, "values")) {
-            if (values != null) return error.InvalidModelsDev;
-            var parsed: Profile = .{};
-            try parseLevels(scanner, allocator, &parsed);
-            values = parsed;
+            if (values != null) {
+                duplicate_values = true;
+                try scanner.skipValue();
+            } else {
+                var parsed: Profile = .{};
+                try parseLevels(scanner, allocator, &parsed);
+                values = parsed;
+            }
         } else try scanner.skipValue();
     }
     try expect(scanner, allocator, .object_end);
@@ -181,15 +184,12 @@ fn parseOption(scanner: *std.json.Scanner, allocator: std.mem.Allocator, profile
         profile.unsupported = true;
         return;
     };
+    if (!equal(option_type, "toggle") and !equal(option_type, "effort")) return;
+    if (duplicate_values) return error.InvalidModelsDev;
     if (equal(option_type, "toggle")) {
         if (profile.has_toggle) profile.unsupported = true;
         if (values) |parsed| profile.unsupported = profile.unsupported or parsed.unsupported;
         profile.has_toggle = true;
-        return;
-    }
-    // budget_tokens and future option kinds are not translated into effort levels.
-    if (!equal(option_type, "effort")) {
-        profile.unsupported = true;
         return;
     }
     const effort = values orelse {
@@ -618,14 +618,11 @@ fn parseModel(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !ModelRo
 
 fn parseModels(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provider: []const u8, records: *std.ArrayList(Record)) !void {
     try expect(scanner, allocator, .object_begin);
-    const supported_provider = providerId(provider) != null;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(allocator);
     while (!(try at(scanner, .object_end))) {
         const model = try nextString(scanner, allocator);
-        // Foreign rows only vote on exact supported IDs. Our output-key limits
-        // must not reject unrelated upstream keys; scanner bounds still apply.
-        if (supported_provider) try directory.validateId(model);
+        try directory.validateId(model);
         if ((try seen.getOrPut(allocator, model)).found_existing) return error.InvalidModelsDev;
         if (records.items.len >= max_records) return error.MetadataTooLarge;
         const row = try parseModel(scanner, allocator);
@@ -676,64 +673,6 @@ fn parseProvider(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provi
     }
 }
 
-fn matching(record: Record, model: []const u8, api: protocol.Protocol, format: thinking.Format) ?thinking.Declaration {
-    if (!equal(record.model, model) or record.api != api) return null;
-    const declaration = record.declaration orelse return null;
-    if (declaration.format != format) return null;
-    return declaration;
-}
-
-fn sameProfile(a: thinking.Declaration, b: thinking.Declaration) bool {
-    if (a.format != b.format) return false;
-    inline for (.{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |field| {
-        const left = @field(a.map, field);
-        const right = @field(b.map, field);
-        if (left == null or right == null) {
-            if (left != null or right != null) return false;
-        } else if (!equal(left.?, right.?)) return false;
-    }
-    return true;
-}
-
-/// Exact usable provider/model profile first. Otherwise the unique most-common
-/// complete profile for the exact model ID and protocol; ties remain unknown.
-fn resolveIn(records: []const Record, provider: []const u8, model: []const u8, api: protocol.Protocol) Resolution {
-    const format = formatFor(provider, api) orelse return .{};
-    for (records) |record| {
-        if (!equal(record.provider, provider) or !equal(record.model, model)) continue;
-        if (record.api != api) return .{};
-        if (record.declaration) |declaration| {
-            if (declaration.format != format) return .{};
-            return .{ .declaration = declaration, .source = .exact };
-        }
-        break;
-    }
-    var best: ?thinking.Declaration = null;
-    var best_count: usize = 0;
-    var tied = false;
-    outer: for (records, 0..) |candidate, index| {
-        const declaration = matching(candidate, model, api, format) orelse continue;
-        for (records[0..index]) |prior| {
-            if (matching(prior, model, api, format)) |earlier| if (sameProfile(earlier, declaration)) continue :outer;
-        }
-        var count: usize = 0;
-        for (records) |other| {
-            if (matching(other, model, api, format)) |profile| if (sameProfile(profile, declaration)) {
-                count += 1;
-            };
-        }
-        if (count > best_count) {
-            best = declaration;
-            best_count = count;
-            tied = false;
-        } else if (count == best_count) {
-            tied = true;
-        }
-    }
-    if (best == null or tied) return .{};
-    return .{ .declaration = best, .source = .majority };
-}
-
 /// Returned records borrow the caller's arena, never the scanner's lifetime.
 fn scan(a: std.mem.Allocator, body: []const u8) ![]const Record {
     try json_bound.bound(body, max_body_bytes, max_structural_nodes);
@@ -745,7 +684,11 @@ fn scan(a: std.mem.Allocator, body: []const u8) ![]const Record {
     while (!(try at(&scanner, .object_end))) {
         const provider = try nextString(&scanner, a);
         if ((try providers_seen.getOrPut(a, provider)).found_existing) return error.InvalidModelsDev;
-        try parseProvider(&scanner, a, provider, &records);
+        if (providerId(provider) != null) {
+            try parseProvider(&scanner, a, provider, &records);
+        } else {
+            try scanner.skipValue();
+        }
     }
     try expect(&scanner, a, .object_end);
     try expect(&scanner, a, .end_of_document);
@@ -761,8 +704,7 @@ fn providerId(name: []const u8) ?providers.Id {
 }
 
 /// Exact rows for the three supported services. Adapter identity is independent
-/// of reasoning availability; only reasoning may use same-ID majority fallback.
-/// All keys and profiles are pointer-free and safe to copy by value.
+/// of reasoning availability. All keys and profiles are safe to copy by value.
 pub fn parseDirectory(allocator: std.mem.Allocator, body: []const u8) !directory.Directory {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -778,39 +720,9 @@ pub fn parseDirectory(allocator: std.mem.Allocator, body: []const u8) !directory
         row.dev_context_tokens = if (record.api != .auto) record.context_tokens else null;
         row.dev_input_price_threshold = if (record.api != .auto) record.input_price_threshold else null;
         row.dev_input_price_flat_limit = if (record.api != .auto) record.input_price_flat_limit else null;
-        const resolved = resolveIn(records, record.provider, record.model, record.api);
-        if (resolved.declaration) |declaration| row.dev_reasoning = try directory.Profile.from(declaration);
-    }
-    // Missing supported presets may borrow only a complete reasoning profile
-    // voted for their exact raw ID and verified preset route. No public listing,
-    // window, output or price evidence is manufactured by this fallback.
-    for (catalog.entries) |entry| {
-        if (result.find(entry.provider, entry.model.name) != null) continue;
-        const resolved = resolveIn(records, providerName(entry.provider), entry.model.name, entry.model.protocol);
-        const declaration = resolved.declaration orelse continue;
-        const row = try result.upsert(entry.provider, entry.model.name);
-        row.dev_present = true;
-        row.dev_protocol = entry.model.protocol;
-        row.dev_reasoning = try directory.Profile.from(declaration);
+        if (record.declaration) |declaration| row.dev_reasoning = try directory.Profile.from(declaration);
     }
     return result;
-}
-
-fn testRecord(provider: []const u8, model: []const u8, api: protocol.Protocol, declaration: ?thinking.Declaration) Record {
-    return .{ .provider = provider, .model = model, .profile = .{}, .api = api, .declaration = declaration };
-}
-
-test "models.dev exact usable profile wins and majority votes complete profiles" {
-    const t = std.testing;
-    const a: thinking.Declaration = .{ .map = .{ .low = "low", .high = "high" } };
-    const b: thinking.Declaration = .{ .map = .{ .low = "low", .medium = "medium" } };
-    const records = [_]Record{ testRecord("one", "sample", .chat, a), testRecord("two", "sample", .chat, b), testRecord("three", "sample", .chat, b) };
-    const exact = resolveIn(&records, "one", "sample", .chat);
-    try t.expectEqual(Source.exact, exact.source.?);
-    try t.expectEqualStrings("high", exact.declaration.?.map.high.?);
-    const majority = resolveIn(&records, "absent", "sample", .chat);
-    try t.expectEqual(Source.majority, majority.source.?);
-    try t.expectEqualStrings("medium", majority.declaration.?.map.medium.?);
 }
 
 test "model API URLs identify SystemOne without SDK or name inference" {
@@ -861,20 +773,6 @@ test "API SDK and ID annotations preserve native and ordinary protocol sources" 
     }
 }
 
-test "models.dev ties, protocol mismatch, missing profiles and exact-name boundaries stay unknown" {
-    const t = std.testing;
-    const left: thinking.Declaration = .{ .map = .{ .low = "low", .high = "high" } };
-    const right: thinking.Declaration = .{ .map = .{ .low = "low", .medium = "medium" } };
-    const tied = [_]Record{ testRecord("one", "same", .chat, left), testRecord("two", "same", .chat, right) };
-    try t.expect(resolveIn(&tied, "missing", "same", .chat).declaration == null);
-    const mismatch = [_]Record{testRecord("one", "same", .responses, left)};
-    try t.expect(resolveIn(&mismatch, "one", "same", .chat).declaration == null);
-    try t.expect(resolveIn(&mismatch, "one", "same", .auto).declaration == null);
-    const missing_exact = [_]Record{ testRecord("one", "same", .chat, null), testRecord("two", "same", .chat, right) };
-    try t.expectEqual(Source.majority, resolveIn(&missing_exact, "one", "same", .chat).source.?);
-    try t.expect(resolveIn(&tied, "missing", "prefix-same", .chat).declaration == null);
-}
-
 test "models.dev parser keeps catalog IDs, derives SDK protocols, and isolates bad option values" {
     const t = std.testing;
     const body =
@@ -894,36 +792,12 @@ test "models.dev parser keeps catalog IDs, derives SDK protocols, and isolates b
     try t.expectEqual(protocol.Protocol.auto, protocolFor("@ai-sdk/google"));
 }
 
-test "models.dev Haiku majority is a complete normalized profile, not a union" {
-    // Synthetic offline fixture only. Never included in production data.
-    const parsed = try parseDirectory(std.testing.allocator, @embedFile("models_dev_fixture.json"));
-    const haiku = parsed.rows[parsed.find(.opencode_go, "claude-haiku-5-5").?];
-    const declaration = haiku.dev_reasoning.?.declaration();
-    try std.testing.expectEqual(thinking.Format.anthropic, declaration.format);
-    try std.testing.expectEqualStrings("disabled", declaration.map.off.?);
-    try std.testing.expectEqualStrings("low", declaration.map.low.?);
-    try std.testing.expectEqualStrings("high", declaration.map.high.?);
-    try std.testing.expectEqualStrings("max", declaration.map.max.?);
-    try std.testing.expect(declaration.map.medium == null); // Minority profile is not merged.
-    const luna = parsed.rows[parsed.find(.opencode_go, "gpt-6-luna").?];
-    try std.testing.expectEqualStrings("none", luna.dev_reasoning.?.declaration().map.off.?);
-}
-
-test "models.dev absent presets receive reasoning only and exact route conflicts never fallback" {
+test "models.dev foreign rows never create presets or fill conflicting exact routes" {
     const a = std.testing.allocator;
     const absent = try parseDirectory(a,
         \\{"foreign":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"limit":{"context":1000000,"output":8192},"cost":{"input":1,"output":2},"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
     );
-    const row = absent.rows[absent.find(.opencode_go, "claude-haiku-5-5").?];
-    try std.testing.expectEqual(protocol.Protocol.anthropic, row.dev_protocol);
-    try std.testing.expectEqualStrings("high", row.dev_reasoning.?.declaration().map.high.?);
-    try std.testing.expect(row.available == null);
-    try std.testing.expect(row.tokens == null);
-    try std.testing.expect(row.output_tokens == null);
-    try std.testing.expect(row.dev_context_tokens == null);
-    try std.testing.expect(row.dev_output_tokens == null);
-    try std.testing.expect(row.dev_input_price_threshold == null);
-    try std.testing.expect(row.dev_input_price_flat_limit == null);
+    try std.testing.expect(absent.find(.opencode_go, "claude-haiku-5-5") == null);
     const conflict = try parseDirectory(a,
         \\{"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"claude-haiku-5-5":{}}},"foreign":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
     );
@@ -932,13 +806,7 @@ test "models.dev absent presets receive reasoning only and exact route conflicts
     try std.testing.expect(exact.dev_reasoning == null);
 }
 
-test "models.dev format mismatch cannot turn DeepSeek thinking toggle into standard effort" {
-    const standard: thinking.Declaration = .{ .map = .{ .off = "none", .high = "high" } };
-    const records = [_]Record{testRecord("fixture", "deepseek-flash", .chat, standard)};
-    try std.testing.expect(resolveIn(&records, "deepseek", "deepseek-flash", .chat).declaration == null);
-}
-
-test "models.dev malformed toggle values neither authorize exact profiles nor cast votes" {
+test "models.dev malformed toggle values do not authorize exact profiles" {
     const a = std.testing.allocator;
 
     for ([_][]const u8{ "42", "null", "[]", "[false]", "[\"high\",false]", "[\"high\",\"high\"]" }) |bad_values| {
@@ -952,25 +820,33 @@ test "models.dev malformed toggle values neither authorize exact profiles nor ca
         defer a.free(bad);
         const bad_directory = try parseDirectory(a, bad);
         try std.testing.expect(bad_directory.rows[bad_directory.find(.opencode_go, "claude-haiku-5-5").?].dev_reasoning == null);
-        const fallback = try std.mem.concat(a, u8, &.{
-            bad[0 .. bad.len - 1],
-            \\,"valid":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
-            ,
-        });
-        defer a.free(fallback);
-        const fallback_directory = try parseDirectory(a, fallback);
-        const resolved = fallback_directory.rows[fallback_directory.find(.opencode_go, "claude-haiku-5-5").?];
-        try std.testing.expectEqualStrings("high", resolved.dev_reasoning.?.declaration().map.high.?);
-        const tied = try std.mem.concat(a, u8, &.{
-            fallback[0 .. fallback.len - 1],
-            \\,"other":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low"]}]}}}}
-            ,
-        });
-        defer a.free(tied);
-        // The malformed high row must not break the valid high/low tie.
-        const tied_directory = try parseDirectory(a, tied);
-        try std.testing.expect(tied_directory.rows[tied_directory.find(.opencode_go, "claude-haiku-5-5").?].dev_reasoning == null);
     }
+}
+
+test "supported providers retain independent exact profiles for the full raw ID" {
+    const result = try parseDirectory(std.testing.allocator,
+        \\{"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"nested/raw":{"reasoning_options":[{"type":"effort","values":["low"]}]},"empty":{}}},"opencode":{"npm":"@ai-sdk/anthropic","models":{"nested/raw":{"reasoning_options":[{"type":"effort","values":["high"]}]},"empty":{"reasoning_options":[{"type":"effort","values":["high"]}]}}}}
+    );
+    const go = result.rows[result.find(.opencode_go, "nested/raw").?].dev_reasoning.?.declaration();
+    const zen = result.rows[result.find(.opencode_zen, "nested/raw").?].dev_reasoning.?.declaration();
+    try std.testing.expectEqualStrings("low", go.map.low.?);
+    try std.testing.expect(go.map.high == null);
+    try std.testing.expectEqualStrings("high", zen.map.high.?);
+    try std.testing.expect(result.rows[result.find(.opencode_go, "empty").?].dev_reasoning == null);
+    try std.testing.expect(result.find(.opencode_go, "raw") == null);
+}
+
+test "unknown option kinds do not poison an exact effort profile" {
+    const result = try parseDirectory(std.testing.allocator,
+        \\{"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"x":{"reasoning_options":[{"values":{"arbitrary":[false,{},42]},"type":"budget_tokens"},{"type":"future","values":["alien",false]},{"type":"toggle"},{"type":"effort","values":["low","high"]}]},"bad":{"reasoning_options":[{"type":"effort","values":["high","future"]}]},"dupe":{"reasoning_options":[{"type":"effort","values":["high"]},{"type":"effort","values":["low"]}]}}}}
+    );
+    const declaration = result.rows[result.find(.opencode_go, "x").?].dev_reasoning.?.declaration();
+    try std.testing.expectEqualStrings("disabled", declaration.map.off.?);
+    try std.testing.expectEqualStrings("high", declaration.map.high.?);
+    for ([_][]const u8{ "bad", "dupe" }) |name| try std.testing.expect(result.rows[result.find(.opencode_go, name).?].dev_reasoning == null);
+    try std.testing.expectError(error.InvalidModelsDev, parseDirectory(std.testing.allocator,
+        \\{"opencode-go":{"models":{"x":{"reasoning_options":[{"values":["high"],"values":["low"],"type":"effort"}]}}}}
+    ));
 }
 
 test "models.dev directory retains new IDs and protocols independently of options" {
@@ -1003,17 +879,13 @@ test "models.dev directory retains new IDs and protocols independently of option
     try t.expect(parsed.find(.opencode_go, "third-party") == null);
 }
 
-test "models.dev new IDs retain exact profiles and safe complete majority fallback" {
+test "models.dev exact profiles cannot be filled or overridden by foreign rows" {
     const t = std.testing;
     const body =
         \\{"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"fresh":{},"exact":{"reasoning_options":[{"type":"effort","values":["low"]}]},"blocked":{"provider":{"npm":null}},"tie":{},"wrong-protocol":{}}},"one":{"npm":"@ai-sdk/anthropic","models":{"fresh":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low","high","max"]}]},"exact":{"reasoning_options":[{"type":"effort","values":["high"]}]},"blocked":{"reasoning_options":[{"type":"effort","values":["high"]}]},"tie":{"reasoning_options":[{"type":"effort","values":["low"]}]}}},"two":{"npm":"@ai-sdk/anthropic","models":{"fresh":{"reasoning_options":[{"type":"effort","values":["max","high","low"]},{"type":"toggle"}]},"exact":{"reasoning_options":[{"type":"effort","values":["high"]}]},"tie":{"reasoning_options":[{"type":"effort","values":["high"]}]}}},"minority":{"npm":"@ai-sdk/anthropic","models":{"fresh":{"reasoning_options":[{"type":"effort","values":["medium","high"]}]}}},"wrong":{"npm":"@ai-sdk/openai","models":{"wrong-protocol":{"reasoning_options":[{"type":"effort","values":["medium"]}]}}},"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"format-check":{}}},"standard":{"npm":"@ai-sdk/openai-compatible","models":{"format-check":{"reasoning_options":[{"type":"effort","values":["none","high"]}]}}}}
     ;
     const parsed = try parseDirectory(t.allocator, body);
-    const fresh = parsed.rows[parsed.find(.opencode_go, "fresh").?].dev_reasoning.?.declaration();
-    try t.expectEqual(thinking.Format.anthropic, fresh.format);
-    try t.expectEqualStrings("disabled", fresh.map.off.?);
-    try t.expectEqualStrings("max", fresh.map.max.?);
-    try t.expect(fresh.map.medium == null);
+    try t.expect(parsed.rows[parsed.find(.opencode_go, "fresh").?].dev_reasoning == null);
     const exact = parsed.rows[parsed.find(.opencode_go, "exact").?].dev_reasoning.?.declaration();
     try t.expectEqualStrings("low", exact.map.low.?);
     try t.expect(exact.map.high == null);
@@ -1024,15 +896,16 @@ test "models.dev new IDs retain exact profiles and safe complete majority fallba
     const fixture = try parseDirectory(t.allocator, @embedFile("models_dev_fixture.json"));
     const haiku = fixture.rows[fixture.find(.opencode_go, "claude-haiku-5-5").?];
     try t.expectEqual(protocol.Protocol.anthropic, haiku.dev_protocol);
-    try t.expect(haiku.dev_reasoning.?.declaration().map.medium == null);
+    const own = haiku.dev_reasoning.?.declaration();
+    try t.expectEqualStrings("disabled", own.map.off.?);
+    try t.expectEqualStrings("max", own.map.max.?);
+    try t.expect(own.map.medium == null);
 }
 
 test "models.dev new model keys and recognized schema duplicates are rejected" {
     const t = std.testing;
     for ([_][]const u8{
         \\{"opencode-go":{"models":{"fresh":{},"fresh":{}}}}
-        ,
-        \\{"other":{"models":{"fresh":{},"fresh":{}}}}
         ,
         \\{"opencode-go":{},"opencode-go":{}}
         ,
@@ -1091,11 +964,11 @@ test "models.dev directory capacity is explicit rather than truncated" {
     try std.testing.expectError(error.MetadataTooLarge, parseDirectory(a, body.items));
 }
 
-test "models.dev scan enforces the all-provider record limit" {
+test "models.dev scan enforces the supported-provider record limit" {
     const a = std.testing.allocator;
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(a);
-    try body.appendSlice(a, "{\"other\":{\"models\":{");
+    try body.appendSlice(a, "{\"opencode-go\":{\"models\":{");
     for (0..max_records + 1) |i| {
         if (i != 0) try body.append(a, ',');
         var buf: [64]u8 = undefined;
@@ -1120,7 +993,7 @@ fn directoryAllocationCheck(a: std.mem.Allocator) !void {
     const result = try parseDirectory(a,
         \\{"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"fresh":{}}},"other":{"npm":"@ai-sdk/anthropic","models":{"fresh":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
     );
-    try std.testing.expect(result.rows[0].dev_reasoning != null);
+    try std.testing.expect(result.rows[0].dev_reasoning == null);
 }
 
 test "models.dev directory allocation failures release parser scratch" {

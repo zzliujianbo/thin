@@ -15,6 +15,7 @@ const picker_module = @import("model_picker.zig");
 const provider_picker_module = @import("provider_picker.zig");
 const corecodex = @import("../core/codex_login.zig");
 const command_menu_module = @import("command_menu.zig");
+const resume_picker_module = @import("resume_picker.zig");
 const settings_menu_module = @import("settings_menu.zig");
 const decision_picker_module = @import("decision_picker.zig");
 const proxy_picker_module = @import("proxy_picker.zig");
@@ -789,6 +790,11 @@ const Ui = struct {
     secret_provider: ?core_config.providers.Id = null,
     /// Non-modal slash-command suggestions shown above the composer while the
     /// editor holds a bare command token. Local only; never executes by itself.
+    resume_picker: ?resume_picker_module.Picker = null,
+    resume_pending: ?struct { epoch: u64, session_id: ?[32]u8, launcher: ?[]u8 } = null,
+    resume_serial: u64 = 0,
+    displayed_resume_generation: ?u64 = null,
+    frame_resume_generation: ?u64 = null,
     command_menu: command_menu_module.Menu = .{},
     command_matches: command_menu_module.Matches = .{},
     displayed_command_generation: ?u64 = null,
@@ -915,7 +921,7 @@ const Ui = struct {
     notice: []const u8 = "Ready",
     /// Last owner-published advisory string already turned into one display
     /// record; repeated identical snapshots are never republished.
-    /// 切换思考档位后的短暂确认：在输入框百分比位置显示新档位，2 秒后自动恢复。
+    /// 切换思考档位后的短暂确认：在输入框百分比位置显示新档位，5 秒后自动恢复。
     effort_flash: ?struct { level: shared.ReasoningEffort, until_ms: u64 } = null,
     log_warning_seen: bool = false,
     /// UI receipt clock and bounded statistics; never read worker-owned timing.
@@ -1048,6 +1054,8 @@ const Ui = struct {
         self.delivery_fences.deinit(self.allocator);
         self.secret.deinit();
         self.closeModelPicker();
+        self.closeResumePicker();
+        self.clearResumePending();
         self.parser.secretMode(false);
         self.wipeEditor();
         self.editor.deinit();
@@ -1185,6 +1193,7 @@ const Ui = struct {
             var pending = found orelse continue;
             defer pending.deinit(self.allocator);
             if (completion.obsolete) {
+                if (pending.purpose == .manage and completion.request.action.manage == .saved_sessions) self.clearResumePending();
                 // A superseded login attempt must never strand an opening panel
                 // nor keep a deferred cancellation armed for a dead generation.
                 if (pending.purpose == .codex_login) {
@@ -1204,6 +1213,7 @@ const Ui = struct {
                 if (permission.epoch != pending.epoch or permission.id != pending.permission_id) continue;
             }
             if (completion.failure) |err| {
+                if (pending.purpose == .manage and completion.request.action.manage == .saved_sessions) self.clearResumePending();
                 if (pending.purpose == .codex_login) {
                     const start = completion.request.action.codex_login.action == .start;
                     self.codex_opening = false;
@@ -1278,6 +1288,7 @@ const Ui = struct {
             },
             .manage => {
                 if (completion.value == .managed) self.acceptManage(&completion.value.managed, true);
+                if (action.manage == .saved_sessions) self.clearResumePending();
             },
             .approve => {
                 if (self.permission) |permission| if (permission.epoch == pending.epoch and permission.id == action.approve.id) self.clearPermission();
@@ -1346,7 +1357,7 @@ const Ui = struct {
                     return;
                 }
                 self.display.setEffort(next);
-                self.effort_flash = .{ .level = next, .until_ms = self.clock_ms +| 2000 };
+                self.effort_flash = .{ .level = next, .until_ms = self.clock_ms +| 5000 };
                 self.notice = "Ready";
             },
             .preference, .setting, .decision, .image, .proxy, .proxy_address => {
@@ -2027,6 +2038,8 @@ const Ui = struct {
     /// A new control epoch (attach/takeover/session switch) revokes every piece
     /// of display authority that belonged to the old session.
     fn resetSessionView(self: *Ui, snapshot: *const session_client.Snapshot) !void {
+        self.closeResumePicker();
+        self.clearResumePending();
         // Revoke old frame and approval authority even if the bridge is busy.
         // Do not adopt the new epoch or destroy the old display until both
         // operations succeed.
@@ -2176,13 +2189,14 @@ const Ui = struct {
         if (trimmed.len == 0 or trimmed[0] != '/') return false;
         const name_end = std.mem.findAny(u8, trimmed, " \t\r\n") orelse trimmed.len;
         const name = trimmed[0..name_end];
+        const is_resume = std.mem.eql(u8, name, "/resume");
         const is_list = std.mem.eql(u8, name, "/ls");
         const is_cd = std.mem.eql(u8, name, "/cd");
         const is_attach = std.mem.eql(u8, name, "/attach") or std.mem.eql(u8, name, "/attch");
         const is_detach = std.mem.eql(u8, name, "/detach");
         const is_exit = std.mem.eql(u8, name, "/exit");
         const is_close = std.mem.eql(u8, name, "/close");
-        if (!(is_list or is_cd or is_attach or is_detach or is_exit or is_close)) return false;
+        if (!(is_resume or is_list or is_cd or is_attach or is_detach or is_exit or is_close)) return false;
         // The editor is wiped below; parse an owned copy so arguments stay valid.
         const owned = self.allocator.dupe(u8, trimmed) catch {
             self.wipeEditor();
@@ -2199,6 +2213,16 @@ const Ui = struct {
         const rest = std.mem.trim(u8, owned[name_end_owned..], " \t");
         if (std.mem.findScalar(u8, owned, '\n') != null or std.mem.findScalar(u8, owned, '\r') != null or std.mem.findScalar(u8, owned, 0) != null) {
             self.notice = "Session commands are single-line";
+            return true;
+        }
+        if (is_resume) {
+            if (rest.len == 0) {
+                self.openResumeRequest(backend);
+            } else if (rest.len == 32 and for (rest) |c| {
+                if (!std.ascii.isHex(c)) break false;
+            } else true) {
+                self.applyManage(backend, .{ .@"resume" = rest });
+            } else self.notice = "Usage: /resume [32-hex-id]";
             return true;
         }
         if (is_detach or is_exit) {
@@ -2294,22 +2318,110 @@ const Ui = struct {
         return count;
     }
 
+    fn clearResumePending(self: *Ui) void {
+        if (self.resume_pending) |pending| {
+            if (pending.launcher) |launcher| self.allocator.free(launcher);
+        }
+        self.resume_pending = null;
+    }
+
+    fn closeResumePicker(self: *Ui) void {
+        if (self.resume_picker) |*picker| picker.deinit(self.allocator);
+        self.resume_picker = null;
+        self.displayed_resume_generation = null;
+        self.frame_resume_generation = null;
+    }
+
+    fn resumeContextCurrent(self: *const Ui, epoch: u64, session_id: ?[32]u8, launcher: ?[]const u8) bool {
+        const client = self.remote() orelse return false;
+        const current = client.snapshot();
+        if (current.control_epoch != epoch or !std.meta.eql(current.session_id, session_id)) return false;
+        if (current.launcher_dir) |dir| return if (launcher) |old| std.mem.eql(u8, dir, old) else false;
+        return launcher == null;
+    }
+
+    fn openResumeRequest(self: *Ui, client: session_client.Client) void {
+        self.clearResumePending();
+        const snapshot = client.snapshot();
+        const launcher = if (snapshot.launcher_dir) |dir| self.allocator.dupe(u8, dir) catch {
+            self.notice = "Out of memory; session list not requested";
+            return;
+        } else null;
+        self.resume_pending = .{ .epoch = snapshot.control_epoch, .session_id = snapshot.session_id, .launcher = launcher };
+        self.applyManage(client, .saved_sessions);
+    }
+
+    fn resumeKey(self: *Ui, event_: input.Event) void {
+        const picker = &self.resume_picker.?;
+        if (!self.resumeContextCurrent(picker.epoch, picker.session_id, picker.launcher)) {
+            self.parser.stop_feed = true;
+            self.closeResumePicker();
+            self.notice = "Session context changed; reopen /resume";
+            return;
+        }
+        if (event_ == .paste_start) {
+            self.resume_serial +%= 1;
+            picker.generation = self.resume_serial;
+            return;
+        }
+        if (self.parser.pasted or self.parser.batch_paste) return;
+        switch (event_) {
+            .escape, .left, .cancel => {
+                self.parser.stop_feed = true;
+                self.closeResumePicker();
+            },
+            .quit => self.requestQuit(),
+            .up, .down => {
+                self.resume_serial +%= 1;
+                picker.move(event_ == .down);
+                picker.generation = self.resume_serial;
+            },
+            .enter => {
+                if (self.frame.len != 0 or self.displayed_resume_generation != picker.generation or self.normalAsyncPending()) return;
+                const id = picker.sessions[picker.selected].id;
+                self.parser.stop_feed = true;
+                self.closeResumePicker();
+                if (self.remote()) |client| self.applyManage(client, .{ .@"resume" = &id });
+            },
+            else => {},
+        }
+    }
+
     fn applyManage(self: *Ui, client: session_client.Client, request: session_client.Manage) void {
         if (self.connection.async_actions != null) {
-            _ = self.beginAsync(.{ .manage = request }, .manage);
+            if (self.beginAsync(.{ .manage = request }, .manage) == null and request == .saved_sessions) self.clearResumePending();
             return;
         }
         var outcome = client.manage(self.allocator, request) catch |err| {
+            if (request == .saved_sessions) self.clearResumePending();
             self.notice = session_client.describe(err);
             self.requestDraw();
             return;
         };
         defer outcome.deinit(self.allocator);
-        self.acceptManage(&outcome, false);
+        self.acceptManage(&outcome, request == .@"resume");
+        if (request == .saved_sessions) self.clearResumePending();
     }
 
     fn acceptManage(self: *Ui, outcome: *session_client.Outcome, preserve_editor: bool) void {
         const leaving = outcome.exit;
+        if (outcome.saved_sessions) |sessions| {
+            if (self.resume_pending) |pending| {
+                if (self.resumeContextCurrent(pending.epoch, pending.session_id, pending.launcher)) {
+                    if (sessions.len == 0) {
+                        self.notice = "No saved sessions in this launcher directory";
+                    } else {
+                        self.closeResumePicker();
+                        self.resume_serial +%= 1;
+                        self.resume_picker = .{ .sessions = sessions, .epoch = pending.epoch, .session_id = pending.session_id, .launcher = pending.launcher, .generation = self.resume_serial };
+                        self.resume_pending = null;
+                        outcome.saved_sessions = null;
+                        self.notice = "Ready";
+                    }
+                }
+            }
+            self.clearResumePending();
+        }
         if (outcome.switched) if (self.remote()) |client| {
             if (preserve_editor) {
                 const parked = self.editor;
@@ -2569,7 +2681,7 @@ const Ui = struct {
         const state = self.connection.current();
         // Individual per-agent rows are the only representation of children.
         // Without that capability the ordinary tool rows stay authoritative.
-        return !self.applying_history and state.subagents_supported and state.subagents.individual_supported and (state.available or state.runtime != null);
+        return !self.applying_history and state.subagents_supported and (state.available or state.runtime != null);
     }
 
     fn subagentPhaseOutcome(agent: @import("../core/subagent_status.zig").AgentView) presentation.Outcome {
@@ -2647,7 +2759,7 @@ const Ui = struct {
     fn observeSubagents(self: *Ui) !void {
         const state = self.connection.current();
         const view = state.subagents;
-        if (!state.subagents_supported or !view.individual_supported or (!state.available and state.runtime == null)) {
+        if (!state.subagents_supported or (!state.available and state.runtime == null)) {
             const had_row = self.subagentRowsVisible();
             self.clearSubagentRows();
             self.subagent_group = 0;
@@ -3227,7 +3339,7 @@ const Ui = struct {
     /// Refresh the slash menu from the current editor bytes. The menu is only
     /// meaningful on an idle, non-pasted session with no modal surface open.
     fn refreshCommandMenu(self: *Ui) void {
-        const active = self.settingsIdle() and self.model_picker == null and !self.provider_open and !self.settings_open and !self.editor_pasted;
+        const active = self.settingsIdle() and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open and !self.editor_pasted;
         if (!active) {
             self.command_matches = .{};
             return;
@@ -3254,7 +3366,7 @@ const Ui = struct {
         self.command_matches = matches;
     }
     fn commandMenuVisible(self: *const Ui) bool {
-        return self.settingsIdle() and !self.editor_pasted and self.command_matches.len != 0 and !self.command_menu.dismissed and self.model_picker == null and !self.provider_open and !self.settings_open;
+        return self.settingsIdle() and !self.editor_pasted and self.command_matches.len != 0 and !self.command_menu.dismissed and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open;
     }
     fn closeCommandMenu(self: *Ui) void {
         self.command_matches = .{};
@@ -4177,7 +4289,7 @@ const Ui = struct {
         const state = self.connection.current();
         self.display = .{ .context = state.initial_context, .reasoning_effort = state.reasoning_effort };
         self.effort_flash = if (state.effort_levels.contains(state.reasoning_effort))
-            .{ .level = state.reasoning_effort, .until_ms = self.clock_ms +| 2000 }
+            .{ .level = state.reasoning_effort, .until_ms = self.clock_ms +| 5000 }
         else
             null;
         self.model_flow = .{};
@@ -4227,7 +4339,7 @@ const Ui = struct {
         }
         self.display.setEffort(next);
         // 档位变更只在输入框百分比位置短暂确认，不再写常驻 hint 行。
-        self.effort_flash = .{ .level = next, .until_ms = self.clock_ms +| 2000 };
+        self.effort_flash = .{ .level = next, .until_ms = self.clock_ms +| 5000 };
         self.notice = "Ready";
         self.requestDraw();
     }
@@ -4375,7 +4487,7 @@ const Ui = struct {
         if (std.mem.eql(u8, command, "/help")) {
             self.wipeEditor();
             _ = try self.add(.notice, if (self.remote() != null)
-                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)\n/ls [--running] [--page N]  List sessions\n/cd <dir>  Change launcher directory\n/attach [--takeover] <id>  Attach a session\n/detach  Leave the session view\n/close [--force] <id>  Close a session\n/exit  Leave this frontend\n!command  Run a local command without main-model inference"
+                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)\n/ls [--running] [--page N]  List sessions\n/resume [id]  Resume saved session\n/cd <dir>  Change launcher directory\n/attach [--takeover] <id>  Attach a session\n/detach  Leave the session view\n/close [--force] <id>  Close a session\n/exit  Leave this frontend\n!command  Run a local command without main-model inference"
             else
                 "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)\n!command  Run a local command without main-model inference");
             return;
@@ -5342,6 +5454,13 @@ const Ui = struct {
             self.stopKey(event_);
             return;
         }
+        if (event_ == .escape and self.resume_pending != null and self.permission == null and !self.parser.pasted and !self.parser.batch_paste) {
+            self.clearResumePending();
+            self.parser.stop_feed = true;
+            self.notice = "Ready";
+            return;
+        }
+        if (self.resume_picker != null and self.permission == null and !self.stop_open) return self.resumeKey(event_);
         if (event_ == .cancel and (self.busy or self.queueSnapshot().newest_id != null)) {
             self.openStop();
             return;
@@ -5468,7 +5587,7 @@ const Ui = struct {
         if (!changed) return;
         if (before.pending_default_effort != null and state.pending_default_effort == null and
             state.effort_levels.contains(state.reasoning_effort))
-            self.effort_flash = .{ .level = state.reasoning_effort, .until_ms = self.clock_ms +| 2000 };
+            self.effort_flash = .{ .level = state.reasoning_effort, .until_ms = self.clock_ms +| 5000 };
         if (self.model_picker) |*picker| picker.changed();
         self.displayed_model_generation = null;
         if (state.metadata_notice) |notice| {
@@ -5823,6 +5942,8 @@ const Ui = struct {
         self.frame_permission_choice = null;
         self.displayed_model_epoch = null;
         self.displayed_model_generation = null;
+        self.displayed_resume_generation = null;
+        self.frame_resume_generation = null;
         self.displayed_command_generation = null;
         self.displayed_provider_generation = null;
         self.displayed_settings_generation = null;
@@ -5936,6 +6057,7 @@ const Ui = struct {
             else
                 picker.drawn_model_len = null;
         }
+        self.displayed_resume_generation = if (self.frame_fresh) self.frame_resume_generation else null;
         self.displayed_command_generation = if (self.frame_fresh) self.frame_command_generation else null;
         self.displayed_provider_generation = if (self.frame_fresh) self.frame_provider_generation else null;
         self.displayed_settings_generation = if (self.frame_fresh) self.frame_settings_generation else null;
@@ -6498,7 +6620,7 @@ const Ui = struct {
         // or replayed here; only the still-mutable tail joins `lines`.
         var lines: std.ArrayList([]const u8) = .empty;
         const flow_allowed = self.size.rows >= 7 and cols >= 8 and
-            self.permission == null and self.model_picker == null and !self.provider_open and !self.settings_open and
+            self.permission == null and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open and
             !self.commandMenuVisible() and !self.stop_open and !self.secret_mode and !self.secret_quarantine;
         const mutable_rows = @max(1, self.size.rows -| (3 + composer_rows));
         var flow_continuation = false;
@@ -6718,7 +6840,7 @@ const Ui = struct {
         const compact = (release_idle and self.tail_hint_hash == hint_hash) or
             ((self.compact_composer and self.compact_hint_hash == hint_hash) and
                 !self.busy and self.permission == null and !self.stop_open and !self.settings_open and
-                !self.provider_open and !self.codex_open and self.model_picker == null and !self.commandMenuVisible() and
+                !self.provider_open and !self.codex_open and self.resume_picker == null and self.model_picker == null and !self.commandMenuVisible() and
                 !self.secret_mode and !self.secret_quarantine and thinking == null and composer_rows == 1);
         // The separator row is footprint, so it exists only while there is
         // something above it to separate: mutable body, an approval/secret
@@ -6726,7 +6848,7 @@ const Ui = struct {
         // released above this tail. Initial entry has none of these and writes
         // the composer alone at the terminal's existing row.
         const popup_requested = self.codex_open or self.stop_open or self.settings_open or self.provider_open or
-            self.model_picker != null or (!release_idle and self.commandMenuVisible()) or
+            self.resume_picker != null or self.model_picker != null or (!release_idle and self.commandMenuVisible()) or
             (self.permission == null and queue_snapshot.preview_count != 0);
         const above_content = for (above) |line| {
             if (!std.mem.eql(u8, line, "\x1b[0m\x1b[K")) break true;
@@ -6742,6 +6864,7 @@ const Ui = struct {
         const body_limit = self.size.rows -| footer_rows;
         const candidate_limit = body_limit -| 1; // Separate candidates from conversation even in short windows.
         const model_state = state;
+        const resume_rows = if (self.resume_picker) |*picker| try resume_picker_module.rows(a, picker, cols, candidate_limit) else resume_picker_module.Rows{};
         const picker_rows = if (self.model_picker) |*picker| try picker.rowsWithProviders(a, model_state.selection_name orelse model_state.model, model_state.context_limit, model_state.models, cols, candidate_limit, .{ .current = model_state.context_official, .models = model_state.model_context_official }, model_state.model_disabled, model_state.model_providers) else picker_module.Rows{ .lines = &.{}, .can_confirm = false };
         if (self.model_picker) |*picker| try picker.captureChoice(a, picker_rows.selected_choice);
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, candidate_limit) else provider_picker_module.Rows{ .lines = &.{} };
@@ -6804,13 +6927,14 @@ const Ui = struct {
         const codex_view = state.codex_login;
         const codex_code = if (self.codex_generation != null and codex_view.generation == self.codex_generation.? and codex_view.status == .pending and validCodexCode(&codex_view)) codex_view.userCode() else "";
         const codex_popup = [_][]const u8{ corecodex.verification_url, if (codex_code.len != 0) codex_code else "Waiting for device code...", "Esc cancels" };
-        const popup_lines: []const []const u8 = if (self.codex_open) &codex_popup else if (self.stop_open) (if (stop_fits) stop_popup else &narrow) else if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else if (menu_visible) menu_rows.lines else queue_lines.items;
-        const selected_line = if (self.codex_open) @as(?usize, null) else if (self.stop_open) @as(?usize, if (self.stop_danger) 2 else 1) else if (self.settings_open) settings_rows.selected_line else if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else menu_rows.selected_line;
+        const popup_lines: []const []const u8 = if (self.codex_open) &codex_popup else if (self.stop_open) (if (stop_fits) stop_popup else &narrow) else if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else if (self.resume_picker != null) resume_rows.lines else if (menu_visible) menu_rows.lines else queue_lines.items;
+        const selected_line = if (self.codex_open) @as(?usize, null) else if (self.stop_open) @as(?usize, if (self.stop_danger) 2 else 1) else if (self.settings_open) settings_rows.selected_line else if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else if (self.resume_picker != null) resume_rows.selected_line else menu_rows.selected_line;
         const checked_mask: u16 = if (self.stop_open) 0 else if (self.provider_open) provider_rows.checked_mask else if (self.model_picker != null) picker_rows.checked_mask else 0;
         const popup_gap: usize = @intFromBool(popup_lines.len != 0);
         const content_body_limit = body_limit -| (popup_lines.len + popup_gap);
         self.frame_model_epoch = null;
         self.frame_model_generation = null;
+        self.frame_resume_generation = null;
         // Reasoning resumes into its own downward window. A closed popup,
         // approval or secret prompt may have borrowed ACKed rows above this
         // tail; put them back at their original coordinates before the window
@@ -6833,7 +6957,7 @@ const Ui = struct {
         const show_thinking = thinking != null and !thinking_deferred;
         self.frame_delivery_reasoning = show_thinking;
         const overlay_visible = self.codex_open or self.permission != null or popup_lines.len != 0 or menu_visible or
-            self.model_picker != null or self.provider_open or self.settings_open;
+            self.resume_picker != null or self.model_picker != null or self.provider_open or self.settings_open;
         const wanted_body = if (self.stop_open) 0 else if (self.permission != null)
             @min(body_limit, 2 + @max(1, approval_lines.lines.len))
         else if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (show_thinking) @min(thinking_gap + @min(reasoning_tail_rows, thinking_lines.len), content_body_limit) else @min((if (overlay_visible) @as(usize, 0) else borrowed.len) + lines.items.len, content_body_limit);
@@ -6870,7 +6994,7 @@ const Ui = struct {
             !self.provider_open and !self.codex_open and self.model_picker == null and
             !self.secret_mode and !self.secret_quarantine and thinking == null and composer_rows == 1;
         const normal_popup = self.codex_open or self.stop_open or self.settings_open or self.provider_open or
-            self.model_picker != null or (self.permission == null and queue_snapshot.preview_count != 0);
+            self.resume_picker != null or self.model_picker != null or (self.permission == null and queue_snapshot.preview_count != 0);
         const normal_body_present = lines.items.len != 0 or borrowed_content or transcript_rows != 0 or above_content or
             self.permission != null or self.secret_mode or thinking != null or normal_popup;
         const normal_footer = if (!root_menu) footer_rows else if (normal_compact) @as(usize, 1) else composer_rows + @as(usize, @intFromBool(normal_body_present)) + @as(usize, @intFromBool(hint_line.len != 0));
@@ -7028,6 +7152,11 @@ const Ui = struct {
                         self.frame_model_generation = picker.generation;
                     }
                 }
+                if (!self.stop_open and !self.codex_open and self.permission == null and !self.secret_mode and !self.secret_quarantine and !self.settings_open and !self.provider_open and self.model_picker == null) {
+                    if (self.resume_picker) |picker| if (resume_rows.can_confirm) {
+                        self.frame_resume_generation = picker.generation;
+                    };
+                }
                 if (!self.stop_open and menu_visible and menu_rows.can_confirm) self.frame_command_generation = self.command_menu.generation;
             }
 
@@ -7061,7 +7190,7 @@ const Ui = struct {
         // Include release in the trusted cursor suffix so full/sparse/recovery
         // tails all close synchronization; cursor-show remains the final marker.
         try writer.writeAll(terminal_module.sync_end ++ "\x1b[?25h");
-        const snapshot_allowed = self.permission == null and self.model_picker == null and !self.provider_open and !self.settings_open and !menu_visible and !self.secret_mode and !self.secret_quarantine;
+        const snapshot_allowed = self.permission == null and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open and !menu_visible and !self.secret_mode and !self.secret_quarantine;
         var candidate = if (snapshot_allowed) try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset) else null;
         errdefer if (candidate) |*snapshot| snapshot.deinit();
         const can_diff = anchored and snapshot_allowed and
@@ -12689,7 +12818,7 @@ test "model selection and late default completion flash the actual logical level
     ui.clock_ms = 123;
     try ui.selectModel("fixture-next");
     try std.testing.expectEqual(shared.ReasoningEffort.medium, ui.effort_flash.?.level);
-    try std.testing.expectEqual(@as(u64, 2123), ui.effort_flash.?.until_ms);
+    try std.testing.expectEqual(@as(u64, 5123), ui.effort_flash.?.until_ms);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
@@ -12700,15 +12829,30 @@ test "model selection and late default completion flash the actual logical level
     fixture.pending_default = .high;
     try ui.selectModel("fixture-late");
     try std.testing.expect(ui.effort_flash == null);
-    fixture.metadata_effort = .high;
+    fixture.metadata_effort = .low; // The actual supported level can differ from the requested default.
     fixture.metadata_changed = true;
     ui.connection.poll_models_fn = SelectionFixture.pollMetadata;
+    ui.clock_ms = 200;
     ui.pollMetadata();
-    try std.testing.expectEqual(shared.ReasoningEffort.high, ui.effort_flash.?.level);
+    try std.testing.expectEqual(shared.ReasoningEffort.low, ui.effort_flash.?.level);
+    try std.testing.expectEqual(@as(u64, 5200), ui.effort_flash.?.until_ms);
     try ui.draw();
-    try std.testing.expectEqual(shared.ReasoningEffort.high, ui.display.reasoning_effort);
+    try std.testing.expectEqual(shared.ReasoningEffort.low, ui.display.reasoning_effort);
     try screen.replay(ui.frame);
-    try std.testing.expect(screen.visible("fixture-late) high"));
+    try std.testing.expect(screen.visible("fixture-late) low"));
+    testAcknowledgeFullFrame(&ui);
+    ui.clock_ms = 5199;
+    ui.pollMetadata(); // No changed metadata must not restart the deadline.
+    fixture.metadata_changed = true;
+    ui.pollMetadata(); // Even a changed poll without a pending transition must not restart it.
+    try ui.draw();
+    try std.testing.expectEqual(@as(u64, 5200), ui.effort_flash.?.until_ms);
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("fixture-late) low"));
+    testAcknowledgeFullFrame(&ui);
+    ui.clock_ms = 5200;
+    ui.expireEffortFlash();
+    try std.testing.expect(ui.effort_flash == null);
 }
 
 test "pending default thinking is explicit and never claims an effective wire option" {
@@ -14502,7 +14646,7 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     try std.testing.expect(!session.app.?.journal.started);
 }
 
-test "effort confirmation expires after two seconds and repeated switches restart it" {
+test "effort confirmation expires after five seconds and repeated switches restart it" {
     var fixture: SelectionFixture = .{ .effort = .low, .levels = .{ .mask = 0x55 } };
     defer fixture.deinit();
     var cancel = p.Cancellation{};
@@ -14519,7 +14663,7 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try std.testing.expect(ui.effort_flash == null);
 
     ui.clock_ms = 1000;
-    ui.cycleEffort(); // low -> high, expires at 3000.
+    ui.cycleEffort(); // low -> high, expires at 6000.
     const context = ui.display.context;
     try std.testing.expectEqualStrings("Ready", ui.notice);
     try ui.draw();
@@ -14533,16 +14677,16 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try std.testing.expectEqual(text.width("(fixture-old) high> "), screen.col);
 
     ui.clock_ms = 2500;
-    ui.cycleEffort(); // high -> max, now expires at 4500 instead.
+    ui.cycleEffort(); // high -> max, now expires at 7500 instead.
     ui.dirty = false;
-    ui.clock_ms = 3000;
+    ui.clock_ms = 6000;
     ui.expireEffortFlash();
     try std.testing.expect(!ui.dirty);
     fixture.fail = true;
     ui.cycleEffort(); // Failed save neither changes the level nor extends time.
-    try std.testing.expectEqual(@as(u64, 4500), ui.effort_flash.?.until_ms);
+    try std.testing.expectEqual(@as(u64, 7500), ui.effort_flash.?.until_ms);
     try std.testing.expectEqual(shared.ReasoningEffort.max, ui.effort_flash.?.level);
-    ui.clock_ms = 4499;
+    ui.clock_ms = 7499;
     ui.dirty = false;
     ui.expireEffortFlash();
     try std.testing.expect(!ui.dirty);
@@ -14552,7 +14696,7 @@ test "effort confirmation expires after two seconds and repeated switches restar
     try std.testing.expect(screen.visible("fixture-old) max"));
 
     ui.display.context = .{ .tokens = 2000, .limit = fixture.limit };
-    ui.clock_ms = 4500;
+    ui.clock_ms = 7500;
     ui.expireEffortFlash(); // Idle expiry schedules a redraw without a keypress.
     try std.testing.expect(ui.dirty and ui.effort_flash == null);
     try ui.draw();
@@ -14566,7 +14710,7 @@ test "effort confirmation expires after two seconds and repeated switches restar
     ui.cycleEffort();
     try ui.selectModel("fixture-next");
     try std.testing.expectEqual(fixture.effort, ui.effort_flash.?.level);
-    try std.testing.expectEqual(@as(u64, 6500), ui.effort_flash.?.until_ms);
+    try std.testing.expectEqual(@as(u64, 12500), ui.effort_flash.?.until_ms);
 }
 
 test "effort shortcut follows declared levels and unknown or singleton sets never publish" {
@@ -15397,8 +15541,8 @@ test "selection guards paste secret busy joined future poison and rollback" {
     try effort_screen.replay(ui.frame);
     try std.testing.expect(effort_screen.visible("(fixture-next) minimal> "));
     testAcknowledgeFullFrame(&ui);
-    // 2 秒后自动恢复为上下文百分比。
-    ui.clock_ms = 2001;
+    // 5 秒后自动恢复为上下文百分比。
+    ui.clock_ms = 5001;
     ui.expireEffortFlash();
     try ui.draw();
     try effort_screen.replay(ui.frame);
@@ -16850,6 +16994,8 @@ const FakeRemote = struct {
     last_manage: ?std.meta.Tag(session_client.Manage) = null,
     manage_switched: bool = false,
     manage_exit: bool = false,
+    manage_failure: ?anyerror = null,
+    saved_fixture: ?[]const session_client.SavedSession = null,
     submit_failure: ?anyerror = null,
     ack_failure: bool = false,
     ack_count: usize = 0,
@@ -16962,10 +17108,13 @@ const FakeRemote = struct {
     fn queueResumeFn(ctx: *anyopaque, _: u64) anyerror!void {
         from(ctx).resumes += 1;
     }
-    fn manageFn(ctx: *anyopaque, _: std.mem.Allocator, request: session_client.Manage) anyerror!session_client.Outcome {
+    fn manageFn(ctx: *anyopaque, a: std.mem.Allocator, request: session_client.Manage) anyerror!session_client.Outcome {
         const self = from(ctx);
         self.manages += 1;
         self.last_manage = std.meta.activeTag(request);
+        if (self.manage_failure) |failure| return failure;
+        if (request == .saved_sessions) if (self.saved_fixture) |saved| return .{ .saved_sessions = try a.dupe(session_client.SavedSession, saved) };
+        if (request == .@"resume") self.record(request.@"resume");
         if (self.manage_switched) self.snapshot.control_epoch +%= 1;
         return .{ .switched = self.manage_switched, .exit = self.manage_exit };
     }
@@ -17027,6 +17176,390 @@ fn remoteUi(fake: *FakeRemote, bridge: *bridge_module.Bridge, cancel: *p.Cancell
     return ui;
 }
 
+const resume_test_sessions = [_]session_client.SavedSession{
+    .{ .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".*, .modified_ms = 1709210040000, .title = @import("../core/session_metadata.zig").Title.fromText("同一标题") },
+    .{ .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".*, .modified_ms = 1, .title = @import("../core/session_metadata.zig").Title.fromText("同一标题") },
+};
+
+test "resume root Tab completion and help show the remote command" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{};
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("/res", sink);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try ui.parser.feed("\t", sink);
+    try std.testing.expectEqualStrings("/resume", ui.editor.bytes.items);
+    ui.wipeEditor();
+    try typeDraft(&ui, "/help");
+    try ui.submit();
+    try std.testing.expect(publishedNotice(&ui, "/resume [id]"));
+}
+
+test "resume empty list and failed request preserve display and draft" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{ .saved_fixture = &.{} };
+    fake.snapshot.launcher_dir = "/one";
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.add(.assistant, "complete old conversation");
+    try typeDraft(&ui, "unsent draft");
+    ui.openResumeRequest(fake.client());
+    try std.testing.expect(ui.resume_picker == null and ui.resume_pending == null);
+    try std.testing.expectEqualStrings("No saved sessions in this launcher directory", ui.notice);
+    try std.testing.expectEqualStrings("complete old conversation", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
+    fake.manage_failure = error.TestSelectionFailure;
+    ui.openResumeRequest(fake.client());
+    try std.testing.expect(ui.resume_pending == null);
+    try std.testing.expectEqualStrings("complete old conversation", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
+}
+
+test "resume loading transfers the owned launcher and real sessions to the ready picker" {
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{};
+    fake.snapshot.launcher_dir = "/one";
+    fake.snapshot.session_id = @as([32]u8, @splat(7));
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    ui.resume_serial = 41;
+    try typeDraft(&ui, "unsent draft");
+    ui.openResumeRequest(fake.client());
+    const pending = ui.resume_pending.?;
+    try std.testing.expect(ui.resume_picker == null);
+    try std.testing.expectEqual(fake.snapshot.control_epoch, pending.epoch);
+    try std.testing.expectEqualDeep(fake.snapshot.session_id, pending.session_id);
+    try std.testing.expectEqualStrings("/one", pending.launcher.?);
+    try std.testing.expect(pending.launcher.?.ptr != fake.snapshot.launcher_dir.?.ptr);
+    try std.testing.expect(actions.requests[0].?.action.manage == .saved_sessions);
+    const sessions = try std.testing.allocator.dupe(session_client.SavedSession, &resume_test_sessions);
+    actions.complete(.{ .managed = .{ .saved_sessions = sessions } }, null, false);
+    ui.pumpAsync();
+    try std.testing.expect(ui.resume_pending == null);
+    const picker = ui.resume_picker.?;
+    try std.testing.expectEqual(pending.epoch, picker.epoch);
+    try std.testing.expectEqualDeep(pending.session_id, picker.session_id);
+    try std.testing.expect(pending.launcher.?.ptr == picker.launcher.?.ptr);
+    try std.testing.expect(sessions.ptr == picker.sessions.ptr);
+    try std.testing.expectEqualStrings(&resume_test_sessions[0].id, &picker.sessions[0].id);
+    try std.testing.expectEqual(@as(u64, 42), picker.generation);
+    try std.testing.expectEqual(ui.resume_serial, picker.generation);
+    try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
+    ui.closeResumePicker();
+    try std.testing.expect(ui.resume_picker == null);
+    // Teardown also owns the launcher of a load that never completed.
+    ui.openResumeRequest(fake.client());
+    try std.testing.expect(ui.resume_pending != null);
+}
+
+test "resume late list with changed epoch session or launcher remains outcome owned" {
+    for (0..3) |change| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var fake: FakeRemote = .{};
+        fake.snapshot.launcher_dir = "/one";
+        var ui = remoteUi(&fake, &bridge, &cancel);
+        defer ui.deinit();
+        try typeDraft(&ui, "draft");
+        ui.resume_pending = .{ .epoch = fake.snapshot.control_epoch, .session_id = fake.snapshot.session_id, .launcher = try std.testing.allocator.dupe(u8, "/one") };
+        const sessions = try std.testing.allocator.dupe(session_client.SavedSession, &resume_test_sessions);
+        var late: session_client.Outcome = .{ .saved_sessions = sessions };
+        defer late.deinit(std.testing.allocator);
+        switch (change) {
+            0 => fake.snapshot.control_epoch += 1,
+            1 => fake.snapshot.session_id = @as([32]u8, @splat(7)),
+            else => fake.snapshot.launcher_dir = "/two",
+        }
+        ui.acceptManage(&late, true);
+        try std.testing.expect(ui.resume_pending == null and ui.resume_picker == null);
+        try std.testing.expect(sessions.ptr == late.saved_sessions.?.ptr);
+        try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
+        try std.testing.expectEqual(@as(usize, 0), fake.manages);
+    }
+}
+
+test "resume fresh ACK partial clipped resize ABA navigation and paste cannot confirm" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{ .saved_fixture = &resume_test_sessions };
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.openResumeRequest(fake.client());
+    try ui.draw();
+    ui.frame_offset = ui.frame.len / 2;
+    ui.resumeKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    testAcknowledgeFullFrame(&ui);
+    const generation = ui.resume_picker.?.generation;
+    try std.testing.expectEqual(@as(?u64, generation), ui.displayed_resume_generation);
+    try ui.draw();
+    try std.testing.expect(ui.frame.len != 0);
+    try std.testing.expectEqual(@as(?u64, generation), ui.displayed_resume_generation);
+    try std.testing.expectEqual(@as(?u64, generation), ui.frame_resume_generation);
+    ui.frame_offset = ui.frame.len / 2;
+    ui.resumeKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    testAcknowledgeFullFrame(&ui);
+    ui.resumeKey(.down);
+    ui.resumeKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    ui.resize(.{ .columns = 2, .rows = 24 });
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    ui.resumeKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    ui.resize(.{ .columns = 80, .rows = 24 });
+    ui.resize(.{ .columns = 2, .rows = 24 });
+    ui.resize(.{ .columns = 80, .rows = 24 });
+    ui.resumeKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b[200~\r\x1b[201~\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", fake.text[0..fake.text_len]);
+    try std.testing.expect(ui.parser.stop_feed);
+}
+
+test "resume narrow title confirms the selected stable id even for duplicate titles" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{ .saved_fixture = &resume_test_sessions };
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.resize(.{ .columns = 20, .rows = 24 });
+    ui.openResumeRequest(fake.client());
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    ui.resumeKey(.down);
+    ui.resumeKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    ui.resumeKey(.enter);
+    try std.testing.expectEqual(@as(usize, 2), fake.manages);
+    try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", fake.text[0..fake.text_len]);
+}
+
+test "resume cancellation discards batch and stale session epoch launcher cannot execute" {
+    for (0..3) |change| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var fake: FakeRemote = .{ .saved_fixture = &resume_test_sessions };
+        fake.snapshot.launcher_dir = "/one";
+        var ui = remoteUi(&fake, &bridge, &cancel);
+        defer ui.deinit();
+        try typeDraft(&ui, "draft");
+        ui.openResumeRequest(fake.client());
+        try ui.draw();
+        testAcknowledgeFullFrame(&ui);
+        switch (change) {
+            0 => fake.snapshot.control_epoch += 1,
+            1 => fake.snapshot.session_id = @as([32]u8, @splat(7)),
+            else => fake.snapshot.launcher_dir = "/two",
+        }
+        ui.resumeKey(.enter);
+        try std.testing.expectEqual(@as(usize, 1), fake.manages);
+        try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
+    }
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{ .saved_fixture = &resume_test_sessions };
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try typeDraft(&ui, "draft");
+    ui.openResumeRequest(fake.client());
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b[D\r", sink);
+    try std.testing.expect(ui.resume_picker == null);
+    try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+}
+
+test "resume picker keeps complete display ownership and blocks confirmation batch tail" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{ .saved_fixture = &resume_test_sessions };
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.add(.user, "full previous user message");
+    _ = try ui.add(.assistant, "full previous assistant answer\nsecond line");
+    try typeDraft(&ui, "draft stays intact");
+    ui.openResumeRequest(fake.client());
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\r\r", sink);
+    try std.testing.expectEqual(@as(usize, 2), fake.manages);
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expectEqualStrings("full previous user message", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("full previous assistant answer\nsecond line", ui.records.items[1].body.items);
+    try std.testing.expectEqualStrings("draft stays intact", ui.editor.bytes.items);
+}
+
+test "resume failure keeps old display and success resets only on switched" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{ .saved_fixture = &resume_test_sessions };
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.add(.assistant, "entire old answer");
+    try typeDraft(&ui, "unsent draft");
+    ui.openResumeRequest(fake.client());
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    fake.manage_failure = error.TestSelectionFailure;
+    ui.resumeKey(.enter);
+    try std.testing.expectEqualStrings("entire old answer", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
+    fake.manage_failure = null;
+    fake.manage_switched = true;
+    ui.openResumeRequest(fake.client());
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    ui.resumeKey(.enter);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
+}
+
+test "resume picker holds live draft stream rows until it closes" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{ .saved_fixture = &resume_test_sessions };
+    fake.snapshot.busy = true;
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try seedShiftDraft(&ui);
+    const index = ui.draft.?;
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[index].stream_written != 0);
+    ui.openResumeRequest(fake.client());
+    try ui.draw();
+    try std.testing.expect(ui.frame_resume_generation != null);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(ui.resume_picker.?.generation, ui.displayed_resume_generation.?);
+    const written = ui.records.items[index].stream_written;
+    const base = ui.records.items[index].stream.?.base;
+    const history = ui.menu_history.?.above.len + ui.menu_history.?.borrowed.len;
+    try ui.appendDraft(.assistant, "stream-row-035 abcdefghijklmnopqrstuvwxyz abcdefghijklmnop\nstream-row-036 abcdefghijklmnopqrstuvwxyz abcdefghijklmnop\n");
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].pending_stream_rows);
+    try std.testing.expectEqual(history, ui.frame_menu_history.?.above.len + ui.frame_menu_history.?.borrowed.len);
+    for (ui.frame_records) |entry| if (entry.record_id == ui.records.items[index].id) {
+        try std.testing.expectEqual(@as(usize, 0), entry.stream_rows);
+        try std.testing.expect(!entry.metadata_staged);
+    };
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(written, ui.records.items[index].stream_written);
+    try std.testing.expectEqual(base, ui.records.items[index].stream.?.base);
+    ui.closeResumePicker();
+    try ui.draw();
+    try std.testing.expect(ui.records.items[index].pending_stream_rows != 0);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[index].stream_written > written);
+    try std.testing.expect(ui.records.items[index].stream.?.base > base);
+}
+
+test "resume loading approval Escape denies without consuming list ownership" {
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{};
+    fake.snapshot.busy = true;
+    fake.snapshot.launcher_dir = "/one";
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    try typeDraft(&ui, "unsent draft");
+    ui.openResumeRequest(fake.client());
+    const launcher = ui.resume_pending.?.launcher.?;
+    try std.testing.expect(launcher.ptr != fake.snapshot.launcher_dir.?.ptr);
+    fake.item = try session_client.ownEvent(std.testing.allocator, fake.snapshot.control_epoch, .{ .permission = .{ .id = 33, .tool_name = "bash", .description = "dangerous operation" } });
+    try ui.pumpRemote();
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(?u64, 33), ui.displayed_permission);
+    ui.parser.stop_feed = false;
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(ui.parser.stop_feed);
+    try std.testing.expectEqual(@as(usize, 2), actions.next);
+    try std.testing.expect(actions.requests[0].?.action.manage == .saved_sessions);
+    const approval = actions.requests[1].?.action.approve;
+    try std.testing.expectEqual(@as(u64, 33), approval.id);
+    try std.testing.expectEqual(r.Decision.deny, approval.decision);
+    try std.testing.expect(!std.mem.eql(u8, ui.notice, "Ready"));
+    try std.testing.expect(ui.resume_pending.?.launcher.?.ptr == launcher.ptr);
+    try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+    const sessions = try std.testing.allocator.dupe(session_client.SavedSession, &resume_test_sessions);
+    actions.complete(.{ .managed = .{ .saved_sessions = sessions } }, null, false);
+    ui.pumpAsync();
+    try std.testing.expect(ui.resume_pending == null);
+    try std.testing.expect(ui.resume_picker.?.launcher.?.ptr == launcher.ptr);
+    try std.testing.expect(ui.resume_picker.?.sessions.ptr == sessions.ptr);
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expect(ui.permission == null);
+    try std.testing.expect(publishedNotice(&ui, "Request denied"));
+    try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+}
+
+test "resume loading Escape cancels intent and ignores late list without cancelling task" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{};
+    fake.snapshot.busy = true;
+    fake.snapshot.launcher_dir = "/one";
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true;
+    try typeDraft(&ui, "pending draft");
+    ui.resume_pending = .{ .epoch = fake.snapshot.control_epoch, .session_id = fake.snapshot.session_id, .launcher = try std.testing.allocator.dupe(u8, "/one") };
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(ui.resume_pending == null and ui.parser.stop_feed);
+    try std.testing.expectEqual(@as(usize, 0), fake.cancels);
+    const sessions = try std.testing.allocator.dupe(session_client.SavedSession, &resume_test_sessions);
+    var late: session_client.Outcome = .{ .saved_sessions = sessions };
+    defer late.deinit(std.testing.allocator);
+    ui.acceptManage(&late, true);
+    try std.testing.expect(ui.resume_picker == null);
+    try std.testing.expect(sessions.ptr == late.saved_sessions.?.ptr);
+    try std.testing.expectEqualStrings("pending draft", ui.editor.bytes.items);
+}
+
 fn drainBridge(ui: *Ui) !void {
     while (ui.bridge.pop()) |value| {
         var item = value;
@@ -17060,7 +17593,7 @@ test "per-agent status rows" {
     var fake = FakeRemote{};
     fake.snapshot.subagents_supported = true;
     fake.snapshot.busy = true;
-    fake.snapshot.subagents = .{ .group_id = 8, .revision = 1, .total = 4, .running = 3, .waiting = 1, .individual_supported = true, .agents = agents[0..4] };
+    fake.snapshot.subagents = .{ .group_id = 8, .revision = 1, .total = 4, .running = 3, .waiting = 1, .agents = agents[0..4] };
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -17206,7 +17739,7 @@ test "per-agent status rows incomplete terminal pages" {
     var fake = FakeRemote{};
     fake.snapshot.subagents_supported = true;
     fake.snapshot.busy = true;
-    fake.snapshot.subagents = .{ .group_id = 8, .revision = 1, .total = 65, .running = 65, .individual_supported = true, .agents = agents[0..64] };
+    fake.snapshot.subagents = .{ .group_id = 8, .revision = 1, .total = 65, .running = 65, .agents = agents[0..64] };
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -17242,7 +17775,7 @@ test "per-agent rows idle attachment and epoch replacement" {
     fake.snapshot.subagents_supported = true;
     fake.snapshot.control_epoch = 1;
     fake.snapshot.busy = false;
-    fake.snapshot.subagents = .{ .group_id = 10, .revision = 1, .total = 1, .completed = 1, .individual_supported = true, .agents = agents[0..1] };
+    fake.snapshot.subagents = .{ .group_id = 10, .revision = 1, .total = 1, .completed = 1, .agents = agents[0..1] };
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -17256,14 +17789,14 @@ test "per-agent rows idle attachment and epoch replacement" {
     // A busy attach adopts the live group with its real ids.
     fake.snapshot.busy = true;
     ui.busy = true;
-    fake.snapshot.subagents = .{ .group_id = 11, .revision = 1, .total = 2, .running = 1, .completed = 1, .individual_supported = true, .agents = agents[0..2] };
+    fake.snapshot.subagents = .{ .group_id = 11, .revision = 1, .total = 2, .running = 1, .completed = 1, .agents = agents[0..2] };
     try ui.observeSubagents();
     try std.testing.expectEqual(@as(u64, 11), ui.subagent_group);
     try std.testing.expectEqual(@as(usize, 2), ui.subagent_rows.items.len);
     // A control epoch switch drops the old unsettled rows without settling.
     fake.snapshot.control_epoch = 2;
     fake.snapshot.busy = false;
-    fake.snapshot.subagents = .{ .group_id = 12, .revision = 1, .total = 1, .completed = 1, .individual_supported = true, .agents = agents[0..1] };
+    fake.snapshot.subagents = .{ .group_id = 12, .revision = 1, .total = 1, .completed = 1, .agents = agents[0..1] };
     ui.busy = false;
     try ui.observeSubagents();
     try std.testing.expectEqual(@as(usize, 0), ui.subagent_rows.items.len);
@@ -17271,7 +17804,7 @@ test "per-agent rows idle attachment and epoch replacement" {
     try std.testing.expectEqual(@as(u64, 12), ui.subagent_last_group);
 }
 
-test "per-agent rows outcomes legacy and history fallbacks" {
+test "per-agent rows outcomes unsupported and history fallbacks" {
     const a = std.testing.allocator;
     try std.testing.expectEqual(presentation.Outcome.success, Ui.subagentPhaseOutcome(testAgent(1, 1, .completed, 0, "")));
     try std.testing.expectEqual(presentation.Outcome.failed, Ui.subagentPhaseOutcome(testAgent(1, 1, .failed, 0, "")));
@@ -17285,12 +17818,14 @@ test "per-agent rows outcomes legacy and history fallbacks" {
     defer bridge.deinit();
     var ui = remoteUi(&fake, &bridge, &cancel);
     defer ui.deinit();
-    // Without the individual capability the ordinary tool rows stay authoritative.
+    // Without subagent support the ordinary tool rows stay authoritative.
+    fake.snapshot.subagents_supported = false;
     try ui.applyEvent(.{ .tool_result = .{ .id = 1, .name = "get_subagent_result", .result = .{ .text = "child report" } } }, false, true);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     try std.testing.expectEqual(@as(usize, 0), ui.subagent_rows.items.len);
     // A failed start keeps only the bounded notice; no aggregate row appears.
-    fake.snapshot.subagents = .{ .individual_supported = true };
+    fake.snapshot.subagents_supported = true;
+    fake.snapshot.subagents = .{};
     ui.busy = true;
     try ui.applyEvent(.{ .tool_started = .{ .id = 7, .name = "subagent" } }, false, true);
     try std.testing.expect(ui.subagent_starting);
@@ -18800,6 +19335,32 @@ const FakeAsync = struct {
         if (self.completed) |*value| value.deinit();
     }
 };
+
+test "async effort completion flashes for five seconds" {
+    var fixture: SelectionFixture = .{ .effort = .low };
+    defer fixture.deinit();
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.connection.async_actions = actions.channel();
+    try std.testing.expect(ui.beginAsync(.cycle_effort, .effort) != null);
+    ui.clock_ms = 100;
+    actions.complete(.{ .effort = .high }, null, false);
+    ui.pumpAsync();
+    try std.testing.expectEqual(shared.ReasoningEffort.high, ui.effort_flash.?.level);
+    try std.testing.expectEqual(@as(u64, 5100), ui.effort_flash.?.until_ms);
+    ui.clock_ms = 5099;
+    ui.expireEffortFlash();
+    try std.testing.expect(ui.effort_flash != null);
+    ui.clock_ms = 5100;
+    ui.expireEffortFlash();
+    try std.testing.expect(ui.effort_flash == null);
+}
 
 test "multiple reserved async records survive intervening display records" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };

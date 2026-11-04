@@ -2,7 +2,7 @@
 const std = @import("std");
 const text = @import("text.zig");
 
-pub const Command = enum { model, auth, compact, settings, sessions, cd, attach, detach, close, exit };
+pub const Command = enum { model, auth, compact, settings, sessions, cd, attach, detach, close, @"resume", exit };
 pub const Item = struct { command: Command, value: []const u8, arguments: []const u8 = "", description: []const u8 };
 pub const items = [_]Item{
     .{ .command = .model, .value = "/model", .arguments = "[exact-id|--refresh]", .description = "Select model" },
@@ -14,6 +14,7 @@ pub const items = [_]Item{
     .{ .command = .attach, .value = "/attach", .arguments = "[--takeover] <id>", .description = "Attach a session" },
     .{ .command = .detach, .value = "/detach", .description = "Leave session view" },
     .{ .command = .close, .value = "/close", .arguments = "[--force] <id>", .description = "Close a session" },
+    .{ .command = .@"resume", .value = "/resume", .arguments = "[id]", .description = "Resume saved session" },
     .{ .command = .exit, .value = "/exit", .description = "Leave this frontend" },
 };
 
@@ -174,6 +175,19 @@ test "slash suggestions preserve model login compact order and support local fuz
     }
 }
 
+test "resume is a remote root candidate and completes to its exact command" {
+    const matches = suggestions("/res", 4, false);
+    var found = false;
+    for (matches.commands[0..matches.len]) |command| {
+        if (command == .@"resume") {
+            found = true;
+            try std.testing.expectEqualStrings("/resume", info(command).value);
+        }
+    }
+    try std.testing.expect(found);
+    try std.testing.expect(sessionOnly(.@"resume"));
+}
+
 test "session commands are classified apart from local commands" {
     try std.testing.expect(!sessionOnly(.model) and !sessionOnly(.auth) and !sessionOnly(.compact) and !sessionOnly(.settings));
     for ([_]Command{ .sessions, .cd, .attach, .detach, .close, .exit }) |command| try std.testing.expect(sessionOnly(command));
@@ -249,7 +263,7 @@ test "command descriptions align across selections windows filters and clipping"
                         for (rendered.lines) |line| a.free(line);
                         a.free(rendered.lines);
                     }
-                    const count = @min(matches.len, height);
+                    const count = @min(matches.len, @min(height, 10));
                     const start = @min(selected -| (count / 2), matches.len - count);
                     try std.testing.expectEqual(selected - start, rendered.selected_line.?);
                     for (rendered.lines, start..) |line, index| {

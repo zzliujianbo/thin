@@ -191,11 +191,6 @@ pub const Client = struct {
         common.mergeUsage(&self.last_usage, response.usage);
         try self.check(cancel);
         if (response.refused or response.unsupported_output or response.finish != .stop or response.message.role != .assistant) return error.InvalidMemoryOutput;
-        if (response.message.replay) |replay| {
-            if (replay.scope.protocol != request.scope.protocol or
-                !std.mem.eql(u8, replay.scope.connection, request.scope.connection) or
-                !std.mem.eql(u8, replay.scope.model, request.scope.model)) return error.InvalidMemoryOutput;
-        }
         var text: std.ArrayList(u8) = .empty;
         for (response.message.blocks) |block| switch (block) {
             .text => |part| {
@@ -227,7 +222,7 @@ const UsageSink = struct {
 const fixture: knowledge.Material = .{ .id = "test", .generation = 1, .created_ms = 100, .sources = &.{.{ .id = 0, .kind = .user, .text = "Prefer Zig." }} };
 const Fake = struct {
     calls: usize = 0,
-    mode: enum { empty, failure, cancel, tool, thrown, canceled_cleanup, partial_usage, partial, reasoning, oversized, replay, wrong_scope } = .empty,
+    mode: enum { empty, failure, cancel, tool, thrown, canceled_cleanup, partial_usage, partial, reasoning, oversized, replay } = .empty,
     client: ?*Client = null,
     body_override: ?[]const u8 = null,
     fn invoke(raw: *anyopaque, a: std.mem.Allocator, request: p.Request, sink: p.ModelSink) !p.Outcome {
@@ -252,9 +247,9 @@ const Fake = struct {
         const body = self.body_override orelse if (self.mode == .partial) "{\"items\":[" else "{\"items\":[]}";
         var msg = try p.textMessage(a, .assistant, body);
         if (self.mode == .reasoning) msg.blocks = try a.dupe(p.Block, &.{ .{ .reasoning = "Do not save this thought" }, .{ .text = body } });
-        if (self.mode == .replay or self.mode == .wrong_scope) {
+        if (self.mode == .replay) {
             var scope = request.scope;
-            if (self.mode == .wrong_scope) scope.model = "wrong";
+            scope.model = "wrong";
             msg.replay = .{ .scope = scope, .json = "\xff not JSON" };
         }
         if (self.mode == .oversized) {
@@ -396,11 +391,17 @@ test "memory client fake normal request preserves usage cancellation no tools no
         fake.mode = mode;
         try std.testing.expectError(error.InvalidMemoryOutput, Client.extract(client, a, fixture, &cancel));
     }
-    fake.mode = .wrong_scope;
-    try std.testing.expectError(error.InvalidMemoryOutput, Client.extract(client, a, fixture, &cancel));
     fake.mode = .replay;
+    fake.body_override = "{\"items\":[{\"category\":\"preferences\",\"topic\":\"language\",\"content\":\"Prefer Zig.\"}]}";
     const ignored_replay = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, ignored_replay);
+    try std.testing.expectEqual(@as(usize, 1), ignored_replay.len);
+    try std.testing.expectEqual(knowledge.Category.preferences, ignored_replay[0].category);
+    try std.testing.expectEqualStrings("language", ignored_replay[0].topic);
+    try std.testing.expectEqualStrings("Prefer Zig.", ignored_replay[0].content);
+    try std.testing.expectEqual(@as(?[]const u8, null), ignored_replay[0].expected_version);
+    try std.testing.expectEqual(@as(?u64, null), ignored_replay[0].expires_at_ms);
+    fake.body_override = null;
     fake.mode = .oversized;
     const large = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, large);
@@ -527,7 +528,7 @@ const WireFake = struct {
         self.calls += 1;
         try std.testing.expectEqual(@as(usize, 0), req.tools.len);
         try std.testing.expectEqual(testConfig().model.output_tokens, req.model_output_tokens);
-        const body = self.body_override orelse "{\"items\":[{\"category\":\"preferences\",\"topic\":\"language\",\"content\":\"Prefer Zig.\"}]}";
+        const body = self.body_override orelse "{\"items\":[{\"category\":\"preferences\",\"topic\":\"language\",\"content\":\"Prefer Zig.\",\"source_id\":0}],\"note\":\"metadata\"}";
         const quoted = try std.json.Stringify.valueAlloc(a, body, .{});
         switch (req.scope.protocol) {
             .chat => {

@@ -1211,7 +1211,7 @@ pub const SessionHost = struct {
 
     fn pageSnapshot(snapshot: *protocol.Snapshot, requested: u64, group: ?u64) SubagentPage {
         const view = &snapshot.subagents;
-        if (!snapshot.subagents_supported or !view.individual_supported) return .{ .next = 0, .group = view.group_id };
+        if (!snapshot.subagents_supported) return .{ .next = 0, .group = view.group_id };
         const total = view.agents.len;
         const start: usize = if (group != null and group.? != view.group_id) 0 else @intCast(@min(requested, total));
         const aligned = if (start % 64 == 0 and (start < total or start == 0)) start else 0;
@@ -3383,7 +3383,7 @@ test "per-agent status rows snapshot pages retain every row" {
     const rows = try a.alloc(Agent, 130);
     defer a.free(rows);
     for (rows, 0..) |*row, i| row.* = .{ .id = @intCast(i + 1), .phase = .running };
-    const source: protocol.Snapshot = .{ .session = @splat('a'), .project = "/tmp", .owner = .daemon, .subagents_supported = true, .subagents = .{ .group_id = 7, .revision = 1, .total = rows.len, .running = rows.len, .latest_id = rows.len, .agents = rows, .individual_supported = true } };
+    const source: protocol.Snapshot = .{ .session = @splat('a'), .project = "/tmp", .owner = .daemon, .subagents_supported = true, .subagents = .{ .group_id = 7, .revision = 1, .total = rows.len, .running = rows.len, .latest_id = rows.len, .agents = rows } };
     var offset: u64 = 0;
     var seen: usize = 0;
     while (true) {

@@ -44,8 +44,8 @@ Coverage (one case per user-visible requirement):
    by an explicit `--takeover` client while the daemon console still holds the
    writable lease; after the source owner closes, `--resume` sends no HTTP,
    re-executes no tool and cannot steal the writer lock.
-6. an offline dangerous `rm -rf` stays pending with no client (the owned
-   directory survives), and a reattached console sees the full approval popup,
+6. an offline dangerous `rm` stays pending with no client (the owned
+   fixture survives), and a reattached console sees the full approval popup,
    approves it explicitly, and the side effect happens exactly once.
 7. daemon SIGTERM cancels workers and owned background services: daemon, worker
    and service PIDs converge, the service port closes, no stale endpoint keeps
@@ -1321,7 +1321,7 @@ def approval_plan(fx, state, body):
     calls, results = tool_history(body)
     if not calls:
         return tool_call('approval-tool-1', 'bash',
-                         {'command': 'rm -rf ' + str(state['victim'])})
+                         {'command': 'rm -f ' + str(state['victim'])})
     assert len(calls) == 1 and calls[0]['id'] == 'approval-tool-1', 'exactly one approved call'
     assert str(state['victim']) in calls[0]['arguments'], 'approval request changed the command'
     assert results.get('approval-tool-1') is not None, 'approved tool result missing'
@@ -1754,9 +1754,9 @@ def case_offline_approval(app, base):
     case = Case(app, base, 'case6-approval')
     case.state.update({'approved': threading.Event(), 'victim': None})
     project = case.workspace.project_a
-    victim = project / 'protected-owned-dir'
-    victim.mkdir(parents=True)
-    (victim / 'keep.txt').write_text('owned\n')
+    victim = project / '.ssh' / 'fixture-marker'
+    victim.parent.mkdir(parents=True)
+    victim.write_text('owned\n')
     case.state['victim'] = victim
     case.start_model(approval_plan)
     try:
@@ -1778,7 +1778,7 @@ def case_offline_approval(app, base):
         client.kill()
         client.wait(10)
         time.sleep(2.5)
-        assert victim.is_dir() and (victim / 'keep.txt').is_file(), \
+        assert victim.is_file() and victim.read_text() == 'owned\n', \
             'offline approval was auto-granted'
         assert case.model.count(APPROVAL_PROMPT) == 1, 'offline approval continued inference'
 
@@ -1789,7 +1789,7 @@ def case_offline_approval(app, base):
             'full approval popup frame', 40, guard=case.model.check)
         assert victim.exists(), 'reattached popup had already executed the command'
         full_frame = attached.capture.decode('utf-8', 'replace')
-        assert 'rm -rf' in full_frame, 'approval preview lost the command'
+        assert 'rm -f ' in full_frame and '.ssh/fixture-marker' in full_frame, 'approval preview lost the command'
         assert case.model.count(APPROVAL_PROMPT) == 1, 'popup caused inference'
 
         # Explicit approval: arrows select the one-shot allow, Enter confirms.
@@ -1802,7 +1802,7 @@ def case_offline_approval(app, base):
         attached.send(b'\r')
         attached.pump_until(lambda: attached.idle_after(0, APPROVAL_ANSWER.encode()),
                             'approved completion', 40, guard=case.model.check)
-        assert not victim.exists(), 'approved command did not remove the owned directory'
+        assert not victim.exists(), 'approved command did not remove the owned fixture'
         assert case.model.count(APPROVAL_PROMPT) == 2, 'approved round count'
         body = case.model.snapshot()[-1]
         calls, results = tool_history(body)

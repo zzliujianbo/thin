@@ -24,8 +24,7 @@ pub const AgentView = struct {
 
 pub const View = struct {
     agents: []const AgentView = &.{},
-    individual_supported: bool = false,
-    /// Wire page metadata; null denotes the legacy complete view.
+    /// Wire page metadata; null denotes a complete view.
     page_offset: ?u64 = null,
     page_total: u64 = 0,
     group_id: u64 = 0,
@@ -78,7 +77,7 @@ pub const View = struct {
 
 test "per-agent status rows own cloned values" {
     var agents = [_]AgentView{.{ .id = 3, .phase = .running }};
-    const borrowed: View = .{ .agents = &agents, .individual_supported = true };
+    const borrowed: View = .{ .agents = &agents };
     var owned = try borrowed.clone(std.testing.allocator);
     defer owned.deinitOwned(std.testing.allocator);
     try std.testing.expect(View.eql(borrowed, owned));

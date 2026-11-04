@@ -4,6 +4,7 @@ const diag = @import("../core/diagnostics.zig");
 const fs = @import("../platform/filesystem.zig");
 const k = @import("../core/knowledge.zig");
 const p = @import("../core/protocol.zig");
+const knowledge = @import("../tools/knowledge_store.zig");
 const Coordinator = @import("memory_service.zig").Coordinator;
 
 fn fixtureConfig(a: std.mem.Allocator) !std.json.Parsed(cfg.Config) {
@@ -608,8 +609,12 @@ test "mixed sources and candidates save only committed safe entries" {
         fn extract(raw: *anyopaque, alloc: std.mem.Allocator, material: k.Material, _: *const p.Cancellation) ![]const k.Candidate {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
-            try std.testing.expectEqual(@as(usize, 1), material.sources.len);
+            try std.testing.expectEqual(@as(usize, 5), material.sources.len);
             try std.testing.expectEqualStrings("Useful source", material.sources[0].text);
+            try std.testing.expectEqualStrings("Use Bearer authentication for HTTP requests", material.sources[1].text);
+            try std.testing.expectEqualStrings("token = nextToken()", material.sources[2].text);
+            try std.testing.expectEqualStrings("password: minimum 8 characters", material.sources[3].text);
+            try std.testing.expectEqualStrings("Set api_key in .env at /app/config", material.sources[4].text);
             return alloc.dupe(k.Candidate, &.{
                 .{ .category = .preferences, .topic = "bad topic", .content = "invalid" },
                 .{ .category = .preferences, .topic = "conflict", .content = "must not overwrite" },
@@ -625,21 +630,37 @@ test "mixed sources and candidates save only committed safe entries" {
     defer arena.deinit();
     var capture: k.Capture = .{ .allocator = arena.allocator() };
     capture.add(.user, "Useful source");
+    capture.add(.user, "Use Bearer authentication for HTTP requests");
+    capture.add(.tool, "token = nextToken()");
+    capture.add(.user, "password: minimum 8 characters");
+    capture.add(.user, "Set api_key in .env at /app/config");
     capture.add(.tool, "owned-memory-fixture-key");
     _ = try owner.enqueueCopy(&capture, .chat, .{});
     var cancel: p.Cancellation = .{};
     owner.drain(&cancel);
     const terminal = owner.view().last_terminal.?;
     try std.testing.expectEqual(@as(usize, 1), mixed.calls);
-    try std.testing.expectEqual(@as(u32, 1), terminal.saved_count);
-    try std.testing.expectEqualStrings("A useful fact.", terminal.summary.text());
+    try std.testing.expectEqual(@as(u32, 2), terminal.saved_count);
+    try std.testing.expectEqualStrings("Bearer abc.def · A useful fact.", terminal.summary.text());
     try std.testing.expect(terminal.result == .saved);
     const saved = try owner.store.read(a, "preferences-good");
     defer a.free(saved.content);
     defer a.free(saved.version);
     try std.testing.expect(std.mem.indexOf(u8, saved.content, "owned-memory-fixture-key") == null);
     try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-secret"));
-    try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-bearer-secret"));
+    const ordinary = try owner.store.read(a, "preferences-bearer-secret");
+    defer a.free(ordinary.content);
+    defer a.free(ordinary.version);
+    var repository = knowledge.Repository.init(&owner.store);
+    const now_ms: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
+    const related = try repository.related(arena.allocator(), "Bearer", now_ms);
+    var matches: usize = 0;
+    for (related) |entry| {
+        if (entry.category != .preferences or !std.mem.eql(u8, entry.topic, "bearer-secret")) continue;
+        matches += 1;
+        try std.testing.expectEqualStrings("Bearer abc.def", entry.content);
+    }
+    try std.testing.expectEqual(@as(usize, 1), matches);
     const conflict = try owner.store.read(a, "preferences-conflict");
     defer a.free(conflict.content);
     defer a.free(conflict.version);

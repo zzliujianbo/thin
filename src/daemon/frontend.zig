@@ -314,9 +314,9 @@ test "per-agent status rows wake frontend once" {
     var frontend: Frontend = .{ .a = std.testing.allocator, .communication = undefined, .view = try testProjection(false, "model"), .revision = 10 };
     defer frontend.view.deinit();
     defer if (frontend.retired) |retired| retired.deinit();
-    frontend.view.state.subagents = .{ .individual_supported = true, .agents = &first_rows };
+    frontend.view.state.subagents = .{ .agents = &first_rows };
     const changed = try testProjection(false, "model");
-    changed.state.subagents = .{ .individual_supported = true, .agents = &next_rows };
+    changed.state.subagents = .{ .agents = &next_rows };
     frontend.adopt(.{ .generation = 1, .revision = 11, .watermark = 0, .ordered = false, .projection = changed });
     try std.testing.expect(Frontend.metadataOwned(&frontend, false));
     try std.testing.expect(!Frontend.metadataOwned(&frontend, false));

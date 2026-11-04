@@ -170,7 +170,6 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
     // Current protocol patches must precede exact-route capability lookup.
     applyInputThreshold(cache, &candidate);
     model = candidate.model;
-    try cfg.validateModel(model, config.limits);
     candidate.provider = provider.connection;
     candidate.model = model;
     candidate.selection_pending = false;

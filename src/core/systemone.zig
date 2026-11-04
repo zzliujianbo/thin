@@ -141,7 +141,7 @@ fn bounded(text: []const u8) bool {
     return depth == 0 and !quoted;
 }
 fn fields(v: Value, names: []const []const u8) !std.json.ObjectMap {
-    if (v != .object or v.object.count() != names.len) return invalid;
+    if (v != .object) return invalid;
     for (names) |name| if (!v.object.contains(name)) return invalid;
     return v.object;
 }
@@ -268,7 +268,6 @@ pub fn parseResponse(output_allocator: Allocator, input: decision.Input, body: [
             break :blk .{ .command = .{ .ask = ask > 0.15, .timeout = timeout } };
         },
         .refine_outputs => |items| blk: {
-            if (answers.object.count() != items.len) return invalid;
             for (items, 0..) |_, i| scores[i] = try noul(answers.object.get(try retainKey(tmp, i)) orelse return invalid);
             var texts: [8][]const u8 = undefined;
             for (items, 0..) |item, i| {
@@ -403,7 +402,7 @@ test "SystemOne numeric noul shapes and independent timeout thresholds" {
     const input: decision.Input = .{ .command = .{ .command = "x", .max_timeout_ms = 30000, .proposed_timeout_ms = 30000 } };
     // Use a max below fixed candidates to prove fallback obeys the hard limit.
     const small: decision.Input = .{ .command = .{ .command = "x", .max_timeout_ms = 7 } };
-    const result = try parseResponse(a, small, "{\"answers\":{\"ask\":{\"type\":\"noul\",\"noul\":0.09},\"timeout\":{\"type\":\"choice\",\"choice\":\"none\",\"confidence\":0.56,\"probabilities\":{\"none\":0.98,\"ms_7\":0.02}}}}");
+    const result = try parseResponse(a, small, "{\"answers\":{\"ask\":{\"type\":\"noul\",\"noul\":0.09,\"metadata\":true},\"timeout\":{\"type\":\"choice\",\"choice\":\"none\",\"confidence\":0.56,\"probabilities\":{\"none\":0.98,\"ms_7\":0.02},\"metadata\":true},\"metadata\":true},\"metadata\":true}");
     try std.testing.expectEqual(@as(u32, 7), result.output.command.timeout.milliseconds);
     for ([_]struct { confidence: f64, none: f64, finite: f64, choice: []const u8, no_timeout: bool }{
         .{ .confidence = 0.85, .none = 0.85, .finite = 0.15, .choice = "none", .no_timeout = true },
@@ -429,13 +428,12 @@ test "SystemOne numeric noul shapes and independent timeout thresholds" {
 test "SystemOne strict records IDs duplicates finite scores nesting and usage" {
     const a = std.testing.allocator;
     for ([_][]const u8{
-        "{}",                                                              "[]",                                                                                            "NaN",                                                                                    "{\"answers\":{}}",
-        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":true}}}",  "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":NaN}}}",                                 "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":1e999}}}",                        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":-0.1}}}",
-        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":1.1}}}",   "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9,\"x\":0}}}",                         "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9,\"noul\":0.9}}}",             "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9},\"wrong\":{}}}",
-        "{\"answers\":{\"retain_0\":{\"type\":\"choice\",\"noul\":0.9}}}", "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":-1}}", "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9}},\"x\":[[[[[[[[[]]]]]]]]]}", "{\"answers\":{},\"answers\":{}}",
-        "{\"answers\":{},\"x\":\"\xff\"}",
+        "{}",                                                                                            "[]",                                                                                     "NaN",                                                             "{\"answers\":{}}",
+        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":true}}}",                                "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":NaN}}}",                          "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":1e999}}}", "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":-0.1}}}",
+        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":1.1}}}",                                 "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9,\"noul\":0.9}}}",             "{\"answers\":{\"wrong\":{}}}",                                    "{\"answers\":{\"retain_0\":{\"type\":\"choice\",\"noul\":0.9}}}",
+        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":-1}}", "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9}},\"x\":[[[[[[[[[]]]]]]]]]}", "{\"answers\":{},\"answers\":{}}",                                 "{\"answers\":{},\"x\":\"\xff\"}",
     }) |bad| try std.testing.expectError(invalid, parseResponse(a, test_refine, bad));
-    const large_usage = try parseResponse(a, test_refine, "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.83}},\"usage\":{\"input_tokens\":18446744073709551615}}");
+    const large_usage = try parseResponse(a, test_refine, "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.83,\"x\":0},\"metadata\":{}},\"usage\":{\"input_tokens\":18446744073709551615}}");
     defer decision.freeOutput(a, large_usage.output);
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), large_usage.usage.input_tokens);
     const huge = try a.alloc(u8, 65537);
@@ -448,7 +446,7 @@ test "SystemOne strict records IDs duplicates finite scores nesting and usage" {
         "\"none\",\"confidence\":1.1,\"probabilities\":{\"none\":0.1,\"ms_30000\":0.9}}}}",
         "\"none\",\"confidence\":0.9,\"probabilities\":{\"none\":0.1,\"ms_30000\":0.1}}}}",
         "\"none\",\"confidence\":0.9,\"probabilities\":{\"none\":0.1,\"ms_2\":0.9}}}}",
-        "\"none\",\"confidence\":0.9,\"probabilities\":{\"none\":0.1,\"ms_30000\":0.9},\"extra\":0}}}",
+        "\"none\",\"confidence\":0.9,\"probabilities\":{\"none\":0.1,\"ms_30000\":0.9,\"extra\":0}}}}",
         "\"none\",\"confidence\":0.9,\"probabilities\":{\"none\":-0.1,\"ms_30000\":1.1}}}}",
     }) |suffix| {
         const bad = try std.mem.concat(a, u8, &.{ base, suffix });

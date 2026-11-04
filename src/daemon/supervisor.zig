@@ -810,9 +810,20 @@ fn testWait() unix.Wait {
 /// One request/reply over the real control socket. The daemon side is driven by
 /// the same bounded slice the serve loop uses, never by a special test path.
 fn controlRoundTrip(supervisor: *Supervisor, client: *unix.Connection, frame: []const u8) ![]u8 {
-    try client.writeFrame(frame, testWait());
-    supervisor.serveTick();
-    return (try client.readFrame(testWait())) orelse error.ConnectionClosed;
+    const wait = testWait();
+    const start = std.Io.Clock.awake.now(wait.io);
+    try client.writeFrame(frame, wait);
+    while (true) {
+        if (start.untilNow(wait.io, .awake).toMilliseconds() >= wait.timeout_ms) return error.Timeout;
+        supervisor.serveTick();
+        const remaining = @as(i64, wait.timeout_ms) - start.untilNow(wait.io, .awake).toMilliseconds();
+        if (remaining <= 0) return error.Timeout;
+        const reply = client.readFrame(.{ .io = wait.io, .timeout_ms = @intCast(@min(remaining, 10)) }) catch |err| switch (err) {
+            error.Timeout, error.Interrupted => continue,
+            else => return err,
+        };
+        return reply orelse error.ConnectionClosed;
+    }
 }
 
 fn setupOpFrame(allocator: std.mem.Allocator, id: u64, op: []const u8, body: []const u8) ![]u8 {

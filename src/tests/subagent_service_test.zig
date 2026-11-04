@@ -384,7 +384,13 @@ const Fixture = struct {
     }
 
     fn active(self: *Fixture) bool {
-        return self.service.service().active();
+        const token: p.Cancellation = .{};
+        const hint = self.service.service().beforeFinish(self.a, &token) catch unreachable;
+        if (hint) |text| {
+            self.a.free(text);
+            return true;
+        }
+        return false;
     }
 };
 
@@ -898,7 +904,7 @@ test "beforeFinish returns bounded host hints whenever a job is uncollected" {
     const id = try fix.start(.{ .task = "uncollected job" });
     defer a.free(id);
     const service = fix.service.service();
-    try std.testing.expect(service.active());
+    try std.testing.expect(fix.active());
     // Runtime owns the reminder budget; the host always answers with a hint.
     var round: usize = 0;
     while (round < 4) : (round += 1) {
@@ -1033,7 +1039,7 @@ const ApprovalModel = struct {
             if (message.role == .tool) break true;
         } else false;
         if (!has_result) return .{ .success = .{
-            .message = try toolCallMessage(a, "approval-call", "bash", "{\"command\":\"rm -rf build\"}"),
+            .message = try toolCallMessage(a, "approval-call", "bash", "{\"command\":\"rm -f .ssh/fixture-marker\"}"),
             .finish = .tool_calls,
         } };
         return .{ .success = .{ .message = try p.textMessage(a, .assistant, "after denial"), .finish = .stop } };
@@ -1438,7 +1444,6 @@ test "per-agent status rows grouped progress four workers without get and ignore
     var started: usize = 0;
     defer for (ids[0..started]) |id| a.free(id);
     fix.service.beginTask(&fix.parent_cancel);
-    try std.testing.expect(fix.service.view().individual_supported);
     try std.testing.expectEqual(@as(usize, 0), fix.service.view().agents.len);
     for (&models, 0..) |*model, i| {
         fix.service.deps.model_factory = .{ .context = model, .make_fn = GroupProgressModel.make };
@@ -1508,7 +1513,6 @@ test "per-agent status rows grouped progress four workers without get and ignore
     fix.service.beginTask(&fix.parent_cancel);
     try std.testing.expectEqual(@as(u64, 0), fix.service.view().group_id);
     try std.testing.expectEqual(@as(u64, 0), fix.service.view().total);
-    try std.testing.expect(fix.service.view().individual_supported);
     try std.testing.expectEqual(@as(usize, 0), fix.service.view().agents.len);
     var next: FakeModel = .{ .io = io, .hold = .init(true) };
     defer next.hold.store(false, .release);
@@ -1894,8 +1898,6 @@ test "multiple retained cleanup owners are all kept until deinit closes them" {
     while (owner) |child| : (owner = child.retained_next) {
         try std.testing.expect(child.job == null);
         try std.testing.expect(child.cancel.parent == null);
-        // The Service-owned mutation gate is a borrow and must be dropped too.
-        try std.testing.expect(child.tools.subagent_mutation_gate == null);
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);

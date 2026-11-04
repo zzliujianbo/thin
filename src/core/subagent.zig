@@ -4,7 +4,7 @@
 //! is no Tools -> App dependency cycle. No filesystem, network or UI code here.
 //!
 //! The parent keeps reasoning and communication while a child runs: `run` is
-//! only a START operation, while `get`, `send`, `cancel`, `active` and the
+//! only a START operation, while `get`, `send`, `cancel` and the
 //! task-lifecycle hooks operate on the host's current-root jobs. A child has
 //! no recursive service; its only channel is `ParentChannel`.
 
@@ -132,42 +132,6 @@ pub fn boundReport(a: std.mem.Allocator, text: []const u8) !Bounded {
     return .{ .text = try a.dupe(u8, text[0..end]), .truncated = true };
 }
 
-/// Root-shared, cancellable write mutex. Every child Tools of one root task
-/// borrows the same instance, so `write_file` and `bash` of sibling children
-/// serialize while child reasoning and reads stay concurrent. The parent does
-/// not share it: a parent write/command is refused while any child is
-/// uncollected. It bounds no job count: it only orders mutating side effects.
-/// The borrow must outlive every joined root job.
-pub const MutationGate = struct {
-    held: std.atomic.Value(bool) = .init(false),
-
-    /// Wait until this gate is exclusively owned. A failed attempt sleeps
-    /// instead of spinning, so a waiter never holds a spin lock. On
-    /// cancellation or an Io error the caller returns without ownership and
-    /// any previous owner's lock stays exactly as it was; the caller runs no
-    /// side effects until this returns successfully.
-    pub fn acquire(self: *MutationGate, io: std.Io, cancel: *const protocol.Cancellation) !void {
-        while (true) {
-            if (cancel.isRequested()) return error.Canceled;
-            if (!self.held.swap(true, .acquire)) {
-                // A cancellation that raced the successful swap must not let
-                // the caller mutate anything, so give the gate back first.
-                if (cancel.isRequested()) {
-                    self.release();
-                    return error.Canceled;
-                }
-                return;
-            }
-            try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-        }
-    }
-
-    /// Release owned exclusivity. Only the current owner may call this.
-    pub fn release(self: *MutationGate) void {
-        self.held.store(false, .release);
-    }
-};
-
 /// Host-provided child service. `run_fn` starts a job and returns immediately
 /// with its id; it must honour `cancel`, own its child resources and finish
 /// cleanup before returning. Optional callbacks are no-ops/wrappers when absent.
@@ -192,8 +156,6 @@ pub const Service = struct {
     send_fn: ?*const fn (*anyopaque, std.mem.Allocator, Send, *const protocol.Cancellation) anyerror!Result = null,
     /// Cancel and join one job, returning its final cancellation/cleanup state.
     cancel_fn: ?*const fn (*anyopaque, std.mem.Allocator, Cancel, *const protocol.Cancellation) anyerror!Result = null,
-    /// True while a job of the current root is running or uncollected.
-    active_fn: ?*const fn (*anyopaque) bool = null,
     /// Before an Inbox seal of a normal stop: return a bounded host-status/ID
     /// hint, or null when nothing remains. Allocated with the passed allocator;
     /// Runtime copies it into the stable history arena.
@@ -240,11 +202,6 @@ pub const Service = struct {
         var result = try callback(self.context, a, request, cancel_token);
         if (result.cleanup_failed) result.is_error = true;
         return result;
-    }
-
-    pub fn active(self: Service) bool {
-        const callback = self.active_fn orelse return false;
-        return callback(self.context);
     }
 
     pub fn beforeFinish(self: Service, a: std.mem.Allocator, token: *const protocol.Cancellation) anyerror!?[]const u8 {
