@@ -121,6 +121,8 @@ pub const Receiver = struct {
     endpoint: []u8,
     uid: u32,
     epoch: u64,
+    /// Bind every subscription, including replacements, to the controller peer.
+    expected_pid: ?u32 = null,
     resume_cursor: ?u64 = null,
     stop: Cancellation = .{},
 
@@ -151,6 +153,10 @@ pub const Receiver = struct {
     }
 
     pub fn startResumed(a: std.mem.Allocator, io: std.Io, endpoint: []const u8, uid: u32, epoch: u64, cursor: ?u64) !*Receiver {
+        return startBound(a, io, endpoint, uid, epoch, cursor, null);
+    }
+
+    pub fn startBound(a: std.mem.Allocator, io: std.Io, endpoint: []const u8, uid: u32, epoch: u64, cursor: ?u64, expected_pid: ?u32) !*Receiver {
         if (epoch == 0) return error.StaleControl;
         const self = try a.create(Receiver);
         errdefer a.destroy(self);
@@ -160,7 +166,7 @@ pub const Receiver = struct {
         errdefer resume_wake.deinit();
         var ready = try Wakeup.init();
         errdefer ready.deinit();
-        self.* = .{ .a = a, .io = io, .endpoint = path, .uid = uid, .epoch = epoch, .resume_cursor = cursor, .resume_wake = resume_wake, .ready = ready };
+        self.* = .{ .a = a, .io = io, .endpoint = path, .uid = uid, .epoch = epoch, .expected_pid = expected_pid, .resume_cursor = cursor, .resume_wake = resume_wake, .ready = ready };
         self.future = try std.Io.concurrent(io, run, .{self});
         return self;
     }
@@ -339,6 +345,53 @@ pub const Receiver = struct {
         return self.count != 0;
     }
 
+    /// Wait for the initial snapshot and baseline without removing either.
+    /// The regular consumer must still process the original ordered frames.
+    /// This uses one total deadline and the same cancellation/progress contract
+    /// as the control socket, even if the peer sends only the first frame.
+    pub fn copyInitial(self: *Receiver, wait: unix.Wait) ![2][]u8 {
+        const started = std.Io.Clock.awake.now(wait.io);
+        while (true) {
+            if (wait.progress_fn) |progress| try progress(wait.progress_context);
+            if (wait.cancel) |cancel| if (cancel.isRequested()) return error.Canceled;
+            self.ready.drain();
+            self.lock();
+            if (self.done) {
+                const failure = self.failure orelse error.ConnectionClosed;
+                self.unlock();
+                return failure;
+            }
+            if (self.count >= 2) {
+                const first = self.a.dupe(u8, self.frames[self.head].?) catch |err| {
+                    self.unlock();
+                    return err;
+                };
+                const second = self.a.dupe(u8, self.frames[(self.head + 1) % max_count].?) catch |err| {
+                    self.a.free(first);
+                    self.unlock();
+                    return err;
+                };
+                self.unlock();
+                // The ordinary consumer still owns both frames and must wake.
+                self.ready.notify();
+                return .{ first, second };
+            }
+            self.unlock();
+            const elapsed = started.untilNow(wait.io, .awake).toMilliseconds();
+            if (elapsed >= wait.timeout_ms) return error.Timeout;
+            const remaining: i64 = @as(i64, wait.timeout_ms) - elapsed;
+            var descriptors = [_]std.c.pollfd{.{ .fd = self.ready.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+            const n = std.c.poll(&descriptors, descriptors.len, @intCast(@min(remaining, 50)));
+            if (n < 0 and std.c._errno().* != @backingInt(std.os.linux.E.INTR)) return error.Transport;
+        }
+    }
+
+    pub fn checkRunning(self: *Receiver) !void {
+        self.lock();
+        defer self.unlock();
+        if (self.done) return self.failure orelse error.ConnectionClosed;
+    }
+
     /// All queued frames precede a terminal transport error. The caller owns
     /// the returned bytes; no receiver arena or backend pointer is borrowed.
     pub fn pop(self: *Receiver) !?[]u8 {
@@ -392,6 +445,7 @@ pub const Receiver = struct {
     fn receive(self: *Receiver) !void {
         var conn = try unix.connect(self.a, self.endpoint, self.uid, .{ .io = self.io, .timeout_ms = setup_timeout_ms, .cancel = &self.stop });
         defer conn.close();
+        if (self.expected_pid) |pid| if (conn.peer.pid != pid) return error.PeerPidMismatch;
         var request_buffer: [160]u8 = undefined;
         const request = if (self.resume_cursor) |cursor|
             try std.fmt.bufPrint(&request_buffer, "{{\"v\":{d},\"id\":1,\"op\":\"watch\",\"epoch\":{d},\"since\":{d}}}", .{ protocol.version, self.epoch, cursor })
@@ -468,6 +522,60 @@ pub const Receiver = struct {
         a.destroy(self);
     }
 };
+
+test "bound watch rejects a different kernel peer before sending watch" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path);
+    var dir = try unix.Directory.resolveUnder(a, path[0..n], "bound", @intCast(std.c.getuid()));
+    defer dir.deinit();
+    var listener = try unix.Listener.bind(a, &dir, "stream.sock", .{});
+    defer listener.deinit();
+    const actual_pid: u32 = @intCast(std.os.linux.getpid());
+    const receiver = try Receiver.startBound(a, io, listener.path, @intCast(std.c.getuid()), 7, null, actual_pid + 1);
+    defer receiver.deinit();
+    var connection = try listener.accept(.{ .io = io, .timeout_ms = 2000 });
+    defer connection.close();
+    try std.testing.expect((try connection.readFrame(.{ .io = io, .timeout_ms = 2000 })) == null);
+    try std.testing.expectError(error.PeerPidMismatch, receiver.copyInitial(.{ .io = io, .timeout_ms = 2000 }));
+}
+
+test "initial watch wait observes progress and cancellation on a real peer" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path);
+    var dir = try unix.Directory.resolveUnder(a, path[0..n], "cancel", @intCast(std.c.getuid()));
+    defer dir.deinit();
+    var listener = try unix.Listener.bind(a, &dir, "stream.sock", .{});
+    defer listener.deinit();
+    const receiver = try Receiver.start(a, io, listener.path, @intCast(std.c.getuid()), 7);
+    var receiver_live = true;
+    defer if (receiver_live) receiver.deinit();
+    var connection = try listener.accept(.{ .io = io, .timeout_ms = 2000 });
+    defer connection.close();
+    const watch = (try connection.readFrame(.{ .io = io, .timeout_ms = 2000 })) orelse return error.TestExpectedFrame;
+    defer a.free(watch);
+    const Progress = struct {
+        fn tick(raw: ?*anyopaque) !void {
+            const count: *usize = @ptrCast(@alignCast(raw.?));
+            count.* += 1;
+        }
+    };
+    var ticks: usize = 0;
+    var cancel: Cancellation = .{};
+    cancel.cancel();
+    try std.testing.expectError(error.Canceled, receiver.copyInitial(.{ .io = io, .timeout_ms = 2000, .cancel = &cancel, .progress_context = &ticks, .progress_fn = Progress.tick }));
+    try std.testing.expectEqual(@as(usize, 1), ticks);
+    receiver.deinit();
+    receiver_live = false;
+    try std.testing.expect((try connection.readFrame(.{ .io = io, .timeout_ms = 2000 })) == null);
+}
 
 test "receiver task keeps reading without a consumer and stops while its queue is full" {
     const a = std.testing.allocator;

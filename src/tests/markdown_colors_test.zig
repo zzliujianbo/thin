@@ -227,7 +227,7 @@ test "inline code uses purple and keeps literal markup" {
 test "single-byte chunks and one-row ACK preserve full-width and styled boundaries" {
     try @import("../ui/text.zig").initLocale();
     const a = std.testing.allocator;
-    const cases = [_][]const u8{ "abcd\n", "abcd", "**ab👩‍💻cdef**\n", "[abcd](url)\n", "**a `中👩‍💻**` z**\n", "x ``a`b``\n" };
+    const cases = [_][]const u8{ "abcd\n", "abcd", "**ab👩‍💻cdef**\n", "[abcd](url)\n", "**a `中👩‍💻**` z**\n", "x ``a`b``\n", "A👩‍💻\r\n中文\r\n" };
     for (cases) |source| {
         const reference = try markdown.render(a, source, .{ .columns = 4, .max_lines = 128 });
         defer markdown.release(a, reference);
@@ -268,6 +268,111 @@ fn progressOne(a: Allocator, body: *body_mod.Body, rows: *std.ArrayList([]const 
         try rows.append(a, copy);
     }
     try std.testing.expectEqual(@as(usize, 1), try body.commit(1));
+}
+
+test "UTF8 and CRLF at every split match static rendering" {
+    try @import("../ui/text.zig").initLocale();
+    const a = std.testing.allocator;
+    const source = "## 标题 👩‍💻\r\n**é中文**\r\nx\r\n";
+    for ([_]usize{ 1, 2, 7 }) |columns| {
+        const reference = try markdown.render(a, source, .{ .columns = columns, .max_lines = 256 });
+        defer markdown.release(a, reference);
+        for (0..source.len + 1) |split| {
+            const body = try body_mod.Body.create(a, columns);
+            defer body.destroy();
+            body.max_window_bytes = 1;
+            var rows: std.ArrayList([]const u8) = .empty;
+            defer freeRows(a, &rows);
+            try body.append(source[0..split]);
+            try progressOne(a, body, &rows);
+            try body.append(source[split..]);
+            try body.finish();
+            for (0..16384) |_| {
+                if (body.isDrained()) break;
+                try progressOne(a, body, &rows);
+            }
+            try std.testing.expect(body.isDrained());
+            try std.testing.expectEqual(body.acceptedSourceEnd(), body.committedSourceEnd());
+            try expectAppearance(a, reference.lines, rows.items);
+        }
+    }
+}
+
+test "decoder state and row checkpoints survive aborted frames" {
+    try @import("../ui/text.zig").initLocale();
+    const body = try body_mod.Body.create(std.testing.allocator, 2);
+    defer body.destroy();
+    try body.append("A\r");
+    try std.testing.expect(body.decoder.held_cr);
+    try std.testing.expectEqual(@as(usize, 2), body.acceptedSourceEnd());
+    try std.testing.expectEqualStrings("A", body.source.items);
+    try body.append("\n\xf0\x9f");
+    try std.testing.expect(!body.decoder.held_cr);
+    try std.testing.expectEqual(@as(usize, 2), body.decoder.carry_len);
+    try std.testing.expectEqualSlices(u8, "\xf0\x9f", body.decoder.carry[0..body.decoder.carry_len]);
+    try std.testing.expectEqualStrings("A\n", body.source.items);
+    try body.append("\x91\xa9\n");
+    try std.testing.expectEqual(@as(usize, 0), body.decoder.carry_len);
+    try std.testing.expectEqualStrings("A\n👩\n", body.source.items);
+    try body.finish();
+    try body.build();
+    try std.testing.expectEqual(@as(usize, 2), body.visibleRows().len);
+    try std.testing.expectEqual(@as(usize, 0), body.visibleRows()[0].start);
+    try std.testing.expectEqual(@as(usize, 2), body.visibleRows()[0].end);
+    try std.testing.expectEqual(@as(usize, 2), body.visibleRows()[1].start);
+    try std.testing.expectEqual(@as(usize, 7), body.visibleRows()[1].end);
+    try std.testing.expect(body.visibleRows()[0].complete and body.visibleRows()[1].complete);
+    try std.testing.expect(std.mem.indexOf(u8, body.visibleRows()[0].text, "A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body.visibleRows()[1].text, "👩") != null);
+    try std.testing.expectEqual(@as(usize, 2), body.visibleSourceEndForRows(1));
+    try std.testing.expectEqual(@as(usize, 7), body.visibleSourceEnd());
+    try std.testing.expectEqual(@as(usize, 0), body.committedSourceEnd());
+    try std.testing.expectEqual(@as(usize, 7), body.windowBytes());
+
+    // The caller aborts an incomplete frame before retrying its checkpoints.
+    body.abort();
+    try std.testing.expectEqual(@as(usize, 0), try body.commit(1));
+    try std.testing.expectEqual(@as(usize, 0), body.committedSourceEnd());
+    try std.testing.expectEqual(@as(usize, 7), body.windowBytes());
+    try body.build();
+    // Model the caller committing the covered prefix after a fresh frame ACK.
+    try std.testing.expectEqual(@as(usize, 1), try body.commit(1));
+    try std.testing.expectEqual(@as(usize, 2), body.committedSourceEnd());
+    try std.testing.expectEqual(@as(usize, 5), body.windowBytes());
+    try body.build();
+    try std.testing.expectEqual(@as(usize, 2), body.visibleRows()[0].start);
+    try std.testing.expectEqual(@as(usize, 7), body.visibleRows()[0].end);
+    body.releasePin();
+    try std.testing.expectEqual(@as(usize, 0), try body.commit(1));
+    try std.testing.expectEqual(@as(usize, 2), body.committedSourceEnd());
+    try body.build();
+    try std.testing.expectEqual(@as(usize, 1), try body.commit(1));
+    try std.testing.expect(body.isDrained());
+    try std.testing.expectEqual(@as(usize, 7), body.committedSourceEnd());
+}
+
+test "empty heading metadata waits for a fresh checkpoint commit" {
+    const body = try body_mod.Body.create(std.testing.allocator, 2);
+    defer body.destroy();
+    try body.append("# ");
+    try body.build();
+    try std.testing.expect(!body.hasMetadataProgress());
+    try body.finish();
+    try std.testing.expect(!body.hasMetadataProgress());
+    body.releasePin();
+    try body.build();
+    try std.testing.expectEqual(@as(usize, 0), body.visibleRows().len);
+    try std.testing.expectEqual(@as(usize, 0), body.pendingBytes());
+    try std.testing.expect(body.hasMetadataProgress());
+    try std.testing.expectEqual(@as(usize, 0), body.committedSourceEnd());
+    body.abort();
+    try std.testing.expectEqual(@as(usize, 0), try body.commit(0));
+    try std.testing.expectEqual(@as(usize, 2), body.windowBytes());
+    try body.build();
+    try std.testing.expect(body.hasMetadataProgress());
+    try std.testing.expectEqual(@as(usize, 0), try body.commit(0));
+    try std.testing.expectEqual(@as(usize, 2), body.committedSourceEnd());
+    try std.testing.expect(body.isDrained());
 }
 
 test "literal unclosed inline cap and long fenced code make progress" {
@@ -362,10 +467,15 @@ fn allocationCase(a: Allocator) !void {
     defer body.destroy();
     try body.append("abc\xf0\x9f");
     const before_end = body.acceptedSourceEnd();
-    const before_carry = body.carry_len;
+    const before_carry = body.decoder.carry_len;
+    const before_cr = body.decoder.held_cr;
     body.append("\x91\xa9more") catch |err| {
         try std.testing.expectEqual(before_end, body.acceptedSourceEnd());
-        try std.testing.expectEqual(before_carry, body.carry_len);
+        try std.testing.expectEqual(before_carry, body.decoder.carry_len);
+        try std.testing.expectEqual(before_cr, body.decoder.held_cr);
+        try std.testing.expectEqualSlices(u8, "\xf0\x9f", body.decoder.carry[0..body.decoder.carry_len]);
+        try std.testing.expectEqualStrings("abc", body.source.items);
+        try std.testing.expect(!body.finished);
         return err;
     };
     try body.finish();
@@ -376,8 +486,61 @@ fn allocationCase(a: Allocator) !void {
     markdown.release(a, rendered);
 }
 
+fn appendHeldCrAllocationCase(a: Allocator) !void {
+    const body = try body_mod.Body.create(a, 4);
+    defer body.destroy();
+    try body.append("abcdefgh\r");
+    const before_end = body.acceptedSourceEnd();
+    body.append("\nmore") catch |err| {
+        try std.testing.expectEqual(before_end, body.acceptedSourceEnd());
+        try std.testing.expect(body.decoder.held_cr);
+        try std.testing.expectEqual(@as(usize, 0), body.decoder.carry_len);
+        try std.testing.expectEqualStrings("abcdefgh", body.source.items);
+        try std.testing.expect(!body.finished);
+        return err;
+    };
+    try std.testing.expect(!body.decoder.held_cr);
+    try std.testing.expectEqualStrings("abcdefgh\nmore", body.source.items);
+}
+
 test "allocation failures preserve decoder and release owned resources" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), allocationCase, .{});
+    try std.testing.checkAllAllocationFailures(backing.allocator(), appendHeldCrAllocationCase, .{});
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+}
+
+fn finishAllocationCase(a: Allocator, suffix: []const u8, expected: []const u8) !void {
+    const body = try body_mod.Body.create(a, 4);
+    defer body.destroy();
+    try body.append("abcdefgh");
+    try body.append(suffix);
+    const before_end = body.acceptedSourceEnd();
+    const before_carry = body.decoder.carry_len;
+    const before_cr = body.decoder.held_cr;
+    body.finish() catch |err| {
+        try std.testing.expectEqual(before_end, body.acceptedSourceEnd());
+        try std.testing.expectEqual(before_carry, body.decoder.carry_len);
+        try std.testing.expectEqual(before_cr, body.decoder.held_cr);
+        try std.testing.expectEqualSlices(u8, if (before_cr) "" else suffix, body.decoder.carry[0..body.decoder.carry_len]);
+        try std.testing.expectEqualStrings("abcdefgh", body.source.items);
+        try std.testing.expect(!body.finished);
+        return err;
+    };
+    try std.testing.expect(body.finished);
+    try std.testing.expect(!body.decoder.held_cr);
+    try std.testing.expectEqual(@as(usize, 0), body.decoder.carry_len);
+    try std.testing.expectEqualStrings(expected, body.source.items);
+}
+
+test "finish allocation failures retain held CR and UTF8 for retry" {
+    // Force growth through allocation so staging and source publication both
+    // participate in exhaustive failure injection.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), finishAllocationCase, .{ "\r", "abcdefgh�" });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), finishAllocationCase, .{ "\xf0\x9f", "abcdefgh��" });
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
 }
 
 test "oversized cluster fails explicitly without retiring source" {

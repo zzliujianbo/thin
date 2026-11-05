@@ -15,8 +15,6 @@ pub const Body = struct {
     base: usize = 0,
     state: scanner.State = .{},
     decoder: Decoder = .{},
-    carry_len: usize = 0,
-    held_cr: bool = false,
     finished: bool = false,
     pinned: bool = false,
     limit: Limit = .none,
@@ -48,7 +46,7 @@ pub const Body = struct {
         return self.source.items.len -| if (self.valid) self.consumed else 0;
     }
     pub fn acceptedSourceEnd(self: *const Body) usize {
-        return self.base + self.source.items.len + @intFromBool(self.held_cr);
+        return self.base + self.source.items.len + @intFromBool(self.decoder.held_cr);
     }
     pub fn committedSourceEnd(self: *const Body) usize {
         return self.base;
@@ -60,14 +58,11 @@ pub const Body = struct {
         if (!self.pinned or count == 0 or self.rows.len == 0) return self.base;
         return @max(self.base, self.rows[@min(count, self.rows.len) - 1].end);
     }
-    pub fn hasPendingPresentation(_: *const Body) bool {
-        return false;
-    }
     pub fn hasMetadataProgress(self: *const Body) bool {
         return self.pinned and self.rows.len == 0 and self.metadata != null and self.metadata.?.end > self.base;
     }
     pub fn isDrained(self: *const Body) bool {
-        return self.finished and self.limit == .none and self.source.items.len == 0 and self.carry_len == 0 and !self.held_cr;
+        return self.finished and self.limit == .none and self.source.items.len == 0 and self.decoder.carry_len == 0 and !self.decoder.held_cr;
     }
     pub fn columnCount(self: *const Body) usize {
         return self.columns;
@@ -99,14 +94,13 @@ pub const Body = struct {
     };
     pub fn append(self: *Body, raw: []const u8) !void {
         if (self.finished) return;
+        // Decoder callbacks can fail after advancing; stage both changes before publication.
         var next = self.decoder;
         var buf: Buffer = .{ .a = self.a };
         defer buf.bytes.deinit(self.a);
         try next.feed(raw, &buf, Buffer.emit);
         try self.source.appendSlice(self.a, buf.bytes.items);
         self.decoder = next;
-        self.carry_len = next.carry_len;
-        self.held_cr = next.held_cr;
         if (self.pinned) self.dirty = true else self.valid = false;
     }
     pub fn finish(self: *Body) !void {
@@ -117,8 +111,6 @@ pub const Body = struct {
         try next.finish(&buf, Buffer.emit);
         try self.source.appendSlice(self.a, buf.bytes.items);
         self.decoder = next;
-        self.carry_len = next.carry_len;
-        self.held_cr = next.held_cr;
         self.finished = true;
         if (self.pinned) self.dirty = true else self.valid = false;
     }

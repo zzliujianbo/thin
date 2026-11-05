@@ -83,7 +83,6 @@ const Record = struct {
     agent_open: bool = false,
     /// Measured wall-clock execution time of this row; null when unobserved.
     duration_ms: ?u64 = null,
-    final_answer: bool = false,
     command_spans: std.ArrayList(presentation.CommandSpan) = .empty,
     /// Only a fully written frame commits transcript delivery. Pending survives index shifts.
     output: bool = false,
@@ -127,7 +126,6 @@ const Record = struct {
     pending_stream_rows: usize = 0,
     /// A real canonical revision replaced already-released stream rows.
     stream_revised: bool = false,
-    stream_columns: usize = 0,
     /// Static records (restored history) deliberately use the batch renderer.
     batch: bool = false,
     /// Heap-owned bounded incremental thinking tail. It survives invalidate()
@@ -237,7 +235,7 @@ const Record = struct {
         self.tail = try plain_tail.Tail.create(a, if (columns == 0) 80 else columns, reasoning_tail_rows, reasoning_tail_bytes);
     }
 
-    /// 追加文本。超出 record_limit 时截断，并在截断后忽略后续追加。
+    /// Retire the current source generation and its pending coverage.
     fn resetStream(self: *Record) !void {
         self.stream_generation +%= 1;
         self.pending_output = false;
@@ -245,7 +243,6 @@ const Record = struct {
         self.stream = null;
         self.stream_written = 0;
         self.pending_stream_rows = 0;
-        self.stream_columns = 0;
         // A new generation owns new source; an old frame's coverage cannot be
         // reused as proof for it.
         self.delivery_visible = 0;
@@ -260,7 +257,6 @@ const Record = struct {
             if (self.stream == null) {
                 const columns = if (self.columns != 0) self.columns else 80;
                 self.stream = try body_stream.Body.create(a, columns);
-                self.stream_columns = columns;
             }
             self.stream.?.append(bytes) catch |err| {
                 // A failed parse/limit must not lose the bytes already accepted;
@@ -829,8 +825,6 @@ const Ui = struct {
     permission_scroll: usize = 0,
     /// 审批期间是否出现过粘贴；出现后该审批只能拒绝。
     approval_paste_seen: bool = false,
-    /// 已有旧记录被丢弃，标题栏会提示 older display clipped。
-    dropped_display: bool = false,
     /// Static restored history uses the batch renderer, not live streaming.
     restoring: bool = false,
     /// 后台任务是否正在运行。
@@ -895,10 +889,8 @@ const Ui = struct {
     /// Owned id of a pending busy-session /close confirmation.
     stop_close: ?[]const u8 = null,
 
-    /// 用户请求退出；若任务仍在运行，会等它结束后再退出。
-    want_exit: bool = false,
+    /// An explicit quit owns exit authority; local tasks are joined first.
     ctrl_d_exit: bool = false,
-    has_submitted: bool = false,
     /// 清理未确认（CleanupFailed 等），禁止再次提交，只允许退出并检查。
     poisoned: bool = false,
     /// 是否需要重绘，由事件与按键置位。
@@ -941,6 +933,10 @@ const Ui = struct {
     /// owner's slice is never retained past one observation.
     subagent_rows: std.ArrayList(AgentRow) = .empty,
     applying_history: bool = false,
+    /// This view published the restored-conversation transcript banner. Its
+    /// byte-identical footer hint / settings notice stays suppressed even if
+    /// the banner is evicted; ownership resets with the rest of the view.
+    history_notice_shown: bool = false,
     /// Mutable display-only tool rows; never released as immutable transcript.
     tool_views: tool_views_module.Views = .{},
     /// Shared canonical FIFO remains the fallback for restored/legacy events.
@@ -1320,6 +1316,7 @@ const Ui = struct {
             .configure => {
                 if (self.secret_mode) self.endSecret();
                 self.secret_quarantine = false;
+                self.display.context = self.connection.current().initial_context;
                 self.publishNotice(if (action.configure.provider != null) "Key saved locally; use /model to select or activate it" else "Saved locally; send a message to connect");
             },
             .codex_login => {
@@ -1826,7 +1823,6 @@ const Ui = struct {
     fn reclaimDisplayCapacity(self: *Ui) void {
         while (self.displayBackpressured() and self.canEvictOldest()) {
             self.removeRecord(0);
-            self.dropped_display = true;
         }
     }
 
@@ -1897,7 +1893,7 @@ const Ui = struct {
             for (self.records.items) |record| {
                 if (record.kind == .reasoning) continue;
                 if (record.stream) |stream| {
-                    if (stream.windowBytes() != 0 or stream.carry_len != 0 or stream.held_cr or record.pending_stream_rows != 0)
+                    if (stream.windowBytes() != 0 or stream.decoder.carry_len != 0 or stream.decoder.held_cr or record.pending_stream_rows != 0)
                         self.replay_refused = true;
                 }
             }
@@ -2126,14 +2122,12 @@ const Ui = struct {
         self.record_index.clearRetainingCapacity();
         self.draft = null;
         self.reasoning = null;
-        self.dropped_display = false;
         self.last_terminal = null;
         self.mode = null;
         self.display = .{};
         self.model_flow = .{};
-        self.has_submitted = false;
+        self.history_notice_shown = false;
         self.poisoned = false;
-        self.want_exit = false;
         self.closeSettingsMenu();
         self.closeProviderPicker();
         self.closeModelPicker();
@@ -2534,7 +2528,6 @@ const Ui = struct {
                 bytes -= self.records.items[index].body.items.len;
                 ordinary_count -= 1;
                 self.removeRecord(index);
-                self.dropped_display = true;
             }
         }
 
@@ -2552,7 +2545,6 @@ const Ui = struct {
             removed.deinit(self.allocator);
             if (self.draft) |i| self.draft = if (i == 0) null else i - 1;
             if (self.reasoning) |i| self.reasoning = if (i == 0) null else i - 1;
-            self.dropped_display = true;
         }
 
         if ((self.restoring or !is_agent_row) and (ordinary_count >= 64 or bytes + growth > 1024 * 1024))
@@ -2578,6 +2570,9 @@ const Ui = struct {
         defer self.restoring = prior_restoring;
         const restore_notice = try self.add(.notice, "Restored model context (display may be shortened); prior tools are NOT rerun");
         self.records.items[restore_notice].batch = false;
+        // Published: this transcript banner now owns the success notice for
+        // this view. Set only after the row really exists.
+        self.history_notice_shown = true;
         for (messages, 0..) |message, index| switch (message.role) {
             .user, .context => {
                 for (message.blocks) |block| switch (block) {
@@ -2620,8 +2615,6 @@ const Ui = struct {
             },
         };
         self.clearToolCaptions();
-        // Restored records are content, not a never-used empty composer tail.
-        self.has_submitted = true;
     }
 
     fn removeRecord(self: *Ui, index: usize) void {
@@ -2896,7 +2889,11 @@ const Ui = struct {
                 terminal_issue = true;
             }
         }
-        if (notice.len == 0 and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
+        // A restored-success banner was published in this view. Its footer
+        // twin stays suppressed even if the row is later evicted; only the
+        // exact canonical success string is dropped.
+        const self_restored = self.history_notice_shown and std.mem.eql(u8, self.notice, session_client.restored_notice);
+        if (notice.len == 0 and !self_restored and !std.mem.eql(u8, self.notice, "Ready") and !std.mem.eql(u8, self.notice, "Running") and !std.mem.eql(u8, self.notice, "Completed")) notice = self.notice;
         if (notice.len == 0 and !configured(state) and (state.settings_notice == null or state.model.len == 0)) notice = "Not configured: /login, then /model";
         if (notice.len == 0 and self.remote() != null and !state.available) notice = "Daemon connection unavailable; /exit and reconnect";
         if (self.permission == null and !self.stop_open and !terminal_issue and notice.len == 0 and state.memory.enabled and state.settings_error == null and state.log_error == null) {
@@ -2936,7 +2933,8 @@ const Ui = struct {
                 const same_capability_cause = std.mem.eql(u8, warning, "Saved thinking level not applied: model capabilities unknown") and
                     (std.mem.eql(u8, notice, "Thinking capabilities are loading; try Shift+Tab again shortly") or
                         std.mem.eql(u8, notice, "Thinking capabilities unknown: refresh /model or declare reasoning levels in configuration"));
-                if (!same_capability_cause and !std.mem.eql(u8, notice, warning)) notice = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ notice, if (notice.len != 0) " | " else "", warning });
+                const restored_twin = self.history_notice_shown and std.mem.eql(u8, warning, session_client.restored_notice);
+                if (!restored_twin and !same_capability_cause and !std.mem.eql(u8, notice, warning)) notice = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ notice, if (notice.len != 0) " | " else "", warning });
             }
         }
         if (state.log_error) |err| return std.fmt.allocPrint(a, "{s}{s}REC FAILED: {s}", .{ notice, if (notice.len != 0) " | " else "", @errorName(err) });
@@ -2993,7 +2991,6 @@ const Ui = struct {
                         (record.stream.?.visibleRows().len != 0 or record.stream_written != 0);
                     self.removeRecord(i);
                 } else {
-                    record.final_answer = shared.answer.classify(blocks, blocks_complete) == .final;
                     if (!clipped and blocks_complete and canonical.items.len <= record_limit) {
                         const same = !record.clipped and !record.mirror_full and record.body.items.len == canonical.items.len and
                             std.mem.eql(u8, record.body.items, canonical.items);
@@ -3044,7 +3041,6 @@ const Ui = struct {
                     // settle only through a fresh frame of the applied state.
                     self.removeRecord(i);
                 } else {
-                    record.final_answer = shared.answer.classify(blocks, blocks_complete) == .final;
                     // Rebuilt from canonical blocks without an incremental body:
                     // the same sequences now own the replacement's rows.
                     self.retargetDeliveryFencesTo(record.id, record.stream_generation, 0);
@@ -3066,7 +3062,7 @@ const Ui = struct {
                 if (record.body.items.len == 0) {
                     withdrawn_preview = record.flow_prefix != null or record.pending_flow_prefix != null;
                     self.removeRecord(i);
-                } else record.final_answer = shared.answer.classify(blocks, blocks_complete) == .final;
+                }
             }
         }
         self.draft = null;
@@ -3298,10 +3294,9 @@ const Ui = struct {
     }
 
     fn requestQuit(self: *Ui) void {
-        // ctrl_d_exit is the provenance bit for an actual parsed quit gesture;
-        // want_exit alone is never authority to terminate the process.
+        // A quit gesture or accepted session-leave action grants authority;
+        // captured signals are checked separately by exitAuthorized.
         self.ctrl_d_exit = true;
-        self.want_exit = true;
         self.parser.stop_feed = true;
         // A remote frontend leaves without canceling the daemon-owned task;
         // deinit reports the detach. Explicit Ctrl-C still cancels it.
@@ -4639,7 +4634,6 @@ const Ui = struct {
             removed.deinit(self.allocator);
             if (self.draft) |i| self.draft = if (i == 0) null else i - 1;
             if (self.reasoning) |i| self.reasoning = if (i == 0) null else i - 1;
-            self.dropped_display = true;
         }
         self.records.appendAssumeCapacity(record);
         self.registerRecord(self.records.items.len - 1) catch |err| {
@@ -4652,7 +4646,6 @@ const Ui = struct {
         self.dropHistoryDraft();
         self.future = future;
         self.prompt = prompt;
-        self.has_submitted = true;
         self.busy = true;
         self.compact_composer = false;
         self.mode = if (local_command) .executing_tool else .calling_model;
@@ -4681,7 +4674,6 @@ const Ui = struct {
         self.future = future;
         self.prompt = null;
         self.task_epoch +%= 1;
-        self.has_submitted = true;
         self.busy = true;
         self.compact_composer = false;
         self.mode = .compacting;
@@ -4762,7 +4754,6 @@ const Ui = struct {
             removed.deinit(self.allocator);
             if (self.draft) |i| self.draft = if (i == 0) null else i - 1;
             if (self.reasoning) |i| self.reasoning = if (i == 0) null else i - 1;
-            self.dropped_display = true;
         }
         if (kind != .compact) {
             self.records.appendAssumeCapacity(record.*);
@@ -4783,7 +4774,6 @@ const Ui = struct {
         self.remote_observed_busy = false;
         self.remote_idle_ticks = 0;
         self.remote_terminal_wait = false;
-        self.has_submitted = true;
         self.busy = true;
         self.compact_composer = false;
         self.mode = switch (kind) {
@@ -5311,6 +5301,7 @@ const Ui = struct {
                 // endSecret still wipes parser scratch and sets stop_feed.
                 self.secret_quarantine = false;
                 self.wipeEditor();
+                self.display.context = self.connection.current().initial_context;
                 self.publishNotice(if (named) "Key saved locally; use /model to select or activate it" else "Saved locally; send a message to connect");
             },
             else => {},
@@ -5835,7 +5826,6 @@ const Ui = struct {
             // 收到信号（如 SIGINT）：转为退出请求并取消任务。A remote task is
             // owned by the backend, so a frontend signal only detaches.
             if (interrupt.signal() != 0) {
-                self.want_exit = true;
                 if (self.remote() == null) self.cancel.cancel();
             }
 
@@ -6110,7 +6100,7 @@ const Ui = struct {
                             self.requestDraw();
                         }
                         record.invalidate();
-                        if (progressed and (stream.pendingBytes() != 0 or stream.hasMetadataProgress() or stream.hasPendingPresentation())) self.requestProgressDraw();
+                        if (progressed and (stream.pendingBytes() != 0 or stream.hasMetadataProgress())) self.requestProgressDraw();
                     } else |_| {
                         committed = false;
                         stream.abort();
@@ -7733,7 +7723,7 @@ test "idle Enter releases exactly one native row and redraw keeps the live draft
         try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
         testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
-        try std.testing.expect(ui.future == null and !ui.busy and !ui.has_submitted and ui.prompt == null);
+        try std.testing.expect(ui.future == null and !ui.busy and ui.prompt == null);
         try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
         try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
         try std.testing.expect(ui.menu_history != null and ui.menu_history.?.above.len != 0);
@@ -7853,14 +7843,19 @@ test "idle Enter precedes rapid nonempty submit and preserves following draft" {
     try std.testing.expect(ui.deferred_submit != null);
     try std.testing.expectEqualStrings("question", ui.deferred_submit.?.editor.bytes.items);
     try std.testing.expectEqualStrings("next draft", ui.editor.bytes.items);
-    try std.testing.expect(ui.future == null and !ui.has_submitted);
+    try std.testing.expect(ui.future == null and !ui.busy and ui.prompt == null);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
     try ui.draw();
     try std.testing.expectEqual(@as(u16, 2), ui.frame_idle_breaks);
     try ui.flushDeferredSubmit();
-    try std.testing.expect(ui.deferred_submit != null and !ui.has_submitted);
+    try std.testing.expect(ui.deferred_submit != null and ui.future == null and !ui.busy and ui.prompt == null);
+    try std.testing.expectEqualStrings("question", ui.deferred_submit.?.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
     testAcknowledgeFullFrame(&ui);
     try ui.flushDeferredSubmit();
-    try std.testing.expect(ui.deferred_submit == null and !ui.has_submitted);
+    try std.testing.expect(ui.deferred_submit == null and ui.future == null and !ui.busy and ui.prompt == null);
     try std.testing.expectEqualStrings("Not configured: use /login first", ui.notice);
     try std.testing.expectEqualStrings("next draft", ui.editor.bytes.items);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
@@ -7928,11 +7923,20 @@ test "large history restore retains bounded visible suffix" {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     var messages: [100]p.Message = undefined;
-    for (&messages) |*message| message.* = .{ .role = .user, .blocks = &.{.{ .text = "restored" }} };
+    var blocks: [100]p.Block = undefined;
+    var labels: [100][32]u8 = undefined;
+    for (&messages, 0..) |*message, i| {
+        blocks[i] = .{ .text = try std.fmt.bufPrint(&labels[i], "restored-{d:0>3}", .{i}) };
+        message.* = .{ .role = .user, .blocks = blocks[i .. i + 1] };
+    }
     try ui.restoreHistory(&messages);
     try std.testing.expectEqual(@as(usize, 64), ui.records.items.len);
-    try std.testing.expect(ui.dropped_display);
+    try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
     try std.testing.expect(std.mem.indexOf(u8, ui.records.items[0].body.items, "display may be shortened") != null);
+    for (ui.records.items[1..], 37..) |record, i| {
+        try std.testing.expectEqual(Kind.user, record.kind);
+        try std.testing.expectEqualStrings(blocks[i].text, record.body.items);
+    }
 }
 
 test "restore mixed long multi-block assistants stays within byte budget" {
@@ -7946,19 +7950,30 @@ test "restore mixed long multi-block assistants stays within byte budget" {
     @memset(chunk, 'x');
     const blocks = [_]p.Block{ .{ .text = chunk }, .{ .text = chunk } };
     var messages: [24]p.Message = undefined;
+    var short_blocks: [24]p.Block = undefined;
+    var labels: [24][32]u8 = undefined;
     for (&messages, 0..) |*message, i| {
-        message.* = if (i % 2 == 0)
-            .{ .role = .assistant, .blocks = &blocks }
-        else
-            .{ .role = .user, .blocks = &.{.{ .text = "short" }} };
+        if (i % 2 == 0) {
+            message.* = .{ .role = .assistant, .blocks = &blocks };
+        } else {
+            short_blocks[i] = .{ .text = try std.fmt.bufPrint(&labels[i], "short-{d:0>3}", .{i}) };
+            message.* = .{ .role = .user, .blocks = short_blocks[i .. i + 1] };
+        }
     }
     try ui.restoreHistory(&messages);
     var bytes: usize = 0;
-    for (ui.records.items) |record| bytes += record.body.items.len;
+    var assistants: usize = 0;
+    for (ui.records.items) |record| {
+        bytes += record.body.items.len;
+        if (record.kind == .assistant) assistants += 1;
+        if (record.kind == .user) try std.testing.expect(!std.mem.eql(u8, record.body.items, "short-001"));
+    }
     try std.testing.expect(bytes <= 1024 * 1024);
-    try std.testing.expect(ui.records.items.len <= 64);
-    try std.testing.expect(ui.dropped_display);
-    try std.testing.expectEqualStrings("short", ui.records.items[ui.records.items.len - 1].body.items);
+    try std.testing.expect(ui.records.items.len <= 64 and ui.records.items.len < messages.len + 1);
+    try std.testing.expect(assistants != 0);
+    try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
+    try std.testing.expectEqual(Kind.user, ui.records.items[ui.records.items.len - 1].kind);
+    try std.testing.expectEqualStrings("short-023", ui.records.items[ui.records.items.len - 1].body.items);
 }
 
 test "normal admission never evicts unprinted records" {
@@ -7967,10 +7982,15 @@ test "normal admission never evicts unprinted records" {
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    for (0..64) |_| _ = try ui.add(.user, "pending");
+    const first = try ui.add(.user, "oldest-pending");
+    const first_id = ui.records.items[first].id;
+    for (1..64) |_| _ = try ui.add(.user, "pending");
     try std.testing.expectError(error.DisplayCapacity, ui.add(.user, "overflow"));
     try std.testing.expectEqual(@as(usize, 64), ui.records.items.len);
-    try std.testing.expect(!ui.dropped_display);
+    try std.testing.expectEqual(first_id, ui.records.items[0].id);
+    try std.testing.expectEqualStrings("oldest-pending", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("pending", ui.records.items[63].body.items);
+    for (ui.records.items) |record| try std.testing.expect(!record.output);
 }
 
 test "real frame ignores a record removed before ack" {
@@ -8912,7 +8932,7 @@ test "Escape protects draft then cancels active task only from empty input" {
     try ui.parser.feed("\x1b", sink);
     try std.testing.expect(!cancel.isRequested());
     try ui.parser.expireEscape(sink);
-    try std.testing.expect(!cancel.isRequested() and !ui.want_exit and !ui.ctrl_d_exit);
+    try std.testing.expect(!cancel.isRequested() and !ui.ctrl_d_exit and !ui.exitAuthorized());
     try std.testing.expectEqualStrings("draft-next", ui.editor.bytes.items);
     ui.wipeEditor();
     try ui.parser.feed("\x1b", sink);
@@ -9344,7 +9364,7 @@ test "exit blank cleanup reclaims acknowledged edges and preserves startup and s
     ui.menu_history.?.borrowed = &.{"borrowed"};
     try Denied.check(&ui);
     ui.menu_history.?.borrowed = borrowed;
-    ui.has_submitted = true;
+    try std.testing.expect(ui.records.items[0].output);
     var conversation_bytes: [2048]u8 = undefined;
     var conversation_writer = Io.Writer.fixed(&conversation_bytes);
     try std.testing.expect(try ui.idleExitBytes(&conversation_writer));
@@ -9382,11 +9402,11 @@ test "exit blank cleanup places shell after completed short conversation" {
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    _ = try ui.add(.user, "short-user");
-    ui.has_submitted = true;
+    const user = try ui.add(.user, "short-user");
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[user].output);
     const answer = try ui.add(.assistant, "short-answer");
     try ui.draw();
     try screen.replay(ui.frame);
@@ -9424,11 +9444,11 @@ test "exit blank cleanup retains completed long conversation and native history"
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    _ = try ui.add(.user, "unique-user-marker");
-    ui.has_submitted = true;
+    const user = try ui.add(.user, "unique-user-marker");
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[user].output);
     var body: Io.Writer.Allocating = .init(a);
     defer body.deinit();
     for (0..80) |i| try body.writer.print("unique-line-{d:0>3}\n", .{i});
@@ -9594,14 +9614,18 @@ test "resume startup projects saved text and tool outcomes without replaying rea
         .{ .role = .assistant, .blocks = &.{.{ .text = "## Earlier answer" }} },
         .{ .role = .user, .blocks = &.{.{ .text = "/login" }} },
     });
-    try std.testing.expect(ui.has_submitted and !ui.busy and ui.future == null and !ui.secret_mode);
+    try std.testing.expect(!ui.busy and ui.future == null and ui.prompt == null and !ui.secret_mode);
     try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
     try std.testing.expectEqualStrings("remember this", ui.input_history.entries.items[0]);
     var tools: usize = 0;
+    var saw_question = false;
+    var saw_answer = false;
     for (ui.records.items) |record| {
         try std.testing.expect(record.kind != .reasoning);
         try std.testing.expect(std.mem.indexOf(u8, record.body.items, "hidden old thought") == null);
         try std.testing.expect(std.mem.indexOf(u8, record.body.items, "raw output must not render") == null);
+        if (record.kind == .user and std.mem.eql(u8, record.body.items, "remember this")) saw_question = true;
+        if (record.kind == .assistant and std.mem.eql(u8, record.body.items, "## Earlier answer")) saw_answer = true;
         if (record.kind == .tool) {
             tools += 1;
             try std.testing.expect(record.command_row and record.duration_ms == null);
@@ -9609,6 +9633,7 @@ test "resume startup projects saved text and tool outcomes without replaying rea
         }
     }
     try std.testing.expectEqual(@as(usize, 1), tools);
+    try std.testing.expect(saw_question and saw_answer);
 }
 
 test "thinking keeps Markdown syntax literal while assistant answers still render it" {
@@ -10419,8 +10444,11 @@ test "incomplete canonical block tails cannot publish a false final heading" {
     defer item.deinit();
     try std.testing.expect(item.display_truncated and !item.canonical_complete);
     try ui.event(item);
-    try std.testing.expect(!ui.records.items[0].final_answer);
+    try std.testing.expect(ui.draft == null and ui.records.items.len == 1);
+    try std.testing.expectEqual(Kind.assistant, ui.records.items[0].kind);
+    try std.testing.expectEqualStrings("intermediate-body", ui.records.items[0].body.items);
     try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "intermediate-body") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Final answer") == null);
     testAcknowledgeFullFrame(&ui);
 }
@@ -11087,18 +11115,24 @@ test "width changes re-render only the retained window without duplicate rows" {
     defer ui.deinit();
     try seedShiftDraft(&ui);
     const index = ui.draft.?;
+    const body = ui.records.items[index].stream.?;
+    try std.testing.expectEqual(@as(usize, 80), body.columnCount());
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
+    try std.testing.expectEqual(@as(usize, 79), body.columnCount());
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("stream-row-000"));
     testAcknowledgeFullFrame(&ui);
     const written = ui.records.items[index].stream_written;
-    var screen: @import("../tests/regular_screen.zig").Screen = .{};
-    try screen.replay(ui.frame);
-    // A width ABA discards the in-flight frame authority and re-analyzes only
-    // the retained window; frozen rows are never replayed.
+    // A width ABA re-analyzes only the retained window; frozen rows are never
+    // replayed.
     ui.resize(.{ .columns = 40, .rows = 12 });
     try ui.draw();
+    try std.testing.expectEqual(@as(usize, 39), body.columnCount());
     testAcknowledgeFullFrame(&ui);
     ui.resize(.{ .columns = 80, .rows = 24 });
     try ui.draw();
+    try std.testing.expectEqual(@as(usize, 79), body.columnCount());
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.records.items[index].stream_written >= written);
@@ -11835,6 +11869,143 @@ test "capability action hint deduplicates only the matching saved warning" {
     try std.testing.expect(std.mem.find(u8, unrelated, state.settings_notice.?) != null);
 }
 
+test "restored startup transcript banner is the only conversation-restored notice" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = SelectionFixture{ .settings_notice = session_client.restored_notice };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    try ui.restoreHistory(&.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
+    // The resume outcome and the owner's settings notice publish the same
+    // canonical success string for this one event.
+    ui.notice = session_client.restored_notice;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), ui.connection.current()));
+    try ui.draw();
+    // Exactly one success row: the transcript banner. No footer twin.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, "prior tools are NOT rerun"));
+    try std.testing.expect(std.mem.find(u8, ui.frame, session_client.restored_notice) == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "display may be shortened") != null);
+    testAcknowledgeFullFrame(&ui);
+}
+
+test "menu restored view falls back to one canonical footer success notice" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = SelectionFixture{ .settings_notice = session_client.restored_notice };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    // An async/menu restored view never runs restoreHistory, so no transcript
+    // banner exists and the canonical footer notice is the single success.
+    try std.testing.expect(!ui.history_notice_shown);
+    ui.notice = session_client.restored_notice;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings(session_client.restored_notice, try ui.hint(arena.allocator(), ui.connection.current()));
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, session_client.restored_notice));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, "prior tools are NOT rerun"));
+    testAcknowledgeFullFrame(&ui);
+}
+
+test "restored banner keeps unrelated action and storage failures visible" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = SelectionFixture{ .settings_notice = session_client.restored_notice };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    try ui.restoreHistory(&.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var state = ui.connection.current();
+    // An unrelated action success keeps its own notice; only the canonical
+    // restored twin is dropped.
+    ui.notice = "Could not save thinking option; previous option kept";
+    const action = try ui.hint(arena.allocator(), state);
+    try std.testing.expectEqualStrings(ui.notice, action);
+    try std.testing.expect(std.mem.find(u8, action, session_client.restored_notice) == null);
+    // Unrelated capability warnings still appear next to the banner.
+    state.settings_notice = "Saved thinking level not applied: model capabilities unknown";
+    ui.notice = "Ready";
+    const capability = try ui.hint(arena.allocator(), state);
+    try std.testing.expectEqualStrings(state.settings_notice.?, capability);
+    // Real storage failures are never hidden by the restored state.
+    state.settings_error = error.TestSettingsFailure;
+    state.log_error = error.TestLogFailure;
+    const storage = try ui.hint(arena.allocator(), state);
+    try std.testing.expect(std.mem.find(u8, storage, "SETTINGS FAILED: TestSettingsFailure") != null);
+    try std.testing.expect(std.mem.find(u8, storage, "REC FAILED: TestLogFailure") != null);
+    try std.testing.expect(std.mem.find(u8, storage, session_client.restored_notice) == null);
+}
+
+test "per-view reset releases restored ownership for the next view" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 1 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try ui.restoreHistory(&.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var state = ui.connection.current();
+    state.settings_notice = session_client.restored_notice;
+    ui.notice = session_client.restored_notice;
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    // The next view starts without that banner, so one canonical footer
+    // notice is correct again.
+    fake.snapshot.control_epoch = 2;
+    try ui.resetSessionView(&fake.snapshot);
+    try std.testing.expect(!ui.history_notice_shown);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    ui.notice = session_client.restored_notice;
+    try std.testing.expectEqualStrings(session_client.restored_notice, try ui.hint(arena.allocator(), state));
+    try std.testing.expectEqual(@as(u64, 2), ui.remote_epoch);
+}
+
+test "evicted restored banner never resurrects a stale footer success" {
+    try text.initLocale();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = SelectionFixture{ .settings_notice = session_client.restored_notice };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    try ui.restoreHistory(&.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
+    ui.notice = session_client.restored_notice;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), ui.connection.current()));
+    // Unrelated updates keep working without turning the suppressed success
+    // into a lingering or reappearing footer notice.
+    ui.notice = "Could not save thinking option; previous option kept";
+    try std.testing.expectEqualStrings(ui.notice, try ui.hint(arena.allocator(), ui.connection.current()));
+    ui.notice = session_client.restored_notice;
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), ui.connection.current()));
+    // Drop the banner row itself: suppression is owned by the view, never
+    // re-derived by scanning records, so no stale success is fabricated.
+    ui.removeRecord(0);
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), ui.connection.current()));
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ui.frame, session_client.restored_notice));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ui.frame, "prior tools are NOT rerun"));
+    testAcknowledgeFullFrame(&ui);
+}
+
 test "read command errors include a safe reason after error and never display raw results" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -11991,7 +12162,10 @@ test "pending restored history stays visible with an unmatched tool result and u
     try ui.parser.feed("new question\r", sink);
     try std.testing.expectEqualStrings(fixture.settings_notice.?, ui.notice);
     try std.testing.expectEqual(count, ui.records.items.len);
-    try std.testing.expect(ui.future == null and !ui.busy and ui.has_submitted);
+    try std.testing.expect(ui.future == null and !ui.busy and ui.prompt == null);
+    try std.testing.expectEqualStrings("retained answer", ui.records.items[count - 1].body.items);
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    try std.testing.expectEqualStrings("retained question", ui.input_history.entries.items[0]);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "retained answer") != null);
 }
@@ -12194,11 +12368,11 @@ test "exit blank cleanup drains and restores completed transcript on owned PTY" 
     ui.notice = "pty-footer";
     try ui.draw(); // A pending frame when Ctrl+D arrives.
     _ = try ui.add(.assistant, "final-exit-reply");
-    ui.want_exit = true;
+    try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
     try ui.drainExit();
     try std.testing.expect(ui.frame.len == 0 and !ui.dirty);
     try std.testing.expect(ui.records.items[0].output);
-    ui.has_submitted = true;
     var buffer: [16384]u8 = undefined;
     var used: usize = 0;
     const Capture = struct {
@@ -14375,7 +14549,7 @@ test "uncertain memory view remains in footer without records" {
     ui.clock_ms = 999_999;
     try std.testing.expectEqualStrings("Memory: request outcome uncertain", try ui.hint(arena.allocator(), state));
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
-    try std.testing.expect(ui.future == null and !ui.has_submitted);
+    try std.testing.expect(ui.future == null and !ui.busy and ui.prompt == null);
     try std.testing.expect(ui.inbox.snapshot().newest_id == null);
 }
 
@@ -15653,17 +15827,18 @@ test "shutdown restores terminal and handles signals without announcing identity
     }
 }
 
-test "exit requires parsed quit or captured signal provenance" {
+test "cancellation alone cannot authorize exit but a parsed quit can" {
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    ui.want_exit = true;
-    try std.testing.expect(!ui.exitAuthorized());
+    cancel.cancel();
+    try std.testing.expect(cancel.isRequested() and !ui.ctrl_d_exit and !ui.exitAuthorized());
     try std.testing.expect(ui.settingsIdle());
-    ui.requestQuit();
-    try std.testing.expect(ui.exitAuthorized());
+    try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
+    try std.testing.expect(!ui.settingsIdle());
 }
 
 test "CtrlD discards the remainder and all subsequent input before submission" {
@@ -15675,7 +15850,7 @@ test "CtrlD discards the remainder and all subsequent input before submission" {
     const previous_notice = ui.notice;
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("\x04hello\r", sink);
-    try std.testing.expect(ui.want_exit and ui.ctrl_d_exit);
+    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
     try std.testing.expectEqualStrings(previous_notice, ui.notice);
     try ui.parser.feed("another\r", sink);
     try std.testing.expectEqualStrings(previous_notice, ui.notice);
@@ -15703,7 +15878,7 @@ test "CtrlD exit reason survives secret quarantine picker and busy cancellation"
         }
         const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
         try ui.parser.feed("\x04", sink);
-        try std.testing.expect(ui.want_exit and ui.ctrl_d_exit);
+        try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
         if (mode_ == 4) try std.testing.expect(cancel.requested.load(.acquire));
         if (mode_ == 1) {
             try std.testing.expect(!ui.secret_mode and ui.secret.len == 0);
@@ -15720,6 +15895,9 @@ const AuthFixture = struct {
     calls: usize = 0,
     normal_calls: usize = 0,
     summary_calls: usize = 0,
+    initial_context: ?r.ContextSnapshot = null,
+    context_after_save: ?r.ContextSnapshot = null,
+    available_after_save: bool = false,
 
     fn connection(self: *AuthFixture) Connection {
         return .{ .context = self, .current_fn = current, .configure_fn = configure };
@@ -15727,7 +15905,7 @@ const AuthFixture = struct {
 
     fn current(ctx: *anyopaque) Connection.State {
         const self: *AuthFixture = @ptrCast(@alignCast(ctx));
-        return .{ .runtime = if (self.configured) self.runtime else null, .model = "fixture-model", .base_url = "http://localhost/fixture" };
+        return .{ .runtime = if (self.configured) self.runtime else null, .available = self.configured and self.available_after_save, .model = "fixture-model", .base_url = "http://localhost/fixture", .initial_context = self.initial_context };
     }
 
     fn configure(ctx: *anyopaque, key_bytes: []const u8) !void {
@@ -15736,6 +15914,11 @@ const AuthFixture = struct {
         self.saves += 1;
         if (self.fail) return error.FixtureSaveFailed;
         self.configured = true;
+        self.initial_context = self.context_after_save;
+    }
+
+    fn configureProvider(ctx: *anyopaque, _: core_config.providers.Id, key_bytes: []const u8) !void {
+        try configure(ctx, key_bytes);
     }
 
     fn call(ctx: *anyopaque, _: std.mem.Allocator, request: p.Request, _: p.ModelSink) !p.Outcome {
@@ -15834,14 +16017,12 @@ test "bang commands use local job with zero main calls and reject unsafe submiss
         ui.poisoned = case == 2;
         ui.editor_pasted = case == 3;
         ui.parser.escape_len = if (case == 4) 2 else 0;
-        ui.want_exit = case == 5;
         ui.ctrl_d_exit = case == 5;
         try ui.submit();
         try std.testing.expect(ui.future == null and ui.prompt == null);
         try std.testing.expectEqual(@as(usize, 0), fixture.calls);
         ui.busy = false;
         ui.poisoned = false;
-        ui.want_exit = false;
         ui.ctrl_d_exit = false;
         ui.parser.escape_len = 0;
     }
@@ -16586,7 +16767,7 @@ test "secret prompt masks keys shows destination and erases cancel error and pas
     try std.testing.expect(!ui.secret_quarantine);
     try ui.parser.feed("/login\r", sink);
     try ui.parser.feed("key\x04exit-tail", sink);
-    try std.testing.expect(ui.want_exit and !ui.secret_mode and ui.secret.len == 0);
+    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized() and !ui.secret_mode and ui.secret.len == 0);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
 }
 
@@ -16859,7 +17040,7 @@ test "ordinary submission preserves draft and pending queue after owner change" 
     try std.testing.expect(ui.inbox.snapshot().paused);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
-    try std.testing.expect(!ui.busy and ui.future == null and !ui.want_exit);
+    try std.testing.expect(!ui.busy and ui.future == null and !ui.ctrl_d_exit and !ui.exitAuthorized());
     try std.testing.expect(std.mem.find(u8, ui.notice, "Ctrl-C") != null);
     ui.inbox.pauseClaims(true);
     try std.testing.expect(ui.inbox.cancelClear(ui.inbox.snapshot().revision, &cancel));
@@ -17910,6 +18091,39 @@ test "remote delivery retains source across batches and unsafe history reset" {
     ui.adoptReplayHistory(&baseline);
     try std.testing.expect(ui.replay_refused);
     try std.testing.expect(ui.records.items[ui.draft.?].stream.?.windowBytes() != 0);
+}
+
+test "history reset retains an assistant decoder holding CR or partial UTF8" {
+    for ([_][]const u8{ "\r", "\xf0\x9f" }) |fragment| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        try ui.appendDraft(.assistant, fragment);
+        const index = ui.draft.?;
+        const id = ui.records.items[index].id;
+        const stream = ui.records.items[index].stream.?;
+        const cr = fragment[0] == '\r';
+        try std.testing.expectEqual(@as(usize, 0), stream.windowBytes());
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].pending_stream_rows);
+        try std.testing.expectEqual(ui.delivery_admitted, ui.delivery_acked);
+        try std.testing.expectEqual(cr, stream.decoder.held_cr);
+        try std.testing.expectEqual(@as(usize, if (cr) 0 else 2), stream.decoder.carry_len);
+        var baseline = try session_client.ownEvent(std.testing.allocator, 1, .{ .state = .calling_model });
+        defer baseline.deinit();
+        baseline.history_display_reset = true;
+        ui.adoptReplayHistory(&baseline);
+        try std.testing.expect(ui.replay_refused);
+        try std.testing.expectEqual(id, ui.records.items[ui.draft.?].id);
+        try std.testing.expectEqualStrings("History reset refused; unacknowledged display retained", ui.notice);
+        try std.testing.expectEqual(cr, stream.decoder.held_cr);
+        try std.testing.expectEqual(@as(usize, if (cr) 0 else 2), stream.decoder.carry_len);
+        // The retained decoder must still resolve the original source correctly.
+        try ui.appendDraft(.assistant, if (cr) "\n" else "\x91\xa9");
+        try std.testing.expectEqualStrings(if (cr) "\n" else "\xf0\x9f\x91\xa9", stream.source.items);
+        try std.testing.expect(!stream.decoder.held_cr and stream.decoder.carry_len == 0);
+    }
 }
 
 test "delivery coverage resolution never claims a cropped or replaced row" {
@@ -19335,6 +19549,141 @@ const FakeAsync = struct {
         if (self.completed) |*value| value.deinit();
     }
 };
+
+fn expectConfigureContextDraw(ui: *Ui, screen: *@import("../tests/regular_screen.zig").Screen, expected: ?r.ContextSnapshot, label: []const u8) !void {
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expectEqualDeep(expected, ui.display.context);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], label) != null);
+    testAcknowledgeFullFrame(ui);
+}
+
+test "configure success adopts current context and keeps later runtime updates" {
+    try text.initLocale();
+    const Case = struct { context: ?r.ContextSnapshot, label: []const u8, named: bool };
+    const cases = [_]Case{
+        .{ .context = .{ .tokens = 77, .limit = 100 }, .label = "77.0%", .named = false },
+        .{ .context = .{ .tokens = 0, .limit = 100 }, .label = "0.0%", .named = true },
+        .{ .context = .{ .tokens = 0, .limit = 100, .known = false }, .label = "?%", .named = false },
+        .{ .context = null, .label = "?%", .named = true },
+    };
+    const old: ?r.ContextSnapshot = .{ .tokens = 25, .limit = 100 };
+    for ([_]bool{ false, true }) |asynchronous| {
+        for (cases) |case| {
+            var actions: FakeAsync = .{};
+            defer actions.deinit();
+            var cancel: p.Cancellation = .{};
+            var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+            defer bridge.deinit();
+            var fixture: AuthFixture = .{ .initial_context = old, .context_after_save = case.context, .available_after_save = true };
+            var ui = fixtureUi(&bridge, &cancel);
+            defer ui.deinit();
+            ui.connection = fixture.connection();
+            ui.connection.configure_provider_fn = AuthFixture.configureProvider;
+            if (asynchronous) ui.connection.async_actions = actions.channel();
+            var screen: @import("../tests/regular_screen.zig").Screen = .{};
+            try expectConfigureContextDraw(&ui, &screen, old, "25.0%");
+
+            const provider: ?core_config.providers.Id = if (case.named) .deepseek else null;
+            ui.beginSecret(provider);
+            const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+            try ui.parser.feed("\x1b[200~sk-fixture-secret\x1b[201~", sink);
+            try ui.parser.feed("\rsecret-tail", sink);
+            if (asynchronous) {
+                try std.testing.expect(ui.secret_mode and ui.secret.len == 0 and ui.hasAsync(.configure));
+                try std.testing.expectEqualDeep(old, ui.display.context);
+                try std.testing.expectEqual(@as(usize, 1), actions.next);
+                const request = actions.requests[0].?;
+                try std.testing.expectEqual(provider, request.action.configure.provider);
+                try std.testing.expectEqualStrings("sk-fixture-secret", request.action.configure.key);
+                // The owner publishes before the receipt; neither admission nor a
+                // pending draw may replace the old display prematurely.
+                fixture.initial_context = case.context;
+                fixture.configured = true;
+                if (case.context == null) {
+                    // A canceled pasted-secret modal can still receive success.
+                    try ui.parser.feed("\x03", sink);
+                    try std.testing.expect(!ui.secret_mode and ui.secret_quarantine);
+                }
+                try ui.draw();
+                try screen.replay(ui.frame);
+                try std.testing.expectEqualDeep(old, ui.display.context);
+                testAcknowledgeFullFrame(&ui);
+                actions.complete(.none, null, false);
+                ui.pumpAsync();
+            } else try std.testing.expectEqual(@as(usize, 1), fixture.saves);
+
+            // This assertion precedes draw: only a successful save/receipt adopts
+            // the freshly published owner snapshot, including null or unknown.
+            try std.testing.expectEqualDeep(case.context, ui.display.context);
+            try std.testing.expect(configured(ui.connection.current()));
+            try std.testing.expect(!ui.secret_mode and !ui.secret_quarantine and !ui.parser.secret);
+            try std.testing.expect(ui.parser.stop_feed and ui.secret_provider == null);
+            try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+            for (ui.secret.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+            try std.testing.expect(publishedNotice(&ui, if (case.named) "Key saved locally" else "Saved locally; send a message to connect"));
+            try expectConfigureContextDraw(&ui, &screen, case.context, case.label);
+
+            const host = bridge.host();
+            const later = r.ContextSnapshot{ .tokens = 31, .limit = 200 };
+            try host.emit_fn(host.context, .{ .context_snapshot = later }, &cancel);
+            try drainBridge(&ui);
+            try std.testing.expectEqualDeep(@as(?r.ContextSnapshot, later), ui.display.context);
+            ui.display.seed(fixture.initial_context);
+            try expectConfigureContextDraw(&ui, &screen, later, "15.5%");
+
+            const usage = r.ContextSnapshot{ .tokens = 86, .limit = 200 };
+            try host.emit_fn(host.context, .{ .usage = .{ .purpose = .normal, .protocol = .chat, .value = .{ .total_tokens = 86 } } }, &cancel);
+            try drainBridge(&ui);
+            try std.testing.expectEqualDeep(@as(?r.ContextSnapshot, usage), ui.display.context);
+            ui.display.seed(fixture.initial_context);
+            try expectConfigureContextDraw(&ui, &screen, usage, "43.0%");
+        }
+    }
+}
+
+test "failed or obsolete configure leaves the seeded context unchanged" {
+    try text.initLocale();
+    const old: ?r.ContextSnapshot = .{ .tokens = 25, .limit = 100 };
+    const changed: ?r.ContextSnapshot = .{ .tokens = 77, .limit = 100 };
+    // Local failure, rejected receipt, and superseded receipt respectively.
+    for (0..3) |mode| {
+        var actions: FakeAsync = .{};
+        defer actions.deinit();
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var fixture: AuthFixture = .{ .initial_context = old, .context_after_save = changed, .fail = true };
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.connection = fixture.connection();
+        if (mode != 0) ui.connection.async_actions = actions.channel();
+        var screen: @import("../tests/regular_screen.zig").Screen = .{};
+        try expectConfigureContextDraw(&ui, &screen, old, "25.0%");
+        ui.beginSecret(null);
+        // Deliberately make current() differ, so even an accidental refresh on
+        // a failure or an obsolete receipt is observable.
+        fixture.initial_context = changed;
+        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+        try ui.parser.feed("sk-fixture-secret\r", sink);
+        if (mode != 0) {
+            try std.testing.expectEqualDeep(old, ui.display.context);
+            actions.complete(.none, if (mode == 1) error.FixtureSaveFailed else null, mode == 2);
+            ui.pumpAsync();
+            try std.testing.expect(!ui.hasAsync(.configure));
+        }
+        try std.testing.expectEqualDeep(old, ui.display.context);
+        try std.testing.expect(!publishedNotice(&ui, "Saved locally"));
+        if (mode == 2) {
+            try std.testing.expect(ui.secret_mode); // Obsolete receipts do not close the modal.
+            ui.endSecret();
+        } else {
+            try std.testing.expect(!ui.secret_mode);
+            try std.testing.expectEqualStrings("Could not save configuration; use /login to retry", ui.notice);
+        }
+        try expectConfigureContextDraw(&ui, &screen, old, "25.0%");
+    }
+}
 
 test "async effort completion flashes for five seconds" {
     var fixture: SelectionFixture = .{ .effort = .low };

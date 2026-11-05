@@ -102,9 +102,48 @@ test "Decision pending selection owns active and declaration after save" {
     try std.testing.expect(session.app == null and session.pending.?.value.decisionActive());
     try std.testing.expect(session.pending.?.arena != session.global_config.?.arena);
     try std.testing.expectEqualStrings("first", session.pending.?.value.model.name);
+    try std.testing.expectEqualStrings("route", session.pending.?.value.selected_provider.?);
+    try std.testing.expectEqualStrings("route/first", session.global_config.?.value.registry.?.default);
+    {
+        const bytes = try read(home, cfg.file_name);
+        defer a.free(bytes);
+        var saved = try cfg.parse(a, bytes);
+        defer cfg.release(&saved);
+        try std.testing.expectEqualStrings("route/first", saved.value.registry.?.default);
+        try std.testing.expect(saved.value.decisionActive());
+        try std.testing.expectEqualStrings("reviewer/arbitrary/raw", saved.value.decision.?.model);
+    }
     try choose(&session, .off);
-    try std.testing.expect(!session.pending.?.value.decisionActive());
-    try std.testing.expectEqualStrings("first", session.pending_base_model.?.name);
+    try std.testing.expect(session.app == null and !session.pending.?.value.decisionActive());
+    try std.testing.expectEqualStrings("first", session.pending.?.value.model.name);
+    try std.testing.expectEqualStrings("route", session.pending.?.value.selected_provider.?);
+    try std.testing.expectEqualStrings("route/first", session.global_config.?.value.registry.?.default);
+    {
+        const bytes = try read(home, cfg.file_name);
+        defer a.free(bytes);
+        var saved = try cfg.parse(a, bytes);
+        defer cfg.release(&saved);
+        try std.testing.expectEqualStrings("route/first", saved.value.registry.?.default);
+        try std.testing.expect(!saved.value.decisionActive());
+        try std.testing.expectEqualStrings("reviewer/arbitrary/raw", saved.value.decision.?.model);
+    }
+    try session.connection().configure("fake-primary-login");
+    try std.testing.expect(session.pending == null and session.app != null);
+    try std.testing.expectEqualStrings("first", session.app.?.config.value.model.name);
+    try std.testing.expectEqualStrings("Bearer fake-primary-login", session.app.?.client.authorization);
+    try std.testing.expect(!session.app.?.config.value.decisionActive());
+    try std.testing.expectEqualStrings("route/first", session.connection().current().selection_name.?);
+    try std.testing.expectEqualStrings("route/first", session.global_config.?.value.registry.?.default);
+    {
+        const bytes = try read(home, cfg.file_name);
+        defer a.free(bytes);
+        var saved = try cfg.parse(a, bytes);
+        defer cfg.release(&saved);
+        try std.testing.expectEqualStrings("route/first", saved.value.registry.?.default);
+        try std.testing.expect(!saved.value.decisionActive());
+        try std.testing.expectEqualStrings("reviewer/arbitrary/raw", saved.value.decision.?.model);
+        try std.testing.expectEqualStrings("fake-primary-login", saved.value.registry.?.find("route").?.connection.api_key.?);
+    }
 }
 
 test "Decision pure editing preserves exact declared provider identity without synthesis" {
@@ -291,6 +330,7 @@ test "history restore adopts current config switches rather than archived budget
             .blocks = &.{ .{ .reasoning = "old prefix" }, .{ .text = "owned answer" } },
             .replay = .{ .scope = .{ .connection = app.config.value.provider.base_url, .model = "first", .protocol = .anthropic }, .json = "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"old prefix\",\"signature\":\"c2ln\"},{\"type\":\"text\",\"text\":\"owned answer\"}]}" },
         }));
+        app.runtime.last_context_tokens = 77;
         try std.testing.expect(try source.saveOnExit());
     }
     {
@@ -312,7 +352,8 @@ test "history restore adopts current config switches rather than archived budget
     try std.testing.expect(history[1].replay == null);
     try std.testing.expectEqual(@as(usize, 1), history[1].blocks.len);
     try std.testing.expectEqualStrings("owned answer", history[1].blocks[0].text);
-    try std.testing.expect(!state.initial_context.?.known);
+    try std.testing.expect(state.initial_context.?.known);
+    try std.testing.expectEqual(@as(u64, 77), state.initial_context.?.tokens);
 }
 
 test "settings auxiliary credentials follow login addition rotation and failed save without rebinding primary" {

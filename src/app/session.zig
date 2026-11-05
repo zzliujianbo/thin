@@ -8,6 +8,7 @@ const diagnostics = @import("../core/diagnostics.zig");
 const App = @import("app.zig").App;
 const Store = @import("auth_store.zig").Store;
 const tui = @import("../ui/tui.zig");
+const session_client = @import("../ui/session_client.zig");
 const presentation = @import("../presentation.zig");
 const ids = @import("session_id.zig");
 const reasoning_defaults = @import("reasoning_defaults.zig");
@@ -270,10 +271,6 @@ pub const Session = struct {
     loaded_selection: ?selections.Snapshot = null,
     custom_credential_revision: u64 = 0,
     active_custom_revision: u64 = 0,
-    /// Separate from the parsed arena; selected config may borrow this name.
-    selected_name: ?[]u8 = null,
-    /// Latest saved disk model, borrowed from pending or global_config while pending.
-    pending_base_model: ?cfg.Model = null,
     /// Computed before publication; callbacks never read worker-owned history.
     initial_context: ?r.ContextSnapshot = null,
     /// Empty-chat model/effort selections update this independent global
@@ -415,9 +412,6 @@ pub const Session = struct {
             if (err != error.OutdatedMetadataCache) self.metadata_blocked = true;
             break :blk .{};
         };
-        // Capture saved defaults before the project overlay/capability clamp.
-        // Only explicit empty-chat model selection may replace this baseline.
-        self.pending_base_model = self.pending.?.value.model;
         if (restored) |snapshot| {
             try self.loadRestoredSelection(snapshot);
         } else {
@@ -443,7 +437,7 @@ pub const Session = struct {
             if (self.applyPreference(config, self.preferred_effort, true)) |notice| self.settings_notice = notice;
         }
         const config = &self.pending.?.value;
-        self.display_models = try self.buildModels(config.*, self.global_config.?.value);
+        self.display_models = try self.buildModels(self.global_config.?.value);
         self.display_decision_models = try self.buildDecisionModels(self.global_config.?.value);
         self.display_image_models = try self.buildImageModels(self.global_config.?.value);
         if (self.selected_alias == null) self.selected_alias = try self.aliasFor(config.*);
@@ -475,7 +469,6 @@ pub const Session = struct {
 
         const parsed = self.pending.?;
         self.pending = null;
-        self.pending_base_model = null;
         self.app = try self.prepareApp(parsed);
         self.last_memory_view = self.app.?.memoryView();
         self.armInitialDefault();
@@ -528,7 +521,7 @@ pub const Session = struct {
         self.active_context_official = resolved.context_official;
         _ = self.applyPreference(config, self.preferred_effort, false);
         self.settings_notice = if (self.loaded_checkpoint != null)
-            "Conversation restored; prior tools are NOT rerun"
+            session_client.restored_notice
         else
             "Selection restored; NEW EMPTY CHAT (history not restored)";
     }
@@ -549,7 +542,8 @@ pub const Session = struct {
             for (state.messages, 0..) |message, i|
                 messages[i] = try @import("../core/context.zig").cloneAfterPrefixRewrite(scratch.allocator(), message);
             state.messages = messages;
-            state.last_context_tokens = null;
+            // Server-confirmed display usage remains valid as a past statistic,
+            // independently of native signed-prefix replay validity.
         }
         try candidate.runtime.restoreCheckpoint(state);
         candidate.journal.seq = loaded.value.journal_seq;
@@ -600,7 +594,6 @@ pub const Session = struct {
         if (self.global_config) |*global| cfg.release(global);
         if (self.app) |app| app.deinit();
         if (self.resume_lease) |*lease| lease.deinit();
-        if (self.selected_name) |name| self.allocator.free(name);
         if (self.pending) |*pending| cfg.release(pending);
         self.store.deinit();
         self.project_root.deinit();
@@ -818,10 +811,16 @@ pub const Session = struct {
                 continue;
             }
         }
+        const initial_context: ?r.ContextSnapshot = if (unselected or config.selection_pending) null else self.initial_context orelse blk: {
+            // This is only a display statistic; loading it cannot activate a route.
+            // A checkpoint's missing usage is unknown, unlike a fresh known zero.
+            const tokens: ?u64 = if (self.loaded_checkpoint) |loaded| loaded.value.last_context_tokens else 0;
+            break :blk .{ .tokens = tokens orelse 0, .limit = @intCast(config.model.context_tokens), .known = tokens != null };
+        };
         return .{
             .codex_login = self.codexLoginView(),
             .runtime = if (self.app) |app| &app.runtime else null,
-            .initial_context = if (unselected or config.selection_pending) null else self.initial_context orelse .{ .tokens = 0, .limit = @intCast(config.model.context_tokens) },
+            .initial_context = initial_context,
             .model = if (unselected) "" else config.model.name,
             .session_id = self.session_id,
             .models = self.display_models,
@@ -968,7 +967,7 @@ pub const Session = struct {
                 initial = try self.prepareApp(parsed);
             }
         }
-        const models = try self.buildModels(if (initial) |app| app.config.value else if (next) |value| value.value else active, latest.value);
+        const models = try self.buildModels(latest.value);
         errdefer self.freeDisplayModels(models);
         const decisions = try self.buildDecisionModels(latest.value);
         errdefer self.freeDisplayModels(decisions);
@@ -982,12 +981,11 @@ pub const Session = struct {
             if (initial) |app| {
                 self.app = app;
                 self.last_memory_view = app.memoryView();
-                self.pending_base_model = null;
                 self.armInitialDefault();
                 self.initial_context = app.runtime.contextSnapshot();
                 self.releaseLoadedHistory();
-                self.settings_notice = if (self.resumed) "Conversation restored; prior tools are NOT rerun" else null;
-            } else if (self.pending) |*pending| self.pending_base_model = pending.value.model;
+                self.settings_notice = if (self.resumed) session_client.restored_notice else null;
+            }
         }
         self.freeDisplayModels(self.display_models);
         self.freeDisplayModels(self.display_decision_models);
@@ -1313,7 +1311,7 @@ pub const Session = struct {
             }
             const previous = self.metadata_cache;
             self.metadata_cache = publication.cache;
-            const models = self.buildModels(self.mutableConfig().*, self.global_config.?.value) catch {
+            const models = self.buildModels(self.global_config.?.value) catch {
                 self.metadata_cache = previous;
                 self.metadata_notice = job.publicationFailed("Metadata display could not be updated; previous values kept");
                 return true;
@@ -1450,7 +1448,7 @@ pub const Session = struct {
 
     /// The returned rows own every string. Session moves, cache replacement and
     /// config-arena release cannot invalidate a published candidate snapshot.
-    fn buildModels(self: *Session, _: cfg.Config, global: cfg.Config) ![]cfg.Model {
+    fn buildModels(self: *Session, global: cfg.Config) ![]cfg.Model {
         var models: std.ArrayList(cfg.Model) = .empty;
         errdefer {
             for (models.items) |model| self.freeDisplayModel(model);
@@ -1480,7 +1478,7 @@ pub const Session = struct {
     fn buildDecisionModels(self: *Session, global: cfg.Config) ![]cfg.Model {
         var independent = global;
         independent.limits = (global.decision orelse cfg.DecisionConfig{ .model = "" }).modelLimits(global.limits.request_timeout_ms);
-        const models = try self.buildModels(independent, independent);
+        const models = try self.buildModels(independent);
         var count: usize = 0;
         for (models) |model| {
             const ref = cfg.splitDefault(model.name) catch unreachable;
@@ -1637,7 +1635,6 @@ pub const Session = struct {
     fn persistSelectionDefaults(self: *Session, candidate: *?std.json.Parsed(cfg.Config)) !void {
         if (candidate.*) |value| {
             try self.store.save(value.value);
-            if (self.pending != null) self.pending_base_model = value.value.model;
             if (self.global_config) |*old| cfg.release(old);
             self.global_config = value;
             candidate.* = null;
@@ -1764,7 +1761,7 @@ pub const Session = struct {
         const reference = try cfg.splitDefault(name);
         const provider = (global.registry orelse return error.MissingRegistry).find(reference.provider) orelse return error.UnknownProvider;
         if (!self.hasLocalCredential(provider.connection)) return error.ApiKeyNotFound;
-        const candidates = try self.buildModels(global, global);
+        const candidates = try self.buildModels(global);
         defer self.freeDisplayModels(candidates);
         for (candidates) |model| if (std.mem.eql(u8, name, model.name)) return;
         return error.UnknownProxyModel;
@@ -1788,7 +1785,6 @@ pub const Session = struct {
             self.initial_context = self.app.?.runtime.contextSnapshot();
         } else {
             std.mem.swap(std.json.Parsed(cfg.Config), &self.pending.?, &pending.?);
-            self.pending_base_model = self.global_config.?.value.model;
         }
         self.publishCheckpoint();
     }
@@ -1880,7 +1876,7 @@ pub const Session = struct {
         const pending_selection = if (self.loaded_checkpoint != null) try selections.capture(owned.value) else null;
         var defaults = if (update_default) try self.selectionDefaults(owned.value) else null;
         defer if (defaults) |*value| cfg.release(value);
-        const models = try self.buildModels(owned.value, if (defaults) |value| value.value else self.global_config.?.value);
+        const models = try self.buildModels(if (defaults) |value| value.value else self.global_config.?.value);
         errdefer self.freeDisplayModels(models);
         const decision_models = try self.buildDecisionModels(if (defaults) |value| value.value else self.global_config.?.value);
         errdefer self.freeDisplayModels(decision_models);
@@ -1919,7 +1915,6 @@ pub const Session = struct {
         if (replacement) |value| self.app.?.installConnection(value) else {
             if (self.pending) |*value| cfg.release(value);
             self.pending = null;
-            self.pending_base_model = null;
             if (initial) |value| {
                 self.app = value;
                 self.last_memory_view = value.memoryView();
@@ -1929,8 +1924,6 @@ pub const Session = struct {
                 if (pending_selection) |snapshot| self.loaded_selection = snapshot;
             }
         }
-        if (self.selected_name) |value| self.allocator.free(value);
-        self.selected_name = null;
         if (self.selected_alias) |value| self.allocator.free(value);
         self.selected_alias = alias;
         self.freeDisplayModels(self.display_models);
@@ -2010,7 +2003,7 @@ pub const Session = struct {
             self.applyInitialDefault(&next, self.preferred_effort);
             initial = try self.prepareApp(try cfg.clone(self.allocator, next));
         }
-        const models = try self.buildModels(if (initial) |value| value.config.value else active, baseline.value);
+        const models = try self.buildModels(baseline.value);
         errdefer self.freeDisplayModels(models);
         const decision_models = try self.buildDecisionModels(baseline.value);
         errdefer self.freeDisplayModels(decision_models);
@@ -2024,16 +2017,13 @@ pub const Session = struct {
         if (initial) |value| {
             if (self.pending) |*old| cfg.release(old);
             self.pending = null;
-            self.pending_base_model = null;
-            if (self.selected_name) |old| self.allocator.free(old);
-            self.selected_name = null;
             self.app = value;
             self.last_memory_view = value.memoryView();
             self.armInitialDefault();
             if (id) |service| self.active_revision = self.credential_revisions[@intCast(@backingInt(service))] else self.active_custom_revision = self.custom_credential_revision;
             self.initial_context = value.runtime.contextSnapshot();
             self.releaseLoadedHistory();
-            self.settings_notice = if (self.resumed) "Conversation restored; prior tools are NOT rerun" else null;
+            self.settings_notice = if (self.resumed) session_client.restored_notice else null;
         }
         self.freeDisplayModels(self.display_models);
         self.display_models = models;
@@ -2187,7 +2177,6 @@ pub const Session = struct {
                 return err;
             };
         }
-        if (self.pending != null and self.pending_base_model == null) self.pending_base_model = config.model;
         config.model = candidate.model;
         self.preferred_effort = effort;
         self.initial_default_pending = false;
@@ -2744,8 +2733,72 @@ test "new llm pending startup and custom login activate without inference" {
     try std.testing.expect(logged_in.model_providers[0].allow_custom);
     try std.testing.expectEqualStrings("archive/saved", logged_in.selection_name.?);
     try std.testing.expectEqualStrings("archive/saved", session.global_config.?.value.registry.?.default);
+    try std.testing.expectEqualDeep(r.ContextSnapshot{ .tokens = 0, .limit = 65536 }, logged_in.initial_context.?);
+    // The no-checkpoint fallback itself also remains fresh known zero.
+    session.initial_context = null;
+    try std.testing.expectEqualDeep(r.ContextSnapshot{ .tokens = 0, .limit = 65536 }, session.connection().current().initial_context.?);
     try std.testing.expect(!session.app.?.journal.started);
     try std.testing.expect(!try session.saveOnExit());
+}
+
+test "checkpoint usage is display only without key and in read only viewers" {
+    const Counter = struct {
+        events: usize = 0,
+        authorizations: usize = 0,
+        fn emit(raw: ?*anyopaque, _: r.Event, _: *const p.Cancellation) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.events += 1;
+        }
+        fn authorize(raw: ?*anyopaque, _: r.Permission, _: *const p.Cancellation) !r.Decision {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.authorizations += 1;
+            return .allow_once;
+        }
+    };
+    for ([_]?u64{ 77, 0, null }) |reported| {
+        var fixture = try SessionTestFixture.init();
+        defer fixture.deinit();
+        const id = blk: {
+            var source = try fixture.open(.{});
+            defer source.deinit();
+            try source.connection().configure("fake-archive-original");
+            try seedSessionTestHistory(&source);
+            source.app.?.runtime.last_context_tokens = reported;
+            try std.testing.expect(try source.saveOnExit());
+            break :blk source.session_id;
+        };
+        // The live model's resolved limit, not the old checkpoint's 65536.
+        try writeSessionTestConfig(fixture.tmp.dir,
+            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","models":{"saved":{"protocol":"chat","context_tokens":131072}}}}},"limits":{"low_price_input":false}}
+        );
+        var counter: Counter = .{};
+        const host = r.Host{ .context = &counter, .emit_fn = Counter.emit, .authorize_fn = Counter.authorize };
+        var no_key = try Session.initWithOptions(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, host, .{ .resume_session = id });
+        defer no_key.deinit();
+        try std.testing.expect(!no_key.read_only and no_key.app == null);
+        try std.testing.expect(no_key.loaded_checkpoint != null and no_key.initial_context == null);
+        const expected = r.ContextSnapshot{ .tokens = reported orelse 0, .limit = 131072, .known = reported != null };
+        const pending = no_key.connection().current();
+        try std.testing.expect(pending.runtime == null);
+        try std.testing.expectEqualDeep(expected, pending.initial_context.?);
+        try expectSessionTestHistory(&no_key);
+
+        // Even with a usable key, a second reader must not acquire send rights.
+        try writeSessionTestConfig(fixture.tmp.dir,
+            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key":"fake-reader-key","models":{"saved":{"protocol":"chat","context_tokens":131072}}}}},"limits":{"low_price_input":false}}
+        );
+        var reader = try Session.initWithOptions(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, host, .{ .resume_session = id });
+        defer reader.deinit();
+        try std.testing.expect(reader.read_only and reader.app == null);
+        try std.testing.expect(reader.loaded_checkpoint != null and reader.initial_context == null);
+        const viewed = reader.connection().current();
+        try std.testing.expect(viewed.runtime == null);
+        try std.testing.expectEqualDeep(expected, viewed.initial_context.?);
+        try expectSessionTestHistory(&reader);
+        try std.testing.expectError(error.ResumeReadOnly, reader.connection().configure("fake-not-published"));
+        try std.testing.expectEqual(@as(usize, 0), counter.events);
+        try std.testing.expectEqual(@as(usize, 0), counter.authorizations);
+    }
 }
 
 test "resume without key displays and saves history then custom login imports it exactly once" {
@@ -2855,6 +2908,7 @@ test "missing alias cannot borrow same model credential and preserves historical
     defer resumed.deinit();
     try std.testing.expect(resumed.app == null);
     try std.testing.expect(resumed.pending.?.value.selection_pending);
+    try std.testing.expect(resumed.connection().current().initial_context == null);
     try std.testing.expectEqualStrings("archive/saved", resumed.connection().current().selection_name.?);
     try std.testing.expectEqualStrings("saved", resumed.connection().current().model);
     try std.testing.expect(resumed.connection().current().provider == null);
@@ -3219,8 +3273,9 @@ test "Anthropic session resume invalidates null-hash replay when title tools are
         if (std.mem.eql(u8, schema.name, "set_session_title")) title_schemas += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), title_schemas);
-    try std.testing.expect(app.runtime.last_context_tokens == null);
-    try std.testing.expect(!restored.initial_context.?.known);
+    try std.testing.expectEqual(@as(?u64, 77), app.runtime.last_context_tokens);
+    try std.testing.expect(restored.initial_context.?.known);
+    try std.testing.expectEqual(@as(u64, 77), restored.initial_context.?.tokens);
     try std.testing.expectEqual(@as(u64, 0), app.runtime.permission_id);
     try std.testing.expect(!app.journal.started);
     const expected: []const p.Message = &.{
@@ -4336,7 +4391,7 @@ test "dynamic official IDs select for all providers and reject unknown protocols
         const unknown = try session.metadata_cache.directory.upsert(id, "new-unknown");
         unknown.available = true;
     }
-    const models = try session.buildModels(session.mutableConfig().*, session.global_config.?.value);
+    const models = try session.buildModels(session.global_config.?.value);
     session.freeDisplayModels(session.display_models);
     session.display_models = models;
     var state = session.connection().current();
@@ -4426,7 +4481,7 @@ test "login refresh opt out remains offline and explicit profiles survive availa
     defer cfg.release(&explicit);
     // An explicit registry patch remains selectable after the official source
     // marks every preset unavailable; opting out must still launch no fetch.
-    const models = try session.buildModels(session.mutableConfig().*, explicit.value);
+    const models = try session.buildModels(explicit.value);
     defer session.freeDisplayModels(models);
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqualStrings("opencode-go/kimi-k3", models[0].name);
@@ -4466,7 +4521,7 @@ test "display candidates own names and explicit wires across cache and config re
             .reasoning = .{ .map = .{ .high = &wire } },
         } }},
     }} };
-    const models = try session.buildModels(session.mutableConfig().*, global);
+    const models = try session.buildModels(global);
     defer session.freeDisplayModels(models);
     try std.testing.expectEqual(@as(usize, 2), models.len);
     // A movable Session/cache and a released config arena are equivalent to
@@ -4505,7 +4560,7 @@ test "raw explicit profile hides only the same provider dynamic identity" {
         \\{"llm":{"default":"opencode-go/shared-profile","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"shared-profile":{"context_tokens":32768,"protocol":"chat"}}},"opencode-zen":{"base_url":"https://opencode.ai/zen/v1","kind":"opencode_zen"}}},"limits":{"low_price_input":false}}
     );
     defer cfg.release(&explicit);
-    const models = try session.buildModels(session.mutableConfig().*, explicit.value);
+    const models = try session.buildModels(explicit.value);
     defer session.freeDisplayModels(models);
     try std.testing.expectEqual(@as(usize, 2), models.len);
     try std.testing.expectEqualStrings("opencode-go/shared-profile", models[0].name);
@@ -4680,7 +4735,7 @@ test "explicit raw and qualified profiles override dynamic rows including explic
         const row = try session.metadata_cache.directory.upsert(.opencode_go, name);
         row.available = true;
     }
-    const models = try session.buildModels(session.mutableConfig().*, session.global_config.?.value);
+    const models = try session.buildModels(session.global_config.?.value);
     defer session.freeDisplayModels(models);
     try std.testing.expectEqual(@as(usize, 3), models.len);
     try std.testing.expectEqualStrings("opencode-go/raw-override", models[0].name);

@@ -178,8 +178,19 @@ fn expectAtomicFailure(name: []const u8, failure: Failure) !void {
     const snapshot = app.runtime.contextSnapshot();
     const initial_context = session.initial_context;
     const display = session.display_models.ptr;
-    const selected_name = session.selected_name;
     const selected_alias = session.selected_alias;
+    const published = session.connection().current();
+    const published_effort = published.reasoning_effort;
+    const published_count = published.models.len;
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", published.selection_name.?);
+    var explicit_index: ?usize = null;
+    for (published.models, 0..) |candidate, index| {
+        if (std.mem.eql(u8, candidate.name, "deepseek/explicit-profile")) {
+            explicit_index = index;
+            break;
+        }
+    }
+    try std.testing.expect(explicit_index != null);
     const global = session.global_config.?.value;
     const expected_version = session.store.expected_version;
     const before = try fixture.bytes();
@@ -216,8 +227,16 @@ fn expectAtomicFailure(name: []const u8, failure: Failure) !void {
     try std.testing.expectEqualDeep(global, session.global_config.?.value);
     try std.testing.expectEqualDeep(expected_version, session.store.expected_version);
     try std.testing.expect(session.display_models.ptr == display);
-    try std.testing.expectEqualDeep(selected_name, session.selected_name);
     try std.testing.expectEqualDeep(selected_alias, session.selected_alias);
+    const current = session.connection().current();
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", current.selection_name.?);
+    try std.testing.expectEqualStrings("deepseek-flash", current.model);
+    try std.testing.expectEqual(published_effort, current.reasoning_effort);
+    try std.testing.expectEqual(published_count, current.models.len);
+    const explicit = current.models[explicit_index.?];
+    try std.testing.expectEqualStrings("deepseek/explicit-profile", explicit.name);
+    try std.testing.expectEqual(@as(u32, 65536), explicit.context_tokens);
+    try std.testing.expectEqual(p.Protocol.responses, explicit.protocol);
     try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
     const after = try fixture.bytes();
     defer a.free(after);

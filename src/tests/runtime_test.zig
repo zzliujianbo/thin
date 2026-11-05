@@ -611,7 +611,7 @@ test "checkpoint schema provenance preserves matching and explicit null native r
         try restored.restoreCheckpoint(source);
         const changed = mode >= 1 and mode <= 3;
         try std.testing.expectEqual(@as(u64, 1731), restored.estimator.per_mille);
-        try std.testing.expectEqual(@as(?u64, if (changed) null else 987), restored.last_context_tokens);
+        try std.testing.expectEqual(@as(?u64, 987), restored.last_context_tokens);
         const messages = restored.messages();
         if (changed) {
             try std.testing.expect(messages[1].replay == null);

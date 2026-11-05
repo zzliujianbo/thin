@@ -48,6 +48,98 @@ fn check(ok: bool) !void {
     if (!ok) return error.AcceptanceFailed;
 }
 
+const frame_begin = "\x1b[?2026h";
+const frame_end = "\x1b[?2026l";
+const frame_ack = "\x1b[?25h";
+const Frame = struct { begin: usize, end: usize, complete: bool };
+const ComposerKind = enum { none, effort, normal };
+
+/// contextLabel emits ?%, >100%, or canonical tenths in 0.0..100.0%.
+/// The policy marker, when enabled, precedes the value (never its percent).
+fn normalLabel(label_: []const u8, low_price: bool) bool {
+    var label = label_;
+    if (low_price) {
+        if (!std.mem.startsWith(u8, label, "L")) return false;
+        label = label[1..];
+    }
+    if (std.mem.eql(u8, label, "?%") or std.mem.eql(u8, label, ">100%")) return true;
+    if (label.len < 4 or label.len > 6 or label[label.len - 3] != '.' or
+        !std.ascii.isDigit(label[label.len - 2]) or label[label.len - 1] != '%') return false;
+    const integer = label[0 .. label.len - 3];
+    if (integer.len > 1 and integer[0] == '0') return false;
+    var whole: u16 = 0;
+    for (integer) |digit| {
+        if (!std.ascii.isDigit(digit)) return false;
+        whole = whole * 10 + @as(u16, digit - '0');
+    }
+    return whole < 100 or (whole == 100 and label[label.len - 2] == '0');
+}
+
+/// A prompt contributes exactly one separator space. Cursor position and all
+/// cells after it matter: trimEnd would discard typed spaces or hide a draft.
+fn composerKind(view: *const regular.Screen, model: []const u8, effort: []const u8, low_price: bool) ComposerKind {
+    if (view.row >= view.rows or view.row >= view.grid.len or view.col >= view.columns or view.wrap) return .none;
+    const line = &view.grid[view.row];
+    const text = line[0..view.col];
+    for (line[view.col..]) |byte| if (byte != ' ') return .none;
+    if (text.len < model.len + 5 or text[0] != '(' or
+        !std.mem.eql(u8, text[1..][0..model.len], model) or
+        !std.mem.startsWith(u8, text[model.len + 1 ..], ") ") or
+        !std.mem.endsWith(u8, text, "> ")) return .none;
+    const slot = text[model.len + 3 .. text.len - 2];
+    if (low_price) {
+        if (std.mem.startsWith(u8, slot, "L") and std.mem.eql(u8, slot[1..], effort)) return .effort;
+    } else if (std.mem.eql(u8, slot, effort)) return .effort;
+    return if (normalLabel(slot, low_price)) .normal else .none;
+}
+
+/// Reconstruct ACK-prefix screens incrementally, only when a caller actually
+/// needs historical evidence. Each captured byte is replayed at most once per
+/// scan; sparse frames inherit the prior screen rather than inventing pixels.
+const FrameScanner = struct {
+    view: *regular.Screen,
+    consumed: usize = 0,
+    witness: ?Frame = null,
+
+    fn init(columns: usize) !FrameScanner {
+        const view = try std.heap.page_allocator.create(regular.Screen);
+        view.* = .{ .columns = columns };
+        return .{ .view = view };
+    }
+
+    fn deinit(self: *FrameScanner) void {
+        std.heap.page_allocator.destroy(self.view);
+    }
+
+    fn next(self: *FrameScanner, bytes: []const u8) !?Frame {
+        const ack = std.mem.indexOfPos(u8, bytes, self.consumed, frame_ack) orelse return null;
+        const begin = std.mem.lastIndexOf(u8, bytes[self.consumed..ack], frame_begin);
+        const end = ack + frame_ack.len;
+        const complete = begin != null and ack >= frame_end.len and
+            std.mem.eql(u8, bytes[ack - frame_end.len .. ack], frame_end);
+        const frame: Frame = .{ .begin = self.consumed + (begin orelse 0), .end = end, .complete = complete };
+        try self.view.replay(bytes[self.consumed..end]);
+        self.consumed = end;
+        return frame;
+    }
+
+    fn findEffort(self: *FrameScanner, bytes: []const u8, start: usize, model: []const u8, effort: []const u8) !?Frame {
+        if (self.witness) |frame| return frame;
+        while (true) {
+            const previously_effort = composerKind(self.view, model, effort, false) == .effort;
+            const frame = (try self.next(bytes)) orelse return null;
+            // An unrelated ACK that merely retains an old effort is not proof
+            // of this action. Require an actual transition to the exact slot.
+            if (frame.complete and frame.begin >= start and !previously_effort and
+                composerKind(self.view, model, effort, false) == .effort)
+            {
+                self.witness = frame;
+                return frame;
+            }
+        }
+    }
+};
+
 /// PTY 驱动器：持有 master/slave 与子进程 PID，负责读写终端、收集输出，并校验退出状态与终端恢复情况。
 const Driver = struct {
     /// 主端 fd：驱动方通过它向应用发送按键、读取屏幕输出。
@@ -78,6 +170,10 @@ const Driver = struct {
     /// polled frequently. Owners must not retain the pointer across another
     /// call; use `screen()` for an independent snapshot.
     scratch: ?*regular.Screen = null,
+    /// Evidence for the most recent changed-effort wait, including the actual
+    /// acknowledged frame even when the current screen has already expired.
+    effort_witness: ?Frame = null,
+    effort_witness_start: usize = 0,
 
     /// 在最多 ms 毫秒内轮询 master 并读尽可读数据；若子进程仍归属本驱动器，则非阻塞检查它是否已退出。
     fn drain(self: *Driver, ms: c_int) !void {
@@ -140,7 +236,13 @@ const Driver = struct {
         const bytes = self.output[0..self.used];
         const ack = std.mem.lastIndexOf(u8, bytes, "\x1b[?25h") orelse return null;
         if (ack < start) return null;
-        if (std.mem.lastIndexOf(u8, bytes, "\x1b[?2026h")) |begin| if (begin > ack) return null;
+        const after = bytes[ack + frame_ack.len ..];
+        if (std.mem.indexOf(u8, after, frame_begin) != null) return null;
+        // read() can stop at *any* byte of the next sync-begin. Even a lone
+        // ESC is an unfinished latest frame, not permission to reuse the ACK.
+        for (1..frame_begin.len) |n| {
+            if (std.mem.endsWith(u8, after, frame_begin[0..n])) return null;
+        }
         if (self.scratch == null) self.scratch = try self.screens.allocator().create(regular.Screen);
         const view = self.scratch.?;
         view.* = .{ .columns = self.columns };
@@ -201,6 +303,53 @@ const Driver = struct {
                 const composer = &view.grid[view.row];
                 if (std.mem.indexOf(u8, composer, "%> ") != null or
                     std.mem.startsWith(u8, composer, "> ")) return;
+            }
+            if (!self.owned) return error.EarlyExit;
+        }
+        return error.VisibleTextTimeout;
+    }
+
+    /// Only post-reply callers may accept a normal percentage without a new
+    /// effort witness. Changed-effort waits recover a delivered flash from the
+    /// capture when a later expiry ACK arrived in the same drain.
+    fn waitEffortIdle(self: *Driver, start: usize, model: []const u8, effort: []const u8, allow_normal: bool) !void {
+        self.effort_witness = null;
+        self.effort_witness_start = start;
+        var scanner: ?FrameScanner = null;
+        defer if (scanner) |*s| s.deinit();
+        const until = now() + 10000;
+        while (now() < until) {
+            try self.drain(20);
+            if (try self.effortIdleReady(start, model, effort, allow_normal, &scanner)) return;
+            if (!self.owned) return error.EarlyExit;
+        }
+        return error.VisibleTextTimeout;
+    }
+
+    fn effortIdleReady(self: *Driver, start: usize, model: []const u8, effort: []const u8, allow_normal: bool, scanner: *?FrameScanner) !bool {
+        const view = (try self.acknowledgedScreen(start)) orelse return false;
+        const kind = composerKind(view, model, effort, false);
+        if (kind == .none) return false;
+        if (allow_normal) return true; // Only used after a completed reply.
+        if (scanner.* == null) scanner.* = try FrameScanner.init(self.columns);
+        const ack = std.mem.lastIndexOf(u8, self.output[0..self.used], frame_ack).?;
+        if (scanner.*) |*s| {
+            if (try s.findEffort(self.output[0 .. ack + frame_ack.len], start, model, effort)) |frame| {
+                self.effort_witness = frame;
+                self.effort_witness_start = start;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Login promises a settled model composer, not an effort confirmation.
+    fn waitAuthSettlement(self: *Driver, start: usize, model: []const u8, effort: []const u8) !void {
+        const until = now() + 10000;
+        while (now() < until) {
+            try self.drain(20);
+            if (try self.acknowledgedScreen(start)) |view| {
+                if (composerKind(view, model, effort, false) != .none) return;
             }
             if (!self.owned) return error.EarlyExit;
         }
@@ -448,27 +597,48 @@ fn required(init: std.process.Init, key: []const u8) ![]const u8 {
 }
 
 /// Exact configured-effort hues, not a visual guess from an animated request.
-fn settingsColor(d: *const Driver, start: usize, level: []const u8) !void {
+/// The caller supplies only one replay-validated, acknowledged frame.
+fn settingsColorFrame(bytes: []const u8, level: []const u8) !bool {
     const color: []const u8 = if (std.mem.eql(u8, level, "off")) "\x1b[38;5;245m" else if (std.mem.eql(u8, level, "low")) "\x1b[38;5;114m" else if (std.mem.eql(u8, level, "high")) "\x1b[38;5;75m" else if (std.mem.eql(u8, level, "max")) "\x1b[38;5;177m" else return error.UnknownSettingsLevel;
-    const bytes = d.output[start..d.used];
-    var from: usize = 0;
-    while (std.mem.indexOfPos(u8, bytes, from, color)) |at| {
-        from = at + color.len;
-        const model_end = "fixture-model\x1b[0m\x1b[1m) ";
-        if (!std.mem.startsWith(u8, bytes[from..], model_end)) continue;
-        const slot = bytes[from + model_end.len ..];
-        // A level confirmation keeps effort color; an actual percentage uses
-        // occupancy, independent of the model's configured effort.
-        if (std.mem.startsWith(u8, slot, color) and std.mem.startsWith(u8, slot[color.len..], level) and std.mem.startsWith(u8, slot[color.len + level.len ..], "\x1b[0m\x1b[1m>\x1b[0m ")) return;
-        if (std.mem.startsWith(u8, slot, "\x1b[0m\x1b[1m?%\x1b[0m\x1b[1m>\x1b[0m ")) return;
-        const green = "\x1b[38;5;114m";
-        if (!std.mem.startsWith(u8, slot, green)) continue;
-        var end = green.len;
-        while (end < slot.len and (std.ascii.isDigit(slot[end]) or slot[end] == '.')) : (end += 1) {}
-        if (!std.mem.startsWith(u8, slot[end..], "%\x1b[0m\x1b[1m>\x1b[0m ")) continue;
-        const percent = std.fmt.parseFloat(f64, slot[green.len..end]) catch continue;
-        if (percent >= 0 and percent < 25) return;
+    const model_end = "fixture-model\x1b[0m\x1b[1m) ";
+    const at = std.mem.lastIndexOf(u8, bytes, model_end) orelse return false;
+    if (at < color.len or !std.mem.eql(u8, bytes[at - color.len .. at], color)) return false;
+    const slot = bytes[at + model_end.len ..];
+    if (std.mem.startsWith(u8, slot, color) and std.mem.startsWith(u8, slot[color.len..], level) and std.mem.startsWith(u8, slot[color.len + level.len ..], "\x1b[0m\x1b[1m>\x1b[0m ")) return true;
+    if (std.mem.startsWith(u8, slot, "\x1b[0m\x1b[1m?%\x1b[0m\x1b[1m>\x1b[0m ")) return true;
+    const green = "\x1b[38;5;114m";
+    if (!std.mem.startsWith(u8, slot, green)) return false;
+    var end = green.len;
+    while (end < slot.len and (std.ascii.isDigit(slot[end]) or slot[end] == '.')) : (end += 1) {}
+    if (!std.mem.startsWith(u8, slot[end..], "%\x1b[0m\x1b[1m>\x1b[0m ")) return false;
+    if (!normalLabel(slot[green.len .. end + 1], false)) return false;
+    const percent = std.fmt.parseFloat(f64, slot[green.len..end]) catch return false;
+    return percent < 25;
+}
+
+fn settingsColor(d: *Driver, start: usize, level: []const u8) !void {
+    const view = (try d.acknowledgedScreen(start)) orelse return error.SettingsColorMismatch;
+    if (composerKind(view, "fixture-model", level, false) == .none) return error.SettingsColorMismatch;
+    if (d.effort_witness_start == start) if (d.effort_witness) |frame| {
+        // In the expiry fallback this is the actual effort frame, not a later
+        // percent frame or some unrelated earlier occurrence of the color.
+        if (try settingsColorFrame(d.output[frame.begin..frame.end], level)) return;
+        return error.SettingsColorMismatch;
+    };
+
+    const ack = std.mem.lastIndexOf(u8, d.output[0..d.used], frame_ack).?;
+    const bytes = d.output[0 .. ack + frame_ack.len];
+    var scanner = try FrameScanner.init(d.columns);
+    defer scanner.deinit();
+    var latest_color: ?bool = null;
+    while (try scanner.next(bytes)) |frame| {
+        if (!frame.complete or frame.begin < start or composerKind(scanner.view, "fixture-model", level, false) == .none) continue;
+        const raw = bytes[frame.begin..frame.end];
+        // A sparse frame may not repaint the footer at all. Preserve the last
+        // validated footer repaint, but never an unacknowledged raw match.
+        if (std.mem.indexOf(u8, raw, "fixture-model") != null) latest_color = try settingsColorFrame(raw, level);
     }
+    if (latest_color orelse false) return;
     return error.SettingsColorMismatch;
 }
 
@@ -1782,9 +1952,129 @@ pub fn testQueuedNatural(init: std.process.Init) !void {
     try main(init);
 }
 
+/// Deterministic test-only capture fixtures; no PTY, child or product clock.
+fn selfAppend(d: *Driver, bytes: []const u8) !void {
+    try check(d.used + bytes.len <= d.output.len);
+    @memcpy(d.output[d.used..][0..bytes.len], bytes);
+    d.used += bytes.len;
+}
+
+fn selfCapture(d: *Driver, parts: []const []const u8) !void {
+    d.used = 0;
+    d.effort_witness = null;
+    for (parts) |part| try selfAppend(d, part);
+}
+
+fn selfEffortReady(d: *Driver, start: usize, allow_normal: bool) !bool {
+    var scanner: ?FrameScanner = null;
+    defer if (scanner) |*s| s.deinit();
+    return try d.effortIdleReady(start, "fixture-model", "low", allow_normal, &scanner);
+}
+
+fn frameSelfCheck() !void {
+    const d = try std.heap.page_allocator.create(Driver);
+    defer std.heap.page_allocator.destroy(d);
+    d.* = .{ .master = -1, .slave = -1, .pid = -1, .owned = false, .original = undefined, .flags = 0, .screens = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    defer d.screens.deinit();
+    const prefix = frame_begin ++ "\r\x1b[2K";
+    const suffix = frame_end ++ frame_ack;
+    const normal = prefix ++ "(\x1b[38;5;114mfixture-model\x1b[0m\x1b[1m) \x1b[0m\x1b[1m?%\x1b[0m\x1b[1m>\x1b[0m " ++ suffix;
+    const low = prefix ++ "(\x1b[38;5;114mfixture-model\x1b[0m\x1b[1m) \x1b[38;5;114mlow\x1b[0m\x1b[1m>\x1b[0m " ++ suffix;
+    const wrong_color = prefix ++ "(\x1b[38;5;75mfixture-model\x1b[0m\x1b[1m) \x1b[38;5;75mlow\x1b[0m\x1b[1m>\x1b[0m " ++ suffix;
+    const high = prefix ++ "(fixture-model) high> " ++ suffix;
+
+    // Every nonempty split of sync-begin invalidates the old ACK; only the
+    // next complete fresh frame may restore it.
+    for (1..frame_begin.len + 1) |n| {
+        try selfCapture(d, &.{ normal, low[0..n] });
+        try check((try d.acknowledgedScreen(0)) == null);
+        try selfAppend(d, low[n..]);
+        const view = (try d.acknowledgedScreen(normal.len)) orelse return error.SelfCheckMissingAck;
+        try check(composerKind(view, "fixture-model", "low", false) == .effort);
+    }
+
+    // Exact prompt suffix + cursor, not trimEnd: typed spaces, a multi-character
+    // draft and a cursor moved before the draft must never count as empty.
+    for ([_][]const u8{
+        prefix ++ "(fixture-model) low>  " ++ suffix,
+        prefix ++ "(fixture-model) low>   " ++ suffix,
+        prefix ++ "(fixture-model) low> draft" ++ suffix,
+        prefix ++ "(fixture-model) low> draft\r\x1b[21C" ++ suffix,
+        prefix ++ "(fixture-model) low> \r\x1b[20C" ++ suffix,
+    }) |bad| {
+        try selfCapture(d, &.{bad});
+        const view = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
+        try check(composerKind(view, "fixture-model", "low", false) == .none);
+    }
+    try selfCapture(d, &.{low});
+    const view = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
+    view.wrap = true;
+    try check(composerKind(view, "fixture-model", "low", false) == .none);
+
+    const valid = [_][]const u8{ "?%", "0.0%", "9.0%", "99.9%", "100.0%", ">100%" };
+    const invalid = [_][]const u8{ "9%", "999.999%", "100.1%", "101.0%", "00.0%", "-1.0%", "+1.0%", "1e1%", "NaN%", "1.2.3%", "x9.0%", "9.0%x", "9.0L%", "L9.0%" };
+    var buffer: [256]u8 = undefined;
+    for (valid ++ invalid, 0..) |label, i| {
+        const bytes = try std.fmt.bufPrint(&buffer, "{s}(fixture-model) {s}> {s}", .{ prefix, label, suffix });
+        try selfCapture(d, &.{bytes});
+        const current = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
+        try check((composerKind(current, "fixture-model", "low", false) == .normal) == (i < valid.len));
+    }
+    try check(normalLabel("L9.0%", true) and normalLabel("L?%", true) and normalLabel("L>100%", true));
+    try check(!normalLabel("9.0L%", true) and !normalLabel("9.0%", true) and !normalLabel("LL9.0%", true));
+    try selfCapture(d, &.{prefix ++ "(fixture-model) L9.0%> " ++ suffix});
+    const marked = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
+    try check(composerKind(marked, "fixture-model", "low", true) == .normal);
+    try check(composerKind(marked, "fixture-model", "low", false) == .none);
+    try selfCapture(d, &.{prefix ++ "(fixture-model) Llow> " ++ suffix});
+    const marked_effort = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
+    try check(composerKind(marked_effort, "fixture-model", "low", true) == .effort);
+    try check(composerKind(marked_effort, "fixture-model", "low", false) == .none);
+
+    // One drain can deliver both the actual flash and its expiry. Historical
+    // ACKs, a wrong effort, and a partial frame cannot stand in for the flash.
+    try selfCapture(d, &.{ normal, low, normal });
+    try check(try selfEffortReady(d, normal.len, false));
+    try settingsColor(d, normal.len, "low");
+    try selfCapture(d, &.{ normal, normal });
+    try check(!(try selfEffortReady(d, normal.len, false)));
+    try check(try selfEffortReady(d, normal.len, true)); // post-reply only
+    try selfCapture(d, &.{ low, normal });
+    try check(!(try selfEffortReady(d, low.len, false)));
+    try selfCapture(d, &.{ low, frame_begin ++ suffix }); // Fresh ACK, unchanged old effort.
+    try check(!(try selfEffortReady(d, low.len, false)));
+    try selfCapture(d, &.{ normal, high, normal });
+    try check(!(try selfEffortReady(d, normal.len, false)));
+    try selfCapture(d, &.{ normal, low[0 .. low.len - suffix.len] });
+    try check(!(try selfEffortReady(d, normal.len, false)));
+    try selfCapture(d, &.{ normal, prefix ++ "(other-model) low> " ++ suffix, normal });
+    try check(!(try selfEffortReady(d, normal.len, false)));
+    // A scanner reused across drains advances rather than replaying prefixes.
+    try selfCapture(d, &.{ normal, normal });
+    var incremental: ?FrameScanner = null;
+    defer if (incremental) |*s| s.deinit();
+    try check(!(try d.effortIdleReady(normal.len, "fixture-model", "low", false, &incremental)));
+    try selfAppend(d, low ++ normal);
+    try check(try d.effortIdleReady(normal.len, "fixture-model", "low", false, &incremental));
+    try selfCapture(d, &.{ normal, wrong_color, normal });
+    try check(try selfEffortReady(d, normal.len, false));
+    var color_failed = false;
+    settingsColor(d, normal.len, "low") catch |err| {
+        if (err != error.SettingsColorMismatch) return err;
+        color_failed = true;
+    };
+    try check(color_failed);
+}
+
 /// 入口：先创建本驱动独占的短运行时目录，再运行验收主体。主体返回后，只有在
 /// 该目录下的 worker 端点都不再接受连接时才删除目录。
 pub fn main(init: std.process.Init) !void {
+    if (init.environ_map.get("THIN_PTY_SELF_CHECK")) |value| {
+        try check(std.mem.eql(u8, value, "1"));
+        try frameSelfCheck();
+        std.debug.print("PTY_FRAME_SELF_CHECK=ok\n", .{});
+        return;
+    }
     // 前台实例会为自己启动 AF_UNIX worker，其 socket 位于
     // `$XDG_RUNTIME_DIR/thin/workers/<instance>.sock`。未设置时产品会回落到共享的
     // `/tmp/thin-<uid>`；因此这里在 fork 之前创建本驱动独占的短绝对运行时目录。
@@ -2710,19 +3000,19 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             for (levels) |level| {
                 var start = d.used;
                 try d.send("\x1b[Z");
-                try d.waitIdle(start);
+                try d.waitEffortIdle(start, "fixture-model", level, false);
                 try settingsColor(&d, start, level);
                 start = d.used;
                 try d.send("settings-task\r");
                 try d.waitText(start, "settings-answer");
-                try d.waitIdle(start);
+                try d.waitEffortIdle(start, "fixture-model", level, true);
             }
             if (std.mem.eql(u8, mode, "settings-cycle")) {
                 // Leave max saved without another HTTP call.
                 for ([_][]const u8{ "low", "high", "max" }) |level| {
                     const start = d.used;
                     try d.send("\x1b[Z");
-                    try d.waitIdle(start);
+                    try d.waitEffortIdle(start, "fixture-model", level, false);
                     try settingsColor(&d, start, level);
                 }
             }
@@ -2744,12 +3034,12 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             start = d.used;
             try d.send("fixture-secret-never-log\r");
             try d.waitText(start, "Saved locally; send a message to connect");
-            try d.waitIdle(start);
+            try d.waitAuthSettlement(start, "fixture-model", "low");
             try settingsColor(&d, start, "low");
             start = d.used;
             try d.send("settings-task\r");
             try d.waitText(start, "settings-answer");
-            try d.waitIdle(start);
+            try d.waitEffortIdle(start, "fixture-model", "low", true);
         } else if (!std.mem.eql(u8, mode, "settings-initial")) {
             const blocked = std.mem.eql(u8, mode, "settings-blocked-low") or std.mem.eql(u8, mode, "settings-unknown-low");
             const clamped = std.mem.startsWith(u8, mode, "settings-clamp-");
@@ -2791,8 +3081,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     } else if (std.mem.eql(u8, mode, "model-select-empty")) {
         const start = d.used;
         try d.send("/model fixture-next\r");
-        try d.waitVisibleFrame(start, "(fixture-next) ");
-        try d.waitIdle(start);
+        try d.waitEffortIdle(start, "fixture-next", "low", false);
         const selected = try d.screen();
         try check(selected.visible("fixture-next") and !selected.visible("Model selection failed"));
     } else if (std.mem.eql(u8, mode, "model-select")) {
@@ -2825,31 +3114,35 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitFrame(start, "Search> ");
         start = d.used;
         try d.send("\r");
-        try d.waitIdle(start);
+        try d.waitEffortIdle(start, "fixture-next", "low", false);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "fixture-next") != null);
         // No global override exists: the selected profile's configured low is
         // now the default, not an obsolete project preference. ACK-safe redraws
         // may emit changed cells only; inspect the resulting idle screen. The
         // exact medium wire after ONE shortcut below proves low was applied.
         const selected_next = try d.screen();
-        try check(selected_next.visible("fixture-next") and selected_next.visible("?%"));
+        try check(selected_next.visible("fixture-next"));
         try check(!selected_next.visible("Search> "));
         try Driver.checkComposerTail(selected_next);
         start = d.used;
         try d.send("\x1b[Z"); // Selected profile low -> medium.
-        // Observe the acknowledged confirmation, then its automatic expiry.
-        // Intermediate levels may render if PTY input arrives in separate reads.
-        // The ACK-owned renderer may update only the changed effort cells;
-        // requiring the complete unchanged model prefix in the byte diff is
-        // invalid. Wait for a fresh complete frame carrying the changed
-        // effort cells, then inspect the replayed screen before the transient
-        // confirmation expires back to the ordinary percentage prompt.
-        try d.waitVisibleFrame(start, "(fixture-next) medium> ");
-        const medium_screen = try d.screen();
-        try check(medium_screen.visible("(fixture-next) medium> "));
+        // Require the acknowledged confirmation, then its automatic expiry.
+        // Sparse redraws may leave the model prefix unchanged; inspect the
+        // reconstructed fresh frame even if both ACKs arrive in one read.
+        try d.waitEffortIdle(start, "fixture-next", "medium", false);
+        // The flash may already have expired by the time the driver is
+        // scheduled; inspect the exact fresh ACK that proved it was delivered.
+        const medium_frame = d.effort_witness orelse return error.MissingEffortFrame;
+        const medium_screen = try d.screens.allocator().create(regular.Screen);
+        medium_screen.* = .{ .columns = d.columns };
+        try medium_screen.replay(d.output[0..medium_frame.end]);
+        try check(composerKind(medium_screen, "fixture-next", "medium", false) == .effort);
         // The transient effort confirmation then expires back to the ordinary
         // percentage prompt; only after observing it should this wait for idle.
         try d.waitIdle(start);
+        const expired_next = try d.screen();
+        try check(expired_next.visible("?%"));
+        try check(std.mem.eql(u8, std.mem.trimEnd(u8, &expired_next.grid[expired_next.row], " "), "(fixture-next) ?%>"));
         start = d.used;
         try d.send("selection-second\r");
         try d.waitText(start, "selection-answer-two");
@@ -2862,19 +3155,18 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitIdle(start);
         start = d.used;
         try d.send("/model fixture-custom\r");
-        try d.waitVisibleFrame(start, "(fixture-custom) ");
-        try d.waitIdle(start);
+        try d.waitEffortIdle(start, "fixture-custom", "off", false);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "fixture-custom") != null);
         start = d.used;
         try d.send("\x1b[Z"); // Selected profile off -> minimal.
         try d.waitFrame(start, "(\x1b[38;5;117mfixture-custom\x1b[0m\x1b[1m) \x1b[38;5;117m");
-        try d.waitIdle(start);
+        try d.waitEffortIdle(start, "fixture-custom", "minimal", false);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "(\x1b[38;5;117mfixture-custom\x1b[0m\x1b[1m) \x1b[38;5;117m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;117m>\x1b[0m") == null);
         start = d.used;
         try d.send("selection-third\r");
         try d.waitText(start, "selection-answer-three");
-        try d.waitIdle(start);
+        try d.waitEffortIdle(start, "fixture-custom", "minimal", true);
         const final = try d.screen();
         try check(final.count("selection-answer-one") == 1 and final.count("selection-answer-two") == 1 and final.count("selection-answer-three") == 1);
         try check(final.count("selection-first") == 1 and final.count("selection-second") == 1 and final.count("selection-third") == 1);

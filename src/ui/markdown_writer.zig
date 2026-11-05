@@ -28,7 +28,7 @@ pub const RowSink = struct {
 /// byte-for-byte copy of that source span (no entities/escapes/replacements),
 /// so wrapped rows can be attributed per scalar. Non-exact spans are attributed
 /// atomically to the first scalar of the emit.
-pub const SourceMap = struct { start: usize, end: usize, exact: bool, generated: bool = false };
+pub const SourceMap = struct { start: usize, end: usize, exact: bool };
 
 pub const Budget = struct {
     bytes: usize = 0,
@@ -94,15 +94,11 @@ pub const Writer = struct {
     origin_start: usize = std.math.maxInt(usize),
     origin_end: usize = 0,
     origin_synthetic: bool = true,
-    generated_start: usize = std.math.maxInt(usize),
-    generated_end: usize = 0,
     map: ?SourceMap = null,
     /// Parser-source origin of the glyph currently staged in `pending`.
     pending_origin_start: usize = 0,
     pending_origin_end: usize = 0,
     pending_origin_synthetic: bool = true,
-    pending_generated_start: usize = std.math.maxInt(usize),
-    pending_generated_end: usize = 0,
 
     pub fn hasContent(self: *const Writer) bool {
         return self.row_started or self.cluster != null or self.col != 0 or self.line.items.len != 0;
@@ -214,10 +210,7 @@ pub const Writer = struct {
                 try self.put(&self.pending, raw);
                 self.cluster = next;
                 if (origin) |o| {
-                    if (o.generated) {
-                        self.pending_generated_start = @min(self.pending_generated_start, o.start);
-                        self.pending_generated_end = @max(self.pending_generated_end, o.end);
-                    } else if (self.pending_origin_synthetic) {
+                    if (self.pending_origin_synthetic) {
                         self.pending_origin_start = o.start;
                         self.pending_origin_end = o.end;
                         self.pending_origin_synthetic = false;
@@ -246,17 +239,10 @@ pub const Writer = struct {
         self.pending_body = prefix_at == null;
         self.pending_src_start = self.pos;
         self.pending_origin_synthetic = true;
-        self.pending_generated_start = std.math.maxInt(usize);
-        self.pending_generated_end = 0;
         if (origin) |o| {
-            if (o.generated) {
-                self.pending_generated_start = o.start;
-                self.pending_generated_end = o.end;
-            } else {
-                self.pending_origin_synthetic = false;
-                self.pending_origin_start = o.start;
-                self.pending_origin_end = o.end;
-            }
+            self.pending_origin_synthetic = false;
+            self.pending_origin_start = o.start;
+            self.pending_origin_end = o.end;
         }
         // Set state before allocation: discardLine/deinit can always recover.
         self.cluster = state;
@@ -314,8 +300,6 @@ pub const Writer = struct {
         const glyph_origin_start = self.pending_origin_start;
         const glyph_origin_end = self.pending_origin_end;
         const glyph_synthetic = self.pending_origin_synthetic;
-        const generated_start = self.pending_generated_start;
-        const generated_end = self.pending_generated_end;
         self.cluster = null;
         self.pending_body = false;
         self.pending_prefix_start = null;
@@ -351,10 +335,6 @@ pub const Writer = struct {
             moved = true;
         }
         if (!glyph_synthetic) self.markSource(glyph_origin_start, glyph_origin_end);
-        if (generated_end > generated_start) {
-            self.generated_start = @min(self.generated_start, generated_start);
-            self.generated_end = @max(self.generated_end, generated_end);
-        }
         if (moved) {
             try self.styleInto(&self.line, first_style);
             if (first_bullet and self.ansi) try self.append(theme.bullet);
@@ -400,8 +380,6 @@ pub const Writer = struct {
         self.origin_start = std.math.maxInt(usize);
         self.origin_end = 0;
         self.origin_synthetic = true;
-        self.generated_start = std.math.maxInt(usize);
-        self.generated_end = 0;
     }
 
     pub fn finish(self: *Writer) !void {
@@ -458,7 +436,7 @@ pub const Writer = struct {
             }
             const origin: ?SourceMap = if (self.map) |map| blk: {
                 if (map.exact and map.end >= map.start and map.end - map.start == s.len)
-                    break :blk .{ .start = map.start + i, .end = map.start + r.end, .exact = true, .generated = map.generated };
+                    break :blk .{ .start = map.start + i, .end = map.start + r.end, .exact = true };
                 break :blk map;
             } else null;
             if (r.cp == 10) {
@@ -969,11 +947,13 @@ const OriginProbe = struct {
     writer: *Writer,
     starts: [8]usize = undefined,
     ends: [8]usize = undefined,
+    synthetic: [8]bool = undefined,
     count: usize = 0,
     fn onRow(context: *anyopaque, row: []const u8, _: usize, _: []const u8) Error!void {
         const self: *OriginProbe = @ptrCast(@alignCast(context));
         self.starts[self.count] = self.writer.origin_start;
         self.ends[self.count] = self.writer.origin_end;
+        self.synthetic[self.count] = self.writer.origin_synthetic;
         self.count += 1;
         self.writer.a.free(row);
     }
@@ -1008,6 +988,39 @@ test "bounded atomic source remains atomic across slices" {
         try std.testing.expectEqual(@as(usize, 20), probe.starts[i]);
         try std.testing.expectEqual(@as(usize, 25), probe.ends[i]);
     }
+}
+
+test "synthetic and sourced glyphs keep independent row origins" {
+    try text.initLocale();
+    var w: Writer = .{ .a = std.testing.allocator, .columns = 1, .ansi = false };
+    defer w.deinit();
+    var probe: OriginProbe = .{ .writer = &w };
+    w.sink = .{ .context = &probe, .onRow = OriginProbe.onRow };
+    try w.emitSynthetic("x");
+    try w.emitSourced("y", 20, 25, false);
+    try w.emitSynthetic("z");
+    try w.finish();
+    try std.testing.expectEqual(@as(usize, 3), probe.count);
+    try std.testing.expect(probe.synthetic[0]);
+    try std.testing.expectEqual(@as(usize, 0), probe.ends[0]);
+    try std.testing.expect(!probe.synthetic[1]);
+    try std.testing.expectEqual(@as(usize, 20), probe.starts[1]);
+    try std.testing.expectEqual(@as(usize, 25), probe.ends[1]);
+    try std.testing.expect(probe.synthetic[2]);
+    try std.testing.expectEqual(@as(usize, 0), probe.ends[2]);
+
+    // A sourced combining mark gives an otherwise synthetic cluster an origin.
+    var mixed: Writer = .{ .a = std.testing.allocator, .columns = 2, .ansi = false };
+    defer mixed.deinit();
+    var combined: OriginProbe = .{ .writer = &mixed };
+    mixed.sink = .{ .context = &combined, .onRow = OriginProbe.onRow };
+    try mixed.emitSynthetic("a");
+    try mixed.emitSourced("́", 30, 32, true);
+    try mixed.finish();
+    try std.testing.expectEqual(@as(usize, 1), combined.count);
+    try std.testing.expect(!combined.synthetic[0]);
+    try std.testing.expectEqual(@as(usize, 30), combined.starts[0]);
+    try std.testing.expectEqual(@as(usize, 32), combined.ends[0]);
 }
 
 test "a rejected sink row is freed exactly once by the writer" {

@@ -292,10 +292,6 @@ pub const App = struct {
         return self;
     }
 
-    pub fn memoryNotice(self: *const App) ?[]const u8 {
-        return self.memory_coordinator.notice();
-    }
-
     pub fn memoryView(self: *const App) @import("../core/memory_status.zig").View {
         return self.memory_coordinator.view();
     }

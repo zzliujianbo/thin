@@ -173,6 +173,7 @@ pub const Registry = struct {
 
     /// Find the unique entry for `id` (optionally restricted to one project).
     /// Same id under several projects is ambiguous and refused, never guessed.
+    /// An unreadable or invalid entry is an error, not proof of absence.
     pub fn resolve(self: *Registry, a: std.mem.Allocator, id: ids.Id, project: ?[]const u8) !?Record {
         if (!ids.valid(id)) return error.InvalidSessionID;
         self.mutex.lockUncancelable(self.io);
@@ -186,14 +187,13 @@ pub const Registry = struct {
         }
 
         var found: ?Record = null;
+        errdefer if (found) |*record| freeRecord(a, record);
         var iter = KeyIterator.init(self);
         while (try iter.next()) |key| {
             const maybe = try self.readOne(a, id, key, null);
             var record = maybe orelse continue;
             if (found != null) {
                 freeRecord(a, &record);
-                var previous = found.?;
-                freeRecord(a, &previous);
                 return error.AmbiguousSession;
             }
             found = record;
@@ -209,7 +209,7 @@ pub const Registry = struct {
     pub fn list(self: *Registry, a: std.mem.Allocator, running_only: bool, page: usize) ![]Record {
         var all: std.ArrayList(Record) = .empty;
         errdefer {
-            freeRecords(a, all.items);
+            for (all.items) |*record| freeRecord(a, record);
             all.deinit(a);
         }
 
@@ -246,7 +246,12 @@ pub const Registry = struct {
                         const id_text = entry.name[0..32];
                         if (!ids.valid(id_text[0..32].*)) continue;
                         const id: ids.Id = id_text[0..32].*;
-                        const stored = (self.readOneLocked(a, id, key, key_fd, null) catch continue) orelse continue;
+                        // Listing remains best-effort for unreadable or corrupt
+                        // entries, but cannot produce a reliable page on OOM.
+                        const stored = (self.readOneLocked(a, id, key, key_fd, null) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => continue,
+                        }) orelse continue;
                         var record = stored;
                         // One kernel+hello verified probe decides both visibility
                         // and the state the caller displays; it never starts a
@@ -434,16 +439,22 @@ pub const Registry = struct {
         if (fd < 0) return if (std.c._errno().* == 2) null else fs.osError();
         defer fs.closeFd(fd);
 
-        if (!isRegularFd(fd)) return null;
-        var buffer: [max_index_bytes]u8 = undefined;
-        const n = fs.fileFromFd(fd).readPositionalAll(self.io, &buffer, 0) catch return null;
-        if (n == 0) return null;
+        if (!try isRegularFd(fd)) return error.NotRegularFile;
+        // Read one byte past the limit, so a larger file cannot be accepted
+        // merely because its first max_index_bytes form a complete JSON value.
+        var buffer: [max_index_bytes + 1]u8 = undefined;
+        const n = try fs.fileFromFd(fd).readPositionalAll(self.io, &buffer, 0);
+        if (n > max_index_bytes) return error.FileTooLarge;
+        if (n == 0) return error.ProtocolError;
 
-        return self.decode(a, buffer[0..n], id, key, project) catch null;
+        return try self.decode(a, buffer[0..n], id, key, project);
     }
 
     fn decode(self: *Registry, a: std.mem.Allocator, bytes: []const u8, id: ids.Id, key: [32]u8, project: ?[]const u8) !Record {
-        const doc = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always }) catch return error.ProtocolError;
+        const doc = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ProtocolError,
+        };
         defer doc.deinit();
         const object = switch (doc.value) {
             .object => |object| object,
@@ -483,18 +494,24 @@ pub const Registry = struct {
         const generation = jsonU64(object.get("generation") orelse return error.ProtocolError);
         const updated_ms = jsonU64(object.get("updated_ms") orelse return error.ProtocolError);
 
-        const record: Record = .{
+        const owned_project = try a.dupe(u8, project_text);
+        errdefer a.free(owned_project);
+        const owned_endpoint = try a.dupe(u8, endpoint);
+        errdefer a.free(owned_endpoint);
+        const owned_instance = try a.dupe(u8, instance);
+        errdefer a.free(owned_instance);
+        const owned_state = try a.dupe(u8, state);
+        return .{
             .id = id,
-            .project = try a.dupe(u8, project_text),
-            .endpoint = try a.dupe(u8, endpoint),
+            .project = owned_project,
+            .endpoint = owned_endpoint,
             .owner = owner,
-            .owner_instance = try a.dupe(u8, instance),
-            .state = try a.dupe(u8, state),
+            .owner_instance = owned_instance,
+            .state = owned_state,
             .pid = @intCast(pid_value),
             .generation = generation,
             .updated_ms = updated_ms,
         };
-        return record;
     }
 
     // -- endpoint probing ------------------------------------------------- --
@@ -567,9 +584,9 @@ fn validateAbsolutePath(path: []const u8) !void {
     while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return error.InvalidInput;
 }
 
-fn isRegularFd(fd: c.fd_t) bool {
+fn isRegularFd(fd: c.fd_t) !bool {
     var st: linux.Statx = undefined;
-    if (c.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &st) != 0) return false;
+    if (c.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &st) != 0) return fs.osError();
     return st.mode & linux.S.IFMT == linux.S.IFREG;
 }
 
@@ -1047,6 +1064,168 @@ test "registry publishes schema v1 id strings and resolves across projects" {
         freeRecord(a, &owned);
         return error.TestUnexpectedResult;
     }
+}
+
+extern "c" fn mkfifoat(c_int, [*:0]const u8, c_uint) c_int;
+
+fn expectResolveError(registry: *Registry, id: ids.Id, project: []const u8, expected: anyerror) !void {
+    try testing.expectError(expected, registry.resolve(testing.allocator, id, project));
+    try testing.expectError(expected, registry.resolve(testing.allocator, id, null));
+}
+
+fn resolveAllocationCase(a: std.mem.Allocator, registry: *Registry, id: ids.Id, project: ?[]const u8) !void {
+    var record = (try registry.resolve(a, id, project)) orelse return error.TestUnexpectedResult;
+    defer freeRecord(a, &record);
+}
+
+fn ambiguousAllocationCase(a: std.mem.Allocator, registry: *Registry, id: ids.Id) !void {
+    if (registry.resolve(a, id, null)) |maybe| {
+        if (maybe) |value| {
+            var record = value;
+            freeRecord(a, &record);
+        }
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.AmbiguousSession => {},
+        else => return err,
+    }
+}
+
+fn listAllocationCase(a: std.mem.Allocator, registry: *Registry) !void {
+    const page = try registry.list(a, false, 0);
+    defer freeRecords(a, page);
+    try testing.expectEqual(@as(usize, 1), page.len);
+}
+
+test "registry distinguishes absent entries from invalid or unreadable records" {
+    const a = testing.allocator;
+    var test_env = try TestEnv.init(a);
+    defer test_env.deinit(a);
+    var registry = try Registry.init(a, testing.io, &test_env.env);
+    defer registry.deinit();
+
+    const id: ids.Id = "1234567890abcdef1234567890abcdef".*;
+    const good_id: ids.Id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".*;
+    const missing_id: ids.Id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".*;
+    const project = "/tmp/strict-project";
+
+    // Neither a missing project directory nor a missing entry is an error.
+    try testing.expect((try registry.resolve(a, id, project)) == null);
+    try testing.expect((try registry.resolve(a, id, null)) == null);
+    // A project-key path that exists but is not a directory is not absent.
+    const blocked_project = "/tmp/not-a-directory";
+    const blocked_key = projectKey(blocked_project);
+    var blocked_name_buf: [33]u8 = undefined;
+    @memcpy(blocked_name_buf[0..32], &blocked_key);
+    blocked_name_buf[32] = 0;
+    const blocked_name = blocked_name_buf[0..32 :0];
+    const index_dir: std.Io.Dir = .{ .handle = registry.index_fd };
+    try index_dir.writeFile(testing.io, .{ .sub_path = blocked_name, .data = "" });
+    try testing.expectError(error.NotDir, registry.resolve(a, id, blocked_project));
+    try testing.expectEqual(@as(c_int, 0), c.unlinkat(registry.index_fd, blocked_name, 0));
+    var good = try testRecord(&registry, good_id, project, "aaaaaaaaaaaaaaaa");
+    defer freeRecord(a, &good);
+    try registry.register(good);
+    try testing.expect((try registry.resolve(a, missing_id, project)) == null);
+    try testing.expect((try registry.resolve(a, missing_id, null)) == null);
+
+    var record = try testRecord(&registry, id, project, "bbbbbbbbbbbbbbbb");
+    defer freeRecord(a, &record);
+    try registry.register(record);
+    const key = projectKey(project);
+    const key_fd = try registry.openKeyDir(key, false);
+    defer fs.closeFd(key_fd);
+    const key_dir: std.Io.Dir = .{ .handle = key_fd };
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrintSentinel(&name_buf, "{s}{s}", .{ id[0..], index_suffix }, 0);
+
+    try key_dir.writeFile(testing.io, .{ .sub_path = name, .data = "" });
+    try expectResolveError(&registry, id, project, error.ProtocolError);
+    try key_dir.writeFile(testing.io, .{ .sub_path = name, .data = "{\"v\":" });
+    try expectResolveError(&registry, id, project, error.ProtocolError);
+    try key_dir.writeFile(testing.io, .{ .sub_path = name, .data = "{}" });
+    try expectResolveError(&registry, id, project, error.ProtocolError);
+    {
+        const page = try registry.list(a, false, 0);
+        defer freeRecords(a, page);
+        try testing.expectEqual(@as(usize, 1), page.len);
+        try testing.expectEqual(good_id, page[0].id);
+    }
+
+    // Exactly the limit is allowed, but a valid JSON prefix at the limit
+    // must not hide any extra byte in the actual file.
+    const encoded = try registry.encode(record, key);
+    defer a.free(encoded);
+    try testing.expect(encoded.len < max_index_bytes);
+    var padded: [max_index_bytes + 1]u8 = undefined;
+    @memset(&padded, ' ');
+    @memcpy(padded[0..encoded.len], encoded);
+    try key_dir.writeFile(testing.io, .{ .sub_path = name, .data = padded[0..max_index_bytes] });
+    {
+        var resolved = (try registry.resolve(a, id, project)) orelse return error.TestUnexpectedResult;
+        defer freeRecord(a, &resolved);
+        try testing.expectEqual(id, resolved.id);
+    }
+    padded[max_index_bytes] = '!';
+    try key_dir.writeFile(testing.io, .{ .sub_path = name, .data = &padded });
+    try expectResolveError(&registry, id, project, error.FileTooLarge);
+    {
+        const page = try registry.list(a, false, 0);
+        defer freeRecords(a, page);
+        try testing.expectEqual(@as(usize, 1), page.len);
+        try testing.expectEqual(good_id, page[0].id);
+    }
+
+    try testing.expectEqual(@as(c_int, 0), c.unlinkat(key_fd, name, 0));
+    try testing.expectEqual(@as(c_int, 0), c.mkdirat(key_fd, name, 0o700));
+    try expectResolveError(&registry, id, project, error.NotRegularFile);
+    try testing.expectEqual(@as(c_int, 0), c.unlinkat(key_fd, name, 0x200)); // AT_REMOVEDIR
+    try testing.expectEqual(@as(c_int, 0), mkfifoat(key_fd, name, 0o600));
+    try expectResolveError(&registry, id, project, error.NotRegularFile);
+    try testing.expectEqual(@as(c_int, 0), c.unlinkat(key_fd, name, 0));
+    try testing.expectEqual(@as(c_int, 0), c.symlinkat("missing-target", key_fd, name));
+    try expectResolveError(&registry, id, project, error.SymlinkNotAllowed);
+
+    // Open and metadata failures are not reclassified as a missing entry.
+    try testing.expectError(error.FileSystemError, registry.readOneLocked(a, id, key, -1, project));
+    try testing.expectError(error.FileSystemError, isRegularFd(-1));
+}
+
+test "registry read allocation failures propagate and release partial records" {
+    const a = testing.allocator;
+    var test_env = try TestEnv.init(a);
+    defer test_env.deinit(a);
+    var registry = try Registry.init(a, testing.io, &test_env.env);
+    defer registry.deinit();
+
+    const id: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
+    const project = "/tmp/allocation-one";
+    var first = try testRecord(&registry, id, project, "cccccccccccccccc");
+    defer freeRecord(a, &first);
+    try registry.register(first);
+
+    // Exercise JSON parsing and every separately owned record field, as well
+    // as list's allocation-failure cleanup after a record was accumulated.
+    try testing.checkAllAllocationFailures(a, resolveAllocationCase, .{ &registry, id, @as(?[]const u8, project) });
+    try testing.checkAllAllocationFailures(a, resolveAllocationCase, .{ &registry, id, @as(?[]const u8, null) });
+    try testing.checkAllAllocationFailures(a, listAllocationCase, .{&registry});
+
+    // If a later project fails or is ambiguous, the first result must be freed.
+    const other_project = "/tmp/allocation-two";
+    var second = try testRecord(&registry, id, other_project, "dddddddddddddddd");
+    defer freeRecord(a, &second);
+    try registry.register(second);
+    try testing.checkAllAllocationFailures(a, ambiguousAllocationCase, .{ &registry, id });
+
+    const key_fd = try registry.openKeyDir(projectKey(other_project), false);
+    defer fs.closeFd(key_fd);
+    const key_dir: std.Io.Dir = .{ .handle = key_fd };
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrintSentinel(&name_buf, "{s}{s}", .{ id[0..], index_suffix }, 0);
+    try key_dir.writeFile(testing.io, .{ .sub_path = name, .data = "{" });
+    var counted = testing.FailingAllocator.init(a, .{});
+    try testing.expectError(error.ProtocolError, registry.resolve(counted.allocator(), id, null));
+    try testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
 }
 
 test "registry rejects records outside the runtime endpoint shape" {

@@ -1123,16 +1123,11 @@ pub const DecodedEvent = struct {
     event: r.Event,
     display_truncated: bool = false,
     canonical_complete: bool = true,
+    /// Event payload slices and blocks borrow the document arena. Callers must
+    /// deep-copy through `ui/session_client.ownEvent` before releasing it.
     doc: std.json.Parsed(std.json.Value),
-    /// Reserved: every payload slice borrows `doc.arena`, so this is empty and
-    /// callers must deep-copy through `ui/session_client.ownEvent`.
-    storage: []u8 = &.{},
-    a: std.mem.Allocator,
 
     pub fn deinit(self: *DecodedEvent) void {
-        // Blocks and text are arena-owned; only an explicitly handed-out
-        // buffer would need freeing here.
-        if (self.storage.len != 0) self.a.free(self.storage);
         self.doc.deinit();
         self.* = undefined;
     }
@@ -1470,8 +1465,6 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
         .display_truncated = display_truncated,
         .canonical_complete = canonical_complete,
         .doc = doc,
-        .storage = &.{},
-        .a = a,
     };
 }
 
@@ -1553,7 +1546,6 @@ fn expectEventRoundTrip(a: std.mem.Allocator, event: r.Event) !void {
     try std.testing.expectEqual(@as(u64, 0), decoded.epoch);
     try std.testing.expect(!decoded.display_truncated);
     try std.testing.expect(decoded.canonical_complete);
-    try std.testing.expectEqual(@as(usize, 0), decoded.storage.len);
     const second = try encodeEvent(a, decoded.event);
     defer a.free(second);
     try std.testing.expectEqualStrings(first, second);
@@ -1865,8 +1857,14 @@ test "assistant encoding marks a bounded block list incomplete" {
 fn decodeAssistantOwned(a: std.mem.Allocator, json: []const u8) !void {
     var decoded = try decodeEvent(a, json);
     defer decoded.deinit();
-    try std.testing.expect(decoded.event.assistant_committed.len != 0);
-    try std.testing.expectEqual(@as(usize, 0), decoded.storage.len);
+    const blocks = decoded.event.assistant_committed;
+    const document_blocks = decoded.doc.value.object.get("blocks").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expectEqual(blocks.len, document_blocks.len);
+    for (blocks, document_blocks) |block, document_block| {
+        try std.testing.expectEqualStrings("block", block.text);
+        try std.testing.expect(block.text.ptr == document_block.object.get("v").?.string.ptr);
+    }
 }
 
 test "assistant decoding owns blocks in the document arena under allocation failure" {
@@ -1874,6 +1872,38 @@ test "assistant decoding owns blocks in the document arena under allocation fail
     const json = try manyBlocksJson(a, 3);
     defer a.free(json);
     try std.testing.checkAllAllocationFailures(a, decodeAssistantOwned, .{json});
+}
+
+test "decoded blocks borrow their document after the wire buffer changes" {
+    const a = std.testing.allocator;
+    const wire = try a.dupe(u8,
+        \\{"t":"assistant","epoch":9,"blocks":[{"k":"text","v":"answer"},{"k":"reasoning","v":"because"},{"k":"tool_call","id":"call-1","name":"search","args":"q=1","item":"item-1"},{"k":"tool_result","id":"call-1","v":"done","is_error":true,"canceled":true,"trunc":true}]}
+    );
+    defer a.free(wire);
+    var decoded = try decodeEvent(a, wire);
+    defer decoded.deinit();
+    @memset(wire, 0);
+
+    try std.testing.expectEqual(@as(u64, 9), decoded.epoch);
+    try std.testing.expect(!decoded.display_truncated);
+    try std.testing.expect(decoded.canonical_complete);
+    const blocks = decoded.event.assistant_committed;
+    try std.testing.expectEqual(@as(usize, 4), blocks.len);
+    try std.testing.expectEqualStrings("answer", blocks[0].text);
+    try std.testing.expectEqualStrings("because", blocks[1].reasoning);
+    try std.testing.expectEqualStrings("call-1", blocks[2].tool_call.id);
+    try std.testing.expectEqualStrings("search", blocks[2].tool_call.name);
+    try std.testing.expectEqualStrings("q=1", blocks[2].tool_call.arguments);
+    try std.testing.expectEqualStrings("item-1", blocks[2].tool_call.item_id.?);
+    try std.testing.expectEqualStrings("call-1", blocks[3].tool_result.call_id);
+    try std.testing.expectEqualStrings("done", blocks[3].tool_result.text);
+    try std.testing.expect(blocks[3].tool_result.is_error);
+    try std.testing.expect(blocks[3].tool_result.canceled);
+    try std.testing.expect(blocks[3].tool_result.truncated);
+    const document_blocks = decoded.doc.value.object.get("blocks").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), document_blocks.len);
+    try std.testing.expect(blocks[0].text.ptr == document_blocks[0].object.get("v").?.string.ptr);
+    try std.testing.expect(blocks[2].tool_call.arguments.ptr == document_blocks[2].object.get("args").?.string.ptr);
 }
 
 test "assistant block errors release the document arena" {
@@ -2033,6 +2063,9 @@ test "snapshot previews stay comma-separated and parse as one whole frame" {
         .session = session,
         .project = "/tmp/project",
         .owner = .daemon,
+        .epoch = 5,
+        .attached = true,
+        .pending_permission = 77,
         .previews = &previews,
     });
     const bytes = try out.finish();
@@ -2040,6 +2073,9 @@ test "snapshot previews stay comma-separated and parse as one whole frame" {
     var doc = try parseWholeReply(a, bytes);
     defer doc.deinit();
     const snapshot = doc.value.object.get("snapshot").?.object;
+    try std.testing.expectEqual(@as(i64, 5), snapshot.get("epoch").?.integer);
+    try std.testing.expect(snapshot.get("attached").?.bool);
+    try std.testing.expectEqual(@as(i64, 77), snapshot.get("pending").?.integer);
     const list = snapshot.get("previews").?.array;
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
     try std.testing.expectEqual(@as(i64, 7), list.items[0].object.get("id").?.integer);

@@ -559,7 +559,10 @@ fn parseObject(a: std.mem.Allocator, bytes: []const u8) !Response {
     if (bytes.len == 0 or bytes.len > protocol.max_response) return error.ProtocolError;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.ProtocolError;
     if (!boundedDepth(bytes)) return error.ProtocolError;
-    const doc = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" }) catch return error.ProtocolError;
+    const doc = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ProtocolError,
+    };
     errdefer doc.deinit();
     const object = switch (doc.value) {
         .object => |value| value,
@@ -567,6 +570,18 @@ fn parseObject(a: std.mem.Allocator, bytes: []const u8) !Response {
     };
     if (object.count() > 64) return error.ProtocolError;
     return .{ .doc = doc, .object = object, .a = a };
+}
+
+test "response parsing propagates allocation failures" {
+    const Helper = struct {
+        fn parse(a: std.mem.Allocator) !void {
+            var response = try parseObject(a,
+                \\{"id":1,"ok":true,"data":{"nested":{"name":"value"},"items":[{"key":"value"},2]}}
+            );
+            defer response.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Helper.parse, .{});
 }
 
 test "response integers preserve u64 and reject coercion without trapping" {
@@ -639,12 +654,10 @@ const SnapshotCache = struct {
     phase: ?r.State = null,
     task: u64 = 0,
     kind: session_client.TaskKind = .prompt,
-    attached: bool = false,
     epoch: u64 = 0,
     /// The owner published an `epoch` field. Only an explicit value may revoke
     /// control; an absent field is "unknown", not "no controller".
     epoch_known: bool = false,
-    pending: ?u64 = null,
     revision: u64 = 0,
     paused: bool = false,
     steering: u32 = 0,
@@ -737,6 +750,8 @@ pub const Client = struct {
     cache_floor: u64 = 0,
     control: ?unix.Connection = null,
     session: ?ids.Id = null,
+    /// Canonical project reported by the verified owner of the current view.
+    view_project: ?[]u8 = null,
     epoch: u64 = 0,
     next_req: u64 = 0,
     /// Set only while a communication owner task has exclusive access.
@@ -812,14 +827,17 @@ pub const Client = struct {
     ) !*Client {
         const self = try a.create(Client);
         errdefer a.destroy(self);
+        const owned_root = try a.dupe(u8, root);
+        errdefer a.free(owned_root);
+        const owned_launcher = try a.dupe(u8, launcher);
         self.* = .{
             .a = a,
             .io = io,
             .uid = @intCast(std.c.getuid()),
             .environ = environ,
             .mode = mode,
-            .root = try a.dupe(u8, root),
-            .launcher = try a.dupe(u8, launcher),
+            .root = owned_root,
+            .launcher = owned_launcher,
         };
         self.arenas[0] = std.heap.ArenaAllocator.init(a);
         self.arenas[1] = std.heap.ArenaAllocator.init(a);
@@ -854,6 +872,7 @@ pub const Client = struct {
         self.published.deinit(self.a);
         self.a.free(self.root);
         self.a.free(self.launcher);
+        if (self.view_project) |project| self.a.free(project);
         const a = self.a;
         a.destroy(self);
     }
@@ -1029,6 +1048,8 @@ pub const Client = struct {
         self.clearPending();
         if (self.conn) |*conn| conn.close();
         self.conn = null;
+        if (self.view_project) |project| self.a.free(project);
+        self.view_project = null;
         self.epoch = 0;
         self.cursor = 0;
         self.need_history = false;
@@ -1400,12 +1421,10 @@ pub const Client = struct {
         cache.phase = if (get.text(object, "phase")) |name| std.meta.stringToEnum(r.State, name) else null;
         cache.task = get.uint(object, "task") orelse 0;
         cache.kind = if (get.text(object, "task_kind")) |name| std.meta.stringToEnum(session_client.TaskKind, name) orelse .prompt else .prompt;
-        cache.attached = get.flag(object, "attached");
         if (get.field(object, "epoch")) |value| if (valueU64(value)) |epoch| {
             cache.epoch = epoch;
             cache.epoch_known = true;
         };
-        cache.pending = get.uint(object, "pending");
         cache.revision = get.uint(object, "queue_revision") orelse 0;
         cache.paused = get.flag(object, "queue_paused");
         cache.steering = @intCast(@min(get.uint(object, "steering") orelse 0, std.math.maxInt(u32)));
@@ -1758,7 +1777,7 @@ pub const Client = struct {
         // Unconfirmed ranges belong to the SAME viewer and epoch: carry them to
         // the replacement connection instead of losing already-shown positions.
         const carried = old.takeRanges();
-        self.stream = try StreamReceiver.startResumed(self.a, self.io, old.endpoint, self.uid, self.epoch, if (need_baseline) null else self.cursor);
+        self.stream = try StreamReceiver.startBound(self.a, self.io, old.endpoint, self.uid, self.epoch, if (need_baseline) null else self.cursor, old.expected_pid);
         try self.stream.?.adoptRanges(carried);
         self.resume_snapshot_pending = !need_baseline;
     }
@@ -2181,14 +2200,30 @@ pub const Client = struct {
     /// One candidate worker view, opened but not yet shown. Nothing in the live
     /// projection changes until `adoptView`, so a refused/unknown attach keeps
     /// the session already on screen.
-    const Candidate = struct { conn: unix.Connection, session: ?ids.Id, epoch: u64, stream: ?*StreamReceiver = null };
+    const Candidate = struct {
+        conn: unix.Connection,
+        session: ids.Id,
+        owner: cli.WorkerOwner,
+        epoch: u64,
+        stream: ?*StreamReceiver = null,
+        project: ?[]u8 = null,
+
+        fn deinit(self: *Candidate, a: std.mem.Allocator) void {
+            if (self.stream) |stream| stream.deinit();
+            if (self.project) |project| a.free(project);
+            self.conn.close();
+        }
+    };
 
     /// Send one request over an explicitly supplied connection. A failure drops
     /// only that candidate; unlike the live path it never calls `loseView`.
     fn exchangeOn(self: *Client, conn: *unix.Connection, req: *Request, timeout_ms: u32) !Response {
         const bytes = try req.out.finish();
         defer self.a.free(bytes);
-        conn.writeFrame(bytes, self.waitFor(timeout_ms)) catch |err| return transport(err);
+        conn.writeFrame(bytes, self.waitFor(timeout_ms)) catch |err| return switch (err) {
+            error.Canceled, error.OutOfMemory => err,
+            else => transport(err),
+        };
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             const frame = conn.readFrame(self.waitFor(timeout_ms)) catch |err| switch (err) {
@@ -2196,11 +2231,15 @@ pub const Client = struct {
                     if (attempt < 3) continue;
                     return error.Transport;
                 },
+                error.Canceled, error.OutOfMemory => return err,
                 else => return transport(err),
             };
             const payload = frame orelse return error.Transport;
             defer self.a.free(payload);
-            var resp = parseObject(self.a, payload) catch return error.ProtocolError;
+            var resp = parseObject(self.a, payload) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.ProtocolError,
+            };
             errdefer resp.deinit();
             const verdict = try validateEnvelope(&resp, req.id);
             return switch (verdict) {
@@ -2210,18 +2249,18 @@ pub const Client = struct {
         }
     }
 
-    /// Dial, greet and take write control on a candidate connection. The raw
-    /// dial error is preserved so the caller can tell an absent listener from a
-    /// merely unreachable or foreign owner.
-    fn openController(self: *Client, endpoint: []const u8, id: ?ids.Id, takeover: bool) !Candidate {
-        var conn = try unix.connect(self.a, endpoint, self.uid, self.waitFor(join_timeout_ms));
-        errdefer conn.close();
-        var session: ?ids.Id = null;
+    /// Greet and take write control on an already dialed candidate. This path
+    /// does not start a watch, so it is also suitable for close-only requests.
+    fn openController(self: *Client, conn: unix.Connection, id: ?ids.Id, takeover: bool, expected: ?*const registry.Record) !Candidate {
+        var owned = conn;
+        errdefer owned.close();
+        var session: ids.Id = undefined;
+        var owner: cli.WorkerOwner = undefined;
         {
             var req = try self.request(.hello);
             defer req.deinit();
             try req.put("view", "controller");
-            var resp = self.exchangeOn(&conn, &req, join_timeout_ms) catch |err| return switch (err) {
+            var resp = self.exchangeOn(&owned, &req, join_timeout_ms) catch |err| return switch (err) {
                 // The dial succeeded but the peer did not complete this exact
                 // IPC greeting. A v1 worker rejects the v2 frame (and a v1 reply
                 // fails the v2 envelope), so this is fail-closed: no attach, no
@@ -2236,6 +2275,12 @@ pub const Client = struct {
             // This is checked BEFORE any controller claim or display adoption.
             if (resp.uint("protocol") != protocol.version) return error.ProtocolMismatch;
             if (!resp.flag("watch", false)) return error.ProtocolMismatch;
+            const pid = resp.uint("pid") orelse return error.ProtocolError;
+            owner = std.meta.stringToEnum(cli.WorkerOwner, resp.text("owner") orelse return error.ProtocolError) orelse return error.ProtocolError;
+            if (pid != owned.peer.pid) return error.PeerPidMismatch;
+            if (expected) |record| {
+                if (pid != record.pid or owner != record.owner) return error.OwnerMismatch;
+            }
             // The greeting carries the authoritative session identity for this
             // view, even when the caller already knows the endpoint.
             const raw = resp.text("session") orelse return error.ProtocolError;
@@ -2253,18 +2298,83 @@ pub const Client = struct {
             defer req.deinit();
             try req.put("write", true);
             try req.put("takeover", takeover);
-            var resp = try self.exchangeOn(&conn, &req, join_timeout_ms);
+            var resp = try self.exchangeOn(&owned, &req, join_timeout_ms);
             defer resp.deinit();
             epoch = resp.uint("epoch") orelse return error.ProtocolError;
             if (epoch == 0) return error.ProtocolError;
         }
-        const stream = try StreamReceiver.start(self.a, self.io, endpoint, self.uid, epoch);
-        return .{ .conn = conn, .session = session, .epoch = epoch, .stream = stream };
+        return .{ .conn = owned, .session = session, .owner = owner, .epoch = epoch };
+    }
+
+    /// Validate both initial pages using the same snapshot/history decoders as
+    /// the normal consumer, but against an isolated scratch view. The original
+    /// pages stay queued in the receiver, so history, deltas and ACK ordering
+    /// are unchanged when the candidate is committed.
+    fn completeCandidate(self: *Client, view: *Candidate, endpoint: []const u8, expected_project: []const u8) !void {
+        view.stream = try StreamReceiver.startBound(self.a, self.io, endpoint, self.uid, view.epoch, null, view.conn.peer.pid);
+        const frames = try view.stream.?.copyInitial(self.waitFor(join_timeout_ms));
+        defer for (frames) |bytes| self.a.free(bytes);
+        var snapshot = try parseObject(self.a, frames[0]);
+        defer snapshot.deinit();
+        var baseline = try parseObject(self.a, frames[1]);
+        defer baseline.deinit();
+        if (try validateEnvelope(&snapshot, 1) != .ok or try validateEnvelope(&baseline, 1) != .ok) return error.ProtocolError;
+        if (!std.mem.eql(u8, snapshot.text("stream") orelse return error.ProtocolError, "snapshot") or
+            !std.mem.eql(u8, baseline.text("stream") orelse return error.ProtocolError, "baseline")) return error.ProtocolError;
+        if (snapshot.uint("epoch") != view.epoch or baseline.uint("epoch") != view.epoch) return error.StaleControl;
+        const through = snapshot.uint("through") orelse return error.ProtocolError;
+        const base = baseline.uint("through") orelse return error.ProtocolError;
+        if (baseline.uint("base") != base or through < base) return error.ProtocolError;
+        _ = valueBool(baseline.field("truncated") orelse return error.ProtocolError) orelse return error.ProtocolError;
+        const state = switch (snapshot.field("snapshot") orelse return error.ProtocolError) {
+            .object => |value| value,
+            else => return error.ProtocolError,
+        };
+        const session = switch (state.get("session") orelse return error.ProtocolError) {
+            .string => |value| value,
+            else => return error.ProtocolError,
+        };
+        const project = switch (state.get("project") orelse return error.ProtocolError) {
+            .string => |value| value,
+            else => return error.ProtocolError,
+        };
+        const owner = switch (state.get("owner") orelse return error.ProtocolError) {
+            .string => |value| value,
+            else => return error.ProtocolError,
+        };
+        if (!std.mem.eql(u8, session, &view.session) or !std.mem.eql(u8, project, expected_project) or
+            !std.mem.eql(u8, owner, @tagName(view.owner))) return error.OwnerMismatch;
+        if (valueU64(state.get("epoch") orelse return error.ProtocolError) != view.epoch) return error.StaleControl;
+        _ = valueBool(state.get("busy") orelse return error.ProtocolError) orelse return error.ProtocolError;
+        if (!(valueBool(state.get("attached") orelse return error.ProtocolError) orelse return error.ProtocolError)) return error.StaleControl;
+        _ = valueBool(state.get("queue_paused") orelse return error.ProtocolError) orelse return error.ProtocolError;
+        for ([_][]const u8{ "task", "queue_revision", "steering", "follow_up" }) |name| {
+            _ = valueU64(state.get(name) orelse return error.ProtocolError) orelse return error.ProtocolError;
+        }
+        const kind = switch (state.get("task_kind") orelse return error.ProtocolError) {
+            .string => |value| value,
+            else => return error.ProtocolError,
+        };
+        _ = std.meta.stringToEnum(session_client.TaskKind, kind) orelse return error.ProtocolError;
+        switch (state.get("previews") orelse return error.ProtocolError) {
+            .array => {},
+            else => return error.ProtocolError,
+        }
+        const scratch = try Client.init(self.a, self.io, null, self.mode, self.launcher, self.root);
+        defer scratch.deinit();
+        scratch.epoch = view.epoch;
+        scratch.session = view.session;
+        try scratch.adoptSnapshot(&snapshot);
+        try scratch.adoptHistory(&baseline, true);
+        view.project = try self.a.dupe(u8, project);
+        try progressWait(@ptrCast(self));
+        if (self.wait_cancel) |cancel| if (cancel.isRequested()) return error.Canceled;
+        try view.stream.?.checkRunning();
     }
 
     /// Commit one candidate: only now is the previous view released. Its socket
     /// EOF is what revokes the old controller epoch on the owner side.
-    fn adoptView(self: *Client, view: *Candidate, fallback: ?ids.Id) void {
+    fn adoptView(self: *Client, view: *Candidate) void {
         self.closeStream();
         self.stream = view.stream;
         self.stream_expected = view.stream != null;
@@ -2273,7 +2383,10 @@ pub const Client = struct {
         self.clearPending();
         if (self.conn) |*previous| previous.close();
         self.conn = view.conn;
-        self.session = view.session orelse fallback;
+        self.session = view.session;
+        if (self.view_project) |project| self.a.free(project);
+        self.view_project = view.project;
+        view.project = null;
         self.epoch = view.epoch;
         self.cursor = 0;
         self.need_history = true;
@@ -2287,24 +2400,45 @@ pub const Client = struct {
     /// Attach the endpoint of one worker and take write control. Typed control
     /// outcomes survive; any dial/protocol failure of the new view is a
     /// transport failure (the old view was already untouched).
-    fn joinWorker(self: *Client, endpoint: []const u8, id: ?ids.Id, takeover: bool) !void {
-        var view = self.openController(endpoint, id, takeover) catch |err| return switch (err) {
-            error.Busy, error.StaleControl, error.SessionNotFound, error.ProtocolMismatch => err,
+    fn joinWorker(self: *Client, endpoint: []const u8, id: ?ids.Id, takeover: bool, project: []const u8) !void {
+        const conn = unix.connect(self.a, endpoint, self.uid, self.waitFor(join_timeout_ms)) catch |err| return switch (err) {
+            error.Canceled, error.OutOfMemory => err,
             else => transport(err),
         };
-        self.adoptView(&view, id);
+        var view = self.openController(conn, id, takeover, null) catch |err| return switch (err) {
+            error.Busy, error.StaleControl, error.SessionNotFound, error.ProtocolMismatch, error.Canceled, error.OutOfMemory => err,
+            else => transport(err),
+        };
+        errdefer view.deinit(self.a);
+        self.completeCandidate(&view, endpoint, project) catch |err| return switch (err) {
+            error.Canceled, error.OutOfMemory => err,
+            else => transport(err),
+        };
+        self.adoptView(&view);
     }
 
-    /// Attach a recorded endpoint, mapping the failure stage instead of
-    /// collapsing everything into `Transport`.
-    fn attachEndpoint(self: *Client, endpoint: []const u8, id: ids.Id, takeover: bool) AttachStage {
-        var view = self.openController(endpoint, id, takeover) catch |err| return switch (err) {
+    /// Only failure of the initial controller dial can prove an endpoint gone.
+    /// Once connected, no greeting, attach, watch or baseline failure can
+    /// authorize creation of a second owner.
+    fn attachEndpoint(self: *Client, record: *const registry.Record, id: ids.Id, takeover: bool) !AttachStage {
+        const conn = unix.connect(self.a, record.endpoint, self.uid, self.waitFor(join_timeout_ms)) catch |err| return switch (err) {
+            error.Canceled, error.OutOfMemory => err,
+            else => dialStage(err),
+        };
+        var view = self.openController(conn, id, takeover, record) catch |err| return switch (err) {
             error.Busy, error.StaleControl => .busy,
-            error.FileNotFound, error.ConnectionRefused, error.NotDir => .gone,
             error.ProtocolMismatch => .outdated,
+            error.Canceled, error.OutOfMemory => return err,
             else => .unknown,
         };
-        self.adoptView(&view, id);
+        self.completeCandidate(&view, record.endpoint, record.project) catch |err| {
+            view.deinit(self.a);
+            return switch (err) {
+                error.Canceled, error.OutOfMemory => err,
+                else => .unknown,
+            };
+        };
+        self.adoptView(&view);
         return .attached;
     }
 
@@ -2445,13 +2579,13 @@ pub const Client = struct {
             if (raw.len != 32) return error.ProtocolError;
             const id: ids.Id = raw[0..32].*;
             if (!ids.valid(id)) return error.ProtocolError;
-            try self.joinWorker(endpoint, id, true);
+            try self.joinWorker(endpoint, id, true, self.launcher);
             return;
         }
         // The foreground owner publishes its endpoint so `/ls`, SSH and
         // `--attach` can discover it; a failed publication closes it again.
         const record = try self.startOwnedWorker(self.launcher, null, null);
-        try self.joinWorker(record.endpoint, record.id, true);
+        try self.joinWorker(record.endpoint, record.id, true, record.project);
     }
 
     /// `hello`-verified readiness probe used before an attach decision. Liveness
@@ -2579,10 +2713,21 @@ pub const Client = struct {
         if (text.len != 32) return error.SessionNotFound;
         const id: ids.Id = text[0..32].*;
         if (!ids.valid(id)) return error.SessionNotFound;
-        if (self.conn != null) if (self.session) |current| {
-            if (std.mem.eql(u8, &current, &id)) return .{ .notice = try a.dupe(u8, "Already attached") };
+        if (self.conn != null) if (self.session) |current| if (self.view_project) |project| {
+            if (std.mem.eql(u8, &current, &id) and std.mem.eql(u8, project, self.launcher)) return .{ .notice = try a.dupe(u8, "Already attached") };
         };
-        return self.resumeSession(a, self.launcher, id);
+        // Reserve the one caller-owned result before registry or filesystem I/O.
+        const notice = try a.dupe(u8, session_client.restored_notice);
+        errdefer a.free(notice);
+        const reg = try self.ensureRegistry();
+        var record = try reg.resolve(self.a, id, self.launcher);
+        if (record) |*found| {
+            defer registry.freeRecord(self.a, found);
+            if (try self.attachRecorded(found, id, false)) return .{ .switched = true, .notice = notice };
+        }
+        if (!hasCheckpoint(self.a, self.io, self.launcher, id)) return error.SessionNotFound;
+        try self.resumeSession(self.launcher, id);
+        return .{ .switched = true, .notice = notice };
     }
 
     fn manageList(self: *Client, a: std.mem.Allocator, running_only: bool, page: usize) !session_client.Outcome {
@@ -2676,38 +2821,47 @@ pub const Client = struct {
             // No index entry: only this launcher project's own checkpoint may
             // locate the history. A missing one keeps the current view as is.
             if (!hasCheckpoint(self.a, self.io, self.launcher, id)) return error.SessionNotFound;
-            return self.resumeSession(self.a, self.launcher, id);
+            return self.resumeForAttach(self.launcher, id);
         }
         var found = record.?;
         defer registry.freeRecord(self.a, &found);
 
-        switch (self.attachEndpoint(found.endpoint, id, takeover)) {
-            .attached => return .{ .switched = true, .notice = try self.a.dupe(u8, "Attached") },
-            // An occupied console is an explicit refusal, never an implicit
-            // takeover and never a reason to kill the existing owner.
-            .busy => return error.Busy,
-            // Timeout, permission, identity or protocol: the owner is merely
-            // unreachable, so no second writer may start.
-            .unknown => return error.Unavailable,
-            // A live endpoint speaking another IPC version is a sanitized,
-            // explicit refusal: never a resume, migration or implicit restart.
-            .outdated => return error.ProtocolMismatch,
-            .gone => {},
-        }
+        const notice = try self.a.dupe(u8, "Attached");
+        const attached = self.attachRecorded(&found, id, takeover) catch |err| {
+            self.a.free(notice);
+            return err;
+        };
+        if (attached) return .{ .switched = true, .notice = notice };
+        self.a.free(notice);
         if (!hasCheckpoint(self.a, self.io, found.project, id)) return error.SessionNotFound;
         const project = try self.a.dupe(u8, found.project);
         defer self.a.free(project);
-        return self.resumeSession(self.a, project, id);
+        return self.resumeForAttach(project, id);
+    }
+
+    /// A false result means the endpoint is confirmed gone. The caller owns a
+    /// preallocated notice, and retains it across a possible checkpoint restore.
+    fn attachRecorded(self: *Client, found: *const registry.Record, id: ids.Id, takeover: bool) !bool {
+        return switch (try self.attachEndpoint(found, id, takeover)) {
+            .attached => true,
+            .busy => error.Busy,
+            .unknown => error.Unavailable,
+            .outdated => error.ProtocolMismatch,
+            .gone => false,
+        };
+    }
+
+    fn resumeForAttach(self: *Client, project: []const u8, id: ids.Id) !session_client.Outcome {
+        const notice = try self.a.dupe(u8, session_client.restored_notice);
+        errdefer self.a.free(notice);
+        try self.resumeSession(project, id);
+        return .{ .switched = true, .notice = notice };
     }
 
     /// Restore one history into a brand-new worker without submitting anything.
     /// The `.resume-lock` inside that project stays the final authority: a busy
     /// lease refuses the resume and leaves the current view untouched.
-    fn resumeSession(self: *Client, result_allocator: std.mem.Allocator, project: []const u8, id: ids.Id) !session_client.Outcome {
-        // Reserve the caller-owned result before starting or joining anything:
-        // an allocation failure must never follow a successful view switch.
-        const notice = try result_allocator.dupe(u8, "Restored session history");
-        errdefer result_allocator.free(notice);
+    fn resumeSession(self: *Client, project: []const u8, id: ids.Id) !void {
         if (self.worksFromDaemon()) {
             var req = try self.controlRequest(.create);
             defer req.deinit();
@@ -2721,19 +2875,18 @@ pub const Client = struct {
             if (raw.len != 32) return error.ProtocolError;
             const session: ids.Id = raw[0..32].*;
             if (!ids.valid(session) or !std.mem.eql(u8, &session, &id)) return error.ProtocolError;
-            try self.joinWorker(endpoint, id, false);
-            return .{ .switched = true, .notice = notice };
+            try self.joinWorker(endpoint, id, false, project);
+            return;
         }
         // Local mode keeps the same ownership rule as `--resume`: this launcher
         // owns the restored worker and publishes its locator.
         const record = try self.startOwnedWorker(project, id, null);
-        self.joinWorker(record.endpoint, record.id, false) catch |err| {
+        self.joinWorker(record.endpoint, record.id, false, record.project) catch |err| {
             if (self.workers) |*workers| {
                 workers.close(record.id, record.project) catch {};
             }
             return err;
         };
-        return .{ .switched = true, .notice = notice };
     }
 
     fn manageAttach(self: *Client, id_text: []const u8, takeover: bool) !session_client.Outcome {
@@ -2848,9 +3001,13 @@ pub const Client = struct {
     /// dedicated connection (no takeover, so an attached console refuses), then
     /// ask that owner to cancel/join/save and exit.
     fn closeViaEndpoint(self: *Client, record: *const registry.Record, id: ids.Id, force: bool) !void {
-        var view = self.openController(record.endpoint, id, false) catch |err| return switch (err) {
+        const conn = unix.connect(self.a, record.endpoint, self.uid, self.waitFor(join_timeout_ms)) catch |err| return switch (err) {
+            error.Canceled, error.OutOfMemory => err,
+            else => transport(err),
+        };
+        var view = self.openController(conn, id, false, record) catch |err| return switch (err) {
             error.Busy, error.StaleControl => error.Busy,
-            error.SessionNotFound => error.SessionNotFound,
+            error.SessionNotFound, error.Canceled, error.OutOfMemory => err,
             else => transport(err),
         };
         defer view.conn.close();
@@ -3441,8 +3598,11 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
         if (value.len == 0 or !std.fs.path.isAbsolute(value)) break :blk cwd;
         break :blk value;
     };
-    // `--connect` has no project cwd of its own: its launcher root is HOME.
-    const launcher = if (options.mode == .connect) home else cwd;
+    // Worker projects and registry keys use the canonical path, while HOME
+    // itself remains unchanged as the credentials/index root.
+    var connect_root: ?fs.Root = if (options.mode == .connect) try fs.Root.open(a, io, home) else null;
+    defer if (connect_root) |*root| root.deinit();
+    const launcher = if (connect_root) |root| root.path else cwd;
 
     const client = try Client.init(a, io, init.environ_map, options.mode, launcher, home);
     defer client.deinit();
@@ -3462,7 +3622,7 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
                 report(io, "thin: could not start the session worker", err);
                 return err;
             };
-            client.joinWorker(record.endpoint, record.id, true) catch |err| {
+            client.joinWorker(record.endpoint, record.id, true, record.project) catch |err| {
                 report(io, "thin: could not attach the session worker", err);
                 return err;
             };
@@ -4155,12 +4315,61 @@ test "coalesced live span is acknowledged as one exact first/last range" {
     try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
 }
 
+/// Emit the same two initial pages a real watch sends, including a history row.
+const InitialDamage = enum { none, snapshot, identity, project, snapshot_epoch, baseline_epoch, baseline };
+
+fn writePeerInitial(a: std.mem.Allocator, io: std.Io, stream: *unix.Connection, id: ids.Id, project: []const u8, owner: cli.WorkerOwner, epoch: u64, damage: InitialDamage) !void {
+    const wait: unix.Wait = .{ .io = io, .timeout_ms = 4_000 };
+    var snapshot = protocol.Out.init(a);
+    defer snapshot.deinit();
+    try snapshot.ok(1);
+    try snapshot.field("stream", "snapshot");
+    try snapshot.field("epoch", epoch);
+    try snapshot.field("through", @as(u64, 0));
+    if (damage == .snapshot) {
+        // Identity and epoch are present, but required memory is absent.
+        try snapshot.beginObject("snapshot");
+        try snapshot.field("session", id[0..]);
+        try snapshot.field("project", project);
+        try snapshot.field("owner", @tagName(owner));
+        try snapshot.field("epoch", epoch);
+        try snapshot.endObject();
+    } else {
+        const snapshot_id: ids.Id = if (damage == .identity) "ffffffffffffffffffffffffffffffff".* else id;
+        try protocol.encodeSnapshot(&snapshot, .{ .session = snapshot_id, .project = if (damage == .project) "/wrong-project" else project, .owner = switch (owner) {
+            .foreground => .foreground,
+            .daemon => .daemon,
+        }, .epoch = if (damage == .snapshot_epoch) epoch + 1 else epoch, .attached = true });
+    }
+    const snapshot_bytes = try snapshot.finish();
+    defer a.free(snapshot_bytes);
+    try stream.writeFrame(snapshot_bytes, wait);
+    var baseline = protocol.Out.init(a);
+    defer baseline.deinit();
+    try baseline.ok(1);
+    try baseline.field("stream", "baseline");
+    try baseline.field("epoch", if (damage == .baseline_epoch) epoch + 1 else epoch);
+    try baseline.field("through", @as(u64, 0));
+    try baseline.field("base", @as(u64, 0));
+    try baseline.beginArray("entries");
+    if (damage == .baseline) {
+        try baseline.element("{\"t\":\"not-an-event\"}");
+    } else {
+        try baseline.element("{\"t\":\"text\",\"v\":\"initial history\"}");
+    }
+    try baseline.endArray();
+    try baseline.field("truncated", false);
+    const baseline_bytes = try baseline.finish();
+    defer a.free(baseline_bytes);
+    try stream.writeFrame(baseline_bytes, wait);
+}
+
 /// Fake worker for the protocol-mismatch regression. The first connection
 /// answers like a v1 worker (a v1 envelope), the second closes without replying
 /// (a v1 worker's actual parse behaviour), the third is an exact v2 worker and
 /// proves the compatible path still adopts normally. `saw_v2` proves the client
 /// really sent v2 greetings, since `parseRequest` only accepts this version.
-fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, saw_v2: *std.atomic.Value(bool), id: ids.Id) void {
+fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, saw_v2: *std.atomic.Value(bool), id: ids.Id, project: []const u8) void {
     const wait: unix.Wait = .{ .io = io, .timeout_ms = 4_000 };
     for (0..3) |attempt| {
         var conn = listener.accept(wait) catch return;
@@ -4175,12 +4384,12 @@ fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listene
         const reply = if (attempt == 0)
             std.fmt.allocPrint(a, "{{\"v\":1,\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":1,\"protocol\":1,\"watch\":true}}", .{ request.id, id[0..] }) catch return
         else
-            std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":1,\"protocol\":{d},\"watch\":true}}", .{ protocol.version, request.id, id[0..], protocol.version }) catch return;
+            std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, request.id, id[0..], std.os.linux.getpid(), protocol.version }) catch return;
         defer a.free(reply);
         conn.writeFrame(reply, wait) catch return;
         if (attempt != 2) continue;
-        // Compatible worker: answer exactly one attach, then accept the stream
-        // subscription and close it. Adoption already happened by then.
+        // Compatible worker supplies a validated snapshot and baseline, then
+        // stays alive until the adopted client closes its watch.
         const attach_raw = (conn.readFrame(wait) catch return) orelse return;
         defer a.free(attach_raw);
         var attach = protocol.parseRequest(a, attach_raw) catch return;
@@ -4195,6 +4404,8 @@ fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listene
         defer a.free(watch_raw);
         var watch = protocol.parseRequest(a, watch_raw) catch return;
         defer watch.deinit();
+        writePeerInitial(a, io, &stream, id, project, .foreground, 7, .none) catch return;
+        if (stream.readFrame(wait) catch return) |extra| a.free(extra);
     }
 }
 
@@ -4211,15 +4422,25 @@ test "a v1 worker handshake is refused, while an exact v2 worker is adopted" {
     defer listener.deinit();
     const id = try ids.generate(io);
     var saw_v2 = std.atomic.Value(bool).init(false);
-    var peer = try std.Io.concurrent(io, protocolVersionPeer, .{ a, io, &listener, &saw_v2, id });
+    var peer = try std.Io.concurrent(io, protocolVersionPeer, .{ a, io, &listener, &saw_v2, id, path[0..n] });
     var peer_pending = true;
     defer if (peer_pending) peer.cancel(io);
     {
         const client = try Client.init(a, io, null, .foreground, path[0..n], path[0..n]);
         defer client.deinit();
 
+        const record: registry.Record = .{
+            .id = id,
+            .project = path[0..n],
+            .endpoint = listener.path,
+            .owner = .foreground,
+            .owner_instance = "0123456789abcdef",
+            .state = "running",
+            .pid = @intCast(std.os.linux.getpid()),
+            .generation = 1,
+        };
         // A v1 envelope for the v2 greeting: explicit, sanitized refusal.
-        try testing.expectEqual(AttachStage.outdated, client.attachEndpoint(listener.path, id, false));
+        try testing.expectError(error.ProtocolMismatch, client.attachRecorded(&record, id, false));
         try testing.expect(client.conn == null and client.session == null);
         try testing.expectEqual(@as(u64, 0), client.epoch);
         try testing.expect(client.stream == null);
@@ -4229,11 +4450,11 @@ test "a v1 worker handshake is refused, while an exact v2 worker is adopted" {
         );
         // A v1 worker that simply rejects and closes the v2 frame is the same
         // fail-closed class: no adoption and no automatic restart or kill.
-        try testing.expectEqual(AttachStage.outdated, client.attachEndpoint(listener.path, id, false));
+        try testing.expectEqual(AttachStage.outdated, try client.attachEndpoint(&record, id, false));
         try testing.expect(client.conn == null and client.session == null and client.epoch == 0);
         // The compatible path is unchanged: exact v2 greeting, session identity,
         // watch capability and attach epoch are accepted together.
-        try testing.expectEqual(AttachStage.attached, client.attachEndpoint(listener.path, id, false));
+        try testing.expect(try client.attachRecorded(&record, id, false));
         try testing.expect(client.conn != null and client.stream != null);
         try testing.expectEqual(@as(u64, 7), client.epoch);
         try testing.expectEqual(id, client.session.?);
@@ -4594,6 +4815,124 @@ test "snapshot and settings project into the UI state without pointers" {
     try std.testing.expectEqual(@as(u8, 1), state.configured_providers);
     // The projection copies: mutating the wire bytes later cannot reach the UI.
     try std.testing.expect(state.models.len == 0);
+}
+
+test "snapshot attachment and owner queues do not replace display items" {
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+
+    try client.pushEvent(.{ .string = "{\"t\":\"text\",\"epoch\":5,\"v\":\"queued display\"}" });
+    try pair.reply(1, "\"snapshot\":{\"epoch\":5,\"attached\":false,\"pending\":99,\"queue_revision\":9,\"queue_paused\":true,\"steering\":2,\"follow_up\":1,\"newest_id\":17,\"newest_bytes\":24,\"previews\":[{\"id\":17,\"kind\":\"steering\",\"text\":\"next\"},{\"id\":18,\"kind\":\"follow_up\",\"text\":\"later\"}],\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    {
+        var response = try client.readResponse(1, quick_timeout_ms);
+        defer response.deinit();
+        try client.adoptSnapshot(&response);
+    }
+    client.rebuild();
+    const first = Client.snapshotFn(@ptrCast(client));
+    // The wire attachment flag cannot override the live connection and epoch.
+    try testing.expect(first.attached);
+    try testing.expectEqual(@as(u64, 5), first.control_epoch);
+    try testing.expectEqual(@as(u64, 9), first.queue_revision);
+    try testing.expect(first.queue_paused);
+    try testing.expectEqual(@as(usize, 2), first.steering);
+    try testing.expectEqual(@as(usize, 1), first.follow_up);
+    try testing.expectEqual(@as(?u64, 17), first.newest_id);
+    try testing.expectEqual(@as(usize, 24), first.newest_bytes);
+    try testing.expectEqual(@as(usize, 2), first.previews.len);
+    try testing.expectEqual(@as(u64, 17), first.previews[0].id);
+    try testing.expectEqual(session_client.QueueKind.steering, first.previews[0].kind);
+    try testing.expectEqualStrings("next", first.previews[0].text);
+    try testing.expectEqual(@as(u64, 18), first.previews[1].id);
+    try testing.expectEqual(session_client.QueueKind.follow_up, first.previews[1].kind);
+    try testing.expectEqualStrings("later", first.previews[1].text);
+    try testing.expectEqual(@as(usize, 1), client.pending.items.len);
+    try testing.expect(Client.bufferedFn(@ptrCast(client)));
+
+    // The pending permission on the wire is not the owned display queue.
+    try pair.reply(2, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"pending\":null,\"queue_revision\":10,\"queue_paused\":false,\"steering\":0,\"follow_up\":1,\"previews\":[{\"id\":18,\"kind\":\"follow_up\",\"text\":\"later\"}],\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    {
+        var response = try client.readResponse(2, quick_timeout_ms);
+        defer response.deinit();
+        try client.adoptSnapshot(&response);
+    }
+    client.rebuild();
+    const second = Client.snapshotFn(@ptrCast(client));
+    try testing.expect(second.attached);
+    try testing.expectEqual(@as(u64, 10), second.queue_revision);
+    try testing.expect(!second.queue_paused);
+    try testing.expectEqual(@as(usize, 0), second.steering);
+    try testing.expectEqual(@as(usize, 1), second.follow_up);
+    try testing.expectEqual(@as(usize, 1), second.previews.len);
+    try testing.expectEqual(@as(u64, 18), second.previews[0].id);
+    try testing.expectEqual(session_client.QueueKind.follow_up, second.previews[0].kind);
+    try testing.expectEqualStrings("later", second.previews[0].text);
+    try testing.expectEqual(@as(usize, 1), client.pending.items.len);
+    var item = (try Client.pollFn(@ptrCast(client), a)) orelse return error.TestUnexpectedResult;
+    defer item.deinit();
+    try testing.expectEqual(@as(usize, 0), client.pending.items.len);
+    try testing.expectEqual(@as(u64, 5), item.epoch);
+    try testing.expectEqualStrings("queued display", item.event.text);
+
+    client.epoch = 0;
+    client.rebuild();
+    try testing.expect(!Client.snapshotFn(@ptrCast(client)).attached);
+    client.epoch = 5;
+    client.rebuild();
+    try testing.expect(Client.snapshotFn(@ptrCast(client)).attached);
+    client.loseView();
+    client.epoch = 5;
+    client.rebuild();
+    try testing.expect(!Client.snapshotFn(@ptrCast(client)).attached);
+    try testing.expectEqualStrings("queued display", item.event.text);
+}
+
+test "decoded display items outlive their wire documents" {
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    const client = pair.client;
+    const wire = try a.dupe(u8,
+        \\{"t":"assistant","epoch":5,"disp_trunc":true,"canon_complete":false,"blocks":[{"k":"text","v":"answer"},{"k":"reasoning","v":"because"},{"k":"tool_call","id":"call-1","name":"search","args":"q=1","item":"item-1"},{"k":"tool_result","id":"call-1","v":"done","is_error":true,"canceled":true,"trunc":true}]}
+    );
+    defer a.free(wire);
+
+    // Both the string and object paths release their decoded document before
+    // the queued item is consumed. The object path also releases its JSON doc.
+    try client.pushEventMode(.{ .string = wire }, true);
+    {
+        var doc = try std.json.parseFromSlice(std.json.Value, a, wire, .{ .allocate = .alloc_always });
+        defer doc.deinit();
+        try client.pushEventMode(doc.value, true);
+    }
+    @memset(wire, 0);
+    try testing.expectEqual(@as(usize, 2), client.pending.items.len);
+    var first = (try Client.pollFn(@ptrCast(client), a)) orelse return error.TestUnexpectedResult;
+    defer first.deinit();
+    var second = (try Client.pollFn(@ptrCast(client), a)) orelse return error.TestUnexpectedResult;
+    defer second.deinit();
+    try testing.expectEqual(@as(usize, 0), client.pending.items.len);
+    client.loseView();
+    for ([_]*const session_client.Item{ &first, &second }) |item| {
+        try testing.expectEqual(@as(u64, 5), item.epoch);
+        try testing.expect(item.display_truncated);
+        try testing.expect(!item.canonical_complete);
+        const blocks = item.event.assistant_committed;
+        try testing.expectEqual(@as(usize, 4), blocks.len);
+        try testing.expectEqualStrings("answer", blocks[0].text);
+        try testing.expectEqualStrings("because", blocks[1].reasoning);
+        try testing.expectEqualStrings("call-1", blocks[2].tool_call.id);
+        try testing.expectEqualStrings("search", blocks[2].tool_call.name);
+        try testing.expectEqualStrings("q=1", blocks[2].tool_call.arguments);
+        try testing.expectEqualStrings("item-1", blocks[2].tool_call.item_id.?);
+        try testing.expectEqualStrings("call-1", blocks[3].tool_result.call_id);
+        try testing.expectEqualStrings("done", blocks[3].tool_result.text);
+        try testing.expect(blocks[3].tool_result.is_error);
+        try testing.expect(blocks[3].tool_result.canceled);
+        try testing.expect(blocks[3].tool_result.truncated);
+    }
 }
 
 test "grouped subagent progress updates state without dirtying settings" {
@@ -5657,8 +5996,6 @@ test "codec flags merge conservatively and a wire epoch is verified" {
         .display_truncated = true,
         .canonical_complete = false,
         .doc = doc,
-        .storage = &.{},
-        .a = a,
     };
     defer decoded.deinit();
     mergeFlags(&item, &decoded);
@@ -5939,6 +6276,7 @@ test "resuming the attached session is a no-op with a caller-owned notice" {
     defer pair.deinit();
     const client = pair.client;
     client.session = session_id;
+    client.view_project = try a.dupe(u8, client.launcher);
     const revision = client.publication_revision;
     var caller = testing.FailingAllocator.init(a, .{});
     {
@@ -6137,6 +6475,108 @@ const AttachEnv = struct {
     }
 };
 
+fn busyResumePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id: ids.Id) !void {
+    const wait: unix.Wait = .{ .io = io, .timeout_ms = 4_000 };
+    var conn = try listener.accept(wait);
+    defer conn.close();
+    const hello_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
+    defer a.free(hello_raw);
+    var hello = try protocol.parseRequest(a, hello_raw);
+    defer hello.deinit();
+    try testing.expectEqual(protocol.Op.hello, hello.op);
+    const reply = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"daemon\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, std.os.linux.getpid(), protocol.version });
+    defer a.free(reply);
+    try conn.writeFrame(reply, wait);
+    const attach_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
+    defer a.free(attach_raw);
+    var attach = try protocol.parseRequest(a, attach_raw);
+    defer attach.deinit();
+    try testing.expectEqual(protocol.Op.attach, attach.op);
+    try testing.expect(try attach.requiredBool("write"));
+    try testing.expect(!try attach.requiredBool("takeover"));
+    const busy = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":false,\"err\":\"busy\"}}", .{ protocol.version, attach.id });
+    defer a.free(busy);
+    try conn.writeFrame(busy, wait);
+    if (try conn.readFrame(wait)) |extra| {
+        a.free(extra);
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "resume live owner allocation failure and occupied controller preserve the old view" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var fixture = try AttachEnv.init(a);
+    defer fixture.deinit(a);
+    const client = try Client.init(a, io, &fixture.env, .connect, fixture.project, fixture.home);
+    defer client.deinit();
+    const current: ids.Id = "fedcbafedcbafedcbafedcbafedcbafe".*;
+    const target: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
+    const peer: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
+    var old_fds: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &old_fds) != 0) return error.SocketPairFailed;
+    client.conn = unix.Connection.init(a, old_fds[0], peer);
+    var old_server = unix.Connection.init(a, old_fds[1], peer);
+    defer old_server.close();
+    client.session = current;
+    client.epoch = 5;
+    var control_fds: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &control_fds) != 0) return error.SocketPairFailed;
+    client.control = unix.Connection.init(a, control_fds[0], peer);
+    var control_server = unix.Connection.init(a, control_fds[1], peer);
+    defer control_server.close();
+
+    // Prepopulate only an owned registry; the client must not open it until
+    // after its caller-owned notice has been allocated successfully.
+    var reg = try Registry.init(a, io, &fixture.env);
+    defer reg.deinit();
+    var workers_dir = try unix.Directory.resolveUnder(a, reg.runtime.path, "workers", client.uid);
+    defer workers_dir.deinit();
+    var listener = try unix.Listener.bind(a, &workers_dir, "0123456789abcdef.sock", .{});
+    defer listener.deinit();
+    try reg.register(.{
+        .id = target,
+        .project = fixture.project,
+        .endpoint = listener.path,
+        .owner = .daemon,
+        .owner_instance = "0123456789abcdef",
+        .state = "running",
+        .pid = @intCast(std.os.linux.getpid()),
+        .generation = 1,
+    });
+    const old_fd = client.conn.?.fd;
+    const revision = client.publication_revision;
+    var failing = testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, client.manageResume(failing.allocator(), &target));
+    try testing.expect(failing.has_induced_failure and client.reg == null);
+    try testing.expectEqual(old_fd, client.conn.?.fd);
+    try testing.expectEqual(current, client.session.?);
+    try testing.expectEqual(@as(u64, 5), client.epoch);
+    try testing.expectEqual(revision, client.publication_revision);
+    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
+    try expectNoFrameOn(&old_server);
+    try expectNoFrameOn(&control_server);
+
+    var task = try std.Io.concurrent(io, busyResumePeer, .{ a, io, &listener, target });
+    var pending = true;
+    defer if (pending) {
+        task.cancel(io) catch {};
+    };
+    try testing.expectError(error.Busy, client.manageResume(a, &target));
+    const result = task.await(io);
+    pending = false;
+    try result;
+    try testing.expectEqual(old_fd, client.conn.?.fd);
+    try testing.expectEqual(current, client.session.?);
+    try testing.expectEqual(@as(u64, 5), client.epoch);
+    try testing.expectEqual(revision, client.publication_revision);
+    try testing.expect(client.workers == null);
+    try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
+    try expectNoFrameOn(&old_server);
+    try expectNoFrameOn(&control_server);
+}
+
 test "attach resumes a confirmed-dead endpoint only with a complete checkpoint" {
     const a = testing.allocator;
     var fixture = try AttachEnv.init(a);
@@ -6169,6 +6609,7 @@ test "attach resumes a confirmed-dead endpoint only with a complete checkpoint" 
     // Registered endpoint that no longer exists and no checkpoint: nothing may
     // start, and no owner is asked to create one.
     try std.testing.expectError(error.SessionNotFound, Client.attachSession(client, id, false));
+    try std.testing.expectError(error.SessionNotFound, Client.manageResume(client, a, &id));
     try expectNoFrameOn(&server);
 
     // A complete checkpoint makes the same history resumable. In --connect the
@@ -6228,6 +6669,409 @@ test "an unreachable-but-present endpoint is never treated as dead" {
     try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = checkpoint, .data = "complete checkpoint" });
 
     try std.testing.expectError(error.Unavailable, Client.attachSession(client, id, false));
+    try std.testing.expectError(error.Unavailable, Client.manageResume(client, a, &id));
     try expectNoFrameOn(&server);
     try std.testing.expect(client.conn == null);
+}
+
+test "resume never resolves another project's registry owner" {
+    const a = testing.allocator;
+    var fixture = try AttachEnv.init(a);
+    defer fixture.deinit(a);
+    const client = try Client.init(a, testing.io, &fixture.env, .connect, fixture.project, fixture.home);
+    defer client.deinit();
+    client.reg = try Registry.init(a, testing.io, &fixture.env);
+    const id: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
+    const endpoint = try std.fmt.allocPrint(a, "{s}/workers/0123456789abcdef.sock", .{client.reg.?.runtime.path});
+    defer a.free(endpoint);
+    const other = try std.fmt.allocPrint(a, "{s}/other", .{fixture.home});
+    defer a.free(other);
+    try client.reg.?.register(.{
+        .id = id,
+        .project = other,
+        .endpoint = endpoint,
+        .owner = .daemon,
+        .owner_instance = "0123456789abcdef",
+        .state = "running",
+        .pid = @intCast(std.os.linux.getpid()),
+        .generation = 1,
+    });
+    try testing.expectError(error.SessionNotFound, client.manageResume(a, &id));
+    try testing.expect(client.conn == null and client.session == null);
+}
+
+fn closeOnlyPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id: ids.Id) !void {
+    const wait: unix.Wait = .{ .io = io, .timeout_ms = 4_000 };
+    var conn = try listener.accept(wait);
+    defer conn.close();
+    const hello_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
+    defer a.free(hello_raw);
+    var hello = try protocol.parseRequest(a, hello_raw);
+    defer hello.deinit();
+    try testing.expectEqual(protocol.Op.hello, hello.op);
+    const greeting = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, std.os.linux.getpid(), protocol.version });
+    defer a.free(greeting);
+    try conn.writeFrame(greeting, wait);
+    const attach_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
+    defer a.free(attach_raw);
+    var attach = try protocol.parseRequest(a, attach_raw);
+    defer attach.deinit();
+    try testing.expectEqual(protocol.Op.attach, attach.op);
+    try testing.expect(!try attach.requiredBool("takeover"));
+    const attached = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"epoch\":7}}", .{ protocol.version, attach.id });
+    defer a.free(attached);
+    try conn.writeFrame(attached, wait);
+    const close_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
+    defer a.free(close_raw);
+    var close = try protocol.parseRequest(a, close_raw);
+    defer close.deinit();
+    try testing.expectEqual(protocol.Op.close, close.op);
+    try testing.expectEqual(@as(u64, 7), try close.u64Field("epoch"));
+    const reply = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"accepted\":true}}", .{ protocol.version, close.id });
+    defer a.free(reply);
+    try conn.writeFrame(reply, wait);
+}
+
+test "close via endpoint opens no watch" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var fixture = try AttachEnv.init(a);
+    defer fixture.deinit(a);
+    const client = try Client.init(a, io, &fixture.env, .foreground, fixture.project, fixture.home);
+    defer client.deinit();
+    var dir = try unix.Directory.resolveUnder(a, fixture.runtime, "close", client.uid);
+    defer dir.deinit();
+    var listener = try unix.Listener.bind(a, &dir, "worker.sock", .{});
+    defer listener.deinit();
+    const id: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
+    const record: registry.Record = .{ .id = id, .project = fixture.project, .endpoint = listener.path, .owner = .foreground, .owner_instance = "0123456789abcdef", .state = "running", .pid = @intCast(std.os.linux.getpid()), .generation = 1 };
+    var task = try std.Io.concurrent(io, closeOnlyPeer, .{ a, io, &listener, id });
+    var pending = true;
+    defer if (pending) task.cancel(io) catch {};
+    try client.closeViaEndpoint(&record, id, true);
+    const result = task.await(io);
+    pending = false;
+    try result;
+    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
+    try testing.expect(client.stream == null and client.conn == null);
+}
+
+const CandidatePeerCase = enum { good, record_pid, hello_pid, owner, watch_gone, watch_eof, watch_reject, watch_timeout, snapshot, snapshot_identity, snapshot_project, snapshot_epoch, baseline_epoch, baseline };
+
+/// Real AF_UNIX listener: a bad hello must receive zero attach frames; every
+/// later failure is after a real attach and cannot become a cold restore.
+fn candidatePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id: ids.Id, project: []const u8, owner: cli.WorkerOwner, behavior: CandidatePeerCase) !void {
+    const wait: unix.Wait = .{ .io = io, .timeout_ms = 9_000 };
+    var conn = try listener.accept(wait);
+    defer conn.close();
+    const hello_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
+    defer a.free(hello_raw);
+    var hello = try protocol.parseRequest(a, hello_raw);
+    defer hello.deinit();
+    try testing.expectEqual(protocol.Op.hello, hello.op);
+    const actual_pid: u32 = @intCast(std.os.linux.getpid());
+    const advertised_pid = if (behavior == .hello_pid) actual_pid + 1 else actual_pid;
+    const advertised_owner = if (behavior == .owner) (if (owner == .daemon) "foreground" else "daemon") else @tagName(owner);
+    const reply = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"{s}\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, advertised_owner, advertised_pid, protocol.version });
+    defer a.free(reply);
+    try conn.writeFrame(reply, wait);
+    if (behavior == .record_pid or behavior == .hello_pid or behavior == .owner) {
+        if (try conn.readFrame(wait)) |unexpected| {
+            a.free(unexpected);
+            return error.TestUnexpectedResult;
+        }
+        return;
+    }
+    const attach_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
+    defer a.free(attach_raw);
+    var attach = try protocol.parseRequest(a, attach_raw);
+    defer attach.deinit();
+    try testing.expectEqual(protocol.Op.attach, attach.op);
+    try testing.expect(try attach.requiredBool("write"));
+    try testing.expect(!try attach.requiredBool("takeover"));
+    if (behavior == .watch_gone) try testing.expectEqual(@as(c_int, 0), std.c.unlinkat(listener.dir_fd, listener.name_z, 0));
+    const attached = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"epoch\":7}}", .{ protocol.version, attach.id });
+    defer a.free(attached);
+    try conn.writeFrame(attached, wait);
+    if (behavior == .watch_gone) {
+        if (try conn.readFrame(wait)) |unexpected| {
+            a.free(unexpected);
+            return error.TestUnexpectedResult;
+        }
+        return;
+    }
+    var stream = try listener.accept(wait);
+    defer stream.close();
+    const watch_raw = (try stream.readFrame(wait)) orelse return error.TestUnexpectedResult;
+    defer a.free(watch_raw);
+    var watch = try protocol.parseRequest(a, watch_raw);
+    defer watch.deinit();
+    try testing.expectEqual(protocol.Op.watch, watch.op);
+    try testing.expectEqual(@as(u64, 7), try watch.u64Field("epoch"));
+    switch (behavior) {
+        .watch_eof => stream.close(),
+        .watch_reject => try stream.writeFrame("{\"v\":2,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
+        .watch_timeout => {},
+        else => try writePeerInitial(a, io, &stream, id, project, owner, 7, switch (behavior) {
+            .snapshot => .snapshot,
+            .snapshot_identity => .identity,
+            .snapshot_project => .project,
+            .snapshot_epoch => .snapshot_epoch,
+            .baseline_epoch => .baseline_epoch,
+            .baseline => .baseline,
+            else => .none,
+        }),
+    }
+    if (behavior == .good) {
+        if (try stream.readFrame(wait)) |unexpected| {
+            a.free(unexpected);
+            return error.TestUnexpectedResult;
+        }
+    } else if (try conn.readFrame(wait)) |unexpected| {
+        a.free(unexpected);
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn checkpointFor(fixture: *AttachEnv, id: ids.Id) !void {
+    var name: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&name, "project/.thin/sessions/{s}.session", .{id});
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = path, .data = "complete checkpoint" });
+}
+
+test "record identity and watch admission failures never replace the current view or create" {
+    const a = testing.allocator;
+    const io = testing.io;
+    for ([_]CandidatePeerCase{ .record_pid, .hello_pid, .owner, .watch_gone, .watch_eof, .watch_reject, .watch_timeout, .snapshot, .snapshot_identity, .snapshot_project, .snapshot_epoch, .baseline_epoch, .baseline }) |behavior| {
+        var fixture = try AttachEnv.init(a);
+        defer fixture.deinit(a);
+        const client = try Client.init(a, io, &fixture.env, .connect, fixture.project, fixture.home);
+        defer client.deinit();
+        const target: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
+        const old_id: ids.Id = "fedcbafedcbafedcbafedcbafedcbafe".*;
+        const creds: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
+        var old_fds: [2]std.c.fd_t = undefined;
+        var control_fds: [2]std.c.fd_t = undefined;
+        if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &old_fds) != 0 or std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &control_fds) != 0) return error.SocketPairFailed;
+        client.conn = unix.Connection.init(a, old_fds[0], creds);
+        var old_peer = unix.Connection.init(a, old_fds[1], creds);
+        defer old_peer.close();
+        client.control = unix.Connection.init(a, control_fds[0], creds);
+        var control_peer = unix.Connection.init(a, control_fds[1], creds);
+        defer control_peer.close();
+        client.session = old_id;
+        client.epoch = 5;
+        client.cursor = 23;
+        client.cache.valid = true;
+        client.cache.task = 42;
+        try client.pushEvent(.{ .string = "{\"t\":\"text\",\"v\":\"old history\"}" });
+        try checkpointFor(&fixture, target);
+        client.reg = try Registry.init(a, io, &fixture.env);
+        var workers_dir = try unix.Directory.resolveUnder(a, client.reg.?.runtime.path, "workers", client.uid);
+        defer workers_dir.deinit();
+        var listener = try unix.Listener.bind(a, &workers_dir, "0123456789abcdef.sock", .{});
+        defer listener.deinit();
+        const real_pid: u32 = @intCast(std.os.linux.getpid());
+        try client.reg.?.register(.{
+            .id = target,
+            .project = fixture.project,
+            .endpoint = listener.path,
+            .owner = .daemon,
+            .owner_instance = "0123456789abcdef",
+            .state = "running",
+            .pid = if (behavior == .record_pid) real_pid + 1 else real_pid,
+            .generation = 1,
+        });
+        const old_fd = client.conn.?.fd;
+        const revision = client.publication_revision;
+        var task = try std.Io.concurrent(io, candidatePeer, .{ a, io, &listener, target, fixture.project, cli.WorkerOwner.daemon, behavior });
+        var pending = true;
+        defer if (pending) task.cancel(io) catch {};
+        try testing.expectError(error.Unavailable, client.manageResume(a, &target));
+        const result = task.await(io);
+        pending = false;
+        try result;
+        try testing.expectEqual(old_fd, client.conn.?.fd);
+        try testing.expectEqual(old_id, client.session.?);
+        try testing.expectEqual(@as(u64, 5), client.epoch);
+        try testing.expectEqual(@as(u64, 23), client.cursor);
+        try testing.expect(client.cache.valid and client.cache.task == 42);
+        try testing.expectEqual(@as(usize, 1), client.pending.items.len);
+        try testing.expectEqual(revision, client.publication_revision);
+        try testing.expect(client.workers == null);
+        try expectNoFrameOn(&old_peer);
+        try expectNoFrameOn(&control_peer); // zero create
+        var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+        try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
+    }
+}
+
+fn registryOwnerPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id: ids.Id, stop: *p.Cancellation, contacted: *std.atomic.Value(bool)) !void {
+    const wait: unix.Wait = .{ .io = io, .timeout_ms = 9_000, .cancel = stop };
+    var conn = listener.accept(wait) catch |err| switch (err) {
+        error.Canceled => return,
+        else => return err,
+    };
+    defer conn.close();
+    contacted.store(true, .release);
+    const raw = (try conn.readFrame(wait)) orelse return;
+    defer a.free(raw);
+    var hello = try protocol.parseRequest(a, raw);
+    defer hello.deinit();
+    try testing.expectEqual(protocol.Op.hello, hello.op);
+    const reply = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"daemon\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, std.os.linux.getpid(), protocol.version });
+    defer a.free(reply);
+    try conn.writeFrame(reply, wait);
+}
+
+test "malformed registry with live owner and checkpoint does not authorize a restore" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var fixture = try AttachEnv.init(a);
+    defer fixture.deinit(a);
+    const client = try Client.init(a, io, &fixture.env, .connect, fixture.project, fixture.home);
+    defer client.deinit();
+    client.reg = try Registry.init(a, io, &fixture.env);
+    const target: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
+    try checkpointFor(&fixture, target);
+    var workers_dir = try unix.Directory.resolveUnder(a, client.reg.?.runtime.path, "workers", client.uid);
+    defer workers_dir.deinit();
+    var listener = try unix.Listener.bind(a, &workers_dir, "0123456789abcdef.sock", .{});
+    defer listener.deinit();
+    try client.reg.?.register(.{ .id = target, .project = fixture.project, .endpoint = listener.path, .owner = .daemon, .owner_instance = "0123456789abcdef", .state = "running", .pid = @intCast(std.os.linux.getpid()), .generation = 1 });
+    const key = registry.projectKey(fixture.project);
+    const record_path = try std.fmt.allocPrint(a, "{s}/.thin/session-index/{s}/{s}.json", .{ fixture.home, key, target });
+    defer a.free(record_path);
+    try fixture.tmp.dir.writeFile(io, .{ .sub_path = record_path, .data = "{broken" });
+    const creds: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
+    var old_fds: [2]std.c.fd_t = undefined;
+    var control_fds: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &old_fds) != 0 or std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &control_fds) != 0) return error.SocketPairFailed;
+    client.conn = unix.Connection.init(a, old_fds[0], creds);
+    var old_peer = unix.Connection.init(a, old_fds[1], creds);
+    defer old_peer.close();
+    client.control = unix.Connection.init(a, control_fds[0], creds);
+    var control_peer = unix.Connection.init(a, control_fds[1], creds);
+    defer control_peer.close();
+    const old_id: ids.Id = "fedcbafedcbafedcbafedcbafedcbafe".*;
+    client.session = old_id;
+    client.epoch = 5;
+    const old_fd = client.conn.?.fd;
+    var stop: p.Cancellation = .{};
+    var contacted = std.atomic.Value(bool).init(false);
+    var owner = try std.Io.concurrent(io, registryOwnerPeer, .{ a, io, &listener, target, &stop, &contacted });
+    var owner_pending = true;
+    defer if (owner_pending) {
+        stop.cancel();
+        owner.cancel(io) catch {};
+    };
+    const result = client.manageResume(a, &target);
+    stop.cancel();
+    const owner_result = owner.await(io);
+    owner_pending = false;
+    try owner_result;
+    try testing.expect(!contacted.load(.acquire));
+    if (result) |outcome| {
+        var unexpected = outcome;
+        unexpected.deinit(a);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectEqual(old_fd, client.conn.?.fd);
+    try testing.expectEqual(old_id, client.session.?);
+    try testing.expectEqual(@as(u64, 5), client.epoch);
+    try expectNoFrameOn(&old_peer);
+    try expectNoFrameOn(&control_peer);
+    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
+}
+
+fn createResumePeer(a: std.mem.Allocator, io: std.Io, conn: *unix.Connection, id: ids.Id, project: []const u8, endpoint: []const u8) !void {
+    const wait: unix.Wait = .{ .io = io, .timeout_ms = 9_000 };
+    const raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
+    defer a.free(raw);
+    var request = try protocol.parseRequest(a, raw);
+    defer request.deinit();
+    try testing.expectEqual(protocol.Op.create, request.op);
+    try testing.expectEqualStrings(project, try request.stringField("project", 4096));
+    try testing.expectEqualStrings(&id, try request.stringField("resume", 32));
+    var out = protocol.Out.init(a);
+    defer out.deinit();
+    try out.ok(request.id);
+    try out.field("endpoint", endpoint);
+    try out.field("session", id[0..]);
+    const bytes = try out.finish();
+    defer a.free(bytes);
+    try conn.writeFrame(bytes, wait);
+}
+
+test "resume selects launcher project when attached to another project's same id" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var fixture = try AttachEnv.init(a);
+    defer fixture.deinit(a);
+    try fixture.tmp.dir.createDir(io, "other", .fromMode(0o700));
+    const other = try std.fmt.allocPrint(a, "{s}/../other", .{fixture.project});
+    defer a.free(other);
+    // Registry projects are canonical, as real workers publish them.
+    const project_b = try std.Io.Dir.cwd().realPathFileAlloc(io, other, a);
+    defer a.free(project_b);
+    const client = try Client.init(a, io, &fixture.env, .connect, fixture.project, fixture.home);
+    var client_live = true;
+    defer if (client_live) client.deinit();
+    client.reg = try Registry.init(a, io, &fixture.env);
+    const id: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
+    try checkpointFor(&fixture, id);
+    var workers_dir = try unix.Directory.resolveUnder(a, client.reg.?.runtime.path, "workers", client.uid);
+    defer workers_dir.deinit();
+    var a_listener = try unix.Listener.bind(a, &workers_dir, "0123456789abcdef.sock", .{});
+    defer a_listener.deinit();
+    var b_listener = try unix.Listener.bind(a, &workers_dir, "fedcba9876543210.sock", .{});
+    defer b_listener.deinit();
+    try client.reg.?.register(.{ .id = id, .project = project_b, .endpoint = b_listener.path, .owner = .foreground, .owner_instance = "fedcba9876543210", .state = "running", .pid = @intCast(std.os.linux.getpid()), .generation = 1 });
+    var b_task = try std.Io.concurrent(io, candidatePeer, .{ a, io, &b_listener, id, project_b, cli.WorkerOwner.foreground, CandidatePeerCase.good });
+    var b_pending = true;
+    defer if (b_pending) b_task.cancel(io) catch {};
+    var attached = try client.attachSession(id, false);
+    defer attached.deinit(a);
+    try testing.expect(attached.switched);
+    try testing.expectEqualStrings(project_b, client.view_project.?);
+    try testing.expectEqual(id, client.session.?);
+    const creds: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    client.control = unix.Connection.init(a, fds[0], creds);
+    var daemon_peer = unix.Connection.init(a, fds[1], creds);
+    defer daemon_peer.close();
+    var a_task = try std.Io.concurrent(io, candidatePeer, .{ a, io, &a_listener, id, fixture.project, cli.WorkerOwner.daemon, CandidatePeerCase.good });
+    var a_pending = true;
+    defer if (a_pending) a_task.cancel(io) catch {};
+    var create_task = try std.Io.concurrent(io, createResumePeer, .{ a, io, &daemon_peer, id, fixture.project, a_listener.path });
+    var create_pending = true;
+    defer if (create_pending) create_task.cancel(io) catch {};
+    var resumed = try client.manageResume(a, &id);
+    defer resumed.deinit(a);
+    try testing.expect(resumed.switched);
+    try testing.expectEqualStrings(session_client.restored_notice, resumed.notice.?);
+    try testing.expectEqualStrings(fixture.project, client.view_project.?);
+    try testing.expectEqual(id, client.session.?);
+    const create_result = create_task.await(io);
+    create_pending = false;
+    try create_result;
+    const b_result = b_task.await(io);
+    b_pending = false;
+    try b_result;
+    // The candidate's copied validation frames were not consumed or ACKed.
+    try client.pumpStream();
+    try client.pumpStream();
+    try testing.expect(!client.need_history);
+    try testing.expectEqual(@as(usize, 1), client.pending.items.len);
+    try testing.expectEqualStrings("initial history", client.pending.items[0].event.text);
+    try testing.expect(client.pending.items[0].history_replay);
+    try expectNoFrameOn(&daemon_peer);
+    client.deinit();
+    client_live = false;
+    const a_result = a_task.await(io);
+    a_pending = false;
+    try a_result;
 }

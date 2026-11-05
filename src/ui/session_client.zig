@@ -29,6 +29,12 @@ pub const block_limit = 256;
 pub const max_previews = 3;
 pub const max_notice_bytes = 64 * 1024;
 
+/// One canonical success wording for a restored conversation. Backend
+/// resume outcomes and the owner's settings notices publish exactly this
+/// string, so the footer can deduplicate by byte equality instead of
+/// matching shapes, and a second success sentence never appears.
+pub const restored_notice = "Conversation restored; prior tools are NOT rerun";
+
 const Storage = []align(@alignOf(p.Block)) u8;
 
 pub const Failure = @import("../core/session_failure.zig").Failure;

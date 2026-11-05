@@ -41,6 +41,22 @@ const KEY = 'fixture-secret-never-log';
 // 模拟模型输出的 OSC 52 剪贴板注入序列；测试要求它不得出现在 CLI 输出中。
 const injection = '\x1b]52;c;ZXZpbA==\x07';
 
+// Timing is opt-in and emits only fixture-owned labels, never process arguments or errors.
+const timingEnabled = process.env.THIN_TEST_TIMING === '1';
+let processSequence = 0;
+async function timed(kind, label, operation) {
+  if (!timingEnabled) return operation();
+  const start = performance.now();
+  let status = 'error';
+  try {
+    const result = await operation();
+    status = 'ok';
+    return result;
+  } finally {
+    console.log(`APP_TIMING ${JSON.stringify({kind, label, elapsed_ms: performance.now() - start, status})}`);
+  }
+}
+
 // 异步判断路径是否存在（access 成功即 true）。
 const exists = p => access(p).then(() => true, () => false);
 
@@ -158,6 +174,12 @@ function send(res, protocol, text, calls = [], truncated = false, nativeReasonin
  * onChild 回调把子进程句柄及"仍归本函数管理"的判断交给调用方（取消测试需要）。
  */
 async function execute(bin, args, env, cwd, onChild, timeout = 30000, spawnChild = spawn) {
+  if (!timingEnabled) return runExecute(bin, args, env, cwd, onChild, timeout, spawnChild);
+  const label = `${++processSequence}-${bin === app ? 'thin' : bin === pty ? 'pty' : 'fixture'}`;
+  return timed('process', label, () => runExecute(bin, args, env, cwd, onChild, timeout, spawnChild));
+}
+
+async function runExecute(bin, args, env, cwd, onChild, timeout = 30000, spawnChild = spawn) {
   // detached 使子进程成为新进程组，便于整组发送信号。
   const child = spawnChild(bin, args, {cwd, env, detached:true, stdio:['ignore','pipe','pipe']});
 
@@ -211,6 +233,10 @@ async function execute(bin, args, env, cwd, onChild, timeout = 30000, spawnChild
  * cancel、term、output、unicode、auth-missing、auth-empty、auth-activate。场景结束时关闭服务器并删除临时目录。
  */
 async function scenario(name, protocol, kind, isPty = false) {
+  return timed('case', name, () => runScenario(name, protocol, kind, isPty));
+}
+
+async function runScenario(name, protocol, kind, isPty = false) {
   // 每个场景使用独立的临时根目录，包含 home 与 project 两个子目录。
   const root = await mkdtemp(join(tmpdir(), 'thin-app-'));
   const home = join(root,'home'), project = join(root,'project');
@@ -835,6 +861,15 @@ async function scenario(name, protocol, kind, isPty = false) {
   }
 }
 async function watchdogRegression() {
+  // The standalone watchdog-only invocation remains usable without a binary.
+  // In the real fixture entry, run the driver's deterministic self-check once.
+  if (!watchdogOnly || ptyArg) {
+    const result = await execute(pty, [], {PATH:'/usr/bin:/bin', THIN_PTY_SELF_CHECK:'1'}, process.cwd());
+    assert.equal(result.code, 0);
+    assert.equal(result.signal, null);
+    assert.equal(result.output, 'PTY_FRAME_SELF_CHECK=ok\n');
+    console.log('PASS pty-frame-self-check: split ACK, composer, grammar, expiry and color');
+  }
   // Deterministic exit-without-close: no real PID is borrowed or signalled.
   const child = new EventEmitter();
   child.stdout = new PassThrough(); child.stderr = new PassThrough();
@@ -863,17 +898,17 @@ try {
     await scenario('PTY model/effort selection chat','chat','model-select',true);
     await scenario('PTY model/effort selection responses','responses','model-select',true);
   } else if (process.argv.includes('--settings-values-only')) {
-    await settingsValuesRegressions({app,pty,execute,send});
+    await timed('suite', 'settings-values', () => settingsValuesRegressions({app,pty,execute,send}));
   } else if (process.argv.includes('--image-model-only')) {
-    await imageModelRegressions({app,pty,execute,send});
+    await timed('suite', 'image-model', () => imageModelRegressions({app,pty,execute,send}));
   } else if (process.argv.includes('--decision-model-only')) {
-    await decisionModelRegressions({app,pty,execute,send});
+    await timed('suite', 'decision-model', () => decisionModelRegressions({app,pty,execute,send}));
   } else if (process.argv.includes('--settings-only')) {
-    await settingsRegressions({app,pty,execute,send});
+    await timed('suite', 'settings', () => settingsRegressions({app,pty,execute,send}));
   } else if (process.argv.includes('--selection-restore-only')) {
-    await selectionRestoreRegressions({app,pty,execute});
+    await timed('suite', 'selection-restore', () => selectionRestoreRegressions({app,pty,execute}));
   } else if (process.argv.includes('--resume-only')) {
-    await fullResumeRegressions({app,pty,execute});
+    await timed('suite', 'full-resume', () => fullResumeRegressions({app,pty,execute}));
   } else if (process.argv.includes('--tool-presentation-only')) {
     for (const kind of ['tool-icons','file-stats','memory-summary']) await scenario(`PTY/${kind}`,'chat',kind,true);
   } else if (!watchdogOnly) {
@@ -899,14 +934,14 @@ try {
 
   // PTY 场景：通过 thin-app-pty 驱动交互式终端，仅使用 chat 协议。
   for (const kind of ['unicode','regular-two','keyboard-history','esc-cancel-tool','stream-markdown','stream-native-history','architecture-table','tool-icons','file-stats','memory-summary','auto-tools','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
-  await reviewRegressions(app);
-  await logRegressions(app,pty);
-  await settingsRegressions({app,pty,execute,send});
-  await decisionModelRegressions({app,pty,execute,send});
-  await imageModelRegressions({app,pty,execute,send});
-  await settingsValuesRegressions({app,pty,execute,send});
-  await selectionRestoreRegressions({app,pty,execute});
-  await fullResumeRegressions({app,pty,execute});
+  await timed('suite', 'review', () => reviewRegressions(app));
+  await timed('suite', 'log', () => logRegressions(app,pty));
+  await timed('suite', 'settings', () => settingsRegressions({app,pty,execute,send}));
+  await timed('suite', 'decision-model', () => decisionModelRegressions({app,pty,execute,send}));
+  await timed('suite', 'image-model', () => imageModelRegressions({app,pty,execute,send}));
+  await timed('suite', 'settings-values', () => settingsValuesRegressions({app,pty,execute,send}));
+  await timed('suite', 'selection-restore', () => selectionRestoreRegressions({app,pty,execute}));
+  await timed('suite', 'full-resume', () => fullResumeRegressions({app,pty,execute}));
   console.log('Application fixture suite passed; general PTY tests exercise chat, model selection also covers responses.');
   }
 

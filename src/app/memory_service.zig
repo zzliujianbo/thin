@@ -18,9 +18,8 @@ const memory_status = @import("../core/memory_status.zig");
 
 pub const State = enum(u8) { idle, finalizing, saved, skipped, failed, uncertain, canceled };
 
-/// One job's frozen outcome. The worker reads only this value, never the
-/// parent-visible legacy state/failure atoms that retrieve() and reportFailure()
-/// may update while a job is running.
+/// One job's frozen outcome. Terminal classification uses this value rather
+/// than the parent-visible failure that reportFailure() may update concurrently.
 const Outcome = struct {
     state: State = .idle,
     err: ?anyerror = null,
@@ -60,9 +59,7 @@ pub const Coordinator = struct {
     /// Test-only provider-independent seam. No fake behavior in production.
     service_override: ?k.Service = null,
     codex_source: ?codex_auth.CredentialSource = null,
-    state: std.atomic.Value(u8) = .init(@backingInt(State.idle)),
     failure: std.atomic.Value(u16) = .init(0),
-    completed: std.atomic.Value(u64) = .init(0),
     poisoned: std.atomic.Value(bool) = .init(false),
     secrets: [34]?[]u8 = @splat(null),
     secret_count: usize = 0,
@@ -265,7 +262,7 @@ pub const Coordinator = struct {
             self.lock();
             self.active_job = null;
             self.status.active = null;
-            self.publish(outcome.state, outcome.err);
+            self.publishFailure(outcome.err);
             self.terminal(job.id, result, if (outcome.err) |err| classifyFailure(err) else null);
             self.status.last_terminal.?.saved_count = outcome.saved_count;
             self.status.last_terminal.?.summary = outcome.summary;
@@ -287,7 +284,7 @@ pub const Coordinator = struct {
         self.status.active = null;
         self.active_job = null;
         self.stopped = true;
-        self.publish(.failed, err);
+        self.publishFailure(err);
         var cursor = pending;
         while (cursor) |job| : (cursor = job.next) self.terminal(job.id, .failed, classifyFailure(err));
         self.status.revision +%= 1;
@@ -491,22 +488,9 @@ pub const Coordinator = struct {
     pub fn isPoisoned(self: *const Coordinator) bool {
         return self.poisoned.load(.acquire);
     }
-    fn publish(self: *Coordinator, value: State, err: ?anyerror) void {
+    fn publishFailure(self: *Coordinator, err: ?anyerror) void {
         if (err) |failure_| if (failure_ == error.CleanupFailed) self.poisoned.store(true, .release);
         self.failure.store(if (err) |e| @intFromError(e) else 0, .release);
-        self.state.store(@backingInt(value), .release);
-    }
-    pub fn notice(self: *const Coordinator) ?[]const u8 {
-        if (!self.config.value.memory.auto) return null;
-        return switch (@as(State, @fromBackingInt(@intCast(self.state.load(.acquire))))) {
-            .idle => null,
-            .finalizing => "Memory: finalizing (separate auxiliary request)",
-            .saved => "Memory: saved",
-            .skipped => null,
-            .failed => "Memory: finalization failed",
-            .uncertain => "Memory: request outcome uncertain; no automatic replay",
-            .canceled => "Memory: finalization canceled",
-        };
     }
 
     pub fn retrieve(self: *Coordinator, a: std.mem.Allocator, query: []const u8, max_bytes: usize) ![]const u8 {
@@ -529,9 +513,9 @@ pub const Coordinator = struct {
         return reference;
     }
 
-    /// Execute one job into its private outcome. Never reads or writes the
-    /// parent-visible state/failure atoms, so a concurrent retrieve() or
-    /// reportFailure() cannot change this job's terminal classification.
+    /// Execute one job into its private outcome. The parent-visible failure is
+    /// not read or written here, so reportFailure() cannot directly rewrite the
+    /// job's outcome. Cleanup poison remains shared.
     fn execute(self: *Coordinator, out: *Outcome, capture: *const k.Capture, protocol: p.Protocol, cancel: *const p.Cancellation) void {
         out.* = .{};
         if (!self.config.value.memory.auto) return;
@@ -586,23 +570,21 @@ pub const Coordinator = struct {
             if (err == error.Canceled) out.set(.canceled, err) else if (err == error.MemoryUnavailable) out.set(.uncertain, err) else out.set(.failed, err);
             return;
         };
-        _ = self.completed.fetchAdd(1, .acq_rel);
     }
 
-    /// Test helper: run one capture on the caller's thread and publish its
-    /// outcome to the legacy parent-visible atoms. Production App only enqueues.
-    fn finalize(self: *Coordinator, capture: *const k.Capture, protocol: p.Protocol, cancel: *const p.Cancellation) void {
+    /// Test helper: run one capture on the caller's thread, publish its failure,
+    /// and return its outcome. Production App only enqueues.
+    fn finalize(self: *Coordinator, capture: *const k.Capture, protocol: p.Protocol, cancel: *const p.Cancellation) Outcome {
         var outcome: Outcome = .{};
         self.execute(&outcome, capture, protocol, cancel);
-        self.publish(outcome.state, outcome.err);
+        self.publishFailure(outcome.err);
+        return outcome;
     }
 
     pub fn reportFailure(self: *Coordinator, err: anyerror) void {
-        // Legacy parent-visible atoms remain for notice()/headless completion,
-        // but the worker never reads them: an active job keeps its own outcome.
-        if (err == error.CleanupFailed) self.poisoned.store(true, .release);
-        self.failure.store(@intFromError(err), .release);
-        self.state.store(@backingInt(State.failed), .release);
+        // Publish the headless failure before locking. Job terminals use each
+        // job's own outcome, while cleanup poison remains shared.
+        self.publishFailure(err);
         self.lock();
         defer self.unlock();
         // A parent failure must never publish over the terminal owned by a job
@@ -745,8 +727,11 @@ test "coordinator diagnostics pair extraction and writes" {
     defer arena.deinit();
     var capture: k.Capture = .{ .allocator = arena.allocator() };
     capture.add(.user, text);
-    owner.finalize(&capture, .chat, &cancel);
-    try std.testing.expectEqualStrings("Memory: saved", owner.notice().?);
+    const saved = owner.finalize(&capture, .chat, &cancel);
+    try std.testing.expectEqual(State.saved, saved.state);
+    try std.testing.expect(saved.err == null);
+    try std.testing.expectEqual(@as(u32, 2), saved.saved_count);
+    try std.testing.expectEqual(@as(u16, 0), owner.failure.load(.acquire));
     try std.testing.expectEqual(@as(usize, 6), events.len);
     try std.testing.expectEqual(diag.Stage.memory_extract, events.records[0].stage);
     try std.testing.expectEqual(@as(?u32, 0), events.records[2].candidate_index);
@@ -756,15 +741,32 @@ test "coordinator diagnostics pair extraction and writes" {
     fake.fail = true;
     const again = try owner.retrieve(a, text, 8192);
     a.free(again);
-    owner.finalize(&capture, .chat, &cancel);
+    const uncertain = owner.finalize(&capture, .chat, &cancel);
+    try std.testing.expectEqual(State.uncertain, uncertain.state);
+    try std.testing.expect(uncertain.err.? == error.MemoryUnavailable);
+    try std.testing.expectEqual(@as(u16, @intFromError(error.MemoryUnavailable)), owner.failure.load(.acquire));
     try std.testing.expectEqualStrings("MemoryUnavailable", events.records[1].error_name.?.name());
     events.len = 0;
     fake.fail = false;
     fake.cancel = true;
     const last = try owner.retrieve(a, text, 8192);
     a.free(last);
-    owner.finalize(&capture, .chat, &cancel);
+    const canceled = owner.finalize(&capture, .chat, &cancel);
+    try std.testing.expectEqual(State.canceled, canceled.state);
+    try std.testing.expect(canceled.err.? == error.Canceled);
+    try std.testing.expectEqual(@as(u16, @intFromError(error.Canceled)), owner.failure.load(.acquire));
     try std.testing.expectEqual(diag.Result.canceled, events.records[1].result.?);
+
+    owner.reportFailure(error.CleanupFailed);
+    try std.testing.expect(owner.isPoisoned());
+    try std.testing.expectEqual(@as(u16, @intFromError(error.CleanupFailed)), owner.failure.load(.acquire));
+    try std.testing.expectEqual(memory_status.Failure.cleanup, owner.view().last_terminal.?.failure.?);
+    var retry_cancel: p.Cancellation = .{};
+    const blocked = owner.finalize(&capture, .chat, &retry_cancel);
+    try std.testing.expectEqual(State.failed, blocked.state);
+    try std.testing.expect(blocked.err.? == error.CleanupFailed);
+    try std.testing.expect(owner.isPoisoned());
+    try std.testing.expectError(error.CleanupFailed, owner.retrieve(a, text, 8192));
 }
 
 test "Codex memory secret registration and incomplete source fail closed" {

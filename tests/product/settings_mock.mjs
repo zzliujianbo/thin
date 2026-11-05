@@ -38,6 +38,16 @@ export async function settingsRegressions({app,pty,execute,send}) {
         requests++;
         assert(next, 'unexpected request');
         assert.equal(wire.model,'fixture-model');
+        // Check the actual submitted user turn, not just its effort settings.
+        const turn = (protocol === 'chat' ? wire.messages : wire.input).at(-1);
+        assert.equal(turn.role, 'user');
+        if (protocol === 'chat') {
+          assert.equal(typeof turn.content, 'string');
+          assert.deepEqual(Buffer.from(turn.content, 'utf8'), Buffer.from('settings-task', 'utf8'));
+        } else {
+          assert.deepEqual(turn.content, [{type:'input_text',text:'settings-task'}]);
+          assert.deepEqual(Buffer.from(turn.content[0].text, 'utf8'), Buffer.from('settings-task', 'utf8'));
+        }
         if (next.savedEffort !== undefined) {
           const disk = JSON.parse(await readFile(next.configPath,'utf8'));
           assert.equal(disk.llm.reasoning_effort,next.savedEffort);

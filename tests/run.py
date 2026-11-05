@@ -15,7 +15,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-GROUPS = {"focus": "test-focus", "render": "test-render", "interaction": "test-interaction", "communication": "test-communication", "streaming": "test-streaming", "full": "test"}
+GROUPS = {"focus": "test-focus", "render": "test-render", "interaction": "test-interaction", "communication": "test-communication", "streaming": "test-streaming", "app": "test-app", "full": "test"}
 STACK_BYTES = 32 * 1024 * 1024
 CAP_DROP = "--drop=cap_dac_override,cap_dac_read_search"
 

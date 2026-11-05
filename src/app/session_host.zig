@@ -513,11 +513,18 @@ pub const SessionHost = struct {
         }
     }
 
-    /// Reload the Session callbacks (and reinstall the checkpoint observer)
-    /// after an owner-thread settings/login mutation.
+    /// Reload callbacks and display context at an owner-thread idle safe point.
     fn refreshConnection(self: *SessionHost) void {
+        // A task may exist before busy is set or after it is cleared; only the
+        // joined/cleared task guarantees that Runtime fields are safe to read.
+        if (self.task != null) return;
+        if (self.session.app) |app| if (app.runtime.busy.load(.acquire)) return;
         self.connection = self.session.connection();
         self.attachInbox();
+        self.context = if (self.session.app) |app|
+            app.runtime.contextSnapshot()
+        else
+            self.connection.current().initial_context;
     }
 
     fn now(self: *SessionHost) u64 {
@@ -2289,6 +2296,158 @@ fn dispatchJson(host: *SessionHost, a: std.mem.Allocator, json: []const u8, conn
     var request = try protocol.parseRequest(a, json);
     defer request.deinit();
     return host.dispatch(a, &request, connection, true);
+}
+
+test "idle refresh publishes restored context after login without requests" {
+    const Spy = struct {
+        calls: usize = 0,
+        fn call(raw: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UnexpectedModelCall;
+        }
+        fn expectSnapshot(host: *SessionHost, expected: r.ContextSnapshot) !void {
+            const a = std.testing.allocator;
+            const frame = try dispatchJson(host, a, "{\"v\":2,\"id\":9,\"op\":\"snapshot\"}", 7);
+            defer a.free(frame);
+            var doc = try parseJson(a, frame);
+            defer doc.deinit();
+            try std.testing.expect(doc.value.object.get("ok").?.bool);
+            const snapshot = doc.value.object.get("snapshot").?.object;
+            try std.testing.expect(!snapshot.get("busy").?.bool);
+            const context = snapshot.get("ctx").?.object;
+            try std.testing.expectEqual(@as(i64, @intCast(expected.tokens)), context.get("tokens").?.integer);
+            try std.testing.expectEqual(@as(i64, @intCast(expected.limit)), context.get("limit").?.integer);
+            try std.testing.expectEqual(expected.known, context.get("known").?.bool);
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]?u64{ 77, 0, null }) |reported| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path: [4096]u8 = undefined;
+        const home = path[0..try tmp.dir.realPath(io, &path)];
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        try env.put("CONTEXT_FIXTURE_KEY", "fake-source-key");
+        try tmp.dir.createDir(io, ".thin", .default_dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data =
+            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key_env":"CONTEXT_FIXTURE_KEY","models":{"saved":{"protocol":"chat","context_tokens":131072}}}}},"limits":{"low_price_input":false}}
+        });
+        const id = try ids.generate(io);
+        {
+            var source = try Session.initWithOptions(a, io, &env, home, .{}, .{ .session_id = id });
+            defer source.deinit();
+            const app = source.app.?;
+            try app.runtime.restoreCheckpoint(.{
+                .system = "archived system",
+                .selector = app.runtime.selector,
+                .estimator = .{},
+                .last_context_tokens = reported,
+                .permission_id = 19,
+                .messages = &.{
+                    .{ .role = .user, .blocks = &.{.{ .text = "saved question" }} },
+                    .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "old-tool", .name = "write_file", .arguments = "{\"path\":\"must-not-run.txt\",\"content\":\"no\"}" } }} },
+                    .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "old-tool", .text = "old result" } }} },
+                    .{ .role = .assistant, .blocks = &.{.{ .text = "saved answer" }} },
+                },
+            });
+            try std.testing.expect(try source.saveOnExit());
+        }
+        try env.put("CONTEXT_FIXTURE_KEY", "");
+        const host = try SessionHost.init(a, io, &env, .{ .project = home, .id = id, .@"resume" = id, .owner = .foreground });
+        defer host.deinit();
+        try std.testing.expect(host.session.app == null and host.session.loaded_checkpoint != null);
+        try std.testing.expectError(error.Unavailable, host.startTask(.prompt, "not sent"));
+        const attached = try dispatchJson(host, a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+        defer a.free(attached);
+        try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
+        const expected = r.ContextSnapshot{ .tokens = reported orelse 0, .limit = 131072, .known = reported != null };
+        try Spy.expectSnapshot(host, expected);
+        const history_count = host.history.items.items.len;
+        try std.testing.expect(history_count != 0);
+        // Refresh without an App must republish the pending display projection.
+        host.context = null;
+        host.refreshConnection();
+        try Spy.expectSnapshot(host, expected);
+        // Simulate an older cached host value to prove login really refreshes it.
+        host.context = .{ .tokens = 999, .limit = 1 };
+        const login = try dispatchJson(host, a, "{\"v\":2,\"id\":2,\"op\":\"login\",\"epoch\":1,\"key\":\"fake-login-key\"}", 7);
+        defer a.free(login);
+        try std.testing.expect(std.mem.indexOf(u8, login, "\"ok\":true") != null);
+        const app = host.session.app.?;
+        try std.testing.expect(host.session.loaded_checkpoint == null);
+        try Spy.expectSnapshot(host, expected);
+        try std.testing.expectEqual(history_count, host.history.items.items.len);
+        try std.testing.expectEqual(@as(usize, 4), app.runtime.messages().len);
+        try std.testing.expectEqualStrings("saved answer", app.runtime.messages()[3].blocks[0].text);
+        try std.testing.expectEqual(@as(u64, 0), app.runtime.permission_id);
+        try std.testing.expect(!app.journal.started and app.client.last_request_finish == null);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "must-not-run.txt", .{}));
+        try std.testing.expectEqual(@as(u64, 0), host.task_seq);
+        try std.testing.expect(host.task == null and host.session.metadata_job == null);
+
+        var spy: Spy = .{};
+        const original_model = app.runtime.model;
+        defer app.runtime.model = original_model;
+        app.runtime.model = .{ .context = &spy, .call_fn = Spy.call };
+        // Model usage and the corresponding bridge event advance independently
+        // of Session.initial_context, which remains the login-time value.
+        app.runtime.last_context_tokens = 246;
+        host.observe(.{ .context_snapshot = app.runtime.contextSnapshot() }, false, true);
+        try std.testing.expectEqualDeep(expected, host.session.initial_context.?);
+        const latest = r.ContextSnapshot{ .tokens = 246, .limit = 131072 };
+        try Spy.expectSnapshot(host, latest);
+        // Disabling an already-disabled image model is an unrelated settings
+        // no-op: it does not update Session.initial_context itself.
+        const setting = try dispatchJson(host, a, "{\"v\":2,\"id\":3,\"op\":\"image_model\",\"epoch\":1,\"off\":true}", 7);
+        defer a.free(setting);
+        try std.testing.expect(std.mem.indexOf(u8, setting, "\"ok\":true") != null);
+        try std.testing.expectEqualDeep(expected, host.session.initial_context.?);
+        try Spy.expectSnapshot(host, latest);
+        try std.testing.expectEqual(@as(usize, 0), spy.calls);
+        try std.testing.expectEqual(@as(u64, 0), host.task_seq);
+        try std.testing.expect(!app.journal.started and app.client.last_request_finish == null);
+    }
+}
+
+test "connection refresh refuses an unjoined or busy runtime" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const home = path[0..try tmp.dir.realPath(io, &path)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    const host = try SessionHost.init(a, io, &env, .{ .project = home, .id = try ids.generate(io), .owner = .foreground });
+    defer host.deinit();
+    try host.connection.configureProvider(.deepseek, "fake-idle-guard-key");
+    const app = host.session.app.?;
+    app.runtime.last_context_tokens = 246;
+    const sentinel = r.ContextSnapshot{ .tokens = 7, .limit = 1 };
+    host.context = sentinel;
+    {
+        // No worker is launched: this only represents the unjoined interval,
+        // including the period before Runtime.busy is set.
+        host.task = .{ .job = undefined, .future = undefined, .id = 1, .kind = .prompt, .prompt = undefined };
+        defer host.task = null;
+        try std.testing.expectError(error.Busy, host.ensureIdle());
+        host.refreshConnection();
+        try std.testing.expectEqualDeep(sentinel, host.context.?);
+    }
+    {
+        app.runtime.busy.store(true, .release);
+        defer app.runtime.busy.store(false, .release);
+        try std.testing.expectError(error.Busy, host.ensureIdle());
+        host.refreshConnection();
+        try std.testing.expectEqualDeep(sentinel, host.context.?);
+    }
+    host.refreshConnection();
+    try std.testing.expectEqualDeep(app.runtime.contextSnapshot(), host.context.?);
 }
 
 // A boundary spy deliberately models the owner-idle argument, not client wait.

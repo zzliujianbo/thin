@@ -62,7 +62,6 @@ const Worker = struct {
     cancel: p.Cancellation = .{},
     /// 0 pending, 1 launched, 2 failed (process.LaunchNotice).
     launch: std.atomic.Value(u8) = .init(0),
-    launched_pid: std.atomic.Value(i32) = .init(0),
     done: std.atomic.Value(bool) = .init(false),
     /// Set only by `awaitReady` when a not-yet-ready worker ended with a
     /// closed private startup exit code. It never relaxes anything for a
@@ -735,7 +734,6 @@ fn describeTerm(buf: []u8, term: ?std.process.Child.Term) []const u8 {
 
 fn launchNotify(context: *anyopaque, notice: platform_process.LaunchNotice) void {
     const worker: *Worker = @ptrCast(@alignCast(context));
-    worker.launched_pid.store(@intCast(notice.pid), .release);
     worker.launch.store(if (notice.launched and notice.group_owned) 1 else 2, .release);
 }
 
@@ -833,6 +831,22 @@ fn wipe(bytes: []u8) void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "worker launch notice requires both exec and owned group" {
+    var worker: Worker = undefined;
+    worker.launch = .init(0);
+    const cases = [_]struct { notice: platform_process.LaunchNotice, expected: u8 }{
+        .{ .notice = .{ .pid = 11, .launched = true, .group_owned = true }, .expected = 1 },
+        .{ .notice = .{ .pid = 12, .launched = true, .group_owned = false }, .expected = 2 },
+        .{ .notice = .{ .pid = 13, .launched = false, .group_owned = true }, .expected = 2 },
+        .{ .notice = .{ .pid = 14, .launched = false, .group_owned = false }, .expected = 2 },
+    };
+    for (cases) |case| {
+        worker.launch.store(0, .monotonic);
+        launchNotify(&worker, case.notice);
+        try testing.expectEqual(case.expected, worker.launch.load(.acquire));
+    }
+}
 
 test "worker argv quotes paths, selection ids and optional flags" {
     const a = testing.allocator;

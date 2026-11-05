@@ -24,6 +24,36 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow.command_for(workflow.parse_args(["full"]))[:4], ["zig", "build", "test", "-j1"])
         self.assertEqual(workflow.command_for(workflow.parse_args(["streaming"]))[:4], ["zig", "build", "test-streaming", "-j1"])
 
+    def test_app_forwards_existing_build_and_preserves_runner_semantics(self):
+        argv = ["app", "--optimize", "ReleaseSmall", "--ssh-include", "/sdk/include", "--ssh-library", "/sdk/libssh.so"]
+        command = ["zig", "build", "test-app", "-j1", "-Doptimize=ReleaseSmall", "--summary", "all", "-Dssh-include=/sdk/include", "-Dssh-library=/sdk/libssh.so"]
+        self.assertEqual(workflow.command_for(workflow.parse_args(argv)), command)
+        wrapped = ["/stub/capsh", workflow.CAP_DROP, "--", "-c", 'exec "$@"', "thin-test", *command]
+        for code, output, mutate, status in [(0, "", False, "passed"), (1, "FAIL application acceptance: example", False, "fixture_failure"), (0, "", True, "source_changed")]:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                self.fixture(root)
+                calls = []
+                def stub(actual, **kwargs):
+                    calls.append(actual)
+                    self.assertEqual(kwargs["cwd"], root)
+                    self.assertIs(kwargs["preexec_fn"], workflow.set_child_stack)
+                    if mutate:
+                        (root / "src" / "a.zig").write_text("changed")
+                    return types.SimpleNamespace(returncode=code, stdout=output)
+                normalizer = workflow.normalized_command
+                def normalize(actual):
+                    return normalizer(actual, euid=0, which=lambda _: "/stub/capsh", limits=(0, workflow.STACK_BYTES))
+                with mock.patch.object(workflow, "normalized_command", side_effect=normalize), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(workflow.run(argv, root, stub), 0 if status == "passed" else 1)
+                self.assertEqual(calls, [wrapped])
+                summary = json.loads(next((root / ".zig-cache" / "workflow").glob("*/summary.json")).read_text())
+                self.assertEqual(summary["status"], status)
+                self.assertEqual(summary["stages"][0]["stage"], "app")
+                self.assertEqual(summary["stages"][0]["command"], wrapped)
+                self.assertEqual(summary["stages"][0]["exit_code"], code)
+                self.assertEqual(summary["source_hash_before"] == summary["source_hash_after"], not mutate)
+
     def test_evidence_and_failure(self):
         self.assertEqual(workflow.classify(0, "0/0 tests passed", True), "no_positive_test_evidence")
         self.assertEqual(workflow.classify(0, "", True), "no_positive_test_evidence")

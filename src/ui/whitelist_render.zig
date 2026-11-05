@@ -10,11 +10,6 @@ pub const Row = struct {
     text: []const u8,
     start: usize,
     end: usize,
-    synthetic: bool = false,
-    leaf: usize = 0,
-    output_start: usize = 0,
-    output_end: usize = 0,
-    output_window: usize = 0,
     checkpoint: scan.State,
     complete: bool,
 };

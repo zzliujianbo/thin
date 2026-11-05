@@ -1287,7 +1287,9 @@ pub const Runtime = struct {
             self.selector.initial_attempted = true;
         }
         self.estimator = if (state.estimator.per_mille < 1000) .{} else state.estimator;
-        self.last_context_tokens = if (schema_changed) null else state.last_context_tokens;
+        // The last server-confirmed display statistic is independent of whether
+        // native replay remains valid for the rewritten tool prefix.
+        self.last_context_tokens = state.last_context_tokens;
         // No saved poison, approval counter or grants become live authority.
         // Current declared context/output/input budgets are untouched.
         self.poisoned = false;

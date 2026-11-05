@@ -25,6 +25,7 @@ const Step = struct {
 const FakeContext = struct {
     steps: []const Step,
     calls: usize = 0,
+    tool_calls: usize = 0,
     owner: ?*r.Runtime = null,
     final_total: ?u64 = null,
     pending_count: usize = 0,
@@ -71,10 +72,14 @@ const FakeContext = struct {
             .usage = step.usage,
         } };
     }
-    fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !r.Prepared {
+    fn prepare(ctx: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !r.Prepared {
+        const self: *FakeContext = @ptrCast(@alignCast(ctx));
+        self.tool_calls += 1;
         return error.UnexpectedTool;
     }
-    fn execute(_: *anyopaque, _: std.mem.Allocator, _: r.Prepared, _: *const p.Cancellation) !r.Execution {
+    fn execute(ctx: *anyopaque, _: std.mem.Allocator, _: r.Prepared, _: *const p.Cancellation) !r.Execution {
+        const self: *FakeContext = @ptrCast(@alignCast(ctx));
+        self.tool_calls += 1;
         return error.UnexpectedTool;
     }
     fn authorize(_: ?*anyopaque, _: r.Permission, _: *const p.Cancellation) !r.Decision {
@@ -136,6 +141,59 @@ fn expectTerminal(runtime: *r.Runtime, fake: *const FakeContext, terminal: r.Ter
     try expectSnapshot(runtime.contextSnapshot(), total, runtime.config.model.context_tokens);
     try t.expectEqualDeep(runtime.contextSnapshot(), terminal.context_snapshot.?);
     try t.expectEqualDeep(terminal, fake.terminal.?);
+}
+
+test "changed checkpoint tool hash preserves server usage while stripping native replay" {
+    const adapter = @import("../llm/anthropic.zig");
+    var config = configuration();
+    config.model.protocol = .anthropic;
+    config.model.output_tokens = 4096; // Known fixture capacity, not a production fallback.
+    for ([_]?u64{ 77, 0, null }) |saved_total| {
+        var fake: FakeContext = .{ .steps = &.{} };
+        var runtime = try init(&config, &fake);
+        defer runtime.deinit();
+        var state = try runtime.exportCheckpoint();
+        var different_hash = state.tool_schema_hash.?;
+        different_hash[0] ^= 1;
+        state.tool_schema_hash = different_hash;
+        state.last_context_tokens = saved_total;
+        state.messages = &.{
+            .{ .role = .user, .blocks = &.{.{ .text = "question" }} },
+            .{ .role = .assistant, .blocks = &.{
+                .{ .reasoning = "private plan" },
+                .{ .tool_call = .{ .id = "original-id", .name = "write_file", .arguments = "{}" } },
+            }, .replay = .{
+                .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .anthropic },
+                .json = "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"private plan\",\"signature\":\"stale-signature\"},{\"type\":\"redacted_thinking\",\"data\":\"stale-redacted\"},{\"type\":\"tool_use\",\"id\":\"original-id\",\"name\":\"write_file\",\"input\":{}}]}",
+            } },
+            .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "original-id", .text = "saved result" } }} },
+            .{ .role = .assistant, .blocks = &.{.{ .text = "answer" }} },
+        };
+        try runtime.restoreCheckpoint(state);
+        try expectSnapshot(runtime.contextSnapshot(), saved_total, 32768);
+        try t.expectEqual(saved_total, runtime.last_context_tokens);
+        try t.expect(runtime.messages()[1].replay == null);
+        const expected: []const p.Message = &.{
+            .{ .role = .user, .blocks = &.{.{ .text = "question" }} },
+            .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "original-id", .name = "write_file", .arguments = "{}" } }} },
+            .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "original-id", .text = "saved result" } }} },
+            .{ .role = .assistant, .blocks = &.{.{ .text = "answer" }} },
+        };
+        try t.expectEqualDeep(expected, runtime.messages());
+        const wire = try adapter.encode(t.allocator, .{
+            .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .anthropic },
+            .system = runtime.system,
+            .messages = runtime.messages(),
+            .tools = runtime.executor.schemas,
+            .model_output_tokens = config.model.output_tokens,
+        });
+        defer t.allocator.free(wire);
+        for ([_][]const u8{ "stale-signature", "stale-redacted", "private plan", "redacted_thinking" }) |stale|
+            try t.expect(std.mem.indexOf(u8, wire, stale) == null);
+        try t.expect(std.mem.indexOf(u8, wire, "original-id") != null);
+        try t.expectEqual(@as(usize, 0), fake.calls);
+        try t.expectEqual(@as(usize, 0), fake.tool_calls);
+    }
 }
 
 test "context usage fresh runtime is known zero despite nonzero safety estimate" {

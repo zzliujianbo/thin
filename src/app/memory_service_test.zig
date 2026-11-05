@@ -3,6 +3,7 @@ const cfg = @import("../core/config.zig");
 const diag = @import("../core/diagnostics.zig");
 const fs = @import("../platform/filesystem.zig");
 const k = @import("../core/knowledge.zig");
+const memory_status = @import("../core/memory_status.zig");
 const p = @import("../core/protocol.zig");
 const knowledge = @import("../tools/knowledge_store.zig");
 const Coordinator = @import("memory_service.zig").Coordinator;
@@ -45,13 +46,16 @@ fn begin(owner: *Coordinator, a: std.mem.Allocator, text: []const u8) !void {
     const reference = try owner.retrieve(a, text, 8192);
     a.free(reference);
 }
-fn finalize(owner: *Coordinator, a: std.mem.Allocator, text: []const u8, cancel: *const p.Cancellation) void {
+fn finalize(owner: *Coordinator, a: std.mem.Allocator, text: []const u8, cancel: *const p.Cancellation) !memory_status.Terminal {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var capture: k.Capture = .{ .allocator = arena.allocator() };
     capture.add(.user, text);
-    _ = owner.enqueueCopy(&capture, .chat, .{}) catch return;
+    const id = try owner.enqueueCopy(&capture, .chat, .{});
     owner.drain(cancel);
+    const terminal = owner.view().last_terminal orelse return error.MissingMemoryTerminal;
+    try std.testing.expectEqual(id, terminal.id);
+    return terminal;
 }
 fn expectNoJobs(root: *fs.Root) !void {
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin/memory/jobs"));
@@ -80,12 +84,12 @@ test "automatic Memory extracts once saves and creates no jobs" {
 
     try begin(owner, a, input);
     var cancel: p.Cancellation = .{};
-    finalize(owner, a, input, &cancel);
+    const saved = try finalize(owner, a, input, &cancel);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(u64, 1), owner.completed.load(.acquire));
-    try std.testing.expectEqualStrings("Memory: saved", owner.notice().?);
-    try std.testing.expectEqual(@as(u32, 1), owner.view().last_terminal.?.saved_count);
-    try std.testing.expectEqualStrings("Prefers concise code-review explanations.", owner.view().last_terminal.?.summary.text());
+    try std.testing.expectEqual(memory_status.Result.saved, saved.result);
+    try std.testing.expect(saved.failure == null);
+    try std.testing.expectEqual(@as(u32, 1), saved.saved_count);
+    try std.testing.expectEqualStrings("Prefers concise code-review explanations.", saved.summary.text());
     const entry = try owner.store.read(a, "preferences-response-style");
     defer a.free(entry.content);
     defer a.free(entry.version);
@@ -93,10 +97,11 @@ test "automatic Memory extracts once saves and creates no jobs" {
     try expectNoJobs(&root);
 
     try begin(owner, a, "Again: concise code reviews.");
-    finalize(owner, a, "Again: I prefer concise explanations in all code reviews.", &cancel);
+    const skipped = try finalize(owner, a, "Again: I prefer concise explanations in all code reviews.", &cancel);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expect(owner.notice() == null);
-    try std.testing.expectEqual(@as(u32, 0), owner.view().last_terminal.?.saved_count);
+    try std.testing.expectEqual(memory_status.Result.skipped, skipped.result);
+    try std.testing.expect(skipped.failure == null);
+    try std.testing.expectEqual(@as(u32, 0), skipped.saved_count);
     try expectNoJobs(&root);
 }
 
@@ -123,9 +128,10 @@ test "automatic Memory snapshots fresh generation after earlier mutation" {
     try begin(owner, a, input);
     try owner.store.delete("old", entry.version);
     var cancel: p.Cancellation = .{};
-    finalize(owner, a, input, &cancel);
+    const terminal = try finalize(owner, a, input, &cancel);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqualStrings("Memory: saved", owner.notice().?);
+    try std.testing.expectEqual(memory_status.Result.saved, terminal.result);
+    try std.testing.expectEqual(@as(u32, 1), terminal.saved_count);
     try expectNoJobs(&root);
 }
 
@@ -151,10 +157,11 @@ test "automatic Memory contention fails promptly without jobs" {
     defer fs.closeFd(held);
     try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(held, 2 | 4));
     var cancel: p.Cancellation = .{};
-    finalize(owner, a, input, &cancel);
+    const terminal = try finalize(owner, a, input, &cancel);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(@as(u16, @intFromError(error.Busy)), owner.failure.load(.acquire));
-    try std.testing.expectEqualStrings("Memory: finalization failed", owner.notice().?);
+    try std.testing.expectEqual(memory_status.Result.failed, terminal.result);
+    try std.testing.expectEqual(memory_status.Failure.busy, terminal.failure.?);
     try expectNoJobs(&root);
 }
 
@@ -177,18 +184,20 @@ test "automatic Memory uncertainty and cancellation are terminal without replay"
     owner.service_override = fake.service();
     try begin(owner, a, input);
     var cancel: p.Cancellation = .{};
-    finalize(owner, a, input, &cancel);
+    const uncertain = try finalize(owner, a, input, &cancel);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expect(std.mem.find(u8, owner.notice().?, "uncertain") != null);
+    try std.testing.expectEqual(memory_status.Result.uncertain, uncertain.result);
+    try std.testing.expectEqual(memory_status.Failure.unavailable, uncertain.failure.?);
     try expectNoJobs(&root);
 
     fake.fail = false;
     fake.cancel_during_extract = true;
     try begin(owner, a, input);
     var second_cancel: p.Cancellation = .{};
-    finalize(owner, a, input, &second_cancel);
+    const canceled = try finalize(owner, a, input, &second_cancel);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expectEqualStrings("Memory: finalization canceled", owner.notice().?);
+    try std.testing.expectEqual(memory_status.Result.canceled, canceled.result);
+    try std.testing.expectEqual(memory_status.Failure.canceled, canceled.failure.?);
     try std.testing.expect(!second_cancel.isRequested());
     try expectNoJobs(&root);
 }
@@ -212,10 +221,11 @@ test "invalid service candidates never reach storage" {
     owner.service_override = fake.service();
     try begin(owner, a, input);
     var cancel: p.Cancellation = .{};
-    finalize(owner, a, input, &cancel);
+    const terminal = try finalize(owner, a, input, &cancel);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(u16, 0), owner.failure.load(.acquire));
-    try std.testing.expect(owner.notice() == null);
+    try std.testing.expectEqual(memory_status.Result.skipped, terminal.result);
+    try std.testing.expect(terminal.failure == null);
     // The rejected batch is never persisted, and no index shard is created.
     try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-response-style"));
     try expectNoJobs(&root);
@@ -241,10 +251,11 @@ test "known secret source is rejected before any auxiliary request" {
     try begin(owner, a, input);
     var cancel: p.Cancellation = .{};
     // The fixture provider key is known to this Coordinator only, not to Capture.
-    finalize(owner, a, "deploy with owned-memory-fixture-key please", &cancel);
+    const terminal = try finalize(owner, a, "deploy with owned-memory-fixture-key please", &cancel);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(@as(u16, 0), owner.failure.load(.acquire));
-    try std.testing.expect(owner.notice() == null);
+    try std.testing.expectEqual(memory_status.Result.skipped, terminal.result);
+    try std.testing.expect(terminal.failure == null);
     try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-response-style"));
     try expectNoJobs(&root);
 }
@@ -272,7 +283,11 @@ test "Auto Memory Off has no helper clients or storage side effects" {
     var cancel: p.Cancellation = .{};
     try std.testing.expectError(error.MemoryUnavailable, owner.enqueueCopy(&capture, .chat, .{}));
     owner.drain(&cancel);
-    try std.testing.expect(owner.notice() == null);
+    const view = owner.view();
+    try std.testing.expect(!view.enabled);
+    try std.testing.expect(view.active == null);
+    try std.testing.expectEqual(memory_status.Result.failed, view.last_terminal.?.result);
+    try std.testing.expectEqual(memory_status.Failure.unavailable, view.last_terminal.?.failure.?);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
 }
 
@@ -407,7 +422,17 @@ test "queued jobs run FIFO from owned capture copies with a fresh generation" {
     try std.testing.expectEqual(@as(usize, 0), gated.related_counts[0]);
     try std.testing.expect(gated.related_counts[1] >= 1 and gated.fresh_versions[1]);
     try std.testing.expect(gated.related_counts[2] >= 2 and gated.fresh_versions[2]);
-    try std.testing.expectEqual(@as(u64, 3), owner.completed.load(.acquire));
+    const expected = [_]struct { key: []const u8, text: []const u8 }{
+        .{ .key = "preferences-job-1", .text = "fifo alpha fact" },
+        .{ .key = "preferences-job-2", .text = "fifo beta fact" },
+        .{ .key = "preferences-job-3", .text = "fifo gamma fact" },
+    };
+    for (expected) |item| {
+        const entry = try owner.store.read(a, item.key);
+        defer a.free(entry.content);
+        defer a.free(entry.version);
+        try std.testing.expect(std.mem.find(u8, entry.content, item.text) != null);
+    }
     const view = owner.view();
     try std.testing.expect(view.active == null);
     try std.testing.expectEqual(@as(u64, 0), view.queued_count);
@@ -443,6 +468,7 @@ test "primary retrieve and parent reportFailure never rewrite an active job outc
     const reference = try owner.retrieve(a, input, 8192);
     a.free(reference);
     owner.reportFailure(error.Busy);
+    try std.testing.expectEqual(@as(u16, @intFromError(error.Busy)), owner.failure.load(.acquire));
     const during = owner.view();
     try std.testing.expectEqual(before.active.?.id, during.active.?.id);
     try std.testing.expectEqual(before.active.?.phase, during.active.?.phase);
@@ -543,7 +569,7 @@ test "worker wait failure fails every queued job and releases drain" {
     try std.testing.expectEqual(@as(u64, 3), view.last_terminal.?.id);
     try std.testing.expect(view.last_terminal.?.result == .failed);
     try std.testing.expect(view.last_terminal.?.failure.? == .other);
-    try std.testing.expect(owner.notice() != null);
+    try std.testing.expectEqual(@as(u16, @intFromError(error.TestWaitFailure)), owner.failure.load(.acquire));
     try expectNoJobs(&root);
 }
 

@@ -247,7 +247,7 @@ pub fn parseResponse(output_allocator: Allocator, input: decision.Input, body: [
     var arena = std.heap.ArenaAllocator.init(output_allocator);
     defer arena.deinit();
     const tmp = arena.allocator();
-    _ = try decision.encodeInput(tmp, input); // Validate typed input before using its limits/IDs.
+    try decision.validateInput(input); // Validate typed input before using its limits/IDs.
     if (body.len > 65536 or !std.unicode.utf8ValidateSlice(body) or !bounded(body)) return invalid;
     const parsed = std.json.parseFromSlice(Value, tmp, body, .{ .duplicate_field_behavior = .@"error" }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -388,6 +388,32 @@ test "SystemOne command harm scope changes without altering timeout or log envel
     }
     try std.testing.expectError(error.InvalidDecisionInput, encodeRequest(a, "jev", .{ .command = .{ .command = "bad\xff", .max_timeout_ms = 1 } }, 16384));
     try std.testing.expectError(error.InvalidDecisionInput, encodeRequest(a, "jev", .{ .command = .{ .command = "valid", .proposed_timeout_ms = 2, .max_timeout_ms = 1 } }, 16384));
+}
+
+test "SystemOne parser validates input before response and allocation" {
+    const t = std.testing;
+    const malformed = "{\"answers\":}";
+    const too_many = [_]decision.RefineItem{
+        .{ .id = "0", .text = "x" }, .{ .id = "1", .text = "x" }, .{ .id = "2", .text = "x" },
+        .{ .id = "3", .text = "x" }, .{ .id = "4", .text = "x" }, .{ .id = "5", .text = "x" },
+        .{ .id = "6", .text = "x" }, .{ .id = "7", .text = "x" }, .{ .id = "8", .text = "x" },
+    };
+    for ([_]decision.Input{
+        .{ .command = .{ .command = "", .max_timeout_ms = 1 } },
+        .{ .command = .{ .command = "valid", .proposed_timeout_ms = 2, .max_timeout_ms = 1 } },
+        .{ .command = .{ .command = "valid", .risk = "\xff", .max_timeout_ms = 1 } },
+        .{ .refine_outputs = &.{ .{ .id = "same", .text = "x" }, .{ .id = "same", .text = "y" } } },
+        .{ .refine_outputs = &too_many },
+        .{ .refine_outputs = &.{.{ .id = "id", .text = "" }} },
+    }) |input| {
+        try t.expectError(error.InvalidDecisionInput, parseResponse(t.allocator, input, malformed));
+        try t.expectError(error.InvalidDecisionInput, parseResponse(t.failing_allocator, input, malformed));
+    }
+    for ([_]decision.Input{ test_command, test_refine }) |input| {
+        try t.expectError(error.InvalidDecisionOutput, parseResponse(t.allocator, input, malformed));
+        // A response rejected by the precheck needs no input serialization allocation.
+        try t.expectError(error.InvalidDecisionOutput, parseResponse(t.failing_allocator, input, "{"));
+    }
 }
 
 test "SystemOne numeric noul shapes and independent timeout thresholds" {
