@@ -251,6 +251,9 @@ const Copy = struct {
                 c.result.text = self.text(v.result.text);
                 break :blk .{ .tool_result = c };
             },
+            // Terminal and Summary contain only fixed owned values; never
+            // borrow from a decoded JSON arena or coalesce as a body delta.
+            .memory_completed => |terminal| .{ .memory_completed = terminal },
             .assistant_committed => |blocks| blk: {
                 const n: usize = @min(blocks.len, block_limit);
                 self.canonical_complete = blocks.len == n;
@@ -608,6 +611,32 @@ test "setConfirming is optional and refuses without an adapter" {
     var context: u8 = 0;
     const client: Client = .{ .context = &context, .vtable = &vt };
     try std.testing.expectError(error.Unsupported, client.setConfirming(1, true));
+}
+
+test "memory completion owns its summary and is a text coalescing barrier" {
+    const a = std.testing.allocator;
+    const memory = @import("../core/memory_status.zig");
+    var terminal: memory.Terminal = .{ .id = 0, .result = .saved, .saved_count = 1 };
+    terminal.summary.append("owned 中文");
+    var before = try ownEvent(a, 1, .{ .text = "before" });
+    defer before.deinit();
+    var item = try ownEvent(a, 1, .{ .memory_completed = terminal });
+    defer item.deinit();
+    var after = try ownEvent(a, 1, .{ .text = "after" });
+    defer after.deinit();
+    before.delivery_epoch = 1;
+    before.delivery_sequence = 1;
+    item.delivery_epoch = 1;
+    item.delivery_sequence = 2;
+    after.delivery_epoch = 1;
+    after.delivery_sequence = 3;
+    @memset(&terminal.summary.buf, 'x');
+    try std.testing.expectEqualStrings("owned 中文", item.event.memory_completed.summary.text());
+    try std.testing.expect(!try before.appendText(&item, max_item_bytes));
+    try std.testing.expect(!try item.appendText(&after, max_item_bytes));
+    try std.testing.expect(!try before.appendText(&after, max_item_bytes));
+    try std.testing.expectEqualStrings("before", before.event.text);
+    try std.testing.expectEqual(@as(u64, 2), item.delivery_sequence);
 }
 
 test "owned events deep-copy text and drop local inbox pointers" {

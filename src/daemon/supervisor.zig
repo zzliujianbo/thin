@@ -728,7 +728,9 @@ fn freeSlot(slots: *[max_connections]?Slot) ?usize {
 /// own connection id, so the host's controller bookkeeping stays authoritative;
 /// the value is never handed to an external caller.
 fn attachSetupHost(a: std.mem.Allocator, host: *session_host.SessionHost, connection_id: u64) !u64 {
-    var request = try protocol.parseRequest(a, "{\"v\":2,\"id\":1,\"op\":\"attach\",\"write\":true}");
+    var buffer: [128]u8 = undefined;
+    const wire = std.fmt.bufPrint(&buffer, "{{\"v\":{d},\"id\":1,\"op\":\"attach\",\"write\":true}}", .{protocol.version}) catch unreachable;
+    var request = try protocol.parseRequest(a, wire);
     defer request.deinit();
     const frame = try host.dispatch(a, &request, connection_id, false);
     defer a.free(frame);

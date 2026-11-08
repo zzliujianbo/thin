@@ -33,6 +33,8 @@ const codex_login = @import("../core/codex_login.zig");
 const codex_oauth = @import("codex_oauth.zig");
 const codex_auth = @import("../core/codex_auth.zig");
 const p = @import("../core/protocol.zig");
+const memory_status = @import("../core/memory_status.zig");
+const MemoryNotifications = @import("memory_notifications.zig").Queue;
 
 test {
     _ = @import("llm_session_test.zig");
@@ -266,6 +268,8 @@ pub const Session = struct {
     settings_notice: ?[]const u8 = null,
     pending: ?std.json.Parsed(cfg.Config) = null,
     app: ?*App = null,
+    /// Heap-stable across Session moves and App/coordinator replacement.
+    memory_notifications: ?*MemoryNotifications = null,
     /// Independently owned replay remains available even without a usable route.
     loaded_checkpoint: ?std.json.Parsed(checkpoint.State) = null,
     loaded_selection: ?selections.Snapshot = null,
@@ -400,6 +404,7 @@ pub const Session = struct {
         lease = null;
         project_moved = true;
         errdefer self.deinit();
+        self.memory_notifications = try MemoryNotifications.create(a);
         self.loaded_checkpoint = loaded;
         loaded = null;
         self.loaded_selection = restored;
@@ -567,7 +572,7 @@ pub const Session = struct {
             return err;
         };
         defer self.allocator.free(protected);
-        const candidate = try App.initConfiguredAnchoredAuth(self.allocator, self.io, self.environ, &self.project_root, protected, self.host, parsed);
+        const candidate = try App.initConfiguredAnchoredAuthWithNotifications(self.allocator, self.io, self.environ, &self.project_root, protected, self.host, parsed, self.memory_notifications.?);
         errdefer candidate.deinit();
         // Pin while the fresh journal still has zero counters. Imported sequence
         // numbers belong to the archive, not to a second pin operation.
@@ -593,6 +598,8 @@ pub const Session = struct {
         if (self.selected_alias) |alias| self.allocator.free(alias);
         if (self.global_config) |*global| cfg.release(global);
         if (self.app) |app| app.deinit();
+        // App teardown joins every producer before freeing the shared queue.
+        if (self.memory_notifications) |queue| queue.deinit();
         if (self.resume_lease) |*lease| lease.deinit();
         if (self.pending) |*pending| cfg.release(pending);
         self.store.deinit();
@@ -600,9 +607,25 @@ pub const Session = struct {
         self.* = undefined;
     }
 
+    /// Peek is non-consuming; the remote host takes only after LiveRing accepts
+    /// this exact value. The Session has one consumer (local UI or remote host).
+    pub fn peekMemoryCompletion(self: *Session) ?memory_status.Terminal {
+        return if (self.memory_notifications) |queue| queue.peek() else null;
+    }
+
+    /// Returns an owned fixed value without allocating or touching a Job.
+    pub fn takeMemoryCompletion(self: *Session) ?memory_status.Terminal {
+        return if (self.memory_notifications) |queue| queue.take() else null;
+    }
+
+    fn takeMemoryCompletionCallback(raw: *anyopaque) ?memory_status.Terminal {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        return self.takeMemoryCompletion();
+    }
+
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin, .take_memory_completion_fn = takeMemoryCompletionCallback };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -640,18 +663,7 @@ pub const Session = struct {
 
     fn persistNotify(ctx: ?*anyopaque, observation: r.Observation) void {
         const self: *Session = @ptrCast(@alignCast(ctx.?));
-        const measured = switch (observation) {
-            .event => |event| event == .assistant_committed or event == .finished,
-            else => false,
-        };
-        if (measured) {
-            const sink = if (self.app) |app| app.journal.diagnosticSink() else diagnostics.Sink{};
-            var observer_span = diagnostics.Span.start(sink, self.io, .{ .stage = .observer });
-            self.inner_observer.notify(observation);
-            observer_span.finish(.ok);
-        } else {
-            self.inner_observer.notify(observation);
-        }
+        self.inner_observer.notify(observation);
         switch (observation) {
             .event => |event| switch (event) {
                 .user_committed, .assistant_committed, .compacted, .finished => self.persistBestEffort(true),
@@ -2285,6 +2297,55 @@ const SessionTestFixture = struct {
     }
 };
 
+test "session completions survive activation and every owner replacement" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    var session = try fixture.open(.{});
+    defer session.deinit();
+    try std.testing.expect(session.app == null);
+    const queue = session.memory_notifications.?;
+    const connection = session.connection();
+    try connection.configure("fake-notification-key");
+    var app = session.app.?;
+    try std.testing.expect(app.memory_coordinator.notification_queue == queue);
+    var incomplete: @import("../core/knowledge.zig").Capture = .{ .allocator = std.testing.allocator, .incomplete = true };
+    try std.testing.expectError(error.IncompleteCapture, app.memory_coordinator.enqueueCopy(&incomplete, .chat, .{}));
+    try std.testing.expectEqual(@as(u64, 1), session.peekMemoryCompletion().?.id);
+    try std.testing.expectEqual(@as(u64, 1), session.peekMemoryCompletion().?.id);
+
+    var declaration = app.config.value;
+    declaration.limits.request_timeout_ms += 1;
+    var settings = try app.prepareSettings(declaration, &fixture.env);
+    defer settings.deinit();
+    try std.testing.expect(settings.replace_memory);
+    app.installSettings(&settings);
+    try std.testing.expect(app.memory_coordinator.notification_queue == queue);
+    app.memory_coordinator.next_id = 10;
+    try std.testing.expectError(error.IncompleteCapture, app.memory_coordinator.enqueueCopy(&incomplete, .chat, .{}));
+
+    const candidate_config = try cfg.clone(std.testing.allocator, app.config.value);
+    const replacement = try app.prepareConnection(candidate_config, &fixture.env);
+    app.installConnection(replacement);
+    try std.testing.expect(app.memory_coordinator.notification_queue == queue);
+    app.memory_coordinator.next_id = 20;
+    try std.testing.expectError(error.IncompleteCapture, app.memory_coordinator.enqueueCopy(&incomplete, .chat, .{}));
+
+    // A new App binds the same heap-stable queue before the old App is freed.
+    const next = try session.prepareApp(try cfg.clone(std.testing.allocator, app.config.value));
+    session.app = next;
+    app.deinit();
+    app = next;
+    try std.testing.expect(app.memory_coordinator.notification_queue == queue);
+    app.memory_coordinator.next_id = 30;
+    try std.testing.expectError(error.IncompleteCapture, app.memory_coordinator.enqueueCopy(&incomplete, .chat, .{}));
+    try std.testing.expectEqual(@as(u64, 1), connection.takeMemoryCompletion().?.id);
+    for ([_]u64{ 11, 21, 31 }) |id| {
+        try std.testing.expectEqual(id, session.peekMemoryCompletion().?.id);
+        try std.testing.expectEqual(id, session.takeMemoryCompletion().?.id);
+    }
+    try std.testing.expect(session.takeMemoryCompletion() == null);
+}
+
 test "session title fallback model update and resume follow successful checkpoints" {
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
@@ -2410,6 +2471,52 @@ test "checkpoint persistence ignores machine-only context but retains prior conv
         }
         try std.testing.expectEqual(case.persists, try session.saveOnExit());
         if (!case.persists) try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, path, .{}));
+    }
+}
+
+test "session observer allocates only checkpoint spans for commit and finish" {
+    for ([_]bool{ false, true }) |fail_checkpoint| {
+        var fixture = try SessionTestFixture.init();
+        defer fixture.deinit();
+        var session = try fixture.open(.{});
+        defer session.deinit();
+        try session.connection().configure("fake-observer-spans");
+        const app = session.app.?;
+        try app.runtime.restoreCheckpoint(.{
+            .system = "saved system",
+            .selector = app.runtime.selector,
+            .estimator = .{},
+            .last_context_tokens = null,
+            .permission_id = 0,
+            .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "question" }} }},
+        });
+        session.installObserver();
+        try std.testing.expect(app.runtime.observer.context == @as(*anyopaque, &session));
+        try session.ensureWritableLease();
+        var path_buffer: [100]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".thin/sessions/{s}.session", .{session.session_id});
+        if (fail_checkpoint) try fixture.tmp.dir.createDir(std.testing.io, path, .default_dir);
+
+        app.runtime.observer.notify(.{ .submitted = "question" });
+        app.journal.flush();
+        try std.testing.expectEqual(null, app.journal.failure());
+        try std.testing.expect(app.journal.diagnostic_ready.load(.acquire));
+        const observations = [_]r.Observation{
+            .{ .event = .{ .assistant_committed = &.{.{ .text = "answer" }} } },
+            .{ .event = .{ .finished = .{ .status = .success } } },
+        };
+        for (observations) |observation| {
+            // IDs are allocated before the lossy diagnostic enqueue.
+            const before = app.journal.diagnostic_span.load(.monotonic);
+            app.runtime.observer.notify(observation);
+            try std.testing.expectEqual(before + 1, app.journal.diagnostic_span.load(.monotonic));
+            try std.testing.expectEqual(fail_checkpoint, session.checkpointError() != null);
+            if (fail_checkpoint) {
+                try std.testing.expectEqual(session.checkpointError().?, session.connection().current().log_error.?);
+            } else {
+                _ = try fixture.tmp.dir.statFile(std.testing.io, path, .{});
+            }
+        }
     }
 }
 
@@ -4983,6 +5090,17 @@ fn proxyToggle(session: *Session, name: []const u8, enabled: bool) !void {
     try callback(connection.context, name, enabled);
 }
 
+fn prepareNativeRouteForTest(client: *@import("decision_client.zig").Client) !void {
+    const a = std.testing.allocator;
+    try std.testing.expect(client.native == null and client.resolved == null);
+    var cancel: p.Cancellation = .{};
+    const output = try client.service().decide(a, .{ .refine_outputs = &.{} }, &cancel);
+    defer @import("../core/decision.zig").freeOutput(a, output);
+    try std.testing.expect(output == .refine_outputs and output.refine_outputs.len == 0);
+    try std.testing.expect(client.native != null and client.resolved != null);
+    try std.testing.expectEqual(@as(u64, 0), client.calls);
+}
+
 test "proxy allowlist revalidates exact rows credentials and preserves unrelated settings" {
     const a = std.testing.allocator;
     var fixture = try SessionTestFixture.init();
@@ -5073,7 +5191,7 @@ test "proxy refresh switches helper routes while primary client and history stay
     const decision_before = app.decision_client.?;
     const image_before = app.image_client.?;
     const memory_before = app.memory_coordinator;
-    try std.testing.expect(decision_before.native != null);
+    try prepareNativeRouteForTest(decision_before);
     try std.testing.expect(decision_before.native.?.proxy_url == null);
     try std.testing.expect(image_before.transport.proxy_url == null);
     try std.testing.expectEqual(@as(u64, 0), decision_before.calls);
@@ -5085,7 +5203,7 @@ test "proxy refresh switches helper routes while primary client and history stay
     try proxyToggle(&session, "aux/native/raw", true);
     const decision_after = app.decision_client.?;
     try std.testing.expect(decision_after != decision_before);
-    try std.testing.expect(decision_after.native != null);
+    try prepareNativeRouteForTest(decision_after);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", decision_after.native.?.proxy_url.?);
     try std.testing.expectEqual(@as(u64, 0), decision_after.calls);
     // Both auxiliary owners are replaced, even when only one route changed.
@@ -5114,12 +5232,17 @@ test "proxy refresh switches helper routes while primary client and history stay
     try proxyToggle(&session, "aux/native/raw", false);
     const memory_direct = app.memory_coordinator;
     try std.testing.expect(memory_direct != memory_after);
+    try prepareNativeRouteForTest(app.decision_client.?);
     try std.testing.expect(app.decision_client.?.native.?.proxy_url == null);
     try std.testing.expectEqual(@as(usize, 1), app.decision_client.?.source.value.proxy.?.models.len);
     try std.testing.expect(memory_direct.extractor.?.transport.?.proxy_http == null);
     try proxyToggle(&session, "aux/native/raw", true);
+    try prepareNativeRouteForTest(app.decision_client.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
 
     try proxyToggle(&session, "img/deepseek-flash", true);
+    try prepareNativeRouteForTest(app.decision_client.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
     const current = session.connection().current();
     try std.testing.expectEqual(@as(usize, 3), current.proxy_models.len);
@@ -5127,6 +5250,8 @@ test "proxy refresh switches helper routes while primary client and history stay
     // The extractor's coordinator config carries the latest allowlist too, so an
     // explicit primary membership proxies only that helper transport.
     try proxyToggle(&session, "main/chat", true);
+    try prepareNativeRouteForTest(app.decision_client.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqual(@as(usize, 4), session.connection().current().proxy_models.len);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
     try std.testing.expect(app.client.proxy_http == null);
@@ -5175,11 +5300,15 @@ test "proxy membership CAS conflict rolls back declaration and helper ownership"
     const saved = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(saved);
     const decision = app.decision_client.?;
+    try prepareNativeRouteForTest(decision);
+    try std.testing.expectEqualStrings("http://10.0.0.9:3128", decision.native.?.proxy_url.?);
     const auth = app.client.authorization.ptr;
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/config.json", .data = "{}" });
     try std.testing.expectError(error.AuthVersionConflict, proxyToggle(&session, "main/chat", true));
     try std.testing.expectEqual(@as(usize, 2), session.global_config.?.value.proxy.?.models.len);
     try std.testing.expect(app.decision_client.? == decision);
+    try std.testing.expectEqualStrings("http://10.0.0.9:3128", decision.native.?.proxy_url.?);
+    try std.testing.expectEqual(@as(u64, 0), decision.calls);
     try std.testing.expect(app.client.authorization.ptr == auth);
     try std.testing.expect(app.client.config == &app.config.value);
     try std.testing.expectEqual(@as(usize, 1), app.config.value.proxy.?.models.len);
@@ -5188,6 +5317,8 @@ test "proxy membership CAS conflict rolls back declaration and helper ownership"
     try std.testing.expectEqualStrings("{}", failed);
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/config.json", .data = saved });
     try proxyToggle(&session, "main/chat", true);
+    try prepareNativeRouteForTest(app.decision_client.?);
+    try std.testing.expectEqualStrings("http://10.0.0.9:3128", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqual(@as(usize, 3), session.global_config.?.value.proxy.?.models.len);
 }
 
@@ -5233,13 +5364,19 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     const messages = app.runtime.messages().len;
     const decision_before = app.decision_client.?;
     const image_before = app.image_client.?;
+    try prepareNativeRouteForTest(decision_before);
     try std.testing.expect(decision_before.native.?.proxy_url == null);
     try std.testing.expect(image_before.transport.proxy_url == null);
 
     // Install exact memberships so every independent helper uses the route.
     try proxyToggle(&session, "aux/native/raw", true);
+    try prepareNativeRouteForTest(app.decision_client.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
     try proxyToggle(&session, "img/deepseek-flash", true);
+    try prepareNativeRouteForTest(app.decision_client.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
     try proxyToggle(&session, "main/chat", true);
+    try prepareNativeRouteForTest(app.decision_client.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
@@ -5247,7 +5384,10 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     const saved = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(saved);
     // Surrounding whitespace and an identical host/port are no-write no-ops.
+    const before_noop = app.decision_client.?;
     try setProxyEndpoint(&session, "  127.0.0.1:18080\n");
+    try std.testing.expect(app.decision_client.? == before_noop);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", before_noop.native.?.proxy_url.?);
     const after_noop = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(after_noop);
     try std.testing.expectEqualStrings(saved, after_noop);
@@ -5261,6 +5401,7 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try std.testing.expectEqual(@as(u16, 8443), state.proxy_port);
     try std.testing.expectEqual(@as(usize, 4), state.proxy_models.len);
     // Auxiliary owners follow the new endpoint with the same exact members.
+    try prepareNativeRouteForTest(app.decision_client.?);
     try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.image_client.?.transport.proxy_url.?);
     try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
@@ -5297,6 +5438,8 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try std.testing.expectError(error.AuthVersionConflict, setProxyEndpoint(&session, "192.0.2.5:8888"));
     try std.testing.expectEqualStrings("2001:db8::5", session.global_config.?.value.proxy.?.address);
     try std.testing.expect(app.decision_client.? == decision_before_conflict);
+    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", decision_before_conflict.native.?.proxy_url.?);
+    try std.testing.expectEqual(@as(u64, 0), decision_before_conflict.calls);
     try std.testing.expect(app.client.authorization.ptr == auth);
     const failed = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(failed);
@@ -5310,6 +5453,7 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try std.testing.expect(state.proxy_address == null);
     try std.testing.expectEqual(@as(u16, 0), state.proxy_port);
     try std.testing.expectEqual(@as(usize, 0), state.proxy_models.len);
+    try prepareNativeRouteForTest(app.decision_client.?);
     try std.testing.expect(app.decision_client.?.native.?.proxy_url == null);
     try std.testing.expect(app.image_client.?.transport.proxy_url == null);
     try std.testing.expect(app.memory_coordinator.extractor.?.transport.?.proxy_http == null);

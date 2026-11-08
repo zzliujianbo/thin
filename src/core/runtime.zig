@@ -62,7 +62,6 @@ pub const Prepared = struct {
     /// 用户拒绝（或 --print 无法询问）时，这段文案作为工具错误回给模型。
     explicit_denial: ?[]const u8 = null,
     decision_input: ?decision.Input = null,
-    command_timeout: ?decision.Timeout = null,
 };
 
 /// 工具执行器接口（上下文指针 + 函数指针），由宿主注入；Runtime 不关心具体工具。
@@ -201,6 +200,9 @@ pub const Event = union(enum) {
     compacted: struct { before: usize, after: usize },
     /// 压缩失败；旧历史保持不变。
     compaction_failed: anyerror,
+    /// Session-owned auxiliary completion, display only. Never a Runtime
+    /// task result, model message, or canonical Journal observation.
+    memory_completed: @import("memory_status.zig").Terminal,
     /// 本次 run 的终态，每个 run 恰好一条。
     finished: Terminal,
 };
@@ -2443,7 +2445,9 @@ pub const Runtime = struct {
             return; // Quality failure: whole original scratch remains available.
         };
         try checkCanceled(cancel);
-        var replacements: [8][]const p.Block = undefined;
+        const Replacement = struct { message: usize, blocks: []p.Block };
+        var replacements: [8]Replacement = undefined;
+        var replacement_count: usize = 0;
         for (items[0..count], 0..) |item, i| {
             var summary: []const u8 = undefined;
             for (output.refine_outputs) |refined| if (std.mem.eql(u8, item.id, refined.id)) {
@@ -2451,31 +2455,42 @@ pub const Runtime = struct {
                 break;
             };
             const location = locations[i];
-            var prior: ?[]p.Block = null;
-            for (locations[0..i], 0..) |previous, pi| {
-                if (previous.message == location.message) {
-                    prior = @constCast(replacements[pi]);
-                    break;
-                }
-            }
-            const blocks = prior orelse try a.dupe(p.Block, scratch_messages[location.message].blocks);
-            var result = blocks[location.block].tool_result;
+            const original = scratch_messages[location.message].blocks[location.block].tool_result;
             // The model NEVER owns execution metadata. JSON exit/error/timeout,
             // canceled/truncated/byte counts and canonical flags stay CODE-owned.
-            result.text = try std.json.Stringify.valueAlloc(a, .{
+            const candidate = try std.json.Stringify.valueAlloc(a, .{
                 .original_execution_metadata = location.metadata,
                 .output_summary_untrusted = summary,
                 .summary_is_lossy = true,
             }, .{});
+            if (candidate.len >= original.text.len) continue;
+
+            // Only a profitable replacement owns mutable blocks. Reuse that
+            // clone for later profitable results in the same message.
+            var prior: ?[]p.Block = null;
+            for (replacements[0..replacement_count]) |replacement| {
+                if (replacement.message == location.message) {
+                    prior = replacement.blocks;
+                    break;
+                }
+            }
+            const blocks = prior orelse blk: {
+                const owned = try a.dupe(p.Block, scratch_messages[location.message].blocks);
+                replacements[replacement_count] = .{ .message = location.message, .blocks = owned };
+                replacement_count += 1;
+                break :blk owned;
+            };
+            var result = original;
+            result.text = candidate;
             blocks[location.block] = .{ .tool_result = result };
-            replacements[i] = blocks;
         }
         // Allocation-free publication after the whole batch succeeded. Shared
         // message replacements already contain every refined block.
         try checkCanceled(cancel);
-        for (locations[0..count], 0..) |location, i| {
-            scratch_messages[location.message].blocks = replacements[i];
-            scratch_messages[location.message].replay = null;
+        if (replacement_count == 0) return;
+        for (replacements[0..replacement_count]) |replacement| {
+            scratch_messages[replacement.message].blocks = replacement.blocks;
+            scratch_messages[replacement.message].replay = null;
         }
     }
 
@@ -2614,7 +2629,6 @@ pub const Runtime = struct {
                 if (kind == .normal and self.reserveSteering()) break :calls;
                 switch (input) {
                     .command => {
-                        prepared.command_timeout = output.command.timeout;
                         prepared.explicit_denial = if (output.command.ask)
                             "Decision requires explicit approval; command was not executed."
                         else

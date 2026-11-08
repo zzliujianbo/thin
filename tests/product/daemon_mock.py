@@ -1783,14 +1783,45 @@ def case_offline_approval(app, base):
         assert case.model.count(APPROVAL_PROMPT) == 1, 'offline approval continued inference'
 
         attached = case.client(['--attach', ident], project, 'approval-attach')
+        deadline = time.monotonic() + 40
+
+        def approval_guard():
+            case.model.check()
+            assert victim.is_file() and victim.read_text() == 'owned\n', 'pending approval executed'
+            assert case.model.count(APPROVAL_PROMPT) == 1, 'popup caused inference'
+
         attached.pump_until(
             lambda: attached.frame_after(0, b'Approval #') and
             b'Allow once' in attached.capture and b'Deny' in attached.capture,
-            'full approval popup frame', 40, guard=case.model.check)
-        assert victim.exists(), 'reattached popup had already executed the command'
-        full_frame = attached.capture.decode('utf-8', 'replace')
-        assert 'rm -f ' in full_frame and '.ssh/fixture-marker' in full_frame, 'approval preview lost the command'
-        assert case.model.count(APPROVAL_PROMPT) == 1, 'popup caused inference'
+            'full approval popup frame', max(0, deadline - time.monotonic()), guard=approval_guard)
+        approval_id = None
+        tokens = set()
+        for page in range(9):  # Initial frame plus at most eight PageDown ACKs.
+            approval_guard()
+            rows = [''.join(row) for row in attached.screen.grid]
+            questions = [(i, re.search(r'Approval #(\d+): \[Allow once / > Deny\]', row))
+                         for i, row in enumerate(rows)]
+            questions = [(i, match) for i, match in questions if match]
+            assert len(questions) == 1, 'missing or changed default-deny approval'
+            row, question = questions[0]
+            if approval_id is None:
+                approval_id = question.group(1)
+            assert question.group(1) == approval_id, 'approval id changed while paging'
+            assert row >= 3, 'approval preview outside screen'
+            # This fixture's risk header and command fill the compact preview;
+            # these three adjacent rows contain only preview and any modal hint.
+            preview = '\n'.join(rows[row - 3:row])
+            tokens.update(token for token in ('rm -f ', '.ssh/fixture-marker') if token in preview)
+            if len(tokens) == 2:
+                break
+            if page == 8:
+                break
+            before = attached.mark()
+            attached.send(b'\x1b[6~')
+            attached.pump_until(lambda: attached.frame_after(before, b'Approval #'),
+                                'approval preview page acknowledged',
+                                max(0, deadline - time.monotonic()), guard=approval_guard)
+        assert len(tokens) == 2, 'approval preview lost the command'
 
         # Explicit approval: arrows select the one-shot allow, Enter confirms.
         before = attached.mark()

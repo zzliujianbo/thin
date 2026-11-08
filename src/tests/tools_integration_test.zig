@@ -611,7 +611,7 @@ test "mutating file and Memory tool allocation failures precede commits" {
     }
 }
 
-test "tools prepare decision inputs without side effects and honor explicit no deadline" {
+test "tools prepare review inputs without side effects and use ordinary command timeouts" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -621,7 +621,7 @@ test "tools prepare decision inputs without side effects and honor explicit no d
     var root = try fs.Root.open(a, io, buffer[0..n]);
     defer root.deinit();
     var config = configuration;
-    config.limits.command_timeout_ms = 1;
+    config.limits.command_timeout_ms = 500;
     var store = mem.Store.init(&root, config.limits);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
@@ -655,7 +655,14 @@ test "tools prepare decision inputs without side effects and honor explicit no d
             .name = "bash",
             .arguments = case.args,
         });
-        const risk = prepared.decision_input.?.command.risk;
+        try std.testing.expect(prepared.decision_input.? == .command);
+        const candidate = prepared.decision_input.?.command;
+        const bash_action: *const t.Action = @ptrCast(@alignCast(prepared.payload));
+        try std.testing.expectEqualStrings(bash_action.bash.command, candidate.command);
+        try std.testing.expectEqual(@as(usize, 2), @typeInfo(@TypeOf(candidate)).@"struct".field_names.len);
+        try std.testing.expect(@hasField(@TypeOf(candidate), "command"));
+        try std.testing.expect(@hasField(@TypeOf(candidate), "risk"));
+        const risk = candidate.risk;
         if (case.label) |label| {
             try std.testing.expectEqualStrings(label, risk.?);
             const approval = try std.fmt.allocPrint(alloc, "DANGEROUS bash ({s}). Explicit approval is required each time", .{label});
@@ -667,19 +674,39 @@ test "tools prepare decision inputs without side effects and honor explicit no d
             try std.testing.expect(prepared.explicit_denial == null);
         }
     }
+    // Preparing a command with a visible side effect must not create the file.
+    const marker = try executor.prepare_fn(executor.context, alloc, .{
+        .id = "marker",
+        .name = "bash",
+        .arguments = "{\"command\":\"printf touched > prepare-only-marker\",\"timeout_ms\":5000}",
+    });
+    try std.testing.expectEqualStrings("printf touched > prepare-only-marker", marker.decision_input.?.command.command);
+    try std.testing.expect(marker.decision_input.?.command.risk == null);
+    try std.testing.expectError(error.FileNotFound, root.read(alloc, "prepare-only-marker", 0, 64));
+
+    // The same bounded one-second command exceeds the 500ms host default, but
+    // completes with a valid 5000ms explicit timeout. Output distinguishes a
+    // real timeout after launch from a failure to start or a false success.
     var cancel = p.Cancellation{};
-    for ([_]@import("../core/decision.zig").Timeout{ .none, .{ .milliseconds = 1000 } }) |timeout| {
-        var prepared = try executor.prepare_fn(executor.context, alloc, .{
+    for ([_]struct { arguments: []const u8, timed_out: bool }{
+        .{ .arguments = "{\"command\":\"printf started; /bin/sleep 1; printf ready\"}", .timed_out = true },
+        .{ .arguments = "{\"command\":\"printf started; /bin/sleep 1; printf ready\",\"timeout_ms\":5000}", .timed_out = false },
+    }) |case| {
+        const prepared = try executor.prepare_fn(executor.context, alloc, .{
             .id = "command",
             .name = "bash",
-            .arguments = "{\"command\":\"sleep 0.02; printf ready\"}",
+            .arguments = case.arguments,
         });
-        try std.testing.expectEqual(@as(u32, config.limits.command_max_timeout_ms), prepared.decision_input.?.command.max_timeout_ms);
-        prepared.command_timeout = timeout;
+        try std.testing.expectEqualStrings("printf started; /bin/sleep 1; printf ready", prepared.decision_input.?.command.command);
+        try std.testing.expect(prepared.decision_input.?.command.risk == null);
         const result = try executor.execute_fn(executor.context, alloc, prepared, &cancel);
-        try std.testing.expect(!result.is_error);
+        try std.testing.expectEqual(case.timed_out, result.is_error);
+        try std.testing.expect(!result.canceled and !result.cleanup_failed);
         const value = try j.parse(alloc, result.text);
-        try std.testing.expectEqualStrings("ready", j.string(j.get(value, "stdout")).?);
-        try std.testing.expectEqual(false, j.get(value, "timed_out").?.bool);
+        try std.testing.expectEqualStrings(if (case.timed_out) "started" else "startedready", j.string(j.get(value, "stdout")).?);
+        try std.testing.expectEqual(case.timed_out, j.get(value, "timed_out").?.bool);
+        try std.testing.expectEqual(false, j.get(value, "canceled").?.bool);
+        if (!case.timed_out) try std.testing.expectEqual(@as(?u64, 0), j.uint(j.get(value, "exit_code")));
     }
+    try std.testing.expectError(error.FileNotFound, root.read(alloc, "prepare-only-marker", 0, 64));
 }

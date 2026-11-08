@@ -29,6 +29,7 @@ pub const user = "\x1b[38;5;255m\x1b[48;2;52;36;24m";
 pub const user_background = "\x1b[48;2;52;36;24m";
 
 pub const success = "\x1b[38;5;114m";
+pub const warning = "\x1b[38;5;220m";
 pub const failure = "\x1b[38;5;203m";
 pub const caution = "\x1b[38;5;214m";
 /// Foreground only: the editor/background remain the terminal's defaults.

@@ -66,6 +66,9 @@ if (!process.argv[2] || process.platform !== 'linux') {
 const bin = resolve(process.argv[2]);
 
 const KEY = 'owned-loopback-subagent-fixture-key';
+const REVIEW_KEY = 'owned-loopback-reviewer-fixture-key';
+const REVIEW_MODEL = 'subagent-reviewer-fixture';
+const REVIEW_USAGE = {input: 4311, output: 919};
 const PARENT_PRIVATE = 'PARENT-PRIVATE-MARKER-9c1f';
 const PARENT_PROMPT = `parent-task ${PARENT_PRIVATE} keep this out of the child`;
 const CHILD_TASK = 'child-task-marker inspect the probe file';
@@ -439,6 +442,41 @@ server = http.createServer(async (req, res) => {
       return;
     }
     assert.equal(req.method, 'POST', 'model requests must be POST');
+    if (req.url === '/v1/reviewer/chat/completions') {
+      assert(plan.reviews, 'unexpected reviewer request while Decision is off');
+      assert.equal(req.headers.authorization, `Bearer ${REVIEW_KEY}`, 'independent reviewer key');
+      const body = JSON.parse(await readBody(req));
+      assert.equal(body.model, REVIEW_MODEL, 'independent reviewer model');
+      assert.equal(body.stream, true);
+      assert(!body.tools || body.tools.length === 0, 'reviewer must have no tools');
+      assert.equal(body.messages.length, 2, 'reviewer receives only its instruction and envelope');
+      assert.equal(body.messages[0].role, 'system');
+      assert.equal(body.messages[1].role, 'user');
+      const envelope = JSON.parse(body.messages[1].content);
+      assert.deepEqual(Object.keys(envelope).sort(), ['data', 'operation']);
+      assert.equal(envelope.operation, 'command');
+      assert.deepEqual(Object.keys(envelope.data).sort(), ['command', 'risk'], 'no Decision timeout selection');
+      const review = plan.reviews.get(envelope.data.command);
+      assert(review, 'unexpected reviewer command');
+      assert.equal(review.seen, false, 'review was replayed');
+      review.seen = true;
+      plan.reviewRequests[review.role] += 1;
+      assert(!JSON.stringify(body).includes(PARENT_PRIVATE), 'parent history leaked into reviewer');
+      if (plan.reviewBarrier) {
+        assert.equal(review.role, 'child');
+        assert(!plan.reviewBarrier.sockets.has(req.socket), 'simultaneous reviews shared a socket');
+        plan.reviewBarrier.sockets.add(req.socket);
+        if (plan.reviewBarrier.sockets.size === PARALLEL_COUNT) fireSignal(plan, 'all-reviews-entered');
+        await waitSignal(plan, 'all-reviews-entered');
+      }
+      if (review.answer === 'fail') {
+        res.writeHead(503, {'content-type': 'text/plain'});
+        res.end('owned review unavailable');
+      } else {
+        sendChat(res, {type: 'text', text: JSON.stringify({ask: review.answer})}, REVIEW_USAGE);
+      }
+      return;
+    }
     assert.equal(req.url, endpoint[plan.protocol], 'endpoint must match the declared protocol');
     if (plan.protocol === 'anthropic') {
       assert.equal(req.headers['x-api-key'], KEY, 'Anthropic key header');
@@ -506,6 +544,7 @@ function makePlan(spec) {
     requests: 0,
     roleRequests: {root: 0, child: 0},
     childRequests: 0,
+    reviewRequests: {root: 0, child: 0},
     ...spec,
   };
 }
@@ -536,6 +575,13 @@ async function run(plan) {
     }}},
     limits: {low_price_input: false, safety_tokens: 100, request_timeout_ms: 10000, task_timeout_ms: 25000},
   };
+  if (plan.decisionMode) {
+    declaration.llm.providers.reviewer = {
+      base_url: `${url}/reviewer`, api_key: REVIEW_KEY,
+      models: {[REVIEW_MODEL]: {protocol: 'chat', context_tokens: 16384}},
+    };
+    declaration.decision = {model: `reviewer/${REVIEW_MODEL}`, enabled: plan.decisionMode !== 'off'};
+  }
   plan.configText = JSON.stringify(declaration);
   await writeFile(join(home, '.thin', 'config.json'), plan.configText, {mode: 0o600});
 
@@ -547,6 +593,7 @@ async function run(plan) {
   plan.requests = 0;
   plan.roleRequests = {root: 0, child: 0};
   plan.childRequests = 0;
+  plan.reviewRequests = {root: 0, child: 0};
   plan.childCalls = plan.stages.child.length;
   plan.childInput = plan.stages.child.reduce((sum, stage) => sum + stage.usage.input, 0);
   plan.childOutput = plan.stages.child.reduce((sum, stage) => sum + stage.usage.output, 0);
@@ -609,10 +656,13 @@ async function run(plan) {
     }
     const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8');
     assert(!stdout.includes(KEY) && !stderr.includes(KEY), 'credential leaked to local output');
+    assert(!stdout.includes(REVIEW_KEY) && !stderr.includes(REVIEW_KEY), 'reviewer credential leaked to local output');
     assert(!stdout.includes('\x1b'), 'headless output carried terminal escapes');
     assert.equal(plan.seq.root, plan.stages.root.length, 'root model request count/choreography');
     assert.equal(plan.seq.child, plan.stages.child.length, 'child model request count/choreography');
     assert.equal(plan.requests, plan.stages.root.length + plan.stages.child.length, 'total request count');
+    assert.deepEqual(plan.reviewRequests, plan.expectedReviews ?? {root: 0, child: 0}, 'root/child reviewer request counts');
+    if (plan.reviews) for (const review of plan.reviews.values()) assert(review.seen, 'expected review was not sent');
     assert.equal(await readFile(join(home, '.thin', 'config.json'), 'utf8'), plan.configText,
       'active run rewrote the configuration declaration');
     await plan.verify({code, out: stdout, err: stderr, project, home, plan});
@@ -639,6 +689,20 @@ async function assertParentArchive(project) {
   assert.equal(rows.filter(row => row.event === 'user').length, 1, 'child task must not become a parent user record');
   assert(rows.some(row => row.event === 'finished'), 'parent completion record missing');
   assert(!JSON.stringify(rows).includes('Subagent mode:'), 'child transcript was archived');
+  return rows;
+}
+
+async function assertRootUsage(plan, project) {
+  const rows = await assertParentArchive(project);
+  const finished = rows.filter(row => row.event === 'finished');
+  assert.equal(finished.length, 1, 'one parent terminal usage record');
+  const usage = finished[0].data.usage;
+  assert.equal(usage.normal_calls, plan.stages.root.length, 'review and child calls excluded from root calls');
+  assert.equal(usage.summary_calls, 0);
+  assert.equal(usage.normal.input_tokens, plan.stages.root.reduce((sum, stage) => sum + stage.usage.input, 0),
+    'review and child input usage excluded from root');
+  assert.equal(usage.normal.output_tokens, plan.stages.root.reduce((sum, stage) => sum + stage.usage.output, 0),
+    'review and child output usage excluded from root');
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1047,83 @@ function childApprovalDenialCase() {
   return plan;
 }
 
+// Real generic reviewer, distinct from the primary model. The same low-risk
+// command is review-gated in root and child; ask=true on another low-risk
+// child command proves that the broker, rather than static classification,
+// controls it. The headless host deliberately denies that request.
+function decisionCase(mode) {
+  const rootCommand = 'printf root-proof > decision-root.txt';
+  const childCommand = 'printf child-proof > decision-child.txt';
+  const blockedCommand = 'printf forbidden > sentinel-dir/sentinel.txt';
+  const staticCommand = 'rm -f .ssh/fixture-marker';
+  const plan = makePlan({
+    name: `chat-decision-${mode}`, protocol: 'chat', childTask: CHILD_TASK, decisionMode: mode,
+    expectedReviews: mode === 'off' ? {root: 0, child: 0} : {root: 1, child: mode === 'on' ? 2 : 1},
+  });
+  plan.reviews = new Map();
+  if (mode !== 'off') {
+    plan.reviews.set(rootCommand, {role: 'root', answer: false, seen: false});
+    if (mode === 'fail') plan.reviews.set(blockedCommand, {role: 'child', answer: 'fail', seen: false});
+    else {
+      plan.reviews.set(childCommand, {role: 'child', answer: false, seen: false});
+      plan.reviews.set(blockedCommand, {role: 'child', answer: true, seen: false});
+    }
+  }
+  plan.stages.root = [
+    {usage: {input: 40, output: 8}, reply: ctx => ctx.call('bash', {command: rootCommand, timeout_ms: 4000})},
+    {usage: {input: 60, output: 10}, check: ctx => {
+      assert.equal(callJson(ctx.history, 'bash').exit_code, 0, 'root reviewed bash must execute');
+    }, reply: ctx => ctx.call('subagent', {task: CHILD_TASK})},
+    {usage: {input: 70, output: 11}, check: ctx => { plan.childId = startResult(ctx.history).id; },
+      reply: ctx => ctx.call('get_subagent_result', {id: plan.childId, wait: true})},
+    {usage: {input: 80, output: 12}, expectedCalls: ['bash', 'subagent', 'get_subagent_result'], check: ctx => {
+      const snap = getResult(ctx.history);
+      if (mode !== 'fail') return assertTerminal(plan, snap);
+      assert.equal(snap.id, plan.childId);
+      assert.equal(snap.status, 'paused', 'review failure must pause the child');
+      assert.equal(snap.detail, 'DecisionUnavailable');
+      assert.equal(snap.usage_scope, 'normal_and_summary_only');
+      assert.equal(snap.auxiliary_usage_excluded, true);
+      assert.equal(snap.usage.normal_calls, 1, 'no child model replay after review failure');
+      assert.equal(snap.usage.normal.input_tokens, 120);
+      assert.equal(snap.usage.normal.output_tokens, 10);
+    }, reply: ctx => ctx.text(ROOT_ANSWER)},
+  ];
+  plan.stages.child = [
+    {expectedCalls: [], usage: {input: 120, output: 10}, reply: ctx => ctx.call('bash', {
+      command: mode === 'fail' ? blockedCommand : childCommand, timeout_ms: 4000,
+    })},
+  ];
+  if (mode !== 'fail') {
+    plan.stages.child.push(
+      {expectedCalls: ['bash'], usage: {input: 160, output: 20}, check: ctx => {
+        assert.equal(callJson(ctx.history, 'bash').exit_code, 0, 'child reviewed bash must execute');
+      }, reply: ctx => ctx.call('bash', {command: mode === 'off' ? staticCommand : blockedCommand})},
+      {expectedCalls: ['bash', 'bash'], usage: {input: 180, output: 22}, check: ctx => {
+        const text = callText(ctx.history, 'bash');
+        assert(text.includes(mode === 'off' ? 'Dangerous bash command was not executed' :
+          'Decision requires explicit approval'), 'child denial must reach its paired tool result');
+      }, reply: ctx => ctx.text(CHILD_REPORT)},
+    );
+  }
+  plan.verify = async ({code, out, err, project}) => {
+    assert.equal(code, 0, 'parent must complete after child review/denial');
+    assert(out.includes(ROOT_ANSWER));
+    assert.equal(plan.roleRequests.root, 4);
+    assert.equal(plan.roleRequests.child, mode === 'fail' ? 1 : 3);
+    assert.equal(await readFile(join(project, 'decision-root.txt'), 'utf8'), 'root-proof');
+    assert.equal(await exists(join(project, 'decision-child.txt')), mode !== 'fail');
+    if (mode !== 'fail') {
+      assert.equal(await readFile(join(project, 'decision-child.txt'), 'utf8'), 'child-proof');
+      assert(err.includes('tool calls were denied by the host.'), 'child approval must pass through the parent host');
+    }
+    assert.equal(await readFile(plan.sentinelFile, 'utf8'), SENTINEL, 'blocked/review-failed child command executed');
+    assert.equal(await readFile(plan.approvalSentinel, 'utf8'), SENTINEL, 'off static approval was bypassed');
+    await assertRootUsage(plan, project);
+  };
+  return plan;
+}
+
 // Parallel same-root delegation: six children are started by one root in six
 // consecutive rounds and must really be in flight at the same time. Every child
 // model request is held by the owned server on ONE barrier that opens only when
@@ -1021,10 +1162,11 @@ function collectParallel(plan, ctx, index) {
   assert.equal(snap.report, parallelReport(index), `parallel child ${index} must report only its own task`);
   assert.equal(snap.truncated, false, 'a short parallel report must not be truncated');
   assert.equal(snap.usage_scope, 'normal_and_summary_only', 'parallel usage scope');
-  assert.equal(snap.usage.normal_calls, 1, 'each parallel child runs exactly one model call');
+  const rounds = plan.parallelRounds ?? 1;
+  assert.equal(snap.usage.normal_calls, rounds, 'parallel child normal model calls');
   assert.equal(snap.usage.summary_calls, 0, 'parallel children make no summary call');
-  assert.equal(snap.usage.normal.input_tokens, PARALLEL_CHILD_USAGE.input, 'parallel child input usage');
-  assert.equal(snap.usage.normal.output_tokens, PARALLEL_CHILD_USAGE.output, 'parallel child output usage');
+  assert.equal(snap.usage.normal.input_tokens, PARALLEL_CHILD_USAGE.input * rounds, 'parallel child input usage');
+  assert.equal(snap.usage.normal.output_tokens, PARALLEL_CHILD_USAGE.output * rounds, 'parallel child output usage');
   assert(!snap.report.includes(PARENT_PRIVATE), 'parent private marker reached a child report');
   assert.equal(plan.collected.has(index), false, `parallel index ${index} must be collected only once`);
   plan.collected.add(index);
@@ -1048,7 +1190,7 @@ function assertParallelComplete(plan, ctx) {
   assert.equal(plan.parallelEntered.size, PARALLEL_COUNT, 'six distinct child requests must have arrived');
   assert.deepEqual([...plan.parallelEntered].sort((a, b) => a - b), expected,
     'each parallel index must arrive exactly once');
-  assert.equal(plan.childRequests, PARALLEL_COUNT, 'each parallel child makes exactly one model request');
+  assert.equal(plan.childRequests, PARALLEL_COUNT * (plan.parallelRounds ?? 1), 'parallel child model requests');
   const starts = parallelCallArgs(ctx.history, 'subagent');
   assert.equal(starts.length, PARALLEL_COUNT, 'exactly six subagent starts');
   const tasks = starts.map(args => args.task);
@@ -1150,6 +1292,40 @@ function parallelCase() {
     assert.equal(plan.parallelEntered.size, PARALLEL_COUNT, 'six distinct child indices must have arrived');
     assert.equal(plan.collected.size, PARALLEL_COUNT, 'all six children must be collected');
     await assertParentArchive(project);
+  };
+  return plan;
+}
+
+// Each sibling must arrive in its own real reviewer request before any of the
+// six requests is answered. A shared client request lock cannot pass the gate.
+function decisionParallelCase() {
+  const plan = parallelCase();
+  plan.name = 'chat-decision-parallel-clones';
+  plan.decisionMode = 'on';
+  plan.parallelRounds = 2;
+  plan.expectedReviews = {root: 0, child: PARALLEL_COUNT};
+  plan.reviewBarrier = {sockets: new Set()};
+  const command = index => `printf parallel-${index} > decision-parallel-${index}.txt`;
+  plan.reviews = new Map(Array.from({length: PARALLEL_COUNT}, (_, index) =>
+    [command(index), {role: 'child', answer: false, seen: false}]));
+  const first = plan.stages.child[0];
+  plan.childStageByRound = [
+    {...first, reply: ctx => ctx.call('bash', {command: command(parallelChildIndex(plan, ctx))})},
+    {expectedCalls: ['bash'], usage: PARALLEL_CHILD_USAGE, check: ctx => {
+      assert.equal(callJson(ctx.history, 'bash').exit_code, 0, 'reviewed sibling bash must run once');
+    }, reply: ctx => ctx.text(parallelReport(parallelChildIndex(plan, ctx)))},
+  ];
+  plan.stages.child = Array.from({length: PARALLEL_COUNT * 2}, (_, index) => plan.childStageByRound[index % 2]);
+  plan.verify = async ({code, out, project}) => {
+    assert.equal(code, 0, 'six independent reviewer clients must complete');
+    assert(out.includes(ROOT_ANSWER));
+    assert.equal(plan.roleRequests.root, PARALLEL_COUNT + 1 + PARALLEL_ORDER.length);
+    assert.equal(plan.roleRequests.child, PARALLEL_COUNT * 2);
+    assert.equal(plan.reviewBarrier.sockets.size, PARALLEL_COUNT, 'six simultaneous reviewer connections');
+    assert.equal(plan.collected.size, PARALLEL_COUNT);
+    for (let index = 0; index < PARALLEL_COUNT; index += 1)
+      assert.equal(await readFile(join(project, `decision-parallel-${index}.txt`), 'utf8'), `parallel-${index}`);
+    await assertRootUsage(plan, project);
   };
   return plan;
 }
@@ -1277,6 +1453,8 @@ try {
     childApprovalDenialCase(),
     parallelCase(),
     toolParallelCase(),
+    decisionCase('on'), decisionCase('fail'), decisionCase('off'),
+    decisionParallelCase(),
   ];
   const results = [];
   for (const plan of cases) {
@@ -1308,8 +1486,12 @@ try {
     childDangerousBashDeniedByPrintHost: true,
     parentOnlySessionArchive: true,
     memoryAutoOffNoAuxiliaryRequest: true,
+    decisionRootAndChildReview: true,
+    decisionChildDenyAndFailureLeaveSentinel: true,
+    decisionOffMakesNoHelperRequests: true,
+    parallelIndependentReviewers: PARALLEL_COUNT,
   }, null, 2) + '\n');
-  console.log('PASS subagent owned loopback acceptance: 9 cases (including 6-way model and 4-way tool barriers)');
+  console.log(`PASS subagent owned loopback acceptance: ${cases.length} cases (including 6-way model/reviewer and 4-way tool barriers)`);
 } catch (error) {
   // Assertion messages only; never dump headers, bodies or configuration.
   console.error(`Subagent owned loopback FAIL: ${error?.message ?? 'runner'}`);

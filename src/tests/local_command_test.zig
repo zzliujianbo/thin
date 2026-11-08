@@ -25,7 +25,6 @@ const Fake = struct {
     cancel_on_approval: ?*p.Cancellation = null,
     disconnect: bool = false,
     runtime: ?*r.Runtime = null,
-    timeout_seen: bool = false,
     execute_error: bool = false,
     result_text: []const u8 = &output,
     fn model(raw: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
@@ -39,21 +38,25 @@ const Fake = struct {
         const args = try std.json.parseFromSliceLeaky(struct { command: []const u8 }, alloc, call.arguments, .{});
         try std.testing.expect(args.command.len != 0);
         if (self.prepare_error) return error.BadCommand;
-        return .{ .payload = self, .description = args.command, .explicit_denial = "Fixture requires explicit approval; not executed.", .decision_input = .{ .command = .{ .command = args.command, .max_timeout_ms = 1000 } } };
+        return .{ .payload = self, .description = args.command, .explicit_denial = "Fixture requires explicit approval; not executed.", .decision_input = .{ .command = .{ .command = args.command } } };
     }
-    fn execute(raw: *anyopaque, _: std.mem.Allocator, prepared: r.Prepared, cancel: *const p.Cancellation) !r.Execution {
+    fn execute(raw: *anyopaque, _: std.mem.Allocator, _: r.Prepared, cancel: *const p.Cancellation) !r.Execution {
         const self: *Fake = @ptrCast(@alignCast(raw));
         self.executions += 1;
         if (self.execute_error) return error.CommandFailed;
-        if (prepared.command_timeout) |timeout| self.timeout_seen = timeout == .milliseconds and timeout.milliseconds == 123;
         while (self.block and !cancel.isRequested()) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
         return .{ .text = self.result_text, .cleanup_failed = self.cleanup, .canceled = cancel.isRequested() };
     }
-    fn review(raw: *anyopaque, _: std.mem.Allocator, _: d.Input, _: *const p.Cancellation) !d.Output {
+    fn review(raw: *anyopaque, _: std.mem.Allocator, input: d.Input, _: *const p.Cancellation) !d.Output {
         const self: *Fake = @ptrCast(@alignCast(raw));
+        try std.testing.expect(input == .command);
+        try std.testing.expectEqualStrings("review", input.command.command);
+        try std.testing.expect(input.command.risk == null);
+        try std.testing.expectEqual(@as(usize, 2), @typeInfo(@TypeOf(input.command)).@"struct".field_names.len);
+        try std.testing.expectEqual(@as(usize, 0), self.primary + self.permissions + self.executions);
         self.reviewed += 1;
         if (self.review_error) |err| return err;
-        return .{ .command = .{ .ask = true, .timeout = .{ .milliseconds = 123 } } };
+        return .{ .command = .{ .ask = true } };
     }
     fn authorize(raw: ?*anyopaque, _: r.Permission, _: *const p.Cancellation) !r.Decision {
         const self: *Fake = @ptrCast(@alignCast(raw.?));
@@ -162,7 +165,7 @@ test "local command default approval and explicit denial never execute" {
     }
 }
 
-test "local command decision ask timeout and failure preserve pairing" {
+test "local command decision ask and review failure preserve pairing" {
     for ([_]?anyerror{ null, error.AuxiliaryTimeout, error.CleanupFailed }) |failure| {
         var fake: Fake = .{ .review_error = failure };
         const config = configuration();
@@ -180,7 +183,8 @@ test "local command decision ask timeout and failure preserve pairing" {
             try std.testing.expectEqual(if (err == error.CleanupFailed) error.CleanupFailed else error.DecisionUnavailable, terminal.detail.?);
             try std.testing.expectEqual(@as(usize, 0), fake.executions + fake.permissions);
         } else {
-            try std.testing.expect(fake.timeout_seen);
+            try std.testing.expectEqual(r.Status.success, terminal.status);
+            try std.testing.expectEqual(@as(usize, 1), fake.executions);
             try std.testing.expectEqual(@as(usize, 1), fake.permissions);
         }
     }

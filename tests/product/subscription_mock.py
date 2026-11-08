@@ -33,7 +33,7 @@ class Wire:
 
     def send(self, op, **fields):
         self.next_id += 1
-        raw = json.dumps(dict(v=2, id=self.next_id, op=op, **fields)).encode()
+        raw = json.dumps(dict(v=3, id=self.next_id, op=op, **fields)).encode()
         self.sock.sendall(struct.pack('!I', len(raw)) + raw)
         return self.next_id
 
@@ -147,7 +147,7 @@ def run(app):
         # Same UID is not enough to borrow a different process's controller.
         script = '''import socket,struct,json,sys
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(3);s.connect(sys.argv[1])
-b=json.dumps(dict(v=2,id=1,op="watch",epoch=int(sys.argv[2]))).encode()
+b=json.dumps(dict(v=3,id=1,op="watch",epoch=int(sys.argv[2]))).encode()
 s.sendall(struct.pack("!I",len(b))+b)
 try:
  assert s.recv(1)==b"", "foreign-PID subscription accepted"

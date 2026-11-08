@@ -1,4 +1,4 @@
-//! Thin daemon/session wire protocol v2 (latest-only; see `version`).
+//! Thin daemon/session wire protocol v3 (latest-only; see `version`).
 //!
 //! Ordinary requests receive one response. `watch` switches a dedicated
 //! read-only connection to an ordered sequence of baseline/update frames.
@@ -26,12 +26,11 @@ const line_stats = @import("../util/line_stats.zig");
 const codex_login = @import("../core/codex_login.zig");
 const memory_status = @import("../core/memory_status.zig");
 
-/// Private daemon/worker IPC version. v2 is the lossless selective-ACK wire
-/// (optional `first` on ACK, `since` resume and the ordered history/live
-/// union). Peers are matched exactly: there is no v1 compatibility path, no
-/// migration and no automatic worker restart. A mismatched peer is refused
-/// before it is adopted, displayed or granted a controller claim.
-pub const version: u16 = 2;
+/// Private daemon/worker IPC version. v3 adds the typed Memory completion event
+/// to the v2 lossless selective-ACK stream. Peers are matched exactly: there is
+/// no older-wire compatibility path, migration or automatic worker restart.
+/// A mismatched peer is refused before adoption, display or controller claim.
+pub const version: u16 = 3;
 /// Same bound as one frame; responses are checked before writeFrame.
 pub const max_response = unix.max_frame_len;
 /// Prompt, queue entry, tool result and notice text.
@@ -893,6 +892,10 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("t", "compaction_failed");
             try out.field("code", failureCode(err));
         },
+        .memory_completed => |terminal| {
+            try out.field("t", "memory_completed");
+            try encodeMemoryTerminalFields(&out, terminal);
+        },
         .finished => |terminal| {
             try out.field("t", "finished");
             try out.field("status", terminal.status);
@@ -1091,6 +1094,27 @@ pub fn encodeSubagentView(out: *Out, view: @import("../core/subagent_status.zig"
     try out.endObject();
 }
 
+/// Memory summaries use the same fixed-size, single-line normalization on
+/// snapshots and events. Reject malformed owned values rather than emitting a
+/// wire frame that the client must reject (or slicing past the fixed buffer).
+fn validMemorySummary(summary: *const memory_status.Summary) bool {
+    if (summary.len > summary.buf.len) return false;
+    const text = summary.text();
+    if (!std.unicode.utf8ValidateSlice(text)) return false;
+    var normalized: memory_status.Summary = .{};
+    normalized.append(text);
+    return std.mem.eql(u8, normalized.text(), text);
+}
+
+fn encodeMemoryTerminalFields(out: *Out, terminal: memory_status.Terminal) !void {
+    if (!validMemorySummary(&terminal.summary)) return error.BadRequest;
+    try out.field("id", terminal.id);
+    try out.field("result", @tagName(terminal.result));
+    try out.field("failure", if (terminal.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
+    try out.field("saved_count", terminal.saved_count);
+    try out.field("summary", terminal.summary.text());
+}
+
 pub fn encodeMemoryView(out: *Out, view: memory_status.View) !void {
     try out.beginObject("memory");
     try out.field("enabled", view.enabled);
@@ -1104,11 +1128,7 @@ pub fn encodeMemoryView(out: *Out, view: memory_status.View) !void {
     } else try out.field("active", @as(?u8, null));
     if (view.last_terminal) |terminal| {
         try out.beginObject("last_terminal");
-        try out.field("id", terminal.id);
-        try out.field("result", @tagName(terminal.result));
-        try out.field("failure", if (terminal.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
-        try out.field("saved_count", terminal.saved_count);
-        try out.field("summary", terminal.summary.text());
+        try encodeMemoryTerminalFields(out, terminal);
         try out.endObject();
     } else try out.field("last_terminal", @as(?u8, null));
     try out.endObject();
@@ -1321,6 +1341,47 @@ fn decodeBlock(value: std.json.Value) !p.Block {
     return error.BadRequest;
 }
 
+/// Closed Memory terminal fields follow the snapshot decoder's exact policy:
+/// known enum names, an explicitly nullable failure, and a bounded summary
+/// which is already UTF-8 and unchanged by Summary's display sanitization.
+fn decodeMemoryTerminal(object: std.json.ObjectMap) !memory_status.Terminal {
+    var keys = object.iterator();
+    while (keys.next()) |entry| {
+        const key = entry.key_ptr.*;
+        var known = false;
+        for ([_][]const u8{ "t", "id", "result", "failure", "saved_count", "summary", "epoch", "seq", "disp_trunc", "canon_complete" }) |allowed| {
+            if (std.mem.eql(u8, key, allowed)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return error.BadRequest;
+    }
+    // `seq` is appended by watchEvents; the other optional fields are the
+    // standard display envelope. Present metadata must not be null/mistyped.
+    if (object.contains("epoch")) _ = try requireU64(object, "epoch");
+    if (object.contains("seq")) _ = try requireU64(object, "seq");
+    if (object.contains("disp_trunc")) _ = try requireBool(object, "disp_trunc");
+    if (object.contains("canon_complete")) _ = try requireBool(object, "canon_complete");
+    const failure: ?memory_status.Failure = switch (try requireValue(object, "failure")) {
+        .null => null,
+        .string => |name| std.meta.stringToEnum(memory_status.Failure, name) orelse return error.BadRequest,
+        else => return error.BadRequest,
+    };
+    const text = try requireText(object, "summary");
+    var summary: memory_status.Summary = .{};
+    if (text.len > summary.buf.len or !std.unicode.utf8ValidateSlice(text)) return error.BadRequest;
+    summary.append(text);
+    if (!std.mem.eql(u8, summary.text(), text)) return error.BadRequest;
+    return .{
+        .id = try requireU64(object, "id"),
+        .result = try requireEnum(memory_status.Result, object, "result"),
+        .failure = failure,
+        .saved_count = try requireU32(object, "saved_count"),
+        .summary = summary,
+    };
+}
+
 /// Decode one encoded event into a borrowed `r.Event` plus the document that
 /// owns every slice. Blocks are allocated from the document arena, so text and
 /// blocks share one lifetime and an error path frees all of them. The client
@@ -1455,6 +1516,8 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
             canonical_complete = false;
         }
         event = .{ .assistant_committed = blocks };
+    } else if (std.mem.eql(u8, kind, "memory_completed")) {
+        event = .{ .memory_completed = try decodeMemoryTerminal(object) };
     } else if (std.mem.eql(u8, kind, "finished")) {
         event = .{ .finished = try decodeTerminalChecked(object) };
     } else return error.BadRequest;
@@ -1695,19 +1758,19 @@ test "tool_view decodes its display fields instead of an unsupported event" {
 test "u64 values above i64.max survive number_string decoding" {
     const a = std.testing.allocator;
     const high = std.math.maxInt(u64);
-    var request = try parseRequest(a, "{\"v\":2,\"id\":18446744073709551615,\"op\":\"ping\"}");
+    var request = try parseRequest(a, "{\"v\":3,\"id\":18446744073709551615,\"op\":\"ping\"}");
     defer request.deinit();
     try std.testing.expectEqual(high, request.id);
     try std.testing.expectEqual(Op.ping, request.op);
 
     // Quoted digits, floats, exponents and negatives are not integers.
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":2,\"id\":\"18446744073709551615\",\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":2,\"id\":1.0,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":2,\"id\":1e3,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":2,\"id\":-1,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":2,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":2,\"id\":0,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":2,\"id\":1,\"op\":\"ping\",\"op\":\"list\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":\"18446744073709551615\",\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":1.0,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":1e3,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":-1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":0,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":1,\"op\":\"ping\",\"op\":\"list\"}"));
 
     const encoded = try encodeEvent(a, .{ .tool_started = .{
         .id = high,
@@ -1726,7 +1789,7 @@ test "u64 values above i64.max survive number_string decoding" {
 
 test "numeric and enum request fields reject wrong types instead of defaulting" {
     const a = std.testing.allocator;
-    var request = try parseRequest(a, "{\"v\":2,\"id\":2,\"op\":\"effort\",\"epoch\":\"7\",\"level\":true}");
+    var request = try parseRequest(a, "{\"v\":3,\"id\":2,\"op\":\"effort\",\"epoch\":\"7\",\"level\":true}");
     defer request.deinit();
     try std.testing.expectError(error.BadRequest, request.u64Field("epoch"));
     try std.testing.expectError(error.BadRequest, request.u64Field("absent"));
@@ -1740,16 +1803,16 @@ test "numeric and enum request fields reject wrong types instead of defaulting" 
 
 test "proxy_address accepts an empty clear and maps endpoint rejections to invalid_input" {
     const a = std.testing.allocator;
-    var cleared = try parseRequest(a, "{\"v\":2,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}");
+    var cleared = try parseRequest(a, "{\"v\":3,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}");
     defer cleared.deinit();
     try std.testing.expectEqual(Op.proxy_address, cleared.op);
     try std.testing.expectEqualStrings("", try cleared.stringField("value", 320));
 
     // A missing, null or non-string `value` is a bad request, never a clear.
     for ([_][]const u8{
-        "{\"v\":2,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1}",
-        "{\"v\":2,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
-        "{\"v\":2,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
+        "{\"v\":3,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1}",
+        "{\"v\":3,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
+        "{\"v\":3,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
     }) |json| {
         var request = try parseRequest(a, json);
         defer request.deinit();
@@ -1764,7 +1827,7 @@ test "proxy_address accepts an empty clear and maps endpoint rejections to inval
 test "proxy_model request keeps the full u64 epoch and rejects loose parameters" {
     const a = std.testing.allocator;
     const high: u64 = @as(u64, std.math.maxInt(i64)) + 7;
-    const body = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":3,\"op\":\"proxy_model\",\"epoch\":{d},\"name\":\"opencode-go/deepseek-v3\",\"enabled\":true}}", .{high});
+    const body = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":3,\"op\":\"proxy_model\",\"epoch\":{d},\"name\":\"opencode-go/deepseek-v3\",\"enabled\":true}}", .{ version, high });
     defer a.free(body);
     var request = try parseRequest(a, body);
     defer request.deinit();
@@ -1776,13 +1839,13 @@ test "proxy_model request keeps the full u64 epoch and rejects loose parameters"
     try std.testing.expectEqual(true, try request.requiredBool("enabled"));
 
     // Absent, stringly or numeric enable flags are bad requests, not defaults.
-    var loose = try parseRequest(a, "{\"v\":2,\"id\":4,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}");
+    var loose = try parseRequest(a, "{\"v\":3,\"id\":4,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}");
     defer loose.deinit();
     try std.testing.expectError(error.BadRequest, loose.requiredBool("enabled"));
-    var stringly = try parseRequest(a, "{\"v\":2,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}");
+    var stringly = try parseRequest(a, "{\"v\":3,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}");
     defer stringly.deinit();
     try std.testing.expectError(error.BadRequest, stringly.requiredBool("enabled"));
-    var numeric_epoch = try parseRequest(a, "{\"v\":2,\"id\":6,\"op\":\"proxy_model\",\"epoch\":\"1\",\"name\":\"p/m\",\"enabled\":false}");
+    var numeric_epoch = try parseRequest(a, "{\"v\":3,\"id\":6,\"op\":\"proxy_model\",\"epoch\":\"1\",\"name\":\"p/m\",\"enabled\":false}");
     defer numeric_epoch.deinit();
     try std.testing.expectError(error.BadRequest, numeric_epoch.u64Field("epoch"));
 }
@@ -1933,7 +1996,7 @@ test "terminal events require complete usage and keep tool timing and keys" {
 
 test "login key copy is wiped before the request arena is released" {
     const a = std.testing.allocator;
-    var request = try parseRequest(a, "{\"v\":2,\"id\":1,\"op\":\"login\",\"key\":\"sk-secret\"}");
+    var request = try parseRequest(a, "{\"v\":3,\"id\":1,\"op\":\"login\",\"key\":\"sk-secret\"}");
     defer request.deinit();
     const secret = request.field("key").?.string;
     try std.testing.expectEqualStrings("sk-secret", secret);
@@ -1952,15 +2015,15 @@ test "event encoding round-trips display text and drops inbox pointers" {
     try std.testing.expect(decoded.event.permission.interrupt == null);
 }
 
-test "wire version 2 is required and v1 packets are rejected" {
+test "wire version 3 is required and older packets are rejected" {
     const a = std.testing.allocator;
-    try std.testing.expectEqual(@as(u16, 2), version);
-    var accepted = try parseRequest(a, "{\"v\":2,\"id\":1,\"op\":\"ping\"}");
+    try std.testing.expectEqual(@as(u16, 3), version);
+    var accepted = try parseRequest(a, "{\"v\":3,\"id\":1,\"op\":\"ping\"}");
     accepted.deinit();
-    // No compatibility path: a v1 packet is malformed for this wire and must be
-    // refused before any session, display or controller state is touched.
+    // No compatibility path for old or future peers.
     try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":1,\"id\":1,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":2,\"id\":1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"ping\"}"));
     // Every reply envelope carries the same exact version.
     var out = Out.init(a);
     defer out.deinit();
@@ -1969,7 +2032,7 @@ test "wire version 2 is required and v1 packets are rejected" {
     defer a.free(bytes);
     var doc = try parseWholeReply(a, bytes);
     defer doc.deinit();
-    try std.testing.expectEqual(@as(i64, 2), doc.value.object.get("v").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), doc.value.object.get("v").?.integer);
 }
 
 test "response builder rejects unbalanced output and oversized keys" {
@@ -2155,6 +2218,77 @@ test "wire error codes keep unsupported distinct from internal" {
     try std.testing.expectEqual(.unsupported, errorCode(error.Unsupported));
     // Everything unlisted still falls back to the internal category.
     try std.testing.expectEqual(.internal, errorCode(error.CleanupFailed));
+}
+
+test "memory completion wire roundtrip owns bounded terminal values and full u64" {
+    const a = std.testing.allocator;
+    var terminal: memory_status.Terminal = .{ .id = std.math.maxInt(u64), .result = .failed, .failure = .storage, .saved_count = std.math.maxInt(u32) };
+    terminal.summary.append("中文 · saved");
+    const wire = try encodeEventMeta(a, .{ .memory_completed = terminal }, .{ .epoch = std.math.maxInt(u64) });
+    defer a.free(wire);
+    var decoded = try decodeEvent(a, wire);
+    const owned = decoded.event.memory_completed;
+    try std.testing.expectEqual(std.math.maxInt(u64), decoded.epoch);
+    decoded.deinit();
+    try std.testing.expectEqual(terminal.id, owned.id);
+    try std.testing.expectEqual(terminal.result, owned.result);
+    try std.testing.expectEqual(terminal.failure, owned.failure);
+    try std.testing.expectEqual(terminal.saved_count, owned.saved_count);
+    try std.testing.expectEqualStrings(terminal.summary.text(), owned.summary.text());
+
+    // Exact capacity and a multi-byte ending remain lossless.
+    var boundary: memory_status.Terminal = .{ .id = 9007199254740993, .result = .saved };
+    const ascii: [253]u8 = @splat('x');
+    boundary.summary.append(&ascii);
+    boundary.summary.append("中"); // separate entries need a four-byte separator
+    try std.testing.expectEqual(@as(usize, 253), boundary.summary.text().len);
+    var full: memory_status.Terminal = .{ .id = boundary.id, .result = .saved };
+    var text: [256]u8 = @splat('x');
+    @memcpy(text[253..256], "中");
+    full.summary.append(&text);
+    const full_wire = try encodeEvent(a, .{ .memory_completed = full });
+    defer a.free(full_wire);
+    var full_decoded = try decodeEvent(a, full_wire);
+    defer full_decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 256), full_decoded.event.memory_completed.summary.text().len);
+    try std.testing.expectEqualStrings(&text, full_decoded.event.memory_completed.summary.text());
+}
+
+test "memory completion rejects missing unknown malformed and unsafe fields" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"t\":\"memory_completed\",\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"saved_count\":0,\"summary\":\"\"}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"summary\":\"\"}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\",\"extra\":1}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"unknown\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"failed\",\"failure\":\"unknown\",\"saved_count\":0,\"summary\":\"\"}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":false,\"saved_count\":0,\"summary\":\"\"}",
+        "{\"t\":\"memory_completed\",\"id\":\"1\",\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
+        "{\"t\":\"memory_completed\",\"id\":18446744073709551616,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":4294967296,\"summary\":\"\"}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"bad\\u001b\"}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"a\\nb\"}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\",\"seq\":null}",
+        "{\"t\":\"memory_completed\",\"id\":1,\"id\":2,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
+    }) |json| try std.testing.expectError(error.BadRequest, decodeEvent(a, json));
+    const too_long: [257]u8 = @splat('x');
+    const wire = try std.fmt.allocPrint(a, "{{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"{s}\"}}", .{&too_long});
+    defer a.free(wire);
+    try std.testing.expectError(error.BadRequest, decodeEvent(a, wire));
+    try std.testing.expectError(error.BadRequest, decodeEvent(a, "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\xff\"}"));
+}
+
+test "memory completion decode preserves allocation failure" {
+    const Scenario = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var decoded = try decodeEvent(a, "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"skipped\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}");
+            defer decoded.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
 
 test "wire error codes classify configuration rejections as invalid input" {

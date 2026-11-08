@@ -965,8 +965,7 @@ test "only a self-terminated worker counts as a confirmed clean stop" {
 
 test "settings reply budgets are read only from a correlated successful reply" {
     const a = testing.allocator;
-    const ok_reply =
-        "{\"v\":2,\"id\":1,\"ok\":true,\"limits\":{\"cleanup_grace_ms\":4000,\"cleanup_timeout_ms\":6000}}";
+    const ok_reply = std.fmt.comptimePrint("{{\"v\":{d},\"id\":1,\"ok\":true,\"limits\":{{\"cleanup_grace_ms\":4000,\"cleanup_timeout_ms\":6000}}}}", .{daemon_protocol.version});
     {
         var doc = try parseReply(a, ok_reply, settings_request_id);
         defer doc.deinit();
@@ -979,21 +978,21 @@ test "settings reply budgets are read only from a correlated successful reply" {
     try testing.expectError(error.BadResponse, parseReply(a, ok_reply, shutdown_request_id));
     try testing.expectError(error.BadResponse, parseReply(
         a,
-        "{\"v\":2,\"id\":2,\"ok\":false,\"err\":\"rejected\"}",
+        std.fmt.comptimePrint("{{\"v\":{d},\"id\":2,\"ok\":false,\"err\":\"rejected\"}}", .{daemon_protocol.version}),
         shutdown_request_id,
     ));
-    try testing.expectError(error.BadResponse, parseReply(a, "{\"v\":2,\"id\":0,\"ok\":true}", shutdown_request_id));
+    try testing.expectError(error.BadResponse, parseReply(a, std.fmt.comptimePrint("{{\"v\":{d},\"id\":0,\"ok\":true}}", .{daemon_protocol.version}), shutdown_request_id));
     try testing.expectError(error.BadResponse, parseReply(a, "", settings_request_id));
     try testing.expectError(error.BadResponse, parseReply(a, "[]", settings_request_id));
 
     // A reply without the two numbers, or with unusable ones, yields no budget.
-    const missing = try std.json.parseFromSlice(std.json.Value, a, "{\"v\":2,\"id\":1,\"ok\":true,\"limits\":{\"command_timeout_ms\":10000}}", .{});
+    const missing = try std.json.parseFromSlice(std.json.Value, a, std.fmt.comptimePrint("{{\"v\":{d},\"id\":1,\"ok\":true,\"limits\":{{\"command_timeout_ms\":10000}}}}", .{daemon_protocol.version}), .{});
     defer missing.deinit();
     try testing.expect(replyCleanupLimits(missing.value) == null);
-    const malformed = try std.json.parseFromSlice(std.json.Value, a, "{\"v\":2,\"id\":1,\"ok\":true,\"limits\":{\"cleanup_grace_ms\":-1,\"cleanup_timeout_ms\":6000}}", .{});
+    const malformed = try std.json.parseFromSlice(std.json.Value, a, std.fmt.comptimePrint("{{\"v\":{d},\"id\":1,\"ok\":true,\"limits\":{{\"cleanup_grace_ms\":-1,\"cleanup_timeout_ms\":6000}}}}", .{daemon_protocol.version}), .{});
     defer malformed.deinit();
     try testing.expect(replyCleanupLimits(malformed.value) == null);
-    const too_large = try std.json.parseFromSlice(std.json.Value, a, "{\"v\":2,\"id\":1,\"ok\":true,\"limits\":{\"cleanup_grace_ms\":4000,\"cleanup_timeout_ms\":60000000}}", .{});
+    const too_large = try std.json.parseFromSlice(std.json.Value, a, std.fmt.comptimePrint("{{\"v\":{d},\"id\":1,\"ok\":true,\"limits\":{{\"cleanup_grace_ms\":4000,\"cleanup_timeout_ms\":60000000}}}}", .{daemon_protocol.version}), .{});
     defer too_large.deinit();
     try testing.expect(replyCleanupLimits(too_large.value) == null);
 }

@@ -62,14 +62,13 @@ pub const schemas = [_]p.ToolSchema{
 // The configured reviewer, not the legacy shell classifier, owns the extra
 // command-confirmation decision. These static variants add no prompt allocation
 // and preserve tool IDs, order and parameter schemas.
-const decision_bash_description = "Run bash in the startup project; cwd changes do not persist. The configured reviewer's ask=true requires approval for this call; ask=false removes the extra command-approval prompt. The reviewer also chooses the command deadline. Unavailable or invalid review pauses without executing. Denial means no execution. Hard validation, task deadlines, cancellation and output limits apply. stdout/stderr retain bounded head/tail, not full logs.";
+const decision_bash_description = "Run bash in the startup project; cwd changes do not persist. The configured reviewer's ask=true requires approval for this call; ask=false removes the extra command-approval prompt. Review decides only whether to ask. Unavailable or invalid review pauses without executing. Denial means no execution. timeout_ms uses the host default when omitted and must not exceed the host maximum; built-in default is 5 minutes. Hard validation, task deadlines, cancellation and output limits apply. stdout/stderr retain bounded head/tail, not full logs.";
 
 /// Background variants only appear when the host supplied a background service
 /// to a root Tools. They state that the bounded timeout covers startup only, so
-/// neither the built-in 5 minutes nor a reviewer deadline is mistaken for the
-/// lifetime of a handed-off service.
+/// the command timeout is not mistaken for the lifetime of a handed-off service.
 const background_bash_description = bash_description ++ " background=true starts a managed service in this Thin instance: the call returns after a bounded startup wait with an id; timeout_ms bounds only that startup wait, not how long the service keeps running. Manage it with the background tool.";
-const decision_background_bash_description = decision_bash_description ++ " background=true starts a managed service in this Thin instance: the reviewer deadline and timeout_ms bound only the bounded startup wait; after handoff the service keeps running until it is stopped or Thin exits. Manage it with the background tool.";
+const decision_background_bash_description = decision_bash_description ++ " background=true starts a managed service in this Thin instance: timeout_ms bounds only the startup wait; after handoff the service keeps running until it is stopped or Thin exits. Manage it with the background tool.";
 const bash_background_parameters_json =
     \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},"background":{"type":"boolean"}},"required":["command"],"additionalProperties":false}
 ;
@@ -745,8 +744,6 @@ pub const Tools = struct {
         const review: ?decision.Input = switch (action.*) {
             .bash => |b| .{ .command = .{
                 .command = b.command,
-                .proposed_timeout_ms = b.timeout_ms,
-                .max_timeout_ms = self.config.limits.command_max_timeout_ms,
                 .risk = if (risk) |finding| finding.label else null,
             } },
             else => null,
@@ -758,17 +755,13 @@ pub const Tools = struct {
     fn executePrepared(context_: *anyopaque, a: std.mem.Allocator, prepared: runtime.Prepared, cancel: *const p.Cancellation) !Execution {
         const self: *Tools = @ptrCast(@alignCast(context_));
         const action: *const Action = @ptrCast(@alignCast(prepared.payload));
-        return self.executeWithTimeout(a, action.*, prepared.command_timeout, cancel);
+        return self.execute(a, action.*, cancel);
     }
 
     /// Explicit approval is a Runtime responsibility. Never call this for an
     /// operation requiring approval before it is granted. This function does no terminal I/O.
     /// 按 Action 执行具体副作用，并把结果编码为 JSON 文本；本函数不做任何终端输入输出。
     pub fn execute(self: *Tools, a: std.mem.Allocator, action: Action, cancel: *const p.Cancellation) !Execution {
-        return self.executeWithTimeout(a, action, null, cancel);
-    }
-
-    fn executeWithTimeout(self: *Tools, a: std.mem.Allocator, action: Action, timeout: ?decision.Timeout, cancel: *const p.Cancellation) !Execution {
         // Readiness/poison and argument guards are pure and precede all I/O.
         try self.checkImageAction(action);
         try self.checkAvailableActions(action);
@@ -844,10 +837,7 @@ pub const Tools = struct {
                     const service = self.background orelse return error.BackgroundDisabled;
                     if (self.parentChannelActive()) return error.BackgroundDisabled;
                     try service.checkReady();
-                    const startup_ms: u32 = if (timeout) |policy| switch (policy) {
-                        .none => self.config.limits.command_timeout_ms,
-                        .milliseconds => |ms| if (ms == 0 or ms > self.config.limits.command_max_timeout_ms) return error.InvalidTimeout else ms,
-                    } else b.timeout_ms orelse self.config.limits.command_timeout_ms;
+                    const startup_ms = b.timeout_ms orelse self.config.limits.command_timeout_ms;
                     if (cancel.isRequested()) return error.Canceled;
                     // Start and handoff happen inside this call; the mutation
                     // gate is released when it returns, never held across the
@@ -862,12 +852,8 @@ pub const Tools = struct {
                     return mapBackgroundResult(started, true);
                 }
                 // 超时、取消与输出上限都交给 process.run；返回的标记用于区分失败原因。
-                const limit: ?u32 = if (timeout) |policy| switch (policy) {
-                    .none => null,
-                    .milliseconds => |ms| if (ms == 0 or ms > self.config.limits.command_max_timeout_ms) return error.InvalidTimeout else ms,
-                } else b.timeout_ms orelse self.config.limits.command_timeout_ms;
                 const result = try process.run(a, self.root.io, self.root.path, b.command, self.environment, .{
-                    .timeout_ms = limit,
+                    .timeout_ms = b.timeout_ms orelse self.config.limits.command_timeout_ms,
                     .output_bytes = self.config.limits.output_bytes,
                     .term_grace_ms = self.config.limits.cleanup_grace_ms,
                     .cleanup_timeout_ms = self.config.limits.cleanup_timeout_ms,
@@ -1102,6 +1088,9 @@ test "tool descriptions distinguish configured decision review from legacy appro
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=true requires approval for this call") != null);
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=false removes the extra command-approval prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "Unavailable or invalid review pauses without executing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "Review decides only whether to ask") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "timeout_ms uses the host default when omitted and must not exceed the host maximum; built-in default is 5 minutes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "reviewer deadline") == null);
     for ([_]usize{ 0, 1, 3 }) |i| try std.testing.expectEqualStrings(plain[i].description, reviewed[i].description);
     for ([_]bool{ false, true }) |review| {
         const selected = schemasForDecision(review);
@@ -1583,14 +1572,18 @@ test "background capability is root-only approved and never re-encoded" {
     try std.testing.expect(!started.memory_evidence);
     try std.testing.expect(!started.is_error);
 
-    // timeout_ms and a reviewer deadline bound only the startup wait; review
-    // choosing none still uses the configured finite command timeout.
-    var action = Action{ .bash = .{ .command = "svc", .background = true, .timeout_ms = 4321 } };
-    _ = try Tools.executePrepared(&tools, a, .{ .payload = &action, .description = "x" }, &cancel);
-    try std.testing.expectEqual(@as(u32, 4321), fake.last_startup_ms);
-    var none_action = Action{ .bash = .{ .command = "svc", .background = true, .timeout_ms = 9999 } };
-    _ = try Tools.executePrepared(&tools, a, .{ .payload = &none_action, .description = "x", .command_timeout = .none }, &cancel);
-    try std.testing.expectEqual(@as(u32, config.limits.command_timeout_ms), fake.last_startup_ms);
+    // Explicit timeout_ms bounds only the startup wait, just like the default.
+    for ([_]u32{ 1, 4321, config.limits.command_max_timeout_ms }) |timeout_ms| {
+        const args = try std.fmt.allocPrint(a, "{{\"command\":\"svc\",\"background\":true,\"timeout_ms\":{d}}}", .{timeout_ms});
+        const explicit = try Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = args });
+        _ = try Tools.executePrepared(&tools, a, explicit, &cancel);
+        try std.testing.expectEqual(timeout_ms, fake.last_startup_ms);
+    }
+    const calls_before_invalid = fake.calls;
+    try std.testing.expectError(error.InvalidCommandTimeout, Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"svc\",\"background\":true,\"timeout_ms\":0}" }));
+    const over_max = try std.fmt.allocPrint(a, "{{\"command\":\"svc\",\"background\":true,\"timeout_ms\":{d}}}", .{@as(u64, config.limits.command_max_timeout_ms) + 1});
+    try std.testing.expectError(error.InvalidCommandTimeout, Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = over_max }));
+    try std.testing.expectEqual(calls_before_invalid, fake.calls);
 
     // stop returns the service's terminal state verbatim; stopping one service
     // is not caller cancellation and must not mark this Q&A canceled.

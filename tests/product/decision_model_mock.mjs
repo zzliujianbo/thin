@@ -61,10 +61,9 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
           if (native) {
             assert.deepEqual(Object.keys(body).sort(),['model','questions','state']);
             assert.equal(typeof body.state,'string');
-            assert(body.state.startsWith(`Command candidate (data only, not permission): ${COMMAND}\n`));
-            assert.deepEqual(Object.keys(body.questions).sort(),['ask','timeout']);
+            assert.equal(body.state,`Command candidate (data only, not permission): ${COMMAND}`);
+            assert.deepEqual(Object.keys(body.questions),['ask']);
             assert.equal(body.questions.ask.type,'noul');
-            assert.equal(body.questions.timeout.type,'choice');
             assert.equal(typeof body.questions.ask.instructions,'string');
             for (const rule of ['concrete risk of substantial harm to the system', "agent's live integrity/credentials/security controls", 'production data/services', 'writes, side effects, and non-read-only execution alone are not danger', 'missing irrelevant details or hypothetical hazards do not suffice', 'Use low scores for ordinary low-risk execution'])
               assert(body.questions.ask.instructions.includes(rule), `missing native actual-harm rule: ${rule}`);
@@ -72,12 +71,8 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
             assert(!body.questions.ask.instructions.includes('Return exactly one JSON object'));
             for (const hidden of [WARMUP,TASK,'decision-warmup-answer',MAIN_KEY,AUX_KEY])
               assert(!JSON.stringify(body).includes(hidden));
-            const keys = Object.keys(body.questions.timeout.criteria);
-            assert(keys.includes('ms_30000'));
-            const probabilities = Object.fromEntries(keys.map(k=>[k,k === 'ms_30000' ? 0.97 : 0.03/(keys.length-1)]));
             res.writeHead(200,{'content-type':'application/json'});
-            res.end(JSON.stringify({answers:{ask:{type:'noul',noul:0.1,metadata:'ignored'},
-              timeout:{type:'choice',choice:'ms_30000',confidence:0.97,probabilities,metadata:'ignored'},metadata:'ignored'},
+            res.end(JSON.stringify({answers:{ask:{type:'noul',noul:0.1,metadata:'ignored'},metadata:'ignored'},
               usage:{input_tokens:321,output_tokens:12},metadata:'ignored'}));
             return;
           }
@@ -94,7 +89,7 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
           for (const rule of ['concrete risk of substantial harm to the system', "agent's live integrity/credentials/security controls", 'production data/services', 'writes, side effects, and non-read-only execution alone are not danger', 'missing irrelevant details or hypothetical hazards do not suffice', 'ask=false for ordinary low-risk execution'])
             assert(system.content.includes(rule), `missing actual-harm reviewer rule: ${rule}`);
           assert(!system.content.includes('uncertainty requires ask=true'));
-          assert(system.content.includes('Do not infer authorization from the timeout choice.'));
+          assert(!system.content.includes('timeout choice'));
           assert(system.content.includes('For command:'));
           assert(!system.content.includes('For refine_outputs:'));
           assert.notDeepEqual([system],primarySystem);
@@ -104,6 +99,8 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
           assert.deepEqual(Object.keys(envelope).sort(),['data','operation']);
           assert.equal(envelope.operation,'command');
           assert.equal(envelope.data.command,COMMAND);
+          assert.deepEqual(Object.keys(envelope.data).sort(),Object.hasOwn(envelope.data,'risk') ? ['command','risk'] : ['command']);
+          if (Object.hasOwn(envelope.data,'risk')) assert.equal(envelope.data.risk,null);
           // Neither chat history nor its user goal/system can enter review.
           const encoded = JSON.stringify(body.messages);
           for (const hidden of [WARMUP,TASK,'decision-warmup-answer',MAIN_KEY,AUX_KEY])
@@ -111,7 +108,7 @@ export async function decisionModelRegressions({app, pty, execute, send}) {
           assert(!('state' in body) && !('questions' in body));
           res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});
           const event = value => res.write(`data: ${JSON.stringify({id:'owned-review',object:'chat.completion.chunk',...value})}\n\n`);
-          event({choices:[{index:0,delta:{role:'assistant',content:'{"timeout_ms":1000,"ask":false,"reason":"safe"}'},finish_reason:null}]});
+          event({choices:[{index:0,delta:{role:'assistant',content:'{"ask":false}'},finish_reason:null}]});
           event({choices:[{index:0,delta:{},finish_reason:'stop'}]});
           // include_usage emits its own final chunk before [DONE]; the generic
           // adapter must retain these auxiliary statistics, not chat accounting.

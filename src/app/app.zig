@@ -21,6 +21,7 @@ const ImageClient = @import("image_client.zig").Client;
 const image_setup = @import("image_setup.zig");
 const knowledge = @import("../core/knowledge.zig");
 const MemoryCoordinator = @import("memory_service.zig").Coordinator;
+const MemoryNotifications = @import("memory_notifications.zig").Queue;
 const subagent_service = @import("subagent_service.zig");
 const SubagentService = subagent_service.SubagentService;
 const background_service = @import("background_service.zig");
@@ -152,16 +153,21 @@ pub const App = struct {
     /// Duplicate an already anchored project; never re-open its replaceable
     /// pathname during activation. parsed is consumed on success AND failure.
     pub fn initConfiguredAnchored(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
-        return initConfiguredRoot(a, io, environ, root.path, root, null, host, parsed);
+        return initConfiguredRoot(a, io, environ, root.path, root, null, host, parsed, null);
     }
 
     /// Delayed activation must retain the Auth Store's startup pathname in the
     /// SAME lexical namespace as root, not rediscover a replaced HOME path.
     pub fn initConfiguredAnchoredAuth(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, protected_auth: []const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
-        return initConfiguredRoot(a, io, environ, root.path, root, protected_auth, host, parsed);
+        return initConfiguredRoot(a, io, environ, root.path, root, protected_auth, host, parsed, null);
     }
 
-    fn initConfiguredRoot(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, anchored: ?*const fs.Root, protected_auth: ?[]const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
+    /// Session queue must be bound before initial core snapshot failures.
+    pub fn initConfiguredAnchoredAuthWithNotifications(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, protected_auth: []const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config), queue: ?*MemoryNotifications) !*App {
+        return initConfiguredRoot(a, io, environ, root.path, root, protected_auth, host, parsed, queue);
+    }
+
+    fn initConfiguredRoot(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, anchored: ?*const fs.Root, protected_auth: ?[]const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config), queue: ?*MemoryNotifications) !*App {
         var owned = parsed;
         errdefer cfg.release(&owned);
         if (owned.value.selection_pending) return error.DefaultModelUnavailable;
@@ -263,6 +269,7 @@ pub const App = struct {
 
         self.memory_coordinator = try self.createMemoryCoordinator(self.config.value, environ);
         errdefer self.memory_coordinator.deinit();
+        self.memory_coordinator.bindNotifications(queue);
         self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
         if (self.decision_client) |decision| decision.diagnostics = self.journal.diagnosticSink();
         // Only small core is frozen into the initial prefix. Task-local memory
@@ -290,6 +297,12 @@ pub const App = struct {
         self.runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieveMemory, .submit_fn = submitMemory, .check_fn = memorySafe };
         self.recordSelection();
         return self;
+    }
+
+    /// A Session binds its heap-stable completion queue before any Memory job.
+    /// Standalone Apps intentionally leave the optional sink unset.
+    pub fn bindMemoryNotifications(self: *App, queue: *MemoryNotifications) void {
+        self.memory_coordinator.bindNotifications(queue);
     }
 
     pub fn memoryView(self: *const App) @import("../core/memory_status.zig").View {
@@ -332,9 +345,9 @@ pub const App = struct {
             filtered.add(source.kind, source.text);
         }
         if (capture.incomplete) filtered.incomplete = true;
-        _ = self.memory_coordinator.enqueueCopy(&filtered, protocol, self.journal.memoryDiagnosticSink()) catch |err| {
-            self.memory_coordinator.reportFailure(err);
-        };
+        // enqueueCopy owns admission diagnostics, failure state and the single
+        // completion; reporting it again would create a duplicate notice.
+        _ = self.memory_coordinator.enqueueCopy(&filtered, protocol, self.journal.memoryDiagnosticSink()) catch {};
     }
 
     fn imageService(self: *App) ?image.Service {
@@ -399,7 +412,14 @@ pub const App = struct {
             };
         }
         const source: ?codex_auth.CredentialSource = if (needs_source) try self.ensureCodexSource(environ) else null;
-        return MemoryCoordinator.createWithCodexSource(self.allocator, self.root.io, &self.root, config, environ, source);
+        const coordinator = try MemoryCoordinator.createWithCodexSource(self.allocator, self.root.io, &self.root, config, environ, source);
+        coordinator.secret_guard = .{ .context = &self.journal, .contains_fn = journalContainsSecret };
+        return coordinator;
+    }
+
+    fn journalContainsSecret(raw: *anyopaque, text: []const u8) bool {
+        const journal: *Journal = @ptrCast(@alignCast(raw));
+        return journal.containsSecret(text);
     }
 
     pub const SettingsRefresh = enum { none, decision, image_model, proxy_models };
@@ -530,6 +550,7 @@ pub const App = struct {
             replacement.image_client = null;
         }
         if (replacement.replace_memory) {
+            replacement.memory_coordinator.?.bindNotifications(self.memory_coordinator.notification_queue);
             self.memory_coordinator.deinit();
             self.memory_coordinator = replacement.memory_coordinator.?;
             self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
@@ -617,6 +638,7 @@ pub const App = struct {
         self.runtime.config = &self.config.value;
         self.executor.config = &self.config.value;
         self.runtime.model = self.client.model();
+        replacement.memory_coordinator.bindNotifications(self.memory_coordinator.notification_queue);
         self.memory_coordinator.deinit();
         self.memory_coordinator = replacement.memory_coordinator;
         self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
@@ -938,6 +960,41 @@ fn expectSessionTitleSchema(app: *const App, expected: usize) !void {
         if (std.mem.eql(u8, schema.name, "set_session_title")) count += 1;
     }
     try std.testing.expectEqual(expected, count);
+}
+
+test "App submit rejection emits one completion and keeps the primary runtime usable" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    var root = try fs.Root.open(a, io, buffer[0..try tmp.dir.realPath(io, &buffer)]);
+    defer root.deinit();
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", root.path);
+    const fixture =
+        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"context_tokens":32768,"protocol":"chat"}}}}},"limits":{"low_price_input":false}}
+    ;
+    var parsed = try cfg.parse(a, fixture);
+    model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &.{}) catch |err| {
+        cfg.release(&parsed);
+        return err;
+    };
+    const queue = try MemoryNotifications.create(a);
+    defer queue.deinit();
+    const app = try App.initConfiguredAnchoredAuth(a, io, &env, &root, "/unused/private/config.json", .{}, parsed);
+    defer app.deinit();
+    app.bindMemoryNotifications(queue);
+    var capture: knowledge.Capture = .{ .allocator = a, .incomplete = true };
+    App.submitMemory(app, &capture, .chat);
+    try std.testing.expectEqual(@as(u16, @intFromError(error.IncompleteCapture)), app.memory_coordinator.failure.load(.acquire));
+    const completion = queue.take().?;
+    try std.testing.expectEqual(@as(u64, 1), completion.id);
+    try std.testing.expectEqual(@import("../core/memory_status.zig").Result.failed, completion.result);
+    try std.testing.expect(queue.take() == null);
+    try std.testing.expect(!app.runtime.poisoned);
+    try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
 }
 
 test "App session title capability survives settings and connection rebinds" {

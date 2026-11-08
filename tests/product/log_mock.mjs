@@ -110,6 +110,10 @@ async function records(project, began, ended, key) {
   rows.sort((a,b) => a.seq-b.seq);
   const session = rows[0]?.session;
   assert(typeof session === 'string' && session.length > 0, 'session missing');
+  for (const file of files) {
+    assert(file.startsWith(session + '-'), 'log filename session mismatch');
+    assert(/^[0-9a-f]{32}-\d+-\d+\.jsonl$/.test(file), 'invalid log filename');
+  }
   let elapsed = -1;
   for (const [index,row] of rows.entries()) {
     assert(row.schema === 1 && row.session === session && row.seq === index+1, 'invalid envelope sequence/session');
@@ -118,6 +122,10 @@ async function records(project, began, ended, key) {
     assert(Number.isSafeInteger(row.elapsed_ms) && row.elapsed_ms >= elapsed, 'elapsed time regressed');
     elapsed = row.elapsed_ms;
     assert(typeof row.event === 'string' && row.data && typeof row.data === 'object', 'invalid event/data');
+    if (row.event === 'session') {
+      assert.equal(row.data.text_bytes, 1024*1024, 'invalid session text limit');
+      assert.equal(row.data.record_bytes, 5*1024*1024, 'invalid session record limit');
+    }
     assert(!['reasoning','native','text_delta'].includes(row.event), 'private event persisted');
     if (row.event === 'first_response') assert(!('text' in row.data) && !('content' in row.data), 'first response contains content');
     // 工具 text/content 可能逐层包装 JSON；不能只检查最外层转义后的字节。
@@ -133,6 +141,36 @@ async function records(project, began, ended, key) {
       }
     };
     safe(row);
+  }
+  const diagnostics = rows.filter(row => row.event === 'diagnostic');
+  const finished = rows.filter(row => row.event === 'finished');
+  for (const row of diagnostics) assert(Number.isSafeInteger(row.dropped_total) && row.dropped_total >= 0, 'invalid diagnostic drop count');
+  for (const row of finished) assert(Number.isSafeInteger(row.data.dropped_total) && row.data.dropped_total >= 0, 'invalid finished drop count');
+  const messageIds = new Set();
+  for (const row of rows.filter(row => row.event === 'assistant' || row.event === 'tool_call')) {
+    assert(Number.isSafeInteger(row.data.message_index) && row.data.message_index > 0, 'invalid assistant message index');
+    messageIds.add(row.data.message_index);
+  }
+  assert(messageIds.size > 0 && finished.length > 0, 'missing observer fixture events');
+  const observerSpans = new Map();
+  for (const row of diagnostics.filter(row => row.data.stage === 'observer')) {
+    const d = row.data;
+    assert(Number.isSafeInteger(d.span_id) && d.span_id > 0, 'invalid observer span id');
+    assert(d.phase === 'begin' || d.phase === 'end', 'invalid observer span phase');
+    const span = observerSpans.get(d.span_id) ?? {};
+    assert(span[d.phase] === undefined, 'duplicate observer span phase');
+    span[d.phase] = row.seq;
+    observerSpans.set(d.span_id, span);
+  }
+  assert(observerSpans.size <= messageIds.size + finished.length, 'unexpected observer span count');
+  // A single endpoint may be dropped; compare ordering only for complete pairs.
+  const complete = [...observerSpans.values()].filter(span => span.begin !== undefined && span.end !== undefined);
+  complete.sort((a,b) => a.begin - b.begin);
+  let previousEnd = 0;
+  for (const span of complete) {
+    assert(span.begin < span.end, 'reversed observer span');
+    assert(span.begin > previousEnd, 'overlapping observer spans');
+    previousEnd = span.end;
   }
   return rows;
 }

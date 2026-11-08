@@ -23,6 +23,13 @@ fn choose(session: *Session, name: []const u8) !void {
     const connection = session.connection();
     try connection.decision_fn.?(connection.context, .{ .model = name });
 }
+fn prepareNativeForTest(client: *@import("decision_client.zig").Client) !void {
+    var cancel: @import("../core/protocol.zig").Cancellation = .{};
+    const output = try client.service().decide(a, .{ .refine_outputs = &.{} }, &cancel);
+    defer @import("../core/decision.zig").freeOutput(a, output);
+    try std.testing.expect(output == .refine_outputs and output.refine_outputs.len == 0);
+    try std.testing.expect(client.native != null and client.resolved != null and client.calls == 0);
+}
 fn declarationsWithoutDecision(config: cfg.Config) ![]u8 {
     var value = config;
     value.decision = null;
@@ -106,13 +113,15 @@ test "Jev official refresh publishes native Decision candidates with only their 
         try std.testing.expectEqualStrings("zen", selected.provider_name);
         try choose(&session, name);
         try std.testing.expectEqualStrings(name, session.connection().current().decision_model.?);
-        try std.testing.expect(app.decision_client.?.native != null);
+        try std.testing.expect(app.decision_client.?.native == null);
         try std.testing.expect(app.decision_client.?.resolved == null and app.decision_client.?.calls == 0);
         try std.testing.expectEqualStrings("fake-zen-own-only", app.decision_client.?.key.?);
         try std.testing.expect(app.client.authorization.ptr == primary_auth);
         try std.testing.expectEqualStrings("route", app.config.value.selected_provider.?);
         try std.testing.expectEqualStrings("first", app.config.value.model.name);
         try std.testing.expectEqualStrings("fake-main-only", app.config.value.provider.api_key.?);
+        try prepareNativeForTest(app.decision_client.?);
+        try std.testing.expectEqualStrings(cfg.providers.systemone_base_url, app.decision_client.?.resolved.?.config.value.provider.base_url);
     }
     try std.testing.expectError(error.UnknownModelProtocol, resolver.protocolFor(session.global_config.?.value, &session.metadata_cache, "go", "jev-1.13-free"));
     try std.testing.expectEqual(@import("../core/protocol.zig").Protocol.chat, try resolver.protocolFor(session.global_config.?.value, &session.metadata_cache, "lookalike", "jev-1.13-free"));
@@ -286,9 +295,11 @@ test "SystemOne without context is auxiliary eligible but cannot become primary 
     defer a.free(after);
     try std.testing.expectEqualStrings(before, after);
     try choose(&session, "native/judge/raw");
-    try std.testing.expect(session.app.?.decision_client.?.native != null);
+    try std.testing.expect(session.app.?.decision_client.?.native == null and session.app.?.decision_client.?.resolved == null and session.app.?.decision_client.?.calls == 0);
     try std.testing.expectEqualStrings("fake-native-only", session.app.?.decision_client.?.key.?);
     try std.testing.expectEqualStrings("native/judge/raw", session.connection().current().decision_model.?);
+    try prepareNativeForTest(session.app.?.decision_client.?);
+    try std.testing.expectEqualStrings("https://native-fixture.invalid/v1", session.app.?.decision_client.?.resolved.?.config.value.provider.base_url);
     try choose(&session, "route/judge/raw");
     try std.testing.expect(session.app.?.decision_client.?.native == null);
     try std.testing.expectEqualStrings("fake-main-only", session.app.?.decision_client.?.key.?);

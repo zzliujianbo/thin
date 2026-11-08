@@ -193,26 +193,87 @@ fn configuration() cfg.Config {
     }, .limits = .{ .low_price_input = false } };
 }
 
+// One-shot backing fault, armed by the decision fake after its response is
+// allocated. The summary can then run and observe the rollback after OOM.
+const RefineFault = struct {
+    action: enum { oom, cancel },
+    cancel: *p.Cancellation,
+    armed: bool = false,
+    triggered: bool = false,
+
+    fn allocator(self: *RefineFault) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *RefineFault = @ptrCast(@alignCast(raw));
+        if (self.armed) {
+            self.armed = false;
+            self.triggered = true;
+            if (self.action == .oom) return null;
+            self.cancel.cancel();
+        }
+        return a.rawAlloc(len, alignment, ra);
+    }
+    fn resize(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        // Force arena growth through alloc, where the one-shot fault is observed.
+        if (len > bytes.len) return false;
+        return a.rawResize(bytes, alignment, len, ra);
+    }
+    fn remap(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        if (len > bytes.len) return null;
+        return a.rawRemap(bytes, alignment, len, ra);
+    }
+    fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        a.rawFree(bytes, alignment, ra);
+    }
+
+    fn arm(self: *RefineFault, alloc_: std.mem.Allocator) !void {
+        // Leave enough room for the first short replacement and its blocks,
+        // but not for the following near-original-size candidate.
+        const room: usize = 1536;
+        for (0..16) |_| {
+            _ = try alloc_.alloc(u8, 32768);
+            const pad = try alloc_.alloc(u8, 1);
+            var len: usize = 1;
+            var step: usize = 16384;
+            while (step != 0) : (step /= 2) {
+                while (alloc_.resize(pad.ptr[0..len], len + step)) len += step;
+            }
+            if (len <= room) continue;
+            try std.testing.expect(alloc_.resize(pad.ptr[0..len], len - room));
+            self.armed = true;
+            return;
+        }
+        return error.FixtureRefineFaultUnavailable;
+    }
+};
+
 const LongTurn = struct {
-    mode: enum { absent, success, failure, canceled, bad_summary, cleanup_failure } = .success,
+    mode: enum { absent, success, failure, service_oom, canceled, bad_summary, cleanup_failure } = .success,
     decisions: usize = 0,
     summaries: usize = 0,
     normals: usize = 0,
     cancel: *p.Cancellation,
+    answers: ?[]const []const u8 = null,
+    expected_results: ?[]const p.ToolResult = null,
+    fault: ?*RefineFault = null,
     fn decide(raw: *anyopaque, alloc: std.mem.Allocator, input: decision.Input, _: *const p.Cancellation) !decision.Output {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.decisions += 1;
         try std.testing.expect(input == .refine_outputs);
         try std.testing.expect(input.refine_outputs.len > 0 and input.refine_outputs.len <= 8);
         var bytes: usize = 0;
-        for (input.refine_outputs) |item| {
+        if (self.answers) |answers| try std.testing.expectEqual(input.refine_outputs.len, answers.len);
+        for (input.refine_outputs, 0..) |item, i| {
             bytes += item.text.len + item.id.len;
             try std.testing.expect(item.text.len <= 8192);
             try std.testing.expect(std.mem.startsWith(u8, item.id, "bash-"));
+            if (self.answers) |answers| try std.testing.expect(answers[i].len < item.text.len);
         }
         try std.testing.expect(bytes <= 16384);
         switch (self.mode) {
             .failure => return error.FixtureDecisionUnavailable,
+            .service_oom => return error.OutOfMemory,
             .cleanup_failure => return error.CleanupFailed,
             .canceled => {
                 self.cancel.cancel();
@@ -221,10 +282,14 @@ const LongTurn = struct {
             else => {},
         }
         const items = try alloc.alloc(decision.RefineItem, input.refine_outputs.len);
-        for (items, 0..) |*item, i| item.* = .{
-            .id = try alloc.dupe(u8, input.refine_outputs[items.len - 1 - i].id),
-            .text = try alloc.dupe(u8, "GENERATED OUTPUT CLAIMS SUCCESS; not execution authority"),
-        };
+        for (items, 0..) |*item, i| {
+            const original_index = items.len - 1 - i;
+            item.* = .{
+                .id = try alloc.dupe(u8, input.refine_outputs[original_index].id),
+                .text = try alloc.dupe(u8, if (self.answers) |answers| answers[original_index] else "GENERATED OUTPUT CLAIMS SUCCESS; not execution authority"),
+            };
+        }
+        if (self.fault) |fault| try fault.arm(alloc);
         return .{ .refine_outputs = items };
     }
     fn call(raw: *anyopaque, alloc: std.mem.Allocator, req: p.Request, _: p.ModelSink) !p.Outcome {
@@ -238,6 +303,14 @@ const LongTurn = struct {
         try std.testing.expectEqual(@as(usize, 1), req.messages.len);
         const text = req.messages[0].blocks[0].text;
         try std.testing.expect(req.messages[0].replay == null);
+        if (self.expected_results) |results| {
+            try std.testing.expectEqual(results.len, std.mem.count(u8, text, "\"tool_result\":{"));
+            for (results) |result| {
+                const encoded = try std.json.Stringify.valueAlloc(alloc, p.Block{ .tool_result = result }, .{});
+                try std.testing.expect(std.mem.indexOf(u8, text, encoded) != null);
+            }
+            return .{ .success = .{ .finish = .stop, .message = try p.textMessage(alloc, .assistant, "Earlier commands produced mixed results.") } };
+        }
         try std.testing.expect(std.mem.indexOf(u8, text, "signature") == null);
         try std.testing.expect(std.mem.indexOf(u8, text, "current goal") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "\\\"exit_code\\\":7") != null);
@@ -317,6 +390,119 @@ test "compaction native sixteen same-user closed groups refinement rollback canc
             defer a.free(paired);
             try std.testing.expect(paired[paired.len - 1]);
             for (runtime.messages()) |message| try std.testing.expect(message.replay == null);
+        }
+    }
+}
+
+const RefineScenario = enum { mixed, unprofitable, failure, service_oom, canceled, staged_oom, staged_cancel };
+
+fn seedRefinementBoundary(runtime: *r.Runtime, alloc: std.mem.Allocator, scenario: RefineScenario, originals: *[6]p.ToolResult, candidates: *[6][]const u8, answers: *[6][]const u8) !void {
+    // One message contains five results and a second contains one; the last
+    // assistant remains outside the cut.
+    const owned = runtime.arena.allocator();
+    try runtime.history.append(owned, try p.textMessage(owned, .user, "current goal"));
+    runtime.protected_index = 0;
+    var calls: [6]p.Block = undefined;
+    var results: [6]p.Block = undefined;
+    const noise: [2200]u8 = @splat('x');
+    for (0..6) |i| {
+        const id = try std.fmt.allocPrint(alloc, "bash-boundary-{d}", .{i});
+        const stdout = try std.fmt.allocPrint(alloc, "ORIGINAL-{d}-{s}", .{ i, &noise });
+        const output = try std.json.Stringify.valueAlloc(alloc, .{ .stdout = stdout, .stderr = "failure\nline 42", .exit_code = 7, .timed_out = true, .canceled = i == 1, .truncated = i % 2 == 0, .stdout_bytes = stdout.len }, .{});
+        originals[i] = .{ .call_id = id, .text = output, .is_error = i % 2 == 0, .canceled = i == 1, .truncated = i % 2 == 0 };
+        calls[i] = .{ .tool_call = .{ .id = id, .name = "bash", .arguments = "{}" } };
+        results[i] = .{ .tool_result = originals[i] };
+
+        // Compute the exact wrapper overhead with the same owned, parsed JSON
+        // and removal order as production, without changing production limits.
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{ .allocate = .alloc_always });
+        var metadata = parsed.value;
+        _ = metadata.object.swapRemove("stdout");
+        _ = metadata.object.swapRemove("stderr");
+        const empty = try std.json.Stringify.valueAlloc(alloc, .{ .original_execution_metadata = metadata, .output_summary_untrusted = "", .summary_is_lossy = true }, .{});
+        try std.testing.expect(output.len > empty.len + 1);
+        const Size = enum { larger, equal, shorter, tiny };
+        const size: Size = switch (scenario) {
+            .mixed => switch (i) {
+                0, 3 => .larger,
+                1 => .equal,
+                2 => .shorter,
+                else => .tiny,
+            },
+            .staged_oom, .staged_cancel => if (i == 0) .tiny else if (i == 1) .equal else .tiny,
+            else => if (i % 2 == 0) .larger else .equal,
+        };
+        const marker = try std.fmt.allocPrint(alloc, "SUMMARY-{d}-", .{i});
+        const len = switch (size) {
+            .larger => output.len - empty.len + 1,
+            .equal => output.len - empty.len,
+            .shorter => output.len - empty.len - 1,
+            .tiny => marker.len,
+        };
+        const answer = try alloc.alloc(u8, len);
+        @memset(answer, 's');
+        @memcpy(answer[0..marker.len], marker);
+        answers[i] = answer;
+        candidates[i] = try std.json.Stringify.valueAlloc(alloc, .{ .original_execution_metadata = metadata, .output_summary_untrusted = answer, .summary_is_lossy = true }, .{});
+        switch (size) {
+            .larger => try std.testing.expectEqual(output.len + 1, candidates[i].len),
+            .equal => try std.testing.expectEqual(output.len, candidates[i].len),
+            .shorter => try std.testing.expectEqual(output.len - 1, candidates[i].len),
+            .tiny => try std.testing.expect(candidates[i].len < output.len),
+        }
+    }
+    try runtime.history.append(owned, try p.cloneMessage(owned, .{ .role = .assistant, .blocks = calls[0..5] }));
+    try runtime.history.append(owned, try p.cloneMessage(owned, .{ .role = .tool, .blocks = results[0..5] }));
+    try runtime.history.append(owned, try p.cloneMessage(owned, .{ .role = .assistant, .blocks = calls[5..6] }));
+    try runtime.history.append(owned, try p.cloneMessage(owned, .{ .role = .tool, .blocks = results[5..6] }));
+    try runtime.history.append(owned, try p.textMessage(owned, .assistant, "recent answer"));
+}
+
+test "compaction refinement publishes only strictly shorter complete wrappers atomically" {
+    for ([_]RefineScenario{ .mixed, .unprofitable, .failure, .service_oom, .canceled, .staged_oom, .staged_cancel }) |scenario| {
+        var fixture = std.heap.ArenaAllocator.init(a);
+        defer fixture.deinit();
+        const alloc = fixture.allocator();
+        var config = configuration();
+        var cancel: p.Cancellation = .{};
+        var fault: RefineFault = .{ .action = if (scenario == .staged_cancel) .cancel else .oom, .cancel = &cancel };
+        var fake: LongTurn = .{ .mode = switch (scenario) {
+            .failure => .failure,
+            .service_oom => .service_oom,
+            .canceled => .canceled,
+            else => .success,
+        }, .cancel = &cancel };
+        var unused: Fake = .{};
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = LongTurn.call }, unused.executor(), .{}, "");
+        defer runtime.deinit();
+        runtime.decision_service = .{ .context = &fake, .decide_fn = LongTurn.decide };
+        var originals: [6]p.ToolResult = undefined;
+        var candidates: [6][]const u8 = undefined;
+        var answers: [6][]const u8 = undefined;
+        try seedRefinementBoundary(&runtime, alloc, scenario, &originals, &candidates, &answers);
+        var expected = originals;
+        if (scenario == .mixed) for (&expected, 0..) |*result, i| {
+            if (candidates[i].len < result.text.len) result.text = candidates[i];
+        };
+        fake.answers = &answers;
+        fake.expected_results = &expected;
+        const original_ptr = runtime.messages().ptr;
+        const before = try std.json.Stringify.valueAlloc(alloc, runtime.messages(), .{});
+        if (scenario == .staged_oom or scenario == .staged_cancel) {
+            runtime.allocator = fault.allocator();
+            fake.fault = &fault;
+        }
+        const terminal = try runtime.compactContext(&cancel);
+        const canceled = scenario == .canceled or scenario == .staged_cancel;
+        try std.testing.expectEqual(if (canceled) r.Status.canceled else r.Status.success, terminal.status);
+        try std.testing.expectEqual(@as(usize, 1), fake.decisions);
+        try std.testing.expectEqual(@as(usize, if (canceled) 0 else 1), fake.summaries);
+        try std.testing.expectEqual(@as(usize, 0), fake.normals);
+        if (scenario == .staged_oom or scenario == .staged_cancel) try std.testing.expect(fault.triggered);
+        if (canceled) {
+            try std.testing.expectEqual(original_ptr, runtime.messages().ptr);
+            const after = try std.json.Stringify.valueAlloc(alloc, runtime.messages(), .{});
+            try std.testing.expectEqualStrings(before, after);
         }
     }
 }

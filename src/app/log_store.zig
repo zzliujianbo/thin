@@ -6,9 +6,9 @@ const ids = @import("session_id.zig");
 
 pub const Limits = struct {
     /// 输入 JSON 的字节上限，不含附加的换行。
-    record_bytes: usize = 2 * 1024 * 1024,
+    record_bytes: usize = 5 * 1024 * 1024,
     /// 每个文件的硬上限，包含换行；单条记录不能跨文件。
-    file_bytes: usize = 16 * 1024 * 1024,
+    file_bytes: usize = 500 * 1024 * 1024,
 };
 
 fn validateIgnore(io: std.Io, dir_fd: c_int) !void {
@@ -104,7 +104,7 @@ pub const Store = struct {
     }
 
     fn name(buffer: []u8, timestamp: i64, id: [32]u8, part: u32) ![:0]u8 {
-        return std.fmt.bufPrintSentinel(buffer, "{d}-{s}-{d}.jsonl", .{ timestamp, id, part }, 0);
+        return std.fmt.bufPrintSentinel(buffer, "{s}-{d}-{d}.jsonl", .{ id, timestamp, part }, 0);
     }
 
     fn createFile(self: *Store, dir_fd: c_int, filename: [:0]const u8) !c_int {
@@ -273,6 +273,12 @@ fn expectContent(root: *filesystem.Root, path: []const u8, expected: []const u8)
     try std.testing.expectEqualStrings(expected, result.data);
 }
 
+test "default log size limits" {
+    const limits = Limits{};
+    try std.testing.expectEqual(@as(usize, 500 * 1024 * 1024), limits.file_bytes);
+    try std.testing.expectEqual(@as(usize, 5 * 1024 * 1024), limits.record_bytes);
+}
+
 test "pinned identity is lazy immutable and collision never substitutes another identity" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -290,6 +296,7 @@ test "pinned identity is lazy immutable and collision never substitutes another 
     try std.testing.expectError(error.SessionIDAlreadyPinned, store.pinSessionID(@splat('c')));
     try std.testing.expectError(error.FileNotFound, filesystem.openDirectory(root.dir.handle, ".thin"));
     try store.startTimestamp(1234);
+    try std.testing.expectEqualStrings(".thin/sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-1234-0.jsonl", store.path());
     try std.testing.expectEqualSlices(u8, &id, &store.session_id);
     try std.testing.expectError(error.SessionIDAlreadyStarted, store.pinSessionID(id));
     try store.append("{}");
@@ -345,6 +352,9 @@ test "log store rotates without splitting or overwriting and keeps old fd on col
     defer root.deinit();
     var store = Store.init(std.testing.allocator, &root, .{ .record_bytes = 8, .file_bytes = 6 });
     defer store.deinit();
+    try store.pinSessionID(@splat('b'));
+    try store.startTimestamp(1234);
+    try std.testing.expectEqualStrings(".thin/sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-1234-0.jsonl", store.path());
     try store.append("{}");
     const first = try std.testing.allocator.dupe(u8, store.path());
     defer std.testing.allocator.free(first);
@@ -352,17 +362,22 @@ test "log store rotates without splitting or overwriting and keeps old fd on col
     try std.testing.expectEqual(@as(u32, 0), store.part);
     try store.append("{}");
     try std.testing.expectEqual(@as(u32, 1), store.part);
+    try std.testing.expectEqualStrings(".thin/sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-1234-1.jsonl", store.path());
     try expectContent(&root, first, "{}\n{}\n");
     try expectContent(&root, store.path(), "{}\n");
     try store.append("{}");
+    try store.append("{}");
+    try std.testing.expectEqual(@as(u32, 2), store.part);
+    try std.testing.expectEqualStrings(".thin/sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-1234-2.jsonl", store.path());
+    try store.append("{}");
     var buffer: [96]u8 = undefined;
-    const next = try Store.name(&buffer, store.timestamp_ms, store.session_id, 2);
+    const next = try Store.name(&buffer, store.timestamp_ms, store.session_id, 3);
     const collision = try store.createFile(store.logs_fd.?, next);
     defer filesystem.closeFd(collision);
     const old_fd = store.file_fd.?;
     try std.testing.expectError(error.PathAlreadyExists, store.append("{}"));
     try std.testing.expectEqual(old_fd, store.file_fd.?);
-    try std.testing.expectEqual(@as(u32, 1), store.part);
+    try std.testing.expectEqual(@as(u32, 2), store.part);
     try expectContent(&root, store.path(), "{}\n{}\n");
     try std.testing.expectEqual(@as(u64, 0), (try filesystem.fileFromFd(collision).stat(root.io)).size);
 }

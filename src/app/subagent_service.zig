@@ -1559,6 +1559,7 @@ const ChildSession = struct {
             .authorize_fn = ChildHost.authorize,
         }, "");
         const runtime = &self.runtime.?;
+        runtime.decision_service = if (self.decision) |client| client.service() else null;
         const old_system = runtime.system;
         runtime.system = try std.fmt.allocPrint(a, "{s}\n\n{s}", .{ old_system, child_mode });
         a.free(old_system);

@@ -6,6 +6,16 @@ fn choose(session: *Session, choice: @import("../ui/tui.zig").Connection.Decisio
     try connection.decision_fn.?(connection.context, choice);
 }
 
+fn prepareNativeForTest(client: *@import("decision_client.zig").Client) !void {
+    try std.testing.expect(client.native == null and client.resolved == null);
+    var cancel: p.Cancellation = .{};
+    const output = try client.service().decide(a, .{ .refine_outputs = &.{} }, &cancel);
+    defer @import("../core/decision.zig").freeOutput(a, output);
+    try std.testing.expect(output == .refine_outputs and output.refine_outputs.len == 0);
+    try std.testing.expect(client.native != null and client.resolved != null);
+    try std.testing.expectEqual(@as(u64, 0), client.calls);
+}
+
 test "Decision declared native model roundtrip CAS and primary identity" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -39,7 +49,7 @@ test "Decision declared native model roundtrip CAS and primary identity" {
     try std.testing.expect(app.client.authorization.ptr == auth);
     try std.testing.expect(app.client.config == &app.config.value and app.runtime.config == &app.config.value);
     const judge = app.decision_client.?;
-    try std.testing.expect(judge.calls == 0 and judge.native != null and judge.resolved == null);
+    try std.testing.expect(judge.calls == 0 and judge.native == null and judge.resolved == null);
     try std.testing.expectEqualStrings("fake-native-own-key", judge.key.?);
     const provider = app.config.value.registry.?.find("reviewer").?;
     try std.testing.expect(provider.patchFor("arbitrary/raw").?.protocol == .systemone);
@@ -55,6 +65,7 @@ test "Decision declared native model roundtrip CAS and primary identity" {
     defer restarted.deinit();
     try std.testing.expectEqualStrings("reviewer/arbitrary/raw", restarted.connection().current().decision_model.?);
     try std.testing.expectEqualStrings("fake-native-own-key", restarted.app.?.decision_client.?.key.?);
+    try std.testing.expect(restarted.app.?.decision_client.?.native == null and restarted.app.?.decision_client.?.resolved == null);
     // Explicit reselection loads only the independent reviewer's latest key.
     var credentials = try cfg.clone(a, session.global_config.?.value);
     defer cfg.release(&credentials);
@@ -65,12 +76,23 @@ test "Decision declared native model roundtrip CAS and primary identity" {
     try std.testing.expect(app.decision_client.? == judge);
     try std.testing.expectEqualStrings("fake-native-own-key", judge.key.?);
     try choose(&session, .{ .model = "reviewer/arbitrary/raw" });
-    try std.testing.expectEqualStrings("fake-native-rotated", app.decision_client.?.key.?);
-    try std.testing.expect(app.decision_client.?.calls == 0 and app.client.authorization.ptr == auth);
-    app.decision_client.?.native.?.poisoned = true;
+    const rotated = app.decision_client.?;
+    try std.testing.expectEqualStrings("fake-native-rotated", rotated.key.?);
+    try std.testing.expect(rotated.calls == 0 and app.client.authorization.ptr == auth);
+    try std.testing.expect(rotated.native == null and rotated.resolved == null);
+    var canceled: p.Cancellation = .{};
+    canceled.cancel();
+    try std.testing.expectError(error.Canceled, rotated.service().decide(a, .{ .refine_outputs = &.{} }, &canceled));
+    try std.testing.expect(rotated.native == null and rotated.resolved == null and rotated.calls == 0);
+    try prepareNativeForTest(rotated);
+    try std.testing.expect(rotated.native.?.explicit_route and rotated.native.?.proxy_url == null);
+    rotated.native.?.poisoned = true;
+    try std.testing.expectError(error.CleanupFailed, rotated.service().decide(a, .{ .refine_outputs = &.{} }, &canceled));
     try std.testing.expectError(error.CleanupFailed, choose(&session, .{ .model = "reviewer/arbitrary/raw" }));
     try std.testing.expectError(error.CleanupFailed, toggle(&session, .low_price_input, true));
-    app.decision_client.?.native.?.poisoned = false;
+    try std.testing.expect(app.decision_client.? == rotated and rotated.native.?.poisoned);
+    try std.testing.expect(rotated.native.?.proxy_url == null and rotated.calls == 0);
+    rotated.native.?.poisoned = false;
     try choose(&session, .off);
     try std.testing.expect(!session.connection().current().decision_enabled and app.decision_client == null);
 }

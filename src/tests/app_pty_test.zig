@@ -422,6 +422,27 @@ const Driver = struct {
         try checkComposerTail(view);
     }
 
+    /// Only the two capability-clamp starts own this one-shot notice body.
+    fn checkStartupNoticeFootprint(view: *const regular.Screen, notice: []const u8) !void {
+        try check(view.rows > 4 and view.rows <= view.grid.len);
+        try check(view.history_len == 0 and view.count(regular.prior) == 1);
+        try check(std.mem.indexOf(u8, &view.grid[0], regular.prior) != null);
+        for (view.grid[1]) |byte| try check(byte == ' ');
+        try check(view.count(notice) == 1);
+        try check(std.mem.eql(u8, std.mem.trim(u8, &view.grid[2], " "), notice));
+        for (view.grid[3]) |byte| try check(byte == ' ');
+        try check(view.row == 4 and view.col < view.columns);
+        var composers: usize = 0;
+        for (view.grid, 0..) |line, row| {
+            if (std.mem.indexOf(u8, &line, "%> ") != null or std.mem.startsWith(u8, &line, "> ")) {
+                composers += 1;
+                try check(row == view.row);
+            }
+        }
+        try check(composers == 1);
+        try checkComposerTail(view);
+    }
+
     /// A fresh end-position snapshot ends at the composer, with no owned rows
     /// below it. Short frames do not imply the physical bottom was reached.
     fn checkComposerTail(view: *const regular.Screen) !void {
@@ -1336,6 +1357,57 @@ fn approvalCancelScreen(d: *Driver, view: *regular.Screen) !void {
     try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
 }
 
+// Confirmation controls are transient composer content, not transcript rows.
+// These fixtures use a normal-width PTY, so both choices fit on the question row.
+fn checkConfirmationRow(view: *const regular.Screen, question: []const u8, selected: []const u8, other: []const u8) !void {
+    try Driver.checkComposerTail(view);
+    const row = &view.grid[view.row];
+    try check(std.mem.indexOf(u8, row, question) != null);
+    try check(std.mem.indexOf(u8, row, selected) != null);
+    try check(std.mem.indexOf(u8, row, other) != null);
+    try check(view.count(question) == 1);
+    for (view.history[0..view.history_len]) |line| {
+        try check(std.mem.indexOf(u8, &line, question) == null);
+    }
+}
+
+// Opening and every PageDown share the original one-shot 15s screen budget.
+// Only a fresh, fully acknowledged frame may advance the three-line preview;
+// PageDown moves its window by two rows without selecting or allowing a call.
+fn approvalCancelPreview(d: *Driver, view: *regular.Screen, start: usize) !void {
+    const until = now() + 15000;
+    var since = start;
+    var pages: usize = 0;
+    var approval_id: ?u64 = null;
+    std.debug.print("APPROVAL_CANCEL_CHECKPOINT=preview-await\n", .{});
+    while (now() < until) {
+        try d.drain(20);
+        if (try d.acknowledgedScreen(since)) |current| {
+            if (current.visible("Approval #")) {
+                try checkConfirmationRow(current, "Approval #", "> Deny", "Allow once");
+                const row = &current.grid[current.row];
+                const id_start = std.mem.indexOf(u8, row, "Approval #").? + "Approval #".len;
+                var id_end = id_start;
+                while (id_end < row.len and std.ascii.isDigit(row[id_end])) : (id_end += 1) {}
+                const id = try std.fmt.parseInt(u64, row[id_start..id_end], 10);
+                if (approval_id) |expected| try check(id == expected) else approval_id = id;
+                const ghost_visible = current.visible("GHOST-CANCEL-ONLY");
+                std.debug.print("APPROVAL_CANCEL_PREVIEW page={d} ghost_visible={any}\n", .{ pages, ghost_visible });
+                if (ghost_visible) {
+                    view.* = current.*;
+                    return;
+                }
+                if (pages == 8) return error.ApprovalCancelPreviewPageLimit;
+                since = d.used;
+                try d.send("\x1b[6~");
+                pages += 1;
+            }
+        }
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.ApprovalCancelPreviewDeadline;
+}
+
 fn checkApprovalCancelRestored(view: *const regular.Screen) !void {
     std.debug.print("APPROVAL_CANCEL_SCREEN last_visible={any} prior_total={d} history={d}\n", .{ view.visible("PRIOR-CANCEL-17"), view.count("PRIOR-CANCEL-"), view.history_len });
     try check(view.visible("PRIOR-CANCEL-17"));
@@ -1392,8 +1464,7 @@ fn approvalCancel(d: *Driver) !void {
 
     start = d.used;
     try d.send("approval-cancel-long\r");
-    try queuedScreen(d, a, start, &.{ "Approval #", "GHOST-CANCEL-ONLY" });
-    try approvalCancelScreen(d, view);
+    try approvalCancelPreview(d, view, start);
     const history_before = view.history_len;
     const waiting = d.used;
     try d.quiet(2400);
@@ -1402,6 +1473,22 @@ fn approvalCancel(d: *Driver) !void {
     try approvalCancelScreen(d, view);
     try check(titles == 0 and view.history_len == history_before);
     try check(view.count("Approval #") == 1 and view.visible("GHOST-CANCEL-ONLY"));
+    try checkConfirmationRow(view, "Approval #", "> Deny", "Allow once");
+    var visible_prior: usize = 0;
+    for (0..18) |i| {
+        var marker: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&marker, "PRIOR-CANCEL-{d:0>2}", .{i});
+        try check(view.count(text) == 1);
+        if (view.visible(text)) visible_prior += 1;
+    }
+    try check(visible_prior >= 8);
+    // The long command's preview is confined to the three rows immediately
+    // above the question, rather than becoming a scrollback record.
+    for (view.grid[0..view.row], 0..) |row, i| {
+        if (std.mem.indexOf(u8, &row, "GHOST-CANCEL-ONLY") != null or
+            std.mem.indexOf(u8, &row, "synthetic-step") != null)
+            try check(view.row - i <= 3);
+    }
     std.debug.print("APPROVAL_CANCEL_WAIT repeated_titles={d}\n", .{titles});
 
     // Standalone ESC: no following byte may mask the parser's 150ms expiry.
@@ -1479,6 +1566,7 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
         try view.replay(d.output[0..ack_after]);
         std.debug.print("APPROVAL_WAIT repeated_titles={d} history_delta={d} visible_titles={d}\n", .{ titles, view.history_len -| history_before, view.count("Approval #") });
         try check(titles == 0 and view.history_len == history_before and view.count("Approval #") == 1);
+        try checkConfirmationRow(view, "Approval #", "> Deny", "Allow once");
         // An actual scroll still redraws and needs a fresh completed frame;
         // freezing idle animation must not freeze input or approval controls.
         const scrolled = d.used;
@@ -1884,6 +1972,12 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
         // Opening drops the whole read tail: neither repetition nor Enter can
         // approve. The fresh replay must still show the safe default.
         try queuedKey(d, a, "\x03\x03\r", &.{"> Continue"});
+        const confirmation = try a.create(regular.Screen);
+        defer a.destroy(confirmation);
+        try approvalCancelScreen(d, confirmation);
+        try checkConfirmationRow(confirmation, "Task running", "> Continue", "Stop and clear");
+        try check(confirmation.visible("Steering pending #1: keep-steer"));
+        try check(confirmation.visible("FollowUp pending #2: keep-follow"));
         try queuedGate(d, a, project, "modal-default");
         // Each probe must cause an observable safe-selection transition.
         // Consecutive writes are NOT application read boundaries: without
@@ -1901,7 +1995,8 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
             // Node releases the already-in-flight final response after this ACK.
             try queuedGate(d, a, project, "natural-release");
             try queuedScreen(d, a, natural_start, &.{ "queued-natural-answer", "> Continue" });
-            try queuedIdle(d, a, natural_start);
+            try approvalCancelScreen(d, confirmation);
+            try checkConfirmationRow(confirmation, "Task ended", "> Continue", "Stop and clear");
             try queuedGate(d, a, project, "natural-finished");
         }
         // Selection and Enter in one read must NOT approve. One write is not
@@ -2315,8 +2410,34 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     // A resumed conversation may raise an owned notice row above the composer;
     // other starts have only the composer and an optional single hint row.
     if (!full_resume) {
-        const startup = (try d.acknowledgedScreen(0)) orelse return error.MissingStartupFrame;
-        try Driver.checkStartupFootprint(startup);
+        const clamp = std.mem.eql(u8, mode, "settings-clamp-high") or std.mem.eql(u8, mode, "settings-clamp-low");
+        const expected_notice: ?[]const u8 = if (clamp)
+            "Saved thinking level adjusted for this model; preference unchanged"
+        else if (std.mem.eql(u8, mode, "restore-selection") or std.mem.eql(u8, mode, "restore-idle"))
+            "Selection restored; NEW EMPTY CHAT (history not restored)"
+        else
+            null;
+        if (expected_notice) |notice| {
+            var ready = false;
+            while (now() < startup_until) {
+                try d.drain(20);
+                const at = std.mem.indexOf(u8, d.output[0..d.used], notice);
+                if (at) |notice_at| {
+                    if (try d.acknowledgedScreen(notice_at + notice.len)) |startup| {
+                        if (startup.visible(notice)) {
+                            try Driver.checkStartupNoticeFootprint(startup, notice);
+                            ready = true;
+                            break;
+                        }
+                    }
+                }
+                if (!d.owned) return error.EarlyExit;
+            }
+            if (!ready) return error.VisibleTextTimeout;
+        } else {
+            const startup = (try d.acknowledgedScreen(0)) orelse return error.MissingStartupFrame;
+            try Driver.checkStartupFootprint(startup);
+        }
     }
     // The removed banner was the only startup version/directory text. Its
     // absence is part of the first-screen contract, not a frozen caption.
@@ -2583,13 +2704,13 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitText(start, "resume-first-answer");
         try d.waitIdle(start);
     } else if (full_resume) {
-        try d.waitFrame(0, if (std.mem.eql(u8, mode, "resume-login")) "Not logged in" else "prior tools are NOT rerun");
+        try d.waitFrame(0, if (std.mem.eql(u8, mode, "resume-login")) "Not configured: /login, then /model" else "prior tools are NOT rerun");
         // Actual history is delivered asynchronously after the restore notice.
         try d.waitText(0, "resume-first-answer");
         try check(std.mem.indexOf(u8, d.output[0..d.used], "PRIVATE-RESUME-REASONING") == null);
         try d.quiet(150); // No startup model request or historical execution.
         if (std.mem.eql(u8, mode, "resume-login")) {
-            try d.waitFrame(0, "Not logged in");
+            try d.waitFrame(0, "Not configured: /login, then /model");
             try d.openAuth();
             const login_start = d.used;
             try d.send("fixture-secret-never-log\r");
@@ -2605,7 +2726,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             try d.waitIdle(start);
         }
     } else if (std.mem.eql(u8, mode, "restore-idle") or std.mem.eql(u8, mode, "restore-no-key")) {
-        const needle = if (std.mem.eql(u8, mode, "restore-no-key")) "Not logged in" else "history not restored";
+        const needle = if (std.mem.eql(u8, mode, "restore-no-key")) "Not configured: /login, then /model" else "history not restored";
         d.waitFrame(0, needle) catch |err| {
             if (std.mem.eql(u8, mode, "restore-idle")) {
                 const bytes = d.output[0..d.used];
@@ -3055,13 +3176,36 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
                 const before = try d.screen();
                 const start = d.used;
                 try d.send("\x1b[Z");
-                // Unknown/fixed capabilities keep the same idle composer. A
-                // completed sparse frame may only replace its notice row; do
-                // not require unchanged model/percentage pixels to be reprinted.
-                // Wait for a settled idle operation, not a pending frame.
-                try d.waitIdle(start);
+                // The rejected shortcut adds a conversation warning, which may
+                // move the composer. Require its fresh text and a complete idle
+                // frame under the same interaction deadline.
+                const warning = "Thinking capabilities unknown";
+                const until = now() + 10000;
+                var settled = false;
+                while (now() < until) {
+                    try d.drain(20);
+                    if (std.mem.indexOf(u8, d.output[start..d.used], warning)) |at| {
+                        if (try d.acknowledgedScreen(start + at + warning.len)) |view| {
+                            const composer = &view.grid[view.row];
+                            if (std.mem.indexOf(u8, composer, "%> ") != null or std.mem.startsWith(u8, composer, "> ")) {
+                                settled = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!d.owned) return error.EarlyExit;
+                }
+                if (!settled) return error.VisibleTextTimeout;
                 const after = try d.screen();
-                try check(after.row == before.row and std.mem.eql(u8, &before.grid[before.row], &after.grid[after.row]));
+                try check(std.mem.endsWith(u8, std.mem.trimEnd(u8, &before.grid[before.row], " "), ">"));
+                try check(std.mem.eql(u8, &before.grid[before.row], &after.grid[after.row]));
+                try Driver.checkComposerTail(after);
+                try check(after.row > 0);
+                var warnings: usize = 0;
+                for (after.grid[0 .. after.row - 1]) |line| {
+                    if (std.mem.indexOf(u8, &line, warning) != null) warnings += 1;
+                }
+                try check(warnings == 1 and std.mem.indexOf(u8, &after.grid[after.row - 1], warning) == null);
                 if (std.mem.indexOf(u8, d.output[start..d.used], "fixture-model") != null) {
                     try settingsColor(&d, start, level);
                 } else {
@@ -3234,6 +3378,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try EditorCheck.expect(&d, "\x1b[B", "history-two-edited");
         const start = d.used;
         try d.send("\x15esc-task\r");
+        try queuedFile(&d, a, project, "keyboard-history-arrived");
         try d.waitBusy(start);
         try d.send("\x1b");
         try d.waitText(start, "Canceled; prior side effects remain");

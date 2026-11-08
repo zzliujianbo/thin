@@ -62,6 +62,70 @@ fn expectNoJobs(root: *fs.Root) !void {
     try std.testing.expectError(error.FileNotFound, fs.openPath(root.dir.handle, ".thin/memory/jobs-owner"));
 }
 
+test "rotated journal credential filters related evidence and candidates" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try openRoot(a, io, tmp.dir);
+    defer root.deinit();
+    var config = try fixtureConfig(a);
+    defer cfg.release(&config);
+    config.value.provider.api_key = "new-credential-canary";
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var journal = try @import("journal.zig").Journal.init(a, &root, "new-credential-canary");
+    defer journal.deinit();
+    try journal.rememberKey("old-credential-canary");
+    const owner = try Coordinator.create(a, io, &root, config.value, &env);
+    defer owner.deinit();
+    const Guard = struct {
+        fn contains(raw: *anyopaque, text: []const u8) bool {
+            const j: *@import("journal.zig").Journal = @ptrCast(@alignCast(raw));
+            return j.containsSecret(text);
+        }
+    };
+    owner.secret_guard = .{ .context = &journal, .contains_fn = Guard.contains };
+    var repository = knowledge.Repository.init(&owner.store);
+    const material: k.Material = .{ .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .generation = try owner.store.generation(), .created_ms = 1, .sources = &.{} };
+    try std.testing.expectEqual(knowledge.Apply.created, try repository.apply(a, material, .{ .category = .preferences, .topic = "rotation", .content = "rotation old-credential-canary" }));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
+    const related = try repository.related(arena.allocator(), "rotation", now);
+    try std.testing.expectEqual(@as(usize, 1), related.len);
+    const Extract = struct {
+        calls: usize = 0,
+        fn extract(raw: *anyopaque, alloc: std.mem.Allocator, source: k.Material, _: *const p.Cancellation) ![]const k.Candidate {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 0), source.related.len);
+            for (source.sources) |evidence| try std.testing.expect(std.mem.find(u8, evidence.text, "old-credential-canary") == null);
+            return alloc.dupe(k.Candidate, &.{
+                .{ .category = .preferences, .topic = "leak", .content = "old-credential-canary" },
+                .{ .category = .preferences, .topic = "safe", .content = "A safe rotation fact." },
+            });
+        }
+    };
+    var fake: Extract = .{};
+    owner.service_override = .{ .context = &fake, .extract_fn = Extract.extract };
+    var capture: k.Capture = .{ .allocator = arena.allocator() };
+    capture.add(.user, "rotation preferences");
+    capture.add(.tool, "old-credential-canary");
+    _ = try owner.enqueueCopy(&capture, .chat, .{});
+    var cancel: p.Cancellation = .{};
+    owner.drain(&cancel);
+    const terminal = owner.view().last_terminal.?;
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(memory_status.Result.saved, terminal.result);
+    try std.testing.expectEqual(@as(u32, 1), terminal.saved_count);
+    try std.testing.expectEqualStrings("A safe rotation fact.", terminal.summary.text());
+    try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-leak"));
+    const saved = try owner.store.read(a, "preferences-safe");
+    defer a.free(saved.content);
+    defer a.free(saved.version);
+}
+
 test "automatic Memory extracts once saves and creates no jobs" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});

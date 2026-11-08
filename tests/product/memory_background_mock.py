@@ -12,10 +12,10 @@ Contract under test (interactive session only; the headless fixture is separate)
     enqueued, so the next prompt is admitted instead of becoming a follow-up.
   * Memory jobs are FIFO: the second extractor request never starts before the
     first one has been answered.
-  * The footer holds exactly one Memory hint directly above the first composer
-    row, with a blank separator above the hint. Active Memory is the row prefix even next to the
-    benign capability warning, and terminal Memory results never become
-    transcript rows.
+  * While Memory is active or queued, exactly one progress hint sits directly
+    above the first composer row, with a blank separator above it. A saved
+    result appears once in the transcript, never as a persistent footer; an
+    empty/skipped result stays silent.
   * The queued Memory suffix carries a count, never the primary S:/F: counters.
   * The queued job's material is a fresh generation: it carries the committed
     fact and its version in `related`.
@@ -66,6 +66,23 @@ RETIRED_PATHS = ('.thin/memory/jobs', '.thin/memory/jobs-owner', '.thin/mem-jobs
 CONTEXT_PREFIX = '[Context material'
 VERSION = re.compile(r'[0-9a-f]{64}')
 WARNING_MARKERS = ('Saved thinking level not applied', 'awaiting model capabilities')
+MEMORY_UI_LABELS = (
+    'Memory: extracting', 'Memory: saving', 'Memory: queued', 'Memory: saved',
+    'Memory: skipped', 'Memory: failed', 'Memory: canceled', 'Memory: request outcome uncertain',
+)
+
+
+def assert_no_ui_memory_notice(value, where):
+    """UI-only status/results must not enter wire requests or durable records."""
+    if isinstance(value, dict):
+        assert value.get('event') != 'memory_completed', f'Memory completion event in {where}'
+        for nested in value.values():
+            assert_no_ui_memory_notice(nested, where)
+    elif isinstance(value, list):
+        for nested in value:
+            assert_no_ui_memory_notice(nested, where)
+    elif isinstance(value, str):
+        assert not any(label in value for label in MEMORY_UI_LABELS), f'Memory UI notice in {where}'
 
 
 def load_idle_fixture():
@@ -173,6 +190,7 @@ class MemoryService(http.server.BaseHTTPRequestHandler):
         with control.lock:
             expected = list(control.expected)
         assert index < len(expected), f'unexpected extra primary request #{index + 1}'
+        assert_no_ui_memory_notice(body, f'primary request {index + 1}')
         messages = body.get('messages') or []
         turns = [m.get('content') for m in messages
                  if m.get('role') == 'user' and isinstance(m.get('content'), str)
@@ -265,23 +283,55 @@ def row_text(screen, index):
     return ''.join(screen.grid[index]).rstrip(' ')
 
 
-def footer_state(screen):
-    """Settled footer view: the normalized Memory label, or None while unsettled.
+def memory_progress(text):
+    return re.match(r'^Memory: (?:extracting|saving|queued)\b', text) is not None
 
-    Never raises: gates must be able to poll. A layout violation simply fails the
-    gate, and assert_footer() then reports the exact rows.
+
+def footer_state(screen):
+    """Settled progress footer, or None while unsettled.
+
+    Never raises: gates must be able to poll. Saved transcript rows are not
+    progress footers, but a second visible progress row is still a violation.
     """
     if not screen.idle() or not 2 <= screen.row < len(screen.grid):
         return None
     rows = [row_text(screen, i) for i in range(len(screen.grid))]
     hint = rows[screen.row - 1]
-    if not hint.startswith('Memory:'):
+    if not memory_progress(hint):
         return None
     if rows[screen.row - 2] != '':
         return None
-    if sum(text.startswith('Memory:') for text in rows) != 1:
+    if sum(memory_progress(text) for text in rows) != 1:
         return None
     return hint.split('|')[0].rstrip()
+
+
+def memory_footer_absent(screen):
+    return 1 <= screen.row < len(screen.grid) and 'Memory:' not in row_text(screen, screen.row - 1)
+
+
+def saved_transcript_rows(screen):
+    """Visible Memory rows outside the footer, with logical positions."""
+    return [(len(screen.history) + i, row_text(screen, i)) for i in range(len(screen.grid))
+            if i != screen.row - 1 and 'Memory:' in row_text(screen, i)]
+
+
+def saved_visible(screen):
+    return any(i < len(screen.history) + screen.row - 1 and row.startswith('Memory: saved') and FACT in row
+               for i, row in saved_transcript_rows(screen))
+
+
+def assert_saved_transcript(screen, expected=None):
+    """Only the one saved result may appear outside the progress footer."""
+    rows = saved_transcript_rows(screen)
+    if expected is None:
+        assert len(rows) <= 1, f'duplicate Memory transcript rows: {rows!r}'
+    else:
+        assert len(rows) == expected, f'Memory transcript rows {len(rows)} != {expected}: {rows!r}'
+    for index, text in rows:
+        assert index < len(screen.history) + screen.row - 1, 'Memory result is not above the footer'
+        assert text.startswith('Memory: saved') and FACT in text, f'unexpected Memory transcript row: {text!r}'
+    return rows
 
 
 def assert_footer(screen, expected):
@@ -293,9 +343,9 @@ def assert_footer(screen, expected):
     assert all(text == '' for text in rows[row + 1:]), 'visible rows below composer are not blank'
     hint = rows[row - 1]
     assert rows[row - 2] == '', f'blank separator above the Memory hint is missing: {rows[row - 2]!r}'
-    hints = [text for text in rows if text.startswith('Memory:')]
-    assert len(hints) == 1, f'Memory hint is not unique on the screen: {hints!r}'
-    assert hints[0] == hint, 'the Memory hint is not the row directly above the composer'
+    hints = [(i, text) for i, text in enumerate(rows) if memory_progress(text)]
+    assert len(hints) == 1, f'Memory progress hint is not unique on the screen: {hints!r}'
+    assert hints[0] == (row - 1, hint), 'the Memory hint is not the row directly above the composer'
     label = hint.split('|')[0].rstrip()
     assert label.startswith(expected), f'Memory footer is {label!r}, expected prefix {expected!r}'
     suffix = label[len(expected):]
@@ -305,16 +355,6 @@ def assert_footer(screen, expected):
     assert 'S:' not in hint and 'F:' not in hint, \
         f'Memory status leaked primary steering/follow-up counters: {hint!r}'
     return hint
-
-
-def assert_no_memory_transcript(screen):
-    """Only the current footer may contain a Memory notice in the visible frame.
-
-    Previously displayed footers can legitimately remain in native scrollback.
-    """
-    rows = [row_text(screen, i) for i in range(len(screen.grid))]
-    assert sum('Memory:' in text for text in rows) == 1, 'extra or missing visible Memory row'
-    assert 'Memory:' in rows[screen.row - 1], 'Memory notice outside the footer'
 
 
 def run(app, columns, observe_saved=False):
@@ -391,18 +431,18 @@ def run(app, columns, observe_saved=False):
                     raise AssertionError(f'app exited early ({child.returncode}) while waiting for {what}')
             raise AssertionError(f'timed out waiting for {what}')
 
-        def fresh(marker=b''):
-            """True only when the newest completed frame carries `marker` and is idle.
+        def fresh(marker=b'', after=0, idle=True):
+            """A complete frame begun after `after`, optionally at the idle composer.
 
             Frame authority is the real FRAME_END sequence plus the borrowed
-            Screen's settled-composer oracle: never a literal '>' or a sleep.
+            Screen's composer oracle: never a literal '>' or a sleep.
             """
             if not capture.endswith(FRAME_END):
                 return False
             end = len(capture) - len(FRAME_END)
             previous = capture.rfind(FRAME_END, 0, end)
             start = capture.rfind(SYNC_BEGIN, previous + len(FRAME_END) if previous >= 0 else 0, end)
-            return start >= 0 and capture.find(marker, start, end) >= 0 and screen.idle()
+            return start >= after and capture.find(marker, start, end) >= 0 and (not idle or screen.idle())
 
         def send(data):
             assert child.poll() is None, 'owned child already exited'
@@ -429,21 +469,31 @@ def run(app, columns, observe_saved=False):
                 'expected the benign capability warning to be visible'
             assert control.helper1_arrived.wait(12), 'Memory 1 request did not arrive'
             assert control.helper == 1 and control.primary == 1
-            assert_no_memory_transcript(screen)
+            assert_saved_transcript(screen, 0)
 
             if observe_saved:
-                # Separate owned run: no queued successor can mask the saved
-                # terminal status. Inspect the current screen, never old PTY bytes.
+                # No queued successor: the acknowledged saved result belongs in
+                # the transcript, not the footer. Inspect the current screen.
                 before = len(capture)
                 control.release1.set()
-                pump_until(lambda: len(capture) > before and fresh() and
-                           any(row_text(screen, i).startswith('Memory: saved') and
-                               FACT in row_text(screen, i) for i in range(len(screen.grid))),
-                           'fresh saved footer containing the actual fact')
-                rows = [row_text(screen, i) for i in range(len(screen.grid))]
-                assert sum('Memory:' in row for row in rows) == 1
-                assert rows[screen.row - 1].startswith('Memory: saved')
-                assert FACT in rows[screen.row - 1]
+                pump_until(lambda: fresh(after=before) and memory_footer_absent(screen) and saved_visible(screen),
+                           'fresh saved transcript containing the actual fact without a Memory footer')
+                saved_rows = assert_saved_transcript(screen, 1)
+
+                # A real editor change and its reversal give two later complete
+                # frames without submitting another request or opening a menu.
+                # The saved result must retain its one logical transcript row.
+                before = len(capture)
+                send(b'x')
+                pump_until(lambda: fresh(after=before, idle=False) and screen.editor_tail().endswith('x'),
+                           'acknowledged editor redraw after saved result')
+                assert memory_footer_absent(screen), 'saved result returned to the footer on redraw'
+                assert assert_saved_transcript(screen, 1) == saved_rows, 'saved result was re-reported on redraw'
+                before = len(capture)
+                send(b'\x15')
+                pump_until(lambda: fresh(after=before), 'acknowledged cleared editor after saved result')
+                assert memory_footer_absent(screen), 'saved result returned to the footer after clearing'
+                assert assert_saved_transcript(screen, 1) == saved_rows, 'saved result was re-reported after clearing'
                 assert control.primary == 1 and control.helper == 1
                 saved_text = (project / SAVED_PATH).read_text(encoding='utf-8')
                 assert FACT in saved_text and KEY not in saved_text
@@ -469,10 +519,11 @@ def run(app, columns, observe_saved=False):
             assert control.helper == 1, 'Memory 2 started before Memory 1 finished (FIFO violated)'
             assert footer_state(screen) == queued_one, f'Memory footer lost while queued: {footer_state(screen)!r}'
             assert_footer(screen, queued_one)
-            assert_no_memory_transcript(screen)
+            assert_saved_transcript(screen, 0)
 
             # Release Memory 1 with valid evidence; the queued job must then run on
             # a fresh generation whose related set carries the committed fact.
+            before = len(capture)
             control.release1.set()
             assert control.helper2_arrived.wait(12), 'queued Memory 2 request did not arrive'
             with control.lock:
@@ -488,18 +539,19 @@ def run(app, columns, observe_saved=False):
             saved_text = saved.read_text(encoding='utf-8')
             assert FACT in saved_text and KEY not in saved_text, 'committed fact file content mismatch'
 
-            # Observe the second job active in an acknowledged frame before
-            # releasing its empty response. A newer acknowledged idle frame with
-            # the active row gone is the completion transition, not a sleep or
-            # merely an absence observed before the result was processed.
-            pump_until(lambda: fresh() and footer_state(screen) == ACTIVE,
-                       'second Memory job active before empty result')
+            # The first completion is a single transcript row even while the
+            # second job owns the progress footer. Observe both in a fresh ACK
+            # before releasing the second job's empty response.
+            pump_until(lambda: fresh(after=before) and footer_state(screen) == ACTIVE and saved_visible(screen),
+                       'second Memory job active with the first saved result in the transcript')
+            assert_footer(screen, ACTIVE)
+            assert_saved_transcript(screen, 1)
             before = len(capture)
             control.release2.set()
-            pump_until(lambda: control.helper2_responded.is_set() and len(capture) > before
-                       and fresh() and all('Memory:' not in row_text(screen, i)
-                                           for i in range(len(screen.grid))),
-                       'acknowledged empty-result completion without Memory notice')
+            pump_until(lambda: control.helper2_responded.is_set() and fresh(after=before)
+                       and memory_footer_absent(screen),
+                       'acknowledged empty-result completion without a Memory footer')
+            assert_saved_transcript(screen)  # Earlier saved row may remain; skipped adds no row.
 
             # Round 3 then exit while its Memory request is unanswered: Ctrl-D from
             # the idle composer must not release a valid response for the job.
@@ -510,7 +562,7 @@ def run(app, columns, observe_saved=False):
                        'round 3 active Memory footer after prompt 3')
             assert b'answer-three-proof' in capture, 'round 3 primary answer is missing'
             assert_footer(screen, ACTIVE)
-            assert_no_memory_transcript(screen)
+            assert_saved_transcript(screen)  # The prior saved result may have scrolled away.
             assert not control.release3.is_set() and not control.helper3_responded
 
             send(b'\x04')
@@ -527,19 +579,44 @@ def run(app, columns, observe_saved=False):
             assert len(journals) <= 16, 'session journal count bound'
             def check_records(value):
                 if isinstance(value, dict):
-                    if value.get('role') in ('user', 'assistant'):
-                        content = value.get('content')
-                        if isinstance(content, str):
-                            assert 'Memory:' not in content, 'Memory notice in canonical message'
+                    assert value.get('event') != 'memory_completed', 'Memory completion event in journal/checkpoint'
                     for nested in value.values():
                         check_records(nested)
                 elif isinstance(value, list):
                     for nested in value:
                         check_records(nested)
+                elif isinstance(value, str):
+                    assert 'Memory:' not in value, 'Memory notice in journal/canonical message'
             for journal in journals:
                 assert journal.stat().st_size <= 4 * 1024 * 1024, 'session journal byte bound'
                 for line in journal.read_text(encoding='utf-8').splitlines():
                     check_records(json.loads(line))
+
+            checkpoints = list((project / '.thin/sessions').glob('*.session'))
+            assert checkpoints and len(checkpoints) <= 16, 'accepted session checkpoint missing or over bound'
+            complete_checkpoint = False
+            for checkpoint in checkpoints:
+                raw = checkpoint.read_bytes()
+                assert 17 <= len(raw) <= 17 + 4096 + 16 * 1024 * 1024, 'checkpoint byte bound'
+                assert raw[:8] == b'THINRSM\x00' and raw[8] == 2, 'checkpoint framing/version'
+                selection_len, payload_len = struct.unpack_from('<II', raw, 9)
+                assert 0 < selection_len <= 4096 and 0 < payload_len <= 16 * 1024 * 1024
+                assert len(raw) == 17 + selection_len + payload_len, 'incomplete checkpoint'
+                selection = json.loads(raw[17:17 + selection_len])
+                payload = json.loads(raw[17 + selection_len:])
+                assert_no_ui_memory_notice(selection, 'checkpoint selection')
+                assert_no_ui_memory_notice(payload, 'checkpoint')
+                messages = payload['messages']
+                assert isinstance(messages, list), 'checkpoint messages missing'
+                check_records(messages)
+                def contains(role, text):
+                    return any(message.get('role') == role and
+                               any(block.get('text') == text for block in message.get('blocks', []))
+                               for message in messages)
+                if (all(contains('user', prompt) for prompt in PROMPTS) and
+                        all(contains('assistant', answer) for answer in ANSWERS)):
+                    complete_checkpoint = True
+            assert complete_checkpoint, 'checkpoint lacks the three canonical primary turns'
             for retired in RETIRED_PATHS:
                 assert not (project / retired).exists(), f'retired Memory jobs path recreated: {retired}'
             assert config_path.read_bytes() == config_bytes, 'active config was rewritten by the fixture run'
@@ -548,7 +625,7 @@ def run(app, columns, observe_saved=False):
             assert child.pid and pgid == child.pid
             print(f'PASS memory-background columns={columns}: primary=3 helper=3 '
                   f'prompt2_admitted_while_memory=1 queued_fifo=1 helper2_related_version=1 '
-                  f'terminal_no_new_entries=1 transcript_memory_rows=0 ctrl_d_cancel=1')
+                  f'terminal_no_new_entries=1 saved_transcript_once=1 ctrl_d_cancel=1')
         finally:
             control.release1.set()
             control.release2.set()

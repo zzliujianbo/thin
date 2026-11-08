@@ -110,6 +110,46 @@ fn expectNoJobs(root: *fs.Root) !void {
     try std.testing.expectError(error.FileNotFound, fs.openPath(root.dir.handle, ".thin/memory/jobs-owner"));
 }
 
+test "initial core failures reach Session queue exactly once" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |busy| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root = try openRoot(a, io, tmp.dir);
+        defer root.deinit();
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", root.path);
+        if (!busy) {
+            var store = @import("../tools/memory.zig").Store.init(&root, .{});
+            const entry = try store.write(a, "core", "known owned-memory-lifecycle-key", null);
+            a.free(entry.content);
+            a.free(entry.version);
+        }
+        const held = try fs.openDirectory(root.dir.handle, ".");
+        defer fs.closeFd(held);
+        if (busy) try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(held, 2 | 4));
+        const queue = try @import("memory_notifications.zig").Queue.create(a);
+        defer queue.deinit();
+        const config = try cfg.clone(a, .{
+            .provider = .{ .base_url = "http://127.0.0.1:1", .api_key = "owned-memory-lifecycle-key" },
+            .selected_provider = "owned",
+            .model = .{ .name = "main", .protocol = .chat, .context_tokens = 32768 },
+            .limits = .{ .low_price_input = false },
+        });
+        const app = try App.initConfiguredAnchoredAuthWithNotifications(a, io, &env, &root, "/unused/private/config.json", .{}, config, queue);
+        defer app.deinit();
+        const terminal = queue.take().?;
+        try std.testing.expectEqual(@as(u64, 0), terminal.id);
+        try std.testing.expectEqual(@import("../core/memory_status.zig").Result.failed, terminal.result);
+        try std.testing.expectEqual(if (busy) @import("../core/memory_status.zig").Failure.busy else .invalid_output, terminal.failure.?);
+        try std.testing.expect(queue.take() == null);
+        try std.testing.expect(!app.runtime.poisoned);
+        try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
+    }
+}
+
 test "Runtime publishes finished and accepts next prompt while Memory is gated" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});

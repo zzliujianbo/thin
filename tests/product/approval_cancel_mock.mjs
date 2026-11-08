@@ -132,9 +132,28 @@ async function run(url) {
     });
     const output = Buffer.concat(chunks).toString('utf8');
     assert(!output.includes('fixture-secret-never-log'), 'secret leaked');
-    for (const line of output.split('\n')) {
-      if (/^APPROVAL_CANCEL_SCREEN last_visible=(?:true|false) prior_total=\d+ history=\d+$/.test(line) ||
-          /^APPROVAL_CANCEL_WAIT repeated_titles=\d+$/.test(line)) console.log(line);
+    if (result.code !== 0) {
+      // Never forward a raw PTY tail, source/command line or unknown message.
+      console.error('APPROVAL_CANCEL_FAILURE checkpoint=pty-exit');
+      let locations = 0;
+      for (const line of output.split('\n')) {
+        if (/^error: [A-Za-z][A-Za-z0-9_]{0,63}$/.test(line)) console.error(line);
+        const location = /(?:^|[ /])app_pty_test\.zig:([1-9][0-9]{0,8}):([1-9][0-9]{0,8})(?=[:\s]|$)/.exec(line);
+        if (location && locations < 8) {
+          console.error(`app_pty_test.zig:${location[1]}:${location[2]}`);
+          locations++;
+        }
+        if (/^APPROVAL_CANCEL_SCREEN last_visible=(?:true|false) prior_total=\d+ history=\d+$/.test(line) ||
+            /^APPROVAL_CANCEL_WAIT repeated_titles=\d+$/.test(line) ||
+            /^APPROVAL_CANCEL_PREVIEW page=[0-8] ghost_visible=(?:true|false)$/.test(line) ||
+            line === 'APPROVAL_CANCEL_CHECKPOINT=preview-await' ||
+            line === 'APPROVAL_CANCEL_GATE=verified') console.error(line);
+      }
+    } else {
+      for (const line of output.split('\n')) {
+        if (/^APPROVAL_CANCEL_SCREEN last_visible=(?:true|false) prior_total=\d+ history=\d+$/.test(line) ||
+            /^APPROVAL_CANCEL_WAIT repeated_titles=\d+$/.test(line)) console.log(line);
+      }
     }
     if (localFailure) throw localFailure;
     if (failure) throw failure;

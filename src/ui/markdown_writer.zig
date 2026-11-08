@@ -7,7 +7,7 @@ const theme = @import("theme.zig");
 const Allocator = std.mem.Allocator;
 pub const Error = Allocator.Error || error{ MarkdownRenderLimit, MarkdownCellOverflow };
 
-pub const Tone = enum { normal, heading, strong, code, inline_code, quote, link, link_url, rule, border, muted, thinking, table_header, user };
+pub const Tone = enum { normal, heading, strong, code, inline_code, quote, link, link_url, rule, border, muted, thinking, table_header, user, warning, failure };
 pub const Style = struct { tone: Tone = .normal, bold: bool = false, italic: bool = false, strike: bool = false, underline: bool = false };
 
 /// Optional completion sink, default off. When set, a finished row is handed to
@@ -182,6 +182,8 @@ pub const Writer = struct {
             .thinking => theme.thinking,
             .table_header => theme.table_header,
             .user => theme.user,
+            .warning => theme.warning,
+            .failure => theme.failure,
         });
         if (style.bold) try self.put(dest, "\x1b[1m");
         if (style.italic) try self.put(dest, "\x1b[3m");
@@ -513,6 +515,28 @@ test "colored rows preserve width, card background and ANSI ownership" {
         try std.testing.expect(std.mem.indexOf(u8, line, theme.user_background) != null);
         try std.testing.expect(std.mem.endsWith(u8, line, theme.reset));
     }
+}
+
+test "warning and failure tones keep body color and row reset intact" {
+    try text.initLocale();
+    var w: Writer = .{ .a = std.testing.allocator, .columns = 40, .ansi = true };
+    defer w.deinit();
+    try w.setStyle(.{ .tone = .warning });
+    try w.emit("warn\n");
+    try w.setStyle(.{ .tone = .failure });
+    try w.emit("fail\n");
+    try w.setStyle(.{});
+    try w.emit("plain");
+    try w.finish();
+    try std.testing.expectEqual(@as(usize, 3), w.lines.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, w.lines.items[0], "\x1b[38;5;220m" ++ "warn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.lines.items[1], "\x1b[38;5;203m" ++ "fail") != null);
+    for (w.lines.items) |line| try std.testing.expect(std.mem.endsWith(u8, line, theme.reset));
+    // Returning to the default tone clears the color before ordinary body text.
+    try std.testing.expect(std.mem.indexOf(u8, w.lines.items[2], theme.reset ++ "plain") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.lines.items[2], "\x1b[38;5;220m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.lines.items[2], "\x1b[38;5;203m") == null);
+    try expectRows(&w);
 }
 
 fn expectRows(w: *const Writer) !void {

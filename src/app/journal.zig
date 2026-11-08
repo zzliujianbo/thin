@@ -16,8 +16,8 @@ fn safeDiagnosticCause(d: *const decision.Diagnostic) ?[]const u8 {
     return name;
 }
 
-const text_limit = 256 * 1024;
-const record_limit = 2 * 1024 * 1024;
+const text_limit = 1 * 1024 * 1024;
+const record_limit = 5 * 1024 * 1024;
 const omitted = "[omitted]";
 
 const SelectionEvent = struct {
@@ -548,8 +548,9 @@ pub const Journal = struct {
                 .text => |v| try self.firstResponse(a, "text", v.len),
                 .reasoning => |v| try self.firstResponse(a, "reasoning", v.len),
                 .tool_preview => |v| try self.firstResponse(a, "tool_preview", v.arguments.len),
-                // Ephemeral display snapshots are not canonical archive data.
-                .tool_views, .tool_view => {},
+                // Ephemeral display snapshots and owner-only Memory notices
+                // are not canonical archive or diagnostic records.
+                .tool_views, .tool_view, .memory_completed => {},
                 .state => |v| {
                     if (v == .calling_model or v == .compacting) self.first = false;
                     try self.record(a, "state", .{ .state = v });
@@ -712,7 +713,7 @@ pub const Journal = struct {
         return result;
     }
 
-    /// 小字符串不预分配 256 KiB；扩容有硬上限，失败不会产生半个 JSON 字符串。
+    /// 小字符串不预分配 1 MiB；扩容有硬上限，失败不会产生半个 JSON 字符串。
     fn encodeJson(a: std.mem.Allocator, value: std.json.Value, hint: usize) !?[]const u8 {
         var capacity = @min(text_limit, @max(@as(usize, 128), hint));
         while (true) {
@@ -1234,6 +1235,55 @@ test "journal is lazy and storage failure is sticky" {
     try std.testing.expectEqual(error.InvalidLimits, journal.failure().?);
     try std.testing.expect(journal.seq <= 2);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
+}
+
+test "journal text and encoded record size boundaries persist through store" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
+    defer journal.deinit();
+    const payload = try std.testing.allocator.alloc(u8, text_limit + 1);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, '"');
+    @memset(payload[0 .. text_limit / 8], 1);
+    const medium_len = 256 * 1024 + 1;
+    const observer = journal.observer();
+    observer.notify(.{ .submitted = payload[0..medium_len] });
+    journal.flush();
+    observer.notify(.{ .submitted = payload[0..text_limit] });
+    journal.flush();
+    observer.notify(.{ .submitted = payload });
+    journal.flush();
+    try std.testing.expectEqual(null, journal.failure());
+    const content = try root.read(std.testing.allocator, journal.store.path(), 0, record_limit);
+    defer std.testing.allocator.free(content.data);
+    try std.testing.expect(!content.truncated);
+    var lines = std.mem.splitScalar(u8, content.data, '\n');
+    var users: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        if (!std.mem.eql(u8, obj.get("event").?.string, "user")) continue;
+        users += 1;
+        const data = obj.get("data").?.object;
+        if (users == 3) {
+            try std.testing.expect(data.get("omitted").?.bool);
+            try std.testing.expectEqualStrings(omitted, data.get("text").?.string);
+        } else {
+            const expected = if (users == 1) payload[0..medium_len] else payload[0..text_limit];
+            try std.testing.expect(!data.get("omitted").?.bool);
+            try std.testing.expectEqualSlices(u8, expected, data.get("text").?.string);
+            if (users == 2) {
+                try std.testing.expect(line.len > 2 * 1024 * 1024);
+                try std.testing.expect(line.len < record_limit);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), users);
 }
 
 test "journal bounded UTF8 payload and oversized encoded record continue" {

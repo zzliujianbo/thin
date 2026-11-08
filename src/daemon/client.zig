@@ -3800,14 +3800,14 @@ test "communication delivers real stream frames during a delayed control reply a
     var request_ = try protocol.parseRequest(a, request_bytes);
     defer request_.deinit();
     try testing.expect(request_.op == .cancel or request_.op == .poll_metadata);
-    try stream.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"snapshot\",\"through\":0,\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"phase\":\"calling_model\",\"task\":1,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2000 });
-    try stream.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2000 });
+    try stream.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"snapshot\",\"through\":0,\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"phase\":\"calling_model\",\"task\":1,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2000 });
+    try stream.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2000 });
     const event_bytes = try protocol.encodeEvent(a, .{ .text = "delayed-control-live-body" });
     defer a.free(event_bytes);
     // Mandatory wire sequence: the page entry carries the owner's position.
     const sequenced = try std.fmt.allocPrint(a, "{s},\"seq\":1}}", .{event_bytes[0 .. event_bytes.len - 1]});
     defer a.free(sequenced);
-    const page = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":1,\"events\":[{s}]}}", .{sequenced});
+    const page = try std.fmt.allocPrint(a, "{{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":1,\"events\":[{s}]}}", .{sequenced});
     defer a.free(page);
     try stream.writeFrame(page, .{ .io = io, .timeout_ms = 2000 });
     const deadline = std.Io.Clock.awake.now(io);
@@ -4013,8 +4013,8 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
     defer watch_request.deinit();
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
     try testing.expect((try watch_request.optionalU64("since")) == null);
-    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
-    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
 
     const first_page = try readyPage(a, 0, 1, &.{1}, "a");
     defer a.free(first_page);
@@ -4054,7 +4054,7 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
     // no per-event FIFO reaches the owner.
     // UTF-8 plus a CR-bearing delta: the CR boundary must stay a separate
     // unacknowledged item across the reconnect, never absorbed into the other.
-    const second_page = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":1,\"through\":3,\"events\":[{{\"t\":\"text\",\"v\":\"中\",\"seq\":2}},{{\"t\":\"text\",\"v\":\"\\r\",\"seq\":3}}]}}", .{});
+    const second_page = try std.fmt.allocPrint(a, "{{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":1,\"through\":3,\"events\":[{{\"t\":\"text\",\"v\":\"中\",\"seq\":2}},{{\"t\":\"text\",\"v\":\"\\r\",\"seq\":3}}]}}", .{});
     defer a.free(second_page);
     try watch.writeFrame(second_page, .{ .io = io, .timeout_ms = 2_000 });
     var received: usize = 0;
@@ -4136,7 +4136,7 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
 
     // Same viewer: snapshot at the cursor is redundant, the delta continues the
     // owned stream with no synthetic history reset and no duplicate.
-    try resumed.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":3,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    try resumed.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":3,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
     const delta = try readyPage(a, 3, 4, &.{4}, "d");
     defer a.free(delta);
     try resumed.writeFrame(delta, .{ .io = io, .timeout_ms = 2_000 });
@@ -4188,8 +4188,8 @@ test "new viewer baseline rows precede ordered pages and gaps are surfaced" {
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
     const hello = try protocol.encodeEvent(a, .{ .user_committed = .{ .id = 1, .text = "hello" } });
     defer a.free(hello);
-    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":5,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
-    const baseline = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":2,\"through\":2,\"truncated\":false,\"entries\":[{s}]}}", .{hello});
+    try watch.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":5,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    const baseline = try std.fmt.allocPrint(a, "{{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":2,\"through\":2,\"truncated\":false,\"entries\":[{s}]}}", .{hello});
     defer a.free(baseline);
     try watch.writeFrame(baseline, .{ .io = io, .timeout_ms = 2_000 });
 
@@ -4209,7 +4209,7 @@ test "new viewer baseline rows precede ordered pages and gaps are surfaced" {
 
     // Positions 4 and 5 follow the baseline cutoff; position 3 is gone (a
     // selectively retired control event), so the page must say so.
-    const page = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":2,\"through\":5,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"A\",\"seq\":4}},{{\"t\":\"user\",\"id\":2,\"v\":\"again\",\"seq\":5}}]}}", .{});
+    const page = try std.fmt.allocPrint(a, "{{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":2,\"through\":5,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"A\",\"seq\":4}},{{\"t\":\"user\",\"id\":2,\"v\":\"again\",\"seq\":5}}]}}", .{});
     defer a.free(page);
     try watch.writeFrame(page, .{ .io = io, .timeout_ms = 2_000 });
     var received: usize = 0;
@@ -4266,11 +4266,11 @@ test "coalesced live span is acknowledged as one exact first/last range" {
     var watch_request = try protocol.parseRequest(a, raw_watch);
     defer watch_request.deinit();
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
-    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
-    try watch.writeFrame("{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
     // Three consecutive raw deltas (positions 4..6) that the display queue
     // coalesces into one payload. Earlier positions were already shortened.
-    const page = try std.fmt.allocPrint(a, "{{\"v\":2,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":6,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"a\",\"seq\":4}},{{\"t\":\"text\",\"v\":\"b\",\"seq\":5}},{{\"t\":\"text\",\"v\":\"c\",\"seq\":6}}]}}", .{});
+    const page = try std.fmt.allocPrint(a, "{{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":6,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"a\",\"seq\":4}},{{\"t\":\"text\",\"v\":\"b\",\"seq\":5}},{{\"t\":\"text\",\"v\":\"c\",\"seq\":6}}]}}", .{});
     defer a.free(page);
     try watch.writeFrame(page, .{ .io = io, .timeout_ms = 2_000 });
 
@@ -5257,7 +5257,7 @@ test "real host settings reply projects providers flags price states and pending
     host.connection.context = &view;
 
     // The real owner frame, not a hand-written fixture object.
-    var request = try protocol.parseRequest(a, "{\"v\":2,\"id\":60,\"op\":\"settings\"}");
+    var request = try protocol.parseRequest(a, "{\"v\":3,\"id\":60,\"op\":\"settings\"}");
     defer request.deinit();
     const frame = try host.dispatch(a, &request, 7, true);
     defer a.free(frame);
@@ -5729,7 +5729,7 @@ test "version and id are checked before ok/err, then the view is dropped" {
     // A wrong id cannot be attributed to this request, so `ok` is irrelevant:
     // the frame is rejected as protocol error and the view is dropped.
     const wait = unix.Wait{ .io = std.testing.io, .timeout_ms = 5_000 };
-    try pair.server.writeFrame("{\"v\":2,\"id\":9,\"ok\":false,\"err\":\"busy\"}", wait);
+    try pair.server.writeFrame("{\"v\":3,\"id\":9,\"ok\":false,\"err\":\"busy\"}", wait);
     try std.testing.expectError(error.ProtocolError, client.readResponse(2, quick_timeout_ms));
     try std.testing.expect(client.conn == null);
     try std.testing.expectEqual(@as(u64, 0), client.epoch);
@@ -6811,7 +6811,7 @@ fn candidatePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id:
     try testing.expectEqual(@as(u64, 7), try watch.u64Field("epoch"));
     switch (behavior) {
         .watch_eof => stream.close(),
-        .watch_reject => try stream.writeFrame("{\"v\":2,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
+        .watch_reject => try stream.writeFrame("{\"v\":3,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
         .watch_timeout => {},
         else => try writePeerInitial(a, io, &stream, id, project, owner, 7, switch (behavior) {
             .snapshot => .snapshot,

@@ -341,6 +341,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
         const expected = ['history-one','history-two','esc-task','history-one'][rounds - 1];
         assert.equal(body.messages.filter(m=>m.role==='user').at(-1).content, expected);
         if (rounds === 3) {
+          await writeFile(join(project, 'keyboard-history-arrived'), 'ready', {mode:0o600});
           stalled = true;
           res.writeHead(200, {'content-type':'text/event-stream'}); res.flushHeaders();
         } else send(res, protocol, rounds === 4 ? 'after-esc-answer' : `history-answer-${rounds}`);
@@ -649,7 +650,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
       const logDir = join(project,'.thin/sessions');
       if (announced && await exists(logDir) && (await stat(logDir)).isDirectory()) {
         for (const file of (await readdir(logDir)).filter(name=>name.endsWith('.jsonl'))) {
-          assert(file.includes(`-${announced}-`), 'archive filename differs from announced identity');
+          assert(file.startsWith(`${announced}-`), 'archive filename differs from announced identity');
           for (const line of (await readFile(join(logDir,file),'utf8')).trimEnd().split('\n').filter(Boolean)) assert.equal(JSON.parse(line).session,announced, 'record identity differs from immutable owner identity');
         }
       }

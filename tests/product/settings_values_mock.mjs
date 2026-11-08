@@ -58,10 +58,12 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
         const envelope = JSON.parse(input.content);
         assert.deepEqual(Object.keys(envelope).sort(),['data','operation']);
         assert.equal(envelope.operation,'command'); assert.equal(envelope.data.command,COMMAND);
+        assert.deepEqual(Object.keys(envelope.data).sort(),Object.hasOwn(envelope.data,'risk') ? ['command','risk'] : ['command']);
+        if (Object.hasOwn(envelope.data,'risk')) assert.equal(envelope.data.risk,null);
         for (const hidden of [WARMUP,TASK,'values-warmup-answer',MAIN_KEY,AUX_KEY])
           assert(!JSON.stringify(body.messages).includes(hidden));
         // Valid strict JSON review carried by normal streaming Chat chunks.
-        send(res,'chat','{"timeout_ms":1000,"ask":false}');
+        send(res,'chat','{"ask":false}');
         return;
       }
       assert.equal(req.url,'/primary/v1/chat/completions');

@@ -4,6 +4,7 @@ const std = @import("std");
 const p = @import("../core/protocol.zig");
 const cfg = @import("../core/config.zig");
 const r = @import("../core/runtime.zig");
+const diagnostics = @import("../core/diagnostics.zig");
 const context = @import("../core/context.zig");
 const auxiliary = @import("../core/decision.zig");
 
@@ -73,6 +74,7 @@ const Fake = struct {
     disconnect_committed: bool = false,
     /// 为 true 时不发送文本增量，只提供最终文本。
     omit_deltas: bool = false,
+    emit_reasoning: bool = false,
     /// 宿主最近一次收到的已提交文本。
     committed_text: []const u8 = "",
     /// 是否已进入（阻塞的）模型调用。
@@ -103,11 +105,10 @@ const Fake = struct {
     /// When set, permission-id exhaustion asks the host to start a new epoch.
     rebase_permissions: bool = false,
     decision_input: ?auxiliary.Input = null,
-    decision_output: auxiliary.Output = .{ .command = .{ .timeout = .none, .ask = false } },
+    decision_output: auxiliary.Output = .{ .command = .{ .ask = false } },
     decision_failure: ?anyerror = null,
     decision_cancel: ?*p.Cancellation = null,
     decision_calls: usize = 0,
-    seen_command_timeout: ?auxiliary.Timeout = null,
 
     fn auxiliaryDecide(raw: *anyopaque, _: std.mem.Allocator, _: auxiliary.Input, _: *const p.Cancellation) !auxiliary.Output {
         const self: *Fake = @ptrCast(@alignCast(raw));
@@ -124,7 +125,7 @@ const Fake = struct {
         try std.testing.expectEqual(self.decision_calls, self.permissions);
         try std.testing.expectEqual(self.decision_calls, self.executions);
         self.decision_calls += 1;
-        return .{ .command = .{ .timeout = .none, .ask = true } };
+        return .{ .command = .{ .ask = true } };
     }
 
     fn service(self: *Fake) auxiliary.Service {
@@ -206,7 +207,10 @@ const Fake = struct {
 
         // 达到 stop_after 后返回纯文本结束。
         if (self.normal_calls > self.stop_after) {
-            if (!self.omit_deltas) try sink.emit(.{ .text_delta = "done" });
+            if (!self.omit_deltas) {
+                if (self.emit_reasoning) try sink.emit(.{ .reasoning_delta = "thinking" });
+                try sink.emit(.{ .text_delta = "done" });
+            }
             return .{ .success = .{
                 .message = .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} },
                 .finish = .stop,
@@ -234,11 +238,10 @@ const Fake = struct {
     }
 
     /// 执行工具：执行前先检查取消（已取消则不产生副作用），成功后计数，并按配置返回成功或清理失败。
-    fn execute(ctx: *anyopaque, _: std.mem.Allocator, prepared: r.Prepared, cancel: *const p.Cancellation) !r.Execution {
+    fn execute(ctx: *anyopaque, _: std.mem.Allocator, _: r.Prepared, cancel: *const p.Cancellation) !r.Execution {
         const self: *Fake = @ptrCast(@alignCast(ctx));
         if (cancel.isRequested()) return error.Canceled;
         self.executions += 1;
-        self.seen_command_timeout = prepared.command_timeout;
         if (self.execution_delay) try std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake);
         if (self.execution_error) |err| return err;
         if (self.fail_after_execution) |armed| armed.* = true;
@@ -376,11 +379,11 @@ test "system prompt keeps evidence authority and quoted Memory boundaries explic
     try std.testing.expectEqual(@as(u32, 0), fake.executions);
 }
 
-test "decision command allow clears classifier ask forces approval and timeout is explicit" {
+test "decision command allow clears classifier and ask forces approval" {
     for ([_]bool{ false, true }) |enabled| for ([_]bool{ false, true }) |ask| {
         var fake: Fake = .{
-            .decision_input = .{ .command = .{ .command = "fixture", .max_timeout_ms = 1000 } },
-            .decision_output = .{ .command = .{ .timeout = if (ask) .{ .milliseconds = 700 } else .none, .ask = ask } },
+            .decision_input = .{ .command = .{ .command = "fixture" } },
+            .decision_output = .{ .command = .{ .ask = ask } },
             .explicit_denial = "old classifier denial",
         };
         var config = configuration();
@@ -394,10 +397,6 @@ test "decision command allow clears classifier ask forces approval and timeout i
         try std.testing.expectEqual(@as(usize, if (enabled) 1 else 0), fake.decision_calls);
         try std.testing.expectEqual(@as(u32, if (!enabled or ask) 1 else 0), fake.permissions);
         try std.testing.expectEqual(@as(u32, 1), fake.executions);
-        if (enabled) {
-            try std.testing.expect(fake.seen_command_timeout != null);
-            if (ask) try std.testing.expectEqual(@as(u32, 700), fake.seen_command_timeout.?.milliseconds) else try std.testing.expect(fake.seen_command_timeout.? == .none);
-        } else try std.testing.expect(fake.seen_command_timeout == null);
         try std.testing.expectEqual(@as(u32, 2), result.usage.normal_calls);
         try std.testing.expectEqual(@as(u32, 0), result.usage.summary_calls);
     };
@@ -408,7 +407,7 @@ test "decision failure and cancellation stop without continuation and pair calls
         var cancel: p.Cancellation = .{};
         var fake: Fake = .{
             .calls_per_response = 2,
-            .decision_input = .{ .command = .{ .command = "fixture", .max_timeout_ms = 1000 } },
+            .decision_input = .{ .command = .{ .command = "fixture" } },
             .decision_failure = if (mode == 0) error.FixtureUnavailable else if (mode == 2) error.CleanupFailed else null,
             .decision_cancel = if (mode == 1) &cancel else null,
         };
@@ -445,8 +444,8 @@ test "decision failure and cancellation stop without continuation and pair calls
 
 test "decision ask requires approval even without a classifier denial" {
     var fake: Fake = .{
-        .decision_input = .{ .command = .{ .command = "fixture", .max_timeout_ms = 1000 } },
-        .decision_output = .{ .command = .{ .timeout = .none, .ask = true } },
+        .decision_input = .{ .command = .{ .command = "fixture" } },
+        .decision_output = .{ .command = .{ .ask = true } },
         .explicit_denial = null,
         .decision = .deny,
     };
@@ -466,7 +465,7 @@ test "decision ask requires a new approval for every successive operation" {
     var fake: Fake = .{
         .stop_after = 2,
         .explicit_denial = null,
-        .decision_input = .{ .command = .{ .command = "fixture", .max_timeout_ms = 1000 } },
+        .decision_input = .{ .command = .{ .command = "fixture" } },
     };
     const config = configuration();
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
@@ -1560,6 +1559,100 @@ test "task deadline reaches a blocked model independently of output" {
     try std.testing.expectEqual(error.TaskTimeout, terminal.detail.?);
     try std.testing.expect(fake.entered_model);
     try std.testing.expectEqual(@as(u32, 1), fake.terminals);
+}
+
+test "standalone runtime pairs observer spans for commit and finish without delta spans" {
+    const Capture = struct {
+        records: [32]diagnostics.Record = undefined,
+        count: usize = 0,
+        next_id: u64 = 0,
+        overflow: bool = false,
+        text_index: ?usize = null,
+        reasoning_index: ?usize = null,
+        committed_index: ?usize = null,
+        finished_index: ?usize = null,
+
+        fn next(ctx: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.next_id += 1;
+            return self.next_id;
+        }
+        fn emit(ctx: ?*anyopaque, record: diagnostics.Record) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.count == self.records.len) {
+                self.overflow = true;
+                return;
+            }
+            self.records[self.count] = record;
+            self.count += 1;
+        }
+        fn observe(ctx: ?*anyopaque, observation: r.Observation) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (observation != .event) return;
+            switch (observation.event) {
+                .text => self.text_index = self.count,
+                .reasoning => self.reasoning_index = self.count,
+                .assistant_committed => self.committed_index = self.count,
+                .finished => self.finished_index = self.count,
+                else => {},
+            }
+        }
+        fn expectPair(self: *const @This(), start: usize, stage: diagnostics.Stage, result: diagnostics.Result) !u64 {
+            try std.testing.expect(start + 1 < self.count);
+            const begin = self.records[start];
+            const end = self.records[start + 1];
+            try std.testing.expectEqual(stage, begin.stage);
+            try std.testing.expectEqual(stage, end.stage);
+            try std.testing.expectEqual(diagnostics.Phase.begin, begin.phase);
+            try std.testing.expectEqual(diagnostics.Phase.end, end.phase);
+            try std.testing.expect(begin.span_id != 0);
+            try std.testing.expectEqual(begin.span_id, end.span_id);
+            try std.testing.expect(begin.result == null);
+            try std.testing.expectEqual(result, end.result.?);
+            if (result == .ok) try std.testing.expect(end.error_name == null);
+            return begin.span_id;
+        }
+    };
+
+    for ([_]bool{ false, true }) |disconnect| {
+        var fake: Fake = .{ .stop_after = 0, .emit_reasoning = true, .disconnect_committed = disconnect };
+        const config = configuration();
+        var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
+        defer runtime.deinit();
+        var capture: Capture = .{};
+        runtime.diagnostics = .{ .context = &capture, .emit_fn = Capture.emit, .next_fn = Capture.next };
+        runtime.observer = .{ .context = &capture, .notify_fn = Capture.observe };
+        var cancel: p.Cancellation = .{};
+        const terminal = try runtime.run("short turn", &cancel);
+        try std.testing.expectEqual(if (disconnect) r.Status.failed else r.Status.success, terminal.status);
+        if (disconnect) try std.testing.expectEqual(error.HostDisconnected, terminal.detail.?);
+        try std.testing.expectEqual(@as(u32, 1), fake.normal_calls);
+        try std.testing.expectEqual(@as(u32, 0), fake.executions);
+        try std.testing.expectEqual(@as(u32, 1), fake.terminals);
+        try std.testing.expect(!capture.overflow);
+        try std.testing.expect(capture.text_index != null and capture.reasoning_index != null);
+        try std.testing.expect(capture.committed_index != null and capture.finished_index != null);
+        const committed = capture.committed_index.?;
+        const finished = capture.finished_index.?;
+        try std.testing.expect(committed >= 2 and finished > committed);
+        try std.testing.expect(capture.text_index.? < committed and capture.reasoning_index.? < committed);
+        try std.testing.expectEqual(diagnostics.Stage.assistant_commit, capture.records[committed - 2].stage);
+        try std.testing.expectEqual(diagnostics.Phase.point, capture.records[committed - 2].phase);
+        const commit_id = try capture.expectPair(committed - 1, .observer, .ok);
+        const finished_id = try capture.expectPair(finished - 1, .observer, .ok);
+        try std.testing.expect(commit_id != finished_id);
+        _ = try capture.expectPair(committed + 1, .host_emit, if (disconnect) .failed else .ok);
+        _ = try capture.expectPair(finished + 1, .host_emit, .ok);
+        if (disconnect) try std.testing.expectEqualStrings("HostDisconnected", capture.records[committed + 2].error_name.?.name());
+        var observer_records: usize = 0;
+        var commit_points: usize = 0;
+        for (capture.records[0..capture.count]) |record| {
+            if (record.stage == .observer) observer_records += 1;
+            if (record.stage == .assistant_commit and record.phase == .point) commit_points += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 4), observer_records);
+        try std.testing.expectEqual(@as(usize, 1), commit_points);
+    }
 }
 
 // 只有最终文本（没有增量）时，宿主仍能收到已提交文本，且不会发生原生回放。

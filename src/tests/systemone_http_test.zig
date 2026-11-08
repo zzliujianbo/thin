@@ -52,12 +52,12 @@ fn makeClient(a: std.mem.Allocator, io: Io, scenario: []const u8, timeout_ms: u3
     }
     const client = (try Client.create(a, io, parsed.value, &env)) orelse return error.MissingClient;
     errdefer client.deinit();
-    try t.expect(client.resolved == null and client.calls == 0);
+    try t.expect(client.resolved == null and client.native == null and client.calls == 0);
     try t.expect(client.last_usage.input_tokens == null);
     return client;
 }
 
-const command: decision.Input = .{ .command = .{ .command = "printf fixture", .proposed_timeout_ms = 120000, .max_timeout_ms = 300000 } };
+const command: decision.Input = .{ .command = .{ .command = "printf fixture" } };
 
 fn independent(client: *Client, calls: u64) !void {
     const resolved = client.resolved orelse return error.MissingNativeResolution;
@@ -104,18 +104,12 @@ test "SystemOne owned HTTP app decisions conservative policy and independent rou
     const io = backend.io();
     const a = t.allocator;
     var cancel = p.Cancellation{};
-    for ([_][]const u8{ "command-none", "command-finite", "command-uncertain" }) |scenario| {
+    for ([_][]const u8{ "command-boundary", "command-above", "command-high" }) |scenario| {
         const client = try makeClient(a, io, scenario, 3000, .direct);
         defer client.deinit();
         const out = try client.service().decide(a, command, &cancel);
         defer decision.freeOutput(a, out);
-        if (std.mem.eql(u8, scenario, "command-none")) {
-            try t.expect(!out.command.ask);
-            try t.expect(out.command.timeout == .none);
-        } else {
-            try t.expect(out.command.ask);
-            try t.expectEqual(@as(u32, if (std.mem.eql(u8, scenario, "command-finite")) 30000 else 120000), out.command.timeout.milliseconds);
-        }
+        try t.expectEqual(!std.mem.eql(u8, scenario, "command-boundary"), out.command.ask);
         try usage(client);
     }
     // More than 2KiB, with a critical middle error, operational metadata and
@@ -142,6 +136,57 @@ test "SystemOne owned HTTP app decisions conservative policy and independent rou
     try t.expectEqualStrings(items[1].id, out.refine_outputs[1].id);
     try t.expectEqualStrings("BEGIN path=src/worker.zig version=v7 count=91\nprogress 0%\nERROR src/worker.zig:417 unresolved: checksum mismatch\nmetadata exit=23 truncated=true state=failed\nprogress important diagnostic\nprogress 100%\nEND unresolved failure, do not claim success\n", out.refine_outputs[0].text);
     try t.expectEqualStrings(items[1].text, out.refine_outputs[1].text);
+    try usage(client);
+}
+
+test "SystemOne no-op uses owned copies and mixed batch sends once unchanged" {
+    var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });
+    defer backend.deinit();
+    const a = t.allocator;
+    var cancel: p.Cancellation = .{};
+    const no_op = try makeClient(a, backend.io(), "no-op", 3000, .direct);
+    defer no_op.deinit();
+    const id = try a.dupe(u8, "immutable-id");
+    defer a.free(id);
+    const text = try a.dupe(u8, "诊断\ntick\nERROR");
+    defer a.free(text);
+    const unchanged = [_]decision.RefineItem{
+        .{ .id = id, .text = text },
+        .{ .id = "fenced", .text = "```\ntick\ntick\ntick\n```" },
+    };
+    const copied = try no_op.service().decide(a, .{ .refine_outputs = &unchanged }, &cancel);
+    defer decision.freeOutput(a, copied);
+    try t.expectEqual(@as(usize, 2), copied.refine_outputs.len);
+    for (unchanged, copied.refine_outputs) |original, owned| {
+        try t.expectEqualStrings(original.id, owned.id);
+        try t.expectEqualStrings(original.text, owned.text);
+        try t.expect(original.id.ptr != owned.id.ptr and original.text.ptr != owned.text.ptr);
+    }
+    @memset(id, 'x');
+    @memset(text, 'x');
+    try t.expectEqualStrings("immutable-id", copied.refine_outputs[0].id);
+    try t.expectEqualStrings("诊断\ntick\nERROR", copied.refine_outputs[0].text);
+    try independent(no_op, 0);
+    try t.expect(no_op.last_http_status == null and no_op.last_failure == null);
+    inline for (@typeInfo(p.Usage).@"struct".field_names) |name| try t.expect(@field(no_op.last_usage, name) == null);
+
+    const mixed = [_]decision.RefineItem{
+        .{ .id = "unchanged/id", .text = "diagnostic\ntick\nend" },
+        .{ .id = "eligible/id", .text = "BEGIN\ntick\nprogress 2%\nERROR\ntick\nEND" },
+        .{ .id = "fenced/id", .text = "~~~\ntick\ntick\ntick\n~~~" },
+    };
+    const client = try makeClient(a, backend.io(), "mixed-refine", 3000, .direct);
+    defer client.deinit();
+    const refined = try client.service().decide(a, .{ .refine_outputs = &mixed }, &cancel);
+    defer decision.freeOutput(a, refined);
+    try t.expectEqual(@as(usize, mixed.len), refined.refine_outputs.len);
+    for (mixed, refined.refine_outputs) |original, owned| {
+        try t.expectEqualStrings(original.id, owned.id);
+        try t.expect(original.id.ptr != owned.id.ptr and original.text.ptr != owned.text.ptr);
+    }
+    try t.expectEqualStrings(mixed[0].text, refined.refine_outputs[0].text);
+    try t.expectEqualStrings("BEGIN\ntick\nERROR\ntick\nEND", refined.refine_outputs[1].text);
+    try t.expectEqualStrings(mixed[2].text, refined.refine_outputs[2].text);
     try usage(client);
 }
 

@@ -15,6 +15,7 @@ const knowledge = @import("../tools/knowledge_store.zig");
 const Extractor = @import("memory_client.zig").Client;
 const codex_auth = @import("../core/codex_auth.zig");
 const memory_status = @import("../core/memory_status.zig");
+const notifications = @import("memory_notifications.zig");
 
 pub const State = enum(u8) { idle, finalizing, saved, skipped, failed, uncertain, canceled };
 
@@ -42,12 +43,19 @@ const Job = struct {
     cancel: p.Cancellation = .{},
     sink: diag.Sink,
     outcome: Outcome = .{},
+    notification: ?*notifications.Node = null,
 
     fn destroy(self: *Job, a: std.mem.Allocator) void {
         self.arena.deinit();
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.outcome));
         a.destroy(self);
     }
 };
+pub const SecretGuard = struct {
+    context: *anyopaque,
+    contains_fn: *const fn (*anyopaque, []const u8) bool,
+};
+
 pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -65,6 +73,8 @@ pub const Coordinator = struct {
     secret_count: usize = 0,
     secret_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     secret_registration_failed: bool = false,
+    /// Bound before use; points to the owning App's stable journal.
+    secret_guard: ?SecretGuard = null,
     queue_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     wake: std.Io.Event = .unset,
     future: ?std.Io.Future(void) = null,
@@ -74,6 +84,9 @@ pub const Coordinator = struct {
     stopped: bool = false,
     next_id: u64 = 0,
     status: memory_status.View = .{},
+    /// Session-owned, stable until all coordinators have joined. Null for
+    /// standalone/headless owners; never changed after this owner starts work.
+    notification_queue: ?*notifications.Queue = null,
     /// Test-only, gated worker-wait failure seam. Production has no branch.
     wait_ready: if (builtin.is_test) std.atomic.Value(bool) else void = if (builtin.is_test) .init(false) else {},
     fail_wait: if (builtin.is_test) std.atomic.Value(bool) else void = if (builtin.is_test) .init(false) else {},
@@ -96,15 +109,41 @@ pub const Coordinator = struct {
         return result;
     }
 
-    fn terminal(self: *Coordinator, id: u64, result: memory_status.Result, failure_: ?memory_status.Failure) void {
-        self.status.last_terminal = .{ .id = id, .result = result, .failure = failure_ };
+    /// Bind before any admission; a replacement receives the same Session sink.
+    pub fn bindNotifications(self: *Coordinator, queue: ?*notifications.Queue) void {
+        self.lock();
+        defer self.unlock();
+        std.debug.assert(self.future == null and self.head == null and self.active_job == null);
+        self.notification_queue = queue;
+    }
+
+    fn statusTerminal(self: *Coordinator, value: memory_status.Terminal) void {
+        self.status.last_terminal = value;
         self.status.revision +%= 1;
     }
 
-    fn admissionFailure(self: *Coordinator, id: u64, err: anyerror) void {
+    /// Caller holds the coordinator lock, which also orders publications.
+    fn notifyTerminal(self: *Coordinator, value: memory_status.Terminal, node: ?*notifications.Node) void {
+        if (self.notification_queue) |queue| {
+            if (node) |reserved| {
+                queue.publish(reserved, value);
+            } else if (queue.reserve()) |reserved| {
+                queue.publish(reserved, value);
+            }
+        } else std.debug.assert(node == null);
+    }
+
+    /// A reserved job terminal requires no allocation at publication. A
+    /// reservation-OOM path makes one attempt in notifyTerminal instead.
+    fn terminal(self: *Coordinator, value: memory_status.Terminal, node: ?*notifications.Node) void {
+        self.statusTerminal(value);
+        self.notifyTerminal(value, node);
+    }
+
+    fn admissionFailure(self: *Coordinator, id: u64, err: anyerror, node: ?*notifications.Node) void {
         self.lock();
         defer self.unlock();
-        self.terminal(id, .failed, classifyFailure(err));
+        self.terminal(.{ .id = id, .result = .failed, .failure = classifyFailure(err) }, node);
     }
 
     /// Safe value-only admission diagnostic: bounded error name, no prompt text
@@ -122,17 +161,40 @@ pub const Coordinator = struct {
     }
 
     pub fn enqueueCopy(self: *Coordinator, capture: *const k.Capture, protocol: p.Protocol, sink: diag.Sink) !u64 {
+        // Every rejected admission preserves the headless error/cleanup poison;
+        // its existing admission path publishes the sole display terminal.
+        return self.enqueueCopyInner(capture, protocol, sink) catch |err| {
+            self.publishFailure(err);
+            return err;
+        };
+    }
+
+    fn enqueueCopyInner(self: *Coordinator, capture: *const k.Capture, protocol: p.Protocol, sink: diag.Sink) !u64 {
+        // Reserve independently of Job/capture before any fallible admission
+        // work. Even a rejected attempt gets its own terminal when possible.
+        const node: ?*notifications.Node = if (self.notification_queue) |queue| queue.reserve() else null;
+        if (self.notification_queue != null and node == null) {
+            // The optional display channel must not impose a Memory job limit.
+            // Explicitly diagnose the only case in which even our emergency
+            // reservation failed; publication will make one more attempt.
+            sink.emit(.{
+                .stage = .memory_submit,
+                .phase = .point,
+                .result = .failed,
+                .error_name = diag.ErrorName.fromError(error.MemoryNotificationReservationUnavailable),
+            });
+        }
         self.lock();
         if (self.stopped or !self.config.value.memory.auto) {
             self.unlock();
-            self.admissionFailure(0, error.MemoryUnavailable);
+            self.admissionFailure(0, error.MemoryUnavailable, node);
             emitAdmissionFailure(sink, 0, error.MemoryUnavailable);
             return error.MemoryUnavailable;
         }
         // Never wrap an exhausted id to a previously used job id.
         if (self.next_id == std.math.maxInt(u64)) {
             self.unlock();
-            self.admissionFailure(0, error.MemoryIdExhausted);
+            self.admissionFailure(0, error.MemoryIdExhausted, node);
             emitAdmissionFailure(sink, 0, error.MemoryIdExhausted);
             return error.MemoryIdExhausted;
         }
@@ -140,12 +202,12 @@ pub const Coordinator = struct {
         const id = self.next_id;
         self.unlock();
         if (capture.incomplete) {
-            self.admissionFailure(id, error.IncompleteCapture);
+            self.admissionFailure(id, error.IncompleteCapture, node);
             emitAdmissionFailure(sink, id, error.IncompleteCapture);
             return error.IncompleteCapture;
         }
         const job = self.allocator.create(Job) catch |err| {
-            self.admissionFailure(id, err);
+            self.admissionFailure(id, err, node);
             emitAdmissionFailure(sink, id, err);
             return err;
         };
@@ -158,30 +220,31 @@ pub const Coordinator = struct {
         job.sink = sink;
         job.sink.memory_job_id = id;
         job.outcome = .{};
+        job.notification = node;
         job.capture = .{ .allocator = job.arena.allocator(), .bytes = capture.bytes, .omitted_sources = capture.omitted_sources };
         errdefer job.destroy(self.allocator);
         for (capture.sources.items) |source| {
             const text = job.capture.allocator.dupe(u8, source.text) catch |err| {
-                self.admissionFailure(id, err);
+                self.admissionFailure(id, err, node);
                 emitAdmissionFailure(sink, id, err);
                 return err;
             };
             job.capture.sources.append(job.capture.allocator, .{ .id = source.id, .kind = source.kind, .text = text }) catch |err| {
-                self.admissionFailure(id, err);
+                self.admissionFailure(id, err, node);
                 emitAdmissionFailure(sink, id, err);
                 return err;
             };
         }
         self.lock();
         if (self.stopped) {
-            self.terminal(id, .failed, .unavailable);
+            self.terminal(.{ .id = id, .result = .failed, .failure = .unavailable }, node);
             self.unlock();
             emitAdmissionFailure(sink, id, error.MemoryUnavailable);
             return error.MemoryUnavailable;
         }
         if (self.future == null) {
             self.future = std.Io.concurrent(self.io, worker, .{self}) catch |err| {
-                self.terminal(id, .failed, classifyFailure(err));
+                self.terminal(.{ .id = id, .result = .failed, .failure = classifyFailure(err) }, node);
                 self.unlock();
                 emitAdmissionFailure(sink, id, err);
                 return err;
@@ -263,9 +326,13 @@ pub const Coordinator = struct {
             self.active_job = null;
             self.status.active = null;
             self.publishFailure(outcome.err);
-            self.terminal(job.id, result, if (outcome.err) |err| classifyFailure(err) else null);
-            self.status.last_terminal.?.saved_count = outcome.saved_count;
-            self.status.last_terminal.?.summary = outcome.summary;
+            self.terminal(.{
+                .id = job.id,
+                .result = result,
+                .failure = if (outcome.err) |err| classifyFailure(err) else null,
+                .saved_count = outcome.saved_count,
+                .summary = outcome.summary,
+            }, job.notification);
             self.unlock();
             job.destroy(self.allocator);
         }
@@ -286,7 +353,7 @@ pub const Coordinator = struct {
         self.stopped = true;
         self.publishFailure(err);
         var cursor = pending;
-        while (cursor) |job| : (cursor = job.next) self.terminal(job.id, .failed, classifyFailure(err));
+        while (cursor) |job| : (cursor = job.next) self.terminal(.{ .id = job.id, .result = .failed, .failure = classifyFailure(err) }, job.notification);
         self.status.revision +%= 1;
         self.wake.set(self.io);
         self.unlock();
@@ -386,7 +453,7 @@ pub const Coordinator = struct {
         if (pending) |first| {
             self.lock();
             var cursor: ?*Job = first;
-            while (cursor) |job| : (cursor = job.next) self.terminal(job.id, .canceled, .canceled);
+            while (cursor) |job| : (cursor = job.next) self.terminal(.{ .id = job.id, .result = .canceled, .failure = .canceled }, job.notification);
             self.unlock();
             cursor = first;
             while (cursor) |job| {
@@ -479,6 +546,8 @@ pub const Coordinator = struct {
         self.secret_count = 0;
     }
     fn containsSecret(self: *const Coordinator, text: []const u8) bool {
+        // Do not nest the journal key mutex with our own secret mutex.
+        if (self.secret_guard) |guard| if (guard.contains_fn(guard.context, text)) return true;
         const mutex = &@constCast(self).secret_mutex;
         std.debug.assert(std.c.pthread_mutex_lock(mutex) == .SUCCESS);
         defer std.debug.assert(std.c.pthread_mutex_unlock(mutex) == .SUCCESS);
@@ -587,10 +656,11 @@ pub const Coordinator = struct {
         self.publishFailure(err);
         self.lock();
         defer self.unlock();
-        // A parent failure must never publish over the terminal owned by a job
-        // that is still running (or about to publish its own result).
-        if (self.status.active != null) return;
-        self.terminal(0, .failed, classifyFailure(err));
+        // Preserve an active job's snapshot and outcome, but independently
+        // deliver this non-job failure rather than hiding it in the footer.
+        const value: memory_status.Terminal = .{ .id = 0, .result = .failed, .failure = classifyFailure(err) };
+        if (self.status.active == null) self.statusTerminal(value);
+        self.notifyTerminal(value, null);
     }
     fn now(io: std.Io) u64 {
         const value = std.Io.Clock.real.now(io).toMilliseconds();
@@ -664,9 +734,322 @@ pub const Coordinator = struct {
         std.debug.assert(std.c.pthread_mutex_destroy(&self.secret_mutex) == .SUCCESS);
         cfg.release(&self.config);
         self.root.deinit();
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.status));
         self.allocator.destroy(self);
     }
 };
+
+const NotificationTestFixture = struct {
+    tmp: std.testing.TmpDir,
+    queue: *notifications.Queue,
+    owner: *Coordinator,
+
+    fn init(io: std.Io) !@This() {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var path: [4096]u8 = undefined;
+        var root = try fs.Root.open(a, io, path[0..try tmp.dir.realPath(io, &path)]);
+        defer root.deinit();
+        var config = try cfg.clone(a, .{
+            .provider = .{ .base_url = "http://fixture.invalid", .api_key = "fixture-key" },
+            .selected_provider = "local",
+            .model = .{ .name = "fixture", .protocol = .chat, .context_tokens = 32768, .output_tokens = 8192 },
+            .limits = .{ .low_price_input = false },
+        });
+        defer cfg.release(&config);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        const queue = try notifications.Queue.create(a);
+        errdefer queue.deinit();
+        const owner = try Coordinator.create(a, io, &root, config.value, &env);
+        owner.bindNotifications(queue);
+        return .{ .tmp = tmp, .queue = queue, .owner = owner };
+    }
+
+    fn deinit(self: *@This()) void {
+        self.owner.deinit();
+        self.queue.deinit();
+        self.tmp.cleanup();
+    }
+
+    fn enqueue(owner: *Coordinator, text: []const u8) !u64 {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var capture: k.Capture = .{ .allocator = arena.allocator() };
+        capture.add(.user, text);
+        return owner.enqueueCopy(&capture, .chat, .{});
+    }
+
+    fn waitBool(io: std.Io, flag: *const std.atomic.Value(bool)) !void {
+        const start = std.Io.Clock.awake.now(io);
+        while (!flag.load(.acquire)) {
+            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > 2000) return error.TestTimeout;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+    }
+
+    fn waitGate(io: std.Io, flag: *const std.atomic.Value(u8)) !void {
+        const start = std.Io.Clock.awake.now(io);
+        while (flag.load(.acquire) == 0) {
+            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > 2000) return error.TestTimeout;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+    }
+};
+
+test "completed jobs retain full FIFO values beyond last snapshot" {
+    const Fake = struct {
+        fn extract(_: *anyopaque, a: std.mem.Allocator, material: k.Material, _: *const p.Cancellation) ![]const k.Candidate {
+            const text = material.sources[0].text;
+            if (std.mem.eql(u8, text, "failure evidence")) return error.InvalidMemoryOutput;
+            if (std.mem.eql(u8, text, "canceled evidence")) return error.Canceled;
+            const first = std.mem.eql(u8, text, "first saved fact");
+            return a.dupe(k.Candidate, &.{.{ .category = .preferences, .topic = if (first) "first" else "second", .content = text }});
+        }
+    };
+    const a = std.testing.allocator;
+    var backend = std.Io.Threaded.init(a, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var fixture = try NotificationTestFixture.init(io);
+    defer fixture.deinit();
+    var context: u8 = 0;
+    fixture.owner.service_override = .{ .context = &context, .extract_fn = Fake.extract };
+    const reference = try fixture.owner.retrieve(a, "first saved fact", 8192);
+    a.free(reference);
+    const one = try NotificationTestFixture.enqueue(fixture.owner, "first saved fact");
+    const two = try NotificationTestFixture.enqueue(fixture.owner, "second saved fact");
+    var cancel: p.Cancellation = .{};
+    fixture.owner.drain(&cancel);
+    try std.testing.expectEqual(two, fixture.owner.view().last_terminal.?.id);
+    try std.testing.expectEqual(one, fixture.queue.peek().?.id);
+    try std.testing.expectEqual(one, fixture.queue.peek().?.id);
+
+    const fail_id = try NotificationTestFixture.enqueue(fixture.owner, "failure evidence");
+    fixture.owner.drain(&cancel);
+    const canceled_id = try NotificationTestFixture.enqueue(fixture.owner, "canceled evidence");
+    fixture.owner.drain(&cancel);
+    var incomplete: k.Capture = .{ .allocator = a, .incomplete = true };
+    try std.testing.expectError(error.IncompleteCapture, fixture.owner.enqueueCopy(&incomplete, .chat, .{}));
+
+    const first = fixture.queue.take().?;
+    try std.testing.expectEqual(one, first.id);
+    try std.testing.expectEqual(memory_status.Result.saved, first.result);
+    try std.testing.expectEqual(@as(u32, 1), first.saved_count);
+    try std.testing.expectEqualStrings("first saved fact", first.summary.text());
+    const second = fixture.queue.take().?;
+    try std.testing.expectEqual(two, second.id);
+    try std.testing.expectEqual(memory_status.Result.saved, second.result);
+    try std.testing.expectEqual(@as(u32, 1), second.saved_count);
+    try std.testing.expectEqualStrings("second saved fact", second.summary.text());
+    const failed = fixture.queue.take().?;
+    try std.testing.expectEqual(fail_id, failed.id);
+    try std.testing.expectEqual(memory_status.Result.failed, failed.result);
+    try std.testing.expectEqual(memory_status.Failure.invalid_output, failed.failure.?);
+    const canceled = fixture.queue.take().?;
+    try std.testing.expectEqual(canceled_id, canceled.id);
+    try std.testing.expectEqual(memory_status.Result.canceled, canceled.result);
+    try std.testing.expectEqual(memory_status.Failure.canceled, canceled.failure.?);
+    const rejected = fixture.queue.take().?;
+    try std.testing.expectEqual(canceled_id + 1, rejected.id);
+    try std.testing.expectEqual(memory_status.Result.failed, rejected.result);
+    try std.testing.expect(fixture.queue.take() == null);
+}
+
+test "parent failure while a job is active notifies without changing either outcome" {
+    const r = @import("../core/runtime.zig");
+    const Fake = struct {
+        io: std.Io,
+        owner: *Coordinator,
+        started: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn extract(raw: *anyopaque, a: std.mem.Allocator, _: k.Material, cancel: *const p.Cancellation) ![]const k.Candidate {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.started.store(true, .release);
+            while (!self.release.load(.acquire)) {
+                if (cancel.isRequested()) return error.Canceled;
+                try std.Io.sleep(self.io, .fromMilliseconds(1), .awake);
+            }
+            return a.dupe(k.Candidate, &.{.{ .category = .preferences, .topic = "parent-test", .content = "Job result remains saved." }});
+        }
+        fn call(raw: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.owner.reportFailure(error.Busy);
+            return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .text = "Primary success" }} }, .finish = .stop } };
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !r.Prepared {
+            return error.UnexpectedTool;
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: r.Prepared, _: *const p.Cancellation) !r.Execution {
+            return error.UnexpectedTool;
+        }
+    };
+    const a = std.testing.allocator;
+    var backend = std.Io.Threaded.init(a, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var fixture = try NotificationTestFixture.init(io);
+    defer fixture.deinit();
+    var fake: Fake = .{ .io = io, .owner = fixture.owner };
+    fixture.owner.service_override = .{ .context = &fake, .extract_fn = Fake.extract };
+    const id = try NotificationTestFixture.enqueue(fixture.owner, "Evidence for a saved job.");
+    try NotificationTestFixture.waitBool(io, &fake.started);
+    const before = fixture.owner.view();
+    try std.testing.expectEqual(id, before.active.?.id);
+    var runtime = try r.Runtime.init(a, io, &fixture.owner.config.value, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
+    defer runtime.deinit();
+    var cancel: p.Cancellation = .{};
+    const primary = try runtime.run("Primary task", &cancel);
+    try std.testing.expectEqual(r.Status.success, primary.status);
+    const during = fixture.owner.view();
+    try std.testing.expectEqual(before.active.?.id, during.active.?.id);
+    try std.testing.expectEqualDeep(before.last_terminal, during.last_terminal);
+    const failure = fixture.queue.take().?;
+    try std.testing.expectEqual(@as(u64, 0), failure.id);
+    try std.testing.expectEqual(memory_status.Result.failed, failure.result);
+    try std.testing.expectEqual(memory_status.Failure.busy, failure.failure.?);
+    fake.release.store(true, .release);
+    fixture.owner.drain(&cancel);
+    const completed = fixture.queue.take().?;
+    try std.testing.expectEqual(id, completed.id);
+    try std.testing.expectEqual(memory_status.Result.saved, completed.result);
+    try std.testing.expect(completed.failure == null);
+    try std.testing.expectEqual(@as(u32, 1), completed.saved_count);
+    try std.testing.expectEqualStrings("Job result remains saved.", completed.summary.text());
+    try std.testing.expect(fixture.queue.take() == null);
+}
+
+test "worker wait failure publishes every pending completion" {
+    const Empty = struct {
+        fn extract(_: *anyopaque, _: std.mem.Allocator, _: k.Material, _: *const p.Cancellation) ![]const k.Candidate {
+            return &.{};
+        }
+    };
+    var backend = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var fixture = try NotificationTestFixture.init(io);
+    defer fixture.deinit();
+    var context: u8 = 0;
+    fixture.owner.service_override = .{ .context = &context, .extract_fn = Empty.extract };
+    const warm = try NotificationTestFixture.enqueue(fixture.owner, "warmup evidence");
+    var cancel: p.Cancellation = .{};
+    fixture.owner.drain(&cancel);
+    try NotificationTestFixture.waitBool(io, &fixture.owner.wait_ready);
+    fixture.owner.fail_wait.store(true, .release);
+    const one = try NotificationTestFixture.enqueue(fixture.owner, "first stranded evidence");
+    try NotificationTestFixture.waitGate(io, &fixture.owner.fail_wait_gate);
+    const two = try NotificationTestFixture.enqueue(fixture.owner, "second stranded evidence");
+    fixture.owner.fail_wait_gate.store(2, .release);
+    fixture.owner.drain(&cancel);
+    fixture.owner.cancelAndJoin();
+    try std.testing.expectEqual(warm, fixture.queue.take().?.id);
+    const first = fixture.queue.take().?;
+    const second = fixture.queue.take().?;
+    try std.testing.expectEqual(one, first.id);
+    try std.testing.expectEqual(two, second.id);
+    try std.testing.expectEqual(memory_status.Result.failed, first.result);
+    try std.testing.expectEqual(memory_status.Result.failed, second.result);
+    try std.testing.expect(fixture.queue.take() == null);
+}
+
+test "cancel joins active and queued jobs before queue release" {
+    const Blocked = struct {
+        io: std.Io,
+        started: std.atomic.Value(bool) = .init(false),
+        fn extract(raw: *anyopaque, _: std.mem.Allocator, _: k.Material, cancel: *const p.Cancellation) ![]const k.Candidate {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.started.store(true, .release);
+            while (!cancel.isRequested()) try std.Io.sleep(self.io, .fromMilliseconds(1), .awake);
+            return error.Canceled;
+        }
+    };
+    var backend = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var fixture = try NotificationTestFixture.init(io);
+    defer fixture.deinit();
+    var blocked: Blocked = .{ .io = io };
+    fixture.owner.service_override = .{ .context = &blocked, .extract_fn = Blocked.extract };
+    const one = try NotificationTestFixture.enqueue(fixture.owner, "active cancellation evidence");
+    try NotificationTestFixture.waitBool(io, &blocked.started);
+    const two = try NotificationTestFixture.enqueue(fixture.owner, "queued cancellation evidence two");
+    const three = try NotificationTestFixture.enqueue(fixture.owner, "queued cancellation evidence three");
+    fixture.owner.cancelAndJoin();
+    for ([_]u64{ one, two, three }) |id| {
+        const result = fixture.queue.take().?;
+        try std.testing.expectEqual(id, result.id);
+        try std.testing.expectEqual(memory_status.Result.canceled, result.result);
+    }
+    try std.testing.expect(fixture.queue.take() == null);
+}
+
+test "notification reservation exhaustion never limits Memory admission" {
+    const Gated = struct {
+        io: std.Io,
+        started: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn extract(raw: *anyopaque, _: std.mem.Allocator, _: k.Material, cancel: *const p.Cancellation) ![]const k.Candidate {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.started.store(true, .release);
+            while (!self.release.load(.acquire)) {
+                if (cancel.isRequested()) return error.Canceled;
+                try std.Io.sleep(self.io, .fromMilliseconds(1), .awake);
+            }
+            return &.{};
+        }
+    };
+    var backend = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var fixture = try NotificationTestFixture.init(io);
+    defer fixture.deinit();
+    const original = fixture.queue.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    fixture.queue.allocator = failing.allocator();
+    defer {
+        fixture.owner.cancelAndJoin();
+        fixture.queue.allocator = original;
+    }
+    for (0..fixture.queue.emergency.len) |i| {
+        fixture.queue.publish(fixture.queue.reserve().?, .{ .id = @intCast(100 + i), .result = .failed });
+    }
+    var gated: Gated = .{ .io = io };
+    fixture.owner.service_override = .{ .context = &gated, .extract_fn = Gated.extract };
+    const job = try NotificationTestFixture.enqueue(fixture.owner, "admitted while notifications are exhausted");
+    try NotificationTestFixture.waitBool(io, &gated.started);
+    // Free one emergency node before completion: publication retries only on
+    // this exceptional OOM path and appends without disturbing earlier values.
+    try std.testing.expectEqual(@as(u64, 100), fixture.queue.take().?.id);
+    gated.release.store(true, .release);
+    var cancel: p.Cancellation = .{};
+    fixture.owner.drain(&cancel);
+    for (101..108) |i| try std.testing.expectEqual(@as(u64, @intCast(i)), fixture.queue.take().?.id);
+    const result = fixture.queue.take().?;
+    try std.testing.expectEqual(job, result.id);
+    try std.testing.expectEqual(memory_status.Result.skipped, result.result);
+    try std.testing.expect(fixture.queue.take() == null);
+}
+
+test "admission allocation failure produces a reserved terminal" {
+    var backend = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer backend.deinit();
+    var fixture = try NotificationTestFixture.init(backend.io());
+    defer fixture.deinit();
+    var capture: k.Capture = .{ .allocator = std.testing.allocator };
+    const original = fixture.owner.allocator;
+    fixture.owner.allocator = std.testing.failing_allocator;
+    const result = fixture.owner.enqueueCopy(&capture, .chat, .{});
+    fixture.owner.allocator = original;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expectEqual(@as(u16, @intFromError(error.OutOfMemory)), fixture.owner.failure.load(.acquire));
+    try std.testing.expect(!fixture.owner.isPoisoned());
+    const failure = fixture.queue.take().?;
+    try std.testing.expectEqual(@as(u64, 1), failure.id);
+    try std.testing.expectEqual(memory_status.Result.failed, failure.result);
+    try std.testing.expect(fixture.queue.take() == null);
+}
 
 test "coordinator diagnostics pair extraction and writes" {
     const Capture = struct {

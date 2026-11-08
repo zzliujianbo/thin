@@ -188,7 +188,7 @@ test "proxy: actual SystemOne and generic judge identities independent of primar
             const client = (try DecisionClient.create(a, backend.io(), parsed.value, &env)) orelse return error.MissingDecisionClient;
             defer client.deinit();
             var cancellation = p.Cancellation{};
-            const out = try client.service().decide(a, .{ .command = .{ .command = "printf fixture", .max_timeout_ms = 30000 } }, &cancellation);
+            const out = try client.service().decide(a, .{ .command = .{ .command = "printf fixture" } }, &cancellation);
             defer decision.freeOutput(a, out);
             try t.expect(out.command.ask);
             try t.expect(client.calls == 1);
