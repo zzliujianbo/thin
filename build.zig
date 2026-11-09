@@ -10,16 +10,12 @@ comptime {
 }
 
 /// 构建图入口（由 `zig build` 调用）。
-/// 目标平台被限制为 Linux x86_64，其他平台在配置阶段直接 panic。
+/// 产品仍限制 Linux x86_64；显式 platform-tests-only 可在 macOS 验证独立平台层。
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    if (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64)
-        @panic("ThinAgent v1 supports Linux x86_64 only");
     const optimize = b.standardOptimizeOption(.{});
-    // Normal builds use the system libssh development package. These build-only
-    // paths also permit an extracted SDK without installing packages globally.
-    const ssh_include = b.option([]const u8, "ssh-include", "Directory containing libssh/ headers");
-    const ssh_library = b.option([]const u8, "ssh-library", "Absolute libssh shared-library path (otherwise link system ssh)");
+    const platform_only = b.option(bool, "platform-tests-only", "Only filesystem/presentation tests; no product executable") orelse false;
+    const platform_llvm = target.result.os.tag == .macos;
 
     // 可供其他前端直接导入；不链接 TTY 或 libc 宽度实现。
     const presentation = b.addModule("presentation", .{
@@ -27,9 +23,36 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const presentation_tests = b.addTest(.{ .use_llvm = false, .root_module = presentation });
+    const presentation_tests = b.addTest(.{ .use_llvm = platform_llvm, .root_module = presentation });
     const run_presentation = b.addRunArtifact(presentation_tests);
     b.step("test-presentation", "Run frontend-neutral presentation tests without terminal or libc").dependOn(&run_presentation.step);
+
+    const filesystem_tests = b.addTest(.{
+        .use_llvm = platform_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/filesystem_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.step("test-filesystem", "Run POSIX file, auth, checkpoint and Memory regressions without SSH or TTY").dependOn(&b.addRunArtifact(filesystem_tests).step);
+
+    if (platform_only) {
+        // Do not let `zig build -Dplatform-tests-only=true` look like a successful
+        // product installation. Only explicit test steps are valid in this mode.
+        const no_product = b.addFail("platform-tests-only does not build thin; select test-filesystem or test-presentation");
+        b.getInstallStep().dependOn(&no_product.step);
+        b.step("run", "Product unavailable in platform-tests-only mode").dependOn(&no_product.step);
+        return;
+    }
+    if (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64)
+        @panic("ThinAgent v1 supports Linux x86_64 only; use -Dplatform-tests-only=true for independent macOS tests");
+
+    // Normal product builds use the system libssh development package. These
+    // build-only paths also permit an extracted SDK without global installation.
+    const ssh_include = b.option([]const u8, "ssh-include", "Directory containing libssh/ headers");
+    const ssh_library = b.option([]const u8, "ssh-library", "Absolute libssh shared-library path (otherwise link system ssh)");
 
     // 主程序 thin。use_llvm = false 表示使用 Zig 自有后端而非 LLVM。
     const exe = b.addExecutable(.{

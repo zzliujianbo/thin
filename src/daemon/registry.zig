@@ -313,7 +313,7 @@ pub const Registry = struct {
         var buf: [64]u8 = undefined;
         const name_z = try std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ id[0..], index_suffix }, 0);
         if (c.unlinkat(key_fd, name_z, 0) != 0) {
-            if (std.c._errno().* == 2) return;
+            if (fs.errno() == .NOENT) return;
             return fs.osError();
         }
     }
@@ -435,8 +435,8 @@ pub const Registry = struct {
     fn readOneLocked(self: *Registry, a: std.mem.Allocator, id: ids.Id, key: [32]u8, key_fd: c.fd_t, project: ?[]const u8) !?Record {
         var name_buf: [64]u8 = undefined;
         const name_z = try std.fmt.bufPrintSentinel(&name_buf, "{s}{s}", .{ id[0..], index_suffix }, 0);
-        const fd = fs.linux.openat(key_fd, name_z, fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0);
-        if (fd < 0) return if (std.c._errno().* == 2) null else fs.osError();
+        const fd = fs.openAt(key_fd, name_z, .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        if (fd < 0) return if (fs.errno() == .NOENT) null else fs.osError();
         defer fs.closeFd(fd);
 
         if (!try isRegularFd(fd)) return error.NotRegularFile;
@@ -658,8 +658,8 @@ fn ensurePrivateDir(a: std.mem.Allocator, parent: c.fd_t, name: []const u8, uid:
     defer a.free(z);
 
     if (c.mkdirat(parent, z.ptr, 0o700) != 0) {
-        const errno = std.c._errno().*;
-        if (errno != 17) return fs.osError();
+        const errno = fs.errno();
+        if (errno != .EXIST) return fs.osError();
     }
     const fd = try fs.openDirectory(parent, z.ptr);
     errdefer fs.closeFd(fd);
@@ -686,14 +686,14 @@ fn atomicReplace(a: std.mem.Allocator, io: std.Io, dir: c.fd_t, name: []const u8
         var random: [16]u8 = undefined;
         try io.randomSecure(&random);
         temp = try std.fmt.bufPrintSentinel(&temp_buf, ".tmp-{s}", .{std.fmt.bytesToHex(random, .lower)}, 0);
-        fd = fs.linux.openat(
+        fd = fs.openAt(
             dir,
             temp,
-            1 | fs.linux.create | fs.linux.exclusive | fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true },
             0o600,
         );
         if (fd >= 0) break;
-        if (std.c._errno().* != 17) return fs.osError();
+        if (fs.errno() != .EXIST) return fs.osError();
     }
     if (fd < 0) return error.TempNameExhausted;
     defer fs.closeFd(fd);
@@ -715,7 +715,7 @@ fn atomicReplace(a: std.mem.Allocator, io: std.Io, dir: c.fd_t, name: []const u8
 fn fsyncFd(fd: c.fd_t) !void {
     while (true) {
         if (fsync(fd) == 0) return;
-        if (std.c._errno().* == 4) continue; // EINTR
+        if (fs.errno() == .INTR) continue; // EINTR
         return fs.osError();
     }
 }
@@ -1009,7 +1009,7 @@ test "registry publishes schema v1 id strings and resolves across projects" {
     defer fs.closeFd(key_fd);
     var file_z_buf: [64]u8 = undefined;
     const file_z = try std.fmt.bufPrintSentinel(&file_z_buf, "{s}.json", .{id[0..]}, 0);
-    const fd = fs.linux.openat(key_fd, file_z, fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0);
+    const fd = fs.openAt(key_fd, file_z, .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
     try testing.expect(fd >= 0);
     defer fs.closeFd(fd);
     var raw_buf: [4096]u8 = undefined;

@@ -57,7 +57,7 @@ test "App memory root contention initial core skips Busy without blocking startu
     };
     var held: ?c_int = try fs.openDirectory(root.dir.handle, ".");
     defer if (held) |fd| fs.closeFd(fd);
-    try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(held.?, 2 | 4));
+    try std.testing.expectEqual(@as(c_int, 0), fs.flock(held.?, fs.LOCK.EX | fs.LOCK.NB));
     var releaser: Releaser = .{ .io = io, .fd = held.? };
     var release = try std.Io.concurrent(io, Releaser.run, .{&releaser});
     held = null;

@@ -1,10 +1,25 @@
-# Darwin P0 独立验证
+# macOS 分阶段验证（P0 / P1）
 
-这些探针用于评估 [macOS 实施方案](../../docs/macos-support.md) 中的高风险候选机制，**不是 `thin` 已兼容 macOS 的证明**。不修改 `build.zig` 的 Linux 限制，不调用真实模型 API，不启动或安装系统服务，不打开 TCP 监听。
+这里保存 [macOS 实施方案](../../docs/macos-support.md) 的独立机制探针与平台子集回归，**不是 `thin` 已兼容 macOS 的证明**。正常产品构建仍限制 Linux；不调用真实模型 API，不启动或安装系统服务，不打开 TCP 监听。
 
-## 运行
+## P1a：原生文件系统回归
 
-需要原生 macOS、Python 3、Zig 0.17.0（或 Xcode Command Line Tools 的 clang）：
+使用 Zig 0.17.0，无需 libssh、Node 或真实凭据：
+
+```sh
+zig build test-filesystem -Dplatform-tests-only=true --summary all
+zig build test-filesystem -Dplatform-tests-only=true -Doptimize=ReleaseSmall --summary all
+zig build test-presentation -Dplatform-tests-only=true --summary all
+zig build test-presentation -Dplatform-tests-only=true -Doptimize=ReleaseSmall --summary all
+```
+
+`test-filesystem` 包含文件系统、认证、checkpoint、Memory 及相关纯模块。`src/tests/filesystem_portability_test.zig` 验证受保护名称的元数据比较、硬链接、无读权限、符号链接/FIFO/设备、目录替换、打开标志和 AGENTS/技能策略。它也进入 Linux 完整 unit 根。
+
+`platform-tests-only` 不创建产品：默认安装和 install/run 都失败，正常 macOS 产品构建也仍失败；构建边界由 `test_build_mode.py` 验证。不要把本入口的成功解释为 CLI、worker 或 SSH 已支持 macOS。
+
+## P0：独立机制探针
+
+C 探针需要原生 macOS、Python 3、Zig 0.17.0（或 Xcode Command Line Tools 的 clang）；P1 构建边界测试必须使用 Zig：
 
 ```sh
 python3 -B tests/macos/run.py
@@ -46,7 +61,7 @@ python3 -B -m unittest discover -s tests/macos -p 'test_*.py' -v
 
 ## 与现有纯 Zig 测试交叉验证
 
-可绕过当前 Linux-only 的产品构建，单独检查前端中立模块（仍不是完整产品测试）：
+也可直接检查前端中立模块，等价于上面的受限 test-presentation 入口（仍不是完整产品测试）：
 
 ```sh
 cache=$(mktemp -d)
@@ -55,16 +70,31 @@ zig test src/presentation.zig -fllvm -O ReleaseSmall --cache-dir "$cache/small"
 rm -rf "$cache"
 ```
 
-本机 Zig 0.17.0 的 `-fno-llvm` 产物被 dyld 以 `__CONST_ZIG` 段顺序错误拒绝加载；不要把这个未修复后端当作 Darwin 验收路径。后续生产构建选项仍需在 P1 实现。
+本机 Zig 0.17.0 的 `-fno-llvm` 产物被 dyld 以 `__CONST_ZIG` 段顺序错误拒绝加载；不要把这个未修复后端当作 Darwin 验收路径。当前 Darwin 独立测试已选择 LLVM；完整生产构建仍待后续 P1/P2。
+
+## 交叉构建（不执行）
+
+以下只检查生成/链接或语义编译，不能替代目标机器回归。跨架构测试必须带 `--test-no-exec`，不要尝试在 Intel Mac 上执行 arm64 产物：
+
+```sh
+cache=$(mktemp -d)
+zig test src/filesystem_test_root.zig -lc -fno-llvm -target x86_64-linux-gnu --test-no-exec -femit-bin="$cache/fs-linux" --cache-dir "$cache/linux"
+zig test src/root.zig -lc -fno-llvm -target x86_64-linux-gnu -fno-emit-bin --cache-dir "$cache/linux"
+zig test src/memory_test_root.zig -lc -fno-llvm -target x86_64-linux-gnu -fno-emit-bin --cache-dir "$cache/linux"
+zig test src/filesystem_test_root.zig -lc -fllvm -target aarch64-macos.14.0 --test-no-exec -femit-bin="$cache/fs-arm64" --cache-dir "$cache/arm64"
+rm -rf "$cache"
+```
 
 ## 本机验证记录
 
 环境：macOS 26.7.2 x86_64、Zig 0.17.0、Apple clang 21、Python 3.13.1。
 
 - 两个 C 探针使用 `zig cc` 重复 10 次通过，并使用系统 clang 编译执行通过。
-- runner 回归 3 项通过，现有 `tests/test_workflow.py` 回归 9 项通过。
+- runner 清理回归 3 项、构建边界回归 3 项通过；现有 `tests/test_workflow.py` 回归 9 项通过。
+- 文件系统 focused 根 Debug 与 ReleaseSmall 各 203/203 通过。
 - 前端中立 Zig 测试：LLVM Debug 与 ReleaseSmall 各 213/213 通过；非 LLVM 的已知失败如上。
-- 两个 C 探针以 `-target aarch64-macos.14.0` 交叉编译/链接通过；未原生执行，不据此确定系统最低版本。
+- 两个 C 探针及文件系统 focused 根以 `-target aarch64-macos.14.0` 交叉编译/链接通过；未原生执行，不据此确定系统最低版本。
+- Linux x86_64 focused 根生成/链接 ELF；完整 unit 根与 memory 根语义编译通过，未运行 Linux 测试。
 - 纯 libproc 的僵尸查询曾失败；当前通过的是带有实际 sysctl 元数据补充的候选机制，不是跳过失败项。
 
 ## 尚未证明

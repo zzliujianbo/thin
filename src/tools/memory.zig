@@ -37,12 +37,12 @@ pub const Store = struct {
         const fd = try fs.openDirectory(self.root.dir.handle, ".");
         errdefer fs.closeFd(fd);
 
-        // 2 = LOCK_EX，4 = LOCK_NB：非阻塞尝试；EINTR 直接重试，EWOULDBLOCK(11) 时 sleep 2ms 后再试。
-        while (fs.linux.flock(fd, 2 | 4) != 0) {
-            const e = std.c._errno().*;
-            if (!self.wait_for_lock and (e == 4 or e == 11)) return error.Busy;
-            if (e == 4) continue;
-            if (e != 11) return fs.osError();
+        // 非阻塞尝试；EINTR 直接重试，EWOULDBLOCK 时 sleep 2ms 后再试。
+        while (fs.flock(fd, fs.LOCK.EX | fs.LOCK.NB) != 0) {
+            const e = fs.errno();
+            if (!self.wait_for_lock and (e == .INTR or e == .AGAIN)) return error.Busy;
+            if (e == .INTR) continue;
+            if (e != .AGAIN) return fs.osError();
             try std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake);
         }
         return fd;
@@ -150,7 +150,7 @@ pub const Store = struct {
         // 最后一步才落盘；仅更新时允许覆盖已有文件，权限固定 0600 以保护私有记忆。
         if (guard == null) try self.advanceGeneration(&mem);
         try mem.writeMode(name, content, expected_version != null, 0o600);
-        const written = fs.linux.openat(mem.dir.handle, name, fs.linux.nofollow | fs.linux.cloexec, 0);
+        const written = fs.openAt(mem.dir.handle, name, .{ .NOFOLLOW = true, .CLOEXEC = true }, 0);
         if (written < 0) return fs.osError();
         defer fs.closeFd(written);
         if (fsync(written) != 0 or fsync(mem.dir.handle) != 0) return fs.osError();
@@ -215,7 +215,7 @@ pub const Store = struct {
         var buffer: [20]u8 = undefined;
         const text = try std.fmt.bufPrint(&buffer, "{d}", .{next});
         try dir.writeMode(".generation", text, true, 0o600);
-        const fd = fs.linux.openat(dir.dir.handle, ".generation", fs.linux.nofollow | fs.linux.cloexec, 0);
+        const fd = fs.openAt(dir.dir.handle, ".generation", .{ .NOFOLLOW = true, .CLOEXEC = true }, 0);
         if (fd < 0) return fs.osError();
         defer fs.closeFd(fd);
         if (fsync(fd) != 0 or fsync(dir.dir.handle) != 0) return fs.osError();
@@ -347,7 +347,7 @@ pub const Store = struct {
         defer parent.deinit();
 
         // nofollow 防止经符号链接读到项目外文件；nonblock 防止 FIFO 之类的特殊文件阻塞线程。
-        const fd = fs.linux.openat(parent.fd, parent.name, fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0);
+        const fd = fs.openAt(parent.fd, parent.name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
         if (fd < 0) return fs.osError();
         defer fs.closeFd(fd);
 
@@ -393,8 +393,8 @@ pub const Store = struct {
 fn child(parent: c_int, name: [*:0]const u8, create: bool) !c_int {
     return fs.openDirectory(parent, name) catch |err| {
         if (err != error.FileNotFound or !create) return err;
-        // 17 = EEXIST：并发创建时目录已存在，视为成功。
-        if (std.c.mkdirat(parent, name, 0o700) != 0 and std.c._errno().* != 17) return fs.osError();
+        // EEXIST：并发创建时目录已存在，视为成功。
+        if (std.c.mkdirat(parent, name, 0o700) != 0 and fs.errno() != .EXIST) return fs.osError();
         if (fsync(parent) != 0) return fs.osError();
         return fs.openDirectory(parent, name);
     };
@@ -522,11 +522,11 @@ test "memory real concurrent Stores and cross-process flock exclusion" {
         // Only async-signal-safe libc operations after fork in the threaded process.
         // 中文：多线程进程 fork 后，子进程只能调用 async-signal-safe 的操作。
         fs.closeFd(held);
-        // 子进程独立 open 根目录，得到新的 open description，flock 应返回 EWOULDBLOCK(11)，证明互斥生效。
-        const independent = fs.linux.openat(root.dir.handle, ".", fs.linux.directory | fs.linux.cloexec, 0);
+        // 子进程独立 open 根目录，得到新的 open description，flock 应返回 EWOULDBLOCK，证明互斥生效。
+        const independent = fs.openAt(root.dir.handle, ".", .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
         if (independent < 0) _exit(2);
-        const rc = fs.linux.flock(independent, 2 | 4);
-        const excluded = rc == -1 and std.c._errno().* == 11;
+        const rc = fs.flock(independent, fs.LOCK.EX | fs.LOCK.NB);
+        const excluded = rc == -1 and fs.errno() == .AGAIN;
         fs.closeFd(independent);
         _exit(if (excluded) 0 else 3);
     }
@@ -535,7 +535,7 @@ test "memory real concurrent Stores and cross-process flock exclusion" {
     var waited: c_int = undefined;
     while (true) {
         waited = waitpid(pid, &status, 0);
-        if (waited < 0 and std.c._errno().* == 4) continue;
+        if (waited < 0 and fs.errno() == .INTR) continue;
         break;
     }
     try std.testing.expectEqual(pid, waited);

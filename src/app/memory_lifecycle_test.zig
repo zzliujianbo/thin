@@ -107,7 +107,7 @@ fn waitFlag(io: std.Io, flag: *const std.atomic.Value(bool)) !void {
 }
 fn expectNoJobs(root: *fs.Root) !void {
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin/memory/jobs"));
-    try std.testing.expectError(error.FileNotFound, fs.openPath(root.dir.handle, ".thin/memory/jobs-owner"));
+    try std.testing.expectError(error.FileNotFound, root.dir.statFile(root.io, ".thin/memory/jobs-owner", .{ .follow_symlinks = false }));
 }
 
 test "initial core failures reach Session queue exactly once" {
@@ -129,7 +129,7 @@ test "initial core failures reach Session queue exactly once" {
         }
         const held = try fs.openDirectory(root.dir.handle, ".");
         defer fs.closeFd(held);
-        if (busy) try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(held, 2 | 4));
+        if (busy) try std.testing.expectEqual(@as(c_int, 0), fs.flock(held, fs.LOCK.EX | fs.LOCK.NB));
         const queue = try @import("memory_notifications.zig").Queue.create(a);
         defer queue.deinit();
         const config = try cfg.clone(a, .{

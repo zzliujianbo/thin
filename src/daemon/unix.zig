@@ -426,10 +426,10 @@ pub const Lock = struct {
         defer allocator.free(name_z);
 
         // O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK; no O_TRUNC.
-        const fd = fs.linux.openat(
+        const fd = fs.openAt(
             dir.fd,
             name_z,
-            2 | fs.linux.create | fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock,
+            .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true },
             0o600,
         );
         if (fd < 0) return fs.osError();
@@ -447,7 +447,7 @@ pub const Lock = struct {
         const entry = try statAt(dir.fd, name_z, true);
         if (!Identity.from(entry).eql(file_identity)) return error.IdentityChanged;
 
-        if (fs.linux.flock(fd, 2 | 4) != 0) {
+        if (fs.flock(fd, fs.LOCK.EX | fs.LOCK.NB) != 0) {
             const e = libcErrno();
             if (e == .AGAIN) return error.AlreadyRunning;
             return mapErrno(e);
@@ -472,7 +472,7 @@ pub const Lock = struct {
         if (!self.held) return;
         self.held = false;
         self.name_len = 0;
-        _ = fs.linux.flock(self.fd, 8); // LOCK_UN; the inode stays on disk.
+        _ = fs.flock(self.fd, fs.LOCK.UN); // The inode stays on disk.
         fs.closeFd(self.fd);
         self.fd = -1;
         if (self.path.len != 0) self.allocator.free(self.path);
@@ -1574,7 +1574,7 @@ test "created directory cleanup is empty-only and identity checked" {
     defer dir.deinit();
     try std.testing.expect(dir.created);
 
-    const keep_fd = fs.linux.openat(dir.fd, "keep", 2 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec, 0o600);
+    const keep_fd = fs.openAt(dir.fd, "keep", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600);
     try std.testing.expect(keep_fd >= 0);
     fs.closeFd(keep_fd);
     try std.testing.expectError(error.DirectoryNotEmpty, dir.removeIfEmpty());
@@ -1629,10 +1629,10 @@ test "lock refuses symlinked and permissive lock files" {
     defer allocator.free(link_z);
     try std.testing.expectEqual(@as(c_int, 0), c.symlinkat("daemon.lock", dir.fd, link_z));
 
-    const loose_fd = fs.linux.openat(
+    const loose_fd = fs.openAt(
         dir.fd,
         "loose.lock",
-        2 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true },
         0o600,
     );
     try std.testing.expect(loose_fd >= 0);
@@ -1725,10 +1725,10 @@ test "listener cleanup removes only its own socket inode" {
     // If the entry was replaced by another inode, cleanup leaves it alone.
     var second = try Listener.bind(allocator, &dir, "owned.sock", .{});
     try std.testing.expectEqual(@as(c_int, 0), c.unlinkat(dir.fd, name_z, 0));
-    const other_fd = fs.linux.openat(
+    const other_fd = fs.openAt(
         dir.fd,
         name_z,
-        2 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true },
         0o600,
     );
     try std.testing.expect(other_fd >= 0);
@@ -1761,10 +1761,10 @@ test "stale socket cleanup requires the lock and the owner UID" {
     try std.testing.expect(!(try removeStaleSocket(&lock, &dir, "stale.sock")));
 
     // Regular files are never removed.
-    const file_fd = fs.linux.openat(
+    const file_fd = fs.openAt(
         dir.fd,
         "file.sock",
-        2 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true },
         0o600,
     );
     try std.testing.expect(file_fd >= 0);
@@ -1847,10 +1847,10 @@ test "stale cleanup refuses a lock whose file inode was replaced" {
 
     // Replace the lock path with a fresh inode while the flock stays held.
     try std.testing.expectEqual(@as(c_int, 0), c.unlinkat(dir.fd, lock_z, 0));
-    const other_fd = fs.linux.openat(
+    const other_fd = fs.openAt(
         dir.fd,
         lock_z,
-        2 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true },
         0o600,
     );
     try std.testing.expect(other_fd >= 0);

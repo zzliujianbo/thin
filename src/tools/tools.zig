@@ -654,12 +654,10 @@ pub const Tools = struct {
     fn matchesReadTarget(target: fs.Root.Parent, fd: ?c_int, protected: fs.Root.Parent) !bool {
         if (std.mem.eql(u8, target.name, protected.name) and try fs.sameObject(target.fd, protected.fd)) return true;
         const opened = fd orelse return false;
-        const protected_fd = fs.openPath(protected.fd, protected.name) catch |err| switch (err) {
+        return fs.sameObjectAt(opened, protected.fd, protected.name) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,
         };
-        defer fs.closeFd(protected_fd);
-        return fs.sameObject(opened, protected_fd);
     }
 
     fn checkTextReadTarget(raw: *anyopaque, target: fs.Root.Parent, fd: ?c_int) !void {

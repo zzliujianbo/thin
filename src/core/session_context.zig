@@ -259,14 +259,14 @@ fn preferred(a: std.mem.Allocator, io: std.Io, dirfd: c_int, budget: usize) !Cho
 }
 
 fn readFile(a: std.mem.Allocator, io: std.Io, dirfd: c_int, name: [*:0]const u8, budget: usize) !Read {
-    const fd = fs.linux.openat(dirfd, name, fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0);
+    const fd = fs.openAt(dirfd, name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
     if (fd < 0) {
-        return switch (std.c._errno().*) {
-            2 => .missing, // ENOENT
+        return switch (fs.errno()) {
+            .NOENT => .missing, // ENOENT
             // EPERM and EACCES: an optional AGENTS layer must not abort the turn.
             // A present override stays preferred, so this does not fall through to AGENTS.md.
-            1, 13 => .invalid,
-            40 => .invalid, // ELOOP
+            .PERM, .ACCES => .invalid,
+            .LOOP => .invalid, // ELOOP
             else => fs.osError(),
         };
     }
@@ -346,12 +346,12 @@ fn openParent(a: std.mem.Allocator, io: std.Io, root: *const fs.Root) !?fs.Root 
 }
 
 fn gitMarker(io: std.Io, dirfd: c_int) !bool {
-    const fd = fs.linux.openat(dirfd, ".git", fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0);
+    const fd = fs.openAt(dirfd, ".git", .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
     if (fd < 0) {
-        return switch (std.c._errno().*) {
-            2 => false,
+        return switch (fs.errno()) {
+            .NOENT => false,
             // A symlink still marks the work tree. Do not follow it.
-            40 => true,
+            .LOOP => true,
             else => fs.osError(),
         };
     }

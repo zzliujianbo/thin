@@ -12,8 +12,7 @@ pub const Limits = struct {
 };
 
 fn validateIgnore(io: std.Io, dir_fd: c_int) !void {
-    const linux = filesystem.linux;
-    const fd = linux.openat(dir_fd, ".gitignore", linux.nofollow | linux.cloexec | linux.nonblock, 0);
+    const fd = filesystem.openAt(dir_fd, ".gitignore", .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
     if (fd < 0) return filesystem.osError();
     defer filesystem.closeFd(fd);
     const file = filesystem.fileFromFd(fd);
@@ -98,7 +97,7 @@ pub const Store = struct {
     }
 
     fn directory(parent: c_int, entry: [*:0]const u8) !c_int {
-        if (std.c.mkdirat(parent, entry, 0o700) != 0 and std.c._errno().* != 17)
+        if (std.c.mkdirat(parent, entry, 0o700) != 0 and filesystem.errno() != .EXIST)
             return filesystem.osError();
         return filesystem.openDirectory(parent, entry);
     }
@@ -108,8 +107,7 @@ pub const Store = struct {
     }
 
     fn createFile(self: *Store, dir_fd: c_int, filename: [:0]const u8) !c_int {
-        const linux = filesystem.linux;
-        const fd = linux.openat(dir_fd, filename, 1 | linux.create | linux.exclusive | linux.nofollow | linux.cloexec | linux.nonblock, 0o600);
+        const fd = filesystem.openAt(dir_fd, filename, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0o600);
         if (fd < 0) return filesystem.osError();
         // 失败也不删除已创建文件；可能为空，但绝不覆盖任何已存在路径。
         errdefer filesystem.closeFd(fd);
@@ -121,23 +119,22 @@ pub const Store = struct {
 
     /// marker 必须先于日志存在；不覆盖已有内容，失败遗留的半个 marker 也拒绝。
     fn ensureIgnore(self: *Store, dir_fd: c_int) !void {
-        const linux = filesystem.linux;
         // startTimestamp owns an independent open description for this directory.
         // Cooperating starters must not inspect a marker still being initialized.
         // Lock only this inode, bounded/cancellable; no lockfile or fsync promise.
         var locked = false;
         for (0..100) |_| {
-            if (linux.flock(dir_fd, 2 | 4) == 0) {
+            if (filesystem.flock(dir_fd, filesystem.LOCK.EX | filesystem.LOCK.NB) == 0) {
                 locked = true;
                 break;
             }
-            const errno = std.c._errno().*;
-            if (errno != 11 and errno != 4) return filesystem.osError();
+            const errno = filesystem.errno();
+            if (errno != .AGAIN and errno != .INTR) return filesystem.osError();
             try std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake);
         }
         if (!locked) return error.LogStoreBusy;
-        defer _ = linux.flock(dir_fd, 8);
-        const created = linux.openat(dir_fd, ".gitignore", 1 | linux.create | linux.exclusive | linux.nofollow | linux.cloexec | linux.nonblock, 0o600);
+        defer _ = filesystem.flock(dir_fd, filesystem.LOCK.UN);
+        const created = filesystem.openAt(dir_fd, ".gitignore", .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0o600);
         if (created >= 0) {
             defer filesystem.closeFd(created);
             if (std.c.fchmod(created, 0o600) != 0) return filesystem.osError();
@@ -146,7 +143,7 @@ pub const Store = struct {
             try file.writePositionalAll(self.root.io, "*\n", 0);
             return;
         }
-        if (std.c._errno().* != 17) return filesystem.osError();
+        if (filesystem.errno() != .EXIST) return filesystem.osError();
         try validateIgnore(self.root.io, dir_fd);
     }
 
@@ -489,7 +486,7 @@ test "log store ignore marker rejects unsafe modes content symlinks FIFO and dir
                     2 => 0o604,
                     else => 0o600,
                 };
-                try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(logs, ".gitignore", mode, 0));
+                try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(logs, ".gitignore", @intCast(mode), 0));
             },
         }
         var store = Store.init(std.testing.allocator, &root, .{});
@@ -526,7 +523,7 @@ test "log store marker lock is bounded and independent stores start after releas
     defer one.deinit();
     var two = Store.init(std.testing.allocator, &root, .{});
     defer two.deinit();
-    try std.testing.expectEqual(@as(c_int, 0), filesystem.linux.flock(logs, 2 | 4));
+    try std.testing.expectEqual(@as(c_int, 0), filesystem.flock(logs, filesystem.LOCK.EX | filesystem.LOCK.NB));
     const before = try openFdCount();
     const start = std.Io.Clock.awake.now(root.io);
     try std.testing.expectError(error.LogStoreBusy, one.start());
@@ -536,15 +533,15 @@ test "log store marker lock is bounded and independent stores start after releas
     try std.testing.expect(one.file_fd == null and one.logs_fd == null);
     try std.testing.expectEqual(@as(usize, 0), try jsonlCount(&root));
     try std.testing.expectError(error.FileNotFound, root.dir.statFile(root.io, ".thin/sessions/.gitignore", .{}));
-    try std.testing.expectEqual(@as(c_int, 0), filesystem.linux.flock(logs, 8));
+    try std.testing.expectEqual(@as(c_int, 0), filesystem.flock(logs, filesystem.LOCK.UN));
     try one.append("{\"writer\":1}");
     try two.append("{\"writer\":2}");
     try std.testing.expect(!std.mem.eql(u8, one.path(), two.path()));
     try expectContent(&root, one.path(), "{\"writer\":1}\n");
     try expectContent(&root, two.path(), "{\"writer\":2}\n");
     // Successful starts release the marker lock even while archive fds live.
-    try std.testing.expectEqual(@as(c_int, 0), filesystem.linux.flock(logs, 2 | 4));
-    try std.testing.expectEqual(@as(c_int, 0), filesystem.linux.flock(logs, 8));
+    try std.testing.expectEqual(@as(c_int, 0), filesystem.flock(logs, filesystem.LOCK.EX | filesystem.LOCK.NB));
+    try std.testing.expectEqual(@as(c_int, 0), filesystem.flock(logs, filesystem.LOCK.UN));
     one.deinit();
     two.deinit();
     try std.testing.expectEqual(before, try openFdCount());
@@ -572,7 +569,8 @@ test "log store marker partial creation fails closed without leaking or creating
 
 // 只枚举自身 fd，不读取用户配置或 HOME。
 fn openFdCount() !usize {
-    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, "/proc/self/fd", .{ .iterate = true });
+    const path = if (@import("builtin").os.tag == .macos) "/dev/fd" else "/proc/self/fd";
+    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, path, .{ .iterate = true });
     defer dir.close(std.testing.io);
     var iterator = dir.iterate();
     var count: usize = 0;
@@ -595,7 +593,7 @@ test "log store rejects symlink regular file and FIFO at either directory compon
             switch (kind) {
                 0 => try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat(".", parent, entry)),
                 1 => {
-                    const fd = filesystem.linux.openat(parent, entry, 1 | filesystem.linux.create | filesystem.linux.exclusive, 0o600);
+                    const fd = filesystem.openAt(parent, entry, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
                     try std.testing.expect(fd >= 0);
                     filesystem.closeFd(fd);
                 },
@@ -627,7 +625,7 @@ test "log store rejects insecure existing logs without chmod and preserves thin 
     var store = Store.init(std.testing.allocator, &root, .{});
     defer store.deinit();
     for ([_]u32{ 0o710, 0o701, 0o777 }) |mode| {
-        try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(logs, mode));
+        try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(logs, @intCast(mode)));
         const before = try openFdCount();
         for (0..8) |_| try std.testing.expectError(error.UnsafeLogDirectory, store.start());
         try std.testing.expectEqual(before, try openFdCount());

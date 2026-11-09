@@ -14,7 +14,7 @@ extern "c" fn fsync(c_int) c_int;
 fn fsyncFd(fd: c_int) !void {
     while (true) {
         if (fsync(fd) == 0) return;
-        if (std.c._errno().* == 4) continue; // EINTR
+        if (fs.errno() == .INTR) continue; // EINTR
         return fs.osError();
     }
 }
@@ -27,8 +27,8 @@ fn name(buffer: []u8, id: ids.Id, suffix: []const u8) ![:0]u8 {
 fn readFile(root: *fs.Root, dir: c_int, id: ids.Id) !?[]u8 {
     var buffer: [64]u8 = undefined;
     const path = try name(&buffer, id, ".session");
-    const fd = fs.linux.openat(dir, path, fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0);
-    if (fd < 0) return if (std.c._errno().* == 2) null else fs.osError();
+    const fd = fs.openAt(dir, path, .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    if (fd < 0) return if (fs.errno() == .NOENT) null else fs.osError();
     defer fs.closeFd(fd);
     const file = fs.fileFromFd(fd);
     const stat = try file.stat(root.io);
@@ -47,7 +47,7 @@ pub const Summary = session_metadata.SavedSession;
 fn readTitle(root: *fs.Root, dir: c_int, id: ids.Id) session_metadata.Title {
     var filename: [64]u8 = undefined;
     const path = name(&filename, id, ".title") catch return .{};
-    const fd = fs.linux.openat(dir, path, fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0);
+    const fd = fs.openAt(dir, path, .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
     if (fd < 0) return .{};
     defer fs.closeFd(fd);
     const file = fs.fileFromFd(fd);
@@ -102,9 +102,9 @@ fn atomicWrite(root: *fs.Root, dir: c_int, path: [:0]const u8, bytes: []const u8
         var random: [16]u8 = undefined;
         try root.io.randomSecure(&random);
         temp = try std.fmt.bufPrintSentinel(&buffer, ".resume-tmp-{s}", .{std.fmt.bytesToHex(random, .lower)}, 0);
-        fd = fs.linux.openat(dir, temp, 1 | fs.linux.create | fs.linux.exclusive | fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0o600);
+        fd = fs.openAt(dir, temp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0o600);
         if (fd >= 0) break;
-        if (std.c._errno().* != 17) return fs.osError();
+        if (fs.errno() != .EXIST) return fs.osError();
     }
     if (fd < 0) return error.TempNameExhausted;
     defer fs.closeFd(fd);
@@ -141,12 +141,12 @@ pub const Lease = struct {
         if (!writable) return .{ .directory_fd = dir, .lock_fd = -1, .id = id, .expected = null, .writable = false };
         var buffer: [64]u8 = undefined;
         const path = try name(&buffer, id, ".resume-lock");
-        const fd = fs.linux.openat(dir, path, 2 | fs.linux.create | fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0o600);
+        const fd = fs.openAt(dir, path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0o600);
         if (fd < 0) return fs.osError();
         errdefer fs.closeFd(fd);
         const stat = try fs.fileFromFd(fd).stat(root.io);
         if (stat.kind != .file) return error.UnsafeResumeFile;
-        if (fs.linux.flock(fd, 2 | 4) != 0) return if (std.c._errno().* == 11) error.SessionInUse else fs.osError();
+        if (fs.flock(fd, fs.LOCK.EX | fs.LOCK.NB) != 0) return if (fs.errno() == .AGAIN) error.SessionInUse else fs.osError();
         return .{ .directory_fd = dir, .lock_fd = fd, .id = id, .expected = null, .writable = true };
     }
 
@@ -158,11 +158,11 @@ pub const Lease = struct {
         errdefer fs.closeFd(dir);
         var buffer: [64]u8 = undefined;
         const path = try name(&buffer, id, ".resume-lock");
-        const fd = fs.linux.openat(dir, path, 2 | fs.linux.create | fs.linux.exclusive | fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0o600);
+        const fd = fs.openAt(dir, path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0o600);
         if (fd < 0) return fs.osError();
         errdefer fs.closeFd(fd);
         if (std.c.fchmod(fd, 0o600) != 0) return fs.osError();
-        if (fs.linux.flock(fd, 2 | 4) != 0) return error.SessionInUse;
+        if (fs.flock(fd, fs.LOCK.EX | fs.LOCK.NB) != 0) return error.SessionInUse;
         return .{ .directory_fd = dir, .lock_fd = fd, .id = id, .expected = null, .writable = true };
     }
 
@@ -293,11 +293,11 @@ test "resume listing is read only sorted and ignores invalid entries" {
     const equal_times = [2]std.c.timespec{ .{ .sec = 100, .nsec = 0 }, .{ .sec = 100, .nsec = 0 } };
     try std.testing.expectEqual(@as(c_int, 0), std.c.utimensat(dir, test_id ++ ".session", &equal_times, 0));
     try std.testing.expectEqual(@as(c_int, 0), std.c.utimensat(dir, second ++ ".session", &equal_times, 0));
-    const unreadable = fs.linux.openat(dir, test_id ++ ".session", fs.linux.nofollow | fs.linux.cloexec, 0);
+    const unreadable = fs.openAt(dir, test_id ++ ".session", .{ .NOFOLLOW = true, .CLOEXEC = true }, 0);
     if (unreadable < 0) return fs.osError();
     defer fs.closeFd(unreadable);
     try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(unreadable, 0));
-    const junk = fs.linux.openat(dir, "INVALID.session", 1 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec, 0o600);
+    const junk = fs.openAt(dir, "INVALID.session", .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600);
     if (junk < 0) return fs.osError();
     fs.closeFd(junk);
     const result = try list(&root, a);
@@ -447,7 +447,7 @@ test "resume store ignores arbitrary legacy markers and permission bits at load"
         try lease.save(&root, "complete JSON-shaped history");
         try fs.fileFromFd(lease.lock_fd).writePositionalAll(root.io, "Aobsolete digest", 0);
         try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(lease.lock_fd, 0o644));
-        const fd = fs.linux.openat(lease.directory_fd, test_id ++ ".session", fs.linux.nofollow | fs.linux.cloexec, 0);
+        const fd = fs.openAt(lease.directory_fd, test_id ++ ".session", .{ .NOFOLLOW = true, .CLOEXEC = true }, 0);
         if (fd < 0) return fs.osError();
         defer fs.closeFd(fd);
         try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(fd, 0o644));

@@ -59,7 +59,7 @@ fn finalize(owner: *Coordinator, a: std.mem.Allocator, text: []const u8, cancel:
 }
 fn expectNoJobs(root: *fs.Root) !void {
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin/memory/jobs"));
-    try std.testing.expectError(error.FileNotFound, fs.openPath(root.dir.handle, ".thin/memory/jobs-owner"));
+    try std.testing.expectError(error.FileNotFound, root.dir.statFile(root.io, ".thin/memory/jobs-owner", .{ .follow_symlinks = false }));
 }
 
 test "rotated journal credential filters related evidence and candidates" {
@@ -219,7 +219,7 @@ test "automatic Memory contention fails promptly without jobs" {
     try begin(owner, a, input);
     const held = try fs.openDirectory(root.dir.handle, ".");
     defer fs.closeFd(held);
-    try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(held, 2 | 4));
+    try std.testing.expectEqual(@as(c_int, 0), fs.flock(held, fs.LOCK.EX | fs.LOCK.NB));
     var cancel: p.Cancellation = .{};
     const terminal = try finalize(owner, a, input, &cancel);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);

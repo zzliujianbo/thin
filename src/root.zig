@@ -63,6 +63,7 @@ test {
     _ = anthropic;
     _ = process;
     _ = filesystem;
+    _ = @import("tests/filesystem_portability_test.zig");
     _ = memory;
     _ = @import("core/diagnostics.zig");
     _ = @import("core/knowledge.zig");

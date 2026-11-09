@@ -875,10 +875,10 @@ test "App ignores retired memory layout and preserves its artifacts" {
     for (markers) |path| try root.writeMode(path, "retired marker", false, 0o600);
     try root.writeMode(".thin/memory/core.md", "current core", false, 0o600);
     // A held retired owner lock must not gate initialization or Store access.
-    const owner = fs.linux.openat(thin, "mem-jobs-owner", 2 | fs.linux.nofollow | fs.linux.cloexec, 0);
+    const owner = fs.openAt(thin, "mem-jobs-owner", .{ .ACCMODE = .RDWR, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     try std.testing.expect(owner >= 0);
     defer fs.closeFd(owner);
-    try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(owner, 2 | 4));
+    try std.testing.expectEqual(@as(c_int, 0), fs.flock(owner, fs.LOCK.EX | fs.LOCK.NB));
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);

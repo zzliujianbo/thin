@@ -65,7 +65,7 @@ pub const Store = struct {
 
         const fd = fs.openDirectory(home_root.dir.handle, ".thin") catch |err| blk: {
             if (!create or err != error.FileNotFound) return err;
-            if (std.c.mkdirat(home_root.dir.handle, ".thin", 0o700) != 0 and std.c._errno().* != 17)
+            if (std.c.mkdirat(home_root.dir.handle, ".thin", 0o700) != 0 and fs.errno() != .EXIST)
                 return fs.osError();
             break :blk try fs.openDirectory(home_root.dir.handle, ".thin");
         };
@@ -89,9 +89,9 @@ pub const Store = struct {
         const fd = try fs.openDirectory(self.root.dir.handle, ".");
         errdefer fs.closeFd(fd);
         for (0..100) |_| {
-            if (fs.linux.flock(fd, 2 | 4) == 0) return fd;
-            const errno = std.c._errno().*;
-            if (errno != 11 and errno != 4) return fs.osError();
+            if (fs.flock(fd, fs.LOCK.EX | fs.LOCK.NB) == 0) return fd;
+            const errno = fs.errno();
+            if (errno != .AGAIN and errno != .INTR) return fs.osError();
             try std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake);
         }
         return error.AuthStoreBusy;
@@ -139,18 +139,18 @@ pub const Store = struct {
             if (cancel) |c| if (c.isRequested()) return error.Cancelled;
             const elapsed = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() -| started);
             if (elapsed >= timeout_ms) return error.AuthStoreBusy;
-            if (fs.linux.flock(fd, 2 | 4) == 0) return .{ .store = self, .fd = fd };
-            const errno = std.c._errno().*;
-            if (errno != 11 and errno != 4) return fs.osError();
+            if (fs.flock(fd, fs.LOCK.EX | fs.LOCK.NB) == 0) return .{ .store = self, .fd = fd };
+            const errno = fs.errno();
+            if (errno != .AGAIN and errno != .INTR) return fs.osError();
             try std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake);
         }
     }
 
     /// 不跟随链接、不阻塞 FIFO；先检查 fd 类型，再读取最多上限加一字节。
     fn read(self: *Store) !?Bytes {
-        const fd = fs.linux.openat(self.root.dir.handle, cfg.file_name, fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0);
+        const fd = fs.openAt(self.root.dir.handle, cfg.file_name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
         if (fd < 0) {
-            if (std.c._errno().* == 2) return null;
+            if (fs.errno() == .NOENT) return null;
             return fs.osError();
         }
         defer fs.closeFd(fd);
@@ -459,7 +459,7 @@ test "auth store rejects symlink directory FIFO and oversize config" {
     try store.root.dir.deleteFile(std.testing.io, cfg.file_name);
     try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(fd, cfg.file_name, 0o700));
     try std.testing.expectError(error.NotRegularFile, store.loadOrInitialize());
-    try std.testing.expectEqual(@as(c_int, 0), std.c.unlinkat(fd, cfg.file_name, 0x200));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.unlinkat(fd, cfg.file_name, std.c.AT.REMOVEDIR));
     try std.testing.expectEqual(@as(c_int, 0), mkfifoat(fd, cfg.file_name, 0o600));
     try std.testing.expectError(error.NotRegularFile, store.loadOrInitialize());
     try store.root.dir.deleteFile(std.testing.io, cfg.file_name);
