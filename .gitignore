@@ -10,8 +10,9 @@ __pycache__/
 # Project-private memory and runtime data
 /.thin/
 
-# Private design documents and plans live outside this repository
-/docs/
+# Private design documents stay ignored except the public macOS feature plan
+/docs/*
+!/docs/macos-support.md
 /plans/
 /thin-docs/
 
