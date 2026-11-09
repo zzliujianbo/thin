@@ -246,6 +246,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
   const seed = 'seed-content-'.repeat(138) + 'end\n'; // ~1800 UTF-8 bytes
   await writeFile(join(project,'seed.txt'), seed);
   if (kind === 'tool-icons') await writeFile(join(project,'r.json'), '{"tool-json-hidden-marker":1}');
+  if (kind === 'exact-edit') await writeFile(join(project,'edit.txt'), '中文🙂 one\ntwo 结束\n');
 
   // 场景计数器：请求数、对话轮次、摘要次数，以及压缩后标记。
   let requests = 0, rounds = 0, summaries = 0, afterSummary = false, stable, fixtureError, idleSocket;
@@ -498,6 +499,24 @@ async function runScenario(name, protocol, kind, isPty = false) {
         return;
       }
 
+      if (kind === 'exact-edit') {
+        assert(!JSON.stringify(body).includes(KEY), 'credential leaked into request body');
+        assert(rounds <= 2, 'exact edit request bound');
+        if (rounds === 1) {
+          assert(body.tools.some(t => (t.function?.name ?? t.name) === 'edit_file'));
+          send(res,protocol,'',[tool('exact-edit-call','edit_file',{path:'edit.txt',edits:[{old_text:'中文🙂',new_text:'你好'},{old_text:'two',new_text:'二'}]})]);
+        } else {
+          assert.equal(outputs.size,1);
+          assert.equal(body.messages.filter(m => m.role === 'tool').length,1);
+          assert.equal(body.messages.filter(m => m.role === 'tool' && m.tool_call_id === 'exact-edit-call').length,1);
+          assert(!outputs.get('exact-edit-call').includes(KEY));
+          assert.equal(JSON.parse(outputs.get('exact-edit-call')).path,'edit.txt');
+          assert.equal(await readFile(join(project,'edit.txt'),'utf8'),'你好 one\n二 结束\n');
+          send(res,protocol,'fixture-answer exact-edit-answer');
+        }
+        return;
+      }
+
       if (kind === 'file-stats') {
         assert.equal(protocol,'chat');
         assert(rounds <= 2, 'file stats request bound');
@@ -654,6 +673,15 @@ async function runScenario(name, protocol, kind, isPty = false) {
           for (const line of (await readFile(join(logDir,file),'utf8')).trimEnd().split('\n').filter(Boolean)) assert.equal(JSON.parse(line).session,announced, 'record identity differs from immutable owner identity');
         }
       }
+    }
+    if (kind === 'exact-edit') {
+      assert.equal(requests,2);
+      assert.equal(rounds,2);
+      assert.equal(summaries,0);
+      assert(!result.output.includes(KEY));
+      assert.equal(observations.size,1);
+      assert(observations.has('exact-edit-call'));
+      assert.equal(await readFile(join(project,'edit.txt'),'utf8'),'你好 one\n二 结束\n');
     }
     if (kind === 'menu-navigation') {
       assert.equal(await readFile(join(home,'.thin/config.json'),'utf8'), navigationConfig, 'menu navigation changed configuration');
@@ -923,6 +951,7 @@ try {
   await scenario('PTY model/effort selection chat','chat','model-select',true);
   await scenario('PTY model/effort selection responses','responses','model-select',true);
   for (const kind of ['exit-batched','exit-no-submit','exit-recorded','exit-unconfigured','exit-secret','exit-busy','exit-busy-tool']) await scenario(`PTY/${kind}`,'chat',kind,true);
+  await scenario('owned CLI exact edit','chat','exact-edit');
   await scenario('help without configuration','chat','help');
   await scenario('print without configuration','chat','no-config');
   await scenario('legacy configuration is not loaded','chat','legacy-config');

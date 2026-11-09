@@ -13,6 +13,7 @@ pub const Kind = enum {
     bash,
     read,
     write,
+    edit,
     /// Child-job start; only its bounded task summary is displayable.
     subagent,
     /// get/send/cancel job control; the bounded id is the only detail.
@@ -25,6 +26,7 @@ pub const Kind = enum {
         if (std.mem.eql(u8, name, "bash")) return .bash;
         if (std.mem.eql(u8, name, "read_file")) return .read;
         if (std.mem.eql(u8, name, "write_file")) return .write;
+        if (std.mem.eql(u8, name, "edit_file")) return .edit;
         if (std.mem.eql(u8, name, "subagent")) return .subagent;
         if (std.mem.eql(u8, name, "get_subagent_result") or std.mem.eql(u8, name, "send_subagent_message") or std.mem.eql(u8, name, "cancel_subagent")) return .subagent_id;
         if (std.mem.eql(u8, name, "message_parent")) return .parent_message;
@@ -240,6 +242,18 @@ test "typed tool fields keep unknown targets safe and preserve clipping provenan
     const invalid = try Call.fromFields(a, "memory", .{ .action = .{ .text = "write", .truncated = true }, .topic = .{ .text = "hidden" } });
     defer invalid.deinit(a);
     try std.testing.expect(invalid.detail == null);
+}
+
+test "edit call exposes only its path in canonical and typed fields" {
+    const a = std.testing.allocator;
+    const call = try Call.init(a, "edit_file", "{\"path\":\"source.zig\",\"edits\":[{\"old_text\":\"private-old\",\"new_text\":\"private-new\"}]}");
+    defer call.deinit(a);
+    try std.testing.expectEqual(Kind.edit, call.kind);
+    try std.testing.expectEqualStrings("source.zig", call.detail.?);
+    const typed = try Call.fromFields(a, "edit_file", .{ .path = .{ .text = "source.zig" } });
+    defer typed.deinit(a);
+    try std.testing.expectEqual(Kind.edit, typed.kind);
+    try std.testing.expectEqualStrings("source.zig", typed.detail.?);
 }
 
 test "memory descriptions include known action and topic without bodies versions or styles" {

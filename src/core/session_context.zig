@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const fs = @import("../platform/filesystem.zig");
+const skill_catalog = @import("skill_catalog.zig");
 
 /// Combined raw AGENTS file bytes injected into one session preface.
 pub const max_agents_bytes: usize = 32 * 1024;
@@ -144,7 +145,9 @@ pub fn load(a: std.mem.Allocator, io: std.Io, home: []const u8, cwd: []const u8,
     errdefer a.free(project_root);
 
     var raw: std.ArrayList(u8) = .empty;
+    errdefer raw.deinit(a);
     var formatted: std.ArrayList(u8) = .empty;
+    errdefer formatted.deinit(a);
     var budget: usize = max_agents_bytes;
     var truncated = false;
 
@@ -157,10 +160,13 @@ pub fn load(a: std.mem.Allocator, io: std.Io, home: []const u8, cwd: []const u8,
     var project = try fs.Root.open(a, io, project_root);
     defer project.deinit();
     try takeLayer(a, io, project.dir.handle, project.path, .project, &budget, &truncated, &raw, &formatted);
+    try skill_catalog.append(a, io, home, &formatted);
 
+    const shell_copy = try a.dupe(u8, shell_text);
+    errdefer a.free(shell_copy);
     const snap = Snapshot{
         .cwd = canonical_cwd,
-        .shell = try a.dupe(u8, shell_text),
+        .shell = shell_copy,
         .project_root = project_root,
         .agents = formatted.items,
         .agents_text = raw.items,

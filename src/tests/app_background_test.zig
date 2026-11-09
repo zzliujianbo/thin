@@ -28,7 +28,8 @@ fn expectBackgroundSurface(app: *App) !void {
     try std.testing.expect(hasSchema(schemas, "background"));
     try std.testing.expect(hasSchema(schemas, "bash"));
     // Appended last, so every earlier tool keeps its index.
-    try std.testing.expectEqualStrings("background", schemas[schemas.len - 1].name);
+    try std.testing.expectEqualStrings("background", schemas[schemas.len - 2].name);
+    try std.testing.expectEqualStrings("edit_file", schemas[schemas.len - 1].name);
     try std.testing.expectEqualStrings("bash", schemas[2].name);
     try std.testing.expect(hasSchema(app.runtime.executor.schemas, "background"));
 }

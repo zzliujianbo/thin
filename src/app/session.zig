@@ -3407,7 +3407,8 @@ test "Anthropic session resume invalidates null-hash replay when title tools are
     defer encoded.deinit();
     const wire_tools = encoded.value.object.get("tools").?.array.items;
     try std.testing.expectEqual(app.runtime.executor.schemas.len, wire_tools.len);
-    try std.testing.expectEqualStrings("set_session_title", wire_tools[wire_tools.len - 1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("set_session_title", wire_tools[wire_tools.len - 2].object.get("name").?.string);
+    try std.testing.expectEqualStrings("edit_file", wire_tools[wire_tools.len - 1].object.get("name").?.string);
     const messages = encoded.value.object.get("messages").?.array.items;
     try std.testing.expectEqual(@as(usize, 4), messages.len);
     try std.testing.expectEqualStrings("original question", messages[0].object.get("content").?.array.items[0].object.get("text").?.string);

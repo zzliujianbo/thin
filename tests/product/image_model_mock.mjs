@@ -137,8 +137,8 @@ export async function imageModelRegressions({app,pty,execute}) {
         }
         const names = body.tools.map(t=>t.function.name);
         assert.equal(names.filter(name=>name === 'set_session_title').length, isPty ? 1 : 0, 'title tool must be root-interactive only');
-        assert.deepEqual(names.filter(name=>name !== 'set_session_title'), [...FIRST_FOUR,...(selected && !off ? ['read_image'] : []),...SUBAGENT_FOUR,'background']);
-        assert.equal(names.filter(name=>name !== 'set_session_title').at(-1),'background');
+        assert.deepEqual(names.filter(name=>name !== 'set_session_title'), [...FIRST_FOUR,...(selected && !off ? ['read_image'] : []),...SUBAGENT_FOUR,'background','edit_file']);
+        assert.equal(names.filter(name=>name !== 'set_session_title').at(-1),'edit_file');
         assert.deepEqual(body.tools.slice(0,4),primaryTools,'Image changed an existing tool schema');
         if (isPty && mainPosts === 1) {
           assert.equal(auxPosts,0); assert.equal(body.messages.at(-1).content,WARMUP);

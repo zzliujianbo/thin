@@ -163,15 +163,15 @@ test "subagent job tools publish exactly when the host service exists" {
     var config = fixtureConfig();
     var tools: Tools = .{ .root = undefined, .memory = undefined, .config = &config, .environment = undefined };
     const base = tools.executor().schemas;
-    try std.testing.expectEqual(@as(usize, 4), base.len);
-    for ([_][]const u8{ "read_file", "write_file", "bash", "memory" }, base) |name, schema| try std.testing.expectEqualStrings(name, schema.name);
+    try std.testing.expectEqual(@as(usize, 5), base.len);
+    for ([_][]const u8{ "read_file", "write_file", "bash", "memory", "edit_file" }, base) |name, schema| try std.testing.expectEqualStrings(name, schema.name);
     for (base) |schema| try std.testing.expect(!std.mem.eql(u8, schema.name, "subagent"));
 
     var fake: FakeService = .{};
     tools.subagent = fake.service();
     const parent = tools.executor().schemas;
-    try std.testing.expectEqual(@as(usize, 8), parent.len);
-    for ([_][]const u8{ "read_file", "write_file", "bash", "memory", "subagent", "get_subagent_result", "send_subagent_message", "cancel_subagent" }, parent) |name, schema| try std.testing.expectEqualStrings(name, schema.name);
+    try std.testing.expectEqual(@as(usize, 9), parent.len);
+    for ([_][]const u8{ "read_file", "write_file", "bash", "memory", "subagent", "get_subagent_result", "send_subagent_message", "cancel_subagent", "edit_file" }, parent) |name, schema| try std.testing.expectEqualStrings(name, schema.name);
     // Same capability set keeps handing out the same read-only slice.
     try std.testing.expectEqual(parent.ptr, tools.executor().schemas.ptr);
     try std.testing.expect(std.mem.indexOf(u8, parent[4].description, "Parent and child tools can run concurrently") != null);
@@ -185,7 +185,8 @@ test "subagent job tools publish exactly when the host service exists" {
     var image_dummy: u8 = 0;
     tools.image = .{ .context = &image_dummy, .inspect_fn = FakeImage.inspect, .check_fn = FakeImage.check };
     const with_image = tools.executor().schemas;
-    try std.testing.expectEqual(@as(usize, 9), with_image.len);
+    try std.testing.expectEqual(@as(usize, 10), with_image.len);
+    try std.testing.expectEqualStrings("edit_file", with_image[9].name);
     try std.testing.expectEqualStrings("read_image", with_image[4].name);
     try std.testing.expectEqualStrings("subagent", with_image[5].name);
 
@@ -195,12 +196,13 @@ test "subagent job tools publish exactly when the host service exists" {
     var channel: FakeChannel = .{};
     tools.parent_channel = .{ .context = &channel, .message_fn = FakeChannel.message };
     const child = tools.executor().schemas;
-    try std.testing.expectEqual(@as(usize, 4), child.len);
-    for ([_][]const u8{ "read_file", "write_file", "bash", "message_parent" }, child) |name, schema| try std.testing.expectEqualStrings(name, schema.name);
+    try std.testing.expectEqual(@as(usize, 5), child.len);
+    for ([_][]const u8{ "read_file", "write_file", "bash", "message_parent", "edit_file" }, child) |name, schema| try std.testing.expectEqualStrings(name, schema.name);
 
     tools.parent_channel = null;
     const bare = tools.executor().schemas;
-    try std.testing.expectEqual(@as(usize, 3), bare.len);
+    try std.testing.expectEqual(@as(usize, 4), bare.len);
+    try std.testing.expectEqualStrings("edit_file", bare[3].name);
     for (bare) |schema| try std.testing.expect(!std.mem.eql(u8, schema.name, "message_parent"));
 }
 

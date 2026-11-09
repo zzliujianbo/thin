@@ -107,7 +107,8 @@ const Fixture = struct {
     fn call(ctx: *anyopaque, a: std.mem.Allocator, req: p.Request, _: p.ModelSink) !p.Outcome {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
         try t.expectEqual(p.Purpose.normal, req.purpose);
-        try t.expectEqual(@as(usize, 4), req.tools.len);
+        try t.expectEqual(@as(usize, 5), req.tools.len);
+        for ([_][]const u8{ "read_file", "write_file", "bash", "memory", "edit_file" }, req.tools) |name, schema| try t.expectEqualStrings(name, schema.name);
         // system prompt 必须在所有轮次保持一致，且不包含运行中写入的 memory。
         if (self.first_system) |first| try t.expectEqualStrings(first, req.system) else self.first_system = req.system;
         try t.expect(std.mem.find(u8, req.system, "New title") == null);

@@ -104,7 +104,7 @@ pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
     if (kind == .parent_message) return .{ .kind = kind, .label = try a.dupe(u8, "message_parent") };
     const unavailable = switch (kind) {
         .bash => "(command unavailable)",
-        .read, .write => "(file unavailable)",
+        .read, .write, .edit => "(file unavailable)",
         .memory => "(operation unavailable)",
         .subagent => "(task unavailable)",
         .subagent_id => "(id unavailable)",
@@ -192,7 +192,7 @@ pub fn completed(a: std.mem.Allocator, value: Caption, stats: ?line_stats.File) 
             try std.fmt.allocPrint(a, "{s}  {d} lines{s}", .{ value.label, stats.?.read.?, if (stats.?.partial) " [partial]" else "" })
         else
             try std.fmt.allocPrint(a, "{s}  lines ?", .{value.label}),
-        .write => if (stats != null and stats.?.changes != null) blk: {
+        .write, .edit => if (stats != null and stats.?.changes != null) blk: {
             const c = stats.?.changes.?;
             const added = value.label.len + "  ~".len + decimalLength(c.modified) + 1;
             const removed = added + 1 + decimalLength(c.added) + 1;
@@ -670,6 +670,18 @@ test "file captions expose safe paths and measured counts with unknown not guess
     const unknown = try completed(a, write, null);
     defer unknown.deinit(a);
     try std.testing.expectEqualStrings("a.zig  changes ?", unknown.label);
+    const edit = try caption(a, "edit_file", "{\"path\":\"a.zig\",\"edits\":[{\"old_text\":\"secret-before\",\"new_text\":\"secret-after\"}]}");
+    defer edit.deinit(a);
+    try std.testing.expectEqual(activity.Tool.edit, edit.kind);
+    try std.testing.expectEqualStrings("a.zig", edit.label);
+    const edit_done = try completed(a, edit, .{ .changes = .{ .modified = 1, .added = 2, .removed = 3 } });
+    defer edit_done.deinit(a);
+    try std.testing.expectEqual(activity.Tool.edit, edit_done.kind);
+    try std.testing.expectEqualStrings("a.zig  ~1 +2 -3 lines", edit_done.label);
+    const edit_text = try commandText(a, edit_done, .success);
+    defer a.free(edit_text);
+    try std.testing.expect(std.mem.startsWith(u8, edit_text, "e "));
+    try std.testing.expect(std.mem.indexOf(u8, edit_text, "secret-") == null);
     const bad = try caption(a, "write_file", "{\"path\":\"unfinished");
     defer bad.deinit(a);
     try std.testing.expectEqualStrings("(file unavailable)", bad.label);

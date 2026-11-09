@@ -19,6 +19,7 @@ const command_risk = @import("command_risk.zig");
 const decision = @import("../core/decision.zig");
 const image = @import("../core/image.zig");
 const image_file = @import("image_file.zig");
+const text_edit = @import("text_edit.zig");
 const subagent = @import("../core/subagent.zig");
 const background = @import("../core/background.zig");
 const Title = @import("../core/session_metadata.zig").Title;
@@ -67,8 +68,8 @@ const decision_bash_description = "Run bash in the startup project; cwd changes 
 /// Background variants only appear when the host supplied a background service
 /// to a root Tools. They state that the bounded timeout covers startup only, so
 /// the command timeout is not mistaken for the lifetime of a handed-off service.
-const background_bash_description = bash_description ++ " background=true starts a managed service in this Thin instance: the call returns after a bounded startup wait with an id; timeout_ms bounds only that startup wait, not how long the service keeps running. Manage it with the background tool.";
-const decision_background_bash_description = decision_bash_description ++ " background=true starts a managed service in this Thin instance: timeout_ms bounds only the startup wait; after handoff the service keeps running until it is stopped or Thin exits. Manage it with the background tool.";
+const background_bash_description = bash_description ++ " background=true starts a managed service in this Thin instance: the call returns after a bounded startup wait with an id; timeout_ms bounds only that startup wait, not how long the service keeps running. For long output needing later inspection, use background=true and read background.logs by offset. Manage it with the background tool.";
+const decision_background_bash_description = decision_bash_description ++ " background=true starts a managed service in this Thin instance: timeout_ms bounds only the startup wait; after handoff the service keeps running until it is stopped or Thin exits. For long output needing later inspection, use background=true and read background.logs by offset. Manage it with the background tool.";
 const bash_background_parameters_json =
     \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},"background":{"type":"boolean"}},"required":["command"],"additionalProperties":false}
 ;
@@ -143,7 +144,14 @@ const parent_schemas = [_]p.ToolSchema{ subagent_schema, get_subagent_schema, se
 const channel_choices = 3;
 /// Largest schema set: read/write/bash/memory + image + 4 parent tools +
 /// the background management tool.
-const max_schemas = 11;
+const max_schemas = 12;
+const edit_schema: p.ToolSchema = .{
+    .name = "edit_file",
+    .description = "Atomically replace exact unique text in an existing project file. All edits match the original text, must be non-overlapping, and are applied together. Read the file first.",
+    .parameters_json =
+    \\{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","minItems":1,"maxItems":128,"items":{"type":"object","properties":{"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"}},"required":["old_text","new_text"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}
+    ,
+};
 const title_schema: p.ToolSchema = .{
     .name = "set_session_title",
     .description = "After first understanding the user's intent, set a short descriptive session title. Update it only when the main topic clearly changes.",
@@ -194,6 +202,7 @@ fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_
         result[count] = title_schema;
         count += 1;
     }
+    result[count] = edit_schema;
     return result;
 }
 
@@ -214,7 +223,7 @@ fn schemaCount(image_on: bool, memory_on: bool, channel: usize, background_on: b
         2 => 1,
         else => 0,
     };
-    return 4 + @as(usize, @intFromBool(image_on)) + channel_count + @as(usize, @intFromBool(background_on)) - @as(usize, @intFromBool(!memory_on));
+    return 5 + @as(usize, @intFromBool(image_on)) + channel_count + @as(usize, @intFromBool(background_on)) - @as(usize, @intFromBool(!memory_on));
 }
 
 fn schemasFor(review: bool, image_on: bool, memory_on: bool, channel: usize, background_on: bool) []const p.ToolSchema {
@@ -240,6 +249,7 @@ fn validateReadImage(r: ReadImage) !void {
 pub const Read = struct { path: []const u8, offset: u64 = 0, limit: ?u32 = null };
 /// write_file 的解析结果；覆盖已有文件必须显式设置 overwrite。
 pub const Write = struct { path: []const u8, content: []const u8, overwrite: bool = false };
+pub const EditFile = struct { path: []const u8, edits: []const text_edit.Edit };
 /// bash 的解析结果；timeout_ms 为空时使用配置的默认超时。background=true
 /// 只改变本次调用的执行方式：异步启动一个实例内托管服务。
 pub const Bash = struct { command: []const u8, timeout_ms: ?u32 = null, background: bool = false };
@@ -261,6 +271,7 @@ pub const Action = union(enum) {
     read_file: Read,
     read_image: ReadImage,
     write_file: Write,
+    edit_file: EditFile,
     bash: Bash,
     background: background.Query,
     memory: Memory,
@@ -279,6 +290,7 @@ pub const Action = union(enum) {
             .write_file => |w| try std.fmt.allocPrint(a, "{s} {s} ({d} bytes)", .{
                 if (w.overwrite) "Write/replace" else "Create", w.path, w.content.len,
             }),
+            .edit_file => |e| try std.fmt.allocPrint(a, "Edit {s} ({d} edits)", .{ e.path, e.edits.len }),
             .bash => |b| try std.fmt.allocPrint(a, "Run bash{s}: {s}", .{ if (b.background) " (background service)" else "", b.command }),
             .background => |q| if (q.id) |id|
                 try std.fmt.allocPrint(a, "Background {s} {s}", .{ q.action.name(), id })
@@ -339,6 +351,20 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
         const limit = args.limit orelse limits.read_bytes;
         if (limit == 0 or limit > limits.read_bytes) return error.InvalidReadLimit;
         return .{ .read_file = args };
+    }
+
+    if (std.mem.eql(u8, name, "edit_file")) {
+        const args = try std.json.parseFromSliceLeaky(EditFile, a, arguments, opts);
+        try validatePath(args.path);
+        if (args.edits.len == 0) return error.EmptyEdits;
+        if (args.edits.len > text_edit.max_edits) return error.TooManyEdits;
+        for (args.edits) |edit| {
+            if (edit.old_text.len == 0) return error.EmptyOldText;
+            for ([_][]const u8{ edit.old_text, edit.new_text }) |text| {
+                if (!std.unicode.utf8ValidateSlice(text) or std.mem.findScalar(u8, text, 0) != null) return error.InvalidText;
+            }
+        }
+        return .{ .edit_file = args };
     }
 
     if (std.mem.eql(u8, name, "write_file")) {
@@ -565,6 +591,7 @@ pub const Tools = struct {
             .read_file => |read| read.path,
             .read_image => |read| read.path,
             .write_file => |write| write.path,
+            .edit_file => |edit| edit.path,
             else => return,
         };
         if (action == .read_file) {
@@ -575,6 +602,7 @@ pub const Tools = struct {
             // against root.path, which can name a different parent after rename.
             return;
         }
+        const is_write = action == .write_file or action == .edit_file;
         const absolute = try std.fs.path.resolve(a, &.{ self.root.path, path });
         defer a.free(absolute);
         const relative = try self.root.relative(path);
@@ -590,7 +618,7 @@ pub const Tools = struct {
                 in_thin = true;
             } else {
                 in_thin = false; // A second non-dot component exists.
-                if (action == .write_file and (std.mem.eql(u8, part, mem.directory_name) or std.mem.eql(u8, part, "mem"))) return error.UseMemoryTool;
+                if (is_write and (std.mem.eql(u8, part, mem.directory_name) or std.mem.eql(u8, part, "mem"))) return error.UseMemoryTool;
                 // Exact project settings path only; ignore dot/slash aliases.
                 if (std.mem.eql(u8, part, settings.file_name)) {
                     var exact = true;
@@ -605,14 +633,14 @@ pub const Tools = struct {
                 // 新档案放在 sessions；旧 logs 留档仍受保护，但不再写入或自动搬迁。
                 // 会话记录允许只读导入，但禁止模型写入/篡改自己的留档。
                 if (std.mem.eql(u8, part, "sessions") or std.mem.eql(u8, part, "logs")) {
-                    if (action == .write_file) return error.ProtectedSessionFile;
+                    if (is_write) return error.ProtectedSessionFile;
                     break;
                 }
                 break;
             }
         }
         // Writing the .thin parent itself must not replace the Memory namespace.
-        if (in_thin and action == .write_file) return error.UseMemoryTool;
+        if (in_thin and is_write) return error.UseMemoryTool;
         const protected = self.auth_path orelse return;
         if (std.mem.eql(u8, absolute, protected)) return error.ProtectedAuthFile;
     }
@@ -815,6 +843,31 @@ pub const Tools = struct {
                 try j.put(a, &value, "truncated", .{ .bool = result.truncated });
                 try j.put(a, &value, "content", j.str(result.data));
                 return .{ .text = try j.encode(a, value), .truncated = result.truncated, .file_stats = .{ .read = @import("../util/line_stats.zig").count(result.data), .partial = result.offset != 0 or result.truncated } };
+            },
+
+            .edit_file => |edit| {
+                if (edit.edits.len > text_edit.max_edits) return error.TooManyEdits;
+                // This is an existing byte safety limit, not a model token/output quota.
+                // Bound both materialized file versions without introducing a config option.
+                const edit_limit = self.config.limits.max_response_bytes;
+                const before = try self.root.readBinaryGuarded(a, edit.path, edit_limit, self.textReadGuard());
+                defer a.free(before);
+                try fs.validateText(before);
+                const after = try text_edit.apply(a, before, edit.edits, edit_limit);
+                defer a.free(after);
+                try fs.validateText(after);
+                try j.put(a, &value, "path", j.str(edit.path));
+                try j.put(a, &value, "written_bytes", try j.number(after.len));
+                const encoded = try j.encode(a, value);
+                errdefer a.free(encoded);
+                if (cancel.isRequested()) return error.Canceled;
+                // A best-effort stale check, not a cross-process CAS.
+                const current = try self.root.readBinaryGuarded(a, edit.path, edit_limit, self.textReadGuard());
+                defer a.free(current);
+                if (!std.mem.eql(u8, before, current)) return error.FileChanged;
+                if (cancel.isRequested()) return error.Canceled;
+                const changes = try self.root.writeObserved(edit.path, after, true);
+                return .{ .text = encoded, .file_stats = .{ .changes = changes } };
             },
 
             .write_file => |w| {
@@ -1071,13 +1124,28 @@ test "tool schemas have stable order and valid JSON" {
     try std.testing.expectEqualStrings("read_file", schemas[0].name);
     try std.testing.expectEqualStrings("memory", schemas[3].name);
 
-    for ([_]bool{ false, true }) |review| for (schemasForDecision(review), schemas) |schema, original| {
+    for ([_]bool{ false, true }) |review| for (schemasForDecision(review)[0..schemas.len], schemas) |schema, original| {
         try std.testing.expectEqualStrings(original.name, schema.name);
         try std.testing.expectEqualStrings(original.parameters_json, schema.parameters_json);
         const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, schema.parameters_json, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value == .object);
     };
+}
+
+test "edit parsing enforces the shared edit count limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const item = "{\"old_text\":\"a\",\"new_text\":\"b\"},";
+    const prefix = try a.alloc(u8, item.len * (text_edit.max_edits - 1));
+    for (0..text_edit.max_edits - 1) |i| @memcpy(prefix[i * item.len ..][0..item.len], item);
+    const suffix = "{\"old_text\":\"a\",\"new_text\":\"b\"}";
+    const at_limit = try std.fmt.allocPrint(a, "{{\"path\":\"a\",\"edits\":[{s}{s}]}}", .{ prefix, suffix });
+    const valid = try parse(a, "edit_file", at_limit, .{});
+    try std.testing.expectEqual(text_edit.max_edits, valid.edit_file.edits.len);
+    const too_many = try std.fmt.allocPrint(a, "{{\"path\":\"a\",\"edits\":[{s}{s}{s}]}}", .{ prefix, item, suffix });
+    try std.testing.expectError(error.TooManyEdits, parse(a, "edit_file", too_many, .{}));
 }
 
 test "tool descriptions distinguish configured decision review from legacy approval" {
@@ -1280,14 +1348,16 @@ test "image tool strict arguments schemas guards and bounded text output" {
     for ([_]bool{ false, true }) |review| {
         const off = schemasForServices(review, false);
         const on = schemasForServices(review, true);
-        try std.testing.expectEqual(@as(usize, 4), off.len);
-        try std.testing.expectEqual(@as(usize, 5), on.len);
-        for (off, on[0..4]) |old, new| {
+        try std.testing.expectEqual(@as(usize, 5), off.len);
+        try std.testing.expectEqual(@as(usize, 6), on.len);
+        for (off[0..4], on[0..4]) |old, new| {
             try std.testing.expectEqualStrings(old.name, new.name);
             try std.testing.expectEqualStrings(old.description, new.description);
             try std.testing.expectEqualStrings(old.parameters_json, new.parameters_json);
         }
         try std.testing.expectEqualStrings("read_image", on[4].name);
+        try std.testing.expectEqualStrings("edit_file", off[4].name);
+        try std.testing.expectEqualStrings("edit_file", on[5].name);
     }
     const parsed = try parse(a, "read_image", "{\"path\":\"fixture.bin\"}", .{});
     try std.testing.expectEqualStrings(image.default_question, parsed.read_image.question);
@@ -1418,15 +1488,22 @@ fn fakeParentMessage(_: *anyopaque, _: std.mem.Allocator, _: subagent.Message, _
 test "session title schema is appended across the static matrix" {
     for ([_]bool{ false, true }) |review| for ([_]bool{ false, true }) |image_on| for ([_]bool{ false, true }) |memory_on| for ([_]bool{ false, true }) |background_on| for (0..channel_choices) |channel| {
         const old = schemasFor(review, image_on, memory_on, channel, background_on);
+        try std.testing.expectEqualStrings("edit_file", old[old.len - 1].name);
         const with_title = schemasWithTitle(review, image_on, memory_on, channel, background_on, true);
         try std.testing.expectEqual(old.len + 1, with_title.len);
-        for (old, with_title[0..old.len]) |before, after| try std.testing.expectEqualStrings(before.name, after.name);
-        try std.testing.expectEqualStrings("set_session_title", with_title[old.len].name);
+        for (old[0 .. old.len - 1], with_title[0 .. old.len - 1]) |before, after| try std.testing.expectEqualStrings(before.name, after.name);
+        try std.testing.expectEqualStrings("set_session_title", with_title[old.len - 1].name);
+        try std.testing.expectEqualStrings("edit_file", with_title[old.len].name);
     };
-    try std.testing.expectEqual(@as(usize, 11), schemasWithTitle(true, true, true, 1, true, true).len);
+    try std.testing.expectEqual(@as(usize, 12), schemasWithTitle(true, true, true, 1, true, true).len);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, title_schema.parameters_json, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
+    const edit_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, edit_schema.parameters_json, .{});
+    defer edit_parsed.deinit();
+    try std.testing.expect(edit_parsed.value == .object);
+    const max_items = edit_parsed.value.object.get("properties").?.object.get("edits").?.object.get("maxItems").?.integer;
+    try std.testing.expectEqual(@as(i64, text_edit.max_edits), max_items);
 }
 
 test "session title prepare execution and capability boundaries" {
@@ -1442,7 +1519,7 @@ test "session title prepare execution and capability boundaries" {
     try std.testing.expectError(error.SessionTitleDisabled, Tools.prepare(&tools, a, call));
     try std.testing.expectError(error.SessionTitleDisabled, tools.execute(a, .{ .set_session_title = Title.fromText("标题") }, &cancel));
     tools.session_title = Title.fromText("原题");
-    try std.testing.expectEqualStrings("set_session_title", tools.executor().schemas[tools.executor().schemas.len - 1].name);
+    try std.testing.expectEqualStrings("set_session_title", tools.executor().schemas[tools.executor().schemas.len - 2].name);
     try std.testing.expectError(error.InvalidSessionTitle, Tools.prepare(&tools, a, .{ .id = "t", .name = "set_session_title", .arguments = "{\"title\":\"\"}" }));
     const prepared = try Tools.prepare(&tools, a, call);
     try std.testing.expect(prepared.explicit_denial == null and prepared.decision_input == null);
@@ -1462,12 +1539,14 @@ test "background schema is appended last and old schemas keep indexes" {
     for ([_]bool{ false, true }) |review| {
         const off = schemasFor(review, true, true, 1, false);
         const on = schemasFor(review, true, true, 1, true);
-        try std.testing.expectEqual(@as(usize, 9), off.len);
-        try std.testing.expectEqual(@as(usize, 10), on.len);
+        try std.testing.expectEqual(@as(usize, 10), off.len);
+        try std.testing.expectEqual(@as(usize, 11), on.len);
         try std.testing.expectEqualStrings("read_image", off[4].name);
         try std.testing.expectEqualStrings("read_image", on[4].name);
-        for (off, on[0..9]) |old, new| try std.testing.expectEqualStrings(old.name, new.name);
+        for (off[0..9], on[0..9]) |old, new| try std.testing.expectEqualStrings(old.name, new.name);
         try std.testing.expectEqualStrings("background", on[9].name);
+        try std.testing.expectEqualStrings("edit_file", off[9].name);
+        try std.testing.expectEqualStrings("edit_file", on[10].name);
         // A Tools without a service keeps the old bash parameters exactly.
         try std.testing.expect(std.mem.indexOf(u8, off[2].parameters_json, "background") == null);
         try std.testing.expect(std.mem.indexOf(u8, on[2].parameters_json, "\"background\":{\"type\":\"boolean\"}") != null);
@@ -1481,13 +1560,14 @@ test "background schema is appended last and old schemas keep indexes" {
     }
     // Child Tools never advertise background capability or the management tool.
     const child = schemasFor(true, false, false, 2, false);
-    try std.testing.expectEqual(@as(usize, 4), child.len);
+    try std.testing.expectEqual(@as(usize, 5), child.len);
     try std.testing.expectEqualStrings("message_parent", child[3].name);
+    try std.testing.expectEqualStrings("edit_file", child[4].name);
     try std.testing.expect(std.mem.indexOf(u8, child[2].parameters_json, "background") == null);
     for (child) |schema| try std.testing.expect(!std.mem.eql(u8, schema.name, "background"));
     // Root without subagent still appends the management tool last.
     const root_only = schemasFor(false, true, true, 0, true);
-    try std.testing.expectEqual(@as(usize, 6), root_only.len);
+    try std.testing.expectEqual(@as(usize, 7), root_only.len);
     try std.testing.expectEqualStrings("background", root_only[5].name);
 }
 
@@ -1623,7 +1703,7 @@ test "background capability is root-only approved and never re-encoded" {
     // changing the tools surface.
     tools.allow_memory = false;
     const child_schemas = tools.executor().schemas;
-    try std.testing.expectEqual(@as(usize, 4), child_schemas.len);
+    try std.testing.expectEqual(@as(usize, 5), child_schemas.len);
     try std.testing.expect(std.mem.indexOf(u8, child_schemas[2].parameters_json, "background") == null);
     tools.allow_memory = true;
     tools.parent_channel = null;

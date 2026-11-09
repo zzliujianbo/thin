@@ -93,8 +93,8 @@ const OUTPUT_TOKENS = 256; // declared output capability, never a request cap
 const ROOT_TOOLS = ['read_file', 'write_file', 'bash', 'memory',
   'subagent', 'get_subagent_result', 'send_subagent_message', 'cancel_subagent',
   // Appended last: the root Tools also carries the instance background registry.
-  'background'];
-const CHILD_TOOLS = ['read_file', 'write_file', 'bash', 'message_parent'];
+  'background', 'edit_file'];
+const CHILD_TOOLS = ['read_file', 'write_file', 'bash', 'message_parent', 'edit_file'];
 const STATUSES = ['running', 'waiting_for_reply', 'success', 'failed', 'canceled', 'paused'];
 const endpoint = {chat: '/v1/chat/completions', responses: '/v1/responses', anthropic: '/v1/messages'};
 const MAX_BODY = 1024 * 1024;

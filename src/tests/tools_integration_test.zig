@@ -15,6 +15,52 @@ const configuration = cfg.Config{
     .model = .{ .name = "fake", .context_tokens = 32768 },
 };
 
+test "exact edit executes atomically on existing owned files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(a, io, buffer[0..n]);
+    defer root.deinit();
+    var store = mem.Store.init(&root, .{});
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    var edit_config = configuration;
+    var tools = t.Tools{ .root = &root, .memory = &store, .config = &edit_config, .environment = &environment };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    var cancel: p.Cancellation = .{};
+    try root.writeMode("edit.txt", "中文🙂\none\ntwo\n", false, 0o640);
+    const executor = tools.executor();
+    const text_edit = @import("../tools/text_edit.zig");
+    var excessive: [text_edit.max_edits + 1]text_edit.Edit = undefined;
+    for (&excessive) |*item| item.* = .{ .old_text = "x", .new_text = "y" };
+    try std.testing.expectError(error.TooManyEdits, tools.execute(temp, .{ .edit_file = .{ .path = "edit.txt", .edits = &excessive } }, &cancel));
+    const prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "e", .name = "edit_file", .arguments = "{\"path\":\"edit.txt\",\"edits\":[{\"old_text\":\"中文🙂\",\"new_text\":\"你好\"},{\"old_text\":\"two\",\"new_text\":\"二\"}]}" });
+    const result = try executor.execute_fn(executor.context, temp, prepared, &cancel);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualDeep(@import("../util/line_stats.zig").Changes{ .modified = 2 }, result.file_stats.?.changes.?);
+    const read = try root.read(temp, "edit.txt", 0, 100);
+    try std.testing.expectEqualStrings("你好\none\n二\n", read.data);
+    const info = try tmp.dir.statFile(io, "edit.txt", .{});
+    try std.testing.expectEqual(@as(u32, 0o640), info.permissions.toMode() & 0o777);
+    const missing = try executor.prepare_fn(executor.context, temp, .{ .id = "m", .name = "edit_file", .arguments = "{\"path\":\"missing\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}" });
+    try std.testing.expectError(error.FileNotFound, executor.execute_fn(executor.context, temp, missing, &cancel));
+    const bad = try executor.prepare_fn(executor.context, temp, .{ .id = "bad", .name = "edit_file", .arguments = "{\"path\":\"edit.txt\",\"edits\":[{\"old_text\":\"one\",\"new_text\":\"changed\"},{\"old_text\":\"missing\",\"new_text\":\"x\"}]}" });
+    try std.testing.expectError(error.EditNotFound, executor.execute_fn(executor.context, temp, bad, &cancel));
+    try std.testing.expectEqualStrings("你好\none\n二\n", (try root.read(temp, "edit.txt", 0, 100)).data);
+    try std.testing.expectError(error.ProtectedSessionFile, executor.prepare_fn(executor.context, temp, .{ .id = "p", .name = "edit_file", .arguments = "{\"path\":\".thin/sessions/log\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}" }));
+    edit_config.limits.max_response_bytes = 4;
+    try std.testing.expectError(error.FileTooLarge, executor.execute_fn(executor.context, temp, prepared, &cancel));
+    edit_config.limits.max_response_bytes = configuration.limits.max_response_bytes;
+    cancel.cancel();
+    try std.testing.expect((try executor.execute_fn(executor.context, temp, prepared, &cancel)).canceled);
+    try std.testing.expectEqualStrings("你好\none\n二\n", (try root.read(temp, "edit.txt", 0, 100)).data);
+}
+
 test "executor selects decision-aware descriptions without changing tool parameters" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
