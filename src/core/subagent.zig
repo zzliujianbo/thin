@@ -10,11 +10,14 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const cfg = @import("config.zig");
 
 /// Bounds are part of the tool contract; keep them centralized instead of
 /// scattering per-call fallbacks.
 pub const max_task_bytes: usize = 8192;
 pub const max_context_bytes: usize = 16384;
+/// Provider alias, separator, and raw model ID, matching config.splitDefault.
+pub const max_model_bytes: usize = 64 + 1 + 1024;
 /// Report/payload cap applied by the App before it encodes the tool result.
 /// Tools never re-truncates or re-encodes the encoded JSON it receives.
 pub const max_report_bytes: usize = 16384;
@@ -38,6 +41,8 @@ pub const Request = struct {
     task: []const u8,
     /// Optional parent-selected reference material, never authorization.
     context: ?[]const u8 = null,
+    /// Full provider/model-id reference; null inherits the parent's selection.
+    model: ?[]const u8 = null,
 };
 
 /// Snapshot or wait query for a started job.
@@ -86,6 +91,10 @@ pub fn validate(request: Request) !void {
         if (context.len > max_context_bytes) return error.InvalidSubagentContext;
         if (!std.unicode.utf8ValidateSlice(context) or std.mem.findScalar(u8, context, 0) != null)
             return error.InvalidSubagentContext;
+    }
+    if (request.model) |model| {
+        if (model.len > max_model_bytes or !std.unicode.utf8ValidateSlice(model)) return error.InvalidSubagentModel;
+        _ = cfg.splitDefault(model) catch return error.InvalidSubagentModel;
     }
 }
 

@@ -36,6 +36,7 @@ const FakeService = struct {
     plan: enum { ok, canceled, cleanup, failed } = .ok,
     wait: bool = true,
     last_message: []const u8 = "",
+    last_model: ?[]const u8 = null,
 
     fn begin(raw: *anyopaque, _: *const p.Cancellation) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -56,9 +57,10 @@ const FakeService = struct {
         };
     }
 
-    fn run(raw: *anyopaque, _: std.mem.Allocator, _: sub.Request, _: *const p.Cancellation) anyerror!sub.Result {
+    fn run(raw: *anyopaque, _: std.mem.Allocator, request: sub.Request, _: *const p.Cancellation) anyerror!sub.Result {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.runs += 1;
+        self.last_model = request.model;
         return self.encoded(payload_running);
     }
 
@@ -176,6 +178,24 @@ test "subagent job tools publish exactly when the host service exists" {
     try std.testing.expectEqual(parent.ptr, tools.executor().schemas.ptr);
     try std.testing.expect(std.mem.indexOf(u8, parent[4].description, "Parent and child tools can run concurrently") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent[4].description, "coordinate overlapping changes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent[4].parameters_json, "\"model\":{\"type\":[\"string\",\"null\"],\"minLength\":1,\"maxLength\":1089}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent[4].parameters_json, "\"additionalProperties\":false") != null);
+    const parsed_schema = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, parent[4].parameters_json, .{});
+    defer parsed_schema.deinit();
+    const model_schema = parsed_schema.value.object.get("properties").?.object.get("model").?.object;
+    const model_type = model_schema.get("type").?;
+    try std.testing.expect(model_type == .array);
+    try std.testing.expectEqual(@as(usize, 2), model_type.array.items.len);
+    try std.testing.expect(model_type.array.items[0] == .string);
+    try std.testing.expectEqualStrings("string", model_type.array.items[0].string);
+    try std.testing.expect(model_type.array.items[1] == .string);
+    try std.testing.expectEqualStrings("null", model_type.array.items[1].string);
+    const model_min = model_schema.get("minLength").?;
+    const model_max = model_schema.get("maxLength").?;
+    try std.testing.expect(model_min == .integer);
+    try std.testing.expectEqual(@as(i64, 1), model_min.integer);
+    try std.testing.expect(model_max == .integer);
+    try std.testing.expectEqual(@as(i64, 1089), model_max.integer);
     // A terminal job is collected even with wait=false, so the report must be kept.
     try std.testing.expect(std.mem.indexOf(u8, parent[5].description, "collected and released even with wait=false") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent[5].description, "bounded terminal cache") != null);
@@ -300,7 +320,15 @@ test "parent get send and cancel stay pure in prepare and pass encoded JSON thro
     const started = try executor.execute_fn(executor.context, a, start_prepared, &cancel);
     try std.testing.expectEqualStrings(payload_running, started.text);
     try std.testing.expectEqual(@as(usize, 1), fake.runs);
+    try std.testing.expect(fake.last_model == null);
     try std.testing.expect(!started.memory_evidence);
+
+    const selected = try executor.prepare_fn(executor.context, a, .{ .id = "r2", .name = "subagent", .arguments = "{\"task\":\"inspect\",\"model\":\"Provider/Org/Model-v1\"}" });
+    _ = try executor.execute_fn(executor.context, a, selected, &cancel);
+    try std.testing.expectEqualStrings("Provider/Org/Model-v1", fake.last_model.?);
+    try std.testing.expectError(error.InvalidSubagentModel, executor.prepare_fn(executor.context, a, .{ .id = "bad", .name = "subagent", .arguments = "{\"task\":\"x\",\"model\":\"bad\"}" }));
+    try std.testing.expectError(error.InvalidSubagentModel, tools.execute(a, .{ .subagent = .{ .task = "x", .model = "bad" } }, &cancel));
+    try std.testing.expectEqual(@as(usize, 2), fake.runs);
 }
 
 test "single-layer failure and cleanup results keep their flags" {
@@ -361,6 +389,57 @@ test "parent write and bash execute with an uncollected child" {
     try std.testing.expectEqual(@as(usize, 0), fake.gets);
     const got = try tools.execute(a, .{ .get_subagent_result = .{ .id = "job-1" } }, &cancel);
     try std.testing.expectEqualStrings(payload_snapshot, got.text);
+}
+
+test "subagent model references are strict and preserve maximum escaped envelope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const limits: cfg.Limits = .{};
+    const omitted = try tools_mod.parse(a, "subagent", "{\"task\":\"x\"}", limits);
+    try std.testing.expect(omitted.subagent.model == null);
+    const null_model = try tools_mod.parse(a, "subagent", "{\"task\":\"x\",\"model\":null}", limits);
+    try std.testing.expect(null_model.subagent.model == null);
+    for ([_][]const u8{
+        "{\"task\":\"x\",\"model\":true}",
+        "{\"task\":\"x\",\"model\":false}",
+        "{\"task\":\"x\",\"model\":1}",
+        "{\"task\":\"x\",\"model\":1.5}",
+        "{\"task\":\"x\",\"model\":[true]}",
+        "{\"task\":\"x\",\"model\":{}}",
+    }) |json| {
+        try std.testing.expectError(error.UnexpectedToken, tools_mod.parse(a, "subagent", json, limits));
+    }
+    try std.testing.expectError(error.InvalidSubagentModel, tools_mod.parse(a, "subagent", "{\"task\":\"x\",\"model\":[]}", limits));
+    try std.testing.expectError(error.DuplicateField, tools_mod.parse(a, "subagent", "{\"task\":\"x\",\"model\":null,\"model\":\"p/m\"}", limits));
+    try std.testing.expectError(error.UnknownField, tools_mod.parse(a, "subagent", "{\"task\":\"x\",\"unknown\":1}", limits));
+    for ([_][]const u8{ "", "p", "/m", "p/", "bad alias/m", "p/m\x00n", "p/m\n", "p/\xff" }) |model| {
+        try std.testing.expectError(error.InvalidSubagentModel, sub.validate(.{ .task = "x", .model = model }));
+    }
+    try std.testing.expectError(error.InvalidSubagentModel, tools_mod.parse(a, "subagent", "{\"task\":\"x\",\"model\":\"p/m\\u0000\"}", limits));
+    try std.testing.expectError(error.InvalidSubagentModel, tools_mod.parse(a, "subagent", "{\"task\":\"x\",\"model\":\"\"}", limits));
+    const provider: [65]u8 = @splat('a');
+    const raw: [1025]u8 = @splat('m');
+    const over_provider = try std.fmt.allocPrint(a, "{s}/m", .{&provider});
+    const over_raw = try std.fmt.allocPrint(a, "p/{s}", .{&raw});
+    const over_all = try std.fmt.allocPrint(a, "{s}/{s}", .{ &provider, raw[0..1024] });
+    for ([_][]const u8{ over_provider, over_raw, over_all }) |model| {
+        try std.testing.expectError(error.InvalidSubagentModel, sub.validate(.{ .task = "x", .model = model }));
+    }
+
+    const escaped_task = try a.alloc(u8, 6 * sub.max_task_bytes);
+    const escaped_context = try a.alloc(u8, 6 * sub.max_context_bytes);
+    const escaped_model = try a.alloc(u8, 6 * sub.max_model_bytes);
+    for (0..sub.max_task_bytes) |i| @memcpy(escaped_task[i * 6 ..][0..6], "\\u0074");
+    for (0..sub.max_context_bytes) |i| @memcpy(escaped_context[i * 6 ..][0..6], "\\u0063");
+    for (0..sub.max_model_bytes) |i| @memcpy(escaped_model[i * 6 ..][0..6], if (i == 64) "\\u002f" else "\\u0061");
+    const json = try std.fmt.allocPrint(a, "{{\"task\":\"{s}\",\"context\":\"{s}\",\"model\":\"{s}\"}}", .{ escaped_task, escaped_context, escaped_model });
+    const max = try tools_mod.parse(a, "subagent", json, limits);
+    try std.testing.expectEqual(@as(usize, sub.max_model_bytes), max.subagent.model.?.len);
+    const expected = try a.alloc(u8, sub.max_model_bytes);
+    @memset(expected, 'a');
+    expected[64] = '/';
+    try std.testing.expectEqualStrings(expected, max.subagent.model.?);
 }
 
 test "job control arguments stay strict bounded and utf8 checked" {

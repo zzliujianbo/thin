@@ -67,6 +67,9 @@ const bin = resolve(process.argv[2]);
 
 const KEY = 'owned-loopback-subagent-fixture-key';
 const REVIEW_KEY = 'owned-loopback-reviewer-fixture-key';
+const MIX_ENV_KEY = 'owned-mixed-env-fixture-key';
+const MIX_INLINE_KEY = 'owned-mixed-inline-fixture-key';
+const MIX_MODELS = ['response/family/model', 'anthropic/family/model', 'owned/subagent-fixture'];
 const REVIEW_MODEL = 'subagent-reviewer-fixture';
 const REVIEW_USAGE = {input: 4311, output: 919};
 const PARENT_PRIVATE = 'PARENT-PRIVATE-MARKER-9c1f';
@@ -390,11 +393,14 @@ function fireSignal(plan, key) {
 
 function validateStage(plan, stage, role, body, tools, raw, history, ctx) {
   assert.equal(body.stream, true, 'all model requests must stream');
-  assert.equal(body.model, MODEL, 'request model identity');
-  const summary = plan.protocol === 'anthropic' ? body.tool_choice?.type === 'none' : body.tool_choice === 'none';
+  assert.equal(body.model, ctx.expectedModel ?? MODEL, 'request model identity');
+  for (const key of [KEY, REVIEW_KEY, MIX_ENV_KEY, MIX_INLINE_KEY])
+    assert(!raw.includes(key), 'credential leaked into model request body');
+  const protocol = ctx.protocol;
+  const summary = protocol === 'anthropic' ? body.tool_choice?.type === 'none' : body.tool_choice === 'none';
   assert(!summary, 'this fixture never expects a summary/compaction request');
   assert(!raw.includes('Extract only durable, reusable knowledge'), 'Memory extraction request leaked into the run');
-  if (plan.protocol === 'anthropic') {
+  if (protocol === 'anthropic') {
     // Messages requires the frozen declared capability; never a retired cap.
     assert.equal(body.max_tokens, OUTPUT_TOKENS, 'Anthropic must send only the declared output capability');
     assert(!Object.hasOwn(body, 'max_output_tokens'), 'retired max_output_tokens setting was sent');
@@ -477,18 +483,25 @@ server = http.createServer(async (req, res) => {
       }
       return;
     }
-    assert.equal(req.url, endpoint[plan.protocol], 'endpoint must match the declared protocol');
-    if (plan.protocol === 'anthropic') {
-      assert.equal(req.headers['x-api-key'], KEY, 'Anthropic key header');
+    const wire = plan.mixed ? ({
+      [endpoint.chat]: {protocol: 'chat', key: KEY, model: MODEL},
+      '/v1/mixed-responses/responses': {protocol: 'responses', key: MIX_ENV_KEY, model: 'family/model'},
+      '/v1/mixed-anthropic/messages': {protocol: 'anthropic', key: MIX_INLINE_KEY, model: 'family/model'},
+    })[req.url] : {protocol: plan.protocol, key: KEY, model: MODEL};
+    assert(wire, 'unexpected mixed-model endpoint');
+    if (!plan.mixed) assert.equal(req.url, endpoint[plan.protocol], 'endpoint must match the declared protocol');
+    if (wire.protocol === 'anthropic') {
+      assert.equal(req.headers['x-api-key'], wire.key, 'Anthropic key header');
       assert.equal(req.headers['anthropic-version'], '2023-06-01', 'Anthropic version header');
       assert.equal(req.headers.authorization, undefined, 'Anthropic must not send a bearer header');
     } else {
-      assert.equal(req.headers.authorization, `Bearer ${KEY}`, 'bearer key header');
+      assert.equal(req.headers.authorization, `Bearer ${wire.key}`, 'bearer key header');
+      assert.equal(req.headers['x-api-key'], undefined, 'non-Anthropic must not send x-api-key');
     }
     const raw = await readBody(req);
     const body = JSON.parse(raw);
-    const tools = toolNames(plan.protocol, body);
-    const history = toolHistory(plan.protocol, body);
+    const tools = toolNames(wire.protocol, body);
+    const history = toolHistory(wire.protocol, body);
     // Role identity comes from the fixed tool sets, never from prompt text.
     const role = tools.includes('message_parent') ? 'child' : 'root';
     assert(role === 'child' ? !tools.includes('get_subagent_result') : true, 'ambiguous request role');
@@ -501,7 +514,7 @@ server = http.createServer(async (req, res) => {
     if (role === 'child') plan.childRequests += 1;
     assert(stage.usage, 'fixture stage must declare usage');
     const ctx = {
-      plan, stage, role, body, raw, history,
+      plan, stage, role, body, raw, history, protocol: wire.protocol, expectedModel: wire.model,
       call(name, args) {
         const id = `${role === 'root' ? 'r' : 'c'}${++plan.callSeq}`;
         (role === 'root' ? plan.parentCallIds : plan.childCallIds).push(id);
@@ -514,7 +527,7 @@ server = http.createServer(async (req, res) => {
     if (stage.hold) await waitSignal(plan, stage.hold);
     const value = typeof stage.reply === 'function' ? stage.reply(ctx) : stage.reply;
     assert(value && (value.type === 'tool' || value.type === 'text'), 'fixture reply shape');
-    sendReplies(plan.protocol, res, value, stage.usage);
+    sendReplies(wire.protocol, res, value, stage.usage);
   } catch {
     fixtureFailed = true;
     releaseToolBarrier(active, false);
@@ -575,6 +588,16 @@ async function run(plan) {
     }}},
     limits: {low_price_input: false, safety_tokens: 100, request_timeout_ms: 10000, task_timeout_ms: 25000},
   };
+  if (plan.mixed) {
+    declaration.llm.providers.response = {
+      base_url: `${url}/mixed-responses`, api_key_env: 'THIN_MIXED_FIXTURE_KEY',
+      models: {'family/model': {protocol: 'responses', context_tokens: 32768, output_tokens: OUTPUT_TOKENS}},
+    };
+    declaration.llm.providers.anthropic = {
+      base_url: `${url}/mixed-anthropic`, api_key: MIX_INLINE_KEY,
+      models: {'family/model': {protocol: 'anthropic', context_tokens: 32768, output_tokens: OUTPUT_TOKENS}},
+    };
+  }
   if (plan.decisionMode) {
     declaration.llm.providers.reviewer = {
       base_url: `${url}/reviewer`, api_key: REVIEW_KEY,
@@ -602,7 +625,8 @@ async function run(plan) {
   const args = ['--print', PARENT_PROMPT, '--no-model-auto-refresh'];
   const child = spawn(bin, args, {
     cwd: project,
-    env: {PATH: '/usr/bin:/bin', HOME: home, LANG: 'C.UTF-8', TERM: 'xterm-256color'},
+    env: {PATH: '/usr/bin:/bin', HOME: home, LANG: 'C.UTF-8', TERM: 'xterm-256color',
+      ...(plan.mixed ? {THIN_MIXED_FIXTURE_KEY: MIX_ENV_KEY} : {})},
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -657,6 +681,8 @@ async function run(plan) {
     const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8');
     assert(!stdout.includes(KEY) && !stderr.includes(KEY), 'credential leaked to local output');
     assert(!stdout.includes(REVIEW_KEY) && !stderr.includes(REVIEW_KEY), 'reviewer credential leaked to local output');
+    for (const key of [MIX_ENV_KEY, MIX_INLINE_KEY])
+      assert(!stdout.includes(key) && !stderr.includes(key), 'mixed credential leaked to local output');
     assert(!stdout.includes('\x1b'), 'headless output carried terminal escapes');
     assert.equal(plan.seq.root, plan.stages.root.length, 'root model request count/choreography');
     assert.equal(plan.seq.child, plan.stages.child.length, 'child model request count/choreography');
@@ -1203,6 +1229,69 @@ function assertParallelComplete(plan, ctx) {
     'children must be collected in the declared non-start order');
 }
 
+function mixedModelCase() {
+  const plan = makePlan({name: 'chat-subagent-mixed-model', protocol: 'chat', childTask: CHILD_TASK, mixed: true});
+  const ids = [], entered = new Set(), collected = new Set();
+  const task = i => `${CHILD_TASK} mixed-index-${i}`;
+  const report = i => `mixed child report ${i}`;
+  const barrier = 'mixed-three-arrived';
+  const usage = {input: 140, output: 18};
+  for (let i = 0; i < 3; i++) {
+    plan.stages.root.push({usage: {input: 50 + i, output: 8}, check: ctx => {
+      if (i) ids.push(startResult(ctx.history).id);
+    }, reply: ctx => ctx.call('subagent', i < 2 ? {task: task(i), model: MIX_MODELS[i]} : {task: task(i)})});
+  }
+  plan.stages.root.push({usage: {input: 60, output: 8}, hold: barrier, check: ctx => {
+    ids.push(startResult(ctx.history).id);
+    assert.equal(new Set(ids).size, 3, 'mixed starts have distinct ids');
+  }, reply: ctx => ctx.call('get_subagent_result', {id: ids[0], wait: true})});
+  for (let i = 0; i < 3; i++) {
+    plan.stages.root.push({usage: {input: 70 + i, output: 10}, check: ctx => {
+      const snap = getResult(ctx.history);
+      assert.equal(snap.id, ids[i]);
+      assert.equal(snap.status, 'success');
+      assert.equal(snap.report, report(i));
+      assert.equal(snap.truncated, false);
+      assert.equal(snap.usage.normal_calls, 1);
+      assert.equal(snap.usage.summary_calls, 0);
+      for (const key of [KEY, MIX_ENV_KEY, MIX_INLINE_KEY])
+        assert(!JSON.stringify(ctx.history).includes(key), 'credential leaked into canonical history');
+      collected.add(i);
+      if (i === 2) {
+        const starts = parallelCallArgs(ctx.history, 'subagent');
+        assert.deepEqual(starts.map(x => x.task), [task(0), task(1), task(2)]);
+        assert.deepEqual(starts.map(x => x.model), [MIX_MODELS[0], MIX_MODELS[1], undefined]);
+        assert.equal(parallelCallArgs(ctx.history, 'get_subagent_result').length, 3);
+      }
+    }, reply: ctx => i === 2 ? ctx.text(ROOT_ANSWER) : ctx.call('get_subagent_result', {id: ids[i + 1], wait: true})});
+  }
+  for (let slot = 0; slot < 3; slot++) {
+    plan.stages.child.push({usage, expectedCalls: [], hold: barrier, check: ctx => {
+      const matches = [0, 1, 2].filter(i => userTexts(ctx.protocol, ctx.body).some(text => text.includes(task(i))));
+      assert.equal(matches.length, 1, 'mixed child task identity');
+      const i = matches[0];
+      assert.equal(ctx.protocol, ['responses', 'anthropic', 'chat'][i], 'mixed target protocol');
+      assert.equal(ctx.expectedModel, i === 2 ? MODEL : 'family/model');
+      assert(!entered.has(i), 'mixed child arrived twice');
+      entered.add(i);
+      if (entered.size === 3) fireSignal(plan, barrier);
+    }, reply: ctx => {
+      const i = [0, 1, 2].find(index => userTexts(ctx.protocol, ctx.body).some(text => text.includes(task(index))));
+      return ctx.text(report(i));
+    }});
+  }
+  plan.verify = async ({code, out, project}) => {
+    assert.equal(code, 0, 'mixed-model task must succeed');
+    assert(out.includes(ROOT_ANSWER));
+    assert.equal(entered.size, 3);
+    assert.equal(collected.size, 3);
+    assert.equal(plan.roleRequests.root, 7);
+    assert.equal(plan.roleRequests.child, 3);
+    await assertParentArchive(project);
+  };
+  return plan;
+}
+
 function parallelCase() {
   const plan = makePlan({
     name: 'chat-subagent-parallel', protocol: 'chat', childTask: CHILD_TASK,
@@ -1452,6 +1541,7 @@ try {
     directCase('anthropic-subagent-direct', 'anthropic'),
     childApprovalDenialCase(),
     parallelCase(),
+    mixedModelCase(),
     toolParallelCase(),
     decisionCase('on'), decisionCase('fail'), decisionCase('off'),
     decisionParallelCase(),
@@ -1479,6 +1569,8 @@ try {
     parallelChildrenHeldOnOneArrivalBarrier: true,
     parallelChildrenCollectedInNonStartOrder: PARALLEL_ORDER,
     parallelChildrenCollectedExactlyOnce: true,
+    mixedModelThreeRealRequestsBarrier: true,
+    mixedModelIndependentCredentialsAndInheritedParent: true,
     foreignIdsRejectedForGetSendCancel: true,
     childFreshContext: true,
     childToolLoop: true,

@@ -918,6 +918,170 @@ test "beforeFinish returns bounded host hints whenever a job is uncollected" {
     try std.testing.expect((try service.beforeFinish(fix.a, &fix.parent_cancel)) == null);
 }
 
+// These declarations are entirely owned and never contacted. The custom target
+// has no catalog price metadata, while the parent gets a synthetic known price.
+const app_selection_fixture =
+    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://127.0.0.1:1/v1","api_key":"fake-parent","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"target":{"base_url":"http://127.0.0.1:2/v1","api_key_env":"TARGET_KEY","models":{"family/raw":{"protocol":"responses","context_tokens":32768}}},"inline":{"base_url":"http://127.0.0.1:3/v1","api_key":"fake-inline","models":{"m":{"protocol":"anthropic","context_tokens":49152,"output_tokens":1024}}},"missing":{"base_url":"http://127.0.0.1:4/v1","api_key_env":"MISSING_TARGET_KEY","models":{"m":{"protocol":"chat","context_tokens":32768}}},"bad":{"base_url":"http://127.0.0.1:5/v1","api_key":"fake-bad","models":{"window":{"protocol":"chat"},"judge":{"protocol":"systemone"}}},"codex":{"base_url":"https://chatgpt.com/backend-api/codex","kind":"openai_codex","codex_oauth":{"access_token":"fake-access","refresh_token":"fake-refresh","expires_at_ms":123456789},"models":{"gpt-fixture":{"protocol":"responses","context_tokens":32768}}}}},"memory":{"auto":false},"proxy":{"address":"127.0.0.1","port":34567,"models":["target/family/raw"]}}
+;
+
+fn selectionApp(fix: *Fixture) !*@import("../app/app.zig").App {
+    const a = fix.a;
+    try fix.env.put("HOME", fix.root.path);
+    try fix.env.put("TARGET_KEY", "fake-target-old");
+    var parsed = try cfg.parse(a, app_selection_fixture);
+    var consumed = false;
+    errdefer if (!consumed) cfg.release(&parsed);
+    const cache = try a.create(@import("../app/model_metadata.zig").Cache);
+    defer a.destroy(cache);
+    cache.* = .{};
+    try @import("../app/model_resolver.zig").applyDefault(parsed.arena.allocator(), &parsed.value, cache);
+    parsed.value.model.input_price_threshold = 20000;
+    parsed.value.model.input_price_flat_limit = 50000;
+    // initConfigured consumes parsed on success and failure.
+    consumed = true;
+    return @import("../app/app.zig").App.initConfiguredAnchoredAuth(a, fix.io, &fix.env, &fix.root, "/owned/unused-auth", .{}, parsed);
+}
+
+fn selectedClient(app: *@import("../app/app.zig").App, parsed: *std.json.Parsed(cfg.Config), reference: []const u8, cancel: *const p.Cancellation) !http.Client {
+    const factory = app.subagent.deps.client_factory.?;
+    return factory.prepare_fn(factory.context, std.testing.allocator, parsed, reference, cancel);
+}
+
+fn expectSelectedKey(app: *@import("../app/app.zig").App, expected: []const u8) !void {
+    var parsed = try cfg.clone(std.testing.allocator, app.config.value);
+    defer cfg.release(&parsed);
+    var cancel: p.Cancellation = .{};
+    var client = try selectedClient(app, &parsed, "target/family/raw", &cancel);
+    defer client.deinit();
+    try std.testing.expectEqualStrings(expected, client.authorization);
+}
+
+test "App child factory resolves independent target credentials protocols and proxy" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    defer fix.deinit();
+    const app = try selectionApp(fix);
+    defer app.deinit();
+    try std.testing.expect(app.environment.get("TARGET_KEY") == null);
+    try fix.env.put("TARGET_KEY", "fake-mutated-source");
+    fix.env.deinit();
+    fix.env = std.process.Environ.Map.init(a);
+    var cancel: p.Cancellation = .{};
+    var target = try cfg.clone(a, app.config.value);
+    defer cfg.release(&target);
+    var client = try selectedClient(app, &target, "target/family/raw", &cancel);
+    defer client.deinit();
+    try std.testing.expectEqualStrings("target", target.value.selected_provider.?);
+    try std.testing.expectEqualStrings("family/raw", target.value.model.name);
+    try std.testing.expectEqual(p.Protocol.responses, target.value.model.protocol);
+    try std.testing.expectEqual(@as(u32, 32768), target.value.model.context_tokens);
+    try std.testing.expectEqualStrings("Bearer fake-target-old", client.authorization);
+    try std.testing.expect(client.proxy_http != null);
+    try std.testing.expect(target.value.model.input_price_threshold == null);
+    try std.testing.expect(target.value.model.input_price_flat_limit == null);
+    try std.testing.expect(target.value.model.reasoning == null);
+    try std.testing.expect(target.value.model.reasoning_effort == null);
+    try std.testing.expect(target.value.limits.low_price_input);
+    var inline_config = try cfg.clone(a, app.config.value);
+    defer cfg.release(&inline_config);
+    var inline_client = try selectedClient(app, &inline_config, "inline/m", &cancel);
+    defer inline_client.deinit();
+    try std.testing.expectEqualStrings("inline", inline_config.value.selected_provider.?);
+    try std.testing.expectEqual(p.Protocol.anthropic, inline_config.value.model.protocol);
+    try std.testing.expectEqual(@as(u32, 49152), inline_config.value.model.context_tokens);
+    try std.testing.expectEqualStrings("Bearer fake-inline", inline_client.authorization);
+    try std.testing.expect(inline_client.proxy_http == null);
+    try std.testing.expectEqualStrings("main", app.config.value.selected_provider.?);
+    try std.testing.expectEqualStrings("main/chat", app.config.value.registry.?.default);
+    try std.testing.expectEqualStrings("chat", app.config.value.model.name);
+    try std.testing.expectEqual(@as(u32, 65536), app.config.value.model.context_tokens);
+    try std.testing.expectEqual(@as(?u32, 20000), app.config.value.model.input_price_threshold);
+    try std.testing.expectEqual(@as(?u32, 50000), app.config.value.model.input_price_flat_limit);
+    try std.testing.expectEqual(p.Protocol.chat, app.runtime.selector.effective());
+    try std.testing.expectEqualStrings("Bearer fake-parent", app.client.authorization);
+    try std.testing.expect(app.client.proxy_http == null and app.client.codex_source == null);
+}
+
+test "App child factory fails closed and unknown price pauses actual child runtime" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    defer fix.deinit();
+    const app = try selectionApp(fix);
+    defer app.deinit();
+    var fake: FakeModel = .{ .io = fix.io };
+    app.subagent.deps.model_factory = .{ .context = &fake, .make_fn = FakeModel.make };
+    var cancel: p.Cancellation = .{};
+    app.subagent.beginTask(&cancel);
+    defer app.subagent.service().endTask(&cancel) catch {};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const svc = app.subagent.service();
+    const cases = [_]struct { reference: []const u8, expected: anyerror }{
+        .{ .reference = "unknown/m", .expected = error.DefaultProviderUnavailable },
+        .{ .reference = "target/unknown", .expected = error.DefaultModelUnavailable },
+        .{ .reference = "missing/m", .expected = error.ApiKeyNotFound },
+        .{ .reference = "bad/judge", .expected = error.UnsupportedSubagentProtocol },
+        .{ .reference = "bad/window", .expected = error.UnknownModelContext },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case.expected, svc.run(arena.allocator(), .{ .task = "must not run", .model = case.reference }, &cancel));
+        try std.testing.expect(app.subagent.current == null and app.subagent.retained_child == null);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+    var canceled: p.Cancellation = .{};
+    canceled.cancel();
+    var child = try cfg.clone(a, app.config.value);
+    defer cfg.release(&child);
+    try std.testing.expectError(error.Canceled, selectedClient(app, &child, "target/family/raw", &canceled));
+    try std.testing.expect(app.subagent.current == null and app.subagent.retained_child == null);
+    const started = try svc.run(arena.allocator(), .{ .task = "price protection", .model = "target/family/raw" }, &cancel);
+    var receipt = try std.json.parseFromSlice(std.json.Value, a, started.text, .{});
+    defer receipt.deinit();
+    const id = receipt.value.object.get("id").?.string;
+    const result = try svc.get(arena.allocator(), .{ .id = id, .wait = true }, &cancel);
+    var terminal = try std.json.parseFromSlice(std.json.Value, a, result.text, .{});
+    defer terminal.deinit();
+    try std.testing.expectEqualStrings("paused", terminal.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("UnknownInputPriceThreshold", terminal.value.object.get("detail").?.string);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(app.subagent.retained_child == null);
+}
+
+test "App staged settings snapshot and non-Codex to Codex child source" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    defer fix.deinit();
+    const app = try selectionApp(fix);
+    defer app.deinit();
+    try fix.env.put("TARGET_KEY", "fake-discarded");
+    var discarded = try app.prepareSettings(app.config.value, &fix.env);
+    discarded.deinit();
+    try expectSelectedKey(app, "Bearer fake-target-old");
+    try fix.env.put("TARGET_KEY", "fake-target-new");
+    var replacement = try app.prepareSettings(app.config.value, &fix.env);
+    defer replacement.deinit();
+    try fix.env.put("TARGET_KEY", "fake-after-prepare");
+    try expectSelectedKey(app, "Bearer fake-target-old");
+    app.installSettings(&replacement);
+    try expectSelectedKey(app, "Bearer fake-target-new");
+    try std.testing.expect(app.environment.get("TARGET_KEY") == null);
+    try std.testing.expectEqualStrings("Bearer fake-parent", app.client.authorization);
+    var codex = try cfg.clone(a, app.config.value);
+    defer cfg.release(&codex);
+    var cancel: p.Cancellation = .{};
+    var client = try selectedClient(app, &codex, "codex/gpt-fixture", &cancel);
+    defer client.deinit();
+    try std.testing.expect(client.codex_source != null and client.authorization.len == 0);
+    try std.testing.expectEqualStrings("codex", codex.value.selected_provider.?);
+    try std.testing.expectEqual(p.Protocol.responses, codex.value.model.protocol);
+    var fake: FakeModel = .{ .io = fix.io };
+    _ = try FakeModel.make(&fake, a, &codex.value);
+    try std.testing.expectEqual(p.Protocol.responses, fake.config_protocol);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(app.client.codex_source == null);
+    try std.testing.expectEqualStrings("Bearer fake-parent", app.client.authorization);
+}
+
 test "unsupported child protocol fails the start without a child run" {
     const a = std.testing.allocator;
     const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
@@ -929,6 +1093,21 @@ test "unsupported child protocol fails the start without a child run" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     try std.testing.expectError(error.UnsupportedSubagentProtocol, fix.service.service().run(arena.allocator(), .{ .task = "no child" }, &fix.parent_cancel));
+    try std.testing.expect(fix.service.retained_child == null);
+    try std.testing.expect(!fix.active());
+}
+
+test "explicit model without client factory fails before publication" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = std.testing.io };
+    fix.withModel(&fake);
+    fix.service.beginTask(&fix.parent_cancel);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.SubagentModelSelectionUnavailable, fix.service.service().run(arena.allocator(), .{ .task = "no child", .model = "provider/raw/model" }, &fix.parent_cancel));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expect(fix.service.retained_child == null);
     try std.testing.expect(!fix.active());
 }

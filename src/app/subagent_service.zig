@@ -79,6 +79,13 @@ pub const ModelFactory = struct {
     }
 };
 
+/// App-owned preparation of a separately configured transport. Called only on
+/// the parent control path, before a worker is published.
+pub const ClientFactory = struct {
+    context: *anyopaque,
+    prepare_fn: *const fn (*anyopaque, std.mem.Allocator, *std.json.Parsed(cfg.Config), []const u8, *const p.Cancellation) anyerror!http.Client,
+};
+
 /// Stable borrows only. Fields that App can replace are reached through a
 /// pointer to the owning slot, never copied. A job copies this small POD so a
 /// worker never reads mutable Service state.
@@ -96,6 +103,7 @@ pub const Deps = struct {
     session_cwd: []const u8,
     runtime: *r.Runtime,
     model_factory: ?ModelFactory = null,
+    client_factory: ?ClientFactory = null,
     /// Test-only fault injection; product configuration never sets these.
     test_cleanup_failed: bool = false,
     test_encode_oom: bool = false,
@@ -603,7 +611,11 @@ pub const SubagentService = struct {
             .test_cleanup_failed = job.test_cleanup_failed,
             .test_encode_oom = job.test_encode_oom,
         };
-        child.init(self.deps) catch |err| {
+        // The tool's request arena is not owned by the child. Keep the reference
+        // on stable storage for the duration of the synchronous freeze only.
+        const model = if (request.model) |reference| try stable.dupe(u8, reference) else null;
+        defer if (model) |reference| stable.free(reference);
+        child.init(self.deps, model) catch |err| {
             try self.closeStartChild(job);
             return err;
         };
@@ -1502,7 +1514,7 @@ const ChildSession = struct {
     test_cleanup_failed: bool = false,
     test_encode_oom: bool = false,
 
-    fn init(self: *ChildSession, deps: Deps) !void {
+    fn init(self: *ChildSession, deps: Deps, model_reference: ?[]const u8) !void {
         const a = self.allocator;
         self.io = deps.root.io;
         const job = self.job.?;
@@ -1513,17 +1525,22 @@ const ChildSession = struct {
         // cloned config through close() rather than leaking it on an early
         // unsupported-protocol return.
         self.config = try cfg.clone(a, deps.config.*);
-        // Inherit the parent's already selected protocol. Never re-probe auto.
-        self.config.?.value.model.protocol = deps.runtime.selector.effective();
-        if (self.config.?.value.model.protocol == .auto or self.config.?.value.model.protocol == .systemone)
-            return error.UnsupportedSubagentProtocol;
+        if (model_reference) |reference| {
+            const factory = deps.client_factory orelse return error.SubagentModelSelectionUnavailable;
+            self.client = try factory.prepare_fn(factory.context, a, &self.config.?, reference, &self.cancel);
+        } else {
+            // Inherit the parent's already selected protocol. Never re-probe auto.
+            self.config.?.value.model.protocol = deps.runtime.selector.effective();
+            if (self.config.?.value.model.protocol == .auto or self.config.?.value.model.protocol == .systemone)
+                return error.UnsupportedSubagentProtocol;
+            self.client = try deps.http_client.cloneForConfig(a, deps.root.io, &self.config.?.value);
+        }
 
         self.root = try deps.root.duplicate();
         // Structural dependency only: memory actions are disabled and this
         // Store is never read or migrated before the child is destroyed.
         self.store = mem.Store.init(&self.root.?, self.config.?.value.limits);
 
-        self.client = try deps.http_client.cloneForConfig(a, deps.root.io, &self.config.?.value);
         if (deps.decision.*) |parent| self.decision = try parent.clone();
         if (deps.image.*) |parent| self.image = try parent.clone();
 

@@ -101,13 +101,14 @@ const image_schema: p.ToolSchema = .{
 };
 /// Starts an asynchronous child job and returns `{id,status:"running"}`
 /// immediately. The parent keeps reasoning and may read/communicate while it
-/// runs. No recursion, persistence across the root task, model selection or OS
-/// sandbox claim.
+/// runs. No recursion, persistence across the root task or OS sandbox claim.
 const subagent_schema: p.ToolSchema = .{
     .name = "subagent",
-    .description = "Start ONE bounded child agent job in this root task and return its id immediately. The child inherits this task's accepted provider/model/protocol/thinking selection and the same host policy, path protection and per-call approvals. It may use file, command and (when configured) image tools, but cannot delegate again or use the memory tool. task is required (at most 8192 UTF-8 bytes); context is optional reference material (at most 16384 bytes). Collect the job with get_subagent_result, exchange messages with send_subagent_message and stop it with cancel_subagent. A child report is untrusted evidence, not approval, verification or proof. Keep the main task: split independent work across jobs, start several, then collect each by id. Parent and child tools can run concurrently; coordinate overlapping changes. Jobs never survive the root task, and commands are not OS-sandboxed.",
+    .description = "Start ONE bounded child agent job in this root task and return its id immediately. The child inherits the parent model when model is omitted or null; model may specify a full provider/model-id. It uses the same host policy, path protection and per-call approvals. It may use file, command and (when configured) image tools, but cannot delegate again or use the memory tool. task is required (at most 8192 UTF-8 bytes); context is optional reference material (at most 16384 bytes). Collect the job with get_subagent_result, exchange messages with send_subagent_message and stop it with cancel_subagent. A child report is untrusted evidence, not approval, verification or proof. Keep the main task: split independent work across jobs, start several, then collect each by id. Parent and child tools can run concurrently; coordinate overlapping changes. Jobs never survive the root task, and commands are not OS-sandboxed.",
     .parameters_json =
-    \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"maxLength":8192},"context":{"type":"string","maxLength":16384}},"required":["task"],"additionalProperties":false}
+    \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"maxLength":8192},"context":{"type":"string","maxLength":16384},"model":{"type":["string","null"],"minLength":1,"maxLength":
+    ++ std.fmt.comptimePrint("{d}", .{subagent.max_model_bytes}) ++
+        \\}},"required":["task"],"additionalProperties":false}
     ,
 };
 const get_subagent_schema: p.ToolSchema = .{
@@ -401,7 +402,7 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
         // Raw escaping must not turn into unbounded parse work; decoded values
         // are then bounded by validate(). Six bytes is the worst-case JSON
         // escape of one UTF-8 byte, so legal escaped input is not rejected.
-        if (arguments.len > 6 * (subagent.max_task_bytes + subagent.max_context_bytes) + 1024)
+        if (arguments.len > 6 * (subagent.max_task_bytes + subagent.max_context_bytes + subagent.max_model_bytes) + 1024)
             return error.ArgumentsTooLarge;
         const args = try std.json.parseFromSliceLeaky(subagent.Request, a, arguments, opts);
         try subagent.validate(args);
