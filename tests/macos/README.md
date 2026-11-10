@@ -2,6 +2,8 @@
 
 这里保存 [macOS 实施方案](../../docs/macos-support.md) 的独立机制探针与平台子集回归，**不是 `thin` 已兼容 macOS 的证明**。正常产品构建仍限制 Linux；不调用真实模型 API，不启动或安装系统服务，不打开 TCP 监听。
 
+当前 macOS 目标仅为本地 CLI/TUI、`--print` 和本地会话/工具功能；SSH、常驻 daemon、launchd 不在范围内。前台必需的内部 worker/Unix IPC 仍须适配，Linux 原有 SSH/daemon 及测试不取消。
+
 ## P1a：原生文件系统回归
 
 使用 Zig 0.17.0，无需 libssh、Node 或真实凭据：
@@ -15,7 +17,7 @@ zig build test-presentation -Dplatform-tests-only=true -Doptimize=ReleaseSmall -
 
 `test-filesystem` 包含文件系统、认证、checkpoint、Memory 及相关纯模块。`src/tests/filesystem_portability_test.zig` 验证受保护名称的元数据比较、硬链接、无读权限、符号链接/FIFO/设备、目录替换、打开标志和 AGENTS/技能策略。它也进入 Linux 完整 unit 根。
 
-`platform-tests-only` 不创建产品：默认安装和 install/run 都失败，正常 macOS 产品构建也仍失败；构建边界由 `test_build_mode.py` 验证。不要把本入口的成功解释为 CLI、worker 或 SSH 已支持 macOS。
+`platform-tests-only` 不创建产品：默认安装和 install/run 都失败，正常 macOS 产品构建也仍失败；构建边界由 `test_build_mode.py` 验证。不要把本入口的成功解释为本地 CLI/worker 已完成 macOS 适配。后续本地产品须不依赖 libssh，并明确拒绝 daemon/SSH 参数；这些能力开关尚待实现。
 
 ## P0：独立机制探针
 
@@ -99,11 +101,11 @@ rm -rf "$cache"
 
 ## 尚未证明
 
-- 探针结果不代表生产 `spawn`、IPC、Runtime、TUI、SSH 或 launchd 已完成移植。
+- 探针结果不代表生产 `spawn`、前台 IPC、Runtime 或 TUI 已完成移植。SSH、常驻 daemon、launchd 已排除在 macOS 范围之外，不是待补齐的验收项。
 - `fork` 只是这里创建实验 fixture 的方式，不代表生产后端已选定多线程 fork。
 - 同 UID 的自有连接不代替跨 UID、real/effective credentials 差异及完整攻击面验证。
 - 目录替换是受控注入，不代表完整并发竞态、socket 叶节点替换、恶意 SCM 消息或资源压力已验收。
 - `LOCAL_PEERPID` 和 fd 归属仍需覆盖生产中所有转交路径；不把 audit token 宣称为冻结的连接时身份。
 - 元数据失败注入不代替真实权限/资源错误测试；探针不覆盖所有 `libproc/sysctl` 截断和进程退出竞态，也不证明生产级父进程监测已正确接入取消流程。
 - 当前机器的通过不代表 Apple Silicon 或最低 macOS 版本通过。
-- 正式合并仍须满足主方案的 P1–P4 和 Linux 回归门槛。
+- 正式合并仍须满足主方案缩减后的 P1–P4、本地模式/不支持参数负向验收，以及 Linux 原有功能回归门槛；不要求 macOS SSH/daemon 测试。

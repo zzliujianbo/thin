@@ -6,15 +6,24 @@
 - 本文件是仓库内的公开方案，`.gitignore` 仅为此文件开放例外，其余私有 docs/plans 仍保持忽略。
 - Linux 主分支行为保持不变；完成稳定性与回归验收后再合并，不在适配过程中直接修改或合并到 `main`。
 - 目标架构：macOS x86_64 和 aarch64；Zig 固定为 0.17.0。
-- 最低系统版本须由 SDK/API、libssh 依赖和目标机器验收共同确定，暂不作版本兼容承诺。
+- 最低系统版本须由 SDK/API、本地模式依赖和目标机器验收共同确定，暂不作版本兼容承诺。macOS 不以 libssh 作为依赖或版本门槛。
 - 本文是实施计划，不是产品已支持 macOS 的声明。独立探针通过不代表 `thin` 已可构建或运行。
+
+## 交付范围（按当前约定缩减）
+
+- **做**：本地前台 CLI/TUI、`--print`、工具执行、Memory、本地 checkpoint 恢复、实例生命周期内的后台任务，以及本地安装/升级/回滚。
+- **不做**：macOS SSH 入口、TCP SSH 监听、常驻 daemon、daemon 会话接入/断线续跑、launchd 或其他服务托管。这些不再是 macOS 发布或合并门槛，也不是需要补齐的“临时缺失”。
+- **保留 Linux 功能**：不删除或禁用既有 Linux SSH、daemon 及其测试；Linux 回归仍覆盖原功能。
+- **内部 worker/IPC 仍需做**：当前普通前台也启动实例自有 worker、使用本地 Unix socket 和部分 `daemon/` 下的共享代码。这不是用户级常驻 daemon，不能因取消 daemon 支持就整目录删除或跳过安全、回收与持久化边界。
+- 本地 `--resume` 等 checkpoint 恢复继续保留；不为 daemon 会话额外实现 attach/takeover。若共享的 attach 逻辑是现有前台所必需，只处理本地所需路径。
+- 本轮只是调整计划，尚未实现平台能力开关：当前 macOS 产品构建仍整体被拒绝。后续按下述构建/参数拒绝规则落实，不能把文档约定当成代码已完成。
 
 ## 不可降低的约束
 
 1. 文件访问保留 dirfd 锚定、逐级 nofollow、设备/inode 身份复核、原子发布与固定 inode 锁。
 2. IPC 必须双向校验内核身份，保留 `hello.pid == kernel peer_pid`；身份不可用时拒绝连接。
 3. 超时或取消后执行有界 TERM → KILL 清理；未确认清理不能报告成功。最终组信号前保留直接子进程的 PID 所有权。
-4. owner 退出与 TUI 断连必须区分；正常 detach 不得取消 daemon 拥有的会话。
+4. 前台 owner 退出/崩溃时必须有界回收自己的 worker 与工具子进程；后台任务只在当前实例生命周期内运行。既有 Linux daemon 的断连语义保持不变，但不要求在 macOS 实现。
 5. 凭据不进入命令行，不通过普通磁盘临时文件替代匿名 curl 输入；取消后 join 所有借用输入的任务。
 6. 会话恢复不得自动重放模型请求或工具调用。
 
@@ -34,9 +43,9 @@
 | 终端 | Linux 保留显式 glibc ABI，Darwin 使用经 canary/roundtrip 验证的 ABI；平台化 ioctl/flags/errno/locale |
 | 通知 | 非阻塞管道，写满合并通知，drain 后复查真实队列；关闭前 join 所有生产者 |
 | curl 输入 | 可取消的有界并发管道，防止大配置死锁，保留不落盘和密钥不进入 argv 的边界 |
-| 内嵌 SSH | 保留 libssh；平台化随机数、stat 时间字段、安全清零、accept、socket flags、owner 监测 |
-| 构建与安装 | Darwin 首先使用 LLVM（自有后端限制见下文），Linux 保持现有选择；验证 SDK 与 libssh，不硬编码库路径；移除 GNU 专属安装参数，保留原子替换和别名防覆盖 |
-| 服务托管 | 新增 launchd 样例；普通前台仍不隐式启动常驻服务；真实服务启停需单独授权 |
+| SSH / 常驻 daemon | 不做 macOS 后端；编译期排除监听器、SSH C 源和 daemon supervisor，保留前台需要的共享 worker/IPC；Linux 现有路径不变 |
+| 构建与安装 | Darwin 使用 LLVM（自有后端限制见下文），macOS 不编译 SSH C 源、不链接/要求 libssh；移除 GNU 专属安装参数，保留原子替换和别名防覆盖；Linux 后端和依赖不变 |
+| 服务托管 | macOS 不提供 launchd/常驻服务样例，不安装或隐式拉起服务 |
 
 最新 SDK 存在的接口不一定支持旧系统。例如 `posix_spawn_file_actions_addfchdir` 从 macOS 26 提供，而 `_np` 版本从 10.15 提供；最低版本须显式约束。
 
@@ -80,7 +89,7 @@
 - 已落地：特性分支、本文、P0 独立探针和失败清理回归；P1a 的文件系统后端、调用收口和原生测试入口。
 - 本机候选机制：IPC 身份/目录锚定、WNOWAIT、组内状态分类、owner 死亡 EOF 已通过独立验证。
 - 当前产品仍限制 Linux x86_64；新增显式 platform-only 测试模式，不提供 macOS `thin` 可执行文件。
-- 未落地：P1 的终端、进程、通知、IPC/registry 适配，以及 P2–P4。
+- 未落地：P1 的终端、进程、通知、前台必需的 IPC/registry、平台能力隔离，以及缩减范围后的 P2–P4。SSH、常驻 daemon、launchd 不再列为 macOS 待办。
 - 未证明：最低 macOS、原生 arm64、完整产品及 Linux 运行回归、生产并发/压力/异常注入门槛。
 - 下一步：继续 P1 其余平台边界；不能把文件系统子集通过当作整个 P1 或产品验收通过。
 
@@ -88,7 +97,14 @@
 
 收口文件身份、flags/errno、终端 ABI、启动/回收、通知、可执行文件定位与 IPC。平台单元测试、竞态测试通过，Linux 对应回归不退化。
 
-普通前台也使用内部 worker 与 Unix socket，不能以“不启用 daemon”为理由跳过这一层。
+只移植前台必需的内部 worker、Unix socket、发现/写租约及回收逻辑；不移植常驻 daemon supervisor。不能以“不启用 daemon”为理由跳过前台实际使用的平台层，也不在本轮擅自改成单进程架构。
+
+构建与能力隔离还须实现：
+
+- macOS 产品不编译 `ssh_keys.c` / `ssh_transport.c`，不要求 libssh 头文件或动态库；终端/入口的 SSH 引用通过编译期分派或明确的禁用实现隔离，不能为满足链接而保留实际监听/认证路径。
+- macOS 的 `--daemon`、`--connect`、`--ssh-listen` 和内部 SSH 入口应明确报告不支持；禁用功能不能静默降级到前台、打开端口、启动 worker 或发起模型请求。帮助信息应反映平台能力。
+- 内部 worker 只启用前台 owner 路径，不接受 daemon owner；本地 checkpoint 恢复仍按原先安全规则执行。
+- Linux 产品仍编译并运行原 SSH/daemon 路径，不通过全局删除模块或改为一律禁用来实现 macOS 范围缩减。
 
 #### P1a：文件系统（已实现，待完整平台回归）
 
@@ -122,18 +138,22 @@ zig build test-presentation -Dplatform-tests-only=true --summary all
 
 ### P2：本地产品闭环
 
-完成 `--print`、TUI、工具、Memory、恢复、后台任务以及手动 daemon/attach。通过本机隔离 HTTP/TLS/代理和真实 PTY 验收，验证取消、恢复、权限和输出背压。
+完成本地 `--print`、前台 TUI、工具、Memory、本地恢复及当前实例内的后台任务。通过本机隔离 HTTP/TLS/代理和真实 PTY 验收，验证取消、恢复、权限、输出背压与前台退出后的资源回收。
 
-### P3：SSH 与部署
+不要求 macOS daemon/SSH 接入、脱离前台后的常驻任务或远程重连；增加不支持参数的负向验收，证明拒绝时没有监听、服务/worker 启动或模型请求等副作用。
 
-完成 libssh C 边界、安装脚本和 launchd 样例。适配期间可临时提供构建期 SSH 开关，但禁用时必须拒绝相关参数；不得以缺少 SSH 的产物宣称全功能兼容。
+### P3：本地安装与发布准备（范围已调整）
+
+原 P3 的 macOS SSH、常驻 daemon 和 launchd 工作取消，不再是未完成项或合并条件。
+
+仅保留本地安装脚本的 BSD 兼容、架构/依赖说明、升级与回滚；不安装或启用后台服务。发布的 macOS 本地版不依赖 libssh，需检查产物动态库依赖。只声明本地模式兼容，不声明 SSH/daemon 能力；Linux 相关部署样例保持原状。
 
 ### P4：发布与合并
 
-- Linux x86_64、macOS x86_64、macOS aarch64 均原生执行对应 Debug 与 ReleaseSmall 回归。
+- Linux x86_64 原有功能（含 SSH/daemon）继续回归；macOS x86_64、macOS aarch64 原生执行本地模式对应的 Debug 与 ReleaseSmall 回归，不要求 macOS SSH/daemon 验收。
 - Linux 专属 seccomp/capabilities 探针保留，明确说明 macOS 的不同覆盖，不以移除平台检查代替验收。
 - 覆盖退出、超时、忽略 TERM、组长先退出、owner 异常死亡、目录替换、硬链接/FIFO、防护文件、会话锁、IPC 身份和凭据输入。
-- 覆盖终端恢复、中文显示、尺寸变化、粘贴、背压、TLS 与 SSH 断线重连。
+- macOS 覆盖终端恢复、中文显示、尺寸变化、粘贴、背压、HTTP/TLS/代理、本地恢复及前台退出清理；覆盖不支持模式的明确拒绝和无副作用，不要求 SSH 断线重连或服务常驻。
 - 对最低系统版本、两种架构、动态库依赖、安装/升级/回滚给出明确证据与说明。
 - 清理不确定、身份校验缺失、数据损坏、终端状态未恢复等阻断问题未关闭时不合并。
 - 合并前检查完整分支 diff；不自动 push、发布或合并到 `main`。
