@@ -16,6 +16,24 @@ fn openFile(parent: c_int, name: [*:0]const u8) !c_int {
     return fd;
 }
 
+test "Darwin Root accepts verified system aliases without following user links" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    for ([_][]const u8{ "/tmp", "/var" }) |alias| {
+        var root = try fs.Root.open(t.allocator, t.io, alias);
+        defer root.deinit();
+        try t.expect(std.mem.startsWith(u8, root.path, "/private/"));
+    }
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(t.io, "real", .default_dir);
+    try t.expectEqual(@as(c_int, 0), std.c.symlinkat("real", tmp.dir.handle, "user-link"));
+    var buffer: [4096]u8 = undefined;
+    const base = buffer[0..try tmp.dir.realPath(t.io, &buffer)];
+    const linked = try std.fs.path.join(t.allocator, &.{ base, "user-link" });
+    defer t.allocator.free(linked);
+    try t.expectError(error.NotDir, fs.Root.open(t.allocator, t.io, linked));
+}
+
 test "filesystem target flags retain nonblocking cloexec and exclusive creation" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();

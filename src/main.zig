@@ -12,6 +12,7 @@ const task = @import("core/task.zig");
 const daemon = @import("daemon/entry.zig");
 const ssh = @import("daemon/ssh.zig");
 const text = @import("ui/text.zig");
+const capabilities = @import("platform/capabilities.zig");
 
 /// 进程入口：返回值即退出码。出错时打印错误信息并返回 1；被信号中断时返回 128 + 信号号。
 pub fn main(init: std.process.Init) u8 {
@@ -19,6 +20,10 @@ pub fn main(init: std.process.Init) u8 {
         // The output itself may be backpressured. Do not try to report an
         // interrupt by writing another message to the same blocked terminal.
         if (err == error.Canceled and interrupt.signal() != 0) return 128 + interrupt.signal();
+        if (err == error.UnsupportedPlatformMode) {
+            output(init.io, .stderr(), "thin: macOS supports local foreground, --print and checkpoint restoration only; SSH, daemon, connect and attach modes are unsupported.\n") catch {};
+            return 2;
+        }
         var buffer: [512]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, "thin: {s}\nCheck ~/.thin/config.json, the configured key source, or --help. For first-time setup, run thin interactively and use /login.\n", .{@errorName(err)}) catch "thin: application error\n";
         output(init.io, .stderr(), message) catch {};
@@ -91,7 +96,9 @@ pub fn reportLogFailure(io: std.Io, app: *App) void {
 /// 主流程：解析参数，处理 --help/--version；--print 在本文件完成，其余模式交给 daemon 入口。
 fn run(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    try capabilities.validateArgs(args);
     const options = try cli.parse(args);
+    try capabilities.validate(options);
     if (options.help) {
         try output(init.io, .stdout(), cli.help);
         return 0;
@@ -101,8 +108,14 @@ fn run(init: std.process.Init) !u8 {
         return 0;
     }
 
-    if (options.ssh_owner) |owner| try ssh.initializeConnection(init.gpa, init.environ_map, owner);
-    defer if (options.ssh_owner != null) ssh.close();
+    if (comptime capabilities.ssh) {
+        if (options.ssh_owner) |owner| try ssh.initializeConnection(init.gpa, init.environ_map, owner);
+    }
+    defer {
+        if (comptime capabilities.ssh) {
+            if (options.ssh_owner != null) ssh.close();
+        }
+    }
 
     // 只有前台/connect/attach 需要真正的终端；daemon 与内部 worker 必须能在无 TTY 下运行。
     // 管道或重定向场景仍必须使用 --print。
@@ -234,7 +247,9 @@ fn run(init: std.process.Init) !u8 {
     // 所有交互/守护/连接/attach/worker 分支统一交给 daemon 入口；
     // --print 分支已在上方完整处理，行为未变。前台默认不自动拉起守护服务。
     const code = try daemon.run(init, options);
-    if (options.ssh_owner != null) try ssh.finish(code);
+    if (comptime capabilities.ssh) {
+        if (options.ssh_owner != null) try ssh.finish(code);
+    }
     return code;
 }
 

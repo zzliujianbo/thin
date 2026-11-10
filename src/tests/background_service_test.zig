@@ -166,6 +166,14 @@ fn waitLogContains(f: *Fixture, a: std.mem.Allocator, id: []const u8, marker: []
 }
 
 fn expectProcessGone(pid: u64) !void {
+    if (@import("builtin").os.tag == .macos) {
+        if (pid <= 1 or pid > std.math.maxInt(std.c.pid_t)) return error.InvalidOwnedPid;
+        // Signal 0 delivers no signal. A reused PID or uncertain permission is
+        // conservatively still present; never TERM/KILL a reaped cached PID.
+        const rc = std.c.kill(@intCast(pid), @fromBackingInt(0));
+        if (rc == 0 or std.c.errno(rc) != .SRCH) return error.OwnedProcessStillExists;
+        return;
+    }
     var buffer: [64]u8 = undefined;
     const path = try std.fmt.bufPrint(&buffer, "/proc/{d}", .{pid});
     if (std.Io.Dir.openFileAbsolute(std.testing.io, path, .{})) |file| {

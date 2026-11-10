@@ -41,6 +41,37 @@ pub fn osError() anyerror {
     return mapError(errno());
 }
 
+/// Resolve ONLY Darwin's root-owned /tmp and /var aliases before a nofollow
+/// directory walk. Never realpath arbitrary HOME/project paths or user links.
+/// Returned bytes are owned. Keep this below the filesystem/metadata layers
+/// so both Root.open and IPC use the same policy without an import cycle.
+pub fn systemPath(a: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len == 0 or path.len > 4096 or path[0] != '/' or
+        std.mem.findScalar(u8, path, 0) != null) return error.InvalidPath;
+    var parts = std.mem.tokenizeScalar(u8, path, '/');
+    while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return error.InvalidPath;
+    if (builtin.os.tag == .macos) {
+        inline for (.{ "tmp", "var" }) |leaf| {
+            const alias = "/" ++ leaf;
+            if (std.mem.eql(u8, path, alias) or std.mem.startsWith(u8, path, alias ++ "/")) {
+                var st: std.c.Stat = undefined;
+                if (std.c.fstatat(std.c.AT.FDCWD, alias, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return osError();
+                if (st.mode & std.c.S.IFMT == std.c.S.IFLNK) {
+                    if (st.uid != 0) return error.SymlinkNotAllowed;
+                    var target: [64]u8 = undefined;
+                    const n = std.c.readlink(alias, &target, target.len);
+                    if (n < 0) return osError();
+                    const actual = target[0..@intCast(n)];
+                    if (!std.mem.eql(u8, actual, "private/" ++ leaf) and
+                        !std.mem.eql(u8, actual, "/private/" ++ leaf)) return error.SymlinkNotAllowed;
+                    return std.fmt.allocPrint(a, "/private{s}", .{path});
+                }
+            }
+        }
+    }
+    return a.dupe(u8, path);
+}
+
 /// Device encoding is backend-local, never serialized or compared across OSes.
 pub const Identity = struct {
     device: u64,

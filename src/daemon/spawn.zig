@@ -11,7 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
-const linux = std.os.linux;
+const metadata = @import("../platform/metadata.zig");
 
 const fs = @import("../platform/filesystem.zig");
 const platform_process = @import("../platform/process.zig");
@@ -59,6 +59,11 @@ const Worker = struct {
     /// the launcher's real pid for the worker's parent-death handshake. Wiped
     /// and released with this worker.
     env: std.process.Environ.Map,
+    /// Darwin-only private lifetime pipe. Only this parent record owns the
+    /// writer; CLOEXEC_DEFAULT excludes it from every spawned child. Keep the
+    /// borrowed reader open until the asynchronous process future is joined.
+    lifetime_read: c.fd_t = -1,
+    lifetime_write: c.fd_t = -1,
     cancel: p.Cancellation = .{},
     /// 0 pending, 1 launched, 2 failed (process.LaunchNotice).
     launch: std.atomic.Value(u8) = .init(0),
@@ -183,15 +188,28 @@ pub const Workers = struct {
             a.free(script);
         };
 
-        // Independent environment for this child. THIN_WORKER_OWNER_PID is the
-        // real pid of the Thin launcher (never the bash wrapper pid), which the
-        // worker checks before and after installing PDEATHSIG.
+        // Dedicated lifecycle channel, never a TUI/control socket. Local
+        // errdefers own both ends until the Worker handoff, including any
+        // allocation/environment failure before the asynchronous spawn starts.
+        const lifetime = if (builtin.os.tag == .macos) try lifetimePipe() else [2]c.fd_t{ -1, -1 };
+        errdefer if (!handed_off) {
+            if (lifetime[0] >= 0) fs.closeFd(lifetime[0]);
+            if (lifetime[1] >= 0) fs.closeFd(lifetime[1]);
+        };
+
+        // Child-only numbers, not credentials. The real launcher pid (never
+        // the bash wrapper pid) is checked against the worker's actual ppid.
         var env = try cloneEnvironment(a, self.environ);
         errdefer if (!handed_off) deinitEnvironmentWiped(&env);
         {
             var pid_buf: [16]u8 = undefined;
-            const pid_text = try std.fmt.bufPrint(&pid_buf, "{d}", .{std.os.linux.getpid()});
+            const pid_text = try std.fmt.bufPrint(&pid_buf, "{d}", .{c.getpid()});
             try env.put("THIN_WORKER_OWNER_PID", pid_text);
+            if (builtin.os.tag == .macos) {
+                var fd_buf: [16]u8 = undefined;
+                const fd_text = try std.fmt.bufPrint(&fd_buf, "{d}", .{lifetime[0]});
+                try env.put("THIN_WORKER_OWNER_FD", fd_text);
+            }
         }
 
         const worker = try a.create(Worker);
@@ -205,9 +223,11 @@ pub const Workers = struct {
             .instance = instance,
             .script = script,
             .env = env,
+            .lifetime_read = lifetime[0],
+            .lifetime_write = lifetime[1],
         };
-        // Handoff point: from here the Worker is the sole owner of all four
-        // resources, including on every error path below.
+        // Handoff point: Worker owns all resources, including both pipe ends,
+        // on every success/failure path from here.
         handed_off = true;
         worker.future = std.Io.concurrent(io, workerMain, .{worker}) catch |err| {
             self.destroyWorker(worker);
@@ -379,6 +399,9 @@ pub const Workers = struct {
         worker.future = null;
         const out = future.await(self.io);
         worker.outcome = out;
+        // run/spawn no longer borrows the reader. This is also the single
+        // normal release point for the parent-only lifetime writer.
+        closeLifetime(worker);
         return out;
     }
 
@@ -545,14 +568,15 @@ pub const Workers = struct {
     fn removeEndpoint(self: *Workers, worker: *Worker) void {
         var buf: [64]u8 = undefined;
         const name_z = std.fmt.bufPrintSentinel(&buf, "{s}.sock", .{worker.instance[0..]}, 0) catch return;
-        var st: linux.Statx = undefined;
-        if (c.statx(self.workers_fd, name_z.ptr, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &st) != 0) return;
-        if (st.mode & linux.S.IFMT != linux.S.IFSOCK) return;
+        const st = metadata.statAt(self.workers_fd, name_z.ptr, true) catch return;
+        if (st.mode & c.S.IFMT != c.S.IFSOCK) return;
         if (st.uid != self.uid) return;
         _ = c.unlinkat(self.workers_fd, name_z.ptr, 0);
     }
 
     fn destroyWorker(self: *Workers, worker: *Worker) void {
+        std.debug.assert(worker.future == null);
+        closeLifetime(worker); // also covers failure to start the future
         const a = self.allocator;
         wipe(worker.script);
         a.free(worker.script);
@@ -689,7 +713,11 @@ fn replyLimit(value: std.json.Value) ?u64 {
 }
 
 fn workerMain(worker: *Worker) Outcome {
+    const inherited = [_]c.fd_t{worker.lifetime_read};
     const options: platform_process.Options = .{
+        // Only the reader is whitelisted by Darwin addinherit_np. Never clear
+        // CLOEXEC in the multithreaded parent or pass the writer to spawn.
+        .inherited_fds = if (builtin.os.tag == .macos) &inherited else &.{},
         // A persistent session has no command deadline; cancellation still
         // performs the bounded TERM->KILL group cleanup and reap.
         .timeout_ms = null,
@@ -738,6 +766,7 @@ fn launchNotify(context: *anyopaque, notice: platform_process.LaunchNotice) void
 }
 
 fn validateParams(params: Params) !void {
+    if (builtin.os.tag == .macos and params.owner == .daemon) return error.UnsupportedPlatform;
     if (params.project.len == 0 or params.project.len > 4096) return error.InvalidArguments;
     if (std.mem.findScalar(u8, params.project, 0) != null) return error.InvalidArguments;
     if (params.@"resume" != null and params.restore_selection != null) return error.InvalidArguments;
@@ -752,10 +781,58 @@ fn randomInstance(io: std.Io, out: *[16]u8) !void {
 }
 
 fn selfExecutable(a: std.mem.Allocator) ![]u8 {
+    if (builtin.os.tag == .macos) {
+        // dyld may return a relative path or symlink. Resolve it before the
+        // spawned worker changes cwd to its project. Retry with dyld's size
+        // rather than assuming the executable path fits PATH_MAX.
+        var size: u32 = 1;
+        var first: [1]u8 = undefined;
+        if (c._NSGetExecutablePath(&first, &size) == 0) return error.InvalidPath;
+        if (size == 0) return error.InvalidPath;
+        const path = try a.alloc(u8, size);
+        defer a.free(path);
+        if (c._NSGetExecutablePath(path.ptr, &size) != 0) return error.NameTooLong;
+        const end = std.mem.indexOfScalar(u8, path, 0) orelse return error.InvalidPath;
+        const path_z = path[0..end :0];
+        var resolved: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const real = c.realpath(path_z.ptr, &resolved) orelse return fs.osError();
+        return a.dupe(u8, std.mem.span(real));
+    }
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const rc = c.readlink("/proc/self/exe", &buf, buf.len);
     if (rc < 0) return fs.osError();
     return a.dupe(u8, buf[0..@intCast(rc)]);
+}
+
+/// pipe()+fcntl() is safe here only because Darwin spawn closes everything
+/// except its explicit whitelist (CLOEXEC_DEFAULT), even during this window.
+fn lifetimePipe() ![2]c.fd_t {
+    var fds: [2]c.fd_t = undefined;
+    if (c.pipe(&fds) < 0) return fs.osError();
+    errdefer for (fds) |fd| fs.closeFd(fd);
+    for (&fds) |*slot| {
+        if (slot.* <= 2) {
+            const moved = c.fcntl(slot.*, c.F.DUPFD_CLOEXEC, @as(c_int, 3));
+            if (moved < 0) return fs.osError();
+            fs.closeFd(slot.*);
+            slot.* = moved;
+        }
+        const fd = slot.*;
+        const descriptor_flags = c.fcntl(fd, c.F.GETFD);
+        if (descriptor_flags < 0 or c.fcntl(fd, c.F.SETFD, descriptor_flags | c.FD_CLOEXEC) < 0)
+            return fs.osError();
+        const flags = c.fcntl(fd, c.F.GETFL);
+        if (flags < 0 or c.fcntl(fd, c.F.SETFL, flags | @as(c_int, @bitCast(c.O{ .NONBLOCK = true }))) < 0)
+            return fs.osError();
+    }
+    return fds;
+}
+
+fn closeLifetime(worker: *Worker) void {
+    if (worker.lifetime_write >= 0) fs.closeFd(worker.lifetime_write);
+    if (worker.lifetime_read >= 0) fs.closeFd(worker.lifetime_read);
+    worker.lifetime_write = -1;
+    worker.lifetime_read = -1;
 }
 
 /// Build the exact `exec` script. Sessions IDs are lowercase hex and owner tags
@@ -896,15 +973,35 @@ test "worker params reject conflicting resume and selection modes" {
     const id: ids.Id = "0123456789abcdef0123456789abcdef".*;
     try testing.expectError(error.InvalidArguments, validateParams(.{
         .project = "/tmp/project",
-        .owner = .daemon,
+        .owner = .foreground,
         .@"resume" = id,
         .restore_selection = id,
     }));
     try testing.expectError(error.InvalidArguments, validateParams(.{
         .project = "",
-        .owner = .daemon,
+        .owner = .foreground,
     }));
     try validateParams(.{ .project = "/tmp/project", .owner = .foreground });
+}
+
+test "Darwin workers reject daemon ownership" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    try testing.expectError(error.UnsupportedPlatform, validateParams(.{ .project = "/tmp/project", .owner = .daemon }));
+}
+
+test "Darwin lifetime pipe owns distinct nonblocking CLOEXEC ends" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const fds = try lifetimePipe();
+    defer for (fds) |fd| fs.closeFd(fd);
+    try testing.expect(fds[0] != fds[1]);
+    for (fds) |fd| {
+        const descriptor_flags = c.fcntl(fd, c.F.GETFD);
+        try testing.expect(descriptor_flags >= 0 and descriptor_flags & c.FD_CLOEXEC != 0);
+        const flags = c.fcntl(fd, c.F.GETFL);
+        try testing.expect(flags >= 0);
+        const status: c.O = @bitCast(@as(u32, @intCast(flags)));
+        try testing.expect(status.NONBLOCK);
+    }
 }
 
 test "cleanup grace covers the reported worker budget and never kills early" {
@@ -1019,8 +1116,7 @@ test "workers runtime directory is private and endpoints use only owner instance
     var workers = try Workers.init(a, testing.io, &env);
     defer workers.deinit();
 
-    var st: linux.Statx = undefined;
-    try testing.expectEqual(@as(c_int, 0), c.statx(workers.workers_fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &st));
+    const st = try metadata.statFd(workers.workers_fd);
     try testing.expectEqual(@as(u16, 0o700), @as(u16, @intCast(st.mode & 0o777)));
     try testing.expect(std.mem.endsWith(u8, workers.base_path, "/workers"));
 
@@ -1053,7 +1149,7 @@ test "workers create rejects a missing project without leaving a child" {
     defer workers.deinit();
     try testing.expectError(error.FileNotFound, workers.create(.{
         .project = "/definitely/missing/project",
-        .owner = .daemon,
+        .owner = .foreground,
     }));
     try testing.expectEqual(@as(usize, 0), workers.list.items.len);
 }

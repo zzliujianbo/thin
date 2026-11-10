@@ -3710,6 +3710,23 @@ fn writeErr(io: std.Io, bytes: []const u8) void {
 
 const testing = std.testing;
 
+/// Preserve the fixtures' blocking sockets; production pairs are nonblocking.
+/// Connection.init only takes ownership, so raw Darwin pairs need SIGPIPE safety.
+fn testSocketPair(fds: *[2]std.c.fd_t) c_int {
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, fds) != 0) return -1;
+    if (@import("builtin").os.tag == .macos) {
+        const enabled: c_int = 1;
+        for (fds.*) |fd| {
+            if (std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.NOSIGPIPE, &enabled, @sizeOf(c_int)) != 0) {
+                _ = std.c.close(fds[0]);
+                _ = std.c.close(fds[1]);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 const Pair = struct {
     client: *Client,
     server: unix.Connection,
@@ -3752,7 +3769,7 @@ fn pairOf(a: std.mem.Allocator) !Pair {
     const n = try std.Io.Dir.cwd().realPath(std.testing.io, &root_buf);
     const client = try Client.init(a, std.testing.io, null, .foreground, root_buf[0..n], root_buf[0..n]);
     var fds: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds) != 0) {
+    if (testSocketPair(&fds) != 0) {
         client.deinit();
         return error.SocketPairFailed;
     }
@@ -3786,7 +3803,7 @@ test "communication delivers real stream frames during a delayed control reply a
     const ticket = try actions.start(5, .cancel);
     var stream = try listener.accept(.{ .io = io, .timeout_ms = 2000 });
     defer stream.close();
-    const watch_bytes = (try stream.readFrame(.{ .io = io, .timeout_ms = 2000 })).?;
+    const watch_bytes = (try stream.readFrame(.{ .io = io, .timeout_ms = 2000 })) orelse return error.MissingWatch;
     defer a.free(watch_bytes);
     var watch = try protocol.parseRequest(a, watch_bytes);
     defer watch.deinit();
@@ -4081,7 +4098,7 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
     // A later independent range is admitted but stays queued behind the one
     // outstanding frame; it is never widened into a cumulative watermark.
     try ui.acknowledgeRange(5, 20, 30);
-    var quiet = [_]std.c.pollfd{.{ .fd = watch.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    var quiet = [_]std.c.pollfd{.{ .fd = watch.fd, .events = std.c.POLL.IN, .revents = 0 }};
     try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
     // A cancel is serviced while one ACK is outstanding and another range is
     // queued: the watch duplex never owns or pauses the control connection.
@@ -4311,7 +4328,7 @@ test "coalesced live span is acknowledged as one exact first/last range" {
     }
     try testing.expectEqual(@as(usize, 0), client.stream.?.ackState().pending);
     try testing.expectEqual(@as(u64, 3), client.stream.?.ackState().confirmed_through);
-    var quiet = [_]std.c.pollfd{.{ .fd = watch.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    var quiet = [_]std.c.pollfd{.{ .fd = watch.fd, .events = std.c.POLL.IN, .revents = 0 }};
     try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
 }
 
@@ -4384,7 +4401,7 @@ fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listene
         const reply = if (attempt == 0)
             std.fmt.allocPrint(a, "{{\"v\":1,\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":1,\"protocol\":1,\"watch\":true}}", .{ request.id, id[0..] }) catch return
         else
-            std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, request.id, id[0..], std.os.linux.getpid(), protocol.version }) catch return;
+            std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, request.id, id[0..], std.c.getpid(), protocol.version }) catch return;
         defer a.free(reply);
         conn.writeFrame(reply, wait) catch return;
         if (attempt != 2) continue;
@@ -4436,7 +4453,7 @@ test "a v1 worker handshake is refused, while an exact v2 worker is adopted" {
             .owner = .foreground,
             .owner_instance = "0123456789abcdef",
             .state = "running",
-            .pid = @intCast(std.os.linux.getpid()),
+            .pid = @intCast(std.c.getpid()),
             .generation = 1,
         };
         // A v1 envelope for the v2 greeting: explicit, sanitized refusal.
@@ -4501,7 +4518,7 @@ fn connectClientWithControl(a: std.mem.Allocator) !Pair {
     const n = try std.Io.Dir.cwd().realPath(std.testing.io, &root_buf);
     const client = try Client.init(a, std.testing.io, null, .connect, root_buf[0..n], root_buf[0..n]);
     var fds: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds) != 0) {
+    if (testSocketPair(&fds) != 0) {
         client.deinit();
         return error.SocketPairFailed;
     }
@@ -6389,7 +6406,7 @@ test "a daemon-owned session close demands --force before any control request" {
     const client = try Client.init(a, testing.io, &fixture.env, .connect, fixture.project, fixture.home);
     defer client.deinit();
     var fds: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    if (testSocketPair(&fds) != 0) return error.SocketPairFailed;
     const peer: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
     client.control = unix.Connection.init(a, fds[0], peer);
     var server = unix.Connection.init(a, fds[1], peer);
@@ -6408,7 +6425,7 @@ test "a daemon-owned session close demands --force before any control request" {
         .owner = .daemon,
         .owner_instance = "0011223344556677",
         .state = "running",
-        .pid = @intCast(std.os.linux.getpid()),
+        .pid = @intCast(std.c.getpid()),
         .generation = 1,
     });
 
@@ -6484,7 +6501,7 @@ fn busyResumePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id
     var hello = try protocol.parseRequest(a, hello_raw);
     defer hello.deinit();
     try testing.expectEqual(protocol.Op.hello, hello.op);
-    const reply = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"daemon\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, std.os.linux.getpid(), protocol.version });
+    const reply = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"daemon\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, std.c.getpid(), protocol.version });
     defer a.free(reply);
     try conn.writeFrame(reply, wait);
     const attach_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
@@ -6514,14 +6531,14 @@ test "resume live owner allocation failure and occupied controller preserve the 
     const target: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
     const peer: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
     var old_fds: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &old_fds) != 0) return error.SocketPairFailed;
+    if (testSocketPair(&old_fds) != 0) return error.SocketPairFailed;
     client.conn = unix.Connection.init(a, old_fds[0], peer);
     var old_server = unix.Connection.init(a, old_fds[1], peer);
     defer old_server.close();
     client.session = current;
     client.epoch = 5;
     var control_fds: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &control_fds) != 0) return error.SocketPairFailed;
+    if (testSocketPair(&control_fds) != 0) return error.SocketPairFailed;
     client.control = unix.Connection.init(a, control_fds[0], peer);
     var control_server = unix.Connection.init(a, control_fds[1], peer);
     defer control_server.close();
@@ -6541,7 +6558,7 @@ test "resume live owner allocation failure and occupied controller preserve the 
         .owner = .daemon,
         .owner_instance = "0123456789abcdef",
         .state = "running",
-        .pid = @intCast(std.os.linux.getpid()),
+        .pid = @intCast(std.c.getpid()),
         .generation = 1,
     });
     const old_fd = client.conn.?.fd;
@@ -6553,7 +6570,7 @@ test "resume live owner allocation failure and occupied controller preserve the 
     try testing.expectEqual(current, client.session.?);
     try testing.expectEqual(@as(u64, 5), client.epoch);
     try testing.expectEqual(revision, client.publication_revision);
-    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.c.POLL.IN, .revents = 0 }};
     try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
     try expectNoFrameOn(&old_server);
     try expectNoFrameOn(&control_server);
@@ -6585,7 +6602,7 @@ test "attach resumes a confirmed-dead endpoint only with a complete checkpoint" 
     const client = try Client.init(a, testing.io, &fixture.env, .connect, fixture.project, fixture.home);
     defer client.deinit();
     var fds: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    if (testSocketPair(&fds) != 0) return error.SocketPairFailed;
     const peer: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
     client.control = unix.Connection.init(a, fds[0], peer);
     var server = unix.Connection.init(a, fds[1], peer);
@@ -6600,7 +6617,7 @@ test "attach resumes a confirmed-dead endpoint only with a complete checkpoint" 
         .owner = .daemon,
         .owner_instance = "0123456789abcdef",
         .state = "running",
-        .pid = @intCast(std.os.linux.getpid()),
+        .pid = @intCast(std.c.getpid()),
         .generation = 1,
     };
     defer a.free(@constCast(record.endpoint));
@@ -6640,7 +6657,7 @@ test "an unreachable-but-present endpoint is never treated as dead" {
     const client = try Client.init(a, testing.io, &fixture.env, .connect, fixture.project, fixture.home);
     defer client.deinit();
     var fds: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    if (testSocketPair(&fds) != 0) return error.SocketPairFailed;
     const peer: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
     client.control = unix.Connection.init(a, fds[0], peer);
     var server = unix.Connection.init(a, fds[1], peer);
@@ -6661,7 +6678,7 @@ test "an unreachable-but-present endpoint is never treated as dead" {
         .owner = .daemon,
         .owner_instance = "fedcba9876543210",
         .state = "running",
-        .pid = @intCast(std.os.linux.getpid()),
+        .pid = @intCast(std.c.getpid()),
         .generation = 1,
     });
     var name_buf: [128]u8 = undefined;
@@ -6693,7 +6710,7 @@ test "resume never resolves another project's registry owner" {
         .owner = .daemon,
         .owner_instance = "0123456789abcdef",
         .state = "running",
-        .pid = @intCast(std.os.linux.getpid()),
+        .pid = @intCast(std.c.getpid()),
         .generation = 1,
     });
     try testing.expectError(error.SessionNotFound, client.manageResume(a, &id));
@@ -6709,7 +6726,7 @@ fn closeOnlyPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id:
     var hello = try protocol.parseRequest(a, hello_raw);
     defer hello.deinit();
     try testing.expectEqual(protocol.Op.hello, hello.op);
-    const greeting = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, std.os.linux.getpid(), protocol.version });
+    const greeting = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, std.c.getpid(), protocol.version });
     defer a.free(greeting);
     try conn.writeFrame(greeting, wait);
     const attach_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
@@ -6744,7 +6761,7 @@ test "close via endpoint opens no watch" {
     var listener = try unix.Listener.bind(a, &dir, "worker.sock", .{});
     defer listener.deinit();
     const id: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
-    const record: registry.Record = .{ .id = id, .project = fixture.project, .endpoint = listener.path, .owner = .foreground, .owner_instance = "0123456789abcdef", .state = "running", .pid = @intCast(std.os.linux.getpid()), .generation = 1 };
+    const record: registry.Record = .{ .id = id, .project = fixture.project, .endpoint = listener.path, .owner = .foreground, .owner_instance = "0123456789abcdef", .state = "running", .pid = @intCast(std.c.getpid()), .generation = 1 };
     var task = try std.Io.concurrent(io, closeOnlyPeer, .{ a, io, &listener, id });
     var pending = true;
     defer if (pending) task.cancel(io) catch {};
@@ -6752,7 +6769,7 @@ test "close via endpoint opens no watch" {
     const result = task.await(io);
     pending = false;
     try result;
-    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.c.POLL.IN, .revents = 0 }};
     try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
     try testing.expect(client.stream == null and client.conn == null);
 }
@@ -6770,7 +6787,7 @@ fn candidatePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id:
     var hello = try protocol.parseRequest(a, hello_raw);
     defer hello.deinit();
     try testing.expectEqual(protocol.Op.hello, hello.op);
-    const actual_pid: u32 = @intCast(std.os.linux.getpid());
+    const actual_pid: u32 = @intCast(std.c.getpid());
     const advertised_pid = if (behavior == .hello_pid) actual_pid + 1 else actual_pid;
     const advertised_owner = if (behavior == .owner) (if (owner == .daemon) "foreground" else "daemon") else @tagName(owner);
     const reply = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"{s}\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, advertised_owner, advertised_pid, protocol.version });
@@ -6853,7 +6870,7 @@ test "record identity and watch admission failures never replace the current vie
         const creds: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
         var old_fds: [2]std.c.fd_t = undefined;
         var control_fds: [2]std.c.fd_t = undefined;
-        if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &old_fds) != 0 or std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &control_fds) != 0) return error.SocketPairFailed;
+        if (testSocketPair(&old_fds) != 0 or testSocketPair(&control_fds) != 0) return error.SocketPairFailed;
         client.conn = unix.Connection.init(a, old_fds[0], creds);
         var old_peer = unix.Connection.init(a, old_fds[1], creds);
         defer old_peer.close();
@@ -6872,7 +6889,7 @@ test "record identity and watch admission failures never replace the current vie
         defer workers_dir.deinit();
         var listener = try unix.Listener.bind(a, &workers_dir, "0123456789abcdef.sock", .{});
         defer listener.deinit();
-        const real_pid: u32 = @intCast(std.os.linux.getpid());
+        const real_pid: u32 = @intCast(std.c.getpid());
         try client.reg.?.register(.{
             .id = target,
             .project = fixture.project,
@@ -6902,7 +6919,7 @@ test "record identity and watch admission failures never replace the current vie
         try testing.expect(client.workers == null);
         try expectNoFrameOn(&old_peer);
         try expectNoFrameOn(&control_peer); // zero create
-        var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+        var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.c.POLL.IN, .revents = 0 }};
         try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
     }
 }
@@ -6920,7 +6937,7 @@ fn registryOwnerPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener,
     var hello = try protocol.parseRequest(a, raw);
     defer hello.deinit();
     try testing.expectEqual(protocol.Op.hello, hello.op);
-    const reply = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"daemon\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, std.os.linux.getpid(), protocol.version });
+    const reply = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"daemon\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, std.c.getpid(), protocol.version });
     defer a.free(reply);
     try conn.writeFrame(reply, wait);
 }
@@ -6939,7 +6956,7 @@ test "malformed registry with live owner and checkpoint does not authorize a res
     defer workers_dir.deinit();
     var listener = try unix.Listener.bind(a, &workers_dir, "0123456789abcdef.sock", .{});
     defer listener.deinit();
-    try client.reg.?.register(.{ .id = target, .project = fixture.project, .endpoint = listener.path, .owner = .daemon, .owner_instance = "0123456789abcdef", .state = "running", .pid = @intCast(std.os.linux.getpid()), .generation = 1 });
+    try client.reg.?.register(.{ .id = target, .project = fixture.project, .endpoint = listener.path, .owner = .daemon, .owner_instance = "0123456789abcdef", .state = "running", .pid = @intCast(std.c.getpid()), .generation = 1 });
     const key = registry.projectKey(fixture.project);
     const record_path = try std.fmt.allocPrint(a, "{s}/.thin/session-index/{s}/{s}.json", .{ fixture.home, key, target });
     defer a.free(record_path);
@@ -6947,7 +6964,7 @@ test "malformed registry with live owner and checkpoint does not authorize a res
     const creds: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
     var old_fds: [2]std.c.fd_t = undefined;
     var control_fds: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &old_fds) != 0 or std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &control_fds) != 0) return error.SocketPairFailed;
+    if (testSocketPair(&old_fds) != 0 or testSocketPair(&control_fds) != 0) return error.SocketPairFailed;
     client.conn = unix.Connection.init(a, old_fds[0], creds);
     var old_peer = unix.Connection.init(a, old_fds[1], creds);
     defer old_peer.close();
@@ -6982,7 +6999,7 @@ test "malformed registry with live owner and checkpoint does not authorize a res
     try testing.expectEqual(@as(u64, 5), client.epoch);
     try expectNoFrameOn(&old_peer);
     try expectNoFrameOn(&control_peer);
-    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.c.POLL.IN, .revents = 0 }};
     try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
 }
 
@@ -7028,7 +7045,7 @@ test "resume selects launcher project when attached to another project's same id
     defer a_listener.deinit();
     var b_listener = try unix.Listener.bind(a, &workers_dir, "fedcba9876543210.sock", .{});
     defer b_listener.deinit();
-    try client.reg.?.register(.{ .id = id, .project = project_b, .endpoint = b_listener.path, .owner = .foreground, .owner_instance = "fedcba9876543210", .state = "running", .pid = @intCast(std.os.linux.getpid()), .generation = 1 });
+    try client.reg.?.register(.{ .id = id, .project = project_b, .endpoint = b_listener.path, .owner = .foreground, .owner_instance = "fedcba9876543210", .state = "running", .pid = @intCast(std.c.getpid()), .generation = 1 });
     var b_task = try std.Io.concurrent(io, candidatePeer, .{ a, io, &b_listener, id, project_b, cli.WorkerOwner.foreground, CandidatePeerCase.good });
     var b_pending = true;
     defer if (b_pending) b_task.cancel(io) catch {};
@@ -7039,7 +7056,7 @@ test "resume selects launcher project when attached to another project's same id
     try testing.expectEqual(id, client.session.?);
     const creds: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
     var fds: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    if (testSocketPair(&fds) != 0) return error.SocketPairFailed;
     client.control = unix.Connection.init(a, fds[0], creds);
     var daemon_peer = unix.Connection.init(a, fds[1], creds);
     defer daemon_peer.close();

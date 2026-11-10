@@ -71,7 +71,7 @@ test "rotated journal credential filters related evidence and candidates" {
     defer root.deinit();
     var config = try fixtureConfig(a);
     defer cfg.release(&config);
-    config.value.provider.api_key = "new-credential-canary";
+    config.value.provider.api_key = try config.arena.allocator().dupe(u8, "new-credential-canary");
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     var journal = try @import("journal.zig").Journal.init(a, &root, "new-credential-canary");

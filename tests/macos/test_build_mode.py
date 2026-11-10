@@ -31,10 +31,9 @@ class BuildModeTests(unittest.TestCase):
         self.assertFalse((prefix / "bin" / "thin").exists(), result.stdout)
         return result
 
-    def test_default_macos_product_remains_rejected(self):
-        result = self.build()
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("supports Linux x86_64 only", result.stdout)
+    def test_macos_product_compiles_without_installing(self):
+        result = self.build("check")
+        self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_platform_only_default_install_explicitly_fails(self):
         result = self.build("-Dplatform-tests-only=true")

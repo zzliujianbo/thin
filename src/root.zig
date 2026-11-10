@@ -82,8 +82,11 @@ test {
     _ = @import("daemon/protocol.zig");
     _ = @import("daemon/registry.zig");
     _ = @import("daemon/spawn.zig");
-    _ = @import("daemon/supervisor.zig");
-    _ = @import("daemon/ssh.zig");
+    if (@import("builtin").os.tag == .linux) {
+        _ = @import("daemon/supervisor.zig");
+        _ = @import("daemon/ssh.zig");
+    }
+    _ = @import("platform/capabilities.zig");
     _ = @import("daemon/worker.zig");
     _ = @import("daemon/client.zig");
     _ = @import("app/session_host.zig");

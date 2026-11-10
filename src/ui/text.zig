@@ -2,20 +2,34 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const posix = @import("../platform/posix_terminal.zig");
 const clean = @import("../util/display_text.zig");
 const rune = clean.decode;
 pub const sanitize = clean.sanitize;
 pub const exceedsSanitizedLimit = clean.exceedsSanitizedLimit;
 
-// libc 的 setlocale；LC_CTYPE(0) 决定 wcwidth 使用的字符类别与宽度表。
-extern "c" fn setlocale(category: c_int, locale: [*:0]const u8) ?[*:0]const u8;
 // libc 的 wcwidth：返回码点的列宽，-1 表示不可打印。
 extern "c" fn wcwidth(c: c_int) c_int;
 
-/// Linux LC_CTYPE. Call once at startup, before starting threads. Width data
-/// comes from the host libc's C.UTF-8 locale, not a pinned Unicode release.
+/// Call once at startup, before producers. Widths come from host libc, not a
+/// pinned Unicode release. Only CTYPE changes; Darwin's category is NOT zero.
 pub fn initLocale() !void {
-    if (setlocale(0, "C.UTF-8") == null) return error.LocaleUnavailable;
+    if (posix.setCtype("C.UTF-8")) return;
+    if (comptime @import("builtin").os.tag == .macos) {
+        for ([_][*:0]const u8{ "en_US.UTF-8", "UTF-8" }) |locale|
+            if (posix.setCtype(locale)) return;
+    }
+    return error.LocaleUnavailable;
+}
+
+test "UTF8 width initialization preserves the numeric locale category" {
+    const before = posix.numericLocale() orelse return error.LocaleUnavailable;
+    const saved = try std.testing.allocator.dupe(u8, std.mem.span(before));
+    defer std.testing.allocator.free(saved);
+    try initLocale();
+    const after = posix.numericLocale() orelse return error.LocaleUnavailable;
+    try std.testing.expectEqualStrings(saved, std.mem.span(after));
+    try std.testing.expectEqual(@as(usize, 4), width("中文"));
 }
 
 /// 一个显示单元（字形簇）：结束字节偏移与占用的终端列数。

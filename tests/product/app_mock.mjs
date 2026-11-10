@@ -626,7 +626,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
     if (failureCase) assert.notEqual(result.code, 0, `${name} unexpectedly succeeded`);
     else {
       // 只提取 thin:/error: 后的标识符作为诊断信息，不输出原始内容。
-      const codes = [...result.output.matchAll(/(?:thin:|error:)\s+[A-Za-z_][A-Za-z0-9_]*/g)].slice(-3).map(m=>m[0]).join(', ');
+      const codes = [...result.output.matchAll(/(?:thin:|error:)\s+[A-Za-z_][A-Za-z0-9_]*/g)].slice(-10).map(m=>m[0]).join(', ');
       if (kind === 'auth-go' && result.code !== 0) {
         const error = new Error('Go login PTY failed');
         error.fixtureCase = 'login/go';
@@ -644,7 +644,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
         const error = new Error('owned PTY failed');
         const lines = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].slice(0,6).map(match => match[1]).join('-') || 'unknown';
         error.fixtureCase = `pty/${kind}`;
-        error.fixtureCheck = `PTY code ${result.code} at ${lines} requests ${requests}`;
+        error.fixtureCheck = `PTY code ${result.code} at ${lines} requests ${requests}${codes ? ` ${codes.replaceAll(', ', ' ')}` : ''}`;
         if (kind === 'stream-markdown') {
           const index = result.output.match(/(?:^|\n)Markdown assertion index: (\d+)\r?(?=\n|$)/);
           if (index) error.fixtureCheck += ` Markdown assertion index: ${index[1]}`;

@@ -2,14 +2,14 @@
 // Never prints raw terminal captures, payloads, headers, or assertion stacks.
 import http from 'node:http';
 import {createHash} from 'node:crypto';
-import {mkdtemp, mkdir, writeFile, readFile, readdir, stat, rm} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, readdir, stat, rm, realpath} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import assert from 'node:assert/strict';
 
 export async function fullResumeRegressions({app, pty, execute}) {
   for (const protocol of ['chat', 'responses']) {
-    const root = await mkdtemp(join(tmpdir(), 'thin-full-resume-'));
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'thin-full-resume-')));
     const home = join(root, 'home'), project = join(root, "project quoted's work");
     const key = 'fixture-secret-never-log';
     const sockets = new Set();

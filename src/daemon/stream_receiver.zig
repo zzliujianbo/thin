@@ -380,9 +380,9 @@ pub const Receiver = struct {
             const elapsed = started.untilNow(wait.io, .awake).toMilliseconds();
             if (elapsed >= wait.timeout_ms) return error.Timeout;
             const remaining: i64 = @as(i64, wait.timeout_ms) - elapsed;
-            var descriptors = [_]std.c.pollfd{.{ .fd = self.ready.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+            var descriptors = [_]std.c.pollfd{.{ .fd = self.ready.fd, .events = std.c.POLL.IN, .revents = 0 }};
             const n = std.c.poll(&descriptors, descriptors.len, @intCast(@min(remaining, 50)));
-            if (n < 0 and std.c._errno().* != @backingInt(std.os.linux.E.INTR)) return error.Transport;
+            if (n < 0 and std.c._errno().* != @backingInt(std.c.E.INTR)) return error.Transport;
         }
     }
 
@@ -495,11 +495,11 @@ pub const Receiver = struct {
             // or an actual partial frame has a transport deadline.
             if ((first_frame or partial) and started.untilNow(self.io, .awake).toMilliseconds() >= setup_timeout_ms) return error.Timeout;
             var descriptors = [_]std.c.pollfd{
-                .{ .fd = self.resume_wake.fd, .events = std.os.linux.POLL.IN, .revents = 0 },
-                .{ .fd = if (can_read or writing) conn.fd else -1, .events = (if (can_read) @as(i16, std.os.linux.POLL.IN) else 0) | (if (writing) @as(i16, std.os.linux.POLL.OUT) else 0), .revents = 0 },
+                .{ .fd = self.resume_wake.fd, .events = std.c.POLL.IN, .revents = 0 },
+                .{ .fd = if (can_read or writing) conn.fd else -1, .events = (if (can_read) @as(i16, std.c.POLL.IN) else 0) | (if (writing) @as(i16, std.c.POLL.OUT) else 0), .revents = 0 },
             };
             const n = std.c.poll(&descriptors, descriptors.len, 50);
-            if (n < 0 and std.c._errno().* != @backingInt(std.os.linux.E.INTR)) return error.Transport;
+            if (n < 0 and std.c._errno().* != @backingInt(std.c.E.INTR)) return error.Transport;
         }
         return error.Canceled;
     }
@@ -534,7 +534,7 @@ test "bound watch rejects a different kernel peer before sending watch" {
     defer dir.deinit();
     var listener = try unix.Listener.bind(a, &dir, "stream.sock", .{});
     defer listener.deinit();
-    const actual_pid: u32 = @intCast(std.os.linux.getpid());
+    const actual_pid: u32 = @intCast(std.c.getpid());
     const receiver = try Receiver.startBound(a, io, listener.path, @intCast(std.c.getuid()), 7, null, actual_pid + 1);
     defer receiver.deinit();
     var connection = try listener.accept(.{ .io = io, .timeout_ms = 2000 });
@@ -651,7 +651,7 @@ test "adopting carried ACK ranges wakes receiver without bridging holes" {
     var carried: AckRanges = .{};
     try carried.insert(2, 3, 0);
     try carried.insert(5, 7, 0);
-    var descriptors = [_]std.c.pollfd{.{ .fd = receiver.resume_wake.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    var descriptors = [_]std.c.pollfd{.{ .fd = receiver.resume_wake.fd, .events = std.c.POLL.IN, .revents = 0 }};
     try std.testing.expectEqual(@as(c_int, 0), std.c.poll(&descriptors, 1, 0));
     try receiver.adoptRanges(carried);
     try std.testing.expectEqual(@as(c_int, 1), std.c.poll(&descriptors, 1, 0));
@@ -756,7 +756,7 @@ test "watch socket carries selective ACK ranges and consumes their confirmations
     try std.testing.expectEqual(@as(usize, 3), pending.pending);
     try std.testing.expect(pending.outstanding);
     try std.Io.sleep(io, .fromMilliseconds(40), .awake);
-    var quiet = [_]std.c.pollfd{.{ .fd = connection.fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+    var quiet = [_]std.c.pollfd{.{ .fd = connection.fd, .events = std.c.POLL.IN, .revents = 0 }};
     try std.testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 20));
 
     const confirm_prefix = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"ack\":true,\"epoch\":7,\"through\":9,\"sequence\":9}}", .{ protocol.version, prefix_id });

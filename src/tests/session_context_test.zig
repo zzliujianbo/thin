@@ -446,7 +446,7 @@ test "unreadable optional agents files are skipped and an override does not fall
 }
 
 fn rm(parent: std.Io.Dir, name: [*:0]const u8, directory: bool) void {
-    _ = std.c.unlinkat(parent.handle, name, if (directory) 0x200 else 0);
+    _ = std.c.unlinkat(parent.handle, name, if (directory) std.c.AT.REMOVEDIR else 0);
 }
 
 test "missing agents files are skipped and a directory without git uses cwd" {

@@ -1191,7 +1191,7 @@ pub const SessionHost = struct {
         try out.ok(id);
         try out.field("session", self.session.session_id);
         try out.field("owner", @tagName(self.owner));
-        try out.field("pid", std.os.linux.getpid());
+        try out.field("pid", std.c.getpid());
         try out.field("protocol", protocol.version);
         try out.field("watch", true);
         return replyFrame(&out);
@@ -1202,7 +1202,7 @@ pub const SessionHost = struct {
         var out = protocol.Out.init(a);
         defer out.deinit();
         try out.ok(id);
-        try out.field("pid", std.os.linux.getpid());
+        try out.field("pid", std.c.getpid());
         return replyFrame(&out);
     }
 

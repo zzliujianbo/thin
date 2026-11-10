@@ -2,6 +2,8 @@
 //! 中文：进程内的优雅中断。信号处理函数只记录信号编号，由主循环轮询 signal() 后自行决定退出流程。
 
 const std = @import("std");
+// std.c selects the target's sigaction layout and signal numbers. In
+// particular, never substitute Linux's sigset_t/Sigaction on Darwin.
 const c = std.c;
 
 /// 最近收到的信号编号，0 表示没有待处理的中断。用原子变量在异步信号上下文与主线程之间传递。
@@ -67,3 +69,41 @@ pub const Guard = struct {
         }
     }
 };
+
+test "interrupt handler records target signal numbers and clear resets state" {
+    defer clear();
+    clear();
+    try std.testing.expectEqual(@as(u8, 0), signal());
+    for (signals) |sig| {
+        handler(sig);
+        try std.testing.expectEqual(@as(u8, @intCast(@backingInt(sig))), signal());
+        clear();
+        try std.testing.expectEqual(@as(u8, 0), signal());
+    }
+}
+
+test "interrupt guard restores target libc actions and repeated deinit is safe" {
+    var before: [signals.len]c.Sigaction = undefined;
+    for (signals, 0..) |sig, i| {
+        try std.testing.expectEqual(@as(c_int, 0), c.sigaction(sig, null, &before[i]));
+    }
+    var guard = try Guard.install();
+    defer guard.deinit();
+    try std.testing.expectEqual(signals.len, guard.installed);
+    for (signals) |sig| {
+        var installed: c.Sigaction = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), c.sigaction(sig, null, &installed));
+        try std.testing.expectEqual(@as(?c.Sigaction.handler_fn, handler), installed.handler.handler);
+    }
+    guard.deinit();
+    guard.deinit();
+    try std.testing.expectEqual(@as(usize, 0), guard.installed);
+    for (signals, 0..) |sig, i| {
+        var after: c.Sigaction = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), c.sigaction(sig, null, &after));
+        try std.testing.expectEqual(before[i].handler.handler, after.handler.handler);
+        for (signals) |masked| {
+            try std.testing.expectEqual(c.sigismember(&before[i].mask, masked), c.sigismember(&after.mask, masked));
+        }
+    }
+}

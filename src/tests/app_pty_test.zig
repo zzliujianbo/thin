@@ -1,9 +1,12 @@
-//! Linux x86_64 application PTY acceptance. Never opens the user's terminal.
-//! 中文：Linux x86_64 应用级 PTY 验收驱动。它只使用 openpty 创建的伪终端，不会打开用户自己的终端。
+//! Linux/Intel Darwin application PTY acceptance. Never opens the user's terminal.
+//! 中文：应用级 PTY 验收驱动，只使用 openpty 创建的伪终端，不打开用户自己的终端。
 
 const std = @import("std");
+const builtin = @import("builtin");
+const darwin = builtin.os.tag == .macos;
 const c = std.c;
 const abi = @import("../platform/terminal_abi.zig");
+const posix_terminal = @import("../platform/posix_terminal.zig");
 const openpty = abi.openpty;
 const regular = @import("regular_screen.zig");
 const spinner_theme = @import("../ui/theme.zig");
@@ -21,6 +24,8 @@ fn onSignal(_: c_int) callconv(.c) void {
 }
 
 extern "c" fn setsid() c_int;
+extern "c" fn getsid(c_int) c_int;
+extern "c" fn tcsetpgrp(c_int, c_int) c_int;
 extern "c" fn chdir([*:0]const u8) c_int;
 extern "c" fn dup2(c_int, c_int) c_int;
 extern "c" fn execve([*:0]const u8, [*:null]const ?[*:0]const u8, [*:null]const ?[*:0]const u8) c_int;
@@ -31,16 +36,12 @@ extern "c" fn mkdtemp([*:0]u8) ?[*:0]u8;
 extern "c" fn kill(c_int, c_int) c_int;
 extern "c" fn getpgid(c_int) c_int;
 
-/// 与 libc struct timespec 布局一致（x86_64 下为两个 64 位整数）。
-const Timespec = extern struct { sec: i64, ns: i64 };
-extern "c" fn clock_gettime(c_int, *Timespec) c_int;
-
 /// 返回单调时钟的毫秒数；时钟读取失败时返回 0。
 fn now() i64 {
-    var t: Timespec = undefined;
-    // 1 == CLOCK_MONOTONIC，超时计算不受系统时间调整影响。
-    if (clock_gettime(1, &t) != 0) return 0;
-    return t.sec * 1000 + @divTrunc(t.ns, 1000000);
+    var t: c.timespec = undefined;
+    // Target libc CLOCK_MONOTONIC: Linux=1, Darwin=6.
+    if (c.clock_gettime(.MONOTONIC, &t) != 0) return 0;
+    return t.sec * 1000 + @divTrunc(t.nsec, 1000000);
 }
 
 /// 断言辅助：条件不成立时返回 AcceptanceFailed。
@@ -191,13 +192,13 @@ const Driver = struct {
         }
 
         if (self.owned) {
-            // WNOHANG (1)：非阻塞回收，避免 drain 被子进程挂住。
-            const result = waitpid(self.pid, &self.status, 1);
+            // WNOHANG：非阻塞回收，避免 drain 被子进程挂住。
+            const result = waitpid(self.pid, &self.status, c.W.NOHANG);
             if (result == self.pid) {
                 self.owned = false;
-            } else if (result < 0 and c._errno().* != 4) {
-                // EINTR (4) 视为可忽略并重试；其他错误中 ECHILD (10) 表示已不可回收。
-                if (c._errno().* == 10) self.owned = false; // ECHILD: never signal a possibly reused PID.
+            } else if (result < 0 and c._errno().* != @backingInt(c.E.INTR)) {
+                // ECHILD: never signal a possibly reused PID.
+                if (c._errno().* == @backingInt(c.E.CHILD)) self.owned = false;
                 return error.WaitFailed;
             }
         }
@@ -490,8 +491,7 @@ const Driver = struct {
             if (std.mem.indexOf(u8, line, composer) != null) composer_row = i;
         }
         if (prior_row == null or candidate_row == null or composer_row == null) {
-            std.debug.print("menu missing: prior={any} candidate={any} composer={any}; expected {s}\n", .{ prior_row, candidate_row, composer_row, composer });
-            for (view.grid) |row| std.debug.print("menu row: {s}\n", .{std.mem.trimEnd(u8, &row, " ")});
+            std.debug.print("menu missing: prior={any} candidate={any} composer={any}\n", .{ prior_row, candidate_row, composer_row });
         }
         try check(prior_row != null and candidate_row != null and composer_row != null);
         try check(prior_row.? < candidate_row.? and candidate_row.? < composer_row.?);
@@ -538,9 +538,15 @@ const Driver = struct {
 
         var restored: abi.Termios = undefined;
         try check(abi.tcgetattr(self.slave, &restored) == 0);
-        try check(std.meta.eql(self.original, restored));
-        // F_GETFL (3)：确认 slave 的文件状态标志已恢复为启动前的值。
-        try check(c.fcntl(self.slave, 3) == self.flags);
+        // Only Darwin's verified kernel-owned PENDIN/FWASWRITTEN bits are
+        // normalized. Every other termios field and file flag stays strict.
+        var original = self.original;
+        original.lflag = abi.configuredLocalFlags(original.lflag);
+        restored.lflag = abi.configuredLocalFlags(restored.lflag);
+        try check(std.meta.eql(original, restored));
+        const restored_flags = c.fcntl(self.slave, c.F.GETFL);
+        try check(restored_flags >= 0);
+        try check(posix_terminal.configuredFileFlags(restored_flags) == posix_terminal.configuredFileFlags(self.flags));
 
         // Regular TUI must never switch buffers, address absolute cells,
         // erase the display, or install a scrolling region (including resize).
@@ -582,17 +588,17 @@ const Driver = struct {
     fn deinit(self: *Driver) void {
         if (self.owned) {
             // The child remains unreaped, hence its PID/group cannot be reused.
-            if (getpgid(self.pid) == self.pid) _ = kill(-self.pid, 9);
-            _ = kill(self.pid, 9); // Also covers failure before setsid.
+            if (getpgid(self.pid) == self.pid) _ = kill(-self.pid, @backingInt(c.SIG.KILL));
+            _ = kill(self.pid, @backingInt(c.SIG.KILL)); // Also covers failure before group setup.
 
             const until = now() + 2000;
             while (self.owned and now() < until) {
-                const result = waitpid(self.pid, &self.status, 1);
-                if (result == self.pid or (result < 0 and c._errno().* == 10)) {
+                const result = waitpid(self.pid, &self.status, c.W.NOHANG);
+                if (result == self.pid or (result < 0 and c._errno().* == @backingInt(c.E.CHILD))) {
                     self.owned = false;
                     break;
                 }
-                if (result < 0 and c._errno().* != 4) break;
+                if (result < 0 and c._errno().* != @backingInt(c.E.INTR)) break;
                 // fd 为 -1 的 pollfd 会被 poll 忽略，因此这里充当 5 毫秒的休眠。
                 var descriptors = [_]c.pollfd{.{ .fd = -1, .events = 0, .revents = 0 }};
                 _ = c.poll(&descriptors, 1, 5);
@@ -686,9 +692,7 @@ fn settingsValues(d: *Driver, low: []const u8, decision: []const u8, selected: u
         }
         if (!d.owned) return error.EarlyExit;
     }
-    std.debug.print("settings expected: {s}; {s}; {s}\n", .{ low_text, decision_text, selected_text });
-    const failed_view = try d.screen();
-    for (failed_view.grid) |row| std.debug.print("settings row: {s}\n", .{std.mem.trimEnd(u8, &row, " ")});
+    // Never print terminal captures, model labels or keys in diagnostics.
     return error.SettingsValueFrameTimeout;
 }
 
@@ -779,12 +783,12 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
 // each owned gate. Marker emission follows a complete replayed UI frame.
 fn decisionModelGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
     const path = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "{s}/decision-model-release-{s}", .{ project, name }), 0);
-    try check(access(path, 0) == -1 and c._errno().* == 2);
+    try check(access(path, 0) == -1 and c._errno().* == @backingInt(c.E.NOENT));
     std.debug.print("DECISION_MODEL_GATE={s}\n", .{name});
     const until = now() + 10000;
     while (now() < until) {
         if (access(path, 0) == 0) return;
-        try check(c._errno().* == 2);
+        try check(c._errno().* == @backingInt(c.E.NOENT));
         try d.drain(20);
         if (!d.owned) return error.EarlyExit;
     }
@@ -873,12 +877,12 @@ fn decisionModel(d: *Driver, init: std.process.Init, mode: []const u8, project: 
 // Image selection owns separate ACKed gates; no timer stands in for a save.
 fn imageModelGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
     const path = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "{s}/image-model-release-{s}", .{ project, name }), 0);
-    try check(access(path, 0) == -1 and c._errno().* == 2);
+    try check(access(path, 0) == -1 and c._errno().* == @backingInt(c.E.NOENT));
     std.debug.print("IMAGE_MODEL_GATE={s}\n", .{name});
     const until = now() + 10000;
     while (now() < until) {
         if (access(path, 0) == 0) return;
-        try check(c._errno().* == 2);
+        try check(c._errno().* == @backingInt(c.E.NOENT));
         try d.drain(20);
         if (!d.owned) return error.EarlyExit;
     }
@@ -947,12 +951,12 @@ fn settingsValueGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name
     defer a.free(raw);
     const path = try a.dupeSentinel(u8, raw, 0);
     defer a.free(path);
-    try check(access(path, 0) == -1 and c._errno().* == 2);
+    try check(access(path, 0) == -1 and c._errno().* == @backingInt(c.E.NOENT));
     std.debug.print("SETTINGS_VALUES_GATE={s}\n", .{name});
     const until = now() + 5000;
     while (now() < until) {
         if (access(path, 0) == 0) return;
-        try check(c._errno().* == 2);
+        try check(c._errno().* == @backingInt(c.E.NOENT));
         try d.drain(5);
         if (!d.owned) return error.EarlyExit;
     }
@@ -1000,12 +1004,12 @@ fn settingsValueChoose(d: *Driver, a: std.mem.Allocator, label: []const u8, pare
 // each owned gate. Marker emission follows a complete replayed UI frame.
 fn settingsProxyGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
     const path = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "{s}/settings-proxy-release-{s}", .{ project, name }), 0);
-    try check(access(path, 0) == -1 and c._errno().* == 2);
+    try check(access(path, 0) == -1 and c._errno().* == @backingInt(c.E.NOENT));
     std.debug.print("SETTINGS_PROXY_GATE={s}\n", .{name});
     const until = now() + 10000;
     while (now() < until) {
         if (access(path, 0) == 0) return;
-        try check(c._errno().* == 2);
+        try check(c._errno().* == @backingInt(c.E.NOENT));
         try d.drain(20);
         if (!d.owned) return error.EarlyExit;
     }
@@ -1515,7 +1519,7 @@ fn approvalCancel(d: *Driver) !void {
     std.debug.print("APPROVAL_CANCEL_GATE=verified\n", .{});
 }
 
-extern "c" fn mkdir([*:0]const u8, c_uint) c_int;
+extern "c" fn mkdir([*:0]const u8, c.mode_t) c_int;
 const approval_marker_content = "owned approval sentinel\n";
 
 fn checkApprovalMarker(init: std.process.Init, project: []const u8) !void {
@@ -1527,7 +1531,7 @@ fn checkApprovalMarker(init: std.process.Init, project: []const u8) !void {
 
 fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: []const u8) !void {
     // Do not materialize another large Screen on this history driver's stack.
-    errdefer std.debug.print("command PTY tail: {s}\n", .{d.output[d.used -| 3000..d.used]});
+    errdefer std.debug.print("command PTY acceptance failed\n", .{});
     try d.waitIdle(0);
     const accept = std.mem.eql(u8, mode, "settings-command-accept");
     const deny = std.mem.eql(u8, mode, "settings-command-deny");
@@ -1537,7 +1541,7 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
     try check(accept or deny or cancel or timeout or stable);
     const a = init.arena.allocator();
     const dir = try std.fmt.allocPrintSentinel(a, "{s}/.ssh", .{project}, 0);
-    if (mkdir(dir, 0o700) != 0) try check(c._errno().* == 17); // EEXIST
+    if (mkdir(dir, 0o700) != 0) try check(c._errno().* == @backingInt(c.E.EXIST));
     const marker = try std.fmt.allocPrint(a, "{s}/fixture-marker", .{dir});
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = marker, .data = approval_marker_content });
     try checkApprovalMarker(init, project);
@@ -1668,9 +1672,7 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
             from = end;
         }
         const settled = (try d.acknowledgedScreen(rejected)) orelse return error.AcceptanceFailed;
-        if (settled.visible(title)) {
-            for (settled.grid) |row| std.debug.print("denial row: {s}\n", .{std.mem.trimEnd(u8, &row, " ")});
-        }
+        if (settled.visible(title)) std.debug.print("denial title still visible\n", .{});
         try check(!settled.visible(title));
         try checkApprovalMarker(init, project);
     }
@@ -1682,7 +1684,7 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
 extern "c" fn access([*:0]const u8, c_int) c_int;
 
 fn previewAbsent(path: [*:0]const u8) !void {
-    try check(access(path, 0) == -1 and c._errno().* == 2);
+    try check(access(path, 0) == -1 and c._errno().* == @backingInt(c.E.NOENT));
 }
 
 fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const u8, pending: bool, summary: ?[]const u8) !void {
@@ -1805,7 +1807,7 @@ fn queuedFile(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []con
     const until = now() + 15000;
     while (now() < until) {
         if (access(path, 0) == 0) return;
-        try check(c._errno().* == 2);
+        try check(c._errno().* == @backingInt(c.E.NOENT));
         try d.drain(20);
         if (!d.owned) return error.EarlyExit;
     }
@@ -2293,6 +2295,26 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     size.col = if (std.mem.startsWith(u8, mode, "settings-command-") and !std.mem.eql(u8, mode, "settings-command-stable")) 160 else 80;
     size.row = 24;
 
+    // Darwin revokes a controlling PTY when its session leader exits. The
+    // disposable DRIVER, not Thin, must own this session through finish().
+    // Node must launch it detached:true with piped/non-TTY stdin and stdout.
+    // Refuse an attached invocation BEFORE acquiring any controlling terminal.
+    var ignore_action = std.mem.zeroes(c.Sigaction);
+    var default_action = std.mem.zeroes(c.Sigaction);
+    if (darwin) {
+        if (builtin.cpu.arch != .x86_64) return error.IntelDarwinFixtureRequired;
+        if (getsid(0) != c.getpid() or c.isatty(0) == 1 or c.isatty(1) == 1)
+            return error.DetachedNonTtyDriverRequired;
+        ignore_action.handler = .{ .handler = c.SIG.IGN };
+        default_action.handler = .{ .handler = c.SIG.DFL };
+        try check(c.sigemptyset(&ignore_action.mask) == 0);
+        try check(c.sigemptyset(&default_action.mask) == 0);
+        // Keep HUP ignored until process exit, including all PTY close/error
+        // paths. Thin resets it below, so product signal behavior is unchanged.
+        try check(c.sigaction(.HUP, &ignore_action, null) == 0);
+        try check(c.sigaction(.TTOU, &ignore_action, null) == 0);
+    }
+
     // 创建 PTY 对，初始窗口尺寸为 80x24。
     try check(openpty(&master, &slave, null, null, &size) == 0);
 
@@ -2303,12 +2325,21 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         _ = c.close(slave);
     };
 
+    // Only this just-created slave may become the driver's controlling TTY.
+    // Retain both original descriptors until Thin exits and finish verifies
+    // restoration; reopening a revoked slave would produce false evidence.
+    if (darwin) try check(c.ioctl(slave, @as(c_int, 0x20007461), @as(c_int, 0)) == 0);
+
     var original: abi.Termios = undefined;
     try check(abi.tcgetattr(slave, &original) == 0);
-    const flags = c.fcntl(slave, 3);
+    const flags = c.fcntl(slave, c.F.GETFL);
+    try check(flags >= 0);
 
-    // F_SETFL (4) 设置 O_NONBLOCK (0x800)，使 master 读取不会阻塞驱动循环。
-    try check(c.fcntl(master, 4, @as(c_int, 0x800)) == 0);
+    // Target O_NONBLOCK, preserving all other master file status flags.
+    const master_flags = c.fcntl(master, c.F.GETFL);
+    try check(master_flags >= 0);
+    const nonblock: c_int = @intCast(@as(u32, @bitCast(c.O{ .NONBLOCK = true })));
+    try check(c.fcntl(master, c.F.SETFL, master_flags | nonblock) == 0);
 
     // Seed pre-existing terminal OUTPUT through the owned slave, never master
     // input. --print backpressure must wait for genuine application stdout.
@@ -2319,14 +2350,23 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
 
     // fork 之后子进程只能调用 async-signal-safe 的 libc 函数。
     const pid = fork();
-    try check(pid >= 0);
+    if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
         // Async-signal-safe libc ONLY; all strings/argv/env prepared before fork.
         _ = c.close(master);
-        // 创建新会话，使 slave 能成为子进程的控制终端。
-        if (setsid() < 0) _exit(120);
-        // TIOCSCTTY (0x540e)：把 slave 设为控制终端，使信号（如 Ctrl-C）能正确投递。
-        if (c.ioctl(slave, @as(c_int, 0x540e), @as(c_int, 0)) < 0) _exit(121);
+        if (darwin) {
+            // Do not setsid: the driver must outlive Thin's controlling session.
+            // A background group's tcsetpgrp would stop on SIGTTOU unless ignored.
+            if (c.sigaction(.TTOU, &ignore_action, null) != 0) _exit(120);
+            if (c.setpgid(0, 0) != 0) _exit(120);
+            if (tcsetpgrp(slave, c.getpid()) != 0) _exit(121);
+            if (c.sigaction(.TTOU, &default_action, null) != 0) _exit(120);
+            if (c.sigaction(.HUP, &default_action, null) != 0) _exit(120);
+        } else {
+            // Linux keeps its original child-owned session/TIOCSCTTY path.
+            if (setsid() < 0) _exit(120);
+            if (c.ioctl(slave, @as(c_int, 0x540e), @as(c_int, 0)) < 0) _exit(121);
+        }
         // 将 slave 复制到 stdin/stdout/stderr。
         if (dup2(slave, 0) < 0 or dup2(slave, 1) < 0 or dup2(slave, 2) < 0) _exit(122);
         if (slave > 2) _ = c.close(slave);
@@ -2336,14 +2376,23 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         _exit(124);
     }
 
-    // 父进程安装 SIGTERM 与 SIGINT 处理器，使驱动在收到外部中断时能中止等待并清理子进程。
-    _ = signal(15, onSignal);
-    _ = signal(2, onSignal);
-
-    // 将 fd 所有权交给 Driver，并用 defer 保证任何退出路径都会清理子进程与 fd。
+    // Transfer PID AND fds before any fallible parent group/foreground setup:
+    // even a setup failure must kill/reap this exact child within two seconds.
     var d = Driver{ .master = master, .slave = slave, .pid = pid, .original = original, .flags = flags, .columns = size.col, .screens = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     handed_off = true;
     defer d.deinit();
+
+    // 父进程安装 SIGTERM 与 SIGINT 处理器，使驱动在收到外部中断时能中止等待并清理子进程。
+    _ = signal(@backingInt(c.SIG.TERM), onSignal);
+    _ = signal(@backingInt(c.SIG.INT), onSignal);
+
+    if (darwin) {
+        // Both sides establish the same group/foreground to close scheduling
+        // races. An already-exec'd child may reject setpgid (EACCES), but its
+        // exact owned group must still be verified before proceeding.
+        if (c.setpgid(pid, pid) != 0) try check(getpgid(pid) == pid);
+        try check(tcsetpgrp(slave, pid) == 0);
+    }
 
     if (std.mem.eql(u8, mode, "output")) {
         // A slow output consumer must not trap the installed signal handler.
@@ -2356,13 +2405,16 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         _ = c.poll(&pause, 1, 150);
 
         // 在子进程阻塞写入时发送 SIGINT，验证取消路径不会被未读取的输出卡住。
-        try check(kill(pid, 2) == 0);
+        try check(d.owned and kill(d.pid, @backingInt(c.SIG.INT)) == 0);
         const until = now() + 2000;
         // 循环非阻塞回收，最长等待 2 秒；超时则报告取消超时。
         while (d.owned and now() < until) {
-            const result = waitpid(pid, &d.status, 1);
+            const result = waitpid(pid, &d.status, c.W.NOHANG);
             if (result == pid) d.owned = false;
-            if (result < 0 and c._errno().* != 4) return error.WaitFailed;
+            if (result < 0 and c._errno().* != @backingInt(c.E.INTR)) {
+                if (c._errno().* == @backingInt(c.E.CHILD)) d.owned = false;
+                return error.WaitFailed;
+            }
             if (d.owned) _ = c.poll(&pause, 1, 5);
         }
         if (d.owned) return error.OutputCancellationTimeout;
@@ -2401,8 +2453,9 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     // report only fixed refusal identifiers.
     const startup_until = now() + 10000;
     d.waitIdleUntil(0, startup_until) catch |err| {
+        if (!d.owned) std.debug.print("error: ChildStatus{d}\n", .{d.status});
         // Only fixed identifiers from our owned child, never captured content.
-        for ([_][]const u8{ "InvalidConfig", "UnknownField", "DefaultModelUnavailable", "UnknownInputPriceThreshold", "InvalidProvider", "InvalidModel" }) |code| {
+        for ([_][]const u8{ "InvalidConfig", "UnknownField", "DefaultModelUnavailable", "UnknownInputPriceThreshold", "InvalidProvider", "InvalidModel", "NotDir", "SymlinkNotAllowed", "SpawnFailed", "CleanupFailed", "ParentGone", "MissingOwnerFd", "InvalidOwnerFd", "MissingOwnerPid", "PeerPidMismatch", "PeerUidMismatch", "PeerCredentialsUnavailable", "TtyRequired", "ForegroundRequired", "AccessDenied", "FileNotFound", "NameTooLong", "InvalidPath", "DirectoryMoved", "InsecureRuntimeBase", "IdentityChanged", "SocketPathTooLong", "Timeout" }) |code| {
             if (std.mem.indexOf(u8, d.output[0..d.used], code) != null) std.debug.print("error: {s}\n", .{code});
         }
         return err;
@@ -3408,7 +3461,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
 
         if (std.mem.eql(u8, mode, "term")) {
             // term 模式：直接发送 SIGTERM，期望退出码 143（128 + 15）。
-            try check(kill(pid, 15) == 0);
+            try check(d.owned and kill(d.pid, @backingInt(c.SIG.TERM)) == 0);
             try d.finish(143);
             return;
         }
@@ -3442,7 +3495,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         for ([_]u16{ 40, 80, 120 }) |width| {
             size.col = width;
             // IOCSWINSZ 设置窗口尺寸，内核会向前台进程组发送 SIGWINCH；此处只登记新尺寸。
-            try check(c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &size) == 0);
+            try check(posix_terminal.setSize(slave, &size) == 0);
             const edited = d.used;
             try d.send("x");
             try d.waitFrame(edited, "x");

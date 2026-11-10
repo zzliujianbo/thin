@@ -11,11 +11,13 @@ const interrupt = @import("../platform/interrupt.zig");
 const worker = @import("worker.zig");
 const client = @import("client.zig");
 const supervisor = @import("supervisor.zig");
+const capabilities = @import("../platform/capabilities.zig");
 
 pub fn run(init: std.process.Init, options: cli.Options) !u8 {
+    try capabilities.validate(options);
     return switch (options.mode) {
         // Explicit service mode only; ordinary foreground never starts a daemon.
-        .daemon => supervisor.run(init, options),
+        .daemon => if (comptime capabilities.daemon) supervisor.run(init, options) else error.UnsupportedPlatformMode,
         .worker => worker.run(init, options),
         .foreground, .connect, .attach => blk: {
             var guard = try interrupt.Guard.install();

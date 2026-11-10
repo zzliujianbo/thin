@@ -69,13 +69,22 @@ pub const Root = struct {
     /// 持有 path 等堆内存的分配器。
     allocator: std.mem.Allocator,
 
-    /// 打开 path 作为根目录。拒绝空路径、NUL、".."；路径中任何符号链接都会因 O_NOFOLLOW 失败。
+    /// 打开 path 作为根目录。拒绝空路径、NUL、".."；仅 Darwin 已验证的根用户系统别名
+    /// /tmp、/var 可重写，其余路径中的符号链接仍因 O_NOFOLLOW 失败。
     pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Root {
         if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return error.InvalidPath;
+        // Only Apple's verified root-owned system aliases are rewritten;
+        // arbitrary HOME/project symlinks still fail the anchored nofollow walk.
+        const canonical = if (@import("builtin").os.tag == .macos and std.fs.path.isAbsolute(path))
+            try native.systemPath(allocator, path)
+        else
+            null;
+        defer if (canonical) |owned| allocator.free(owned);
+        const walk_path = canonical orelse path;
         // AT_FDCWD is target-dependent (-100 on Linux, -2 on Darwin).
-        var fd = try openDirectory(std.c.AT.FDCWD, if (std.fs.path.isAbsolute(path)) "/" else ".");
+        var fd = try openDirectory(std.c.AT.FDCWD, if (std.fs.path.isAbsolute(walk_path)) "/" else ".");
         errdefer closeFd(fd);
-        var parts = std.mem.tokenizeScalar(u8, path, '/');
+        var parts = std.mem.tokenizeScalar(u8, walk_path, '/');
         while (parts.next()) |part| {
             if (std.mem.eql(u8, part, "..")) return error.InvalidPath;
             if (std.mem.eql(u8, part, ".")) continue;

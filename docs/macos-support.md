@@ -5,18 +5,19 @@
 - 特性分支：`feat/macos-support`；生产源码基线为 `main` 的 `85a53aa`。
 - 本文件是仓库内的公开方案，`.gitignore` 仅为此文件开放例外，其余私有 docs/plans 仍保持忽略。
 - Linux 主分支行为保持不变；完成稳定性与回归验收后再合并，不在适配过程中直接修改或合并到 `main`。
-- 目标架构：macOS x86_64 和 aarch64；Zig 固定为 0.17.0。
-- 最低系统版本须由 SDK/API、本地模式依赖和目标机器验收共同确定，暂不作版本兼容承诺。macOS 不以 libssh 作为依赖或版本门槛。
-- 本文是实施计划，不是产品已支持 macOS 的声明。独立探针通过不代表 `thin` 已可构建或运行。
+- 当前目标架构仅为 **macOS x86_64（Intel Mac）**；Zig 固定为 0.17.0。Apple Silicon/aarch64 适配和实机验收明确不做，不列为待办或完成门槛；已有通用代码不因此删除。
+- 最低 macOS 版本及其他 Mac 机器的兼容验证明确不做，不列为待办、发布或完成门槛；仅报告当前机器实测环境，不作未经验证的版本/异机兼容承诺。macOS 不以 libssh 作为依赖或版本门槛。
+- 本文记录实施计划与实测证据：当前 Intel Mac 已通过本地模式构建、单元及隔离端到端验收，但不据此承诺最低系统版本、其他机器或生产压力下的发布兼容性。
 
 ## 交付范围（按当前约定缩减）
 
-- **做**：本地前台 CLI/TUI、`--print`、工具执行、Memory、本地 checkpoint 恢复、实例生命周期内的后台任务，以及本地安装/升级/回滚。
+- **做**：本地前台 CLI/TUI、`--print`、工具执行、Memory、本地 checkpoint 恢复及实例生命周期内的后台任务。用户随后追加授权 `install.sh` 的 Intel macOS 安装适配及隔离验收；真实系统安装仍由用户手动操作。
 - **不做**：macOS SSH 入口、TCP SSH 监听、常驻 daemon、daemon 会话接入/断线续跑、launchd 或其他服务托管。这些不再是 macOS 发布或合并门槛，也不是需要补齐的“临时缺失”。
 - **保留 Linux 功能**：不删除或禁用既有 Linux SSH、daemon 及其测试；Linux 回归仍覆盖原功能。
 - **内部 worker/IPC 仍需做**：当前普通前台也启动实例自有 worker、使用本地 Unix socket 和部分 `daemon/` 下的共享代码。这不是用户级常驻 daemon，不能因取消 daemon 支持就整目录删除或跳过安全、回收与持久化边界。
 - 本地 `--resume` 等 checkpoint 恢复继续保留；不为 daemon 会话额外实现 attach/takeover。若共享的 attach 逻辑是现有前台所必需，只处理本地所需路径。
-- 本轮只是调整计划，尚未实现平台能力开关：当前 macOS 产品构建仍整体被拒绝。后续按下述构建/参数拒绝规则落实，不能把文档约定当成代码已完成。
+- 产品能力开关与 Darwin 本地后端代码已完成，本机 Debug/ReleaseSmall 产品构建、完整单元和四套既有本地端到端验收均通过；最低 macOS 版本及其他 Mac 机器验证明确排除。
+- 先按用户要求完成代码、统一构建/单元测试并停止；随后经明确授权完成既有 CLI/TUI 端到端验收，再追加安装脚本适配及临时目录验收。用户现已授权提交并推送 `feat/macos-support`；不向真实安装目录安装，不发布或合并到 `main`。
 
 ## 不可降低的约束
 
@@ -44,10 +45,10 @@
 | 通知 | 非阻塞管道，写满合并通知，drain 后复查真实队列；关闭前 join 所有生产者 |
 | curl 输入 | 可取消的有界并发管道，防止大配置死锁，保留不落盘和密钥不进入 argv 的边界 |
 | SSH / 常驻 daemon | 不做 macOS 后端；编译期排除监听器、SSH C 源和 daemon supervisor，保留前台需要的共享 worker/IPC；Linux 现有路径不变 |
-| 构建与安装 | Darwin 使用 LLVM（自有后端限制见下文），macOS 不编译 SSH C 源、不链接/要求 libssh；移除 GNU 专属安装参数，保留原子替换和别名防覆盖；Linux 后端和依赖不变 |
+| 构建与安装 | Darwin 使用 LLVM（自有后端限制见下文），macOS 不编译 SSH C 源、不链接/要求 libssh；Linux 后端和依赖不变。`install.sh` 支持系统 Bash 3.2 与 BSD 工具；Darwin 用系统 Perl 的原子 symlink/rename 保留 exact-leaf 发布语义 |
 | 服务托管 | macOS 不提供 launchd/常驻服务样例，不安装或隐式拉起服务 |
 
-最新 SDK 存在的接口不一定支持旧系统。例如 `posix_spawn_file_actions_addfchdir` 从 macOS 26 提供，而 `_np` 版本从 10.15 提供；最低版本须显式约束。
+最新 SDK 存在的接口不一定支持旧系统。例如 `posix_spawn_file_actions_addfchdir` 从 macOS 26 提供，而 `_np` 版本从 10.15 提供；这里只记录 API 差异，不扩展最低版本或异机验收。
 
 ## 阶段与门槛
 
@@ -86,14 +87,16 @@
 
 #### 当前落地状态
 
-- 已落地：特性分支、本文、P0 独立探针和失败清理回归；P1a 的文件系统后端、调用收口和原生测试入口。
-- 本机候选机制：IPC 身份/目录锚定、WNOWAIT、组内状态分类、owner 死亡 EOF 已通过独立验证。
-- 当前产品仍限制 Linux x86_64；新增显式 platform-only 测试模式，不提供 macOS `thin` 可执行文件。
-- 未落地：P1 的终端、进程、通知、前台必需的 IPC/registry、平台能力隔离，以及缩减范围后的 P2–P4。SSH、常驻 daemon、launchd 不再列为 macOS 待办。
-- 未证明：最低 macOS、原生 arm64、完整产品及 Linux 运行回归、生产并发/压力/异常注入门槛。
-- 下一步：继续 P1 其余平台边界；不能把文件系统子集通过当作整个 P1 或产品验收通过。
+- 已验证基础：P0 独立机制、P1a 文件系统，以及 P1b 终端/通知独立测试。
+- 已实现并通过完整单元及本地端到端：Darwin 进程启动/回收、本地 IPC/registry、owner 生命周期管道、匿名请求输入、产品构建与能力隔离；Runtime、工具、Memory、checkpoint 和实例后台任务通过这些共享边界运行，不重写业务协议。
+- macOS 构建图已开放 x86_64/aarch64 本地产品；不编译 SSH C 源、不链接 libssh。`check` 只编译，不安装或执行产品。
+- 最新验证：本机 macOS x86_64 Debug/ReleaseSmall 产品与 PTY 驱动构建通过，两模式完整 unit 根各 **1903 通过、9 项 Linux 专属跳过、0 失败**；四套既有端到端两模式均通过，详见 P2。
+- 最终修复后 Linux x86_64 完整 unit 根语义编译通过，没有 Linux 原生执行。此前 Darwin arm64 产品交叉链接通过，未在最终修复后重跑，也不属于本轮交付范围。
+- Linux 原生运行及生产压力未验证；mock 验收不等于真实提供方或外网 TLS/代理已验证。最低 macOS 版本、其他 Mac 机器及 Apple Silicon 验证明确定为不做，不是待办或完成门槛。以上端到端阶段未运行安装、发布、推送或合并；后续安装脚本与推送授权见 P3。
 
 ### P1：平台基础
+
+**执行优先级：先打通 macOS 本地 CLI 的 `--print` 编译与运行主链路。** 不擅自扩展额外探针或验收范围；主链路不依赖的完善项后置。保留必要回归以及既定文件/IPC 安全、实例自有进程有界回收约束，不用跳过平台实现换取表面编译成功。
 
 收口文件身份、flags/errno、终端 ABI、启动/回收、通知、可执行文件定位与 IPC。平台单元测试、竞态测试通过，Linux 对应回归不退化。
 
@@ -124,7 +127,7 @@ zig build test-filesystem -Dplatform-tests-only=true -Doptimize=ReleaseSmall --s
 zig build test-presentation -Dplatform-tests-only=true --summary all
 ```
 
-`platform-tests-only` 是显式的受限构建模式。默认安装、显式 install/run 必须失败，不创建产品；正常 macOS 构建仍被拒绝。`tests/macos/test_build_mode.py` 检查这些边界。Linux 正常产品构建仍使用原后端和依赖方式。
+`platform-tests-only` 是显式的受限构建模式。该模式默认安装、显式 install/run 必须失败，不创建产品；正常 macOS 产品构建已开放并通过后续集中验证。`tests/macos/test_build_mode.py` 检查这些边界。Linux 正常产品构建仍使用原后端和依赖方式。
 
 本机验证（macOS 26.7.2 x86_64 / Zig 0.17.0）：
 
@@ -134,26 +137,88 @@ zig build test-presentation -Dplatform-tests-only=true --summary all
 - Linux x86_64 focused 根交叉生成/链接 ELF；完整 unit 根及 memory 根语义编译通过，**未执行 Linux 测试**。
 - Darwin arm64 focused 根交叉生成/链接 Mach-O，**未原生执行，也不代表 macOS 14 最低版本已验收**。
 
-`daemon/unix.zig`、registry 等本轮只迁移通用文件/锁调用；其 statx 布局、socket、安全绑定与身份后端仍待后续 P1 实现。完整 Linux 运行回归是后续合并门槛，交叉编译不能替代。
+P1a 当时只迁移通用文件/锁调用；`daemon/unix.zig`、registry 的其余后端现已在后续代码中实现，验证状态见当前落地状态。完整 Linux 运行回归是后续合并门槛，交叉编译不能替代。
+
+#### P1b：终端与通知（核心及本地产品验收已通过）
+
+- Darwin 使用 libc termios ABI；Linux 保留原 glibc 60 字节布局及 SSH 路径。终端 flags、errno、ioctl、poll 和流控按目标平台处理，macOS 终端链路不引用 SSH C 符号。
+- Darwin wakeup 使用 NONBLOCK/CLOEXEC pipe，保留 Linux eventfd；pipe drain 有界，调用方仍以实际工作队列为准。pipe+fcntl 不具备原子 CLOEXEC 保证，后续 spawn 必须使用默认关闭及明确 FD 白名单。
+- locale 只设置 CTYPE，保留其他类别；启动时间使用目标 `time_t`。独立 C SDK 检查校验 termios、locale、ioctl 和流控 ABI；Darwin 恢复比较只排除内核维护的 PENDIN/FWASWRITTEN 状态。
+- `zig build test-terminal -Dplatform-tests-only=true --summary all`：终端根 Debug/ReleaseSmall 各 301/301 通过。Linux 完整 unit/终端根语义编译、Darwin arm64 终端根链接通过，均不代表异机原生执行。
+- 撤掉偏离优先级的额外 controlling-PTY 探针，不恢复该探针。本地产品闭环改用既有 PTY 夹具，实测结果见 P2，平台测试本身不替代产品验收。
+
+#### P1c：其余本地后端与产品入口（代码与集中单元验证完成）
+
+- `darwin_process.c` / `process_darwin.zig`：posix_spawn、cwd dirfd、信号/进程组、默认关闭及 FD 白名单、WNOWAIT、libproc/sysctl 组状态分类、有界回收；保留 Linux fork/procfs 路径。
+- `metadata.zig` / `ipc_native.zig` / `darwin_ipc.c`：目标元数据、已知系统路径别名、dirfd 锚定 helper bind/SCM_RIGHTS、真实服务 listen、内核 peer PID/UID、身份一致才清理。
+- `daemon/spawn.zig` / `worker.zig`：Darwin 只允许前台 owner，专用 pipe 检测 owner 死亡；仅传 reader，退出取消/join/保存；共享通信按目标 errno/poll 运行。
+- `anonymous_input.zig`：Linux 保留 memfd，Darwin 并发有界可取消 pipe 输入；借用配置在退出前 join，不落普通磁盘文件、不把密钥放进 argv。
+- `capabilities.zig` / CLI / 入口：Mac 不支持的服务/SSH 模式在配置、worker 或请求创建前拒绝；Linux 服务功能保持原路径。帮助文本区分平台。
+- `build.zig`：Darwin LLVM + 本地 C shim，Linux 保留原后端/libssh；新增 `check` 编译步骤，不触发安装。
+
+集中验证入口为 `zig build check test-unit --summary all` 及 ReleaseSmall 单元测试；这些不是安装或端到端验收。遇到测试崩溃使构建 runner 等待时，实际采用编译完整 unit 根后直接执行二进制记录全部进度，该阶段两模式各 1902 通过、9 跳过、0 失败；P2 修复后再次完整回归，最新为各 1903/9/0。Darwin 配置 32 MiB 主栈，避免 LLVM Debug 下多个有界 metadata/Session 副本导致栈溢出，Linux 栈策略不变。
+
+集中修复包含：SCM_RIGHTS 接收前保留原 socket FD 引用（避免 XNU 将监听器标记读关闭）、PTY 测试目标 NONBLOCK/状态位、目标目录删除标志、配置 fixture 密钥可写所有权，以及平台化 help 断言。临时诊断已移除。不运行安装脚本，不自动发布或合并。
 
 ### P2：本地产品闭环
 
-完成本地 `--print`、前台 TUI、工具、Memory、本地恢复及当前实例内的后台任务。通过本机隔离 HTTP/TLS/代理和真实 PTY 验收，验证取消、恢复、权限、输出背压与前台退出后的资源回收。
+#### 当前追加验收（用户已授权，已完成）
+
+上一轮在单元测试通过后按约定停止；用户随后明确授权继续 **Intel Mac CLI/TUI 端到端验证**。该端到端阶段不涉及 Apple Silicon、SSH、常驻 daemon、安装、推送或合并；后续安装与推送授权独立记录于 P3。
+
+复用现有 `test-app`（含 CLI Chat/Responses、工具/审批、中文/流式/窗口变化及真实 checkpoint 恢复）、`test-memory-app`、`test-memory-background`、`test-background`。不运行依赖 daemon 的 resume-menu，也不为本轮引入 tmux/额外探针。所有应用只用独占 HOME/项目/XDG 与本地 loopback 模拟服务、伪凭据；不调用付费 API。
+
+现有 PTY 夹具在 Darwin 由驱动/controller 持有 session，Thin 使用独立 foreground 进程组，使退出后仍可在原 slave 严格核对恢复（不重开终端伪造默认状态）；仅归一化已验证的 PENDIN/FWASWRITTEN。后台存活/退出用 kill(pid, 0) 与有界本机 ps 联合观察，僵尸/查询不确定不算已回收；成功必须同时证明 PID 消失及服务 loopback 连接被拒绝，fixture lease 保底只在成功断言之后或失败清理时使用。
+
+本轮修复两个真实 Darwin 运行问题：
+
+- `Root.open` 接受经根用户身份/预期目标核验的 `/tmp`、`/var` 系统别名；归一化集中于 `filesystem_native.systemPath`，其余项目符号链接仍被逐级 nofollow 拒绝。新增回归覆盖合法别名与用户链接拒绝。恢复夹具用真实 canonical 项目路径校验新上下文，不放松历史隔离断言。
+- XNU 间接 `/dev/tty` 描述符可在 poll 中返回 POLLNVAL；Darwin C helper 改开内核报告的实际 tty 节点新描述符，并核对 nofollow、设备/inode、session 及 foreground group。Linux 仍使用原 `/dev/tty` 路径。临时生产诊断已移除。
+
+最终本机结果（macOS 26.7.2 x86_64，Zig 0.17.0，LLVM，32 MiB 主栈）：
+
+| 既有验收入口 | Debug | ReleaseSmall | 实际覆盖证据 |
+| --- | --- | --- | --- |
+| `app_mock.mjs`（`test-app`，不加子集参数） | 通过 | 通过 | 每模式 93 条 PASS 标签（含夹具自检）；CLI Chat/Responses、工具/取消、真实 PTY、selection restore、完整 Chat/Responses checkpoint 恢复 |
+| `memory_auto_mock.mjs`（`test-memory-app`） | 通过 | 通过 | 每模式 primary=7、helper=5；先答后辅助、drain、保存/检索、Off、日志、无旧 jobs、interrupt |
+| `memory_background_mock.py`（`test-memory-background`） | 通过 | 通过 | 每模式 3 个独占 PTY，primary=7、helper=7；运行中下一轮输入、FIFO、已保存事实、退出取消及原 slave 恢复 |
+| `background_mock.py`（`test-background`） | 通过 | 通过 | 每模式 CLI 6 个并发真实 loopback 服务及退出回收；单 TUI 跨两任务保持同一服务、显式 stop、退出及原 slave 恢复 |
+| 完整 `src/root.zig` 单元回归 | 1903 通过 / 9 跳过 / 0 失败 | 1903 通过 / 9 跳过 / 0 失败 | 包含本轮系统别名与 nofollow 回归；9 项为 Linux 专属 |
+
+本机产物及日志目录：`/tmp/thin-macos-e2e.30XEQI`（临时证据，不是仓库产物）。最终文件为 `app-{debug,small}.log`、`memory-cli-{debug,small}.log`、`memory-tui-{debug,small}.log`、`background-{debug,small}.log`、`unit-{debug,small}.log`，产品与驱动在 `bin/`。完整 unit 根编译后直接运行，避免构建协议掩盖崩溃进度；Linux 最终语义检查见 `linux-semantic.log`。
+
+复跑使用上述既有脚本与同模式产品/PTY 驱动，`TMPDIR=/tmp`；app 入口必须不带 `--resume-only` 或 `--selection-restore-only` 等子集开关。全部为私有配置与 loopback HTTP/真实 PTY，不以这些结果宣称真实提供方、外网 TLS/代理或生产压力已验证。本轮验收至此结束。
 
 不要求 macOS daemon/SSH 接入、脱离前台后的常驻任务或远程重连；增加不支持参数的负向验收，证明拒绝时没有监听、服务/worker 启动或模型请求等副作用。
 
 ### P3：本地安装与发布准备（范围已调整）
 
-原 P3 的 macOS SSH、常驻 daemon 和 launchd 工作取消，不再是未完成项或合并条件。
+macOS SSH、常驻 daemon、launchd、Apple Silicon、最低系统版本及其他 Mac 机器验证明确不做，不列为待办或完成门槛。
 
-仅保留本地安装脚本的 BSD 兼容、架构/依赖说明、升级与回滚；不安装或启用后台服务。发布的 macOS 本地版不依赖 libssh，需检查产物动态库依赖。只声明本地模式兼容，不声明 SSH/daemon 能力；Linux 相关部署样例保持原状。
+用户追加授权修改 `install.sh` 支持 Intel macOS 安装，并提交推送当前特性分支。脚本仍以当前用户构建 ReleaseSmall，只在目标目录需权限时使用 sudo，不改 shell 配置，不安装或启用服务。默认安装 `/usr/local/bin/thin` 并创建相对别名 `t -> thin`，可用 `INSTALL_DIR` 指定其他绝对目录；Zig 固定 0.17.0。
+
+- Linux 保留 GNU `ln -sT` / `mv -fT`。Darwin BSD 工具没有等价 `-T`，使用预检后的系统 Perl `symlink` / `rename` 内建操作，精确作用于目标叶节点；不把目标目录当容器、不跟随指向目录的目标链接，保留原子替换及别名竞态拒绝。
+- 移除 Darwin 不适用的调用形式；以函数而非空数组分派 sudo，兼容系统 Bash 3.2 的 `set -u`。仅允许 Intel Darwin；不为 Apple Silicon 扩展安装支持。
+- 复用 `tests/install_test.sh`：Darwin 原生与 Linux 命令分派两种各 8 条 PASS，覆盖构建/复制/发布失败保护、临时文件清理、文件/链接/目录 alias 竞态、权限、含空格路径、重复升级、悬空别名和目标目录保护。Linux 分派在本机用受控包装器模拟 GNU exact-leaf 命令，不等同于 Linux 原生执行。
+- 实际执行脚本构建并安装到 `/tmp/thin-macos-install.yxW73G/installed bin`：真实 ReleaseSmall 产品与 `t` 的 `--help` 一致，权限 0755，相对别名正确，无 libssh 动态依赖；未写真实安装目录。证据为同一临时目录的 `fixture-{Darwin,Linux}.log`、`actual-install.log`、`installed-help.log`、`alias-help.log`。
+- 补齐既有 `test-terminal` 构建图对 Darwin C helper 的链接；`zig build test-terminal -Dplatform-tests-only=true --summary all` 再次通过 301/301 和独立 SDK ABI 检查，日志为 `terminal-build-regression.log`。此前 P2 完整单元/E2E 结果不重算为安装测试。
+
+真实安装由用户手动运行：
+
+```sh
+./install.sh
+# 或使用无需 sudo 的用户目录（PATH 由用户自行配置）
+INSTALL_DIR="$HOME/.local/bin" ./install.sh
+```
+
+安装需要 Zig 0.17.0 及 macOS 编译工具链/SDK；Darwin 原子发布还需要系统 Perl，不要求 GNU coreutils、libssh 或 Python。不声明未测试的整机升级/回滚；Linux 部署样例保持原状。
 
 ### P4：发布与合并
 
-- Linux x86_64 原有功能（含 SSH/daemon）继续回归；macOS x86_64、macOS aarch64 原生执行本地模式对应的 Debug 与 ReleaseSmall 回归，不要求 macOS SSH/daemon 验收。
+- Linux x86_64 原有功能（含 SSH/daemon）继续回归；当前仅要求 macOS x86_64 原生执行本地模式对应的 Debug 与 ReleaseSmall 回归，不要求 Apple Silicon 或 macOS SSH/daemon 验收。
 - Linux 专属 seccomp/capabilities 探针保留，明确说明 macOS 的不同覆盖，不以移除平台检查代替验收。
 - 覆盖退出、超时、忽略 TERM、组长先退出、owner 异常死亡、目录替换、硬链接/FIFO、防护文件、会话锁、IPC 身份和凭据输入。
 - macOS 覆盖终端恢复、中文显示、尺寸变化、粘贴、背压、HTTP/TLS/代理、本地恢复及前台退出清理；覆盖不支持模式的明确拒绝和无副作用，不要求 SSH 断线重连或服务常驻。
-- 对最低系统版本、两种架构、动态库依赖、安装/升级/回滚给出明确证据与说明。
+- 记录当前 Intel Mac 实测环境与动态库依赖；最低 macOS 版本、其他 Mac 机器、Apple Silicon、macOS SSH/常驻 daemon/launchd 明确不做，不作为待办或门槛。安装/升级/回滚由用户手动操作。
 - 清理不确定、身份校验缺失、数据损坏、终端状态未恢复等阻断问题未关闭时不合并。
-- 合并前检查完整分支 diff；不自动 push、发布或合并到 `main`。
+- 合并前检查完整分支 diff；仅按本次明确授权提交并推送 `feat/macos-support`，不发布或合并到 `main`。
