@@ -41,6 +41,7 @@ pub const Call = struct {
     kind: Kind,
     detail: ?[]const u8 = null,
     truncated: bool = false,
+    display: ?@import("../core/background_status.zig").Caption = null,
 
     pub fn init(a: std.mem.Allocator, name: []const u8, arguments: []const u8) !Call {
         const kind = Kind.fromName(name);
@@ -130,10 +131,12 @@ pub const Completion = struct {
     outcome: Outcome,
     file_stats: ?FileStats,
     duration_ms: ?u64 = null,
+    display: ?@import("../core/background_status.zig").Caption = null,
 
     pub fn fromExecution(result: r.Execution) Completion {
         const outcome: Outcome = if (result.canceled) .canceled else if (result.is_error) .failed else .success;
-        return .{ .outcome = outcome, .file_stats = if (outcome == .success) result.file_stats else null, .duration_ms = result.duration_ms };
+        const handoff = if (result.display) |display| display.action == .start and outcome == .success else false;
+        return .{ .outcome = outcome, .file_stats = if (outcome == .success) result.file_stats else null, .duration_ms = if (handoff) null else result.duration_ms, .display = result.display };
     }
 };
 

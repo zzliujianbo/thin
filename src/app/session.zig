@@ -34,6 +34,7 @@ const codex_oauth = @import("codex_oauth.zig");
 const codex_auth = @import("../core/codex_auth.zig");
 const p = @import("../core/protocol.zig");
 const memory_status = @import("../core/memory_status.zig");
+const background_status = @import("../core/background_status.zig");
 const MemoryNotifications = @import("memory_notifications.zig").Queue;
 
 test {
@@ -263,6 +264,9 @@ pub const Session = struct {
     /// Project fd anchors histories/memory only, never thinking preferences.
     project_root: fs.Root,
     preferred_effort: ?presentation.ReasoningEffort = null,
+    /// Owner-only: spans spawn through the actual future join.
+    owner_task_active: bool = false,
+    thinking_pending: bool = false,
     initial_default_pending: bool = false,
     settings_error: ?anyerror = null,
     settings_notice: ?[]const u8 = null,
@@ -623,9 +627,65 @@ pub const Session = struct {
         return self.takeMemoryCompletion();
     }
 
+    pub fn backgroundView(self: *Session) background_status.View {
+        return if (self.app) |app| app.backgroundView() else .{};
+    }
+
+    pub fn peekBackgroundCompletion(self: *Session) ?background_status.Terminal {
+        return if (self.app) |app| app.peekBackgroundCompletion() else null;
+    }
+
+    pub fn takeBackgroundCompletion(self: *Session, id: background_status.Id) void {
+        if (self.app) |app| app.takeBackgroundCompletion(id);
+    }
+
+    fn peekBackgroundCallback(raw: *anyopaque) ?background_status.Terminal {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        return self.peekBackgroundCompletion();
+    }
+
+    fn takeBackgroundCallback(raw: *anyopaque, id: background_status.Id) void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        self.takeBackgroundCompletion(id);
+    }
+
+    pub fn beginOwnerTask(self: *Session) !void {
+        try self.guardSelection();
+        if (self.app == null) return error.Unavailable;
+        self.owner_task_active = true;
+    }
+
+    /// Only the owner, after the future has actually joined, may call this.
+    pub fn finishOwnerTask(self: *Session) void {
+        if (!self.owner_task_active) return;
+        if (self.app) |app| {
+            if (self.thinking_pending) {
+                if (app.thinking_control.get()) |selection| {
+                    app.config.value.model.reasoning_effort = selection.reasoning_effort;
+                    app.config.value.model.reasoning = selection.reasoning;
+                    app.recordSelection();
+                    self.publishCheckpoint();
+                }
+            }
+            app.thinking_control.clear();
+        }
+        self.thinking_pending = false;
+        self.owner_task_active = false;
+    }
+
+    fn taskBegin(raw: *anyopaque) !void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        try self.beginOwnerTask();
+    }
+
+    fn taskJoined(raw: *anyopaque) void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        self.finishOwnerTask();
+    }
+
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin, .take_memory_completion_fn = takeMemoryCompletionCallback };
+        return .{ .context = self, .task_begin_fn = taskBegin, .task_joined_fn = taskJoined, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin, .take_memory_completion_fn = takeMemoryCompletionCallback, .peek_background_fn = peekBackgroundCallback, .take_background_fn = takeBackgroundCallback };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -784,7 +844,8 @@ pub const Session = struct {
 
     fn current(raw: *anyopaque) tui.Connection.State {
         const self: *Session = @ptrCast(@alignCast(raw));
-        const config = if (self.app) |app| app.config.value else self.pending.?.value;
+        const base = if (self.app) |app| app.config.value else self.pending.?.value;
+        const config = self.pendingThinkingConfig(base);
         const unselected = self.app == null and self.loaded_checkpoint == null;
         var provider_count: usize = 0;
         if (self.global_config.?.value.registry) |registry| {
@@ -873,6 +934,7 @@ pub const Session = struct {
             .proxy_port = if (self.global_config.?.value.proxy) |value| value.port else 0,
             .memory_auto = config.memory.auto,
             .memory = if (self.app) |app| app.memoryView() else .{},
+            .background = self.backgroundView(),
             .subagents = if (self.app) |app| app.subagentView() else .{},
             .subagents_supported = true,
             .global_settings_available = !self.read_only,
@@ -1019,12 +1081,12 @@ pub const Session = struct {
     pub fn pollCodexLogin(self: *Session) !bool {
         if (self.codex_job) |job| {
             if (job.done.load(.acquire)) {
-                if (self.app) |app| if (app.runtime.busy.load(.acquire)) {
+                if (self.owner_task_active or (if (self.app) |app| app.runtime.busy.load(.acquire) else false)) {
                     const view = job.snapshot();
                     const changed = !std.meta.eql(view, self.codex_reported);
                     self.codex_reported = view;
                     return changed;
-                };
+                }
                 if (job.future) |*future| future.await(self.io);
                 job.future = null;
                 self.codex_view = job.snapshot();
@@ -1201,6 +1263,7 @@ pub const Session = struct {
         session.last_subagent_view = .{};
         defer session.last_subagent_view.deinitOwned(session.allocator);
         session.app = null;
+        session.owner_task_active = false;
         session.initial_default_pending = false;
         session.codex_job = null;
         session.codex_view = .{};
@@ -1231,8 +1294,9 @@ pub const Session = struct {
 
     /// Owner polling never waits for network. Notice publication only dirties
     /// presentation; the active Runtime budget stays frozen until selection.
-    fn pollModels(raw: *anyopaque, idle: bool) bool {
+    fn pollModels(raw: *anyopaque, reported_idle: bool) bool {
         const self: *Session = @ptrCast(@alignCast(raw));
+        const idle = reported_idle and !self.owner_task_active;
         const memory_view = if (self.app) |app| app.memoryView() else @import("../core/memory_status.zig").View{};
         const memory_changed = self.memoryViewChanged(memory_view);
         const subagent_view = if (self.app) |app| app.subagentView() else @import("../core/subagent_status.zig").View{};
@@ -1623,7 +1687,7 @@ pub const Session = struct {
 
     fn guardSelection(self: *Session) !void {
         if (self.read_only) return error.ResumeReadOnly;
-        // TUI additionally owns the future-joined requirement.
+        if (self.owner_task_active) return error.Busy;
         if (self.app) |app| {
             if (app.runtime.busy.load(.acquire)) return error.Busy;
             if (app.runtime.poisoned) return error.UnsafeToContinue;
@@ -2057,6 +2121,24 @@ pub const Session = struct {
         return self.configureRegistryProvider(id, key);
     }
 
+    fn pendingThinkingConfig(self: *const Session, base: cfg.Config) cfg.Config {
+        var result = base;
+        if (self.thinking_pending) if (self.app) |app| {
+            if (app.thinking_control.get()) |selection| {
+                result.model.reasoning_effort = selection.reasoning_effort;
+                result.model.reasoning = selection.reasoning;
+            }
+        };
+        return result;
+    }
+
+    fn guardEffort(self: *Session) !void {
+        if (self.read_only) return error.ResumeReadOnly;
+        // Poison is checked at begin and after join; the worker owns it while
+        // running, so reading it here would race the worker.
+        if (!self.owner_task_active) try self.guardSelection();
+    }
+
     /// Cache-only opt-in: discover a missing map on an explicit effort action,
     /// never replace an already accepted map or re-resolve unrelated budgets.
     fn effortCandidate(self: *const Session, config: cfg.Config) cfg.Config {
@@ -2093,7 +2175,7 @@ pub const Session = struct {
         if (!self.initial_default_pending or self.read_only) return false;
         const app = self.app orelse return false;
         // Join/idle ownership precedes every read of the mutable journal.
-        if (!idle or app.runtime.busy.load(.acquire)) return false;
+        if (!idle or self.owner_task_active or app.runtime.busy.load(.acquire)) return false;
         const config = &app.config.value;
         if (app.journal.started or hasConversationData(app.runtime.messages()) or
             config.model.reasoning_effort != null or config.model.reasoning != null)
@@ -2137,8 +2219,8 @@ pub const Session = struct {
 
     fn cycleEffort(raw: *anyopaque) !presentation.ReasoningEffort {
         const self: *Session = @ptrCast(@alignCast(raw));
-        try self.guardSelection();
-        const config = self.mutableConfig().*;
+        try self.guardEffort();
+        const config = self.pendingThinkingConfig(self.mutableConfig().*);
         const current_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort);
         const capabilities = self.capabilitiesFor(self.effortCandidate(config));
         const next = capabilities.levels.next(current_effort) orelse {
@@ -2153,10 +2235,11 @@ pub const Session = struct {
 
     fn setEffort(raw: *anyopaque, effort: presentation.ReasoningEffort) !void {
         const self: *Session = @ptrCast(@alignCast(raw));
-        try self.guardSelection();
+        try self.guardEffort();
         const name = effort.name() orelse return error.InvalidReasoningEffort;
         const config = self.mutableConfig();
-        var candidate = self.effortCandidate(config.*);
+        const base = self.pendingThinkingConfig(config.*);
+        var candidate = self.effortCandidate(base);
         const capabilities = self.capabilitiesFor(candidate);
         if (!capabilities.levels.contains(effort)) return error.UnsupportedReasoningEffort;
         candidate.model.reasoning_effort = name;
@@ -2170,13 +2253,23 @@ pub const Session = struct {
         errdefer inline for (0..fields.len) |i| {
             if (@field(owned_map, fields[fields.len - 1 - i])) |value| a.free(value);
         };
-        if (!sameDeclaration(config.model.reasoning, candidate.model.reasoning)) {
+        if (!sameDeclaration(base.model.reasoning, candidate.model.reasoning)) {
             var declaration = candidate.model.reasoning.?;
             inline for (fields) |field| {
                 if (@field(declaration.map, field)) |value| @field(owned_map, field) = try a.dupe(u8, value);
             }
             declaration.map = owned_map;
             candidate.model.reasoning = declaration;
+        }
+        if (self.owner_task_active) {
+            const app = self.app orelse return error.Unavailable;
+            app.thinking_control.publish(.{ .reasoning_effort = candidate.model.reasoning_effort, .reasoning = candidate.model.reasoning });
+            self.thinking_pending = true;
+            self.preferred_effort = effort;
+            self.initial_default_pending = false;
+            self.settings_error = null;
+            self.settings_notice = null;
+            return;
         }
         // No effective option, baseline, replay or estimator mutation until
         // the bounded atomic save has succeeded. No fallible work follows it.
@@ -3929,6 +4022,51 @@ test "first activation defaults clamp without changing preference and own late c
             try std.testing.expect(!session.app.?.journal.started);
         }
     }
+}
+
+test "owner thinking selections merge only after join and preserve cache ownership" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
+    defer session.deinit();
+    try session.connection().configureProvider(.opencode_go, "fixture-key");
+    try session.connection().selectModel("opencode-go/gpt-6-luna");
+    var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"protocol\":\"responses\",\"effort\":{\"supported_levels\":[\"low\",\"high\"]}}]}", .opencode_go);
+    publicReasoningFixture(&listing, "gpt-6-luna");
+    session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), listing);
+    const app = session.app.?;
+    const before = app.config.value.model;
+    const borrowed = session.effortCandidate(app.config.value).model.reasoning.?.map.high.?;
+    try session.beginOwnerTask();
+    try std.testing.expectError(error.Busy, session.guardSelection());
+    try Session.setEffort(&session, .high);
+    try std.testing.expectEqualStrings("high", session.connection().current().reasoning_effort.name().?);
+    try std.testing.expectEqual(before.reasoning_effort, app.config.value.model.reasoning_effort);
+    try std.testing.expect(Session.sameDeclaration(before.reasoning, app.config.value.model.reasoning));
+    const owned = app.thinking_control.get().?.reasoning.?.map.high.?;
+    try std.testing.expect(borrowed.ptr != owned.ptr);
+    session.metadata_cache = .{};
+    try std.testing.expectEqualStrings("high", owned);
+    session.read_only = true;
+    try std.testing.expectError(error.ResumeReadOnly, Session.setEffort(&session, .low));
+    session.read_only = false;
+    try std.testing.expectError(error.InvalidReasoningEffort, Session.setEffort(&session, .unknown));
+    try Session.setEffort(&session, .low);
+    _ = try Session.cycleEffort(&session);
+    const last = try Session.cycleEffort(&session);
+    try std.testing.expectEqual(before.reasoning_effort, app.config.value.model.reasoning_effort);
+    // No worker was spawned in this fixture; finish models the completed join.
+    session.finishOwnerTask();
+    try std.testing.expectEqualStrings(last.name().?, app.config.value.model.reasoning_effort.?);
+    try std.testing.expect(app.thinking_control.get() == null);
+    try std.testing.expect(!session.owner_task_active);
 }
 
 test "initial default stops after journal start and never overwrites an accepted effort or map" {

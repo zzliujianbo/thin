@@ -78,7 +78,7 @@ const bash_background_parameters_json =
 /// for a root Tools with a background service and no child channel.
 const background_schema: p.ToolSchema = .{
     .name = "background",
-    .description = "Manage background commands started with bash background=true in this Thin instance. list pages services by launch order (default 20, at most 100); status returns state, exit code/signal, startup time and cleanup errors; logs reads incremental stdout/stderr with absolute raw byte offsets and a bounded total budget (default 4096, at most 16384); stop cancels and joins exactly one service and returns its final state. Unknown or foreign ids are rejected. Status and exit are only returned here: nothing is appended to the conversation automatically and no inference runs because a process changed state.",
+    .description = "Manage background commands started with bash background=true in this Thin instance. list pages services by launch order (default 20, at most 100); status returns state, exit code/signal, startup time and cleanup errors; logs reads incremental stdout/stderr with absolute raw byte offsets and a bounded total budget (default 4096, at most 16384); stop cancels and joins exactly one service and returns its final state. Unknown or foreign ids are rejected. The model can obtain results only through this control tool; the UI may passively show completion without triggering inference. Status and exit are only returned here: nothing is appended to the conversation automatically and no inference runs because a process changed state.",
     .parameters_json =
     \\{"type":"object","properties":{"action":{"type":"string","enum":["list","status","logs","stop"]},"id":{"type":"string","minLength":1,"maxLength":64},"after":{"type":"integer","minimum":0},"stdout_offset":{"type":"integer","minimum":0},"stderr_offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["action"],"additionalProperties":false}
     ,
@@ -777,7 +777,22 @@ pub const Tools = struct {
             } },
             else => null,
         };
-        return .{ .payload = action, .description = description, .explicit_denial = denial, .decision_input = review };
+        const status = @import("../core/background_status.zig");
+        const display: ?status.Caption = switch (action.*) {
+            .bash => |b| if (b.background) .{ .action = .start, .command = self.background.?.caption(b.command) } else null,
+            .background => |q| .{
+                .action = switch (q.action) {
+                    .list => .list,
+                    .status => .status,
+                    .logs => .logs,
+                    .stop => .stop,
+                },
+                .id = if (q.id) |id| status.Id.from(id) else null,
+                .command = if (q.id) |id| if (self.background) |service| service.command(id) else null else null,
+            },
+            else => null,
+        };
+        return .{ .payload = action, .description = description, .explicit_denial = denial, .decision_input = review, .display = display };
     }
 
     /// 从 prepare 生成的 payload 取回 Action 并执行；payload 指向同一个 arena 中的 Action。
@@ -854,7 +869,8 @@ pub const Tools = struct {
                 const before = try self.root.readBinaryGuarded(a, edit.path, edit_limit, self.textReadGuard());
                 defer a.free(before);
                 try fs.validateText(before);
-                const after = try text_edit.apply(a, before, edit.edits, edit_limit);
+                const applied = try text_edit.applyObserved(a, before, edit.edits, edit_limit);
+                const after = applied.bytes;
                 defer a.free(after);
                 try fs.validateText(after);
                 try j.put(a, &value, "path", j.str(edit.path));
@@ -868,7 +884,7 @@ pub const Tools = struct {
                 if (!std.mem.eql(u8, before, current)) return error.FileChanged;
                 if (cancel.isRequested()) return error.Canceled;
                 const changes = try self.root.writeObserved(edit.path, after, true);
-                return .{ .text = encoded, .file_stats = .{ .changes = changes } };
+                return .{ .text = encoded, .file_stats = .{ .changes = changes orelse applied.changes } };
             },
 
             .write_file => |w| {

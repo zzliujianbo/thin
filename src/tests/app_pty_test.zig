@@ -1923,6 +1923,52 @@ fn waitAcceptedBusy(d: *Driver, start: usize) !void {
     return error.AcceptedBusyDeadline;
 }
 
+// The cursor row is the current editor, not a historical echo. Require a
+// complete fresh ACK and the running marker alongside the exact fixture text.
+fn selectionBusyFrame(d: *Driver, start: usize, slot: []const u8, draft: []const u8, rejected: bool) !void {
+    const until = now() + 10000;
+    var seen_fresh_ack = false;
+    var last_cursor_row: usize = 0;
+    var exact_composer_match = false;
+    var has_exact_draft = false;
+    var has_expected_rejection_notice = false;
+    var has_model_selection_idle_notice = false;
+    var has_steering = false;
+    var observed_effort_minimal = false;
+    var busy_marker_present = false;
+    errdefer std.debug.print("SELECTION_FRAME_DIAG seenFreshAck={} lastCursorRow={d} exactComposerMatch={} hasExactDraft={} hasExpectedRejectionNotice={} hasModelSelectionIdleNotice={} hasSteering={} observedEffortMinimal={} busyMarkerPresent={} expectedRejected={}\n", .{ seen_fresh_ack, last_cursor_row, exact_composer_match, has_exact_draft, has_expected_rejection_notice, has_model_selection_idle_notice, has_steering, observed_effort_minimal, busy_marker_present, rejected });
+    while (now() < until) {
+        try d.drain(20);
+        if (try d.acknowledgedScreen(start)) |view| {
+            const row = &view.grid[view.row];
+            var expected: [128]u8 = undefined;
+            const prefix = try std.fmt.bufPrint(&expected, "(fixture-model) {s}~ {s}", .{ slot, draft });
+            const trimmed = std.mem.trimEnd(u8, row, " ");
+            seen_fresh_ack = true;
+            last_cursor_row = view.row;
+            exact_composer_match = std.mem.eql(u8, trimmed, std.mem.trimEnd(u8, prefix, " "));
+            has_exact_draft = if (std.mem.indexOf(u8, row, ") ")) |at| blk: {
+                const remainder = row[at + 2 ..];
+                const space = std.mem.indexOfScalar(u8, remainder, ' ') orelse break :blk false;
+                break :blk std.mem.eql(u8, std.mem.trimEnd(u8, remainder[space + 1 ..], " "), draft);
+            } else false;
+            has_expected_rejection_notice = view.visible("Only ordinary conversation text can be queued");
+            has_model_selection_idle_notice = view.visible("Model selection requires an idle, non-pasted session");
+            has_steering = view.visible("Steering pending");
+            observed_effort_minimal = std.mem.indexOf(u8, row, "(fixture-model) minimal") != null;
+            busy_marker_present = std.mem.indexOf(u8, row, "~ ") != null;
+            if (std.mem.eql(u8, std.mem.trimEnd(u8, row, " "), std.mem.trimEnd(u8, prefix, " ")) and
+                (!rejected or view.visible("Only ordinary conversation text can be queued")))
+            {
+                try check(!view.visible("Steering pending"));
+                return;
+            }
+        }
+        if (!d.owned) return error.EarlyExit;
+    }
+    return error.SelectionBusyFrameDeadline;
+}
+
 fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project: []const u8) !void {
     const a = init.arena.allocator();
     errdefer {
@@ -3235,9 +3281,19 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         // submit spinner: only after acceptance is the busy composer empty, so
         // the injected draft below cannot be appended to the submitted text.
         try waitAcceptedBusy(&d, start);
-        // Neither the effort shortcut nor direct command may mutate a live
-        // request. The server checks exact first/continuation wire options.
-        try d.send("\x1b[Z/model rejected-busy\r");
+        // Acceptance alone does not prove the first HTTP body has been sent.
+        try queuedFile(&d, a, project, "selection-request-started");
+        // The first wire request is held by the fixture. A fresh complete
+        // composer ACK proves the new level was applied while still running.
+        start = d.used;
+        try d.send("\x1b[Z");
+        try selectionBusyFrame(&d, start, "minimal", "", false);
+        start = d.used;
+        try d.send("/model rejected-busy\r");
+        try selectionBusyFrame(&d, start, "minimal", "/model rejected-busy", true);
+        // Existing driver-to-server gate: never use an observation timer as
+        // evidence of a UI action. The request remains held until this point.
+        std.debug.print("SELECTION_GATE=release\n", .{});
         try d.waitText(start, "selection-answer-one");
         try d.waitIdle(start);
         // Busy special commands are rejected without destroying their draft.

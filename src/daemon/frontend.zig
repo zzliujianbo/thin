@@ -76,6 +76,7 @@ pub const Frontend = struct {
             view.projection.configuration_revision != self.view.configuration_revision or
             codexViewChanged(self.view.state.codex_login, view.projection.state.codex_login) or
             !std.meta.eql(self.view.state.memory, view.projection.state.memory) or
+            !std.meta.eql(self.view.state.background, view.projection.state.background) or
             !@import("../core/subagent_status.zig").View.eql(self.view.state.subagents, view.projection.state.subagents) or
             self.view.state.subagents_supported != view.projection.state.subagents_supported;
         if (self.retired) |retired| retired.deinit();

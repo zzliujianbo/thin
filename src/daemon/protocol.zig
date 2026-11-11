@@ -1,4 +1,4 @@
-//! Thin daemon/session wire protocol v3 (latest-only; see `version`).
+//! Thin daemon/session wire protocol v4 (latest-only; see `version`).
 //!
 //! Ordinary requests receive one response. `watch` switches a dedicated
 //! read-only connection to an ordered sequence of baseline/update frames.
@@ -25,12 +25,13 @@ const write_preview = @import("../core/write_preview.zig");
 const line_stats = @import("../util/line_stats.zig");
 const codex_login = @import("../core/codex_login.zig");
 const memory_status = @import("../core/memory_status.zig");
+const background = @import("../core/background_status.zig");
 
-/// Private daemon/worker IPC version. v3 adds the typed Memory completion event
-/// to the v2 lossless selective-ACK stream. Peers are matched exactly: there is
+/// Private daemon/worker IPC version. v4 adds typed background display data.
+/// Peers are matched exactly: there is
 /// no older-wire compatibility path, migration or automatic worker restart.
 /// A mismatched peer is refused before adoption, display or controller claim.
-pub const version: u16 = 3;
+pub const version: u16 = 4;
 /// Same bound as one frame; responses are checked before writeFrame.
 pub const max_response = unix.max_frame_len;
 /// Prompt, queue entry, tool result and notice text.
@@ -666,6 +667,40 @@ pub const EventMeta = struct {
     canonical_complete: bool = true,
 };
 
+fn validId(value: *const background.Id) bool {
+    if (value.len > value.bytes.len) return false;
+    const normalized = background.Id.from(value.slice());
+    return std.mem.eql(u8, normalized.slice(), value.slice());
+}
+
+fn validCommand(value: *const background.Command) bool {
+    if (value.len > value.bytes.len) return false;
+    const normalized = background.Command.from(value.slice());
+    return std.mem.eql(u8, normalized.slice(), value.slice());
+}
+
+fn encodeCaption(out: *Out, name: []const u8, maybe: ?background.Caption) !void {
+    const value = maybe orelse return out.field(name, @as(?u8, null));
+    if (value.id) |id| if (!validId(&id)) return error.BadRequest;
+    if (value.command) |command| if (!validCommand(&command)) return error.BadRequest;
+    try out.beginObject(name);
+    try out.field("action", @tagName(value.action));
+    if (value.id) |id| try out.field("id", id.slice()) else try out.field("id", @as(?u8, null));
+    if (value.command) |command| try out.field("command", command.slice()) else try out.field("command", @as(?u8, null));
+    try out.endObject();
+}
+
+fn encodeBackgroundTerminal(out: *Out, value: background.Terminal) !void {
+    if (!validId(&value.id) or !validCommand(&value.command)) return error.BadRequest;
+    try out.field("id", value.id.slice());
+    try out.field("command", value.command.slice());
+    try out.field("result", @tagName(value.result));
+    try out.field("duration_ms", value.duration_ms);
+    try out.field("exit_code", value.exit_code);
+    try out.field("signal", value.signal);
+    try out.field("failure", if (value.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
+}
+
 fn encodeField(out: *Out, name: []const u8, value: ?preview.Field) !void {
     const field = value orelse {
         try out.field(name, @as(?[]const u8, null));
@@ -834,6 +869,7 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try encodeField(&out, "task", view.fields.task);
             try encodeField(&out, "id", view.fields.id);
             try out.endObject();
+            try encodeCaption(&out, "display", view.display);
             try encodeProgress(&out, "wprog", view.write_progress);
             if (view.subagent_progress) |progress| {
                 var n = @min(progress.len, 2048);
@@ -868,6 +904,7 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("cleanup", value.result.cleanup_failed);
             try out.field("ms", value.result.duration_ms);
             try encodeDisplayKey(&out, "key", value.display_key);
+            try encodeCaption(&out, "display", value.result.display);
             try out.field("mem_ev", value.result.memory_evidence);
             try encodeFileStats(&out, "opts", value.result.file_stats);
         },
@@ -891,6 +928,10 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
         .compaction_failed => |err| {
             try out.field("t", "compaction_failed");
             try out.field("code", failureCode(err));
+        },
+        .background_completed => |terminal| {
+            try out.field("t", "background_completed");
+            try encodeBackgroundTerminal(&out, terminal);
         },
         .memory_completed => |terminal| {
             try out.field("t", "memory_completed");
@@ -1004,6 +1045,7 @@ pub const Snapshot = struct {
     provider: ?[]const u8 = null,
     codex_login: codex_login.View = .{},
     memory: memory_status.View = .{},
+    background: background.View = .{},
     subagents: @import("../core/subagent_status.zig").View = .{},
     subagents_supported: bool = false,
     read_only: bool = false,
@@ -1056,6 +1098,9 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
     try out.field("failure", if (snapshot.codex_login.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
     try out.endObject();
     try encodeMemoryView(out, snapshot.memory);
+    try out.beginObject("background");
+    try out.field("active_count", snapshot.background.active_count);
+    try out.endObject();
     if (snapshot.subagents_supported) try encodeSubagentView(out, snapshot.subagents);
     try out.field("read_only", snapshot.read_only);
     try out.field("truncated", snapshot.truncated);
@@ -1341,6 +1386,87 @@ fn decodeBlock(value: std.json.Value) !p.Block {
     return error.BadRequest;
 }
 
+fn decodeId(text: []const u8) !background.Id {
+    if (text.len > 64 or !std.unicode.utf8ValidateSlice(text)) return error.BadRequest;
+    const id = background.Id.from(text);
+    if (!std.mem.eql(u8, id.slice(), text)) return error.BadRequest;
+    return id;
+}
+
+fn decodeCommand(text: []const u8) !background.Command {
+    if (text.len > 512 or !std.unicode.utf8ValidateSlice(text)) return error.BadRequest;
+    const command = background.Command.from(text);
+    if (!std.mem.eql(u8, command.slice(), text)) return error.BadRequest;
+    return command;
+}
+
+fn checkToolEventFields(object: std.json.ObjectMap, allowed: []const []const u8) !void {
+    var keys = object.iterator();
+    while (keys.next()) |entry| {
+        var known = false;
+        for (allowed) |key| {
+            if (std.mem.eql(u8, entry.key_ptr.*, key)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return error.BadRequest;
+    }
+    if (object.contains("seq")) _ = try requireU64(object, "seq");
+}
+
+fn decodeCaption(object: std.json.ObjectMap) !?background.Caption {
+    const inner = switch (try requireValue(object, "display")) {
+        .null => return null,
+        .object => |v| v,
+        else => return error.BadRequest,
+    };
+    if (inner.count() != 3) return error.BadRequest;
+    const id: ?background.Id = switch (try requireValue(inner, "id")) {
+        .null => null,
+        .string => |s| try decodeId(s),
+        else => return error.BadRequest,
+    };
+    const command: ?background.Command = switch (try requireValue(inner, "command")) {
+        .null => null,
+        .string => |s| try decodeCommand(s),
+        else => return error.BadRequest,
+    };
+    return .{ .action = try requireEnum(background.Action, inner, "action"), .id = id, .command = command };
+}
+
+fn decodeBackgroundTerminal(object: std.json.ObjectMap) !background.Terminal {
+    var keys = object.iterator();
+    while (keys.next()) |entry| {
+        var known = false;
+        for ([_][]const u8{ "t", "id", "command", "result", "duration_ms", "exit_code", "signal", "failure", "epoch", "seq", "disp_trunc", "canon_complete" }) |key| {
+            if (std.mem.eql(u8, entry.key_ptr.*, key)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return error.BadRequest;
+    }
+    if (object.contains("epoch")) _ = try requireU64(object, "epoch");
+    if (object.contains("seq")) _ = try requireU64(object, "seq");
+    if (object.contains("disp_trunc")) _ = try requireBool(object, "disp_trunc");
+    if (object.contains("canon_complete")) _ = try requireBool(object, "canon_complete");
+    const exit_code: ?u8 = switch (try requireValue(object, "exit_code")) {
+        .null => null,
+        else => |v| std.math.cast(u8, try numberU64(v)) orelse return error.BadRequest,
+    };
+    const signal: ?u32 = switch (try requireValue(object, "signal")) {
+        .null => null,
+        else => |v| std.math.cast(u32, try numberU64(v)) orelse return error.BadRequest,
+    };
+    const failure: ?background.Failure = switch (try requireValue(object, "failure")) {
+        .null => null,
+        .string => |s| std.meta.stringToEnum(background.Failure, s) orelse return error.BadRequest,
+        else => return error.BadRequest,
+    };
+    return .{ .id = try decodeId(try requireText(object, "id")), .command = try decodeCommand(try requireText(object, "command")), .result = try requireEnum(background.Result, object, "result"), .duration_ms = try requireU64(object, "duration_ms"), .exit_code = exit_code, .signal = signal, .failure = failure };
+}
+
 /// Closed Memory terminal fields follow the snapshot decoder's exact policy:
 /// known enum names, an explicitly nullable failure, and a bounded summary
 /// which is already UTF-8 and unchanged by Summary's display sanitization.
@@ -1455,6 +1581,7 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
             .phase = try requireEnum(ToolViewsPhase, object, "phase"),
         } };
     } else if (std.mem.eql(u8, kind, "tool_view")) {
+        try checkToolEventFields(object, &.{ "t", "gen", "idx", "name", "fields", "display", "wprog", "sprog", "ready", "epoch", "seq", "disp_trunc", "canon_complete" });
         event = .{ .tool_view = .{
             .key = .{
                 .generation = try requireU64(object, "gen"),
@@ -1462,6 +1589,7 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
             },
             .name = try requireText(object, "name"),
             .fields = try decodeFields(object, "fields"),
+            .display = try decodeCaption(object),
             .write_progress = try decodeProgress(object, "wprog"),
             .subagent_progress = try decodeSubagentProgress(object),
             .ready = try optionalBool(object, "ready") orelse false,
@@ -1474,6 +1602,7 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
             .display_key = try decodeDisplayKey(object, "key"),
         } };
     } else if (std.mem.eql(u8, kind, "tool_result")) {
+        try checkToolEventFields(object, &.{ "t", "id", "name", "key", "v", "is_error", "canceled", "trunc", "cleanup", "display", "mem_ev", "opts", "ms", "epoch", "seq", "disp_trunc", "canon_complete" });
         event = .{ .tool_result = .{
             .id = try requireU64(object, "id"),
             .name = try requireText(object, "name"),
@@ -1484,6 +1613,7 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
                 .canceled = try optionalBool(object, "canceled") orelse false,
                 .truncated = try optionalBool(object, "trunc") orelse false,
                 .cleanup_failed = try optionalBool(object, "cleanup") orelse false,
+                .display = try decodeCaption(object),
                 .memory_evidence = try optionalBool(object, "mem_ev") orelse true,
                 .file_stats = try decodeFileStats(object, "opts"),
                 .duration_ms = try optionalU64(object, "ms"),
@@ -1516,6 +1646,8 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
             canonical_complete = false;
         }
         event = .{ .assistant_committed = blocks };
+    } else if (std.mem.eql(u8, kind, "background_completed")) {
+        event = .{ .background_completed = try decodeBackgroundTerminal(object) };
     } else if (std.mem.eql(u8, kind, "memory_completed")) {
         event = .{ .memory_completed = try decodeMemoryTerminal(object) };
     } else if (std.mem.eql(u8, kind, "finished")) {
@@ -1645,10 +1777,10 @@ test "subagent tool progress roundtrip and malformed wire" {
     try std.testing.expect(bounded.display_truncated);
     try std.testing.expectEqual(@as(usize, 2048), bounded.event.tool_view.subagent_progress.?.len);
     for ([_][]const u8{
-        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"sprog\":1}",
-        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"sprog\":{}}",
-        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1.0,\"idx\":0,\"sprog\":null}",
-        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0.0,\"sprog\":null}",
+        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"display\":null,\"sprog\":1}",
+        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"display\":null,\"sprog\":{}}",
+        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1.0,\"idx\":0,\"display\":null,\"sprog\":null}",
+        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0.0,\"display\":null,\"sprog\":null}",
     }) |json| try std.testing.expectError(error.BadRequest, decodeEvent(a, json));
 }
 
@@ -1739,7 +1871,7 @@ test "tool_view decodes its display fields instead of an unsupported event" {
         "{\"t\":\"tool_view\",\"name\":\"bash\",\"gen\":18446744073709551615,\"idx\":3,\"ready\":true," ++
         "\"fields\":{\"path\":{\"text\":\"src/a.zig\",\"trunc\":true},\"command\":{\"text\":\"zig build\",\"trunc\":false}," ++
         "\"action\":null,\"topic\":null,\"task\":null,\"id\":null}," ++
-        "\"wprog\":{\"added\":4,\"deleted\":null}}";
+        "\"display\":null,\"wprog\":{\"added\":4,\"deleted\":null}}";
     var decoded = try decodeEvent(a, json);
     defer decoded.deinit();
     const view = decoded.event.tool_view;
@@ -1758,19 +1890,19 @@ test "tool_view decodes its display fields instead of an unsupported event" {
 test "u64 values above i64.max survive number_string decoding" {
     const a = std.testing.allocator;
     const high = std.math.maxInt(u64);
-    var request = try parseRequest(a, "{\"v\":3,\"id\":18446744073709551615,\"op\":\"ping\"}");
+    var request = try parseRequest(a, "{\"v\":4,\"id\":18446744073709551615,\"op\":\"ping\"}");
     defer request.deinit();
     try std.testing.expectEqual(high, request.id);
     try std.testing.expectEqual(Op.ping, request.op);
 
     // Quoted digits, floats, exponents and negatives are not integers.
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":\"18446744073709551615\",\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":1.0,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":1e3,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":-1,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":0,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":1,\"op\":\"ping\",\"op\":\"list\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":\"18446744073709551615\",\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":1.0,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":1e3,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":-1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":0,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"ping\",\"op\":\"list\"}"));
 
     const encoded = try encodeEvent(a, .{ .tool_started = .{
         .id = high,
@@ -1789,7 +1921,7 @@ test "u64 values above i64.max survive number_string decoding" {
 
 test "numeric and enum request fields reject wrong types instead of defaulting" {
     const a = std.testing.allocator;
-    var request = try parseRequest(a, "{\"v\":3,\"id\":2,\"op\":\"effort\",\"epoch\":\"7\",\"level\":true}");
+    var request = try parseRequest(a, "{\"v\":4,\"id\":2,\"op\":\"effort\",\"epoch\":\"7\",\"level\":true}");
     defer request.deinit();
     try std.testing.expectError(error.BadRequest, request.u64Field("epoch"));
     try std.testing.expectError(error.BadRequest, request.u64Field("absent"));
@@ -1803,16 +1935,16 @@ test "numeric and enum request fields reject wrong types instead of defaulting" 
 
 test "proxy_address accepts an empty clear and maps endpoint rejections to invalid_input" {
     const a = std.testing.allocator;
-    var cleared = try parseRequest(a, "{\"v\":3,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}");
+    var cleared = try parseRequest(a, "{\"v\":4,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}");
     defer cleared.deinit();
     try std.testing.expectEqual(Op.proxy_address, cleared.op);
     try std.testing.expectEqualStrings("", try cleared.stringField("value", 320));
 
     // A missing, null or non-string `value` is a bad request, never a clear.
     for ([_][]const u8{
-        "{\"v\":3,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1}",
-        "{\"v\":3,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
-        "{\"v\":3,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
+        "{\"v\":4,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1}",
+        "{\"v\":4,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
+        "{\"v\":4,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
     }) |json| {
         var request = try parseRequest(a, json);
         defer request.deinit();
@@ -1839,13 +1971,13 @@ test "proxy_model request keeps the full u64 epoch and rejects loose parameters"
     try std.testing.expectEqual(true, try request.requiredBool("enabled"));
 
     // Absent, stringly or numeric enable flags are bad requests, not defaults.
-    var loose = try parseRequest(a, "{\"v\":3,\"id\":4,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}");
+    var loose = try parseRequest(a, "{\"v\":4,\"id\":4,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}");
     defer loose.deinit();
     try std.testing.expectError(error.BadRequest, loose.requiredBool("enabled"));
-    var stringly = try parseRequest(a, "{\"v\":3,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}");
+    var stringly = try parseRequest(a, "{\"v\":4,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}");
     defer stringly.deinit();
     try std.testing.expectError(error.BadRequest, stringly.requiredBool("enabled"));
-    var numeric_epoch = try parseRequest(a, "{\"v\":3,\"id\":6,\"op\":\"proxy_model\",\"epoch\":\"1\",\"name\":\"p/m\",\"enabled\":false}");
+    var numeric_epoch = try parseRequest(a, "{\"v\":4,\"id\":6,\"op\":\"proxy_model\",\"epoch\":\"1\",\"name\":\"p/m\",\"enabled\":false}");
     defer numeric_epoch.deinit();
     try std.testing.expectError(error.BadRequest, numeric_epoch.u64Field("epoch"));
 }
@@ -1985,7 +2117,7 @@ test "terminal events require complete usage and keep tool timing and keys" {
     const json =
         "{\"t\":\"tool_result\",\"id\":9,\"name\":\"bash\",\"v\":\"done\",\"is_error\":false,\"canceled\":false," ++
         "\"trunc\":false,\"cleanup\":false,\"ms\":18446744073709551615," ++
-        "\"key\":{\"gen\":18446744073709551615,\"idx\":2},\"mem_ev\":true,\"opts\":null}";
+        "\"key\":{\"gen\":18446744073709551615,\"idx\":2},\"display\":null,\"mem_ev\":true,\"opts\":null}";
     var decoded = try decodeEvent(a, json);
     defer decoded.deinit();
     const result = decoded.event.tool_result;
@@ -1996,7 +2128,7 @@ test "terminal events require complete usage and keep tool timing and keys" {
 
 test "login key copy is wiped before the request arena is released" {
     const a = std.testing.allocator;
-    var request = try parseRequest(a, "{\"v\":3,\"id\":1,\"op\":\"login\",\"key\":\"sk-secret\"}");
+    var request = try parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"login\",\"key\":\"sk-secret\"}");
     defer request.deinit();
     const secret = request.field("key").?.string;
     try std.testing.expectEqualStrings("sk-secret", secret);
@@ -2015,15 +2147,85 @@ test "event encoding round-trips display text and drops inbox pointers" {
     try std.testing.expect(decoded.event.permission.interrupt == null);
 }
 
-test "wire version 3 is required and older packets are rejected" {
+test "background terminal and captions have strict owned wire values" {
     const a = std.testing.allocator;
-    try std.testing.expectEqual(@as(u16, 3), version);
-    var accepted = try parseRequest(a, "{\"v\":3,\"id\":1,\"op\":\"ping\"}");
+    const terminal: background.Terminal = .{ .id = background.Id.from("job-1"), .command = background.Command.from("echo 中文"), .result = .failed, .duration_ms = 42, .exit_code = 7, .failure = .exit };
+    const wire = try encodeEvent(a, .{ .background_completed = terminal });
+    defer a.free(wire);
+    var decoded = try decodeEvent(a, wire);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("echo 中文", decoded.event.background_completed.command.slice());
+    try std.testing.expectEqual(@as(?u8, 7), decoded.event.background_completed.exit_code);
+    const invalid = [_][]const u8{
+        "{\"t\":\"background_completed\",\"id\":\"x\",\"command\":\"a\",\"result\":\"success\",\"duration_ms\":1,\"exit_code\":null,\"signal\":null}",
+        "{\"t\":\"background_completed\",\"id\":\"x\",\"command\":\"a\\n\",\"result\":\"success\",\"duration_ms\":1,\"exit_code\":null,\"signal\":null,\"failure\":null}",
+        "{\"t\":\"background_completed\",\"id\":\"x\",\"command\":\"a\",\"result\":\"success\",\"duration_ms\":1,\"exit_code\":256,\"signal\":null,\"failure\":null}",
+        "{\"t\":\"background_completed\",\"id\":\"x\",\"command\":\"a\",\"result\":\"success\",\"duration_ms\":1,\"exit_code\":null,\"signal\":null,\"failure\":null,\"extra\":0}",
+        "{\"t\":\"tool_view\",\"name\":\"bash\",\"gen\":1,\"idx\":0}",
+        "{\"t\":\"tool_view\",\"name\":\"bash\",\"gen\":1,\"idx\":0,\"display\":{\"action\":\"start\",\"id\":null}}",
+    };
+    for (invalid) |json| try std.testing.expectError(error.BadRequest, decodeEvent(a, json));
+    const view: r.Event = .{ .tool_view = .{ .key = .{ .generation = 1, .index = 0 }, .name = "bash", .display = .{ .action = .start, .command = background.Command.from("echo ok") } } };
+    const view_wire = try encodeEvent(a, view);
+    defer a.free(view_wire);
+    var view_decoded = try decodeEvent(a, view_wire);
+    defer view_decoded.deinit();
+    try std.testing.expectEqualStrings("echo ok", view_decoded.event.tool_view.display.?.command.?.slice());
+}
+
+test "tool caption and execution wire round trips and rejects malformed fields" {
+    const a = std.testing.allocator;
+    const caption: background.Caption = .{ .action = .start, .id = background.Id.from("job-1"), .command = background.Command.from("echo ok") };
+    const events = [_]r.Event{
+        .{ .tool_view = .{ .key = .{ .generation = std.math.maxInt(u64), .index = 0 }, .name = "bash", .display = caption } },
+        .{ .tool_result = .{ .id = 9, .name = "bash", .result = .{ .text = "done", .display = caption } } },
+    };
+    for (events) |event| {
+        const wire = try encodeEvent(a, event);
+        defer a.free(wire);
+        var decoded = try decodeEvent(a, wire);
+        defer decoded.deinit();
+        const actual = switch (decoded.event) {
+            .tool_view => |v| v.display.?,
+            .tool_result => |v| v.result.display.?,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(caption.action, actual.action);
+        try std.testing.expectEqualStrings("job-1", actual.id.?.slice());
+        try std.testing.expectEqualStrings("echo ok", actual.command.?.slice());
+    }
+    const invalid = [_][]const u8{
+        "{\"t\":\"tool_result\",\"id\":1,\"name\":\"bash\",\"v\":\"ok\"}",
+        "{\"t\":\"tool_result\",\"id\":1,\"name\":\"bash\",\"v\":\"ok\",\"display\":{\"action\":\"start\",\"id\":null}}",
+        "{\"t\":\"tool_result\",\"id\":1,\"name\":\"bash\",\"v\":\"ok\",\"display\":{\"action\":\"start\",\"id\":null,\"command\":null,\"extra\":0}}",
+        "{\"t\":\"tool_result\",\"id\":1,\"name\":\"bash\",\"v\":\"ok\",\"display\":null,\"extra\":0}",
+        "{\"t\":\"tool_view\",\"name\":\"bash\",\"gen\":1,\"idx\":0,\"display\":null,\"extra\":0}",
+        "{\"t\":\"tool_view\",\"name\":\"bash\",\"gen\":1,\"idx\":0,\"display\":null,\"seq\":-1}",
+        "{\"t\":\"tool_view\",\"name\":\"bash\",\"gen\":1,\"idx\":0,\"display\":{\"action\":\"start\",\"id\":null,\"command\":null,\"command\":null}}",
+    };
+    for (invalid) |json| try std.testing.expectError(error.BadRequest, decodeEvent(a, json));
+    const long_id: [65]u8 = @splat('x');
+    const long_command: [513]u8 = @splat('x');
+    const long_id_wire = try std.fmt.allocPrint(a, "{{\"t\":\"tool_result\",\"id\":1,\"name\":\"bash\",\"v\":\"ok\",\"display\":{{\"action\":\"start\",\"id\":\"{s}\",\"command\":null}}}}", .{&long_id});
+    defer a.free(long_id_wire);
+    try std.testing.expectError(error.BadRequest, decodeEvent(a, long_id_wire));
+    const long_command_wire = try std.fmt.allocPrint(a, "{{\"t\":\"tool_result\",\"id\":1,\"name\":\"bash\",\"v\":\"ok\",\"display\":{{\"action\":\"start\",\"id\":null,\"command\":\"{s}\"}}}}", .{&long_command});
+    defer a.free(long_command_wire);
+    try std.testing.expectError(error.BadRequest, decodeEvent(a, long_command_wire));
+    var sequenced = try decodeEvent(a, "{\"t\":\"tool_result\",\"id\":1,\"name\":\"bash\",\"v\":\"ok\",\"display\":null,\"seq\":18446744073709551615,\"epoch\":1,\"disp_trunc\":false,\"canon_complete\":true}");
+    sequenced.deinit();
+}
+
+test "wire version 4 is required and older packets are rejected" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(@as(u16, 4), version);
+    var accepted = try parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"ping\"}");
     accepted.deinit();
     // No compatibility path for old or future peers.
     try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":1,\"id\":1,\"op\":\"ping\"}"));
     try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":2,\"id\":1,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":5,\"id\":1,\"op\":\"ping\"}"));
     // Every reply envelope carries the same exact version.
     var out = Out.init(a);
     defer out.deinit();
@@ -2032,7 +2234,7 @@ test "wire version 3 is required and older packets are rejected" {
     defer a.free(bytes);
     var doc = try parseWholeReply(a, bytes);
     defer doc.deinit();
-    try std.testing.expectEqual(@as(i64, 3), doc.value.object.get("v").?.integer);
+    try std.testing.expectEqual(@as(i64, version), doc.value.object.get("v").?.integer);
 }
 
 test "response builder rejects unbalanced output and oversized keys" {

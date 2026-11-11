@@ -204,6 +204,7 @@ pub const App = struct {
 
     /// Agent 运行时，最后初始化，依赖前面所有字段。
     runtime: r.Runtime,
+    thinking_control: r.ThinkingControl = .{},
 
     /// Enable only during Session initialization, before restoring a checkpoint.
     /// Restore compares the actual schema fingerprint and resets native replay
@@ -285,6 +286,7 @@ pub const App = struct {
         const self = try a.create(App);
         errdefer a.destroy(self);
         self.allocator = a;
+        self.thinking_control = .{};
         self.config = owned;
 
         self.auth_path = if (protected_auth) |path| try a.dupe(u8, path) else blk: {
@@ -346,6 +348,7 @@ pub const App = struct {
             .io = io,
             .root = &self.root,
             .environment = &self.environment,
+            .secret_guard = .{ .context = &self.journal, .contains_fn = journalContainsSecret },
         };
         self.executor = .{ .root = &self.root, .memory = &self.memory, .config = &self.config.value, .environment = &self.environment, .auth_path = self.auth_path, .background = self.background.service() };
         self.client = try self.initPrimaryClient(&self.config.value, key, environ);
@@ -402,6 +405,7 @@ pub const App = struct {
             break :blk "";
         } else snapshot;
         self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, safe_snapshot);
+        self.runtime.thinking_control = &self.thinking_control;
         self.runtime.diagnostics = self.journal.diagnosticSink();
         self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
         self.runtime.session_loader = .{ .context = self, .load_fn = loadSessionPolicy };
@@ -423,6 +427,18 @@ pub const App = struct {
 
     pub fn subagentView(self: *App) @import("../core/subagent_status.zig").View {
         return self.subagent.view();
+    }
+
+    pub fn backgroundView(self: *App) @import("../core/background_status.zig").View {
+        return self.background.view();
+    }
+
+    pub fn peekBackgroundCompletion(self: *App) ?@import("../core/background_status.zig").Terminal {
+        return self.background.peekCompletion();
+    }
+
+    pub fn takeBackgroundCompletion(self: *App, id: @import("../core/background_status.zig").Id) void {
+        self.background.takeCompletion(id);
     }
 
     pub fn drainMemory(self: *App, cancel: *const @import("../core/protocol.zig").Cancellation) void {
@@ -652,7 +668,7 @@ pub const App = struct {
                 self.config.value.imageActive() != declaration.imageActive(),
         };
         errdefer result.deinit();
-        result.config = try @import("decision_selection.zig").activeClone(self.allocator, self.config.value, declaration);
+        result.config = try @import("decision_selection.zig").activeClone(self.allocator, self.runtime.effectiveConfig(), declaration);
         result.subagent_environment = try captureSubagentEnvironment(self.allocator, result.config.?.value, environ);
         result.replace_memory = result.replace_decision or self.config.value.memory.auto != declaration.memory.auto or
             !std.meta.eql(self.config.value.limits, declaration.limits);
@@ -690,6 +706,7 @@ pub const App = struct {
         std.debug.assert(!self.runtime.busy.load(.acquire));
         if (replacement.replace_memory) self.memory_coordinator.cancelAndJoin();
         const memory_poisoned = self.memory_coordinator.isPoisoned();
+        self.thinking_control.clear();
         var previous_config = self.config;
         self.config = replacement.config.?;
         replacement.config = null;
@@ -769,7 +786,7 @@ pub const App = struct {
         if (self.runtime.poisoned or self.memory_coordinator.isPoisoned()) return error.UnsafeToContinue;
         if (owned.value.model.protocol == .systemone) return error.SystemOneNotChatModel;
         const plan = try self.runtime.planSelection(owned.value, true);
-        if (!std.meta.eql(owned.value.limits, self.config.value.limits)) return error.ConnectionLimitsChanged;
+        if (!std.meta.eql(owned.value.limits, self.runtime.effectiveConfig().limits)) return error.ConnectionLimitsChanged;
         const key = if (isCodex(owned.value)) blk: {
             if (owned.value.provider.codex_oauth == null) return error.ApiKeyNotFound;
             break :blk try self.allocator.alloc(u8, 0);
@@ -803,6 +820,7 @@ pub const App = struct {
         self.memory_coordinator.cancelAndJoin();
         const memory_poisoned = self.memory_coordinator.isPoisoned();
         self.runtime.applySelection(replacement.plan);
+        self.thinking_control.clear();
         var previous = self.config;
         // Never relocate a used pool: destroy it in its original App slot.
         self.client.deinit();

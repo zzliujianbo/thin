@@ -254,6 +254,7 @@ const Copy = struct {
             // Terminal and Summary contain only fixed owned values; never
             // borrow from a decoded JSON arena or coalesce as a body delta.
             .memory_completed => |terminal| .{ .memory_completed = terminal },
+            .background_completed => |terminal| .{ .background_completed = terminal },
             .assistant_committed => |blocks| blk: {
                 const n: usize = @min(blocks.len, block_limit);
                 self.canonical_complete = blocks.len == n;
@@ -282,6 +283,7 @@ pub const QueuePreview = struct {
 /// adapter documents otherwise (normally until the next snapshot update); the
 /// TUI copies what it keeps. No Runtime, socket or callback lives here.
 pub const Snapshot = struct {
+    background: @import("../core/background_status.zig").View = .{},
     memory: @import("../core/memory_status.zig").View = .{},
     subagents: @import("../core/subagent_status.zig").View = .{},
     subagents_supported: bool = false,
@@ -611,6 +613,21 @@ test "setConfirming is optional and refuses without an adapter" {
     var context: u8 = 0;
     const client: Client = .{ .context = &context, .vtable = &vt };
     try std.testing.expectError(error.Unsupported, client.setConfirming(1, true));
+}
+
+test "background completion and tool caption are copied by value" {
+    const a = std.testing.allocator;
+    const bg = @import("../core/background_status.zig");
+    var terminal: bg.Terminal = .{ .id = bg.Id.from("job-1"), .command = bg.Command.from("echo ok"), .result = .success, .duration_ms = 9 };
+    var item = try ownEvent(a, 1, .{ .background_completed = terminal });
+    defer item.deinit();
+    @memset(&terminal.command.bytes, 'x');
+    try std.testing.expectEqualStrings("echo ok", item.event.background_completed.command.slice());
+    var caption: bg.Caption = .{ .action = .start, .command = bg.Command.from("sleep 1") };
+    var view = try ownEvent(a, 1, .{ .tool_view = .{ .key = .{ .generation = 1, .index = 0 }, .name = "bash", .display = caption } });
+    defer view.deinit();
+    @memset(&caption.command.?.bytes, 'x');
+    try std.testing.expectEqualStrings("sleep 1", view.event.tool_view.display.?.command.?.slice());
 }
 
 test "memory completion owns its summary and is a text coalescing barrier" {

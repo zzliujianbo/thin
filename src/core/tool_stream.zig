@@ -12,6 +12,7 @@ pub const View = struct {
     fields: preview.Snapshot = .{},
     write_progress: ?write_preview.Progress = null,
     ready: bool = false,
+    display: ?@import("background_status.zig").Caption = null,
     /// Borrowed display-only child activity, at most 2048 UTF-8 bytes.
     subagent_progress: ?[]const u8 = null,
 };

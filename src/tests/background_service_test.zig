@@ -177,6 +177,57 @@ fn expectProcessGone(pid: u64) !void {
     }
 }
 
+test "completion is retained by exact id and duration is frozen" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cancel: p.Cancellation = .{};
+    const first = try receiptId(a, try startJson(&f, a, "exit 0", 2000, 1024, &cancel));
+    const second = try receiptId(a, try startJson(&f, a, "exit 7", 2000, 1024, &cancel));
+    _ = try waitTerminal(&f, a, first, &cancel);
+    _ = try waitTerminal(&f, a, second, &cancel);
+    const one = f.service.peekCompletion().?;
+    try std.testing.expectEqualStrings(first, one.id.slice());
+    try std.testing.expectEqual(@import("../core/background_status.zig").Result.success, one.result);
+    f.service.takeCompletion(@import("../core/background_status.zig").Id.from(second));
+    try std.Io.sleep(f.io, .fromMilliseconds(20), .awake);
+    const again = f.service.peekCompletion().?;
+    try std.testing.expectEqualStrings(first, again.id.slice());
+    try std.testing.expectEqual(one.duration_ms, again.duration_ms);
+    f.service.takeCompletion(one.id);
+    try std.testing.expect(f.service.peekCompletion() == null);
+    try std.testing.expectEqual(@as(usize, 0), f.service.view().active_count);
+}
+
+fn guardTestKey(_: *anyopaque, text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "test-secret") != null;
+}
+
+test "known key hides entire command even beyond clipped prefix" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var marker: u8 = 0;
+    f.service.deps.?.secret_guard = .{ .context = &marker, .contains_fn = guardTestKey };
+    const cancel: p.Cancellation = .{};
+    const padding: [520]u8 = @splat('x');
+    const command = try std.fmt.allocPrint(a, ": {s}test-secret", .{padding});
+    const before = f.service.service().caption(command);
+    try std.testing.expectEqualStrings("[command hidden]", before.slice());
+    const id = try receiptId(a, try startJson(&f, a, command, 2000, 1024, &cancel));
+    const lookup = f.service.service().command(id).?;
+    try std.testing.expectEqualStrings("[command hidden]", lookup.slice());
+    _ = try waitTerminal(&f, a, id, &cancel);
+    const terminal = f.service.peekCompletion().?;
+    try std.testing.expectEqualStrings("[command hidden]", terminal.command.slice());
+}
+
 fn cancelAfter(token: *p.Cancellation, milliseconds: u64) void {
     std.Io.sleep(std.testing.io, .fromMilliseconds(@intCast(milliseconds)), .awake) catch {};
     token.cancel();

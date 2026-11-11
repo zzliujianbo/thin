@@ -1002,6 +1002,98 @@ test "App child factory resolves independent target credentials protocols and pr
     try std.testing.expect(app.client.proxy_http == null and app.client.codex_source == null);
 }
 
+test "App child freezes effective thinking and explicit target keeps its defaults" {
+    const Recorder = struct {
+        const Effort = enum { none, low, high, other };
+        const Identity = enum { parent, target, other };
+        io: std.Io,
+        effort: Effort = .other,
+        identity: Identity = .other,
+        calls: usize = 0,
+        second_effort: Effort = .other,
+        entered: std.atomic.Value(bool) = .init(false),
+        hold: std.atomic.Value(bool) = .init(false),
+
+        fn classify(value: ?[]const u8) Effort {
+            const text = value orelse return .none;
+            if (std.mem.eql(u8, text, "low")) return .low;
+            if (std.mem.eql(u8, text, "high")) return .high;
+            return .other;
+        }
+        fn make(raw: *anyopaque, _: std.mem.Allocator, config: *const cfg.Config) !p.Model {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.effort = classify(config.model.reasoning_effort);
+            self.identity = if (std.mem.eql(u8, config.model.name, "chat")) .parent else if (std.mem.eql(u8, config.model.name, "family/raw")) .target else .other;
+            return .{ .context = self, .call_fn = call };
+        }
+        fn call(raw: *anyopaque, a: std.mem.Allocator, request: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1 and self.hold.load(.acquire)) {
+                self.entered.store(true, .release);
+                while (self.hold.load(.acquire) and !request.cancellation.?.isRequested())
+                    try std.Io.sleep(self.io, .fromMilliseconds(2), .awake);
+                return .{ .success = .{ .message = try toolCallMessage(a, "frozen-read", "read_file", "{\"path\":\"missing-frozen-file\"}"), .finish = .tool_calls } };
+            }
+            self.second_effort = classify(request.reasoning_effort);
+            return .{ .success = .{ .message = try p.textMessage(a, .assistant, "done"), .finish = .stop } };
+        }
+    };
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    defer fix.deinit();
+    const app = try selectionApp(fix);
+    defer app.deinit();
+    const owned = app.config.arena.allocator();
+    const low = try owned.dupe(u8, "low");
+    const high = try owned.dupe(u8, "high");
+    const declaration = r.ReasoningSelection{ .reasoning_effort = low, .reasoning = .{ .map = .{ .low = low, .high = high } } };
+    try std.testing.expect(app.config.value.model.reasoning_effort == null);
+    app.thinking_control.publish(declaration);
+
+    var old: Recorder = .{ .io = fix.io, .hold = .init(true) };
+    var current: Recorder = .{ .io = fix.io };
+    var explicit: Recorder = .{ .io = fix.io };
+    var cancel: p.Cancellation = .{};
+    app.subagent.beginTask(&cancel);
+    defer app.subagent.service().endTask(&cancel) catch {};
+    defer old.hold.store(false, .release);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const svc = app.subagent.service();
+    app.subagent.deps.model_factory = .{ .context = &old, .make_fn = Recorder.make };
+    const first = try svc.run(arena.allocator(), .{ .task = "frozen child" }, &cancel);
+    var first_receipt = try std.json.parseFromSlice(std.json.Value, a, first.text, .{});
+    defer first_receipt.deinit();
+    const first_id = first_receipt.value.object.get("id").?.string;
+    try waitFlag(fix.io, &old.entered, 5000);
+    app.thinking_control.publish(.{ .reasoning_effort = high, .reasoning = declaration.reasoning });
+    app.subagent.deps.model_factory = .{ .context = &current, .make_fn = Recorder.make };
+    const second = try svc.run(arena.allocator(), .{ .task = "new child" }, &cancel);
+    var second_receipt = try std.json.parseFromSlice(std.json.Value, a, second.text, .{});
+    defer second_receipt.deinit();
+    const second_id = second_receipt.value.object.get("id").?.string;
+    app.subagent.deps.model_factory = .{ .context = &explicit, .make_fn = Recorder.make };
+    const third = try svc.run(arena.allocator(), .{ .task = "explicit target", .model = "target/family/raw" }, &cancel);
+    var third_receipt = try std.json.parseFromSlice(std.json.Value, a, third.text, .{});
+    defer third_receipt.deinit();
+    const third_id = third_receipt.value.object.get("id").?.string;
+    old.hold.store(false, .release);
+    _ = try svc.get(arena.allocator(), .{ .id = first_id, .wait = true }, &cancel);
+    _ = try svc.get(arena.allocator(), .{ .id = second_id, .wait = true }, &cancel);
+    _ = try svc.get(arena.allocator(), .{ .id = third_id, .wait = true }, &cancel);
+    try svc.endTask(&cancel);
+    try std.testing.expectEqual(Recorder.Identity.parent, old.identity);
+    try std.testing.expectEqual(Recorder.Effort.low, old.effort);
+    try std.testing.expectEqual(@as(usize, 2), old.calls);
+    try std.testing.expectEqual(Recorder.Effort.low, old.second_effort);
+    try std.testing.expectEqual(Recorder.Identity.parent, current.identity);
+    try std.testing.expectEqual(Recorder.Effort.high, current.effort);
+    try std.testing.expectEqual(Recorder.Identity.target, explicit.identity);
+    try std.testing.expectEqual(Recorder.Effort.none, explicit.effort);
+    try std.testing.expect(app.config.value.model.reasoning_effort == null);
+}
+
 test "App child factory fails closed and unknown price pauses actual child runtime" {
     const a = std.testing.allocator;
     const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);

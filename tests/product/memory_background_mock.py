@@ -45,9 +45,10 @@ import tempfile
 import termios
 import threading
 import time
+import unicodedata
 
 ROWS = 24
-COLUMNS = (120, 100)
+COLUMNS = (120, 50)
 KEY = 'owned-memory-background-fixture-key'
 HELPER_PREFIX = 'Extract only durable, reusable knowledge'
 # Prompt 2 shares the "review"/"concise" tokens of the committed fact so the
@@ -59,8 +60,9 @@ PROMPTS = (
     'Third question after the memory work settles.',
 )
 ANSWERS = ('answer-one-proof', 'answer-two-proof', 'answer-three-proof')
-FACT = 'Prefers concise code reviews.'
-ACTIVE = 'Memory: extracting'
+FACT = ('Prefers concise code reviews. 中文记忆😀详细内容 ' * 3).strip()
+SPINNERS = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+PROGRESS = re.compile(r'^M: ([' + SPINNERS + r'])(?: \+([1-9][0-9]*))?$')
 SAVED_PATH = '.thin/memory/preferences-review-style.md'
 RETIRED_PATHS = ('.thin/memory/jobs', '.thin/memory/jobs-owner', '.thin/mem-jobs', '.thin/mem-jobs-owner')
 CONTEXT_PREFIX = '[Context material'
@@ -69,6 +71,7 @@ WARNING_MARKERS = ('Saved thinking level not applied', 'awaiting model capabilit
 MEMORY_UI_LABELS = (
     'Memory: extracting', 'Memory: saving', 'Memory: queued', 'Memory: saved',
     'Memory: skipped', 'Memory: failed', 'Memory: canceled', 'Memory: request outcome uncertain',
+    'M: ✓',
 )
 
 
@@ -83,6 +86,7 @@ def assert_no_ui_memory_notice(value, where):
             assert_no_ui_memory_notice(nested, where)
     elif isinstance(value, str):
         assert not any(label in value for label in MEMORY_UI_LABELS), f'Memory UI notice in {where}'
+        assert not re.search(r'M: [' + SPINNERS + r']', value), f'Memory progress in {where}'
 
 
 def load_idle_fixture():
@@ -104,9 +108,65 @@ def load_idle_fixture():
 
 
 IDLE = load_idle_fixture()
-Screen = IDLE.Screen
 FRAME_END = IDLE.FRAME_END
 SYNC_BEGIN = IDLE.SYNC_BEGIN
+
+
+class Screen(IDLE.Screen):
+    """The borrowed VT oracle, extended locally for UTF-8 display cells."""
+
+    def feed(self, data):
+        self.pending += data
+        data = self.pending
+        i = 0
+        while i < len(data):
+            b = data[i]
+            if b == 27:
+                m = IDLE.CSI.match(data, i)
+                if not m:
+                    if data[i:i + 2] == b'\x1b[' or i + 1 == len(data):
+                        break
+                    i += 2
+                    continue
+                args, final = m.groups()
+                assert final not in (b'H', b'f', b'J', b'r'), 'fullscreen operation'
+                assert not (final in (b'h', b'l') and any(x in args.split(b';') for x in (b'?1049', b'?1047', b'?47')))
+                n = int(args) if args.isdigit() else 1
+                if final == b'A': self.row = max(0, self.row - n)
+                elif final == b'B': self.row = min(23, self.row + n)
+                elif final == b'C': self.col = min(self.columns - 1, self.col + n)
+                elif final == b'D': self.col = max(0, self.col - n)
+                elif final == b'K': self.grid[self.row][self.col:] = [' '] * (self.columns - self.col)
+                elif final == b'M':
+                    for _ in range(n):
+                        self.grid.pop(self.row)
+                        self.grid.append([' '] * self.columns)
+                i = m.end()
+                continue
+            if b >= 128:
+                size = 2 if 0xc2 <= b <= 0xdf else 3 if 0xe0 <= b <= 0xef else 4 if 0xf0 <= b <= 0xf4 else 1
+                if i + size > len(data):
+                    break
+                ch = data[i:i + size].decode('utf-8', errors='replace')
+                width = 0 if unicodedata.combining(ch) else 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+                if width == 0:
+                    if self.col:
+                        self.grid[self.row][self.col - 1] += ch
+                else:
+                    self.grid[self.row][self.col] = ch
+                    if width == 2 and self.col + 1 < self.columns:
+                        self.grid[self.row][self.col + 1] = ''
+                    self.col = min(self.columns - 1, self.col + width)
+                i += size
+                continue
+            i += 1
+            if b == 13: self.col = 0
+            elif b == 10: self.down()
+            elif b == 8: self.col = max(0, self.col - 1)
+            elif 32 <= b < 127:
+                self.grid[self.row][self.col] = chr(b)
+                self.col = min(self.columns - 1, self.col + 1)
+        self.pending = data[i:]
 
 
 class Control:
@@ -284,7 +344,7 @@ def row_text(screen, index):
 
 
 def memory_progress(text):
-    return re.match(r'^Memory: (?:extracting|saving|queued)\b', text) is not None
+    return PROGRESS.fullmatch(text.split('|')[0].rstrip()) is not None
 
 
 def footer_state(screen):
@@ -307,17 +367,20 @@ def footer_state(screen):
 
 
 def memory_footer_absent(screen):
-    return 1 <= screen.row < len(screen.grid) and 'Memory:' not in row_text(screen, screen.row - 1)
+    if not 1 <= screen.row < len(screen.grid):
+        return False
+    hint = row_text(screen, screen.row - 1)
+    return not hint.startswith(('M: ', 'Memory: '))
 
 
 def saved_transcript_rows(screen):
     """Visible Memory rows outside the footer, with logical positions."""
     return [(len(screen.history) + i, row_text(screen, i)) for i in range(len(screen.grid))
-            if i != screen.row - 1 and 'Memory:' in row_text(screen, i)]
+            if i != screen.row - 1 and row_text(screen, i).startswith('M: ✓')]
 
 
 def saved_visible(screen):
-    return any(i < len(screen.history) + screen.row - 1 and row.startswith('Memory: saved') and FACT in row
+    return any(i < len(screen.history) + screen.row - 1 and row.startswith('M: ✓ ')
                for i, row in saved_transcript_rows(screen))
 
 
@@ -330,11 +393,22 @@ def assert_saved_transcript(screen, expected=None):
         assert len(rows) == expected, f'Memory transcript rows {len(rows)} != {expected}: {rows!r}'
     for index, text in rows:
         assert index < len(screen.history) + screen.row - 1, 'Memory result is not above the footer'
-        assert text.startswith('Memory: saved') and FACT in text, f'unexpected Memory transcript row: {text!r}'
+        assert text.startswith('M: ✓ ') and text.endswith('...'), f'unexpected saved row: {text!r}'
+        summary_prefix = text[len('M: ✓ '):-3]
+        assert summary_prefix and FACT.startswith(summary_prefix) and len(summary_prefix) < len(FACT), \
+            f'saved summary is not a clipped prefix: {text!r}'
+        assert '中文' in summary_prefix and '😀' in summary_prefix, f'wide characters missing: {text!r}'
+        assert IDLE.cells(text.encode('utf-8')) <= screen.columns, f'saved row exceeds physical width: {text!r}'
+        physical = index - len(screen.history)
+        if physical + 1 < len(screen.grid):
+            continuation = FACT[len(summary_prefix):].lstrip()
+            next_row = row_text(screen, physical + 1).lstrip()
+            assert not (next_row and continuation.startswith(next_row)), \
+                f'saved summary wrapped onto another row: {next_row!r}'
     return rows
 
 
-def assert_footer(screen, expected):
+def assert_footer(screen, queued):
     """Exactly one Memory hint between the blank separator and composer row."""
     rows = [row_text(screen, i) for i in range(len(screen.grid))]
     row = screen.row
@@ -343,18 +417,24 @@ def assert_footer(screen, expected):
     assert all(text == '' for text in rows[row + 1:]), 'visible rows below composer are not blank'
     hint = rows[row - 1]
     assert rows[row - 2] == '', f'blank separator above the Memory hint is missing: {rows[row - 2]!r}'
+    assert not any(text.startswith(('Memory: extracting', 'Memory: saving', 'Memory: queued'))
+                   for text in rows), 'legacy Memory progress is visible'
     hints = [(i, text) for i, text in enumerate(rows) if memory_progress(text)]
     assert len(hints) == 1, f'Memory progress hint is not unique on the screen: {hints!r}'
     assert hints[0] == (row - 1, hint), 'the Memory hint is not the row directly above the composer'
     label = hint.split('|')[0].rstrip()
-    assert label.startswith(expected), f'Memory footer is {label!r}, expected prefix {expected!r}'
-    suffix = label[len(expected):]
-    if suffix:
-        assert re.search(r'\d', suffix) and 'queue' in suffix.lower(), \
-            f'queued Memory suffix is not a count: {suffix!r}'
+    match = PROGRESS.fullmatch(label)
+    assert match and match.group(2) == (str(queued) if queued else None), \
+        f'Memory footer {label!r} has incorrect queued count {queued}'
     assert 'S:' not in hint and 'F:' not in hint, \
         f'Memory status leaked primary steering/follow-up counters: {hint!r}'
-    return hint
+    return match.group(1)
+
+
+def footer_has_queue(screen, queued):
+    hint = footer_state(screen)
+    match = PROGRESS.fullmatch(hint) if hint else None
+    return bool(match and match.group(2) == (str(queued) if queued else None))
 
 
 def run(app, columns, observe_saved=False):
@@ -461,9 +541,17 @@ def run(app, columns, observe_saved=False):
             # held unanswered on a fixture-owned Event.
             control.expect(PROMPTS[0])
             send(PROMPTS[0].encode() + b'\r')
-            pump_until(lambda: b'answer-one-proof' in capture and fresh() and footer_state(screen) == ACTIVE,
-                       'round 1 idle primary with an active Memory footer')
-            hint = assert_footer(screen, ACTIVE)
+            round1_deadline = time.monotonic() + 12
+            pump_until(lambda: b'answer-one-proof' in capture and fresh() and footer_has_queue(screen, 0),
+                       'round 1 idle primary with an active Memory footer',
+                       timeout=max(0, round1_deadline - time.monotonic()))
+            first_spinner = assert_footer(screen, 0)
+            before = len(capture)
+            pump_until(lambda: fresh(after=before) and footer_has_queue(screen, 0)
+                       and PROGRESS.fullmatch(footer_state(screen)).group(1) != first_spinner,
+                       'a second Memory-only idle animation frame',
+                       timeout=max(0, round1_deadline - time.monotonic()))
+            assert_footer(screen, 0)
             rows = [row_text(screen, i) for i in range(len(screen.grid))]
             assert any(marker in text for text in rows for marker in WARNING_MARKERS), \
                 'expected the benign capability warning to be visible'
@@ -509,16 +597,15 @@ def run(app, columns, observe_saved=False):
 
             # Round 2 while Memory 1 is still unanswered: the primary must be
             # admitted, answer and settle without releasing Memory 1.
-            queued_one = ACTIVE + ' (queued: 1)'
             control.expect(PROMPTS[1])
             send(PROMPTS[1].encode() + b'\r')
             pump_until(lambda: control.primary == 2 and b'answer-two-proof' in capture and fresh()
-                       and footer_state(screen) == queued_one,
+                       and footer_has_queue(screen, 1),
                        'round 2 primary answer while Memory 1 is blocked')
             assert not control.release1.is_set(), 'Memory 1 was released before round 2 settled'
             assert control.helper == 1, 'Memory 2 started before Memory 1 finished (FIFO violated)'
-            assert footer_state(screen) == queued_one, f'Memory footer lost while queued: {footer_state(screen)!r}'
-            assert_footer(screen, queued_one)
+            assert footer_has_queue(screen, 1), f'Memory footer lost while queued: {footer_state(screen)!r}'
+            assert_footer(screen, 1)
             assert_saved_transcript(screen, 0)
 
             # Release Memory 1 with valid evidence; the queued job must then run on
@@ -542,9 +629,9 @@ def run(app, columns, observe_saved=False):
             # The first completion is a single transcript row even while the
             # second job owns the progress footer. Observe both in a fresh ACK
             # before releasing the second job's empty response.
-            pump_until(lambda: fresh(after=before) and footer_state(screen) == ACTIVE and saved_visible(screen),
+            pump_until(lambda: fresh(after=before) and footer_has_queue(screen, 0) and saved_visible(screen),
                        'second Memory job active with the first saved result in the transcript')
-            assert_footer(screen, ACTIVE)
+            assert_footer(screen, 0)
             assert_saved_transcript(screen, 1)
             before = len(capture)
             control.release2.set()
@@ -558,10 +645,10 @@ def run(app, columns, observe_saved=False):
             control.expect(PROMPTS[2])
             send(PROMPTS[2].encode() + b'\r')
             pump_until(lambda: control.helper3_arrived.is_set() and b'answer-three-proof' in capture
-                       and fresh() and footer_state(screen) == ACTIVE,
+                       and fresh() and footer_has_queue(screen, 0),
                        'round 3 active Memory footer after prompt 3')
             assert b'answer-three-proof' in capture, 'round 3 primary answer is missing'
-            assert_footer(screen, ACTIVE)
+            assert_footer(screen, 0)
             assert_saved_transcript(screen)  # The prior saved result may have scrolled away.
             assert not control.release3.is_set() and not control.helper3_responded
 
@@ -587,6 +674,7 @@ def run(app, columns, observe_saved=False):
                         check_records(nested)
                 elif isinstance(value, str):
                     assert 'Memory:' not in value, 'Memory notice in journal/canonical message'
+                    assert_no_ui_memory_notice(value, 'journal/canonical message')
             for journal in journals:
                 assert journal.stat().st_size <= 4 * 1024 * 1024, 'session journal byte bound'
                 for line in journal.read_text(encoding='utf-8').splitlines():

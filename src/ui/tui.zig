@@ -36,6 +36,7 @@ const shared = @import("../presentation.zig");
 const bridge_module = @import("bridge.zig");
 const session_client = @import("session_client.zig");
 const memory_status = @import("../core/memory_status.zig");
+const background_status = @import("../core/background_status.zig");
 const remote_action = @import("remote_action.zig");
 const Io = std.Io;
 
@@ -83,6 +84,11 @@ const Record = struct {
     kind: Kind,
     /// Notice-only tone; all other kinds render exactly as before.
     notice_level: NoticeLevel = .plain,
+    /// One physical display row: the body is clipped to the real screen width
+    /// with an ellipsis instead of wrapping. Only compact confirmations (the
+    /// Memory saved result) opt in; every other notice keeps paragraph
+    /// rendering so no real failure text is ever cut away.
+    single_row: bool = false,
     /// Compact completion caption; explicit local output uses a separate plain record.
     command_row: bool = false,
     agent_row: bool = false,
@@ -382,6 +388,24 @@ const Record = struct {
             self.cache = arena;
             return;
         }
+        if (self.single_row) {
+            // Storage keeps the whole text; only this row is clipped. A width
+            // change re-derives the line from the retained body, so a still
+            // drawable record obeys the new geometry. Rows already retired into
+            // native scrollback stay exactly as written.
+            const tone = switch (self.notice_level) {
+                .plain => theme.muted,
+                .warning => theme.caution,
+                .failure => theme.failure,
+            };
+            const line = try presentation.singleLine(temp, self.body.items, @max(1, columns));
+            const styled = try std.fmt.allocPrint(temp, "{s}{s}{s}", .{ theme.reset, tone, line });
+            self.lines = try temp.dupe([]const u8, &.{styled});
+            self.excerpt = false;
+            self.columns = columns;
+            self.cache = arena;
+            return;
+        }
         // 截断时追加提示，但提示只用于显示，模型历史保持不变。
         const data = if (self.clipped and self.kind != .reasoning) try std.fmt.allocPrint(temp, "{s}\n[display clipped; model history is unchanged]", .{self.body.items}) else self.body.items;
         const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = 4096, .markdown = self.kind == .assistant, .tone = if (self.kind == .user) .user else if (self.kind == .reasoning) .thinking else if (self.kind == .notice) switch (self.notice_level) {
@@ -446,8 +470,10 @@ pub const Connection = struct {
     context: *anyopaque,
     current_fn: *const fn (*anyopaque) State,
     configure_fn: *const fn (*anyopaque, []const u8) anyerror!void,
-    /// Idle, joined-owner callbacks; no network calls. Model selection stays
-    /// local; effort saves the project preference, never global defaults.
+    /// Owner callbacks; no network calls. Model selection stays local and
+    /// idle-only; effort/cycle-effort are the only two operations also issued
+    /// while the main task runs, and the owner queues that value for the next
+    /// request boundary instead of mutating a live request's configuration.
     select_model_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     configure_provider_fn: ?*const fn (*anyopaque, core_config.providers.Id, []const u8) anyerror!void = null,
     codex_login_fn: ?*const fn (*anyopaque, corecodex.Action, u64) anyerror!void = null,
@@ -463,6 +489,14 @@ pub const Connection = struct {
     /// Local foreground only: pop one delivered Memory terminal. The owner
     /// returns it exactly once; remote sessions deliver through display events.
     take_memory_completion_fn: ?*const fn (*anyopaque) ?memory_status.Terminal = null,
+    peek_background_fn: ?*const fn (*anyopaque) ?background_status.Terminal = null,
+    take_background_fn: ?*const fn (*anyopaque, background_status.Id) void = null,
+    /// Local foreground task lifecycle. The owner marks its own shared
+    /// configuration as owned between begin and the matching joined, so a
+    /// request boundary never reads a selection that is still being published.
+    /// A remote backend already owns its task; that path never calls these.
+    task_begin_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    task_joined_fn: ?*const fn (*anyopaque) void = null,
     /// Optional remote session adapter (daemon --connect / --attach). When set,
     /// the TUI never dereferences a Runtime: tasks, Inbox, approvals and
     /// checkpoints stay owned by the backend and the UI only submits, ACKs and
@@ -517,6 +551,7 @@ pub const Connection = struct {
         image_model: ?[]const u8 = null,
         memory_auto: bool = true,
         memory: @import("../core/memory_status.zig").View = .{},
+        background: background_status.View = .{},
         subagents: @import("../core/subagent_status.zig").View = .{},
         subagents_supported: bool = false,
         decision_enabled: bool = false,
@@ -554,6 +589,16 @@ pub const Connection = struct {
     pub fn takeMemoryCompletion(self: Connection) ?memory_status.Terminal {
         const callback = self.take_memory_completion_fn orelse return null;
         return callback(self.context);
+    }
+
+    pub fn peekBackground(self: Connection) ?background_status.Terminal {
+        const callback = self.peek_background_fn orelse return null;
+        return callback(self.context);
+    }
+
+    pub fn takeBackground(self: Connection, id: background_status.Id) void {
+        const callback = self.take_background_fn orelse return;
+        callback(self.context, id);
     }
 
     pub fn configure(self: Connection, key: []const u8) !void {
@@ -961,6 +1006,9 @@ const Ui = struct {
     /// Exact Memory terminal popped locally whose transcript publication
     /// failed. One fixed value, retried before taking any new source value.
     memory_completion_pending: ?memory_status.Terminal = null,
+    /// A local foreground task was announced to the owner and its joined
+    /// release is still owed. Exactly one release follows one begin.
+    task_owned: bool = false,
     /// Foreground terminal detail that could not be published yet. Retried at
     /// the same idle safe point; only a proven append clears it.
     terminal_notice_pending: ?r.Terminal = null,
@@ -1089,6 +1137,7 @@ const Ui = struct {
         self.cancel.cancel();
         // 必须等待 worker 结束，否则它可能仍在访问 Ui 的字段。
         if (self.future) |*future| future.await(self.io);
+        self.endTaskOwnership();
         self.detachInbox();
         self.inbox.deinit();
         if (self.prompt) |prompt| self.allocator.free(prompt);
@@ -1216,7 +1265,9 @@ const Ui = struct {
         };
         slot.* = .{ .ticket = ticket, .purpose = purpose, .original_editor = original, .editor_revision = self.editor_revision, .epoch = epoch, .permission_id = if (self.permission) |permission| permission.id else null, .previous_effort = self.connection.current().reasoning_effort, .settings_generation = self.settings_menu.generation, .stop_instance = self.stop_instance };
         if (purpose == .open_stop or purpose == .release_stop) self.async_stop_intent = ticket;
-        self.parser.stop_feed = true;
+        // Effort changes do not transfer input ownership; retain the rest of
+        // this feed without clearing a barrier set by an earlier action.
+        if (purpose != .effort) self.parser.stop_feed = true;
         self.notice = pending_session_notice;
         self.requestDraw();
         return &slot.*.?;
@@ -2765,11 +2816,13 @@ const Ui = struct {
     fn executionCaption(self: *Ui, name: []const u8, identity: ?p.ToolDisplayKey) !presentation.Caption {
         const call = try self.tool_calls.take(name, self.allocator);
         defer call.deinit(self.allocator);
-        // Preserve reliable canonical captions, including valid optional/null
-        // fields that the intentionally conservative preview extractor omits.
-        if (call.detail != null) return presentation.fromCall(self.allocator, call);
+        // Prepared background metadata is authoritative even when canonical
+        // arguments happened to yield an ordinary bash or control caption.
         if (identity) |value| {
-            if (try self.tool_views.cloneReadyCaption(self.allocator, value)) |caption| return caption;
+            if (try self.tool_views.cloneReadyCaption(self.allocator, value)) |caption| {
+                if (caption.display != null or call.detail == null) return caption;
+                caption.deinit(self.allocator);
+            }
         }
         return presentation.fromCall(self.allocator, call);
     }
@@ -2908,14 +2961,22 @@ const Ui = struct {
     fn toolCompleted(self: *Ui, caption: presentation.Caption, result: r.Execution) !void {
         const completion = shared.tools.Completion.fromExecution(result);
         const outcome = completion.outcome;
-        const observed = if (outcome == .success) try presentation.completed(self.allocator, caption, completion.file_stats) else presentation.Caption{
-            .kind = caption.kind,
-            .label = try self.allocator.dupe(u8, caption.label),
-            .failure_reason = if (caption.kind == .read) shared.tools.readFailure(result) else null,
+        const replacement: ?presentation.Caption = if (completion.display) |display|
+            try presentation.withBackground(self.allocator, caption, display)
+        else
+            null;
+        defer if (replacement) |value| value.deinit(self.allocator);
+        const effective = replacement orelse caption;
+        const observed = if (outcome == .success) try presentation.completed(self.allocator, effective, completion.file_stats) else presentation.Caption{
+            .kind = effective.kind,
+            .label = try self.allocator.dupe(u8, effective.label),
+            .display = effective.display,
+            .failure_reason = if (effective.kind == .read) shared.tools.readFailure(result) else null,
         };
         defer observed.deinit(self.allocator);
         const index = try self.add(.tool, "");
-        try self.records.items[index].setCommand(self.allocator, observed, outcome, completion.duration_ms);
+        const handoff = if (effective.display) |display| display.action == .start and outcome == .success else false;
+        try self.records.items[index].setCommand(self.allocator, observed, outcome, if (handoff) null else completion.duration_ms);
     }
 
     fn localCommandOutput(self: *Ui, data: []const u8, truncated: bool) !void {
@@ -2933,7 +2994,8 @@ const Ui = struct {
         const label = try presentation.commandText(a, self.active_tool.?.caption, .pending);
         defer a.free(label);
         const start = self.active_tool.?.started_ms;
-        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, self.clock_ms -| start, self.clock_ms);
+        const background_start = if (self.active_tool.?.caption.display) |display| display.action == .start else false;
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, if (background_start) null else self.clock_ms -| start, self.clock_ms);
     }
 
     fn waitingCommand(self: *Ui, a: std.mem.Allocator, entry: tool_views_module.Entry, columns: usize) ![]const u8 {
@@ -3057,19 +3119,29 @@ const Ui = struct {
             }
         }
         if (notice.len == 0 and self.remote() != null and !state.available) notice = "Daemon connection unavailable; /exit and reconnect";
-        // Active/queued Memory is the only persistent background status. Its
+        // Active/queued Memory has an independent persistent status. Its
         // terminal results are conversation notices and never return here.
+        // The row is one braille frame plus, when waiting work exists, exactly
+        // the queued count (the active job is never counted twice). The frame
+        // comes from the ordinary 80 ms animation clock; nothing here schedules
+        // a refresh of its own.
         if (self.permission == null and !self.stop_open and state.memory.enabled and
             (state.memory.active != null or state.memory.queued_count != 0))
         {
-            const memory_text = if (state.memory.active) |active|
-                if (state.memory.queued_count != 0)
-                    try std.fmt.allocPrint(a, "Memory: {s} (queued: {d})", .{ @tagName(active.phase), state.memory.queued_count })
-                else
-                    try std.fmt.allocPrint(a, "Memory: {s}", .{@tagName(active.phase)})
+            const spinner = activity.spinner(self.clock_ms);
+            const memory_text = if (state.memory.queued_count != 0)
+                try std.fmt.allocPrint(a, "M: {s} +{d}", .{ spinner, state.memory.queued_count })
             else
-                try std.fmt.allocPrint(a, "Memory: queued ({d})", .{state.memory.queued_count});
+                try std.fmt.allocPrint(a, "M: {s}", .{spinner});
             notice = if (notice.len == 0) memory_text else try std.fmt.allocPrint(a, "{s} | {s}", .{ notice, memory_text });
+        }
+        if (self.permission == null and !self.stop_open and state.background.active_count != 0) {
+            const spinner = activity.spinner(self.clock_ms);
+            const background_text = if (state.background.active_count > 1)
+                try std.fmt.allocPrint(a, "B: {s} {d}", .{ spinner, state.background.active_count })
+            else
+                try std.fmt.allocPrint(a, "B: {s}", .{spinner});
+            notice = if (notice.len == 0) background_text else try std.fmt.allocPrint(a, "{s} | {s}", .{ notice, background_text });
         }
         if (notice.len == 0) if (state.pending_default_effort) |effort| {
             notice = try std.fmt.allocPrint(a, "Default thinking: {s}; awaiting model capabilities", .{effort.name() orelse "unknown"});
@@ -3276,8 +3348,8 @@ const Ui = struct {
                 reasoning = true;
                 source = v.len != 0;
             },
-            .memory_completed => {
-                // A completed Memory result owns its appended row, not a
+            .memory_completed, .background_completed => {
+                // A completed background result owns its appended row, not a
                 // stream source. A silent skipped result is a metadata fence.
                 source = false;
                 if (self.newestDeliveryRecord(before.next_id)) |index| {
@@ -3429,6 +3501,7 @@ const Ui = struct {
                     @errorName(err));
             },
             .memory_completed => |terminal| try self.acceptMemoryCompletion(terminal),
+            .background_completed => |terminal| try self.appendBackgroundCompletion(terminal),
             // 这些事件对 UI 没有需要展示的内容。
             .finished => {},
             // Raw arguments only feed the shared meter above. Visible rows use
@@ -4458,12 +4531,29 @@ const Ui = struct {
         self.notice = if (inherited) "Model selected; inherited context budget" else "Model selected";
         self.requestDraw();
     }
+    /// Shift+Tab is allowed while the main task runs: the owner queues the
+    /// selection at the next request boundary, so the UI only lifts the
+    /// task-idle requirement. Every ownership guard stays exactly as strict as
+    /// before: poison, secret/paste isolation, overlays, confirmation, approval
+    /// and exit authority. This is not a relaxed settingsIdle().
+    fn effortAdjustable(self: *const Ui) bool {
+        return !self.remoteSynchronizing() and self.permission == null and !self.poisoned and
+            !self.exitAuthorized() and !self.secret_mode and !self.secret_quarantine and
+            !self.parser.pasted and !self.editor_pasted and !self.parser.batch_paste and
+            self.model_picker == null and !self.provider_open and !self.settings_open and
+            !self.stop_open and !self.codex_open and !self.codex_opening and
+            !self.commandMenuVisible();
+    }
+
     fn cycleEffort(self: *Ui) void {
-        if (!self.settingsIdle() or self.editor_pasted or self.model_picker != null or self.provider_open or self.settings_open) {
+        if (!self.effortAdjustable()) {
             self.notice = "Thinking selection requires an idle, non-pasted session";
             return;
         }
-        self.bridge.reset() catch {
+        // A running task keeps its bridge, draft, body, tool rows and busy
+        // state: resetting them here would interrupt the request that the new
+        // selection must not touch.
+        if (!self.busy) self.bridge.reset() catch {
             self.notice = "Thinking selection requires a drained session bridge";
             return;
         };
@@ -4499,7 +4589,9 @@ const Ui = struct {
         self.display.setEffort(next);
         // 档位变更只在输入框百分比位置短暂确认，不再写常驻 hint 行。
         self.effort_flash = .{ .level = next, .until_ms = self.clock_ms +| 5000 };
-        self.notice = "Ready";
+        // While the main task runs, its own notice (pending control, warning)
+        // stays untouched; the flash is the only confirmation.
+        if (!self.busy) self.notice = "Ready";
         self.requestDraw();
     }
     fn expireEffortFlash(self: *Ui) void {
@@ -4800,6 +4892,10 @@ const Ui = struct {
         self.job = .{ .runtime = runtime, .cancel = self.cancel, .prompt = prompt, .kind = kind };
         self.attachInbox(runtime);
         errdefer self.detachInbox();
+        // Ownership is announced immediately before the worker exists, so a
+        // failed start releases it and never leaves the owner holding a lock.
+        try self.beginTaskOwnership();
+        errdefer self.endTaskOwnership();
         const future = try Io.concurrent(self.io, task.Job.run, .{&self.job});
         var bytes: usize = record.body.items.len;
         for (self.records.items) |old| bytes += old.body.items.len;
@@ -4847,6 +4943,8 @@ const Ui = struct {
         self.job = .{ .runtime = runtime, .cancel = self.cancel, .prompt = "", .kind = .compact };
         self.attachInbox(runtime);
         errdefer self.detachInbox();
+        try self.beginTaskOwnership();
+        errdefer self.endTaskOwnership();
         const future = try Io.concurrent(self.io, task.Job.run, .{&self.job});
         self.future = future;
         self.prompt = null;
@@ -5074,6 +5172,7 @@ const Ui = struct {
         if (value.len == 0) return;
         if (value[0] == '/' or value[0] == '!') {
             self.notice = "Only ordinary conversation text can be queued";
+            self.publishNoticeAlias(.warning);
             return;
         }
         if (self.poisoned or self.stop_open or !self.queueOwnerMatches()) {
@@ -5807,14 +5906,17 @@ const Ui = struct {
     }
 
     /// Memory terminal wording. Skipped is deliberately silent; failed and
-    /// uncertain are warnings unless cleanup safety is at stake.
+    /// uncertain are warnings unless cleanup safety is at stake. The saved
+    /// confirmation is a compact one-row summary, never a count. A failed or
+    /// uncertain result that still saved some entries keeps that fact and its
+    /// original severity instead of pretending to be a success.
     fn formatMemoryTerminal(terminal: memory_status.Terminal, buffer: []u8) ?struct { level: NoticeLevel, text: []const u8 } {
         if (terminal.result == .skipped) return null;
         const label: []const u8 = switch (terminal.result) {
-            .saved => "Memory: saved",
-            .failed => "Memory: failed",
-            .uncertain => "Memory: request outcome uncertain",
-            .canceled => "Memory: canceled",
+            .saved => "M: \u{2713}",
+            .failed => "M: failed",
+            .uncertain => "M: uncertain",
+            .canceled => "M: canceled",
             .skipped => return null,
         };
         const level: NoticeLevel = switch (terminal.result) {
@@ -5825,11 +5927,11 @@ const Ui = struct {
         const summary = terminal.summary.text();
         const value_text = if (terminal.result == .saved)
             if (summary.len == 0)
-                std.fmt.bufPrint(buffer, "{s} ({d})", .{ label, terminal.saved_count }) catch return null
+                label
             else
-                std.fmt.bufPrint(buffer, "{s} ({d}) — {s}", .{ label, terminal.saved_count, summary }) catch return null
+                std.fmt.bufPrint(buffer, "{s} {s}", .{ label, summary }) catch return null
         else if (terminal.saved_count != 0 and summary.len != 0)
-            std.fmt.bufPrint(buffer, "{s}; saved ({d}) — {s}", .{ label, terminal.saved_count, summary }) catch return null
+            std.fmt.bufPrint(buffer, "{s}; saved ({d}) - {s}", .{ label, terminal.saved_count, summary }) catch return null
         else if (terminal.saved_count != 0)
             std.fmt.bufPrint(buffer, "{s}; saved ({d})", .{ label, terminal.saved_count }) catch return null
         else
@@ -5840,13 +5942,81 @@ const Ui = struct {
     fn appendMemoryCompletion(self: *Ui, terminal: memory_status.Terminal) !void {
         var buffer: [640]u8 = undefined;
         const formatted = formatMemoryTerminal(terminal, &buffer) orelse return;
-        try self.appendNotice(formatted.level, formatted.text);
+        const index = try self.addRecord(.notice, formatted.text, false);
+        self.records.items[index].notice_level = formatted.level;
+        // Only the saved confirmation is guaranteed one physical row. Failure,
+        // uncertainty and cancellation keep the ordinary paragraph rendering so
+        // nothing real becomes invisible on a narrow screen.
+        self.records.items[index].single_row = terminal.result == .saved;
     }
 
     /// Remote delivery is fallible on purpose: the caller keeps the source
     /// sequence unacknowledged when the row was not really appended.
     fn acceptMemoryCompletion(self: *Ui, terminal: memory_status.Terminal) !void {
         try self.appendMemoryCompletion(terminal);
+    }
+
+    /// Background terminal rows are UI-only. Keep the result and failure
+    /// classification ahead of the potentially long command when clipped.
+    fn appendBackgroundCompletion(self: *Ui, terminal: background_status.Terminal) !void {
+        var buffer: [768]u8 = undefined;
+        var detail_buffer: [96]u8 = undefined;
+        const status = if (terminal.result == .canceled) "canceled" else "failed";
+        const detail = if (terminal.result == .success)
+            "✓"
+        else if (terminal.exit_code) |code|
+            if (terminal.failure) |failure|
+                try std.fmt.bufPrint(&detail_buffer, "{s} ({s}, exit {d})", .{ status, @tagName(failure), code })
+            else
+                try std.fmt.bufPrint(&detail_buffer, "{s} (exit {d})", .{ status, code })
+        else if (terminal.signal) |signal|
+            if (terminal.failure) |failure|
+                try std.fmt.bufPrint(&detail_buffer, "{s} ({s}, signal {d})", .{ status, @tagName(failure), signal })
+            else
+                try std.fmt.bufPrint(&detail_buffer, "{s} (signal {d})", .{ status, signal })
+        else if (terminal.failure) |failure|
+            try std.fmt.bufPrint(&detail_buffer, "{s} ({s})", .{ status, @tagName(failure) })
+        else
+            status;
+        const command = terminal.command.slice();
+        const message = if (std.mem.eql(u8, command, "[command hidden]"))
+            try std.fmt.bufPrint(&buffer, "B: {s} {s} {s} · {d}ms", .{ detail, terminal.id.slice(), command, terminal.duration_ms })
+        else
+            try std.fmt.bufPrint(&buffer, "B: {s} {s} · {d}ms", .{ detail, command, terminal.duration_ms });
+        const index = try self.addRecord(.notice, message, false);
+        self.records.items[index].notice_level = if (terminal.result == .success) .plain else if (terminal.result == .canceled and terminal.failure != .cleanup) .warning else .failure;
+        self.records.items[index].single_row = true;
+    }
+
+    /// Peek is non-consuming: admission must succeed before the exact source
+    /// id is retired. Remote completions arrive only through the live stream.
+    fn pollBackgroundCompletion(self: *Ui) void {
+        if (!self.memorySafePoint() or self.remote() != null or self.connection.take_background_fn == null) return;
+        var batch: usize = 0;
+        while (batch < 8) : (batch += 1) {
+            const terminal = self.connection.peekBackground() orelse return;
+            self.appendBackgroundCompletion(terminal) catch return;
+            self.connection.takeBackground(terminal.id);
+            self.requestDraw();
+        }
+    }
+
+    /// Local foreground ownership handoff, strictly paired. A remote backend
+    /// already owns its task, so this view never announces a second one.
+    fn beginTaskOwnership(self: *Ui) !void {
+        if (self.task_owned or self.remote() != null) return;
+        const begin = self.connection.task_begin_fn orelse return;
+        try begin(self.connection.context);
+        self.task_owned = true;
+    }
+
+    /// Release exactly the ownership a successful begin established. A failed
+    /// begin leaves no release to send, and the caller's input stays untouched.
+    fn endTaskOwnership(self: *Ui) void {
+        if (!self.task_owned) return;
+        self.task_owned = false;
+        const joined = self.connection.task_joined_fn orelse return;
+        joined(self.connection.context);
     }
 
     /// Memory completion is appended only at the idle point the host proxy
@@ -6062,6 +6232,10 @@ const Ui = struct {
             future.await(self.io);
             self.future = null;
         }
+        // The worker is really joined here, and no next task or FollowUp can be
+        // dispatched before this release: the owner may hand its shared
+        // configuration back at a safe boundary.
+        self.endTaskOwnership();
         self.detachInbox();
 
         // The producer can finish after our per-tick drain limit. Once joined,
@@ -6228,9 +6402,29 @@ const Ui = struct {
             !self.busy and !self.presentationWaiting() and !self.remoteSynchronizing() and self.mode == null and self.active_tool == null;
     }
 
+    /// Active or queued Memory keeps its own neutral animated footer row even
+    /// while the main task is idle. Read-only owner snapshot; it neither polls
+    /// nor schedules anything, so the ordinary tick owns the cadence.
+    fn memoryAnimating(self: *const Ui) bool {
+        if (self.permission != null or self.stop_open or self.secret_mode or self.secret_quarantine or
+            self.settings_open or self.provider_open or self.model_picker != null or self.commandMenuVisible()) return false;
+        const memory = self.connection.current().memory;
+        return memory.enabled and (memory.active != null or memory.queued_count != 0);
+    }
+
+    fn backgroundAnimating(self: *const Ui) bool {
+        if (self.permission != null or self.stop_open or self.secret_mode or self.secret_quarantine or
+            self.settings_open or self.provider_open or self.model_picker != null or self.commandMenuVisible()) return false;
+        return self.connection.current().background.active_count != 0;
+    }
+
     fn animate(self: *Ui) void {
         const tick = self.clock_ms / 80;
-        if ((!self.busy and !self.presentationWaiting() and !self.remoteSynchronizing()) or self.resize_waiting or self.animation_tick == tick) return;
+        if (self.resize_waiting or self.animation_tick == tick) return;
+        // Memory progress is a background owner: it rotates on the same 80 ms
+        // tick and dirty-draw path as a running task, but it needs neither a
+        // busy main task nor a second refresh source.
+        if (!self.busy and !self.presentationWaiting() and !self.remoteSynchronizing() and !self.memoryAnimating() and !self.backgroundAnimating()) return;
         self.animation_tick = tick;
         // An approval owns a full, non-sparse preview. Repainting that unchanged
         // preview for a composer pulse sends its title/body again every 80 ms.
@@ -6239,7 +6433,7 @@ const Ui = struct {
         // A static pending preview needs no spinner-only repaint. Real events,
         // input and tool timing retain their normal independent draw requests.
         const queue = self.queueSnapshot();
-        if (self.permission == null and (queue.preview_count == 0 or self.active_tool != null)) self.dirty = true;
+        if (self.permission == null and (queue.preview_count == 0 or self.active_tool != null or self.memoryAnimating() or self.backgroundAnimating())) self.dirty = true;
     }
 
     /// 主事件循环：有界消费、处理按键，然后绘制最新状态；仅动画自身限频。
@@ -6258,6 +6452,7 @@ const Ui = struct {
             // buffered remote deltas must not wait one terminal tick apiece.
             try self.pumpDisplay();
             self.pollMemoryCompletion();
+            self.pollBackgroundCompletion();
 
             // acquire 与 worker 的 release 配对，确保读到任务结果。
             try self.finishReadyTask();
@@ -7993,9 +8188,15 @@ test "memory footer stays adjacent to wrapped composer after ACK" {
     try screen.replay(ui.frame);
     try std.testing.expect(ui.frame_composer_rows > 1);
     const status_row = screen.rows - ui.frame_composer_rows - 1;
-    try std.testing.expectEqualStrings("Memory: extracting", std.mem.trimEnd(u8, screen.grid[status_row][0..30], " "));
+    // The screen fixture maps each non-ASCII code point to one '~' cell.
+    try std.testing.expectEqualStrings("M: ~", std.mem.trimEnd(u8, screen.grid[status_row][0..30], " "));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expected_status = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(ui.clock_ms)});
+    try std.testing.expectEqualStrings(expected_status, try ui.hint(arena.allocator(), ui.connection.current()));
+    try std.testing.expectEqual(status_row + 1, try rowStartingWith(&screen, "(fixture) "));
     try std.testing.expectEqualStrings("", std.mem.trimEnd(u8, screen.grid[status_row - 1][0..30], " "));
-    try std.testing.expectEqual(@as(usize, 1), screen.count("Memory:"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("M: "));
     testAcknowledgeFullFrame(&ui);
     const history = screen.history_len;
     const records = ui.records.items.len;
@@ -8004,7 +8205,7 @@ test "memory footer stays adjacent to wrapped composer after ACK" {
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(history, screen.history_len);
     try std.testing.expectEqual(records, ui.records.items.len);
-    try std.testing.expectEqual(@as(usize, 1), screen.count("Memory:"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("M: "));
 }
 
 fn expectLongWarningAdjacent(screen: *const @import("../tests/regular_screen.zig").Screen, composer_rows: usize, columns: usize) !void {
@@ -13084,6 +13285,108 @@ test "completed producer drains final events before bridge can reset" {
     try bridge.reset();
 }
 
+test "local task ownership is announced once and released only after the join" {
+    const Tracker = struct {
+        begins: usize = 0,
+        joins: usize = 0,
+        fail_begin: bool = false,
+        fn current(_: *anyopaque) Connection.State {
+            return .{ .runtime = null, .model = "fixture", .base_url = "" };
+        }
+        fn begin(raw: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail_begin) return error.OwnerBusy;
+            self.begins += 1;
+        }
+        fn joined(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.joins += 1;
+        }
+    };
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var tracker: Tracker = .{};
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.context = &tracker;
+    ui.connection.current_fn = Tracker.current;
+    ui.connection.task_begin_fn = Tracker.begin;
+    ui.connection.task_joined_fn = Tracker.joined;
+
+    // A failed begin publishes nothing and owes no release. The refused start
+    // leaves the caller's input exactly as it was.
+    try std.testing.expect(try ui.editor.insert("kept draft"));
+    tracker.fail_begin = true;
+    try std.testing.expectError(error.OwnerBusy, ui.beginTaskOwnership());
+    try std.testing.expect(!ui.task_owned);
+    try std.testing.expectEqual(@as(usize, 0), tracker.begins);
+    try std.testing.expectEqual(@as(usize, 0), tracker.joins);
+    try std.testing.expectEqualStrings("kept draft", ui.editor.bytes.items);
+
+    tracker.fail_begin = false;
+    try ui.beginTaskOwnership();
+    try std.testing.expectEqual(@as(usize, 1), tracker.begins);
+    try std.testing.expect(ui.task_owned);
+    // A repeated begin never announces a second task.
+    try ui.beginTaskOwnership();
+    try std.testing.expectEqual(@as(usize, 1), tracker.begins);
+    try std.testing.expectEqual(@as(usize, 0), tracker.joins);
+
+    // The release happens only inside complete(), after the future is awaited.
+    ui.prompt = try std.testing.allocator.dupe(u8, "fixture");
+    ui.job = .{ .runtime = undefined, .cancel = &cancel, .prompt = ui.prompt.? };
+    ui.busy = true;
+    const Producer = struct {
+        fn run(state: *Ui) void {
+            state.job.terminal = .{ .status = .success };
+            state.job.done.store(true, .release);
+        }
+    };
+    ui.future = try Io.concurrent(std.testing.io, Producer.run, .{&ui});
+    try std.testing.expectEqual(@as(usize, 0), tracker.joins);
+    try std.testing.expect(ui.task_owned);
+    try ui.complete();
+    try std.testing.expectEqual(@as(usize, 1), tracker.joins);
+    try std.testing.expect(!ui.task_owned);
+    try std.testing.expect(!ui.busy);
+    // A later completion of the same task cannot release ownership twice.
+    try ui.complete();
+    try std.testing.expectEqual(@as(usize, 1), tracker.joins);
+    try std.testing.expectEqual(@as(usize, 1), tracker.begins);
+}
+
+test "remote sessions never announce a local task ownership" {
+    const Tracker = struct {
+        var begins: usize = 0;
+        var joins: usize = 0;
+        fn begin(_: *anyopaque) anyerror!void {
+            begins += 1;
+        }
+        fn joined(_: *anyopaque) void {
+            joins += 1;
+        }
+    };
+    Tracker.begins = 0;
+    Tracker.joins = 0;
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fake: FakeRemote = .{};
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.task_begin_fn = Tracker.begin;
+    ui.connection.task_joined_fn = Tracker.joined;
+    try std.testing.expect(ui.remote() != null);
+    // The backend owns the task, so this view announces and releases nothing:
+    // no second task may be started for an attached session.
+    try ui.beginTaskOwnership();
+    try std.testing.expect(!ui.task_owned);
+    try std.testing.expectEqual(@as(usize, 0), Tracker.begins);
+    ui.endTaskOwnership();
+    try std.testing.expectEqual(@as(usize, 0), Tracker.joins);
+}
+
 // 验证：即使字节未超过 bridge 预算，超高的审批预览也会被截断，并且只能拒绝。
 test "permission line clipping is deny-only even when bytes fit bridge budget" {
     try text.initLocale();
@@ -15050,6 +15353,117 @@ test "memory notice owner poll dirties UI without replacing foreground notice" {
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 }
 
+test "background and memory indicators animate independently while idle" {
+    const Fixture = struct {
+        count: usize = 1,
+        fn current(raw: *anyopaque) Connection.State {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .background = .{ .active_count = self.count }, .memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .extracting } } };
+        }
+    };
+    var fixture: Fixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.context = &fixture;
+    ui.connection.current_fn = Fixture.current;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    ui.clock_ms = 80;
+    ui.dirty = false;
+    ui.animate();
+    try std.testing.expect(ui.dirty);
+    const first = try ui.hint(arena.allocator(), Fixture.current(&fixture));
+    try std.testing.expect(std.mem.indexOf(u8, first, "M: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "B: ") != null);
+    ui.clock_ms = 160;
+    ui.dirty = false;
+    ui.animate();
+    try std.testing.expect(ui.dirty);
+    fixture.count = 3;
+    const multiple = try ui.hint(arena.allocator(), Fixture.current(&fixture));
+    try std.testing.expect(std.mem.indexOf(u8, multiple, " 3") != null);
+    fixture.count = 0;
+    const none = try ui.hint(arena.allocator(), Fixture.current(&fixture));
+    try std.testing.expect(std.mem.indexOf(u8, none, "B: ") == null);
+    ui.secret_mode = true;
+    try std.testing.expect(!ui.backgroundAnimating());
+}
+
+test "background completion is admitted before exact-id retirement" {
+    const Fixture = struct {
+        fn current(_: *anyopaque) Connection.State {
+            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "" };
+        }
+        pending: ?background_status.Terminal = .{ .id = background_status.Id.from("job"), .command = background_status.Command.from("中文😀"), .result = .failed, .duration_ms = 1234, .exit_code = 7, .failure = .exit },
+        takes: usize = 0,
+        fn peek(raw: *anyopaque) ?background_status.Terminal {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.pending;
+        }
+        fn take(raw: *anyopaque, id: background_status.Id) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.pending) |*terminal| {
+                if (std.mem.eql(u8, terminal.id.slice(), id.slice())) {
+                    self.pending = null;
+                    self.takes += 1;
+                }
+            }
+        }
+    };
+    var fixture: Fixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.context = &fixture;
+    ui.connection.current_fn = Fixture.current;
+    ui.connection.peek_background_fn = Fixture.peek;
+    ui.connection.take_background_fn = Fixture.take;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    ui.allocator = failing.allocator();
+    ui.pollBackgroundCompletion();
+    ui.allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 0), fixture.takes);
+    try std.testing.expectEqualStrings("job", fixture.pending.?.id.slice());
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    ui.pollBackgroundCompletion();
+    ui.pollBackgroundCompletion();
+    try std.testing.expectEqual(@as(usize, 1), fixture.takes);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    const row = ui.records.items[0];
+    try std.testing.expect(row.single_row);
+    try std.testing.expectEqual(NoticeLevel.failure, row.notice_level);
+    try std.testing.expect(std.mem.indexOf(u8, row.body.items, "exit 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row.body.items, "1234ms") != null);
+    ui.size = .{ .columns = 24, .rows = 12 };
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items[0].lines.len);
+    try std.testing.expectEqual(@as(usize, 23), ui.records.items[0].columns);
+    try std.testing.expect(@import("text.zig").styledWidth(ui.records.items[0].lines[0]) <= 23);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[0].output);
+    ui.resize(.{ .columns = 12, .rows = 12 });
+    ui.clock_ms = 80;
+    ui.animate();
+    try std.testing.expect(ui.resize_waiting and !ui.drawReady() and ui.frame.len == 0);
+    fixture.pending = .{ .id = background_status.Id.from("other"), .command = background_status.Command.from("另一个😀长任务名称"), .result = .canceled, .duration_ms = 9 };
+    ui.pollBackgroundCompletion();
+    try std.testing.expectEqual(@as(usize, 2), fixture.takes);
+    try std.testing.expectEqual(NoticeLevel.warning, ui.records.items[1].notice_level);
+    try ui.draw();
+    const second = &ui.records.items[1];
+    try std.testing.expect(second.single_row);
+    try std.testing.expectEqual(@as(usize, 1), second.lines.len);
+    try std.testing.expectEqual(@as(usize, 11), second.columns);
+    try std.testing.expect(@import("text.zig").styledWidth(second.lines[0]) <= 11);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(second.lines[0]));
+    testAcknowledgeFullFrame(&ui);
+}
+
 test "memory active and queued own the neutral footer and terminals stay in conversation" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -15061,14 +15475,24 @@ test "memory active and queued own the neutral footer and terminals stay in conv
     var runtime: r.Runtime = undefined;
     var state = ui.connection.current();
     state.runtime = &runtime;
+    // One braille frame, no phase word: the two states share one neutral row.
     state.memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .extracting } };
-    try std.testing.expectEqualStrings("Memory: extracting", try ui.hint(arena.allocator(), state));
+    ui.clock_ms = 0;
+    const frame0 = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(0)});
+    try std.testing.expectEqualStrings(frame0, try ui.hint(arena.allocator(), state));
+    // queued only, active kept: the count is exactly the waiting jobs.
     state.memory.queued_count = 2;
-    try std.testing.expectEqualStrings("Memory: extracting (queued: 2)", try ui.hint(arena.allocator(), state));
+    const with_queue = try std.fmt.allocPrint(arena.allocator(), "M: {s} +2", .{activity.spinner(0)});
+    try std.testing.expectEqualStrings(with_queue, try ui.hint(arena.allocator(), state));
+    // Waiting work alone still animates, with the same count.
     state.memory.active = null;
-    try std.testing.expectEqualStrings("Memory: queued (2)", try ui.hint(arena.allocator(), state));
+    try std.testing.expectEqualStrings(with_queue, try ui.hint(arena.allocator(), state));
+    // A zero count never prints a number and no history comes from last_terminal.
     state.memory.queued_count = 0;
     state.memory.last_terminal = .{ .id = 1, .result = .saved, .saved_count = 2 };
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    // Disabled Memory owns nothing even with active/queued values present.
+    state.memory = .{ .enabled = false, .active = .{ .id = 1, .phase = .saving }, .queued_count = 3 };
     try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 
@@ -15078,8 +15502,12 @@ test "memory active and queued own the neutral footer and terminals stay in conv
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     const saved_row = ui.records.items[0];
     try std.testing.expectEqual(NoticeLevel.plain, saved_row.notice_level);
-    const expected_saved = try std.fmt.allocPrint(arena.allocator(), "Memory: saved (2) — {s}", .{saved.summary.text()});
+    try std.testing.expect(saved_row.single_row);
+    const expected_saved = try std.fmt.allocPrint(arena.allocator(), "M: \u{2713} {s}", .{saved.summary.text()});
     try std.testing.expectEqualStrings(expected_saved, saved_row.body.items);
+    // The saved confirmation never advertises a count or a background run.
+    try std.testing.expect(std.mem.find(u8, saved_row.body.items, "saved") == null);
+    try std.testing.expect(std.mem.find(u8, saved_row.body.items, "(2)") == null);
     try std.testing.expect(std.mem.find(u8, saved_row.body.items, "偏好中文 下一行") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, saved_row.body.items, '\x1b') == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, saved_row.body.items, '\n') == null);
@@ -15090,15 +15518,289 @@ test "memory active and queued own the neutral footer and terminals stay in conv
         .{ .id = 9, .result = .uncertain, .failure = .unavailable },
     }) |terminal| {
         try ui.acceptMemoryCompletion(terminal);
-        try std.testing.expectEqual(NoticeLevel.warning, ui.records.items[ui.records.items.len - 1].notice_level);
+        const row = ui.records.items[ui.records.items.len - 1];
+        // Real outcomes stay real, keep their warning tone, and are never forced
+        // into the success shape or the one-row clipping.
+        try std.testing.expectEqual(NoticeLevel.warning, row.notice_level);
+        try std.testing.expect(!row.single_row);
+        try std.testing.expect(std.mem.startsWith(u8, row.body.items, "M: "));
+        try std.testing.expect(std.mem.count(u8, row.body.items, "\u{2713}") == 0);
     }
     try ui.acceptMemoryCompletion(.{ .id = 10, .result = .failed, .failure = .cleanup });
     try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[ui.records.items.len - 1].notice_level);
+    // A partial save followed by a failure is reported as a failure.
+    try ui.acceptMemoryCompletion(.{ .id = 13, .result = .failed, .failure = .storage, .saved_count = 1 });
+    const partial = ui.records.items[ui.records.items.len - 1];
+    try std.testing.expectEqual(NoticeLevel.warning, partial.notice_level);
+    try std.testing.expect(!partial.single_row);
+    try std.testing.expect(std.mem.count(u8, partial.body.items, "\u{2713}") == 0);
     try ui.acceptMemoryCompletion(.{ .id = 11, .result = .canceled, .failure = .canceled });
     try std.testing.expectEqual(NoticeLevel.plain, ui.records.items[ui.records.items.len - 1].notice_level);
     const before_skipped = ui.records.items.len;
     try ui.acceptMemoryCompletion(.{ .id = 12, .result = .skipped });
     try std.testing.expectEqual(before_skipped, ui.records.items.len);
+}
+
+test "memory footer keeps rotating while only memory is active" {
+    const Fixture = struct {
+        active: bool = true,
+        fn current(raw: *anyopaque) Connection.State {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .memory = if (self.active)
+                .{ .enabled = true, .active = .{ .id = 1, .phase = .saving } }
+            else
+                .{} };
+        }
+    };
+    var fixture: Fixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.context = &fixture;
+    ui.connection.current_fn = Fixture.current;
+    try std.testing.expect(!ui.busy);
+    // Two real ticks of the existing 80 ms clock each stage an ordinary dirty
+    // draw; no timer, frame or refresh source is added for Memory.
+    ui.clock_ms = 80;
+    ui.dirty = false;
+    ui.animate();
+    try std.testing.expect(ui.dirty);
+    const first = ui.animation_tick;
+    try std.testing.expectEqual(@as(u64, 1), first);
+    // Inside the same tick nothing is restaged.
+    ui.dirty = false;
+    ui.clock_ms = 159;
+    ui.animate();
+    try std.testing.expect(!ui.dirty);
+    ui.clock_ms = 160;
+    ui.animate();
+    try std.testing.expect(ui.dirty);
+    try std.testing.expectEqual(first + 1, ui.animation_tick);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const state = ui.connection.current();
+    const tick0 = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(0)});
+    ui.clock_ms = 0;
+    try std.testing.expectEqualStrings(tick0, try ui.hint(arena.allocator(), state));
+    const tick80 = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(80)});
+    ui.clock_ms = 80;
+    try std.testing.expectEqualStrings(tick80, try ui.hint(arena.allocator(), state));
+    try std.testing.expect(!std.mem.eql(u8, tick0, tick80));
+    // Nothing to animate once the owner reports no active/queued work.
+    fixture.active = false;
+    ui.dirty = false;
+    ui.clock_ms = 160;
+    ui.animate();
+    try std.testing.expect(!ui.dirty);
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), ui.connection.current()));
+}
+
+test "paused follow-up preview keeps idle memory animation ticking without hidden overlay redraws" {
+    const Fixture = struct {
+        fn current(_: *anyopaque) Connection.State {
+            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .saving } } };
+        }
+    };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.current_fn = Fixture.current;
+    _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "queued input");
+    ui.inbox.pause();
+    try std.testing.expect(!ui.busy);
+    try std.testing.expect(ui.queueSnapshot().paused);
+    try std.testing.expectEqual(@as(usize, 1), ui.queueSnapshot().preview_count);
+    for (1..3) |tick| {
+        ui.dirty = false;
+        ui.clock_ms = @intCast(tick * 80);
+        ui.animate();
+        try std.testing.expect(ui.dirty);
+        try std.testing.expectEqual(@as(u64, @intCast(tick)), ui.animation_tick);
+    }
+    // A higher-priority footer hides Memory; animation must not repaint it.
+    ui.secret_mode = true;
+    ui.dirty = false;
+    ui.clock_ms = 240;
+    ui.animate();
+    try std.testing.expect(!ui.dirty);
+    ui.secret_mode = false;
+    ui.settings_open = true;
+    ui.clock_ms = 320;
+    ui.animate();
+    try std.testing.expect(!ui.dirty);
+    ui.settings_open = false;
+    // Passive resize still waits for real input/content and preserves dirty.
+    ui.resize_waiting = true;
+    ui.clock_ms = 400;
+    ui.animate();
+    try std.testing.expect(!ui.dirty);
+    ui.dirty = true;
+    ui.clock_ms = 480;
+    ui.animate();
+    try std.testing.expect(ui.dirty);
+}
+
+test "paused preview animates background alone on two ticks" {
+    const Fixture = struct {
+        fn current(_: *anyopaque) Connection.State {
+            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .background = .{ .active_count = 1 } };
+        }
+    };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.current_fn = Fixture.current;
+    _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "queued input");
+    ui.inbox.pause();
+    try std.testing.expect(ui.queueSnapshot().paused and ui.queueSnapshot().preview_count == 1);
+    try std.testing.expect(!ui.busy and ui.active_tool == null and !ui.memoryAnimating());
+    for (1..3) |tick| {
+        ui.clock_ms = @intCast(tick * 80);
+        ui.dirty = false;
+        ui.animate();
+        try std.testing.expect(ui.dirty);
+        try std.testing.expectEqual(@as(u64, @intCast(tick)), ui.animation_tick);
+        ui.dirty = false;
+        ui.animate();
+        try std.testing.expect(!ui.dirty);
+    }
+    ui.secret_mode = true;
+    ui.clock_ms = 240;
+    ui.animate();
+    try std.testing.expect(!ui.dirty);
+    ui.secret_mode = false;
+    ui.settings_open = true;
+    ui.clock_ms = 320;
+    ui.animate();
+    try std.testing.expect(!ui.dirty);
+    ui.settings_open = false;
+    ui.resize_waiting = true;
+    ui.clock_ms = 400;
+    ui.animate();
+    try std.testing.expect(!ui.dirty);
+    ui.dirty = true;
+    ui.clock_ms = 480;
+    ui.animate();
+    try std.testing.expect(ui.dirty);
+}
+
+test "memory saved notice is one clipped physical row at the real width" {
+    const fixture_text = "M: \u{2713} 已保存偏好：中文与emoji \u{1F600} 混排的长摘要不会换行";
+    const Geometry = struct {
+        fn check(record: *Record, columns: usize) !void {
+            const text_module = @import("text.zig");
+            try record.layout(std.testing.allocator, columns);
+            try std.testing.expectEqual(@as(usize, 1), record.lines.len);
+            const line = record.lines[0];
+            try std.testing.expectEqual(columns, record.columns);
+            try std.testing.expect(text_module.styledWidth(line) <= columns);
+            try std.testing.expect(std.mem.startsWith(u8, line, theme.reset));
+            // Whole clusters only: clipping never leaves a broken UTF-8 tail.
+            try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+        }
+    };
+    var record = Record{ .kind = .notice, .single_row = true, .notice_level = .plain };
+    defer record.deinit(std.testing.allocator);
+    try record.body.appendSlice(std.testing.allocator, fixture_text);
+    try Geometry.check(&record, 40);
+    try std.testing.expect(std.mem.find(u8, record.lines[0], "...") != null);
+    // The retained body, not a pre-cut copy, is what a new width re-derives.
+    const wide = try std.testing.allocator.dupe(u8, record.lines[0]);
+    defer std.testing.allocator.free(wide);
+    try Geometry.check(&record, 12);
+    try std.testing.expect(!std.mem.eql(u8, wide, record.lines[0]));
+    // A width that fits nothing still stays inside one row without overrun.
+    try Geometry.check(&record, 1);
+    // Warning and failure rows keep their original tone when they opt in.
+    record.notice_level = .warning;
+    try Geometry.check(&record, 20);
+    try std.testing.expect(std.mem.find(u8, record.lines[0], theme.caution) != null);
+}
+
+test "memory saved notices stay one row across a passive resize and new delivery" {
+    const Fixture = struct {
+        next: ?memory_status.Terminal = null,
+        fn current(_: *anyopaque) Connection.State {
+            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .memory = .{ .enabled = true, .active = .{ .id = 7, .phase = .saving } } };
+        }
+        fn take(raw: *anyopaque) ?memory_status.Terminal {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const value = self.next;
+            self.next = null;
+            return value;
+        }
+    };
+    var fixture: Fixture = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.context = &fixture;
+    ui.connection.current_fn = Fixture.current;
+    ui.connection.take_memory_completion_fn = Fixture.take;
+    ui.size = .{ .columns = 24, .rows = 12 };
+    var saved: memory_status.Terminal = .{ .id = 5, .result = .saved };
+    saved.summary.append("first-long-summary 中文与emoji \u{1F600} 超出可见列宽");
+    fixture.next = saved;
+    ui.pollMemoryCompletion();
+    const first_id = ui.records.items[0].id;
+    const text_module = @import("text.zig");
+    var first_screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 24, .rows = 12 };
+    try ui.draw();
+    const first = &ui.records.items[ui.record_index.get(first_id).?];
+    try std.testing.expect(first.single_row);
+    try std.testing.expectEqual(@as(usize, 1), first.lines.len);
+    try std.testing.expectEqual(@as(usize, 23), first.columns);
+    try std.testing.expect(text_module.styledWidth(first.lines[0]) <= 23);
+    try std.testing.expect(std.mem.find(u8, first.lines[0], "...") != null);
+    try first_screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 1), first_screen.count("M: ~ first"));
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[ui.record_index.get(first_id).?].output);
+    try std.testing.expect(ui.records.items[ui.record_index.get(first_id).?].delivery_complete);
+    const before = ui.records.items.len;
+
+    ui.resize(.{ .columns = 12, .rows = 12 });
+    try std.testing.expect(ui.resize_waiting);
+    ui.clock_ms = 80;
+    ui.animate();
+    try std.testing.expect(ui.resize_waiting);
+    try std.testing.expect(!ui.drawReady());
+    try std.testing.expectEqual(@as(usize, 0), ui.frame.len);
+    try std.testing.expectEqual(before, ui.records.items.len);
+
+    var next: memory_status.Terminal = .{ .id = 6, .result = .saved };
+    next.summary.append("second-long-summary 中文与emoji \u{1F600} 超出可见列宽");
+    fixture.next = next;
+    ui.pollMemoryCompletion();
+    try std.testing.expect(!ui.resize_waiting);
+    try std.testing.expectEqual(before + 1, ui.records.items.len);
+    const second_id = ui.records.items[ui.records.items.len - 1].id;
+    try std.testing.expect(first_id != second_id);
+    try ui.draw();
+    const second = &ui.records.items[ui.record_index.get(second_id).?];
+    try std.testing.expect(second.single_row);
+    try std.testing.expectEqual(@as(usize, 1), second.lines.len);
+    try std.testing.expectEqual(@as(usize, 11), second.columns);
+    try std.testing.expect(text_module.styledWidth(second.lines[0]) <= 11);
+    try std.testing.expect(std.mem.find(u8, second.lines[0], "...") != null);
+    // The screen fixture cannot emulate terminal reflow: inspect each geometry
+    // separately, and assert the new frame never replays the retired first row.
+    try std.testing.expect(std.mem.find(u8, ui.frame, "first-long") == null);
+    var second_screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 12, .rows = 12 };
+    try second_screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 1), second_screen.count("M: ~ sec"));
+    try std.testing.expectEqual(@as(usize, 0), second_screen.count("first"));
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expect(ui.records.items[ui.record_index.get(second_id).?].output);
+    try std.testing.expect(ui.records.items[ui.record_index.get(second_id).?].delivery_complete);
 }
 
 test "memory completion delivery is per delivered value and never clears a foreground error" {
@@ -16727,13 +17429,14 @@ test "selection guards paste secret busy joined future poison and rollback" {
     ui.busy = true;
     try ui.parser.feed("\x1b[Z/model busy-id\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.selections);
-    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    try std.testing.expectError(error.Busy, ui.selectModel("busy-id"));
+    try std.testing.expectEqual(@as(usize, 2), fixture.cycles);
     ui.busy = false;
     ui.future = ui.io.async(struct {
         fn noop() void {}
     }.noop, .{});
     ui.cycleEffort();
-    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    try std.testing.expectEqual(@as(usize, 3), fixture.cycles);
     ui.future.?.await(ui.io);
     ui.future = null;
     ui.poisoned = true;
@@ -16745,12 +17448,12 @@ test "selection guards paste secret busy joined future poison and rollback" {
     fixture.fail = false;
     ui.secret_quarantine = true;
     try ui.parser.feed("\x1b[Z", sink);
-    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    try std.testing.expectEqual(@as(usize, 3), fixture.cycles);
     ui.secret_quarantine = false;
     ui.secret_mode = true;
     ui.parser.secretMode(true);
     try ui.parser.feed("\x1b[Z", sink);
-    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    try std.testing.expectEqual(@as(usize, 3), fixture.cycles);
     ui.secret_mode = false;
     ui.parser.secretMode(false);
     ui.openModelPicker();
@@ -16792,6 +17495,77 @@ test "effort shortcut waits for queued and borrowed bridge items" {
         try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
         try std.testing.expectEqual(shared.ReasoningEffort.minimal, fixture.effort);
     }
+}
+
+test "busy thinking shortcut keeps the running task and only queues the next level" {
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = SelectionFixture{ .effort = .low, .levels = .{ .mask = 0x55 } };
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.size = .{ .columns = 80, .rows = 24 };
+
+    // A live request: running mode, a streaming body draft, a tool row, its own
+    // notice and a queued bridge item that belongs to this request.
+    const body = try ui.add(.assistant, "streaming body");
+    _ = try ui.add(.tool, "");
+    ui.draft = body;
+    ui.busy = true;
+    ui.mode = .calling_model;
+    ui.notice = "Pause pending";
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .context_snapshot = .{ .tokens = 12, .limit = 32768 } }, &cancel);
+    const records = ui.records.items.len;
+
+    ui.clock_ms = 1000;
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    try std.testing.expectEqual(shared.ReasoningEffort.high, fixture.effort);
+    // The running task itself is untouched: still busy, same mode, same draft,
+    // same body rows and the same count of records.
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqual(@as(?r.State, .calling_model), ui.mode);
+    try std.testing.expectEqual(@as(?usize, body), ui.draft);
+    try std.testing.expectEqualStrings("streaming body", ui.records.items[body].body.items);
+    try std.testing.expectEqual(records, ui.records.items.len);
+    // Its notice is not replaced by an idle "Ready", and the bridge was neither
+    // reset nor drained while the request still owns it.
+    try std.testing.expectEqualStrings("Pause pending", ui.notice);
+    var owned = bridge.pop().?;
+    owned.deinit();
+    // The confirmation is the existing five second composer flash.
+    try std.testing.expectEqual(shared.ReasoningEffort.high, ui.effort_flash.?.level);
+    try std.testing.expectEqual(@as(u64, 6000), ui.effort_flash.?.until_ms);
+
+    // Paste and sensitive/policy overlays keep the original refusal priority.
+    ui.editor_pasted = true;
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    ui.editor_pasted = false;
+    ui.secret_mode = true;
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "idle, non-pasted") != null);
+    ui.secret_mode = false;
+    ui.stop_open = true;
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    ui.stop_open = false;
+    ui.poisoned = true;
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    ui.poisoned = false;
+    ui.parser.pasted = true;
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 1), fixture.cycles);
+    ui.parser.pasted = false;
+    // None of those refusals touched the running task either.
+    try std.testing.expect(ui.busy);
+    try std.testing.expectEqual(@as(?usize, body), ui.draft);
+    try std.testing.expectEqualStrings("streaming body", ui.records.items[body].body.items);
 }
 
 test "shutdown restores terminal and handles signals without announcing identity" {
@@ -21243,6 +22017,107 @@ test "multiple reserved async records survive intervening display records" {
     try std.testing.expectEqual(@as(usize, 8), ui.records.items.len);
     try std.testing.expectEqual(@as(usize, 8), ui.record_index.count());
     for (ui.records.items, 0..) |record, index| try std.testing.expectEqual(index, ui.record_index.get(record.id).?);
+}
+
+test "busy async effort preserves same batch draft through late completion" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    ui.busy = true;
+    ui.mode = .calling_model;
+    ui.future = ui.io.async(struct {
+        fn noop() void {}
+    }.noop, .{});
+    const body = try ui.add(.assistant, "streaming body");
+    const tool = try ui.add(.tool, "tool body");
+    ui.draft = body;
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .context_snapshot = .{ .tokens = 12, .limit = 32768 } }, &cancel);
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b[Z/model rejected-busy\r", sink);
+    try std.testing.expectEqualStrings("/model rejected-busy", ui.editor.bytes.items);
+    try std.testing.expectEqualStrings("Only ordinary conversation text can be queued", ui.notice);
+    try std.testing.expectEqual(@as(usize, 3), ui.records.items.len);
+    try std.testing.expect(ui.records.items[2].kind == .notice);
+    try std.testing.expectEqual(NoticeLevel.warning, ui.records.items[2].notice_level);
+    try std.testing.expectEqualStrings("Only ordinary conversation text can be queued", ui.records.items[2].body.items);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("Only ordinary conversation text can be queued"));
+    try std.testing.expectEqual(@as(?usize, body), ui.draft);
+    try std.testing.expectEqual(@as(usize, 1), actions.next);
+    try std.testing.expect(actions.requests[0].?.action == .cycle_effort);
+    try std.testing.expect(ui.hasAsync(.effort));
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
+    const revision = ui.editor_revision;
+    // A second shortcut is not admitted while the first ticket is outstanding.
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 1), actions.next);
+    actions.complete(.{ .effort = .high }, null, false);
+    ui.pumpAsync();
+    try std.testing.expect(!ui.hasAsync(.effort));
+    try std.testing.expectEqual(@as(usize, 3), ui.records.items.len);
+    try std.testing.expectEqualStrings("/model rejected-busy", ui.editor.bytes.items);
+    try std.testing.expectEqual(revision, ui.editor_revision);
+    try std.testing.expect(ui.busy and ui.future != null);
+    try std.testing.expectEqual(@as(?r.State, .calling_model), ui.mode);
+    try std.testing.expectEqual(@as(?usize, body), ui.draft);
+    try std.testing.expectEqualStrings("streaming body", ui.records.items[body].body.items);
+    try std.testing.expectEqualStrings("tool body", ui.records.items[tool].body.items);
+    var item = bridge.pop().?;
+    item.deinit();
+    // Actual task completion joins the future; it must not consume the draft.
+    fake.snapshot.busy = false;
+    try ui.complete();
+    try std.testing.expect(!ui.busy and ui.future == null);
+    try std.testing.expectEqualStrings("/model rejected-busy", ui.editor.bytes.items);
+    try std.testing.expectEqual(revision, ui.editor_revision);
+    try ui.parser.feed("!", sink);
+    try std.testing.expectEqualStrings("/model rejected-busy!", ui.editor.bytes.items);
+}
+
+test "async input barrier remains for submit and effort guards" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    ui.busy = true;
+    ui.editor_pasted = true;
+    try ui.parser.feed("\x1b[Z", sink);
+    try std.testing.expectEqual(@as(usize, 0), actions.next);
+    ui.editor_pasted = false;
+    try ui.parser.feed("\x1b[200~\x1b[Z\x1b[201~", sink);
+    try std.testing.expectEqual(@as(usize, 0), actions.next);
+    ui.wipeEditor();
+    ui.secret_mode = true;
+    ui.cycleEffort();
+    try std.testing.expectEqual(@as(usize, 0), actions.next);
+    ui.secret_mode = false;
+    ui.secret_quarantine = true;
+    try ui.parser.feed("\x1b[Z", sink);
+    try std.testing.expectEqual(@as(usize, 0), actions.next);
+    ui.secret_quarantine = false;
+    ui.busy = false;
+    try ui.parser.feed("hello\rdiscarded", sink);
+    try std.testing.expectEqual(@as(usize, 1), actions.next);
+    try std.testing.expect(actions.requests[0].?.action == .submit);
+    try std.testing.expectEqualStrings("hello", ui.editor.bytes.items);
+    try std.testing.expect(ui.parser.stop_feed);
 }
 
 test "async submit queues behind an effort probe without dropping Enter" {

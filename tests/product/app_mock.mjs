@@ -184,7 +184,7 @@ async function runExecute(bin, args, env, cwd, onChild, timeout = 30000, spawnCh
   const child = spawnChild(bin, args, {cwd, env, detached:true, stdio:['ignore','pipe','pipe']});
 
   // owned 表示子进程仍由本函数管理；退出后置为 false，防止向已回收的 PID 发信号。
-  let owned = true, size = 0, chunks = [], failure, rejectWait;
+  let owned = true, size = 0, chunks = [], stderrChunks = [], failure, rejectWait;
   // An exited leader cannot be signalled, but inherited pipes may stay open.
   // Stop waiting/capturing independently of PID ownership on watchdog failure.
   const abandonOutput = () => { child.stdout.destroy(); child.stderr.destroy(); rejectWait?.(failure); };
@@ -201,7 +201,7 @@ async function runExecute(bin, args, env, cwd, onChild, timeout = 30000, spawnCh
   const capture = b => { size += b.length; if (size <= 2*1024*1024) chunks.push(b); else { failure = new Error('output bound exceeded'); stop(); } };
 
   // 同时读取 stdout 与 stderr，否则管道写满会阻塞子进程。
-  child.stdout.on('data', capture); child.stderr.on('data', capture);
+  child.stdout.on('data', capture); child.stderr.on('data', b => { capture(b); if (size <= 2*1024*1024) stderrChunks.push(b); });
 
   // 子进程退出后清除 owned 标记。
   child.on('exit', () => { owned = false; if (failure) abandonOutput(); });
@@ -222,7 +222,10 @@ async function runExecute(bin, args, env, cwd, onChild, timeout = 30000, spawnCh
 
     // 安全断言通过后才报告超时或输出超限错误。
     if (failure) throw failure;
-    return {...result, output};
+    // Only the complete, fixed-schema numeric/boolean diagnostic may escape stderr.
+    const stderr = Buffer.concat(stderrChunks).toString('utf8');
+    const diag = stderr.match(/^SELECTION_FRAME_DIAG seenFreshAck=(?:true|false) lastCursorRow=\d{1,5} exactComposerMatch=(?:true|false) hasExactDraft=(?:true|false) hasExpectedRejectionNotice=(?:true|false) hasModelSelectionIdleNotice=(?:true|false) hasSteering=(?:true|false) observedEffortMinimal=(?:true|false) busyMarkerPresent=(?:true|false) expectedRejected=(?:true|false)\r?$/m)?.[0].trim();
+    return {...result, output, selectionFrameDiag: diag && diag.length <= 400 ? diag : undefined};
   } finally { clearTimeout(timer); clearTimeout(escalator); stop(); }
 }
 
@@ -251,6 +254,8 @@ async function runScenario(name, protocol, kind, isPty = false) {
   // 场景计数器：请求数、对话轮次、摘要次数，以及压缩后标记。
   let requests = 0, rounds = 0, summaries = 0, afterSummary = false, stable, fixtureError, idleSocket;
   let selectionStage = 0;
+  let releaseSelection;
+  const selectionGate = new Promise(resolve => { releaseSelection = resolve; });
 
   // stalled 表示已到达挂起点；signalChild 与 ownsChild 来自 execute 回调，非 PTY 取消时用于发送 SIGINT。
   let stalled, signalChild, ownsChild;
@@ -370,7 +375,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
         selectionStage = 2;
         assert.equal(body.model, rounds <= 2 ? 'fixture-model' : rounds === 3 ? 'fixture-next' : 'fixture-custom');
         selectionStage = 3;
-        assert.equal(protocol === 'chat' ? body.reasoning_effort : body.reasoning?.effort, rounds <= 2 ? 'none' : rounds === 3 ? 'medium' : 'minimal');
+        assert.equal(protocol === 'chat' ? body.reasoning_effort : body.reasoning?.effort, rounds === 1 ? 'none' : rounds === 2 ? 'minimal' : rounds === 3 ? 'medium' : 'minimal');
         const serialized = JSON.stringify(protocol === 'chat' ? body.messages : body.input);
         selectionStage = 4;
         assert(serialized.includes(rounds <= 2 ? 'selection-first' : rounds === 3 ? 'selection-second' : 'selection-third'));
@@ -388,8 +393,11 @@ async function runScenario(name, protocol, kind, isPty = false) {
           }
         }
         if (rounds === 1) {
-          // Observation window only; production requests are never delayed for UI.
-          await new Promise(resolve => setTimeout(resolve, 500));
+          // Signal that the validated first request body has arrived before the driver changes effort.
+          await writeFile(join(project,'selection-request-started'), 'started\n', {flag:'wx'});
+          // The owned driver releases only after the busy effort ACK and the
+          // rejected command's exact retained draft have both been observed.
+          await selectionGate;
           send(res, protocol, '', [tool('selection-read','read_file',{path:'seed.txt'})], false, protocol === 'responses');
         } else send(res, protocol, rounds === 2 ? 'selection-answer-one' : rounds === 3 ? 'selection-answer-two' : 'selection-answer-three');
         return;
@@ -607,7 +615,8 @@ async function runScenario(name, protocol, kind, isPty = false) {
       const filename = kind === 'legacy-config' ? 'auth.json' : 'config.json';
       // 空白文件走交互初始化；待激活配置始终使用回环服务，绝不向公共端点发送密钥或消息。
       const provider = ['auth-activate','exit-unconfigured','exit-secret'].includes(kind) ? {base_url:url, api_key_env:'', api_key:null, chat_max_tokens:true} : {base_url:url, api_key_env:'THIN_FIXTURE_KEY'};
-      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',providers:{local:{...provider,models:{'fixture-model':{protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'none':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined},...(['model-select','model-select-empty'].includes(kind)?{'fixture-next':{protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}},'fixture-custom':{protocol,context_tokens:32768,reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}}:{})}}}}, limits:{low_price_input:false,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+      // The configured effort is logical; the provider maps logical off to wire 'none'.
+      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',providers:{local:{...provider,models:{'fixture-model':{protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'off':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined},...(['model-select','model-select-empty'].includes(kind)?{'fixture-next':{protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}},'fixture-custom':{protocol,context_tokens:32768,reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}}:{})}}}}, limits:{low_price_input:false,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
       await writeFile(join(home,'.thin',filename), content);
     }
 
@@ -617,7 +626,16 @@ async function runScenario(name, protocol, kind, isPty = false) {
     const navigationConfig = kind === 'menu-navigation' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
     const selectionConfig = kind === 'model-select' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
     // 运行 CLI 或 PTY 驱动（PTY 超时 90 秒，其它 30 秒）。
-    const result = await execute(isPty?pty:app, isPty?[]:args, env, project, (child, owns) => {signalChild=child; ownsChild=owns;}, isPty?90000:30000);
+    const result = await execute(isPty?pty:app, isPty?[]:args, env, project, (child, owns) => {
+      signalChild=child; ownsChild=owns;
+      if (kind === 'model-select') {
+        let markers = '';
+        child.stderr.on('data', chunk => {
+          markers = (markers + chunk.toString('utf8')).slice(-128);
+          if (markers.includes('SELECTION_GATE=release\n')) releaseSelection();
+        });
+      }
+    }, isPty?90000:30000);
 
     // 先检查伪造服务的断言错误，避免被 CLI 的失败掩盖。
     if (fixtureError) throw fixtureError;
@@ -638,6 +656,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
         const lines = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].slice(0,6).map(match => match[1]).join('-') || 'unknown';
         error.fixtureCase = `selection/${protocol}`;
         error.fixtureCheck = `PTY code ${result.code} at ${lines} requests ${requests}`;
+        if (result.selectionFrameDiag) error.fixtureCheck += ` ${result.selectionFrameDiag}`;
         throw error;
       }
       if (isPty && result.code !== 0) {
@@ -862,7 +881,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
       assert.equal(requests,4, 'selection issued discovery or extra requests');
       const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
       assert.equal(disk.llm.default,'local/fixture-model');
-      assert.equal(disk.llm.providers.local.models['fixture-model'].reasoning_effort,'none');
+      assert.equal(disk.llm.providers.local.models['fixture-model'].reasoning_effort,'off');
       assert.equal(disk.llm.providers.local.models['fixture-model'].context_tokens,32768);
       assert.equal(disk.llm.providers.local.models['fixture-next'].reasoning_effort,'low');
       assert.equal(disk.llm.reasoning_effort ?? null,null);
@@ -979,7 +998,7 @@ try {
 } catch (error) {
   // 中文：不要渲染捕获的终端或模型输出、响应头或请求体。
   // Do not render captured terminal/model output, headers, or request bodies.
-  const label = /^(?:log|selection|settings|resume|login|pty)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_-]+$/.test(error.fixtureCheck ?? '')
+  const label = /^(?:log|selection|settings|resume|login|pty)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_=-]+$/.test(error.fixtureCheck ?? '')
     ? `${error.fixtureCase}: ${error.fixtureCheck}` : `offline fixture assertion at app_mock.mjs:${/app_mock\.mjs:(\d+):/.exec(error.stack ?? '')?.[1] ?? 'unknown'} (details withheld)`;
   console.error(`FAIL application acceptance: ${label}`);
   process.exitCode = 1;

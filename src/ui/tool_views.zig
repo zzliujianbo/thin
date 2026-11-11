@@ -59,7 +59,14 @@ pub const Views = struct {
 
         // Build all fallible state first. Neither an OOM during formatting nor
         // append failure may destroy the previously displayed caption/order.
-        const base = try presentation.fromToolView(a, event.name, event.fields);
+        const plain = try presentation.fromToolView(a, event.name, event.fields);
+        // A later ready refresh without metadata must not revert a guarded
+        // caption back to the raw preview or discard its value-owned metadata.
+        const display = event.display orelse if (index) |i| self.entries.items[i].caption.display else null;
+        const base = if (display) |metadata| blk: {
+            defer plain.deinit(a);
+            break :blk try presentation.withBackground(a, plain, metadata);
+        } else plain;
         const candidate = if (event.ready and event.subagent_progress != null) blk: {
             defer base.deinit(a);
             break :blk try presentation.subagentProgress(a, base, event.subagent_progress.?);
@@ -219,6 +226,40 @@ test "subagent tool progress respects generation readiness and ownership" {
     event.fields = .{ .path = .{ .text = "file" } };
     try views.upsert(a, event);
     try std.testing.expectEqualStrings("file", views.get(event.key).?.caption.label);
+}
+
+test "background ready metadata refreshes one owned row" {
+    const a = std.testing.allocator;
+    const status = @import("../core/background_status.zig");
+    var views: Views = .{};
+    defer views.deinit(a);
+    views.begin(a, 7);
+    var event: r.ToolView = .{ .key = key(7, 1), .name = "bash", .fields = .{ .command = .{ .text = "old" } }, .ready = true };
+    try views.upsert(a, event);
+    event.display = .{ .action = .start, .command = status.Command.from("sleep 1") };
+    try views.upsert(a, event);
+    try std.testing.expectEqual(@as(usize, 1), views.entries.items.len);
+    const caption = (try views.cloneReadyCaption(a, event.key)).?;
+    defer caption.deinit(a);
+    try std.testing.expectEqualStrings("▶ sleep 1", caption.label);
+    try std.testing.expect(caption.display.?.action == .start);
+    const line = try presentation.commandText(a, caption, .success);
+    defer a.free(line);
+    try std.testing.expectEqualStrings("B: ▶ sleep 1", line);
+    event.display = null;
+    event.fields.command = .{ .text = "unguarded preview" };
+    try views.upsert(a, event);
+    try std.testing.expectEqualStrings("▶ sleep 1", views.get(event.key).?.caption.label);
+    const done = try presentation.completed(a, caption, null);
+    defer done.deinit(a);
+    try std.testing.expect(done.display.?.action == .start);
+    const call = @import("../presentation.zig").tools.Call{ .kind = .bash, .detail = "unguarded", .display = caption.display };
+    const fallback = try presentation.fromCall(a, call);
+    defer fallback.deinit(a);
+    try std.testing.expectEqualStrings("▶ sleep 1", fallback.label);
+    try std.testing.expect(fallback.display.?.action == .start);
+    const completion = @import("../presentation.zig").tools.Completion.fromExecution(.{ .text = "ok", .duration_ms = 22, .display = caption.display });
+    try std.testing.expect(completion.duration_ms == null);
 }
 
 test "tool views same key updates in place and same names remain distinct" {

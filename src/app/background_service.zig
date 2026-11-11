@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bg = @import("../core/background.zig");
+const status = @import("../core/background_status.zig");
 const p = @import("../core/protocol.zig");
 const fs = @import("../platform/filesystem.zig");
 const process = @import("../platform/process.zig");
@@ -19,6 +20,12 @@ pub const Dependencies = struct {
     io: std.Io,
     root: *const fs.Root,
     environment: *const std.process.Environ.Map,
+    secret_guard: ?SecretGuard = null,
+};
+
+pub const SecretGuard = struct {
+    context: *anyopaque,
+    contains_fn: *const fn (*anyopaque, []const u8) bool,
 };
 
 /// worker 返回值：只含标量，安全跨线程复制。
@@ -166,6 +173,9 @@ const Job = struct {
     cleanup_timeout_ms: u32,
     /// 真实启动时刻（awake 单调时钟）。
     started: std.Io.Timestamp,
+    duration_ms: u64 = 0,
+    handed_off: bool = false,
+    ui_notified: bool = false,
 
     /// 启动握手：0 未决、1 成功、2 失败。由 worker 线程写入。
     launch: std.atomic.Value(u8) = .init(0),
@@ -177,7 +187,8 @@ const Job = struct {
     outcome: Outcome = .{},
     future: ?std.Io.Future(Outcome) = null,
 
-    fn publish(self: *Job, out: Outcome) void {
+    fn publish(self: *Job, out: Outcome, started: std.Io.Timestamp) void {
+        self.duration_ms = elapsedMs(self.io, started);
         self.outcome = out;
         self.done.store(true, .release);
     }
@@ -233,6 +244,7 @@ fn stateName(job: *Job, out: Outcome, running: bool) []const u8 {
 pub const BackgroundService = struct {
     /// 默认 `.{}` 空可析构（此时断言没有任何 Job）。
     deps: ?Dependencies = null,
+    mutex: Spin = .{},
     /// 按登记顺序保存；worker 绝不修改此容器。
     jobs: std.ArrayList(*Job) = .empty,
     /// 128 位随机实例前缀（32 位小写十六进制），拒绝跨实例 ID。
@@ -249,7 +261,7 @@ pub const BackgroundService = struct {
     pub const max_command_bytes: usize = 32768;
 
     pub fn service(self: *BackgroundService) bg.Service {
-        return .{ .context = self, .start_fn = startFn, .control_fn = controlFn, .check_fn = checkFn };
+        return .{ .context = self, .start_fn = startFn, .control_fn = controlFn, .check_fn = checkFn, .command_fn = commandFn, .caption_fn = captionFn };
     }
 
     fn startFn(context: *anyopaque, a: std.mem.Allocator, args: bg.Start, cancel: *const p.Cancellation) anyerror!bg.Result {
@@ -262,7 +274,99 @@ pub const BackgroundService = struct {
 
     fn checkFn(context: *anyopaque) anyerror!void {
         const self: *BackgroundService = @ptrCast(@alignCast(context));
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.unhealthy()) return error.CleanupFailed;
+    }
+
+    fn commandFn(context: *anyopaque, id: []const u8) ?status.Command {
+        const self: *BackgroundService = @ptrCast(@alignCast(context));
+        return self.command(id);
+    }
+
+    fn captionFn(context: *anyopaque, raw: []const u8) status.Command {
+        const self: *BackgroundService = @ptrCast(@alignCast(context));
+        return self.caption(raw);
+    }
+
+    // Call outside the registry lock: Journal has its own lock. Test the full
+    // original before clipping, and the sanitized text as well.
+    pub fn caption(self: *BackgroundService, raw: []const u8) status.Command {
+        if (self.deps) |deps| if (deps.secret_guard) |guard| {
+            if (guard.contains_fn(guard.context, raw)) return status.Command.from("[command hidden]");
+        };
+        const value = status.Command.from(raw);
+        if (self.deps) |deps| if (deps.secret_guard) |guard| {
+            if (guard.contains_fn(guard.context, value.slice())) return status.Command.from("[command hidden]");
+        };
+        return value;
+    }
+
+    pub fn command(self: *BackgroundService, id: []const u8) ?status.Command {
+        self.mutex.lock();
+        const job = self.resolve(id);
+        self.mutex.unlock();
+        // Jobs remain owned until deinit; callers retire borrowers first.
+        return self.caption((job orelse return null).command);
+    }
+
+    pub fn view(self: *BackgroundService) status.View {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var result: status.View = .{};
+        for (self.jobs.items) |job| {
+            if (job.handed_off and !job.done.load(.acquire)) result.active_count += 1;
+        }
+        return result;
+    }
+
+    pub fn peekCompletion(self: *BackgroundService) ?status.Terminal {
+        self.mutex.lock();
+        var found: ?*Job = null;
+        for (self.jobs.items) |job| {
+            if (job.handed_off and !job.ui_notified and job.done.load(.acquire)) {
+                found = job;
+                break;
+            }
+        }
+        self.mutex.unlock();
+        const job = found orelse return null;
+        const out = job.outcome;
+        var terminal: status.Terminal = .{
+            .id = status.Id.from(job.id),
+            .command = self.caption(job.command),
+            .result = .failed,
+            .duration_ms = job.duration_ms,
+        };
+        if (out.cleanup_failed or out.unreaped_pid != null) {
+            terminal.failure = .cleanup;
+        } else if (out.timed_out) {
+            terminal.failure = .timeout;
+        } else if (out.canceled) {
+            terminal.result = .canceled;
+        } else if (out.exit_error != null) {
+            terminal.failure = if (job.launch.load(.acquire) == 1) .io else .spawn;
+        } else if (out.term) |term| switch (term) {
+            .exited => |code| {
+                terminal.exit_code = code;
+                if (code == 0) terminal.result = .success else terminal.failure = .exit;
+            },
+            .signal => |sig| {
+                terminal.signal = @backingInt(sig);
+                terminal.failure = .signal;
+            },
+            else => terminal.failure = .io,
+        } else {
+            terminal.failure = .io;
+        }
+        return terminal;
+    }
+
+    pub fn takeCompletion(self: *BackgroundService, id: status.Id) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const job = self.resolve(id.slice()) orelse return;
+        if (job.handed_off and job.done.load(.acquire)) job.ui_notified = true;
     }
 
     /// 启动预算校验：拒绝 0 启动窗口、0 清理预算、非法命令与超限日志。
@@ -323,7 +427,6 @@ pub const BackgroundService = struct {
         var future = job.future orelse return job.outcome;
         job.future = null;
         const out = future.await(job.io);
-        job.outcome = out;
         if (out.cleanup_failed or out.unreaped_pid != null) self.poison.store(true, .release);
         return out;
     }
@@ -347,10 +450,10 @@ pub const BackgroundService = struct {
         const a = deps.allocator;
         const job = try a.create(Job);
         errdefer a.destroy(job);
-        const command = try a.dupe(u8, args.command);
+        const command_bytes = try a.dupe(u8, args.command);
         errdefer {
-            wipe(command);
-            a.free(command);
+            wipe(command_bytes);
+            a.free(command_bytes);
         }
         var root = try deps.root.duplicate();
         errdefer root.deinit();
@@ -360,7 +463,7 @@ pub const BackgroundService = struct {
             .allocator = a,
             .io = deps.io,
             .id = id,
-            .command = command,
+            .command = command_bytes,
             .root = root,
             .env = try cloneEnvironment(a, deps.environment),
             .logs = logs,
@@ -404,6 +507,8 @@ pub const BackgroundService = struct {
     }
 
     pub fn start(self: *BackgroundService, a: std.mem.Allocator, args: bg.Start, cancel: *const p.Cancellation) !bg.Result {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const deps = try self.depsOrFail();
         if (self.unhealthy()) return error.BackgroundUnavailable;
         try validateStart(args);
@@ -465,12 +570,15 @@ pub const BackgroundService = struct {
             return .{ .text = failure_text, .is_error = true, .canceled = caller_canceled };
         }
 
+        job.handed_off = true;
         const text = receipt.?;
         receipt = null;
         return .{ .text = text };
     }
 
     pub fn control(self: *BackgroundService, a: std.mem.Allocator, query: bg.Query, cancel: *const p.Cancellation) !bg.Result {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         _ = try self.depsOrFail();
         bg.validateQuery(query) catch return bg.Result.failed(try invalidArguments(a));
         switch (query.action) {
@@ -601,6 +709,7 @@ pub const BackgroundService = struct {
 
 /// worker 线程：只通过 Job 自己的 token/root/env/log 运行；无命令 deadline。
 fn worker(job: *Job) Outcome {
+    const execution_started = std.Io.Clock.awake.now(job.io);
     const options: process.Options = .{
         .timeout_ms = null,
         .output_bytes = 0,
@@ -616,7 +725,7 @@ fn worker(job: *Job) Outcome {
     const result = process.run(job.allocator, job.io, job.root.path, job.command, &job.env, options, &job.cancel) catch |e| {
         // process.run 只在 fork 前失败或清理已成功后才返回错误：如实记录，不伪造 cleanup_failed。
         const out: Outcome = .{ .exit_error = e };
-        job.publish(out);
+        job.publish(out, execution_started);
         return out;
     };
     defer {
@@ -633,7 +742,7 @@ fn worker(job: *Job) Outcome {
         .stdout_bytes = result.stdout_bytes,
         .stderr_bytes = result.stderr_bytes,
     };
-    job.publish(out);
+    job.publish(out, execution_started);
     return out;
 }
 
@@ -677,7 +786,7 @@ fn writeJobObject(w: *std.Io.Writer, io: std.Io, job: *Job, out: Outcome) !void 
     try w.print(",\"state\":\"{s}\"", .{stateName(job, out, running)});
     try w.print(",\"pid\":{d}", .{job.launched_pid.load(.acquire)});
     try w.print(",\"started_ms\":{d},\"elapsed_ms\":{d}", .{
-        job.started.toMilliseconds(), elapsedMs(io, job.started),
+        job.started.toMilliseconds(), if (running) elapsedMs(io, job.started) else job.duration_ms,
     });
     if (out.term) |term| switch (term) {
         .exited => |code| try w.print(",\"exit_code\":{d}", .{code}),

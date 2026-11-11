@@ -6,7 +6,7 @@ pub const Changes = struct { modified: u64 = 0, added: u64 = 0, removed: u64 = 0
 pub const File = struct { read: ?u64 = null, partial: bool = false, changes: ?Changes = null };
 pub const max_bytes = 256 * 1024;
 const max_lines = 2048;
-const max_cells = 1024 * 1024;
+pub const max_cells = 1024 * 1024;
 
 pub fn count(bytes: []const u8) u64 {
     if (bytes.len == 0) return 0;
@@ -25,6 +25,15 @@ fn split(a: std.mem.Allocator, bytes: []const u8) ![][]const u8 {
     return out;
 }
 
+fn lineEnd(bytes: []const u8, start: usize) usize {
+    return if (std.mem.indexOfScalar(u8, bytes[start..], '\n')) |n| start + n + 1 else bytes.len;
+}
+
+fn lineStartBefore(bytes: []const u8, end: usize) usize {
+    const search_end = if (bytes[end - 1] == '\n') end - 1 else end;
+    return if (std.mem.lastIndexOfScalar(u8, bytes[0..search_end], '\n')) |n| n + 1 else 0;
+}
+
 fn hunk(out: *Changes, removed: *u64, added: *u64) void {
     // Pair replacement lines, then count unpaired additions/deletions. No double
     // counting: ~M +A -D is a presentation convention, not patch +/- totals.
@@ -40,29 +49,46 @@ fn hunk(out: *Changes, removed: *u64, added: *u64) void {
 /// bytes/lines/table work; unavailable is null, never fabricated zero changes.
 /// Call before commit. OOM may be ignored by the optional observation caller.
 pub fn compare(a: std.mem.Allocator, before: []const u8, after: []const u8) !?Changes {
+    var budget: usize = max_cells;
+    return compareBudgeted(a, before, after, &budget);
+}
+
+/// Shared cell budget permits independent, aligned hunks without multiplying the work cap.
+pub fn compareBudgeted(a: std.mem.Allocator, before: []const u8, after: []const u8, budget: *usize) !?Changes {
     if (std.mem.eql(u8, before, after)) return Changes{};
-    if (before.len > max_bytes or after.len > max_bytes) return null;
     if (!std.unicode.utf8ValidateSlice(before) or !std.unicode.utf8ValidateSlice(after)) return null;
-    if (before.len == 0) return Changes{ .added = count(after) };
-    if (after.len == 0) return Changes{ .removed = count(before) };
-    if (count(before) > max_lines or count(after) > max_lines) return null;
-    const old_all = try split(a, before);
-    defer a.free(old_all);
-    const new_all = try split(a, after);
-    defer a.free(new_all);
-    var prefix: usize = 0;
-    while (prefix < @min(old_all.len, new_all.len) and std.mem.eql(u8, old_all[prefix], new_all[prefix])) : (prefix += 1) {}
-    var old_end = old_all.len;
-    var new_end = new_all.len;
-    while (old_end > prefix and new_end > prefix and std.mem.eql(u8, old_all[old_end - 1], new_all[new_end - 1])) {
-        old_end -= 1;
-        new_end -= 1;
+    var start: usize = 0;
+    while (start < before.len and start < after.len) {
+        const old_end = lineEnd(before, start);
+        const new_end = lineEnd(after, start);
+        if (!std.mem.eql(u8, before[start..old_end], after[start..new_end])) break;
+        start = old_end;
     }
-    const old = old_all[prefix..old_end];
-    const new = new_all[prefix..new_end];
+    var old_end = before.len;
+    var new_end = after.len;
+    while (old_end > start and new_end > start) {
+        const old_start = lineStartBefore(before, old_end);
+        const new_start = lineStartBefore(after, new_end);
+        if (old_start < start or new_start < start or !std.mem.eql(u8, before[old_start..old_end], after[new_start..new_end])) break;
+        old_end = old_start;
+        new_end = new_start;
+    }
+    const old_bytes = before[start..old_end];
+    const new_bytes = after[start..new_end];
+    if (old_bytes.len > max_bytes or new_bytes.len > max_bytes) return null;
+    const old_count = count(old_bytes);
+    const new_count = count(new_bytes);
+    if (old_count > max_lines or new_count > max_lines) return null;
+    if (old_count == 0) return Changes{ .added = new_count };
+    if (new_count == 0) return Changes{ .removed = old_count };
+    const cells = (@as(usize, @intCast(old_count)) + 1) * (@as(usize, @intCast(new_count)) + 1);
+    if (cells > budget.*) return null;
+    budget.* -= cells;
+    const old = try split(a, old_bytes);
+    defer a.free(old);
+    const new = try split(a, new_bytes);
+    defer a.free(new);
     const stride = new.len + 1;
-    const cells = (old.len + 1) * stride; // <= 2049^2, no adversarial usize overflow.
-    if (cells > max_cells) return null;
     const table = try a.alloc(u16, cells);
     defer a.free(table);
     @memset(table, 0);
@@ -95,6 +121,39 @@ pub fn compare(a: std.mem.Allocator, before: []const u8, after: []const u8) !?Ch
     }
     hunk(&out, &removed, &added);
     return out;
+}
+
+test "budget is shared and charged exactly for LCS cells" {
+    const a = std.testing.allocator;
+    var budget: usize = 8;
+    try std.testing.expectEqualDeep(Changes{ .modified = 1 }, (try compareBudgeted(a, "a\n", "b\n", &budget)).?);
+    try std.testing.expectEqual(@as(usize, 4), budget);
+    try std.testing.expectEqualDeep(Changes{ .modified = 1 }, (try compareBudgeted(a, "x", "y", &budget)).?);
+    try std.testing.expectEqual(@as(usize, 0), budget);
+    try std.testing.expect((try compareBudgeted(a, "p", "q", &budget)) == null);
+    try std.testing.expectEqual(@as(usize, 0), budget);
+    // Equal input and pure additions/deletions require no table cells.
+    try std.testing.expectEqualDeep(Changes{}, (try compareBudgeted(a, "same", "same", &budget)).?);
+    try std.testing.expectEqualDeep(Changes{ .added = 1 }, (try compareBudgeted(a, "", "added\n", &budget)).?);
+    try std.testing.expectEqualDeep(Changes{ .removed = 1 }, (try compareBudgeted(a, "removed\n", "", &budget)).?);
+    try std.testing.expectEqual(@as(usize, 0), budget);
+    budget = 3;
+    try std.testing.expect((try compareBudgeted(a, "a", "b", &budget)) == null);
+    try std.testing.expectEqual(@as(usize, 3), budget);
+}
+
+test "trim complete common lines before applying observation caps" {
+    const a = std.testing.allocator;
+    const prefix = try a.alloc(u8, 300 * 1024);
+    defer a.free(prefix);
+    for (prefix, 0..) |*byte, i| byte.* = if (i % 32 == 31) '\n' else 'x';
+    const before = try std.mem.concat(a, u8, &.{ prefix, "old\n", prefix });
+    defer a.free(before);
+    const after = try std.mem.concat(a, u8, &.{ prefix, "new\n", prefix });
+    defer a.free(after);
+    var budget: usize = 4;
+    try std.testing.expectEqualDeep(Changes{ .modified = 1 }, (try compareBudgeted(a, before, after, &budget)).?);
+    try std.testing.expectEqual(@as(usize, 0), budget);
 }
 
 test "line observations count returned segments and bounded replacement hunks without double counting" {

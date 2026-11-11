@@ -448,6 +448,28 @@ test "grouped subagent progress decoder owns text and rejects malformed counts" 
     try std.testing.expectError(error.ProtocolError, decodeSubagentView(a, bad.value));
 }
 
+fn decodeBackgroundView(value: std.json.Value) !@import("../core/background_status.zig").View {
+    const obj = switch (value) {
+        .object => |v| v,
+        else => return error.ProtocolError,
+    };
+    if (obj.count() != 1) return error.ProtocolError;
+    const count = valueU64(obj.get("active_count") orelse return error.ProtocolError) orelse return error.ProtocolError;
+    return .{ .active_count = std.math.cast(usize, count) orelse return error.ProtocolError };
+}
+
+test "background view decoder requires exact bounded count" {
+    const a = std.testing.allocator;
+    const valid = try std.json.parseFromSlice(std.json.Value, a, "{\"active_count\":2}", .{});
+    defer valid.deinit();
+    try std.testing.expectEqual(@as(usize, 2), (try decodeBackgroundView(valid.value)).active_count);
+    for ([_][]const u8{ "{}", "{\"active_count\":null}", "{\"active_count\":-1}", "{\"active_count\":1.0}", "{\"active_count\":1,\"extra\":0}" }) |json| {
+        const invalid = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.ProtocolError, decodeBackgroundView(invalid.value));
+    }
+}
+
 fn decodeMemoryView(value: std.json.Value) !memory_status.View {
     const obj = switch (value) {
         .object => |v| v,
@@ -645,6 +667,7 @@ const max_preview_bytes = 96;
 const max_label_bytes = 64;
 
 const SnapshotCache = struct {
+    background: @import("../core/background_status.zig").View = .{},
     memory: memory_status.View = .{},
     subagents: @import("../core/subagent_status.zig").View = .{},
     subagents_supported: bool = false,
@@ -1143,6 +1166,7 @@ pub const Client = struct {
             .previews = previews,
             .running_sessions = 0,
             .memory = cache.memory,
+            .background = cache.background,
             .subagents = try cache.subagents.clone(arena),
             .subagents_supported = cache.subagents_supported,
         };
@@ -1156,6 +1180,7 @@ pub const Client = struct {
         var state: tui.Connection.State = baseState();
         state.codex_login = cache.codex_login;
         state.memory = cache.memory;
+        state.background = cache.background;
         state.subagents = try cache.subagents.clone(arena);
         state.subagents_supported = cache.subagents_supported;
         state.available = cfg.available and (self.conn != null or self.control != null);
@@ -1364,6 +1389,7 @@ pub const Client = struct {
         };
         cache.valid = true;
         cache.memory = try decodeMemoryView(object.get("memory") orelse return error.ProtocolError);
+        cache.background = try decodeBackgroundView(object.get("background") orelse return error.ProtocolError);
         if (object.get("subagents")) |value| {
             cache.subagents = try decodeSubagentView(self.a, value);
             if (cache.subagents.page_offset != null and self.cache.subagents_supported and self.cache.subagents.group_id == cache.subagents.group_id) {
@@ -1481,6 +1507,7 @@ pub const Client = struct {
         if (cache.codex_login.status == .succeeded and
             (self.cache.codex_login.status != .succeeded or self.cache.codex_login.generation != cache.codex_login.generation)) self.dirty = true;
         if (!std.meta.eql(self.cache.memory, cache.memory)) self.dirty = true;
+        if (!std.meta.eql(self.cache.background, cache.background)) self.dirty = true;
         if (cache.subagents.page_offset) |offset| {
             self.row_group = cache.subagents.group_id;
             // Merged rows can contain earlier pages; use the decoded page length.
@@ -2262,8 +2289,8 @@ pub const Client = struct {
             try req.put("view", "controller");
             var resp = self.exchangeOn(&owned, &req, join_timeout_ms) catch |err| return switch (err) {
                 // The dial succeeded but the peer did not complete this exact
-                // IPC greeting. A v1 worker rejects the v2 frame (and a v1 reply
-                // fails the v2 envelope), so this is fail-closed: no attach, no
+                // IPC greeting. A v1 worker rejects the v4 frame (and a v1 reply
+                // fails the v4 envelope), so this is fail-closed: no attach, no
                 // session adoption, no cursor and no display claim. Nothing is
                 // restarted, migrated or killed to make it compatible.
                 error.ProtocolError, error.Transport => error.ProtocolMismatch,
@@ -2544,7 +2571,7 @@ pub const Client = struct {
         // From here the stored connection owns the descriptor exactly once.
         errdefer self.closeControl();
         // The daemon socket is part of the same IPC version. A v1 daemon rejects
-        // this v2 greeting (or answers a v1 envelope), so it is refused here
+        // this v4 greeting (or answers a v1 envelope), so it is refused here
         // before any create/list/attach command is sent.
         var hello = try self.request(.hello);
         defer hello.deinit();
@@ -3800,14 +3827,14 @@ test "communication delivers real stream frames during a delayed control reply a
     var request_ = try protocol.parseRequest(a, request_bytes);
     defer request_.deinit();
     try testing.expect(request_.op == .cancel or request_.op == .poll_metadata);
-    try stream.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"snapshot\",\"through\":0,\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"phase\":\"calling_model\",\"task\":1,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2000 });
-    try stream.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2000 });
+    try stream.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"snapshot\",\"through\":0,\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"phase\":\"calling_model\",\"task\":1,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2000 });
+    try stream.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2000 });
     const event_bytes = try protocol.encodeEvent(a, .{ .text = "delayed-control-live-body" });
     defer a.free(event_bytes);
     // Mandatory wire sequence: the page entry carries the owner's position.
     const sequenced = try std.fmt.allocPrint(a, "{s},\"seq\":1}}", .{event_bytes[0 .. event_bytes.len - 1]});
     defer a.free(sequenced);
-    const page = try std.fmt.allocPrint(a, "{{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":1,\"events\":[{s}]}}", .{sequenced});
+    const page = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":1,\"events\":[{s}]}}", .{sequenced});
     defer a.free(page);
     try stream.writeFrame(page, .{ .io = io, .timeout_ms = 2000 });
     const deadline = std.Io.Clock.awake.now(io);
@@ -3871,7 +3898,7 @@ fn serveControlUntilSnapshot(pair: *Pair, a: std.mem.Allocator) !void {
         switch (request.op) {
             .snapshot => {
                 try testing.expect(saw_settings);
-                try pair.reply(request.id, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+                try pair.reply(request.id, "\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
                 return;
             },
             .settings => {
@@ -4013,8 +4040,8 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
     defer watch_request.deinit();
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
     try testing.expect((try watch_request.optionalU64("since")) == null);
-    try watch.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
-    try watch.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
 
     const first_page = try readyPage(a, 0, 1, &.{1}, "a");
     defer a.free(first_page);
@@ -4054,7 +4081,7 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
     // no per-event FIFO reaches the owner.
     // UTF-8 plus a CR-bearing delta: the CR boundary must stay a separate
     // unacknowledged item across the reconnect, never absorbed into the other.
-    const second_page = try std.fmt.allocPrint(a, "{{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":1,\"through\":3,\"events\":[{{\"t\":\"text\",\"v\":\"中\",\"seq\":2}},{{\"t\":\"text\",\"v\":\"\\r\",\"seq\":3}}]}}", .{});
+    const second_page = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":1,\"through\":3,\"events\":[{{\"t\":\"text\",\"v\":\"中\",\"seq\":2}},{{\"t\":\"text\",\"v\":\"\\r\",\"seq\":3}}]}}", .{});
     defer a.free(second_page);
     try watch.writeFrame(second_page, .{ .io = io, .timeout_ms = 2_000 });
     var received: usize = 0;
@@ -4136,7 +4163,7 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
 
     // Same viewer: snapshot at the cursor is redundant, the delta continues the
     // owned stream with no synthetic history reset and no duplicate.
-    try resumed.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":3,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    try resumed.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":3,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
     const delta = try readyPage(a, 3, 4, &.{4}, "d");
     defer a.free(delta);
     try resumed.writeFrame(delta, .{ .io = io, .timeout_ms = 2_000 });
@@ -4188,8 +4215,8 @@ test "new viewer baseline rows precede ordered pages and gaps are surfaced" {
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
     const hello = try protocol.encodeEvent(a, .{ .user_committed = .{ .id = 1, .text = "hello" } });
     defer a.free(hello);
-    try watch.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":5,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
-    const baseline = try std.fmt.allocPrint(a, "{{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":2,\"through\":2,\"truncated\":false,\"entries\":[{s}]}}", .{hello});
+    try watch.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":5,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    const baseline = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":2,\"through\":2,\"truncated\":false,\"entries\":[{s}]}}", .{hello});
     defer a.free(baseline);
     try watch.writeFrame(baseline, .{ .io = io, .timeout_ms = 2_000 });
 
@@ -4209,7 +4236,7 @@ test "new viewer baseline rows precede ordered pages and gaps are surfaced" {
 
     // Positions 4 and 5 follow the baseline cutoff; position 3 is gone (a
     // selectively retired control event), so the page must say so.
-    const page = try std.fmt.allocPrint(a, "{{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":2,\"through\":5,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"A\",\"seq\":4}},{{\"t\":\"user\",\"id\":2,\"v\":\"again\",\"seq\":5}}]}}", .{});
+    const page = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":2,\"through\":5,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"A\",\"seq\":4}},{{\"t\":\"user\",\"id\":2,\"v\":\"again\",\"seq\":5}}]}}", .{});
     defer a.free(page);
     try watch.writeFrame(page, .{ .io = io, .timeout_ms = 2_000 });
     var received: usize = 0;
@@ -4266,11 +4293,11 @@ test "coalesced live span is acknowledged as one exact first/last range" {
     var watch_request = try protocol.parseRequest(a, raw_watch);
     defer watch_request.deinit();
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
-    try watch.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
-    try watch.writeFrame("{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
     // Three consecutive raw deltas (positions 4..6) that the display queue
     // coalesces into one payload. Earlier positions were already shortened.
-    const page = try std.fmt.allocPrint(a, "{{\"v\":3,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":6,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"a\",\"seq\":4}},{{\"t\":\"text\",\"v\":\"b\",\"seq\":5}},{{\"t\":\"text\",\"v\":\"c\",\"seq\":6}}]}}", .{});
+    const page = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":6,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"a\",\"seq\":4}},{{\"t\":\"text\",\"v\":\"b\",\"seq\":5}},{{\"t\":\"text\",\"v\":\"c\",\"seq\":6}}]}}", .{});
     defer a.free(page);
     try watch.writeFrame(page, .{ .io = io, .timeout_ms = 2_000 });
 
@@ -4366,10 +4393,10 @@ fn writePeerInitial(a: std.mem.Allocator, io: std.Io, stream: *unix.Connection, 
 
 /// Fake worker for the protocol-mismatch regression. The first connection
 /// answers like a v1 worker (a v1 envelope), the second closes without replying
-/// (a v1 worker's actual parse behaviour), the third is an exact v2 worker and
-/// proves the compatible path still adopts normally. `saw_v2` proves the client
-/// really sent v2 greetings, since `parseRequest` only accepts this version.
-fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, saw_v2: *std.atomic.Value(bool), id: ids.Id, project: []const u8) void {
+/// (a v1 worker's actual parse behaviour), the third is an exact v4 worker and
+/// proves the compatible path still adopts normally. `saw_v4` proves the client
+/// really sent v4 greetings, since `parseRequest` only accepts this version.
+fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, saw_v4: *std.atomic.Value(bool), id: ids.Id, project: []const u8) void {
     const wait: unix.Wait = .{ .io = io, .timeout_ms = 4_000 };
     for (0..3) |attempt| {
         var conn = listener.accept(wait) catch return;
@@ -4379,7 +4406,7 @@ fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listene
         var request = protocol.parseRequest(a, raw) catch return;
         defer request.deinit();
         if (request.op != .hello) return;
-        saw_v2.store(true, .release);
+        saw_v4.store(true, .release);
         if (attempt == 1) continue; // Close the second greeting unanswered.
         const reply = if (attempt == 0)
             std.fmt.allocPrint(a, "{{\"v\":1,\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":1,\"protocol\":1,\"watch\":true}}", .{ request.id, id[0..] }) catch return
@@ -4409,7 +4436,7 @@ fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listene
     }
 }
 
-test "a v1 worker handshake is refused, while an exact v2 worker is adopted" {
+test "a v1 worker handshake is refused, while an exact v4 worker is adopted" {
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -4421,8 +4448,8 @@ test "a v1 worker handshake is refused, while an exact v2 worker is adopted" {
     var listener = try unix.Listener.bind(a, &dir, "worker.sock", .{});
     defer listener.deinit();
     const id = try ids.generate(io);
-    var saw_v2 = std.atomic.Value(bool).init(false);
-    var peer = try std.Io.concurrent(io, protocolVersionPeer, .{ a, io, &listener, &saw_v2, id, path[0..n] });
+    var saw_v4 = std.atomic.Value(bool).init(false);
+    var peer = try std.Io.concurrent(io, protocolVersionPeer, .{ a, io, &listener, &saw_v4, id, path[0..n] });
     var peer_pending = true;
     defer if (peer_pending) peer.cancel(io);
     {
@@ -4439,7 +4466,7 @@ test "a v1 worker handshake is refused, while an exact v2 worker is adopted" {
             .pid = @intCast(std.os.linux.getpid()),
             .generation = 1,
         };
-        // A v1 envelope for the v2 greeting: explicit, sanitized refusal.
+        // A v1 envelope for the v4 greeting: explicit, sanitized refusal.
         try testing.expectError(error.ProtocolMismatch, client.attachRecorded(&record, id, false));
         try testing.expect(client.conn == null and client.session == null);
         try testing.expectEqual(@as(u64, 0), client.epoch);
@@ -4448,11 +4475,11 @@ test "a v1 worker handshake is refused, while an exact v2 worker is adopted" {
             "Session worker speaks an incompatible Thin protocol version; restart Thin to start a compatible worker",
             session_client.describe(error.ProtocolMismatch),
         );
-        // A v1 worker that simply rejects and closes the v2 frame is the same
+        // A v1 worker that simply rejects and closes the v4 frame is the same
         // fail-closed class: no adoption and no automatic restart or kill.
         try testing.expectEqual(AttachStage.outdated, try client.attachEndpoint(&record, id, false));
         try testing.expect(client.conn == null and client.session == null and client.epoch == 0);
-        // The compatible path is unchanged: exact v2 greeting, session identity,
+        // The compatible path is unchanged: exact v4 greeting, session identity,
         // watch capability and attach epoch are accepted together.
         try testing.expect(try client.attachRecorded(&record, id, false));
         try testing.expect(client.conn != null and client.stream != null);
@@ -4463,7 +4490,7 @@ test "a v1 worker handshake is refused, while an exact v2 worker is adopted" {
     // peer task is awaited, so the fake worker never outlives its sockets.
     peer.await(io);
     peer_pending = false;
-    try testing.expect(saw_v2.load(.acquire));
+    try testing.expect(saw_v4.load(.acquire));
 }
 
 test "buffered event readiness and draining never fetch a new socket page" {
@@ -4792,7 +4819,7 @@ test "snapshot and settings project into the UI state without pointers" {
     try std.testing.expectEqual(@as(usize, 1), client.pubcfg.providers.len);
     try std.testing.expectEqual(@as(u8, 1), client.pubcfg.configured);
 
-    try pair.reply(2, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":true,\"phase\":\"calling_model\",\"task\":4,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":1,\"follow_up\":0,\"previews\":[{\"id\":5,\"kind\":\"steering\",\"text\":\"next\"}],\"ctx\":{\"tokens\":10,\"limit\":100,\"known\":true},\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    try pair.reply(2, "\"snapshot\":{\"background\":{\"active_count\":0},\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":true,\"phase\":\"calling_model\",\"task\":4,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":1,\"follow_up\":0,\"previews\":[{\"id\":5,\"kind\":\"steering\",\"text\":\"next\"}],\"ctx\":{\"tokens\":10,\"limit\":100,\"known\":true},\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     var snapshot = try client.readResponse(2, quick_timeout_ms);
     try client.adoptSnapshot(&snapshot);
     snapshot.deinit();
@@ -4824,7 +4851,7 @@ test "snapshot attachment and owner queues do not replace display items" {
     const client = pair.client;
 
     try client.pushEvent(.{ .string = "{\"t\":\"text\",\"epoch\":5,\"v\":\"queued display\"}" });
-    try pair.reply(1, "\"snapshot\":{\"epoch\":5,\"attached\":false,\"pending\":99,\"queue_revision\":9,\"queue_paused\":true,\"steering\":2,\"follow_up\":1,\"newest_id\":17,\"newest_bytes\":24,\"previews\":[{\"id\":17,\"kind\":\"steering\",\"text\":\"next\"},{\"id\":18,\"kind\":\"follow_up\",\"text\":\"later\"}],\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    try pair.reply(1, "\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":false,\"pending\":99,\"queue_revision\":9,\"queue_paused\":true,\"steering\":2,\"follow_up\":1,\"newest_id\":17,\"newest_bytes\":24,\"previews\":[{\"id\":17,\"kind\":\"steering\",\"text\":\"next\"},{\"id\":18,\"kind\":\"follow_up\",\"text\":\"later\"}],\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     {
         var response = try client.readResponse(1, quick_timeout_ms);
         defer response.deinit();
@@ -4852,7 +4879,7 @@ test "snapshot attachment and owner queues do not replace display items" {
     try testing.expect(Client.bufferedFn(@ptrCast(client)));
 
     // The pending permission on the wire is not the owned display queue.
-    try pair.reply(2, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"pending\":null,\"queue_revision\":10,\"queue_paused\":false,\"steering\":0,\"follow_up\":1,\"previews\":[{\"id\":18,\"kind\":\"follow_up\",\"text\":\"later\"}],\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    try pair.reply(2, "\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"pending\":null,\"queue_revision\":10,\"queue_paused\":false,\"steering\":0,\"follow_up\":1,\"previews\":[{\"id\":18,\"kind\":\"follow_up\",\"text\":\"later\"}],\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     {
         var response = try client.readResponse(2, quick_timeout_ms);
         defer response.deinit();
@@ -4945,13 +4972,13 @@ test "grouped subagent progress updates state without dirtying settings" {
     try client.adoptSettings(settings.object);
     settings.deinit();
 
-    try pair.reply(2, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    try pair.reply(2, "\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     var baseline = try client.readResponse(2, quick_timeout_ms);
     try client.adoptSnapshot(&baseline);
     baseline.deinit();
     client.dirty = false;
 
-    try pair.reply(3, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":1,\"total\":2,\"running\":2,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":10,\"latest_id\":1,\"text\":\"working\",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":10,\"text\":\"working\"},{\"id\":2,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":10,\"text\":\"working\"}]}}");
+    try pair.reply(3, "\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":1,\"total\":2,\"running\":2,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":10,\"latest_id\":1,\"text\":\"working\",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":10,\"text\":\"working\"},{\"id\":2,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":10,\"text\":\"working\"}]}}");
     var first = try client.readResponse(3, quick_timeout_ms);
     try client.adoptSnapshot(&first);
     first.deinit();
@@ -4961,7 +4988,7 @@ test "grouped subagent progress updates state without dirtying settings" {
     try testing.expect(Client.currentFn(@ptrCast(client)).subagents_supported);
     try testing.expectEqual(@as(u32, 2), client.cache.subagents.running);
 
-    try pair.reply(4, "\"snapshot\":{\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":2,\"total\":2,\"running\":1,\"waiting\":0,\"completed\":1,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":250,\"latest_id\":1,\"text\":\"working\",\"agents\":[{\"id\":1,\"revision\":2,\"phase\":\"completed\",\"elapsed_ms\":250,\"text\":\"working\"},{\"id\":2,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":250,\"text\":\"working\"}]}}");
+    try pair.reply(4, "\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":2,\"total\":2,\"running\":1,\"waiting\":0,\"completed\":1,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":250,\"latest_id\":1,\"text\":\"working\",\"agents\":[{\"id\":1,\"revision\":2,\"phase\":\"completed\",\"elapsed_ms\":250,\"text\":\"working\"},{\"id\":2,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":250,\"text\":\"working\"}]}}");
     var next = try client.readResponse(4, quick_timeout_ms);
     try client.adoptSnapshot(&next);
     next.deinit();
@@ -5039,14 +5066,14 @@ test "per-agent status rows projection survives cache replacement" {
     defer pair.deinit();
     const client = pair.client;
     client.dirty = false;
-    try pair.reply(1, "\"snapshot\":{\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":1,\"total\":1,\"running\":1,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":1,\"latest_id\":1,\"text\":\"x\",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":1,\"text\":\"first\"}]}}");
+    try pair.reply(1, "\"snapshot\":{\"background\":{\"active_count\":0},\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":1,\"revision\":1,\"total\":1,\"running\":1,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":1,\"latest_id\":1,\"text\":\"x\",\"agents\":[{\"id\":1,\"revision\":1,\"phase\":\"running\",\"elapsed_ms\":1,\"text\":\"first\"}]}}");
     var first = try client.readResponse(1, quick_timeout_ms);
     try client.adoptSnapshot(&first);
     first.deinit();
     client.rebuild();
     const projection = try client.exportProjection();
     defer projection.deinit();
-    try pair.reply(2, "\"snapshot\":{\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":0,\"revision\":0,\"total\":0,\"running\":0,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":0,\"latest_id\":0,\"text\":\"\",\"agents\":[]}}");
+    try pair.reply(2, "\"snapshot\":{\"background\":{\"active_count\":0},\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null},\"subagents\":{\"group_id\":0,\"revision\":0,\"total\":0,\"running\":0,\"waiting\":0,\"completed\":0,\"failed\":0,\"canceled\":0,\"paused\":0,\"elapsed_ms\":0,\"latest_id\":0,\"text\":\"\",\"agents\":[]}}");
     var second = try client.readResponse(2, quick_timeout_ms);
     try client.adoptSnapshot(&second);
     second.deinit();
@@ -5105,8 +5132,8 @@ test "memory summary-only snapshot publishes once without settings dirtiness" {
     var pair = try pairOf(testing.allocator);
     defer pair.deinit();
     const client = pair.client;
-    const first = "\"snapshot\":{\"memory\":{\"enabled\":true,\"revision\":1,\"active\":null,\"queued_count\":0,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":1,\"summary\":\"first\"}}}";
-    const second = "\"snapshot\":{\"memory\":{\"enabled\":true,\"revision\":1,\"active\":null,\"queued_count\":0,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":1,\"summary\":\"second\"}}}";
+    const first = "\"snapshot\":{\"background\":{\"active_count\":0},\"memory\":{\"enabled\":true,\"revision\":1,\"active\":null,\"queued_count\":0,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":1,\"summary\":\"first\"}}}";
+    const second = "\"snapshot\":{\"background\":{\"active_count\":0},\"memory\":{\"enabled\":true,\"revision\":1,\"active\":null,\"queued_count\":0,\"last_terminal\":{\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":1,\"summary\":\"second\"}}}";
     try pair.reply(1, first);
     var response = try client.readResponse(1, quick_timeout_ms);
     try client.adoptSnapshot(&response);
@@ -5145,7 +5172,7 @@ test "Memory closeout nonzero view survives response and client projection lifet
         var pair = try pairOf(testing.allocator);
         defer pair.deinit();
         const client = pair.client;
-        try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":false,\"phase\":\"calling_model\",\"task\":0,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"previews\":[],\"memory\":{\"enabled\":true,\"revision\":18446744073709551614,\"active\":{\"id\":9007199254740993,\"phase\":\"extracting\"},\"queued_count\":3,\"last_terminal\":{\"id\":9007199254740992,\"result\":\"failed\",\"failure\":\"storage\",\"saved_count\":0,\"summary\":\"\"}}}");
+        try pair.reply(1, "\"snapshot\":{\"background\":{\"active_count\":0},\"session\":\"0123456789abcdef0123456789abcdef\",\"project\":\"/p\",\"owner\":\"foreground\",\"busy\":false,\"phase\":\"calling_model\",\"task\":0,\"task_kind\":\"prompt\",\"epoch\":5,\"attached\":true,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"previews\":[],\"memory\":{\"enabled\":true,\"revision\":18446744073709551614,\"active\":{\"id\":9007199254740993,\"phase\":\"extracting\"},\"queued_count\":3,\"last_terminal\":{\"id\":9007199254740992,\"result\":\"failed\",\"failure\":\"storage\",\"saved_count\":0,\"summary\":\"\"}}}");
         var response = try client.readResponse(1, quick_timeout_ms);
         client.adoptSnapshot(&response) catch |err| {
             response.deinit();
@@ -5170,7 +5197,7 @@ test "Memory closeout nonzero view survives response and client projection lifet
         errdefer projection.deinit();
         try testing.expect(std.meta.eql(expected, projection.state.memory));
         try testing.expect(std.meta.eql(expected, projection.snapshot.memory));
-        try pair.reply(2, "\"snapshot\":{\"busy\":false,\"phase\":\"calling_model\",\"task_kind\":\"prompt\",\"epoch\":5,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"memory\":{\"enabled\":true,\"revision\":7,\"active\":{\"id\":8,\"phase\":\"saving\"},\"queued_count\":1,\"last_terminal\":{\"id\":6,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}}}");
+        try pair.reply(2, "\"snapshot\":{\"background\":{\"active_count\":0},\"busy\":false,\"phase\":\"calling_model\",\"task_kind\":\"prompt\",\"epoch\":5,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"memory\":{\"enabled\":true,\"revision\":7,\"active\":{\"id\":8,\"phase\":\"saving\"},\"queued_count\":1,\"last_terminal\":{\"id\":6,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}}}");
         var updated = try client.readResponse(2, quick_timeout_ms);
         client.adoptSnapshot(&updated) catch |err| {
             updated.deinit();
@@ -5257,7 +5284,7 @@ test "real host settings reply projects providers flags price states and pending
     host.connection.context = &view;
 
     // The real owner frame, not a hand-written fixture object.
-    var request = try protocol.parseRequest(a, "{\"v\":3,\"id\":60,\"op\":\"settings\"}");
+    var request = try protocol.parseRequest(a, "{\"v\":4,\"id\":60,\"op\":\"settings\"}");
     defer request.deinit();
     const frame = try host.dispatch(a, &request, 7, true);
     defer a.free(frame);
@@ -5729,7 +5756,7 @@ test "version and id are checked before ok/err, then the view is dropped" {
     // A wrong id cannot be attributed to this request, so `ok` is irrelevant:
     // the frame is rejected as protocol error and the view is dropped.
     const wait = unix.Wait{ .io = std.testing.io, .timeout_ms = 5_000 };
-    try pair.server.writeFrame("{\"v\":3,\"id\":9,\"ok\":false,\"err\":\"busy\"}", wait);
+    try pair.server.writeFrame("{\"v\":4,\"id\":9,\"ok\":false,\"err\":\"busy\"}", wait);
     try std.testing.expectError(error.ProtocolError, client.readResponse(2, quick_timeout_ms));
     try std.testing.expect(client.conn == null);
     try std.testing.expectEqual(@as(u64, 0), client.epoch);
@@ -5871,7 +5898,7 @@ test "receipt snapshot error preserves accepted receipt and recovers cache" {
     const client = pair.client;
     client.session = session_id;
 
-    try pair.reply(1, "\"snapshot\":{\"busy\":false,\"task\":7,\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    try pair.reply(1, "\"snapshot\":{\"background\":{\"active_count\":0},\"busy\":false,\"task\":7,\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     client.refreshSnapshot();
     const initial_frame = try readFrameJson(&pair, a);
     defer initial_frame.deinit();
@@ -5900,7 +5927,7 @@ test "receipt snapshot error preserves accepted receipt and recovers cache" {
     confirmed.kind = .prompt;
     try testing.expect(std.meta.eql(confirmed, client.cache));
 
-    try pair.reply(4, "\"snapshot\":{\"busy\":false,\"task\":55,\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    try pair.reply(4, "\"snapshot\":{\"background\":{\"active_count\":0},\"busy\":false,\"task\":55,\"epoch\":5,\"attached\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     client.refreshSnapshot();
     const refresh = try readFrameJson(&pair, a);
     defer refresh.deinit();
@@ -6198,7 +6225,7 @@ test "a replaced controller epoch drops the view and returns to the launcher" {
     const client = pair.client;
     client.session = session_id;
 
-    try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"epoch\":99,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    try pair.reply(1, "\"snapshot\":{\"background\":{\"active_count\":0},\"session\":\"0123456789abcdef0123456789abcdef\",\"epoch\":99,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     client.refreshSnapshot();
     // Only this view is released: no shutdown, no cancel, no epoch-0 connection
     // that would make every later input stale forever.
@@ -6239,7 +6266,7 @@ test "a real takeover (owner reports epoch 0) returns to the launcher without to
 
     // The service never hands another console's epoch to the loser: a revoked
     // controller sees `epoch: 0` (still busy, still running).
-    try pair.reply(1, "\"snapshot\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"epoch\":0,\"attached\":false,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    try pair.reply(1, "\"snapshot\":{\"background\":{\"active_count\":0},\"session\":\"0123456789abcdef0123456789abcdef\",\"epoch\":0,\"attached\":false,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     client.refreshSnapshot();
 
     const published = Client.snapshotFn(@ptrCast(client));
@@ -6811,7 +6838,7 @@ fn candidatePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id:
     try testing.expectEqual(@as(u64, 7), try watch.u64Field("epoch"));
     switch (behavior) {
         .watch_eof => stream.close(),
-        .watch_reject => try stream.writeFrame("{\"v\":3,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
+        .watch_reject => try stream.writeFrame("{\"v\":4,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
         .watch_timeout => {},
         else => try writePeerInitial(a, io, &stream, id, project, owner, 7, switch (behavior) {
             .snapshot => .snapshot,

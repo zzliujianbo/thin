@@ -50,6 +50,7 @@ pub const Execution = struct {
     /// Monotonic dispatch-through-cleanup time, excluding permission/model waits
     /// and result rendering. Null for calls that never started.
     duration_ms: ?u64 = null,
+    display: ?@import("background_status.zig").Caption = null,
 };
 
 /// prepare_fn 的产物：只解析与校验参数、不产生副作用，供授权与执行阶段使用。
@@ -62,6 +63,7 @@ pub const Prepared = struct {
     /// 用户拒绝（或 --print 无法询问）时，这段文案作为工具错误回给模型。
     explicit_denial: ?[]const u8 = null,
     decision_input: ?decision.Input = null,
+    display: ?@import("background_status.zig").Caption = null,
 };
 
 /// 工具执行器接口（上下文指针 + 函数指针），由宿主注入；Runtime 不关心具体工具。
@@ -170,6 +172,7 @@ pub fn policyPause(detail: ?anyerror) bool {
 
 /// 发给宿主的运行时事件，按发生顺序同步送达 Host.emit_fn。
 pub const Event = union(enum) {
+    background_completed: @import("background_status.zig").Terminal,
     /// 阶段切换。
     state: State,
     context_snapshot: ContextSnapshot,
@@ -273,6 +276,24 @@ test "thinking runtime normal and summary requests map current model" {
     var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "");
     defer runtime.deinit();
     const cancel: p.Cancellation = .{};
+    var control: ThinkingControl = .{};
+    runtime.thinking_control = &control;
+    const old_request = try runtime.request(.normal, &.{}, &cancel);
+    var strings = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer strings.deinit();
+    const opaque_wire = try strings.allocator().dupe(u8, "opaque-wire-value");
+    control.publish(.{ .reasoning_effort = "off", .reasoning = .{ .map = .{ .off = "first" } } });
+    control.publish(.{ .reasoning_effort = "high", .reasoning = .{ .map = .{ .max = opaque_wire } } });
+    const next = try runtime.request(.normal, &.{}, &cancel);
+    try std.testing.expectEqualStrings("high", old_request.reasoning_effort.?);
+    try std.testing.expectEqualStrings(opaque_wire, next.reasoning_effort.?);
+    try std.testing.expectEqualStrings("medium", config.model.reasoning_effort.?);
+    // Both constructed requests cross the real model gate without network IO.
+    try std.testing.expectError(error.UnexpectedRequest, runtime.checkedModel().call(std.testing.allocator, old_request, .{}));
+    try std.testing.expectError(error.UnexpectedRequest, runtime.checkedModel().call(std.testing.allocator, next, .{}));
+    control.clear();
+    try std.testing.expectEqualStrings(opaque_wire, next.reasoning_effort.?);
+    try std.testing.expectEqualStrings("high", (try runtime.request(.normal, &.{}, &cancel)).reasoning_effort.?);
     for ([_]p.Purpose{ .normal, .summary }) |purpose| {
         const req = try runtime.request(purpose, &.{}, &cancel);
         try std.testing.expectEqualStrings("high", req.reasoning_effort.?);
@@ -372,6 +393,10 @@ test "restored foreign scope blocks normal replay but permits text-only summary 
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             try std.testing.expectEqual(p.Purpose.summary, req.purpose);
+            const anthropic = req.scope.protocol == .anthropic;
+            try std.testing.expectEqualStrings(if (anthropic) "high" else "summary-wire", req.reasoning_effort.?);
+            try std.testing.expectEqual(if (anthropic) thinking.Format.anthropic else .standard, req.reasoning_format);
+            try std.testing.expectEqual(if (anthropic) @as(?bool, true) else null, req.thinking);
             try std.testing.expectEqual(@as(usize, 0), req.tools.len);
             for (req.messages) |message| {
                 try std.testing.expect(message.replay == null);
@@ -400,6 +425,13 @@ test "restored foreign scope blocks normal replay but permits text-only summary 
         var fake: Fake = .{};
         var runtime = try Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
         defer runtime.deinit();
+        var control: ThinkingControl = .{};
+        runtime.thinking_control = &control;
+        // Keep the override legal at the actual protocol encoder boundary.
+        control.publish(.{ .reasoning_effort = "high", .reasoning = .{
+            .format = if (proto == .anthropic) .anthropic else .standard,
+            .map = .{ .high = if (proto == .anthropic) "high" else "summary-wire" },
+        } });
         const state: @import("checkpoint.zig").State = .{
             .system = "archive",
             .messages = &.{
@@ -440,6 +472,8 @@ test "restored foreign scope blocks normal replay but permits text-only summary 
         try std.testing.expectEqual(Status.success, summary.status);
         try std.testing.expectEqual(@as(usize, 1), fake.calls);
         try std.testing.expectEqual(@as(usize, 0), fake.tools);
+        try std.testing.expect(config.model.reasoning_effort == null);
+        try std.testing.expect(config.model.reasoning == null);
     }
 }
 
@@ -630,6 +664,52 @@ pub fn initialSelector(config: cfg.Config) llm.Selector {
     }
     return selector;
 }
+
+/// Borrowed immutable strings remain owned by the configuration arena.
+pub const ReasoningSelection = struct {
+    reasoning_effort: ?[]const u8,
+    reasoning: ?thinking.Declaration,
+
+    pub fn apply(self: ReasoningSelection, model: cfg.Model) cfg.Model {
+        var result = model;
+        result.reasoning_effort = self.reasoning_effort;
+        result.reasoning = self.reasoning;
+        return result;
+    }
+};
+
+/// Fixed-size publication slot. Its lock protects only copies, never allocation.
+pub const ThinkingControl = struct {
+    mutex: std.atomic.Value(bool) = .init(false),
+    selection: ?ReasoningSelection = null,
+
+    fn lock(self: *const ThinkingControl) void {
+        const mutex = &@constCast(self).mutex;
+        while (mutex.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *const ThinkingControl) void {
+        @constCast(&self.mutex).store(false, .release);
+    }
+
+    pub fn get(self: *const ThinkingControl) ?ReasoningSelection {
+        self.lock();
+        defer self.unlock();
+        return self.selection;
+    }
+
+    pub fn publish(self: *ThinkingControl, selection: ReasoningSelection) void {
+        self.lock();
+        defer self.unlock();
+        self.selection = selection;
+    }
+
+    pub fn clear(self: *ThinkingControl) void {
+        self.lock();
+        defer self.unlock();
+        self.selection = null;
+    }
+};
 
 /// Apply the same configured wire options to normal, summary and probe requests.
 pub fn withReasoning(config: cfg.Config, request_: p.Request) p.Request {
@@ -934,6 +1014,7 @@ test "system prompt carries approach, completion and UI constraints with quoted 
         "Use the provided tools when needed",
         "Approach: Reason from the user's actual goal, constraints, and success criteria, rather than assuming existing conventions are required.",
         "Answer simple questions directly; avoid unnecessary process, delegation, abstractions, refactoring, dependencies, or unrelated improvements.",
+        "不要把简单的事情复杂化，最简单的方案就是最好的架构。编译速度、运行效率是我们的标准之一",
         "Completion: for requested changes, complete related changes before running proportionate verification within the authorized scope.",
         "Avoid repeating checks after every small edit; check earlier when needed to resolve blockers or validate critical assumptions.",
         "UI: for UI work, let layout, hierarchy, and visual relationships explain the interface.",
@@ -958,6 +1039,7 @@ pub const Runtime = struct {
     io: Io,
     /// 配置只读引用，生命周期需长于 Runtime。
     config: *const cfg.Config,
+    thinking_control: ?*ThinkingControl = null,
     /// 当前使用的模型描述。
     model: p.Model,
     /// Independent auxiliary client: never part of checkpoint or primary accounting.
@@ -1025,6 +1107,7 @@ pub const Runtime = struct {
         // 系统提示词：声明边界（工具输出、Memory、历史摘要都是不可信数据，权限由宿主决定）。
         const system = try std.fmt.allocPrint(a, "You are ThinAgent, a coding assistant. Respond in the user's language using plain, natural wording. Match detail to the task; avoid jargon, boilerplate, and repetition. Preserve quoted code, identifiers, commands, and error messages exactly. Use the provided tools when needed to inspect the startup project and make authorized changes.\n\n" ++
             "Approach: Reason from the user's actual goal, constraints, and success criteria, rather than assuming existing conventions are required. Choose the simplest correct and safe solution within scope. Answer simple questions directly; avoid unnecessary process, delegation, abstractions, refactoring, dependencies, or unrelated improvements. Clarify only ambiguities that materially affect the work.\n\n" ++
+            "不要把简单的事情复杂化，最简单的方案就是最好的架构。编译速度、运行效率是我们的标准之一\n\n" ++
             "Authorization: do not modify code unless the user authorizes code changes. A request to implement or fix authorizes changes within its stated scope; explanation, investigation, review or planning alone is read-only.\n\n" ++
             "Evidence: read relevant files before overwriting. Claim execution, changes or success only when completed tool results support it. Timeout, cancellation or an incomplete result does not prove success or rollback.\n\n" ++
             "Completion: for requested changes, complete related changes before running proportionate verification within the authorized scope. Avoid repeating checks after every small edit; check earlier when needed to resolve blockers or validate critical assumptions. In the final response, distinguish changes made, checks actually run, and remaining blockers or unverified behavior.\n\n" ++
@@ -2146,10 +2229,20 @@ pub const Runtime = struct {
         }
     };
 
+    /// Snapshot the current reasoning selection without modifying the base config.
+    pub fn effectiveConfig(self: *const Runtime) cfg.Config {
+        var result = self.config.*;
+        if (self.thinking_control) |control| {
+            if (control.get()) |selection| result.model = selection.apply(result.model);
+        }
+        return result;
+    }
+
     /// Build a purpose-specific request without assigning an output allowance.
     fn request(self: *Runtime, purpose: p.Purpose, messages_: []const p.Message, cancel: *const p.Cancellation) !p.Request {
-        return withReasoning(self.config.*, .{
-            .scope = .{ .connection = self.config.provider.base_url, .model = self.config.model.name, .protocol = self.selector.effective() },
+        const effective = self.effectiveConfig();
+        return withReasoning(effective, .{
+            .scope = .{ .connection = effective.provider.base_url, .model = effective.model.name, .protocol = self.selector.effective() },
             .system = self.system,
             .tools = self.executor.schemas,
             .messages = messages_,
@@ -2287,8 +2380,9 @@ pub const Runtime = struct {
         const messages_ = try a.alloc(p.Message, 1);
         messages_[0] = try p.textMessage(a, .user, view);
         const raw = context.rawTokens(instruction, &.{}, messages_);
-        const summary_request = withReasoning(self.config.*, .{
-            .scope = .{ .connection = self.config.provider.base_url, .model = self.config.model.name, .protocol = self.selector.effective() },
+        const effective = self.effectiveConfig();
+        const summary_request = withReasoning(effective, .{
+            .scope = .{ .connection = effective.provider.base_url, .model = effective.model.name, .protocol = self.selector.effective() },
             .system = instruction,
             .tools = &.{},
             .messages = messages_,
@@ -2299,7 +2393,7 @@ pub const Runtime = struct {
         // Reject an unsendable complete summary request before counting an
         // inference attempt. Input/protocol rejection is not a paid summary
         // failure and must preserve its explicit error and recovery semantics.
-        try context.checkInputFor(self.config.*, .summary, self.estimator.tokens(raw));
+        try context.checkInputFor(effective, .summary, self.estimator.tokens(raw));
         try @import("checkpoint.zig").validateRequestHistory(a, summary_request);
 
         // Compaction is not a user-facing model round. Failed and successful
@@ -2614,6 +2708,11 @@ pub const Runtime = struct {
 
             try checkCanceled(cancel);
             if (kind == .normal and self.reserveSteering()) break :calls;
+            if (prepared.display != null) if (display_key) |key| {
+                // The prepared caption is authoritative and guarded; do not
+                // republish unguarded raw argument previews in this refresh.
+                try self.emit(.{ .tool_view = .{ .key = key, .name = call.name, .ready = true, .display = prepared.display } }, cancel);
+            };
             if (self.decision_service) |service| if (prepared.decision_input) |input| {
                 const output = service.decide(a, input, cancel) catch |err| {
                     if (err == error.Canceled) return err;
@@ -2702,6 +2801,7 @@ pub const Runtime = struct {
                 result.duration_ms = @intCast(@max(0, began.untilNow(self.io, .awake).toMilliseconds()));
             }
 
+            result.display = prepared.display;
             // 清理失败可能残留子进程，之后必须拒绝运行。
             if (result.cleanup_failed) self.poisoned = true;
 

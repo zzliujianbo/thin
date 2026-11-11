@@ -72,6 +72,7 @@ pub const Caption = struct {
     write_marks: ?WriteMarks = null,
     /// Static, allowlisted diagnostic from shared tools; never a raw result body.
     failure_reason: ?[]const u8 = null,
+    display: ?@import("../core/background_status.zig").Caption = null,
 
     pub fn deinit(self: Caption, a: std.mem.Allocator) void {
         a.free(self.label);
@@ -96,9 +97,23 @@ pub fn fromToolView(a: std.mem.Allocator, name: []const u8, fields: @import("../
     return fromCall(a, call);
 }
 
+/// Replace a preview with the prepared, value-owned background metadata.
+pub fn withBackground(a: std.mem.Allocator, value: Caption, display: @import("../core/background_status.zig").Caption) !Caption {
+    var metadata = display;
+    const label = if (metadata.action == .start) blk: {
+        const command = if (metadata.command) |*cmd| cmd.slice() else "(command unavailable)";
+        break :blk try std.fmt.allocPrint(a, "▶ {s}", .{command});
+    } else blk: {
+        const target = if (metadata.command) |*cmd| cmd.slice() else if (metadata.id) |*id| id.slice() else "";
+        break :blk if (target.len == 0) try a.dupe(u8, @tagName(metadata.action)) else try std.fmt.allocPrint(a, "{s} {s}", .{ @tagName(metadata.action), target });
+    };
+    return .{ .kind = value.kind, .label = label, .failure_reason = value.failure_reason, .display = display };
+}
+
 /// Terminal widths and labels adapt shared structured data; no JSON parsing here.
 pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
     const kind = call.kind;
+    if (call.display) |display| return withBackground(a, .{ .kind = kind, .label = "" }, display);
     if (kind == .other) return .{ .kind = kind, .label = try a.dupe(u8, "tool") };
     // Child status is a bare tool-name row, not a new panel or message body.
     if (kind == .parent_message) return .{ .kind = kind, .label = try a.dupe(u8, "message_parent") };
@@ -201,7 +216,7 @@ pub fn completed(a: std.mem.Allocator, value: Caption, stats: ?line_stats.File) 
         } else try std.fmt.allocPrint(a, "{s}  changes ?", .{value.label}),
         else => try a.dupe(u8, value.label),
     };
-    return .{ .kind = value.kind, .label = label, .write_marks = marks };
+    return .{ .kind = value.kind, .label = label, .write_marks = marks, .display = value.display };
 }
 
 fn decimalLength(value: u64) usize {
@@ -240,7 +255,7 @@ pub const CommandSpan = struct { start: usize, end: usize, outcome: Outcome, wri
 
 pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome) ![]const u8 {
     const reason = if (outcome == .failed) value.failure_reason orelse "" else "";
-    return std.fmt.allocPrint(a, "{s} {s}{s}{s}{s}", .{ activity.icon(value.kind), value.label, switch (outcome) {
+    return std.fmt.allocPrint(a, "{s} {s}{s}{s}{s}", .{ if (value.display != null) "B:" else activity.icon(value.kind), value.label, switch (outcome) {
         .failed => " [error]",
         .canceled => " [canceled]",
         else => "",

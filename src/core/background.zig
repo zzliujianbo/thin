@@ -217,6 +217,18 @@ pub const Service = struct {
     start_fn: *const fn (context: *anyopaque, a: std.mem.Allocator, start: Start, cancel: *const Cancellation) anyerror!Result,
     control_fn: *const fn (context: *anyopaque, a: std.mem.Allocator, query: Query, cancel: *const Cancellation) anyerror!Result,
     check_fn: *const fn (context: *anyopaque) anyerror!void,
+    command_fn: ?*const fn (context: *anyopaque, id: []const u8) ?@import("background_status.zig").Command = null,
+    caption_fn: ?*const fn (context: *anyopaque, raw: []const u8) @import("background_status.zig").Command = null,
+
+    pub fn caption(self: Service, raw: []const u8) @import("background_status.zig").Command {
+        const callback = self.caption_fn orelse return @import("background_status.zig").Command.from(raw);
+        return callback(self.context, raw);
+    }
+
+    pub fn command(self: Service, id: []const u8) ?@import("background_status.zig").Command {
+        const callback = self.command_fn orelse return null;
+        return callback(self.context, id);
+    }
 
     pub fn start(self: Service, a: std.mem.Allocator, start_args: Start, cancel: *const Cancellation) anyerror!Result {
         return self.start_fn(self.context, a, start_args, cancel);

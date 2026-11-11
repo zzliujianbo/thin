@@ -1524,7 +1524,7 @@ const ChildSession = struct {
         // Publish ownership immediately: every later error must release the
         // cloned config through close() rather than leaking it on an early
         // unsupported-protocol return.
-        self.config = try cfg.clone(a, deps.config.*);
+        self.config = try cfg.clone(a, if (model_reference == null) deps.runtime.effectiveConfig() else deps.config.*);
         if (model_reference) |reference| {
             const factory = deps.client_factory orelse return error.SubagentModelSelectionUnavailable;
             self.client = try factory.prepare_fn(factory.context, a, &self.config.?, reference, &self.cancel);

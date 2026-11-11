@@ -550,7 +550,7 @@ pub const Journal = struct {
                 .tool_preview => |v| try self.firstResponse(a, "tool_preview", v.arguments.len),
                 // Ephemeral display snapshots and owner-only Memory notices
                 // are not canonical archive or diagnostic records.
-                .tool_views, .tool_view, .memory_completed => {},
+                .tool_views, .tool_view, .memory_completed, .background_completed => {},
                 .state => |v| {
                     if (v == .calling_model or v == .compacting) self.first = false;
                     try self.record(a, "state", .{ .state = v });
