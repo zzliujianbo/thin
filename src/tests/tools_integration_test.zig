@@ -730,27 +730,34 @@ test "tools prepare review inputs without side effects and use ordinary command 
     try std.testing.expect(marker.decision_input.?.command.risk == null);
     try std.testing.expectError(error.FileNotFound, root.read(alloc, "prepare-only-marker", 0, 64));
 
-    // The same bounded one-second command exceeds the 500ms host default, but
-    // completes with a valid 5000ms explicit timeout. Output distinguishes a
-    // real timeout after launch from a failure to start or a false success.
-    var cancel = p.Cancellation{};
-    for ([_]struct { arguments: []const u8, timed_out: bool }{
-        .{ .arguments = "{\"command\":\"printf started; /bin/sleep 1; printf ready\"}", .timed_out = true },
-        .{ .arguments = "{\"command\":\"printf started; /bin/sleep 1; printf ready\",\"timeout_ms\":5000}", .timed_out = false },
+    // 默认 500ms：命令阻塞 30s，必然超时，不依赖调度快慢。
+    // 显式 60s：0.7s 命令正常完成；若参数被忽略，500ms 默认值仍会杀掉它，
+    // 因此端到端语义不变，但不再赌 5 秒余量。
+    for ([_]struct { command: []const u8, arguments: []const u8, timed_out: bool }{
+        .{ .command = "printf started; /bin/sleep 30; printf ready", .arguments = "{\"command\":\"printf started; /bin/sleep 30; printf ready\"}", .timed_out = true },
+        .{ .command = "printf started; /bin/sleep 0.7; printf ready", .arguments = "{\"command\":\"printf started; /bin/sleep 0.7; printf ready\",\"timeout_ms\":60000}", .timed_out = false },
     }) |case| {
         const prepared = try executor.prepare_fn(executor.context, alloc, .{
             .id = "command",
             .name = "bash",
             .arguments = case.arguments,
         });
-        try std.testing.expectEqualStrings("printf started; /bin/sleep 1; printf ready", prepared.decision_input.?.command.command);
+        try std.testing.expectEqualStrings(case.command, prepared.decision_input.?.command.command);
         try std.testing.expect(prepared.decision_input.?.command.risk == null);
+        // 每个用例使用独立 token，避免前一个用例的取消状态影响下一个。
+        var cancel: p.Cancellation = .{};
         const result = try executor.execute_fn(executor.context, alloc, prepared, &cancel);
-        try std.testing.expectEqual(case.timed_out, result.is_error);
-        try std.testing.expect(!result.canceled and !result.cleanup_failed);
-        const value = try j.parse(alloc, result.text);
-        try std.testing.expectEqualStrings(if (case.timed_out) "started" else "startedready", j.string(j.get(value, "stdout")).?);
+        const value = j.parse(alloc, result.text) catch |err| {
+            // cleanup_failed 等失败路径返回纯文本而非 JSON；打印原文再失败。
+            std.debug.print("bash tool result is not JSON (case timed_out={}): {s}\n", .{ case.timed_out, result.text });
+            return err;
+        };
+        if (case.timed_out != j.get(value, "timed_out").?.bool)
+            std.debug.print("bash timeout case failed: expected_timed_out={} text={s}\n", .{ case.timed_out, result.text });
         try std.testing.expectEqual(case.timed_out, j.get(value, "timed_out").?.bool);
+        try std.testing.expect(!result.canceled and !result.cleanup_failed);
+        try std.testing.expectEqual(case.timed_out, result.is_error);
+        try std.testing.expectEqualStrings(if (case.timed_out) "started" else "startedready", j.string(j.get(value, "stdout")).?);
         try std.testing.expectEqual(false, j.get(value, "canceled").?.bool);
         if (!case.timed_out) try std.testing.expectEqual(@as(?u64, 0), j.uint(j.get(value, "exit_code")));
     }

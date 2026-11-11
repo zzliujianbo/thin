@@ -53,9 +53,9 @@ pub const schemas = [_]p.ToolSchema{
     },
     .{
         .name = "memory",
-        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns core/index; read returns content and version. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.",
+        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns one page of the core/index; use offset and limit to page. read returns content and version. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.",
         .parameters_json =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["list","read","write","delete"]},"topic":{"type":"string"},"content":{"type":"string"},"expected_version":{"type":["string","null"]}},"required":["action"],"additionalProperties":false}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["list","read","write","delete"]},"topic":{"type":"string"},"content":{"type":"string"},"expected_version":{"type":["string","null"]},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["action"],"additionalProperties":false}
         ,
     },
 };
@@ -265,6 +265,9 @@ pub const Memory = struct {
     content: ?[]const u8 = null,
     /// 乐观并发版本（内容哈希）：write 更新与 delete 必须提供，create 必须为空。
     expected_version: ?[]const u8 = null,
+    /// list 分页起点与每页条数。索引没有总大小上限，但每次只返回一页。
+    offset: u32 = 0,
+    limit: ?u32 = null,
 };
 
 /// 已解析且通过基本校验的工具动作；内部的切片指向解析时的 arena。
@@ -443,7 +446,9 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
         if (args.action == .list) {
             if (args.topic != null or args.content != null or args.expected_version != null)
                 return error.InvalidMemoryArguments;
+            if (args.limit) |limit| if (limit == 0 or limit > mem.max_list_limit) return error.InvalidMemoryArguments;
         } else {
+            if (args.offset != 0 or args.limit != null) return error.InvalidMemoryArguments;
             // 非 list 操作都必须带合法 topic（core 或 ASCII slug）。
             const topic = args.topic orelse return error.MissingMemoryTopic;
             mem.validTopic(topic) catch return error.InvalidMemoryTopic;
@@ -655,12 +660,10 @@ pub const Tools = struct {
     fn matchesReadTarget(target: fs.Root.Parent, fd: ?c_int, protected: fs.Root.Parent) !bool {
         if (std.mem.eql(u8, target.name, protected.name) and try fs.sameObject(target.fd, protected.fd)) return true;
         const opened = fd orelse return false;
-        const protected_fd = fs.openPath(protected.fd, protected.name) catch |err| switch (err) {
+        return fs.sameObjectAt(opened, protected.fd, protected.name) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,
         };
-        defer fs.closeFd(protected_fd);
-        return fs.sameObject(opened, protected_fd);
     }
 
     fn checkTextReadTarget(raw: *anyopaque, target: fs.Root.Parent, fd: ?c_int) !void {
@@ -976,7 +979,33 @@ pub const Tools = struct {
             // topic/content 在 parse 中已校验存在，这里的 .? 不会失败。
             .memory => |m| switch (m.action) {
                 .list => {
-                    try j.put(a, &value, "current_snapshot", j.str(try self.memory.snapshot(a)));
+                    const limit: usize = if (m.limit) |page_limit| @intCast(page_limit) else mem.default_list_limit;
+                    const page = try self.memory.listPage(a, @intCast(m.offset), limit);
+                    const core = try self.memory.coreSnapshot(a);
+                    const snapshot = if (core.len == 0) blk: {
+                        a.free(core);
+                        break :blk page.text;
+                    } else if (page.text.len == 0) blk: {
+                        a.free(page.text);
+                        break :blk core;
+                    } else blk: {
+                        const joined = std.fmt.allocPrint(a, "{s}\n\n{s}", .{ core, page.text }) catch |err| {
+                            a.free(core);
+                            a.free(page.text);
+                            return err;
+                        };
+                        a.free(core);
+                        a.free(page.text);
+                        break :blk joined;
+                    };
+                    try j.put(a, &value, "current_snapshot", j.str(snapshot));
+                    try j.put(a, &value, "total", try j.number(page.total));
+                    try j.put(a, &value, "offset", try j.number(page.offset));
+                    try j.put(a, &value, "count", try j.number(page.count));
+                    if (page.offset + page.count < page.total)
+                        try j.put(a, &value, "next_offset", try j.number(page.offset + page.count))
+                    else
+                        try j.put(a, &value, "next_offset", .null);
                 },
 
                 .read => {

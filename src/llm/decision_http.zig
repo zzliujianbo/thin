@@ -7,7 +7,7 @@ const std = @import("std");
 const process = @import("../platform/process.zig");
 const protocol = @import("../core/protocol.zig");
 const c = std.c;
-const linux = std.os.linux;
+const Input = @import("../platform/anonymous_input.zig").Input;
 
 const script = "exec /usr/bin/curl --disable --config -";
 const max_body = 65536;
@@ -109,12 +109,9 @@ pub const Client = struct {
         try checkCancel(self.io, cancel);
         const config = try makeConfigRouted(a, url, key, payload, timeout_ms, self.explicit_route, self.proxy_url);
         defer wipeFree(a, config);
-        var input = try Input.init(config);
-        defer input.deinit();
         try checkCancel(self.io, cancel);
 
-        const result = process.run(a, self.io, "/", script, &self.env, .{
-            .stdin_file = .{ .handle = input.fd, .flags = .{ .nonblocking = false } },
+        const result = self.runWithInput(a, config, .{
             .raw_output = true,
             // process splits the combined budget equally across stdout/stderr.
             // Reserve the full body + four-byte status suffix on stdout.
@@ -122,10 +119,14 @@ pub const Client = struct {
             .timeout_ms = timeout_ms,
             .term_grace_ms = 200,
             .cleanup_timeout_ms = 5000,
-        }, cancel) catch |err| {
+        }, timeout_ms, cancel, null) catch |err| {
             self.last_error = err;
+            if (err == error.CleanupFailed) return err;
             try checkCancel(self.io, cancel);
-            return if (err == error.OutOfMemory) error.OutOfMemory else error.DecisionTransport;
+            return switch (err) {
+                error.OutOfMemory, error.CleanupFailed, error.Canceled, error.Timeout => err,
+                else => error.DecisionTransport,
+            };
         };
         defer a.free(result.stdout);
         defer a.free(result.stderr);
@@ -143,20 +144,16 @@ pub const Client = struct {
         try checkCancel(self.io, cancel);
         const config = try makeStreamConfig(a, url, headers, payload, timeout_ms, body_limit, self.proxy_url);
         defer wipeFree(a, config);
-        var input = try Input.init(config);
-        defer input.deinit();
         var parser: StreamParser = .{ .sink = sink, .body_limit = body_limit };
         try checkCancel(self.io, cancel);
-        if (sink.check_fn) |check| try check(sink.context);
-        const result = try process.run(a, self.io, "/", script, &self.env, .{
-            .stdin_file = .{ .handle = input.fd, .flags = .{ .nonblocking = false } },
+        const result = try self.runWithInput(a, config, .{
             .raw_output = true,
             .stdout_sink = .{ .context = &parser, .write_fn = StreamParser.write },
             .output_bytes = 8192,
             .timeout_ms = timeout_ms,
             .term_grace_ms = 200,
             .cleanup_timeout_ms = 5000,
-        }, cancel);
+        }, timeout_ms, cancel, sink);
         defer a.free(result.stdout);
         defer a.free(result.stderr);
         if (result.cleanup_failed or result.unreaped_pid != null) {
@@ -181,6 +178,44 @@ pub const Client = struct {
         return parser.head orelse error.InvalidHttpHead;
     }
 
+    /// Keep run on the caller's thread (notably its stdout sink). Only the
+    /// bounded input producer is concurrent; it is joined before config dies.
+    fn runWithInput(self: *Client, a: std.mem.Allocator, config: []const u8, options: process.Options, timeout_ms: u32, cancel: *const protocol.Cancellation, before_spawn: ?BodySink) !process.Result {
+        var input = try Input.init(config);
+        defer input.deinit(self.io);
+        try checkCancel(self.io, cancel);
+        var run_options = options;
+        run_options.stdin_file = input.file();
+        if (before_spawn) |sink| if (sink.check_fn) |check| try check(sink.context);
+        try input.start(self.io, cancel, timeout_ms);
+        const result = process.run(a, self.io, "/", script, &self.env, run_options, &input.cancellation) catch |err| {
+            const producer_error = input.finish(self.io);
+            try checkCancel(self.io, cancel);
+            // Preserve sink/run errors when merely stopping an unfinished
+            // producer; actual producer faults are never swallowed.
+            if (producer_error) |input_error| if (input_error != error.Canceled) return input_error;
+            return err;
+        };
+        errdefer {
+            a.free(result.stdout);
+            a.free(result.stderr);
+        }
+        const producer_error = input.finish(self.io);
+        // Ownership failure wins even over producer failure or cancellation.
+        if (result.cleanup_failed or result.unreaped_pid != null) {
+            self.poisoned = true;
+            self.unreaped_pid = result.unreaped_pid;
+            return error.CleanupFailed;
+        }
+        try checkCancel(self.io, cancel);
+        if (producer_error) |err| {
+            // run may already have observed Io cancellation or its deadline.
+            if (err != error.Canceled) return err;
+            if (!result.canceled and !result.timed_out) return error.AnonymousInputFailed;
+        }
+        return result;
+    }
+
     fn acceptResult(self: *Client, a: std.mem.Allocator, result: process.Result, cancel: *const protocol.Cancellation) !Response {
         // Ownership failures always win over cancellation and transport errors.
         // Never let a retry/fallback launch while a child might still be owned.
@@ -200,12 +235,12 @@ pub const Client = struct {
         var killed = false;
         while (true) {
             var status: c_int = undefined;
-            const rc = c.waitpid(pid, &status, linux.W.NOHANG);
-            if (rc == pid or (rc < 0 and std.posix.errno(rc) == .CHILD)) {
+            const rc = c.waitpid(pid, &status, c.W.NOHANG);
+            if (rc == pid or (rc < 0 and c.errno(rc) == .CHILD)) {
                 self.unreaped_pid = null;
                 return; // Ownership is gone: no subsequent signal of this PID.
             }
-            if (rc < 0 and std.posix.errno(rc) != .INTR) return;
+            if (rc < 0 and c.errno(rc) != .INTR) return;
             if (rc == 0 and !killed) {
                 // Only the still-owned direct child, never its cached PGID.
                 _ = c.kill(pid, .KILL);
@@ -282,7 +317,7 @@ fn makeConfigRouted(a: std.mem.Allocator, url: []const u8, key: []const u8, payl
     if (capacity > max_config) return error.InvalidPayload;
     const buffer = try a.alloc(u8, capacity);
     errdefer wipeFree(a, buffer);
-    // Initialize unused bytes as well; no stale allocator content enters memfd.
+    // Initialize unused bytes as well; no stale allocator content enters stdin.
     @memset(buffer, 0);
     var w = std.Io.Writer.fixed(buffer);
     try w.writeAll(
@@ -307,7 +342,7 @@ fn makeConfigRouted(a: std.mem.Allocator, url: []const u8, key: []const u8, payl
     try field(&w, "connect-timeout", connect);
     try field(&w, "write-out", "\n%{http_code}");
     // Preserve the original allocation for wiping/freeing, and pass only the
-    // written prefix to memfd (the first trailing zero is not curl config).
+    // written prefix to anonymous stdin (the first zero is not curl config).
     // Every accepted field is NUL-free, so this delimiter is unambiguous.
     return buffer;
 }
@@ -412,54 +447,6 @@ const StreamParser = struct {
         if (body.len > self.body_limit - self.body_bytes) return error.CurlResponseTooLarge;
         self.body_bytes += body.len;
         try self.sink.write_fn(self.sink.context, self.head.?, body);
-    }
-};
-
-const Input = struct {
-    fd: c.fd_t,
-    length: usize,
-
-    fn init(config: []const u8) !Input {
-        const length = std.mem.indexOfScalar(u8, config, 0) orelse config.len;
-        const rc = linux.memfd_create("thin-decision", linux.MFD.CLOEXEC);
-        if (linux.errno(rc) != .SUCCESS) return error.DecisionTransport;
-        var self: Input = .{ .fd = @intCast(rc), .length = length };
-        errdefer self.deinit();
-        var offset: usize = 0;
-        while (offset < length) {
-            // Positional writes leave the shared stdin offset at zero.
-            const n = linux.pwrite(self.fd, config[offset..].ptr, length - offset, @intCast(offset));
-            switch (linux.errno(n)) {
-                .SUCCESS => {
-                    if (n == 0) return error.DecisionTransport;
-                    offset += n;
-                },
-                .INTR => continue,
-                else => return error.DecisionTransport,
-            }
-        }
-        return self;
-    }
-
-    fn deinit(self: *Input) void {
-        var zeros: [4096]u8 = @splat(0);
-        var offset: usize = 0;
-        while (offset < self.length) {
-            const count = @min(zeros.len, self.length - offset);
-            const n = linux.pwrite(self.fd, &zeros, count, @intCast(offset));
-            switch (linux.errno(n)) {
-                .SUCCESS => {
-                    if (n == 0) break;
-                    offset += n;
-                },
-                .INTR => continue,
-                else => break,
-            }
-        }
-        // Truncate even if an overwrite unexpectedly failed. No durable file
-        // ever existed; closing releases the anonymous inode after child exit.
-        while (linux.errno(linux.ftruncate(self.fd, 0)) == .INTR) {}
-        _ = c.close(self.fd);
     }
 };
 
@@ -592,13 +579,14 @@ test "decision environment allowlist cancellation and poison reject before spawn
 }
 
 test "decision anonymous input begins at zero CLOEXEC and wipes then truncates" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
     const config = try makeConfig(a, "https://example.invalid/", "fake-test-key", "{}", 100);
     defer wipeFree(a, config);
     var input = try Input.init(config);
     const duplicate = c.fcntl(input.fd, c.F.DUPFD_CLOEXEC, @as(c_int, 3));
     if (duplicate < 0) {
-        input.deinit();
+        input.deinit(std.testing.io);
         return error.TestDuplicateFailed;
     }
     defer _ = c.close(duplicate);
@@ -606,13 +594,13 @@ test "decision anonymous input begins at zero CLOEXEC and wipes then truncates" 
     const flags = c.fcntl(input.fd, c.F.GETFD);
     var bytes: [6]u8 = undefined;
     const n = c.read(input.fd, &bytes, bytes.len);
-    input.deinit();
+    input.deinit(std.testing.io);
     try std.testing.expect(flags & cloexec != 0);
     try std.testing.expectEqual(@as(isize, 6), n);
     try std.testing.expectEqualStrings("silent", &bytes);
-    const end = linux.lseek(duplicate, 0, linux.SEEK.END);
-    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(end));
-    try std.testing.expectEqual(@as(u64, 0), end);
+    const end = c.lseek(duplicate, 0, c.SEEK.END);
+    try std.testing.expectEqual(c.E.SUCCESS, c.errno(end));
+    try std.testing.expectEqual(@as(c.off_t, 0), end);
 }
 
 test "decision cleanup failure without PID is sticky even over cancellation" {
@@ -650,8 +638,8 @@ test "decision deinit reaps only its owned direct child and clears PID" {
     client.deinit();
     try std.testing.expectEqual(@as(?c.pid_t, null), client.unreaped_pid);
     var status: c_int = undefined;
-    const rc = c.waitpid(pid, &status, linux.W.NOHANG);
-    try std.testing.expect(rc < 0 and std.posix.errno(rc) == .CHILD);
+    const rc = c.waitpid(pid, &status, c.W.NOHANG);
+    try std.testing.expect(rc < 0 and c.errno(rc) == .CHILD);
 }
 
 fn allocationCase(a: std.mem.Allocator) !void {

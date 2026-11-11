@@ -1,30 +1,20 @@
-//! Linux terminal mechanics only. Uses a fresh /dev/tty open description, so
+//! POSIX local terminal mechanics (Linux and macOS). Uses a fresh /dev/tty open description, so
 //! nonblocking flags do not modify the parent shell's inherited stdio flags.
-//! 中文：Linux 终端底层操作，包括 /dev/tty 打开、raw 模式切换、主缓冲显示状态以及非阻塞读写。
+//! 本地终端：独立打开 /dev/tty、raw 模式恢复、主缓冲显示与非阻塞 I/O。
 
 const std = @import("std");
 const c = std.c;
 const abi = @import("../platform/terminal_abi.zig");
 const openpty = abi.openpty;
-
-// The remote transport exists only in an authenticated internal SSH child.
-// Ordinary local/PTY calls retain their original termios and fd behavior.
-extern "c" fn thin_ssh_active() c_int;
-extern "c" fn thin_ssh_read([*]u8, usize) isize;
-extern "c" fn thin_ssh_write([*]const u8, usize) isize;
-extern "c" fn thin_ssh_wait(c_int, c_int) c_int;
-extern "c" fn thin_ssh_notification_fd(c_int) c_int;
-extern "c" fn thin_ssh_size(*c_uint, *c_uint) void;
-
-// openat 以 AT_FDCWD(-100) 打开 /dev/tty；flags: 2=O_RDWR, 0x100=O_NOCTTY(不成为控制终端), 0x80000=O_CLOEXEC。
-extern "c" fn openat(c_int, [*:0]const u8, c_int, c_uint) c_int;
+const posix = @import("../platform/posix_terminal.zig");
+const remote = @import("../platform/terminal_remote.zig");
 // 查询终端的前台进程组，用于判断当前进程是否位于前台。
 extern "c" fn tcgetpgrp(c_int) c_int;
 // 当前进程所属的进程组，与 tcgetpgrp 的结果比较。
 extern "c" fn getpgrp() c_int;
+extern "c" fn thin_darwin_terminal_open() c_int;
 
-// O_NONBLOCK 的 Linux 数值（0x800），使读写不阻塞。
-const nonblock = 0x800;
+const nonblock: c_int = @intCast(@as(u32, @bitCast(c.O{ .NONBLOCK = true })));
 
 /// Supporting terminals present a complete frame together; others ignore this
 /// private mode. It supplements owned row diffs, never replaces their safety.
@@ -106,7 +96,7 @@ pub const Terminal = struct {
 
     /// 打开控制终端 /dev/tty。要求 stdin/stdout 均为 tty，且当前进程位于前台进程组，否则后台写终端会被 SIGTTOU 挂起。
     pub fn open() !Terminal {
-        if (thin_ssh_active() == 1) {
+        if (remote.active()) {
             var self: Terminal = .{ .fd = -1, .owned = false, .original = undefined, .original_flags = 0, .remote = true };
             errdefer _ = self.restore();
             try self.enterDisplay();
@@ -114,8 +104,16 @@ pub const Terminal = struct {
         }
         if (c.isatty(0) != 1 or c.isatty(1) != 1) return error.TtyRequired;
         // 使用新的 open 文件描述，使 O_NONBLOCK 不会影响父 shell 继承的 stdio。
-        const fd = openat(-100, "/dev/tty", 2 | nonblock | 0x80000 | 0x100, 0);
-        if (fd < 0) return error.TtyRequired;
+        // Darwin poll cannot monitor the indirect /dev/tty device. The C
+        // boundary opens its proven controlling node with a fresh description.
+        const fd = if (@import("builtin").os.tag == .macos)
+            thin_darwin_terminal_open()
+        else
+            c.openat(c.AT.FDCWD, "/dev/tty", .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true, .NOCTTY = true }, @as(c_uint, 0));
+        if (fd < 0) {
+            if (@import("builtin").os.tag == .macos and c.errno(fd) == .PERM) return error.ForegroundRequired;
+            return error.TtyRequired;
+        }
         // 后续任一步失败时关闭刚打开的 fd，避免泄漏。
         errdefer _ = c.close(fd);
         // 不在前台则直接拒绝，避免后台进程修改用户终端状态。
@@ -128,13 +126,10 @@ pub const Terminal = struct {
     pub fn fromFd(fd: c_int, owned: bool) !Terminal {
         var original: abi.Termios = undefined;
         if (abi.tcgetattr(fd, &original) != 0) return error.TerminalReadFailed;
-        // F_GETFL(3)：读取文件状态标志，以便失败或恢复时使用。
-        const flags = c.fcntl(fd, 3);
+        const flags = c.fcntl(fd, c.F.GETFL);
         if (flags < 0) return error.TerminalReadFailed;
-        // F_SETFL(4)：追加 O_NONBLOCK，使读写不会阻塞 UI 循环。
-        if (c.fcntl(fd, 4, flags | nonblock) < 0) return error.TerminalSetupFailed;
-        // 后续失败时把文件状态标志还原（errdefer 仅在返回错误时执行）。
-        errdefer _ = c.fcntl(fd, 4, flags);
+        if (c.fcntl(fd, c.F.SETFL, flags | nonblock) < 0) return error.TerminalSetupFailed;
+        errdefer _ = c.fcntl(fd, c.F.SETFL, flags);
         // 基于原始属性生成 raw 模式（cfmakeraw 关闭回显、规范模式、信号字符等）。
         var raw = original;
         abi.cfmakeraw(&raw);
@@ -164,11 +159,11 @@ pub const Terminal = struct {
         if (self.remote) {
             var columns: c_uint = 80;
             var rows: c_uint = 24;
-            thin_ssh_size(&columns, &rows);
+            remote.size(&columns, &rows);
             return .{ .columns = std.math.clamp(columns, 1, 512), .rows = std.math.clamp(rows, 1, 200) };
         }
         var dimensions = std.mem.zeroes(c.winsize);
-        if (c.ioctl(self.fd, std.os.linux.T.IOCGWINSZ, &dimensions) != 0) return .{ .columns = 80, .rows = 24 };
+        if (posix.getSize(self.fd, &dimensions) != 0) return .{ .columns = 80, .rows = 24 };
         return .{ .columns = if (dimensions.col == 0) 80 else @min(dimensions.col, 512), .rows = if (dimensions.row == 0) 24 else @min(dimensions.row, 200) };
     }
 
@@ -177,11 +172,11 @@ pub const Terminal = struct {
         if (self.remote) {
             var columns: c_uint = 0;
             var rows: c_uint = 0;
-            thin_ssh_size(&columns, &rows);
+            remote.size(&columns, &rows);
             return rows != 0 and rows == expected;
         }
         var dimensions = std.mem.zeroes(c.winsize);
-        return c.ioctl(self.fd, std.os.linux.T.IOCGWINSZ, &dimensions) == 0 and
+        return posix.getSize(self.fd, &dimensions) == 0 and
             dimensions.row != 0 and dimensions.row == expected;
     }
 
@@ -242,14 +237,14 @@ pub const Terminal = struct {
 
     fn rawRead(self: Terminal, out: []u8) !usize {
         if (self.remote) {
-            const count = thin_ssh_read(out.ptr, out.len);
+            const count = remote.read(out.ptr, out.len);
             return if (count >= 0) @intCast(count) else error.TerminalDisconnected;
         }
         const n = c.read(self.fd, out.ptr, out.len);
         if (n >= 0) return @intCast(n);
-        // EINTR(4) 与 EAGAIN(11) 表示暂时无数据或被信号打断，返回 0；其他错误视为终端断开。
-        return switch (c._errno().*) {
-            4, 11 => 0,
+        // Temporary lack of data or interruption, not application EOF.
+        return switch (c.errno(n)) {
+            .INTR, .AGAIN => 0,
             else => error.TerminalDisconnected,
         };
     }
@@ -257,14 +252,14 @@ pub const Terminal = struct {
     /// Main loop keeps any unwritten tail and continues input/cancel handling.
     pub fn write(self: Terminal, bytes: []const u8) !usize {
         if (self.remote) {
-            const count = thin_ssh_write(bytes.ptr, bytes.len);
+            const count = remote.write(bytes.ptr, bytes.len);
             return if (count >= 0) @intCast(count) else error.TerminalDisconnected;
         }
         const n = c.write(self.fd, bytes.ptr, bytes.len);
         if (n >= 0) return @intCast(n);
-        // EINTR(4) 与 EAGAIN(11) 表示暂时写不进去，返回 0 由主循环保留未写部分后重试。
-        return switch (c._errno().*) {
-            4, 11 => 0,
+        // The owner retains the unwritten tail on interruption/backpressure.
+        return switch (c.errno(n)) {
+            .INTR, .AGAIN => 0,
             else => error.TerminalDisconnected,
         };
     }
@@ -273,25 +268,23 @@ pub const Terminal = struct {
     /// this fd alive until removal; only its queue consumer drains it.
     pub fn setNotification(self: *Terminal, fd: c_int) !void {
         if (self.notification_fd == fd) return;
-        if (self.remote and thin_ssh_notification_fd(fd) != 0) return error.TerminalSetupFailed;
+        if (self.remote and remote.notificationFd(fd) != 0) return error.TerminalSetupFailed;
         self.notification_fd = fd;
     }
 
     /// 用 poll 等待终端可读（want_write 时等待可写），最多等待 ms 毫秒。
     pub fn wait(self: Terminal, want_write: bool, ms: c_int) !void {
         if (self.remote) {
-            if (thin_ssh_wait(@intFromBool(want_write), ms) != 0) return error.TerminalDisconnected;
+            if (remote.wait(@intFromBool(want_write), ms) != 0) return error.TerminalDisconnected;
             return;
         }
-        // POLLIN(1) 始终监听；want_write 时额外监听 POLLOUT(4)。
         var descriptors = [_]c.pollfd{
-            .{ .fd = self.fd, .events = @as(c_short, 1) | (if (want_write) @as(c_short, 4) else 0), .revents = 0 },
-            .{ .fd = self.notification_fd, .events = 1, .revents = 0 },
+            .{ .fd = self.fd, .events = c.POLL.IN | (if (want_write) @as(c_short, c.POLL.OUT) else 0), .revents = 0 },
+            .{ .fd = self.notification_fd, .events = c.POLL.IN, .revents = 0 },
         };
         const result = c.poll(&descriptors, descriptors.len, ms);
-        if (result < 0 and c._errno().* != 4) return error.TerminalDisconnected;
-        // revents 中 8=POLLERR、16=POLLHUP、32=POLLNVAL，任一出现即视为断开。
-        if (result > 0 and descriptors[0].revents & (8 | 16 | 32) != 0) return error.TerminalDisconnected;
+        if (result < 0 and c.errno(result) != .INTR) return error.TerminalDisconnected;
+        if (result > 0 and descriptors[0].revents & (c.POLL.ERR | c.POLL.HUP | c.POLL.NVAL) != 0) return error.TerminalDisconnected;
     }
 
     /// 有界写入：最多尝试 attempts 次，写不完时短暂等待可写。返回是否全部写完，永不无限阻塞。
@@ -323,19 +316,19 @@ pub const Terminal = struct {
         }
 
         var attrs_ok = false;
-        // 最多重试 8 次；仅 EINTR(4) 时继续，其他错误直接放弃。
+        // At most eight attempts; only interruption is retryable.
         for (0..8) |_| {
             if (abi.tcsetattr(self.fd, .NOW, &self.original) == 0) {
                 attrs_ok = true;
                 break;
             }
-            if (c._errno().* != 4) break;
+            if (c.errno(@as(c_int, -1)) != .INTR) break;
         }
 
         // 即使属性恢复失败，也要尝试输出离开序列（复位样式与粘贴模式）；两项结果分别汇总。
         const display_ok = self.writeBounded(leave, 50);
         // 无论前面是否成功，都尝试还原 O_NONBLOCK 标志。
-        const flags_ok = c.fcntl(self.fd, 4, self.original_flags) >= 0;
+        const flags_ok = c.fcntl(self.fd, c.F.SETFL, self.original_flags) >= 0;
 
         // 三项都成功才返回 true，任何失败都如实返回 false。
         self.restored = attrs_ok and display_ok and flags_ok;
@@ -356,11 +349,11 @@ pub const Terminal = struct {
             if (!try self.writeBoundedStopped(data, 50, stop)) return error.TerminalWriteFailed;
             return;
         }
-        const flags = c.fcntl(self.fd, 3);
-        if (flags < 0 or c.fcntl(self.fd, 4, flags | nonblock) < 0) return error.TerminalWriteFailed;
+        const flags = c.fcntl(self.fd, c.F.GETFL);
+        if (flags < 0 or c.fcntl(self.fd, c.F.SETFL, flags | nonblock) < 0) return error.TerminalWriteFailed;
         // Preserve the error until AFTER temporary flags have been restored.
         const complete = self.writeBoundedStopped(data, 50, stop);
-        const flags_ok = c.fcntl(self.fd, 4, flags) >= 0;
+        const flags_ok = c.fcntl(self.fd, c.F.SETFL, flags) >= 0;
         if (!flags_ok) return error.TerminalRestoreFailed;
         if (!try complete) return error.TerminalWriteFailed;
     }
@@ -375,6 +368,35 @@ pub const Terminal = struct {
         }
     }
 };
+
+test "local terminal wait observes borrowed wakeup without consuming it as input" {
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
+    defer _ = c.close(slave);
+    defer _ = c.close(master);
+    var terminal = try Terminal.fromFd(slave, false);
+    defer terminal.deinit();
+    var wake = try @import("../platform/wakeup.zig").Wakeup.init();
+    defer wake.deinit();
+    try terminal.setNotification(wake.fd);
+    defer terminal.setNotification(-1) catch {};
+    wake.notify();
+    const start = std.Io.Clock.awake.now(std.testing.io);
+    try terminal.wait(false, 500);
+    try std.testing.expect(start.untilNow(std.testing.io, .awake).toMilliseconds() < 250);
+    var input: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try terminal.read(&input));
+    var descriptor = [_]c.pollfd{.{ .fd = wake.fd, .events = c.POLL.IN }};
+    try std.testing.expectEqual(@as(c_int, 1), c.poll(&descriptor, 1, 0));
+    wake.drain();
+    try std.testing.expectEqual(@as(c_int, 0), c.poll(&descriptor, 1, 0));
+    try terminal.setNotification(-1);
+    terminal.deinit();
+    try std.testing.expect(c.fcntl(wake.fd, c.F.GETFD) >= 0);
+}
 
 test "CPR parser accepts only an in-range complete first reply" {
     const dimensions = Size{ .columns = 80, .rows = 24 };
@@ -392,12 +414,14 @@ test "entry probe preserves raw suffix and non replies and wipes consumed input"
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var dimensions = std.mem.zeroes(c.winsize);
     dimensions.col = 80;
     dimensions.row = 24;
-    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &dimensions));
+    try std.testing.expectEqual(@as(c_int, 0), posix.setSize(slave, &dimensions));
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
     const input = "\x1b[12;34Rabc";
@@ -423,8 +447,10 @@ test "entry probe timeout and stop are bounded" {
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
     const start = std.Io.Clock.awake.now(std.testing.io);
@@ -443,7 +469,7 @@ fn expectAttributes(a: abi.Termios, b: abi.Termios) !void {
     try std.testing.expectEqual(a.iflag, b.iflag);
     try std.testing.expectEqual(a.oflag, b.oflag);
     try std.testing.expectEqual(a.cflag, b.cflag);
-    try std.testing.expectEqual(a.lflag, b.lflag);
+    try std.testing.expectEqual(abi.configuredLocalFlags(a.lflag), abi.configuredLocalFlags(b.lflag));
     try std.testing.expectEqualSlices(c.cc_t, &a.cc, &b.cc);
     try std.testing.expectEqual(a.ispeed, b.ispeed);
     try std.testing.expectEqual(a.ospeed, b.ospeed);
@@ -453,17 +479,19 @@ test "physical rows require an exact raw PTY size" {
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var size = std.mem.zeroes(c.winsize);
     size.col = 80;
     size.row = 24;
-    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &size));
+    try std.testing.expectEqual(@as(c_int, 0), posix.setSize(slave, &size));
     const terminal: Terminal = .{ .fd = slave, .owned = false, .original = undefined, .original_flags = 0, .active = false };
     try std.testing.expect(terminal.exactPhysicalRows(24));
     try std.testing.expect(!terminal.exactPhysicalRows(200));
     size.row = 500;
-    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &size));
+    try std.testing.expectEqual(@as(c_int, 0), posix.setSize(slave, &size));
     try std.testing.expect(!terminal.exactPhysicalRows(200));
     var invalid = terminal;
     invalid.fd = -1;
@@ -475,11 +503,13 @@ test "product terminal restores raw attributes and flags on PTY only" {
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var original: abi.Termios = undefined;
     try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &original));
-    const flags = c.fcntl(slave, 3);
+    const flags = c.fcntl(slave, c.F.GETFL);
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
     var raw: abi.Termios = undefined;
@@ -489,7 +519,7 @@ test "product terminal restores raw attributes and flags on PTY only" {
         var size = std.mem.zeroes(c.winsize);
         size.col = columns;
         size.row = 24;
-        try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &size));
+        try std.testing.expectEqual(@as(c_int, 0), posix.setSize(slave, &size));
         try std.testing.expectEqual(@as(usize, columns), terminal.size().columns);
     }
 
@@ -500,7 +530,7 @@ test "product terminal restores raw attributes and flags on PTY only" {
     var restored: abi.Termios = undefined;
     try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &restored));
     try expectAttributes(original, restored);
-    try std.testing.expectEqual(flags, c.fcntl(slave, 3));
+    try std.testing.expectEqual(posix.configuredFileFlags(flags), posix.configuredFileFlags(c.fcntl(slave, c.F.GETFL)));
 }
 
 test "restoration releases synchronized display after interrupted frame escapes on owned PTY" {
@@ -511,7 +541,7 @@ test "restoration releases synchronized display after interrupted frame escapes 
         try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
         defer _ = c.close(master);
         defer _ = c.close(slave);
-        try std.testing.expect(c.fcntl(master, 4, c.fcntl(master, 3) | nonblock) >= 0);
+        try std.testing.expect(c.fcntl(master, c.F.SETFL, c.fcntl(master, c.F.GETFL) | nonblock) >= 0);
         var terminal = try Terminal.fromFd(slave, false);
         defer terminal.deinit();
         try std.testing.expect(terminal.writeBounded(partial, 10));
@@ -519,7 +549,7 @@ test "restoration releases synchronized display after interrupted frame escapes 
         var buffer: [2048]u8 = undefined;
         var used: usize = 0;
         for (0..20) |_| {
-            var pollfd = [_]c.pollfd{.{ .fd = master, .events = 1, .revents = 0 }};
+            var pollfd = [_]c.pollfd{.{ .fd = master, .events = c.POLL.IN, .revents = 0 }};
             if (c.poll(&pollfd, 1, 10) <= 0) continue;
             const n = c.read(master, buffer[used..].ptr, buffer.len - used);
             if (n > 0) used += @intCast(n);
@@ -533,7 +563,7 @@ test "restoration releases synchronized display after interrupted frame escapes 
         var restored: abi.Termios = undefined;
         try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &restored));
         try expectAttributes(terminal.original, restored);
-        try std.testing.expectEqual(terminal.original_flags, c.fcntl(slave, 3));
+        try std.testing.expectEqual(posix.configuredFileFlags(terminal.original_flags), posix.configuredFileFlags(c.fcntl(slave, c.F.GETFL)));
     }
 }
 
@@ -541,18 +571,32 @@ test "post restoration stop on a backpressured retry still restores descriptor f
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
     try std.testing.expect(terminal.restore());
-    const flags = c.fcntl(slave, 3);
-    const Flow = struct {
-        extern "c" fn tcflow(c_int, c_int) c_int;
-    };
-    // Hold output: filling the PTY can race with asynchronous line-discipline draining.
-    try std.testing.expectEqual(@as(c_int, 0), Flow.tcflow(slave, 0));
-    defer _ = Flow.tcflow(slave, 1);
+    const flags = c.fcntl(slave, c.F.GETFL);
+    try std.testing.expect(flags >= 0);
+    // Darwin may still admit writes while output is paused. Fill even the last
+    // byte of queue space so a small report cannot race a large-write EAGAIN.
+    try std.testing.expectEqual(@as(c_int, 0), posix.pauseOutput(slave, true));
+    defer _ = posix.pauseOutput(slave, false);
+    try std.testing.expect(c.fcntl(slave, c.F.SETFL, flags | nonblock) >= 0);
+    defer _ = c.fcntl(slave, c.F.SETFL, flags);
+    var blocked = false;
+    for (0..1024 * 1024) |_| {
+        const n = c.write(slave, "x", 1);
+        if (n == 1) continue;
+        if (n < 0 and c.errno(n) == .INTR) continue;
+        try std.testing.expectEqual(c.E.AGAIN, c.errno(n));
+        blocked = true;
+        break;
+    }
+    try std.testing.expect(blocked);
+    try std.testing.expect(c.fcntl(slave, c.F.SETFL, flags) >= 0);
     const Reader = struct {
         fn stopped(ctx: ?*const anyopaque) bool {
             const immutable: *const usize = @ptrCast(@alignCast(ctx.?));
@@ -564,7 +608,7 @@ test "post restoration stop on a backpressured retry still restores descriptor f
     var calls: usize = 0;
     try std.testing.expectError(error.Canceled, terminal.writeAfterRestoreStopped("bounded-report", .{ .context = &calls, .stopped_fn = Reader.stopped }));
     try std.testing.expectEqual(@as(usize, 2), calls);
-    try std.testing.expectEqual(flags, c.fcntl(slave, 3));
+    try std.testing.expectEqual(posix.configuredFileFlags(flags), posix.configuredFileFlags(c.fcntl(slave, c.F.GETFL)));
     try std.testing.expect(terminal.restore());
 }
 
@@ -587,13 +631,15 @@ fn captureStartup(output: []u8, columns: u16, screen_rows: u16) ![]const u8 {
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var dimensions = std.mem.zeroes(c.winsize);
     dimensions.col = columns;
     dimensions.row = screen_rows;
-    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(slave, std.os.linux.T.IOCSWINSZ, &dimensions));
-    try std.testing.expect(c.fcntl(master, 4, c.fcntl(master, 3) | nonblock) >= 0);
+    try std.testing.expectEqual(@as(c_int, 0), posix.setSize(slave, &dimensions));
+    try std.testing.expect(c.fcntl(master, c.F.SETFL, c.fcntl(master, c.F.GETFL) | nonblock) >= 0);
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
     return try drainMaster(master, output);
@@ -608,8 +654,8 @@ fn drainMaster(master: c_int, output: []u8) ![]const u8 {
             continue;
         }
         // Empty nonblocking queue is EAGAIN; anything else is a real PTY fault.
-        if (n < 0) try std.testing.expectEqual(@as(c_int, 11), c._errno().*);
-        var descriptor = [_]c.pollfd{.{ .fd = master, .events = 1, .revents = 0 }};
+        if (n < 0) try std.testing.expectEqual(c.E.AGAIN, c.errno(n));
+        var descriptor = [_]c.pollfd{.{ .fd = master, .events = c.POLL.IN, .revents = 0 }};
         if (c.poll(&descriptor, 1, 20) <= 0) break;
     }
     return output[0..used];
@@ -682,8 +728,10 @@ test "backpressured terminal stays nonblocking and reports failed display restor
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
     const bytes: [4096]u8 = @splat('x');

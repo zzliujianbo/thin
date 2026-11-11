@@ -126,14 +126,42 @@ pub const Repository = struct {
         };
         const Selection = struct { key: []const u8, rank: usize };
         var selected: std.ArrayList(Selection) = .empty;
-        var lines = std.mem.splitScalar(u8, try self.store.topicIndex(a), '\n');
-        while (lines.next()) |line| {
-            const sep = std.mem.find(u8, line, ".md: ") orelse continue;
-            const key = line[0..sep];
-            const rank = score(query, key, line[sep + 5 ..]);
-            if (rank == 0) continue;
-            try selected.append(a, .{ .key = key, .rank = rank });
-        }
+        const Visitor = struct {
+            a: std.mem.Allocator,
+            query: []const u8,
+            selected: *std.ArrayList(Selection),
+            const max_selected = 15;
+
+            fn better(x: Selection, y: Selection) bool {
+                if (x.rank != y.rank) return x.rank > y.rank;
+                return std.mem.order(u8, x.key, y.key) == .lt;
+            }
+
+            fn worse(x: Selection, y: Selection) bool {
+                if (x.rank != y.rank) return x.rank < y.rank;
+                return std.mem.order(u8, x.key, y.key) == .gt;
+            }
+
+            fn visit(ctx: ?*anyopaque, key: []const u8, title: []const u8) anyerror!void {
+                const state: *@This() = @ptrCast(@alignCast(ctx.?));
+                const rank = score(state.query, key, title);
+                if (rank == 0) return;
+                if (state.selected.items.len < max_selected) {
+                    try state.selected.append(state.a, .{ .key = try state.a.dupe(u8, key), .rank = rank });
+                    return;
+                }
+                var worst: usize = 0;
+                for (state.selected.items, 0..) |item, index| {
+                    if (worse(item, state.selected.items[worst])) worst = index;
+                }
+                const candidate: Selection = .{ .key = key, .rank = rank };
+                if (!better(candidate, state.selected.items[worst])) return;
+                state.a.free(state.selected.items[worst].key);
+                state.selected.items[worst] = .{ .key = try state.a.dupe(u8, key), .rank = rank };
+            }
+        };
+        var visitor = Visitor{ .a = a, .query = query, .selected = &selected };
+        try self.store.forEachTopic(.{ .context = &visitor, .visit_fn = Visitor.visit });
         std.mem.sort(Selection, selected.items, {}, struct {
             fn less(_: void, x: Selection, y: Selection) bool {
                 if (x.rank != y.rank) return x.rank > y.rank;

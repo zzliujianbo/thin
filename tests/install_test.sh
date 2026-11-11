@@ -14,6 +14,15 @@ export REAL_MV
 REAL_MV=$(command -v mv)
 export REAL_LN
 REAL_LN=$(command -v ln)
+export REAL_PERL
+REAL_PERL=$(command -v perl || true)
+export HOST_OS
+HOST_OS=$(uname -s)
+export FIXTURE_OS=${FIXTURE_OS:-$HOST_OS}
+if [[ ( $HOST_OS == Darwin || $FIXTURE_OS == Darwin ) && -z $REAL_PERL ]]; then
+    printf 'Darwin installer fixtures require Perl.\n' >&2
+    exit 1
+fi
 export FIXTURE_PROJECT="$project"
 export ZIG="$fixture/fake tools/zig"
 export INSTALL_DIR="$bin"
@@ -41,6 +50,10 @@ if [[ ${RACE_ALIAS:-} != '' && ${!#} == "$INSTALL_DIR/t" ]]; then
 fi
 [[ ${FAIL_MOVE:-0} == 0 ]] || exit 44
 if [[ ${FAIL_BINARY_MOVE:-0} != 0 && ${!#} == "$INSTALL_DIR/thin" ]]; then exit 45; fi
+if [[ $HOST_OS == Darwin && $1 == -fT ]]; then
+    [[ $# -eq 4 && $2 == -- ]]
+    exec "$REAL_PERL" -e 'rename($ARGV[0], $ARGV[1]) or die "rename: $!\n";' -- "$3" "$4"
+fi
 exec "$REAL_MV" "$@"
 MOVE
 cat > "$fixture/fake tools/ln" <<'LINK'
@@ -50,9 +63,37 @@ if [[ ${RACE_ALIAS:-} != '' && ${!#} == "$INSTALL_DIR/t" ]]; then
     source "$RACE_HOOK" ln
 fi
 [[ ${FAIL_LINK:-0} == 0 ]] || exit 46
+if [[ $HOST_OS == Darwin && $1 == -sT ]]; then
+    [[ $# -eq 4 && $2 == -- ]]
+    exec "$REAL_PERL" -e 'symlink($ARGV[0], $ARGV[1]) or die "symlink: $!\n";' -- "$3" "$4"
+fi
 exec "$REAL_LN" "$@"
 LINK
-chmod 0755 "$ZIG" "$fixture/fake tools/install" "$fixture/fake tools/mv" "$fixture/fake tools/ln"
+cat > "$fixture/fake tools/perl" <<'PERL'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# -eq 5 && $1 == -e && $3 == -- ]]
+case $2 in
+    *'symlink('*)
+        if [[ ${RACE_ALIAS:-} != '' && ${!#} == "$INSTALL_DIR/t" ]]; then source "$RACE_HOOK" ln; fi
+        [[ ${FAIL_LINK:-0} == 0 ]] || exit 46
+        ;;
+    *'rename('*)
+        [[ ${FAIL_MOVE:-0} == 0 && ${FAIL_BINARY_MOVE:-0} == 0 ]] || exit 45
+        ;;
+    *) exit 98 ;;
+esac
+exec "$REAL_PERL" "$@"
+PERL
+cat > "$fixture/fake tools/uname" <<'UNAME'
+#!/bin/sh
+case "$1" in
+    -s) printf '%s\n' "$FIXTURE_OS" ;;
+    -m) printf '%s\n' "${FIXTURE_ARCH:-x86_64}" ;;
+    *) exit 98 ;;
+esac
+UNAME
+chmod 0755 "$ZIG" "$fixture/fake tools/"{install,mv,ln,perl,uname}
 export PATH="$fixture/fake tools:$PATH"
 # Fail closed if the test ever tries to elevate privileges.
 cat > "$fixture/fake tools/sudo" <<'SUDO'
@@ -67,7 +108,8 @@ cat > "$RACE_HOOK" <<'RACE'
 [[ ! -e "$INSTALL_DIR/t" && ! -L "$INSTALL_DIR/t" ]]
 case $RACE_ALIAS in
     file) printf 'racing-command\n' > "$INSTALL_DIR/t" ;;
-    link) "$REAL_LN" -sT -- "$RACE_TARGET" "$INSTALL_DIR/t" ;;
+    link) "$REAL_LN" -s "$RACE_TARGET" "$INSTALL_DIR/t" ;;
+    directory) mkdir "$INSTALL_DIR/t"; printf 'keep-directory\n' > "$INSTALL_DIR/t/keep" ;;
     *) exit 97 ;;
 esac
 printf '%s\n' "$1" > "$RACE_MARKER"
@@ -90,6 +132,8 @@ cd -- "$fixture"
 ZIG=/does/not/exist "$project/install.sh" --help >/dev/null
 expect_failure "$project/install.sh" unexpected-argument
 expect_failure env INSTALL_DIR=relative "$project/install.sh"
+expect_failure env FIXTURE_OS=FreeBSD "$project/install.sh"
+expect_failure env FIXTURE_OS=Darwin FIXTURE_ARCH=arm64 "$project/install.sh"
 [[ ! -e "$project/zig-out" ]]
 printf 'previous-binary\n' > "$bin/thin"
 expect_failure env ZIG=/does/not/exist "$project/install.sh"
@@ -107,7 +151,7 @@ done
 printf 'PASS installer atomic failure and cleanup\n'
 
 race_failed=0
-for kind in file link; do
+for kind in file link directory; do
     rm -f -- "$bin/t"
     printf 'previous-binary\n' > "$bin/thin"
     target="$fixture/racing target"
@@ -123,7 +167,9 @@ for kind in file link; do
     preserved=0
     if [[ $kind == file ]]; then
         if [[ -f "$bin/t" && ! -L "$bin/t" && $(< "$bin/t") == racing-command ]]; then preserved=1; fi
-    elif [[ -L "$bin/t" && $(readlink -- "$bin/t") == "$target" ]]; then
+    elif [[ $kind == link && -L "$bin/t" && $(readlink "$bin/t") == "$target" ]]; then
+        preserved=1
+    elif [[ $kind == directory && -d "$bin/t" && ! -L "$bin/t" && $(< "$bin/t/keep") == keep-directory && ! -e "$bin/t/thin" ]]; then
         preserved=1
     fi
     [[ $(< "$target") == untouched-racing-target ]]
@@ -132,10 +178,11 @@ for kind in file link; do
         printf 'FAIL race %s: must reject publish and preserve unrelated t and previous binary (t_preserved=%s).\n' "$kind" "$preserved" >&2
         race_failed=1
     fi
+    if [[ $kind == directory ]]; then rm "$bin/t/keep"; rmdir "$bin/t"; fi
 done
 [[ $race_failed == 0 ]] || exit 1
 rm -f -- "$bin/t"
-printf 'PASS installer atomic alias race refusal (file and symlink)\n'
+printf 'PASS installer atomic alias race refusal (file, symlink and directory)\n'
 
 rm -f -- "$bin/t"
 printf 'unrelated-command\n' > "$bin/t"
@@ -157,7 +204,11 @@ ln -sf -- "$fixture/symlink target" "$bin/thin"
 "$project/install.sh" >/dev/null
 [[ ! -L "$bin/thin" && $(< "$fixture/symlink target") == untouched-target ]]
 [[ $("$bin/thin") == release-fixture ]]
-[[ $(stat -c '%a' -- "$bin/thin") == 755 ]]
+if [[ $HOST_OS == Darwin ]]; then
+    [[ $(stat -f '%Lp' "$bin/thin") == 755 ]]
+else
+    [[ $(stat -c '%a' -- "$bin/thin") == 755 ]]
+fi
 no_temps
 [[ -L "$bin/t" && $(readlink -- "$bin/t") == thin ]]
 [[ $("$bin/t") == release-fixture ]]
@@ -175,3 +226,20 @@ FIXTURE_RELEASE=release-from-dangling "$project/install.sh" >/dev/null
 [[ $(readlink -- "$bin/t") == thin && $("$bin/t") == release-from-dangling ]]
 no_temps
 printf 'PASS installer accepts existing dangling t -> thin\n'
+
+# Exact-leaf publication must replace a symlink to a directory, never copy
+# into it, and must reject a real destination directory without changing it.
+rm "$bin/thin"
+mkdir "$fixture/directory target"
+printf 'untouched-directory\n' > "$fixture/directory target/keep"
+ln -s "$fixture/directory target" "$bin/thin"
+"$project/install.sh" >/dev/null
+[[ ! -L "$bin/thin" && -f "$bin/thin" && $(< "$fixture/directory target/keep") == untouched-directory ]]
+[[ ! -e "$fixture/directory target/thin" ]]
+rm "$bin/thin"
+mkdir "$bin/thin"
+printf 'keep-destination\n' > "$bin/thin/keep"
+expect_failure "$project/install.sh"
+[[ $(< "$bin/thin/keep") == keep-destination && $(find "$bin/thin" -type f | wc -l) -eq 1 ]]
+no_temps
+printf 'PASS installer exact-leaf directory protection (%s)\n' "$FIXTURE_OS"

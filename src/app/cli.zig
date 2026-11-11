@@ -179,7 +179,7 @@ fn parseId(value: []const u8) !ids.Id {
 }
 
 /// 帮助文本，由 --help 输出。字符串内容即为用户可见的文档。
-pub const help =
+const linux_modes_help =
     \\thin - minimal local agent (Linux x86_64, Zig 0.17.0)
     \\
     \\Usage: thin
@@ -212,6 +212,29 @@ pub const help =
     \\A session keeps one writable owner; an unattended dangerous command still waits.
     \\Disconnecting from a daemon session detaches the view, it does not cancel work.
     \\
+;
+
+const macos_modes_help =
+    \\thin - minimal local agent (macOS local mode, Zig 0.17.0)
+    \\
+    \\Usage: thin
+    \\       thin --print "prompt"
+    \\       thin --restore-selection <32-lowerhex-session-id>
+    \\       thin --resume <32-lowerhex-session-id>
+    \\       thin --help | --version
+    \\
+    \\Modes: local foreground by default; --print runs one task without a TTY.
+    \\Foreground workers and background tasks belong to this running instance.
+    \\Exiting the foreground cancels and reaps its owned workers and tasks.
+    \\--resume restores a local checkpoint; it never automatically replays a request.
+    \\SSH, --daemon, --connect, --attach, --takeover and --ssh-listen are unsupported.
+    \\No persistent service or launchd job is installed or started.
+    \\
+;
+
+pub const help = (if (@import("builtin").os.tag == .macos) macos_modes_help else linux_modes_help) ++ "\n" ++ common_help;
+
+const common_help =
     \\Configuration: ~/.thin/config.json
     \\Startup initializes a missing/empty file for DeepSeek (deepseek-flash).
     \\Use /login in the TUI for hidden key entry; the key is saved locally with mode 0600.
@@ -533,6 +556,15 @@ test "CLI worker restore-selection is worker-only and exclusive" {
 }
 
 test "CLI help documents explicit modes without advertising internal entry" {
+    if (@import("builtin").os.tag == .macos) {
+        try std.testing.expect(std.mem.indexOf(u8, help, "macOS local mode") != null);
+        try std.testing.expect(std.mem.indexOf(u8, help, "--resume <32-lowerhex-session-id>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, help, "are unsupported") != null);
+        try std.testing.expect(std.mem.indexOf(u8, help, "Only --daemon explicitly runs") == null);
+        try std.testing.expect(std.mem.indexOf(u8, help, "--internal-worker") == null);
+        try std.testing.expect(std.mem.indexOf(u8, help, "--worker-resume") == null);
+        return;
+    }
     try std.testing.expect(std.mem.indexOf(u8, help, "ordinary local foreground by default") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "Only --daemon explicitly runs the per-user service") != null);
     // 只有 --connect 依赖 daemon；--attach 可连普通前台公布的 worker，两者都不自启服务。

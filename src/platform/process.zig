@@ -1,4 +1,4 @@
-//! 子进程执行器（Linux + libc）：通过 /bin/bash -c 运行脚本，有界捕获 stdout/stderr，
+//! 子进程执行器（Linux/Darwin + libc）：通过 /bin/bash -c 运行脚本，有界捕获 stdout/stderr，
 //! 并以进程组为单位做 TERM -> KILL 的有界清理，保证取消或超时后不遗留后台进程。
 
 const std = @import("std");
@@ -7,6 +7,8 @@ const spawn = @import("spawn.zig");
 // libc 与 Linux 系统调用接口。
 const c = std.c;
 const linux = std.os.linux;
+const builtin = @import("builtin");
+const darwin = @import("process_darwin.zig");
 
 // 查询 pid 所属进程组；用于判断子进程是否为自己进程组的组长。
 extern "c" fn getpgid(pid: c.pid_t) c.pid_t;
@@ -23,8 +25,9 @@ pub const OutputSink = struct {
 
 /// 已验证启动握手的通知内容：`launched` 为 true 表示 exec 成功且进程组归本模块所有。
 pub const LaunchNotice = struct {
+    /// Zero only for a synchronous Darwin spawn failure (no child ownership).
     pid: c.pid_t,
-    /// exec 成功（CLOEXEC 握手管道 EOF）；false 表示启动失败。
+    /// exec 成功（Linux CLOEXEC 握手 / Darwin posix_spawn）；false 表示启动失败。
     launched: bool,
     /// 子进程确为自己进程组的组长，可用 -pid 对整组发信号。
     group_owned: bool,
@@ -77,6 +80,10 @@ pub const Options = struct {
     /// Borrowed until run returns; consumed from its current, shared offset.
     /// null keeps stdin connected to /dev/null.
     stdin_file: ?std.Io.File = null,
+    /// Borrow open FDs > 2 until run returns; preserve descriptor numbers and
+    /// parent flags/ownership. Darwin exec allowlist (besides stdio). Pass only
+    /// the dedicated owner-lifetime READ end to a worker, never its writer.
+    inherited_fds: []const c.fd_t = &.{},
     /// Private protocol callers only: return bytes without terminal escaping.
     /// Callers must reject truncated responses in their entirety.
     raw_output: bool = false,
@@ -414,6 +421,7 @@ fn drain(fd: c.fd_t, capture: *Capture, sink: ?*SinkState) !void {
 
 /// 非阻塞且不回收地检查子进程是否已退出（WNOWAIT）。返回 true 表示已退出；ECHILD 表示所有权已丢失。
 fn observedExit(pid: c.pid_t) !bool {
+    if (builtin.os.tag == .macos) return darwin.observedExit(pid);
     var info: linux.siginfo_t = std.mem.zeroes(linux.siginfo_t);
     const rc = linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT, null);
     // si_pid 非 0 表示子进程已可等待；WNOWAIT 让状态保留给之后的 waitpid 回收。
@@ -426,10 +434,42 @@ fn observedExit(pid: c.pid_t) !bool {
     };
 }
 
-/// 向 pid 发送信号。ESRCH（目标已不存在）视为成功，因为目标已经结束；其他失败返回 false。
+/// Linux retains its ESRCH behavior. Darwin ESRCH/EPERM never prove an empty
+/// group: every actual failed signal is sticky cleanup_failed.
 fn signal(pid: c.pid_t, sig: c.SIG) bool {
     const rc = c.kill(pid, sig);
-    return rc == 0 or std.posix.errno(rc) == .SRCH;
+    return rc == 0 or (builtin.os.tag == .linux and std.posix.errno(rc) == .SRCH);
+}
+
+fn reap(pid: c.pid_t, status: *c_int) c.pid_t {
+    if (builtin.os.tag == .macos) return darwin.reap(pid, status);
+    return c.waitpid(pid, status, linux.W.NOHANG);
+}
+
+// Darwin may reject kill(-pgid) for a zombie-only group. Avoid an unnecessary
+// signal ONLY after an independent, complete dead-group proof. A failed
+// delivery is not proof of a live group either: re-check with the remaining
+// cleanup budget and report an empty group as cleaned. Failed queries stay
+// fail-closed; no signal failure is ever reclassified without a complete proof.
+fn signalOwned(io: std.Io, pid: c.pid_t, group_owned: bool, exited: bool, sig: c.SIG, since: std.Io.Timestamp, budget: u32) bool {
+    if (builtin.os.tag == .macos and group_owned and exited) {
+        // A pre-signal proof must not spend the TERM/KILL budget enumerating a
+        // large or continuously forking group. The final confirmation below
+        // may use the remaining full budget; this optional proof gets <=5ms.
+        const age: u32 = @intCast(@min(@max(elapsed(io, since), 0), budget));
+        const proof_budget = @min(budget, age +| 5);
+        const alive = groupAlive(io, pid, since, proof_budget) catch true;
+        if (!alive) return true;
+    }
+    if (signal(if (group_owned) -pid else pid, sig)) return true;
+    if (builtin.os.tag == .macos and group_owned) {
+        // EPERM/ESRCH on a zombie-only group is expected here. Only a complete
+        // proof that no live member remains may turn this into success; a
+        // deadline, short scan, or transient query error keeps the failure.
+        const alive = groupAlive(io, pid, since, budget) catch return false;
+        return !alive;
+    }
+    return false;
 }
 
 /// 自 start 起经过的毫秒数，基于 awake 时钟（不受系统挂起或时间调整影响）。
@@ -443,6 +483,11 @@ fn elapsed(io: std.Io, start: std.Io.Timestamp) i64 {
 // 中文：扫描失败或不完整时返回错误而不是 false，避免误判为“进程组已清空”。
 /// 扫描 /proc，判断进程组 pgid 中是否仍有非僵尸进程。
 fn groupAlive(io: std.Io, pgid: c.pid_t, start: std.Io.Timestamp, budget: u32) !bool {
+    if (builtin.os.tag == .macos) {
+        const age = elapsed(io, start);
+        if (age >= budget) return error.CleanupDeadline;
+        return darwin.groupAlive(pgid, budget - @as(u32, @intCast(@max(age, 0))));
+    }
     const dir = c.opendir("/proc") orelse return error.ProcUnavailable;
     defer _ = c.closedir(dir);
 
@@ -499,7 +544,7 @@ fn groupAlive(io: std.Io, pgid: c.pid_t, start: std.Io.Timestamp, budget: u32) !
     return false;
 }
 
-/// Linux + libc implementation. Caller must not reap this child from another
+/// Linux/Darwin + libc implementation. Caller must not reap this child from another
 /// thread or install SIGCHLD=SIG_IGN/SA_NOCLDWAIT. Escaped process groups are not
 /// owned. Cleanup is bounded; cleanup_failed can mean an unreaped/still-live
 /// child, and must not be presented as successful termination by the caller.
@@ -518,8 +563,7 @@ const Launch = struct {
 };
 
 fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, script: []const u8, environ: *const std.process.Environ.Map, options: Options, cancel: *const p.Cancellation, launch: Launch) !Result {
-    // 仅支持 Linux：依赖 waitid、/proc 与 poll。
-    if (@import("builtin").os.tag != .linux) return error.UnsupportedPlatform;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedPlatform;
     var result: Result = .{ .stdout = "", .stderr = "", .stdout_bytes = 0, .stderr_bytes = 0, .truncated = false };
 
     // 启动前已取消：不 spawn 任何进程，直接返回 canceled。
@@ -560,8 +604,15 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
     const start = std.Io.Clock.awake.now(io);
     // pgid=0：子进程成为新进程组的组长，之后可对 -pid 整组发信号。
     // Default stdin is /dev/null; private callers may supply an owned input source.
-    // 自有启动层在 fork 后始终返回 PID；chdir/exec 失败也进入下面的有界清理。
-    const child = try spawn.startWithInput(allocator, root, options.cwd_dir, launch.executable, script, environ, launch.test_mode, options.stdin_file);
+    // Linux fork 后始终转交 PID；Darwin posix_spawn 失败不产生可转交的子 PID。
+    const child = spawn.startWithFds(allocator, root, options.cwd_dir, launch.executable, script, environ, launch.test_mode, options.stdin_file, options.inherited_fds) catch |e| {
+        // posix_spawn can fail synchronously without creating/transferring a
+        // child. A failed launch still notifies once, with no owned PID/group.
+        if (builtin.os.tag == .macos) {
+            if (options.on_launch) |notify| notify.notify_fn(notify.context, .{ .pid = 0, .launched = false, .group_owned = false });
+        }
+        return e;
+    };
 
     // Never call Child.wait/kill: canceled wait can erase ownership; kill uses
     // TERM and an unbounded wait. Hold the PID until the LAST group signal.
@@ -605,6 +656,11 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
     var cleaning: ?std.Io.Timestamp = null;
     var exited = false;
     var killed = false;
+    // 进程组存活性检查的最近一次失败原因。只在最终清理失败时打印：子进程
+    // 刚退出时 proc_listpgrppids 短暂返回 ESRCH 很常见，下一次轮询即恢复，
+    // 不能把它当成故障刷屏。
+    var last_check_error: ?anyerror = null;
+    var last_check_errno: c_int = 0;
 
     // ownership=false 表示 PID 所有权已丢失（被他人回收），此后绝不再发信号。
     var ownership = true;
@@ -668,7 +724,7 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
             const err_sink_failed = if (stderr_sink) |state| state.failure != null else false;
             if (exited or failure != null or sink_failed or err_sink_failed or result.canceled or result.timed_out) {
                 cleaning = std.Io.Clock.awake.now(io);
-                if (!signal(if (group_owned) -pid else pid, .TERM)) result.cleanup_failed = true;
+                if (!signalOwned(io, pid, group_owned, exited, .TERM, cleaning.?, options.cleanup_timeout_ms)) result.cleanup_failed = true;
             }
         }
 
@@ -685,19 +741,32 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
             const age = elapsed(io, since);
             // Reserve time after KILL even when grace exceeds cleanup budget.
             if (!killed and age >= @min(options.term_grace_ms, options.cleanup_timeout_ms / 2)) {
-                if (!signal(if (group_owned) -pid else pid, .KILL)) result.cleanup_failed = true;
+                if (!signalOwned(io, pid, group_owned, exited, .KILL, since, options.cleanup_timeout_ms)) result.cleanup_failed = true;
                 killed = true;
             }
             // 子进程已退出且管道已 EOF（或不再读）时，检查进程组是否还有残留后代；全部消失才结束循环。
             if (exited and launch_status != .pending and group_owned and (out.eof or !out_ready) and (err.eof or !err_ready)) {
-                // 无法确认时保守地视为仍存活，继续等待直到预算耗尽。
-                const alive = groupAlive(io, pid, since, options.cleanup_timeout_ms) catch true;
-                if (!alive) break;
+                if (groupAlive(io, pid, since, options.cleanup_timeout_ms)) |alive| {
+                    last_check_error = null;
+                    if (!alive) break;
+                } else |check_err| {
+                    // 无法确认时保守地视为仍存活，继续等待直到预算耗尽。
+                    last_check_error = check_err;
+                    if (comptime builtin.os.tag == .macos) last_check_errno = c._errno().*;
+                }
             }
             // 清理预算耗尽：补发 KILL，报告 cleanup_failed，并放弃等待。
             if (age >= options.cleanup_timeout_ms) {
-                if (!killed) _ = signal(if (group_owned) -pid else pid, .KILL);
+                if (!killed and !signalOwned(io, pid, group_owned, exited, .KILL, since, options.cleanup_timeout_ms)) result.cleanup_failed = true;
                 result.cleanup_failed = true;
+                // 只有真正放弃时才记录原因：区分"有活着的后代"和"查不清"。
+                if (last_check_error) |check_err| {
+                    if (comptime builtin.os.tag == .macos) {
+                        std.debug.print("thin: process group {d} liveness unconfirmed ({s}, errno={d})\n", .{ pid, @errorName(check_err), last_check_errno });
+                    } else {
+                        std.debug.print("thin: process group {d} liveness unconfirmed ({s})\n", .{ pid, @errorName(check_err) });
+                    }
+                }
                 break;
             }
         }
@@ -720,9 +789,9 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
     if (ownership) {
         var status: c_int = 0;
         // 非阻塞回收；EINTR 在清理预算内重试。
-        var rc = c.waitpid(pid, &status, linux.W.NOHANG);
+        var rc = reap(pid, &status);
         while (rc < 0 and std.posix.errno(rc) == .INTR and elapsed(io, cleaning.?) < options.cleanup_timeout_ms)
-            rc = c.waitpid(pid, &status, linux.W.NOHANG);
+            rc = reap(pid, &status);
         // 回收成功：记录真实退出状态。
         if (rc == pid) {
             result.term = std.Io.Threaded.statusToTerm(@bitCast(status));
@@ -914,7 +983,7 @@ test "stdout sink cleanup failure takes precedence over callback error" {
         const start = std.Io.Clock.awake.now(std.testing.io);
         while (true) {
             var status: c_int = 0;
-            const rc = c.waitpid(pid, &status, linux.W.NOHANG);
+            const rc = reap(pid, &status);
             if (rc == pid or (rc < 0 and std.posix.errno(rc) == .CHILD)) break;
             try std.testing.expect(rc == 0 or std.posix.errno(rc) == .INTR);
             try std.testing.expect(elapsed(std.testing.io, start) < 2500);
@@ -982,6 +1051,10 @@ test "launch notice reports failed exec before cleanup and error" {
     try std.testing.expectError(error.SpawnFailed, runExecutable(std.testing.allocator, std.testing.io, ctx.root, "exit 0", &ctx.env, options, &cancel, .{ .executable = missing }));
     try std.testing.expectEqual(@as(usize, 1), probe.notices);
     try std.testing.expect(!probe.notice.?.launched);
+    if (builtin.os.tag == .macos) {
+        try std.testing.expectEqual(@as(c.pid_t, 0), probe.notice.?.pid);
+        try std.testing.expect(!probe.notice.?.group_owned);
+    }
 }
 
 test "stderr sink error is sticky and cleanup failure takes precedence" {
@@ -1010,7 +1083,7 @@ test "stderr sink error is sticky and cleanup failure takes precedence" {
             const start = std.Io.Clock.awake.now(std.testing.io);
             while (true) {
                 var status: c_int = 0;
-                const rc = c.waitpid(pid, &status, linux.W.NOHANG);
+                const rc = reap(pid, &status);
                 if (rc == pid or (rc < 0 and std.posix.errno(rc) == .CHILD)) break;
                 try std.testing.expect(rc == 0 or std.posix.errno(rc) == .INTR);
                 try std.testing.expect(elapsed(std.testing.io, start) < 2500);
@@ -1117,6 +1190,7 @@ test "exit7, cwd, ignored stdin and explicit filtered environment" {
 // Only inspect our own descriptors/direct children; never reap an unspecified
 // PID or scan/signals unrelated processes to repair a failed launch.
 fn ownFdCount() !usize {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const dir = c.opendir("/proc/self/fd") orelse return error.ProcUnavailable;
     defer _ = c.closedir(dir);
     var count: usize = 0;
@@ -1132,6 +1206,7 @@ fn ownFdCount() !usize {
 }
 
 fn ownChildren(buf: []u8) ![]const u8 {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const fd = c.open("/proc/thread-self/children", .{ .CLOEXEC = true });
     if (fd < 0) return error.ProcUnavailable;
     defer _ = c.close(fd);
@@ -1339,7 +1414,7 @@ test "exhausted cleanup deadline is explicitly reported, never successful" {
     while (r.term == null) {
         try std.testing.expect(pid > 1);
         var status: c_int = 0;
-        const rc = c.waitpid(pid, &status, linux.W.NOHANG);
+        const rc = reap(pid, &status);
         if (rc == pid or (rc < 0 and std.posix.errno(rc) == .CHILD)) break;
         try std.testing.expect(rc == 0 or std.posix.errno(rc) == .INTR);
         try std.testing.expect(elapsed(std.testing.io, start) < 2500);
@@ -1427,6 +1502,107 @@ test "borrowed stdin starts at shared offset and raw output roundtrips exact byt
     try std.testing.expectEqual(flags, c.fcntl(fd, c.F.GETFD));
     // dup shares the open-file description: cat consumed to EOF, no rewind.
     try std.testing.expectEqual(@as(isize, 0), c.read(fd, &prefix, prefix.len));
+}
+
+test "explicit inherited CLOEXEC fd survives exec without changing parent flags" {
+    var ctx = try TestContext.init();
+    defer ctx.deinit();
+    try ctx.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "inherited", .data = "owner-read-end\n" });
+    const file = try ctx.tmp.dir.openFile(std.testing.io, "inherited", .{});
+    defer file.close(std.testing.io);
+    const fd = c.fcntl(file.handle, c.F.DUPFD_CLOEXEC, @as(c_int, 100));
+    try std.testing.expect(fd >= 100);
+    defer _ = c.close(fd);
+    const flags = c.fcntl(fd, c.F.GETFD);
+    const command = try std.fmt.allocPrint(std.testing.allocator, "IFS= read -r line <&{d}; printf '%s' \"$line\"", .{fd});
+    defer std.testing.allocator.free(command);
+    const inherited = [_]c.fd_t{fd};
+    var options = test_options;
+    options.inherited_fds = &inherited;
+    var cancel: p.Cancellation = .{};
+    const result = try run(std.testing.allocator, std.testing.io, ctx.root, command, &ctx.env, options, &cancel);
+    defer freeResult(result);
+    try std.testing.expect(!result.cleanup_failed and !result.truncated);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term.?);
+    try std.testing.expectEqualStrings("owner-read-end", result.stdout);
+    try std.testing.expectEqual(flags, c.fcntl(fd, c.F.GETFD));
+}
+
+test "Darwin default-close excludes unrelated non CLOEXEC descriptor" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var ctx = try TestContext.init();
+    defer ctx.deinit();
+    const file = try ctx.tmp.dir.createFile(std.testing.io, "not-allowlisted", .{});
+    defer file.close(std.testing.io);
+    const fd = c.fcntl(file.handle, c.F.DUPFD, @as(c_int, 100));
+    try std.testing.expect(fd >= 100);
+    defer _ = c.close(fd);
+    const flags = c.fcntl(fd, c.F.GETFD);
+    try std.testing.expectEqual(@as(c_int, 0), flags & c.FD_CLOEXEC);
+    const command = try std.fmt.allocPrint(std.testing.allocator, "test ! -e /dev/fd/{d}", .{fd});
+    defer std.testing.allocator.free(command);
+    var cancel: p.Cancellation = .{};
+    const result = try run(std.testing.allocator, std.testing.io, ctx.root, command, &ctx.env, test_options, &cancel);
+    defer freeResult(result);
+    try std.testing.expect(!result.cleanup_failed);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term.?);
+    try std.testing.expectEqual(flags, c.fcntl(fd, c.F.GETFD));
+}
+
+test "inherited descriptors reject stdio and duplicates before spawn" {
+    var ctx = try TestContext.init();
+    defer ctx.deinit();
+    const fd = c.open("/dev/null", .{ .CLOEXEC = true });
+    try std.testing.expect(fd > 2);
+    defer _ = c.close(fd);
+    const duplicate = [_]c.fd_t{ fd, fd };
+    const stdio = [_]c.fd_t{1};
+    const negative = [_]c.fd_t{-1};
+    for ([_][]const c.fd_t{ &duplicate, &stdio, &negative }) |inherited| {
+        var options = test_options;
+        options.inherited_fds = inherited;
+        var cancel: p.Cancellation = .{};
+        try std.testing.expectError(error.InvalidInheritedFd, run(std.testing.allocator, std.testing.io, ctx.root, "exit 91", &ctx.env, options, &cancel));
+    }
+}
+
+test "Darwin process queries fail closed for missing leader and zero deadline" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    // No signal, fork, or unrelated PID query: group zero is invalid at our
+    // private boundary, and deadline zero must fail before libproc enumeration.
+    try std.testing.expectError(error.ProcUnavailable, darwin.groupAlive(0, 100));
+    try std.testing.expectError(error.ProcUnavailable, darwin.groupAlive(2, 0));
+}
+
+test "Darwin zombie-only signal failure is proven clean instead of cleanup failure" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var ctx = try TestContext.init();
+    defer ctx.deinit();
+    const child = try spawn.start(std.testing.allocator, ctx.root, null, "/bin/bash", "exit 0", &ctx.env, .none);
+    defer child.close();
+
+    // Hold the direct child unreaped until it is an observable zombie.
+    const start = std.Io.Clock.awake.now(std.testing.io);
+    while (!try observedExit(child.pid)) {
+        try std.testing.expect(elapsed(std.testing.io, start) < 1000);
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+    }
+
+    // This kernel quirk is the point of the test. Skip where a group signal to
+    // zombies still succeeds, so the post-signal proof would not be exercised.
+    const probe = c.kill(-child.pid, @fromBackingInt(@intCast(0)));
+    if (probe == 0 or std.posix.errno(probe) != .PERM) return error.SkipZigTest;
+
+    // exited=true takes the short pre-signal proof; exited=false forces the
+    // failed-delivery path that must absorb Darwin's EPERM without reporting a
+    // cleanup failure. Both must only succeed on a complete dead-group proof.
+    const since = std.Io.Clock.awake.now(std.testing.io);
+    try std.testing.expect(signalOwned(std.testing.io, child.pid, true, true, .TERM, since, 500));
+    try std.testing.expect(signalOwned(std.testing.io, child.pid, true, false, .TERM, since, 500));
+
+    // No signal after this point: reap the still-owned child exactly once.
+    var status: c_int = 0;
+    try std.testing.expectEqual(child.pid, reap(child.pid, &status));
 }
 
 test "raw output overflow remains bounded and marks whole response truncated" {

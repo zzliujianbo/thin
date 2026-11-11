@@ -252,7 +252,7 @@ const Supervisor = struct {
         defer fs.closeFd(dir);
         var buffer: [64]u8 = undefined;
         const path = std.fmt.bufPrintSentinel(&buffer, "{s}.session", .{id}, 0) catch return false;
-        const fd = fs.linux.openat(dir, path, fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0);
+        const fd = fs.openAt(dir, path, .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
         if (fd < 0) return false;
         defer fs.closeFd(fd);
         const stat = fs.fileFromFd(fd).stat(self.io) catch return false;
@@ -1264,7 +1264,7 @@ fn writeTestSessionsFile(a: std.mem.Allocator, io: std.Io, project: []const u8, 
     defer fs.closeFd(dir);
     var buffer: [64]u8 = undefined;
     const path = try std.fmt.bufPrintSentinel(&buffer, "{s}{s}", .{ id, suffix }, 0);
-    const fd = fs.linux.openat(dir, path, 1 | fs.linux.create | fs.linux.exclusive | fs.linux.nofollow | fs.linux.cloexec, 0o600);
+    const fd = fs.openAt(dir, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600);
     if (fd < 0) return fs.osError();
     defer fs.closeFd(fd);
     try fs.fileFromFd(fd).writePositionalAll(io, "{}", 0);

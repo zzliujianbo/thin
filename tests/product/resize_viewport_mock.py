@@ -140,7 +140,7 @@ def run(app, wrap=False, local_command=False):
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
-        with tempfile.TemporaryDirectory(prefix='thin-viewport-') as tmp:
+        with tempfile.TemporaryDirectory(prefix='thin-viewport-', dir='/tmp') as tmp:
             root = Path(tmp)
             home, project = root / 'home', root / 'project'
             (home / '.thin').mkdir(parents=True)

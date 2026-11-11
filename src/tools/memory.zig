@@ -13,6 +13,11 @@ const config = @import("../core/config.zig");
 const Root = fs.Root;
 extern "c" fn fsync(c_int) c_int;
 pub const directory_name = "memory";
+/// The filesystem directory is the index. Titles are capped per row so one
+/// entry can never make listing or retrieval unbounded.
+pub const max_title_bytes: usize = 512;
+pub const default_list_limit: usize = 100;
+pub const max_list_limit: usize = 1000;
 
 /// 一次读取的结果：content 为正文，version 为正文的 sha256 十六进制串（用作 CAS 比较依据）。
 pub const Entry = struct { content: []const u8, version: []const u8 };
@@ -21,7 +26,7 @@ pub const Entry = struct { content: []const u8, version: []const u8 };
 pub const Store = struct {
     /// 项目根目录（不是 .thin/memory 本身）。
     root: *Root,
-    /// core 与分片的大小、索引总预算等上限。
+    /// core 与单条分片的大小上限。There is no total index budget.
     limits: config.Limits,
     /// Optional reference reads may decline contention; manual operations wait.
     wait_for_lock: bool = true,
@@ -37,12 +42,12 @@ pub const Store = struct {
         const fd = try fs.openDirectory(self.root.dir.handle, ".");
         errdefer fs.closeFd(fd);
 
-        // 2 = LOCK_EX，4 = LOCK_NB：非阻塞尝试；EINTR 直接重试，EWOULDBLOCK(11) 时 sleep 2ms 后再试。
-        while (fs.linux.flock(fd, 2 | 4) != 0) {
-            const e = std.c._errno().*;
-            if (!self.wait_for_lock and (e == 4 or e == 11)) return error.Busy;
-            if (e == 4) continue;
-            if (e != 11) return fs.osError();
+        // 非阻塞尝试；EINTR 直接重试，EWOULDBLOCK 时 sleep 2ms 后再试。
+        while (fs.flock(fd, fs.LOCK.EX | fs.LOCK.NB) != 0) {
+            const e = fs.errno();
+            if (!self.wait_for_lock and (e == .INTR or e == .AGAIN)) return error.Busy;
+            if (e == .INTR) continue;
+            if (e != .AGAIN) return fs.osError();
             try std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake);
         }
         return fd;
@@ -143,14 +148,11 @@ pub const Store = struct {
             if (current == null or !std.mem.eql(u8, current.?.version, expected)) return error.VersionConflict;
         } else if (current != null) return error.PathAlreadyExists;
 
-        // Index budget is independent, and checked before publishing this write.
-        // 索引预算先于落盘检查，避免写入成功后索引超限、留下不一致的状态。
-        _ = try self.index(&mem, a, topic, content);
         const name = try filename(a, topic);
         // 最后一步才落盘；仅更新时允许覆盖已有文件，权限固定 0600 以保护私有记忆。
         if (guard == null) try self.advanceGeneration(&mem);
         try mem.writeMode(name, content, expected_version != null, 0o600);
-        const written = fs.linux.openat(mem.dir.handle, name, fs.linux.nofollow | fs.linux.cloexec, 0);
+        const written = fs.openAt(mem.dir.handle, name, .{ .NOFOLLOW = true, .CLOEXEC = true }, 0);
         if (written < 0) return fs.osError();
         defer fs.closeFd(written);
         if (fsync(written) != 0 or fsync(mem.dir.handle) != 0) return fs.osError();
@@ -215,7 +217,7 @@ pub const Store = struct {
         var buffer: [20]u8 = undefined;
         const text = try std.fmt.bufPrint(&buffer, "{d}", .{next});
         try dir.writeMode(".generation", text, true, 0o600);
-        const fd = fs.linux.openat(dir.dir.handle, ".generation", fs.linux.nofollow | fs.linux.cloexec, 0);
+        const fd = fs.openAt(dir.dir.handle, ".generation", .{ .NOFOLLOW = true, .CLOEXEC = true }, 0);
         if (fd < 0) return fs.osError();
         defer fs.closeFd(fd);
         if (fsync(fd) != 0 or fsync(dir.dir.handle) != 0) return fs.osError();
@@ -243,14 +245,11 @@ pub const Store = struct {
             for (rows.items) |row| a.free(row);
             rows.deinit(a);
         }
-        var bytes: usize = 0;
         var it = dir.dir.iterate();
         while (try it.next(dir.io)) |item| {
             if (!std.mem.endsWith(u8, item.name, ".md")) continue;
             const topic = item.name[0 .. item.name.len - 3];
             try validTopic(topic);
-            bytes += topic.len + 6;
-            if (bytes > self.limits.index_bytes) return error.IndexTooLarge;
             try rows.append(a, try a.dupe(u8, topic));
         }
         std.mem.sort([]const u8, rows.items, {}, struct {
@@ -261,93 +260,115 @@ pub const Store = struct {
         return rows.toOwnedSlice(a);
     }
 
-    /// Bounded titles only, for per-turn candidate selection (not permanent injection).
-    pub fn topicIndex(self: *Store, a: std.mem.Allocator) ![]const u8 {
+    /// Streaming visitor over topic name and bounded first-line title. The
+    /// directory is the index: callers never receive a full index string. The
+    /// callback runs under the store lock and must not call Store methods.
+    pub const TopicVisitor = struct {
+        context: ?*anyopaque = null,
+        visit_fn: *const fn (?*anyopaque, []const u8, []const u8) anyerror!void,
+
+        fn visit(self: TopicVisitor, topic: []const u8, title: []const u8) !void {
+            return self.visit_fn(self.context, topic, title);
+        }
+    };
+
+    pub fn forEachTopic(self: *Store, visitor: TopicVisitor) !void {
         const fd = try self.lock();
         defer fs.closeFd(fd);
         var dir = self.directory(false) catch |err| {
-            if (err == error.FileNotFound) return a.dupe(u8, "");
+            if (err == error.FileNotFound) return;
             return err;
         };
         defer dir.deinit();
-        return self.index(&dir, a, null, null);
-    }
-
-    /// Frozen by Runtime at startup. Missing storage creates no paths.
-    /// Format: raw core followed by a sorted `filename: first line` shard index.
-    /// 中文：返回启动时注入上下文的快照；core 缺失是正常情况，其他错误必须上报。
-    pub fn snapshot(self: *Store, allocator: std.mem.Allocator) ![]const u8 {
-        const fd = try self.lock();
-        defer fs.closeFd(fd);
-        var mem = self.directory(false) catch |err| {
-            if (err == error.FileNotFound) return allocator.dupe(u8, "");
-            return err;
-        };
-        defer mem.deinit();
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        const core = self.load(&mem, a, "core") catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-
-        // 索引只包含分片首行，不读取分片正文，使启动上下文大小保持可控。
-        const idx = try self.index(&mem, a, null, null);
-
-        if (idx.len == 0) return allocator.dupe(u8, if (core) |c| c.content else "");
-        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ if (core) |c| c.content else "", if (core != null and core.?.content.len > 0) "\n\n" else "", idx });
-    }
-
-    /// 生成排序后的索引文本（每行 "topic.md: 首行"）。replacement 为即将写入的 topic，其旧行被跳过，改用 content 生成的新行。
-    fn index(self: *Store, mem: *Root, a: std.mem.Allocator, replacement: ?[]const u8, content: ?[]const u8) ![]const u8 {
-        var rows: std.ArrayList([]const u8) = .empty;
-        var bytes: usize = 0;
-
-        var iterator = mem.dir.iterate();
-        while (try iterator.next(mem.io)) |item| {
+        var it = dir.dir.iterate();
+        while (try it.next(dir.io)) |item| {
             if (!std.mem.endsWith(u8, item.name, ".md")) continue;
             const topic = item.name[0 .. item.name.len - 3];
-            try validTopic(topic);
             if (std.mem.eql(u8, topic, "core")) continue;
-
-            // 被替换的 topic 旧行跳过，避免索引中出现重复行。
-            if (replacement) |r| if (std.mem.eql(u8, r, topic)) continue;
-
-            // 6 = ".md: " 的 5 字节加换行，用于在读取前提前检查索引预算。
-            const overhead = topic.len + 6;
-            if (overhead > self.limits.index_bytes or bytes > self.limits.index_bytes - overhead) return error.IndexTooLarge;
-
-            // Index only the first line, not every complete shard and hash.
-            // Reclaim each read before advancing; memory is bounded by index
-            // size plus one title, rather than topic-count times shard size.
-            var temporary = std.heap.ArenaAllocator.init(self.root.allocator);
-            defer temporary.deinit();
-            const title = try self.firstLine(mem, temporary.allocator(), topic, self.limits.index_bytes - bytes - overhead);
-            try self.addRow(a, &rows, &bytes, topic, title);
-        }
-
-        // 待写入的新 topic 不一定已在目录中，因此单独加入索引；core 从不进入索引。
-        if (replacement) |r| if (!std.mem.eql(u8, r, "core")) try self.addRow(a, &rows, &bytes, r, content.?);
-
-        // 排序使输出与文件系统遍历顺序无关，结果稳定、可比较。
-        std.mem.sort([]const u8, rows.items, {}, struct {
-            fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
-                return std.mem.order(u8, lhs, rhs) == .lt;
+            try validTopic(topic);
+            {
+                var temporary = std.heap.ArenaAllocator.init(self.root.allocator);
+                defer temporary.deinit();
+                const title = try self.firstLine(&dir, temporary.allocator(), topic);
+                try visitor.visit(topic, title);
             }
-        }.less);
-        return std.mem.join(a, "", rows.items);
+        }
     }
 
-    /// 只读取分片首行，最多 limit 字节。以 O_NOFOLLOW|O_NONBLOCK 打开，拒绝符号链接与非普通文件。
-    fn firstLine(self: *Store, mem: *Root, a: std.mem.Allocator, topic: []const u8, limit: usize) ![]const u8 {
+    pub const ListPage = struct {
+        total: usize,
+        offset: usize,
+        count: usize,
+        text: []u8,
+    };
+
+    /// Sorted, paginated listing without a total byte budget. Only the selected
+    /// page's first lines are read; the full index is never materialized.
+    pub fn listPage(self: *Store, a: std.mem.Allocator, offset: usize, limit: usize) !ListPage {
+        const fd = try self.lock();
+        defer fs.closeFd(fd);
+        var dir = self.directory(false) catch |err| {
+            if (err == error.FileNotFound) return .{ .total = 0, .offset = 0, .count = 0, .text = try a.dupe(u8, "") };
+            return err;
+        };
+        defer dir.deinit();
+
+        var names: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (names.items) |name| a.free(name);
+            names.deinit(a);
+        }
+        var it = dir.dir.iterate();
+        while (try it.next(dir.io)) |item| {
+            if (!std.mem.endsWith(u8, item.name, ".md")) continue;
+            const topic = item.name[0 .. item.name.len - 3];
+            if (std.mem.eql(u8, topic, "core")) continue;
+            try validTopic(topic);
+            try names.append(a, try a.dupe(u8, topic));
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn less(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.order(u8, x, y) == .lt;
+            }
+        }.less);
+
+        const total = names.items.len;
+        const start = @min(offset, total);
+        const count = @min(limit, total - start);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(a);
+        for (names.items[start .. start + count]) |topic| {
+            var temporary = std.heap.ArenaAllocator.init(self.root.allocator);
+            defer temporary.deinit();
+            const title = try self.firstLine(&dir, temporary.allocator(), topic);
+            const row = try std.fmt.allocPrint(a, "{s}.md: {s}\n", .{ topic, title });
+            defer a.free(row);
+            try out.appendSlice(a, row);
+        }
+        return .{ .total = total, .offset = start, .count = count, .text = try out.toOwnedSlice(a) };
+    }
+
+    /// Legacy full snapshot for callers/tests that need one string. Production
+    /// listing uses listPage; writes never rebuild an index.
+    pub fn snapshot(self: *Store, allocator: std.mem.Allocator) ![]const u8 {
+        const core = try self.coreSnapshot(allocator);
+        defer allocator.free(core);
+        const page = try self.listPage(allocator, 0, std.math.maxInt(usize));
+        defer allocator.free(page.text);
+        if (page.text.len == 0) return allocator.dupe(u8, core);
+        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ core, if (core.len != 0) "\n\n" else "", page.text });
+    }
+
+    /// Read only the first line, capped at max_title_bytes. Truncation happens
+    /// on a UTF-8 boundary; the complete body is never loaded for listing.
+    fn firstLine(self: *Store, mem: *Root, a: std.mem.Allocator, topic: []const u8) ![]const u8 {
         const name = try filename(a, topic);
+        defer a.free(name);
         var parent = try mem.parent(name);
         defer parent.deinit();
 
         // nofollow 防止经符号链接读到项目外文件；nonblock 防止 FIFO 之类的特殊文件阻塞线程。
-        const fd = fs.linux.openat(parent.fd, parent.name, fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0);
+        const fd = fs.openAt(parent.fd, parent.name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
         if (fd < 0) return fs.osError();
         defer fs.closeFd(fd);
 
@@ -356,45 +377,49 @@ pub const Store = struct {
         if (stat.kind != .file) return error.NotRegularFile;
         try self.bound(topic, stat.size);
 
-        var line: std.ArrayList(u8) = .empty;
-        var offset: u64 = 0;
-        var buffer: [512]u8 = undefined;
-        while (offset < stat.size) {
-            // 每次读取的上限是剩余预算加 1：多读 1 字节即可判断首行是否超限。
-            const count: usize = @intCast(@min(@as(u64, buffer.len), @min(stat.size - offset, limit - line.items.len + 1)));
-            const n = try file.readPositionalAll(mem.io, buffer[0..count], offset);
-            if (n != count) return error.FileChanged;
-            const newline = std.mem.findScalar(u8, buffer[0..n], '\n');
-            const end = newline orelse n;
-            // 首行超过预算时直接报错，而不是截断后静默写入索引。
-            if (end > limit - line.items.len) return error.IndexTooLarge;
-            try line.appendSlice(a, buffer[0..end]);
-            if (newline != null) break;
-            offset += n;
+        const want: usize = @intCast(@min(stat.size, max_title_bytes));
+        const line = try a.alloc(u8, want);
+        defer a.free(line);
+        if (want != 0) {
+            const n = try file.readPositionalAll(mem.io, line, 0);
+            if (n != want) return error.FileChanged;
         }
-
-        // 首行必须是合法文本，否则索引会带入二进制内容。
-        try fs.validateText(line.items);
-        return line.items;
-    }
-
-    /// 追加一行索引并累计字节数；超出 index_bytes 预算时返回 IndexTooLarge。
-    fn addRow(self: *Store, a: std.mem.Allocator, rows: *std.ArrayList([]const u8), bytes: *usize, topic: []const u8, content: []const u8) !void {
-        // 只取第一行作为标题。
-        const line = content[0..(std.mem.findScalar(u8, content, '\n') orelse content.len)];
-        const len = topic.len + 6 + line.len; // `.md: ` + newline
-        if (len > self.limits.index_bytes or bytes.* > self.limits.index_bytes - len) return error.IndexTooLarge;
-        bytes.* += len;
-        try rows.append(a, try std.fmt.allocPrint(a, "{s}.md: {s}\n", .{ topic, line }));
+        var end = std.mem.findScalar(u8, line, '\n') orelse line.len;
+        if (end == line.len and stat.size > line.len) {
+            // The cap cut the first line; drop only an incomplete UTF-8 suffix.
+            // Invalid bytes earlier in the line still make validateText fail.
+            end = completeUtf8Prefix(line);
+        }
+        try fs.validateText(line[0..end]);
+        return a.dupe(u8, line[0..end]);
     }
 };
+
+/// Return the prefix ending on a complete UTF-8 sequence. Only an incomplete
+/// suffix is removed; invalid bytes elsewhere are left for validateText.
+fn completeUtf8Prefix(bytes: []const u8) usize {
+    var i = bytes.len;
+    var continuation: usize = 0;
+    while (i > 0) {
+        const byte = bytes[i - 1];
+        if (byte & 0xc0 == 0x80) {
+            continuation += 1;
+            if (continuation > 3) return bytes.len;
+            i -= 1;
+            continue;
+        }
+        const need: usize = if (byte & 0x80 == 0) 1 else if (byte & 0xe0 == 0xc0) 2 else if (byte & 0xf0 == 0xe0) 3 else if (byte & 0xf8 == 0xf0) 4 else return bytes.len;
+        return if (continuation + 1 < need) i - 1 else bytes.len;
+    }
+    return bytes.len;
+}
 
 /// 在 parent 下打开子目录；create 为 true 且目录不存在时以 0700 创建。
 fn child(parent: c_int, name: [*:0]const u8, create: bool) !c_int {
     return fs.openDirectory(parent, name) catch |err| {
         if (err != error.FileNotFound or !create) return err;
-        // 17 = EEXIST：并发创建时目录已存在，视为成功。
-        if (std.c.mkdirat(parent, name, 0o700) != 0 and std.c._errno().* != 17) return fs.osError();
+        // EEXIST：并发创建时目录已存在，视为成功。
+        if (std.c.mkdirat(parent, name, 0o700) != 0 and fs.errno() != .EXIST) return fs.osError();
         if (fsync(parent) != 0) return fs.osError();
         return fs.openDirectory(parent, name);
     };
@@ -522,11 +547,11 @@ test "memory real concurrent Stores and cross-process flock exclusion" {
         // Only async-signal-safe libc operations after fork in the threaded process.
         // 中文：多线程进程 fork 后，子进程只能调用 async-signal-safe 的操作。
         fs.closeFd(held);
-        // 子进程独立 open 根目录，得到新的 open description，flock 应返回 EWOULDBLOCK(11)，证明互斥生效。
-        const independent = fs.linux.openat(root.dir.handle, ".", fs.linux.directory | fs.linux.cloexec, 0);
+        // 子进程独立 open 根目录，得到新的 open description，flock 应返回 EWOULDBLOCK，证明互斥生效。
+        const independent = fs.openAt(root.dir.handle, ".", .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
         if (independent < 0) _exit(2);
-        const rc = fs.linux.flock(independent, 2 | 4);
-        const excluded = rc == -1 and std.c._errno().* == 11;
+        const rc = fs.flock(independent, fs.LOCK.EX | fs.LOCK.NB);
+        const excluded = rc == -1 and fs.errno() == .AGAIN;
         fs.closeFd(independent);
         _exit(if (excluded) 0 else 3);
     }
@@ -535,7 +560,7 @@ test "memory real concurrent Stores and cross-process flock exclusion" {
     var waited: c_int = undefined;
     while (true) {
         waited = waitpid(pid, &status, 0);
-        if (waited < 0 and std.c._errno().* == 4) continue;
+        if (waited < 0 and fs.errno() == .INTR) continue;
         break;
     }
     try std.testing.expectEqual(pid, waited);
@@ -599,8 +624,8 @@ test "index reads bounded titles, not full shard bodies" {
     try std.testing.expectError(error.InvalidTopic, validTopic(&long_topic));
 }
 
-// 索引排序稳定、各项预算（core、分片、索引总量）独立生效，且不同项目之间互相隔离。
-test "memory sorted index independent limits and project isolation" {
+// 排序稳定、core/分片预算独立生效，且不同项目之间互相隔离；legacy index_bytes 不限制总量。
+test "memory sorted listing independent limits and project isolation" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -613,7 +638,9 @@ test "memory sorted index independent limits and project isolation" {
     defer root.deinit();
     var root2 = try testRoot(a, io, other.dir);
     defer root2.deinit();
-    var store = Store.init(&root, .{ .core_bytes = 4, .index_bytes = 30, .shard_bytes = 12, .read_bytes = 1 });
+    // index_bytes is retained only for configuration compatibility. Even a
+    // one-byte value must not reject a write or a listing.
+    var store = Store.init(&root, .{ .core_bytes = 4, .index_bytes = 1, .shard_bytes = 12, .read_bytes = 1 });
     var isolated = Store.init(&root2, .{});
 
     const c = try store.write(a, "core", "CORE", null);
@@ -629,15 +656,32 @@ test "memory sorted index independent limits and project isolation" {
     try std.testing.expectError(error.FileNotFound, isolated.read(a, "core"));
     try std.testing.expectError(error.CoreTooLarge, store.write(a, "core", "large", c.version));
     try std.testing.expectError(error.ShardTooLarge, store.write(a, "shard", "1234567890123", null));
-    try std.testing.expectError(error.IndexTooLarge, store.write(a, "extra", "123456789", null));
-    try std.testing.expectError(error.FileNotFound, store.read(a, "extra"));
+
+    const extra = try store.write(a, "extra", "123456789", null);
+    defer freeEntry(a, extra);
+    const extra_read = try store.read(a, "extra");
+    defer freeEntry(a, extra_read);
+    try std.testing.expectEqualStrings("123456789", extra_read.content);
+    const with_extra = try store.snapshot(a);
+    defer a.free(with_extra);
+    try std.testing.expectEqualStrings("CORE\n\na.md: alpha\nextra.md: 123456789\nz.md: zed\n", with_extra);
+
+    const first_page = try store.listPage(a, 0, 2);
+    defer a.free(first_page.text);
+    try std.testing.expectEqual(@as(usize, 3), first_page.total);
+    try std.testing.expectEqual(@as(usize, 2), first_page.count);
+    try std.testing.expectEqualStrings("a.md: alpha\nextra.md: 123456789\n", first_page.text);
+    const last_page = try store.listPage(a, 2, 2);
+    defer a.free(last_page.text);
+    try std.testing.expectEqual(@as(usize, 1), last_page.count);
+    try std.testing.expectEqualStrings("z.md: zed\n", last_page.text);
+    const empty_page = try store.listPage(a, 3, 2);
+    defer a.free(empty_page.text);
+    try std.testing.expectEqual(@as(usize, 0), empty_page.count);
+    try std.testing.expectEqualStrings("", empty_page.text);
 
     const stat = try root.dir.statFile(io, ".thin/memory/core.md", .{});
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
-
-    store.limits.index_bytes = 1;
-    try std.testing.expectError(error.IndexTooLarge, store.snapshot(a));
-    store.limits.index_bytes = 30;
 
     store.limits.core_bytes = 3;
     try std.testing.expectError(error.CoreTooLarge, store.snapshot(a));
@@ -645,4 +689,27 @@ test "memory sorted index independent limits and project isolation" {
 
     store.limits.shard_bytes = 2;
     try std.testing.expectError(error.ShardTooLarge, store.read(a, "a"));
+}
+
+test "memory listing caps oversized titles on a UTF-8 boundary" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(a, io, tmp.dir);
+    defer root.deinit();
+    var store = Store.init(&root, .{});
+    const prefix: [max_title_bytes]u8 = @splat('a');
+    const content = try std.fmt.allocPrint(a, "{s}中\nbody", .{prefix[0 .. max_title_bytes - 1]});
+    defer a.free(content);
+    const entry = try store.write(a, "long-title", content, null);
+    defer freeEntry(a, entry);
+
+    const page = try store.listPage(a, 0, 1);
+    defer a.free(page.text);
+    const header = "long-title.md: ";
+    try std.testing.expect(std.mem.startsWith(u8, page.text, header));
+    const title = page.text[header.len .. page.text.len - 1];
+    try std.testing.expectEqual(max_title_bytes - 1, title.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(title));
 }

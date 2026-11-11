@@ -1,7 +1,10 @@
-//! 窄 Linux/libc 启动层：fork 前完成所有分配；fork 后不再抛出父进程错误。
+//! Linux: fork 前完成分配；Darwin: posix_spawn + 明确 FD allowlist，无 fork 后 Zig。
 //! 返回即转交准确 PID 与三个读端，调用方必须有界清理、最后一次组信号后再 reap。
 const std = @import("std");
 const c = std.c;
+const builtin = @import("builtin");
+
+extern "c" fn thin_darwin_process_spawn(pid: *c.pid_t, executable: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, dir_fd: c.fd_t, input_fd: c.fd_t, output_fd: c.fd_t, error_fd: c.fd_t, inherited_fds: [*]const c.fd_t, inherited_count: usize) c_int;
 
 // Guard owns the first four; Threaded Io owns PIPE/IO. CHLD must also have
 // ordinary shell semantics. Prepare all actions/masks before fork.
@@ -33,7 +36,20 @@ fn aboveStdio(fd: c.fd_t) !c.fd_t {
 
 fn pipe() ![2]c.fd_t {
     var fds: [2]c.fd_t = undefined;
-    if (c.pipe2(&fds, .{ .CLOEXEC = true }) != 0) return error.SpawnPipeFailed;
+    if (builtin.os.tag == .linux) {
+        if (c.pipe2(&fds, .{ .CLOEXEC = true }) != 0) return error.SpawnPipeFailed;
+    } else {
+        if (c.pipe(&fds) != 0) return error.SpawnPipeFailed;
+        // Not atomic against concurrent spawn. Darwin's CLOEXEC_DEFAULT closes
+        // unlisted descriptors even in the pipe/fcntl window.
+        for (fds) |fd| {
+            if (c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC)) < 0) {
+                _ = c.close(fds[0]);
+                _ = c.close(fds[1]);
+                return error.SpawnFdFailed;
+            }
+        }
+    }
     fds[0] = aboveStdio(fds[0]) catch |e| {
         _ = c.close(fds[1]);
         return e;
@@ -66,6 +82,27 @@ pub fn start(allocator: std.mem.Allocator, root: []const u8, cwd_dir: ?std.Io.Di
 /// Borrow input without closing or rewinding it in the parent. The duplicate
 /// shares its open-file offset; ownership of only the duplicate is transferred.
 pub fn startWithInput(allocator: std.mem.Allocator, root: []const u8, cwd_dir: ?std.Io.Dir, executable: []const u8, script: []const u8, environ: *const std.process.Environ.Map, test_mode: TestMode, input: ?std.Io.File) !Child {
+    return startWithFds(allocator, root, cwd_dir, executable, script, environ, test_mode, input, &.{});
+}
+
+/// Borrow explicit inherited descriptors until return, preserving their exact
+/// numbers. Each must be open and > 2; duplicate entries are rejected. Parent
+/// flags/ownership are untouched. The caller prevents concurrent close/reuse.
+/// Darwin inherits ONLY stdio plus this list; Linux retains its existing exec
+/// inheritance policy, clearing CLOEXEC for these descriptors in the child only.
+/// Never pass an owner-lifetime pipe's writer to its worker or tool children.
+/// A posix_spawn failure returns SpawnFailed with NO transferred child PID.
+pub fn startWithFds(allocator: std.mem.Allocator, root: []const u8, cwd_dir: ?std.Io.Dir, executable: []const u8, script: []const u8, environ: *const std.process.Environ.Map, test_mode: TestMode, input: ?std.Io.File, inherited_fds: []const c.fd_t) !Child {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedPlatform;
+    if (comptime builtin.is_test) {
+        if (builtin.os.tag == .macos and test_mode != .none) return error.UnsupportedSpawnTestMode;
+    }
+    // Validate BEFORE opening internal descriptors: a closed caller FD must not
+    // accidentally turn into an internal pipe/cwd descriptor with that number.
+    for (inherited_fds, 0..) |fd, index| {
+        if (fd <= 2 or c.fcntl(fd, c.F.GETFD) < 0) return error.InvalidInheritedFd;
+        if (std.mem.indexOfScalar(c.fd_t, inherited_fds[0..index], fd) != null) return error.InvalidInheritedFd;
+    }
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -112,11 +149,28 @@ pub fn startWithInput(allocator: std.mem.Allocator, root: []const u8, cwd_dir: ?
     };
     defer _ = c.close(input_fd);
     // Duplicate the anchor before fork, so it too cannot alias fd 0/1/2.
-    const dir_fd = if (cwd_dir) |dir| c.fcntl(dir.handle, c.F.DUPFD_CLOEXEC, @as(c_int, 3)) else -1;
+    const dir_fd = if (cwd_dir) |dir| c.fcntl(dir.handle, c.F.DUPFD_CLOEXEC, @as(c_int, 3)) else if (builtin.os.tag == .macos) blk: {
+        const fd = c.open(cwd.ptr, .{ .CLOEXEC = true, .DIRECTORY = true });
+        if (fd < 0) return error.SpawnFailed;
+        break :blk try aboveStdio(fd);
+    } else -1;
     if (cwd_dir != null and dir_fd < 0) return error.SpawnFdFailed;
     defer if (dir_fd >= 0) {
         _ = c.close(dir_fd);
     };
+
+    if (builtin.os.tag == .macos) {
+        var pid: c.pid_t = undefined;
+        if (thin_darwin_process_spawn(&pid, exe.ptr, &argv, envp.ptr, dir_fd, input_fd, out[1], err[1], inherited_fds.ptr, inherited_fds.len) != 0)
+            return error.SpawnFailed;
+        // Synchronous posix_spawn success proves exec; closing the synthetic
+        // report writer preserves Child/status's existing EOF contract. There
+        // are NO fallible returns after the PID transfers to this caller.
+        _ = c.close(out[1]);
+        _ = c.close(err[1]);
+        _ = c.close(report[1]);
+        return .{ .pid = pid, .stdout = out[0], .stderr = err[0], .exec_error = report[0], .signal_restore_failed = false };
+    }
 
     var defaults = std.mem.zeroes(c.Sigaction);
     defaults.handler = .{ .handler = null };
@@ -150,9 +204,13 @@ pub fn startWithInput(allocator: std.mem.Allocator, root: []const u8, cwd_dir: ?
         _ = c.close(input_fd);
         // Even a borrowed non-CLOEXEC source must not leak through exec.
         if (input) |file| {
-            if (file.handle > 2) _ = c.close(file.handle);
+            if (file.handle > 2 and std.mem.indexOfScalar(c.fd_t, inherited_fds, file.handle) == null) _ = c.close(file.handle);
         }
         if (dir_fd >= 0) _ = c.close(dir_fd);
+        for (inherited_fds) |fd| {
+            const flags = c.fcntl(fd, c.F.GETFD);
+            if (flags < 0 or c.fcntl(fd, c.F.SETFD, flags & ~@as(c_int, c.FD_CLOEXEC)) < 0) failed(report[1]);
+        }
         // Test-only controlled pre-exec stall; there is no such branch in the
         // product build. The parent must still cancel/timeout and KILL/reap it.
         if (comptime @import("builtin").is_test) {
@@ -207,6 +265,8 @@ fn testProcField(pid: c.pid_t, suffix: []const u8, key: []const u8, base: u8) !u
 }
 
 test "pre-exec restores signal defaults and empty mask without changing parent" {
+    // This fixture inspects /proc and a Linux-only stopped pre-exec child.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const t = std.testing;
     const linux = std.os.linux;
     var tmp = t.tmpDir(.{});

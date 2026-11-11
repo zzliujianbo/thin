@@ -1,51 +1,21 @@
-//! Linux dirfd-anchored files. Normal operations stay project-rooted; the
+//! POSIX dirfd-anchored files (Linux and macOS). Normal operations stay project-rooted; the
 //! explicit readExternal text path also permits absolute/parent paths.
 //! Symlinks remain rejected. No terminal interaction.
 
 const std = @import("std");
 const line_stats = @import("../util/line_stats.zig");
+const native = @import("filesystem_native.zig");
 
 /// 文本读取结果：data 为独立复制的内容，offset 为字符对齐后的真实字节起点。
 /// total_bytes 为文件总字节数，truncated 表示之后仍有未返回的内容。
 pub const ReadResult = struct { data: []const u8, offset: u64, total_bytes: u64, truncated: bool };
 
-/// Linux x86_64 系统调用与 O_* 标志的本地声明（数值与 fcntl.h 一致）。
-pub const linux = struct {
-    /// 相对目录 fd 打开文件；dirfd 为 -100（AT_FDCWD）时相对当前目录。
-    pub extern "c" fn openat(c_int, [*:0]const u8, c_int, c_uint) c_int;
-    /// 对 fd 加咨询锁。
-    pub extern "c" fn flock(c_int, c_int) c_int;
-
-    /// O_DIRECTORY：要求目标必须是目录。
-    pub const directory = 0x10000;
-    /// O_NOFOLLOW：路径最后一段是符号链接时直接失败（ELOOP），防止越出根目录。
-    pub const nofollow = 0x20000;
-    /// O_CLOEXEC：exec 时自动关闭，避免 fd 泄漏给子进程。
-    pub const cloexec = 0x80000;
-    /// O_NONBLOCK：open 不因 FIFO 等特殊文件而阻塞。
-    pub const nonblock = 0x800;
-    /// O_PATH: metadata handle only, never opens a device for I/O.
-    pub const path_only = 0x200000;
-    /// O_CREAT：文件不存在时创建。
-    pub const create = 0x40;
-    /// O_EXCL：与 O_CREAT 同用，目标已存在则失败。
-    pub const exclusive = 0x80;
-};
-
-/// 把刚刚失败的系统调用的 errno 映射为本模块的错误；必须在下一次 libc 调用前读取。
-pub fn osError() anyerror {
-    return switch (std.c._errno().*) {
-        2 => error.FileNotFound,
-        13, 1 => error.AccessDenied,
-        17 => error.PathAlreadyExists,
-        20 => error.NotDir,
-        21 => error.IsDir,
-        40 => error.SymlinkNotAllowed,
-        36 => error.NameTooLong,
-        28 => error.NoSpaceLeft,
-        else => error.FileSystemError,
-    };
-}
+/// Narrow target-aware libc boundary; callers keep their own failure policies.
+pub const openAt = native.openAt;
+pub const flock = native.flock;
+pub const LOCK = native.LOCK;
+pub const errno = native.errno;
+pub const osError = native.osError;
 
 /// 关闭 fd，忽略返回值：关闭失败通常无法补救，且 fd 仍应视为已释放。
 pub fn closeFd(fd: c_int) void {
@@ -54,8 +24,8 @@ pub fn closeFd(fd: c_int) void {
 
 /// 相对 parent 打开子目录，带 O_DIRECTORY | O_NOFOLLOW，返回的新 fd 由调用方关闭。
 pub fn openDirectory(parent: c_int, name: [*:0]const u8) !c_int {
-    const fd = linux.openat(parent, name, linux.directory | linux.nofollow | linux.cloexec, 0);
-    if (fd < 0) return osError();
+    const fd = openAt(parent, name, .{ .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    if (fd < 0) return if (errno() == .LOOP) error.NotDir else osError();
     return fd;
 }
 
@@ -67,24 +37,18 @@ pub fn fileFromFd(fd: c_int) std.Io.File {
 
 /// Descriptor identity includes the device: inode numbers alone are not global.
 pub fn sameObject(left: c_int, right: c_int) !bool {
-    const l = try objectIdentity(left);
-    const r = try objectIdentity(right);
-    return l.ino == r.ino and l.dev_major == r.dev_major and l.dev_minor == r.dev_minor;
+    return (try native.identity(left)).eql(try native.identity(right));
 }
 
-fn objectIdentity(fd: c_int) !std.os.linux.Statx {
-    var result: std.os.linux.Statx = undefined;
-    if (std.c.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .INO = true }, &result) != 0) return osError();
-    if (!result.mask.INO) return error.FileIdentityUnavailable;
-    return result;
-}
-
-/// Metadata-only handle, including for unreadable files. Never follows the leaf.
-/// O_PATH may open the symlink itself; it does not authorize a text read.
-pub fn openPath(parent: c_int, name: [*:0]const u8) !c_int {
-    const fd = linux.openat(parent, name, linux.path_only | linux.nofollow | linux.cloexec, 0);
-    if (fd < 0) return osError();
-    return fd;
+/// Compare an already-open object with the current protected directory entry.
+/// fd stays open throughout: its inode cannot be reused during the comparison.
+/// Query the protected leaf without opening it, even if unreadable/FIFO/device.
+/// This is a fresh namespace snapshot, not a lock over later name changes.
+pub fn sameObjectAt(fd: c_int, parent: c_int, name: [*:0]const u8) !bool {
+    const leaf = std.mem.span(name);
+    if (leaf.len == 0 or std.mem.indexOfScalar(u8, leaf, '/') != null or
+        std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, "..")) return error.InvalidPath;
+    return (try native.identity(fd)).eql(try native.identityAt(parent, name));
 }
 
 /// 校验文本：必须是合法 UTF-8，且不含 \n \r \t 以外的控制字符和 DEL(127)；否则视为二进制或非法文本。
@@ -105,13 +69,22 @@ pub const Root = struct {
     /// 持有 path 等堆内存的分配器。
     allocator: std.mem.Allocator,
 
-    /// 打开 path 作为根目录。拒绝空路径、NUL、".."；路径中任何符号链接都会因 O_NOFOLLOW 失败。
+    /// 打开 path 作为根目录。拒绝空路径、NUL、".."；仅 Darwin 已验证的根用户系统别名
+    /// /tmp、/var 可重写，其余路径中的符号链接仍因 O_NOFOLLOW 失败。
     pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Root {
         if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return error.InvalidPath;
-        // -100 即 AT_FDCWD：绝对路径从 "/" 开始，相对路径从当前工作目录开始。
-        var fd = try openDirectory(-100, if (std.fs.path.isAbsolute(path)) "/" else ".");
+        // Only Apple's verified root-owned system aliases are rewritten;
+        // arbitrary HOME/project symlinks still fail the anchored nofollow walk.
+        const canonical = if (@import("builtin").os.tag == .macos and std.fs.path.isAbsolute(path))
+            try native.systemPath(allocator, path)
+        else
+            null;
+        defer if (canonical) |owned| allocator.free(owned);
+        const walk_path = canonical orelse path;
+        // AT_FDCWD is target-dependent (-100 on Linux, -2 on Darwin).
+        var fd = try openDirectory(std.c.AT.FDCWD, if (std.fs.path.isAbsolute(walk_path)) "/" else ".");
         errdefer closeFd(fd);
-        var parts = std.mem.tokenizeScalar(u8, path, '/');
+        var parts = std.mem.tokenizeScalar(u8, walk_path, '/');
         while (parts.next()) |part| {
             if (std.mem.eql(u8, part, "..")) return error.InvalidPath;
             if (std.mem.eql(u8, part, ".")) continue;
@@ -193,7 +166,7 @@ pub const Root = struct {
         if (std.fs.path.isAbsolute(path)) {
             if (self.projectReadSuffix(path)) |rel|
                 return self.walkParent(try openDirectory(self.dir.handle, "."), rel);
-            return self.walkParent(try openDirectory(-100, "/"), path[1..]);
+            return self.walkParent(try openDirectory(std.c.AT.FDCWD, "/"), path[1..]);
         }
         return self.walkParent(try openDirectory(self.dir.handle, "."), path);
     }
@@ -254,7 +227,7 @@ pub const Root = struct {
         var parent_ = try self.parent(path);
         defer parent_.deinit();
         if (guard) |policy| try policy.check(parent_, null);
-        const fd = linux.openat(parent_.fd, parent_.name, linux.nofollow | linux.cloexec | linux.nonblock, 0);
+        const fd = openAt(parent_.fd, parent_.name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
         if (fd < 0) return osError();
         defer closeFd(fd);
         if (guard) |policy| try policy.check(parent_, fd);
@@ -296,7 +269,7 @@ pub const Root = struct {
     fn readParentText(self: *Root, allocator: std.mem.Allocator, p: Parent, offset: u64, limit: usize, guard: ?ReadGuard) !ReadResult {
         if (guard) |policy| try policy.check(p, null);
         // NOFOLLOW 拒绝符号链接；NONBLOCK 保证 FIFO 等特殊文件不会让 open 挂起。
-        const fd = linux.openat(p.fd, p.name, linux.nofollow | linux.cloexec | linux.nonblock, 0);
+        const fd = openAt(p.fd, p.name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
         if (fd < 0) return osError();
         defer closeFd(fd);
         if (guard) |policy| try policy.check(p, fd);
@@ -391,7 +364,7 @@ pub const Root = struct {
         // 默认权限 0600；覆盖已有文件时沿用其权限位，除非调用方显式指定 forced_mode（例如 Memory）。
         var mode: u32 = forced_mode orelse 0o600;
         // 检查目标是否已存在：存在且不允许覆盖则报错；errno 为 ENOENT(2) 时目标不存在，可以继续创建。
-        const old = linux.openat(p.fd, p.name, linux.nofollow | linux.cloexec | linux.nonblock, 0);
+        const old = openAt(p.fd, p.name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
         if (old >= 0) {
             defer closeFd(old);
             if (!overwrite) return error.PathAlreadyExists;
@@ -399,7 +372,7 @@ pub const Root = struct {
             if (stat.kind != .file) return error.NotRegularFile;
             if (forced_mode == null) mode = stat.permissions.toMode() & 0o777;
             if (observed) |out| out.* = try self.observeChanges(old, stat.size, content);
-        } else if (std.c._errno().* != 2) return osError() else if (observed) |out| {
+        } else if (errno() != .NOENT) return osError() else if (observed) |out| {
             out.* = .{ .added = line_stats.count(content) };
         }
 
@@ -413,9 +386,9 @@ pub const Root = struct {
             try self.io.randomSecure(&random);
             const hex = std.fmt.bytesToHex(random, .lower);
             name = try std.fmt.bufPrintSentinel(&name_buffer, ".thin-tmp-{s}", .{hex}, 0);
-            temp_fd = linux.openat(p.fd, name, 1 | linux.create | linux.exclusive | linux.nofollow | linux.cloexec, 0o600);
+            temp_fd = openAt(p.fd, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600);
             if (temp_fd >= 0) break;
-            if (std.c._errno().* != 17) return osError();
+            if (errno() != .EXIST) return osError();
         }
         if (temp_fd < 0) return error.TempNameExhausted;
 
@@ -426,7 +399,8 @@ pub const Root = struct {
         try fileFromFd(temp_fd).writePositionalAll(self.io, content, 0);
 
         // 临时文件以 0600 创建，内容写完后才设为目标权限，避免写入期间权限过宽。
-        if (std.c.fchmod(temp_fd, mode) != 0) return osError();
+        const permissions = std.math.cast(std.c.mode_t, mode) orelse return error.InvalidFileMode;
+        if (std.c.fchmod(temp_fd, permissions) != 0) return osError();
 
         // rename 原子替换目标：读者要么看到旧文件，要么看到新文件。
         if (overwrite) {
@@ -487,17 +461,14 @@ test "guarded read checks post-open identity" {
     defer root.deinit();
     try root.write("payload.txt", "public", false);
     try root.write("private.txt", "synthetic private", false);
-    const private_fd = try openPath(root.dir.handle, "private.txt");
-    defer closeFd(private_fd);
     const Guard = struct {
         root: *Root,
-        private_fd: c_int,
         checks: usize = 0,
         fn check(raw: *anyopaque, parent_: Root.Parent, fd: ?c_int) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.checks += 1;
             if (fd) |opened| {
-                if (try sameObject(opened, self.private_fd)) return error.GuardDenied;
+                if (try sameObjectAt(opened, self.root.dir.handle, "private.txt")) return error.GuardDenied;
             } else {
                 // Substitute the leaf between the parent check and openat.
                 if (std.c.unlinkat(parent_.fd, parent_.name, 0) != 0) return osError();
@@ -505,7 +476,7 @@ test "guarded read checks post-open identity" {
             }
         }
     };
-    var guard: Guard = .{ .root = &root, .private_fd = private_fd };
+    var guard: Guard = .{ .root = &root };
     try std.testing.expectError(error.GuardDenied, root.readExternalGuarded(a, "payload.txt", 0, 100, .{ .context = &guard, .check_fn = Guard.check }));
     try std.testing.expectEqual(@as(usize, 2), guard.checks);
 }

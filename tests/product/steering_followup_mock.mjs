@@ -13,7 +13,7 @@ assert(appArg && ptyArg, 'expected APP PTY [scenario]');
 const app = resolve(appArg), pty = resolve(ptyArg);
 const modes = ['steer', 'withdraw', 'cancel', 'natural'];
 assert(!only || modes.includes(only), 'unknown scenario');
-const base = await mkdtemp(join(tmpdir(), 'thin-queued-'));
+const base = await mkdtemp(join('/tmp', 'thin-queued-'));
 let passed = false;
 async function exists(path) { try { await stat(path); return true; } catch (e) { if (e.code === 'ENOENT') return false; throw e; } }
 async function absent(path) { assert.equal(await exists(path), false, 'unexpected owned side effect'); }

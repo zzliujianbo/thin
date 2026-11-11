@@ -41,6 +41,9 @@ pub const Client = struct {
     /// OpenCode routing identity, stable across requests. The application can
     /// replace the local headless fallback with its immutable session ID.
     session_id: ?[32]u8 = null,
+    /// Connection-acquisition backoff. Production keeps 200/500ms; focused
+    /// tests replace this pair with a short schedule without changing policy.
+    retry_delays_ms: [2]u32 = .{ 200, 500 },
 
     /// 创建客户端并校验密钥。密钥需非空、长度不超过 16KB，且不含控制字符（防止 HTTP 头注入）。
     pub fn init(allocator: std.mem.Allocator, io: Io, config: *const cfg.Config, key: []const u8) !Client {
@@ -415,7 +418,7 @@ pub const Client = struct {
     /// HostName.connect may try multiple resolved addresses within one call;
     /// this caps acquisition rounds, not the resolver's address fan-out.
     fn acquireRequest(job: *Job, uri: std.Uri, options: std.http.Client.RequestOptions) !std.http.Client.Request {
-        const delays_ms = [_]u32{ 200, 500 };
+        const delays_ms = job.client.retry_delays_ms;
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             try job.checkBudget();

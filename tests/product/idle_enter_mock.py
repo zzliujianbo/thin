@@ -252,7 +252,7 @@ def run(app, width, batched):
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Service)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    with tempfile.TemporaryDirectory(prefix='thin-idle-enter-') as base:
+    with tempfile.TemporaryDirectory(prefix='thin-idle-enter-', dir='/tmp') as base:
         home, project = Path(base) / 'home', Path(base) / 'project'
         # The foreground starts its own AF_UNIX worker under $XDG_RUNTIME_DIR/thin.
         # An owned short base keeps sockets inside this fixture instead of the
@@ -561,7 +561,7 @@ def deny_inet_sockets():
 
 def first_entry(app, origin, width, auto, response='normal'):
     """First-frame origin/scrollback oracle; never submits a user prompt."""
-    with tempfile.TemporaryDirectory(prefix='thin-entry-') as base:
+    with tempfile.TemporaryDirectory(prefix='thin-entry-', dir='/tmp') as base:
         home, project, runtime = (Path(base) / name for name in ('home', 'project', 'r'))
         (home / '.thin').mkdir(parents=True)
         project.mkdir()
@@ -837,7 +837,7 @@ def streaming(app, line_count):
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    with tempfile.TemporaryDirectory(prefix='thin-stream-') as base:
+    with tempfile.TemporaryDirectory(prefix='thin-stream-', dir='/tmp') as base:
         home, project, runtime = (Path(base) / n for n in ('home', 'project', 'r'))
         (home / '.thin').mkdir(parents=True)
         project.mkdir()

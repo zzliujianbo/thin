@@ -1,4 +1,4 @@
-//! Linux-only, bounded preflight for std.http.Client's idle pool. Never probes
+//! POSIX bounded preflight for std.http.Client's idle pool. Never probes
 //! used connections, consumes peer bytes, waits for socket data, or replays POSTs.
 //! A peer can still close after this check; that remains an ordinary failure.
 const std = @import("std");

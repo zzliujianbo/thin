@@ -467,12 +467,12 @@ pub const Communication = struct {
                 metadata_at = now + 250;
             }
             var descriptors = [_]std.c.pollfd{
-                .{ .fd = self.wake.fd, .events = std.os.linux.POLL.IN, .revents = 0 },
-                .{ .fd = if (room) (if (self.client.stream) |stream| stream.ready.fd else -1) else -1, .events = std.os.linux.POLL.IN, .revents = 0 },
+                .{ .fd = self.wake.fd, .events = std.c.POLL.IN, .revents = 0 },
+                .{ .fd = if (room) (if (self.client.stream) |stream| stream.ready.fd else -1) else -1, .events = std.c.POLL.IN, .revents = 0 },
             };
             const local = room and (self.client.pending.items.len != 0 or if (self.client.stream) |stream| stream.buffered() else false);
             const result = std.c.poll(&descriptors, descriptors.len, if (local) 0 else 30);
-            if (result < 0 and std.c._errno().* != @backingInt(std.os.linux.E.INTR)) return error.Transport;
+            if (result < 0 and std.c._errno().* != @backingInt(std.c.E.INTR)) return error.Transport;
         }
     }
 

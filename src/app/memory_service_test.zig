@@ -59,7 +59,7 @@ fn finalize(owner: *Coordinator, a: std.mem.Allocator, text: []const u8, cancel:
 }
 fn expectNoJobs(root: *fs.Root) !void {
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin/memory/jobs"));
-    try std.testing.expectError(error.FileNotFound, fs.openPath(root.dir.handle, ".thin/memory/jobs-owner"));
+    try std.testing.expectError(error.FileNotFound, root.dir.statFile(root.io, ".thin/memory/jobs-owner", .{ .follow_symlinks = false }));
 }
 
 test "rotated journal credential filters related evidence and candidates" {
@@ -71,7 +71,7 @@ test "rotated journal credential filters related evidence and candidates" {
     defer root.deinit();
     var config = try fixtureConfig(a);
     defer cfg.release(&config);
-    config.value.provider.api_key = "new-credential-canary";
+    config.value.provider.api_key = try config.arena.allocator().dupe(u8, "new-credential-canary");
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     var journal = try @import("journal.zig").Journal.init(a, &root, "new-credential-canary");
@@ -219,7 +219,7 @@ test "automatic Memory contention fails promptly without jobs" {
     try begin(owner, a, input);
     const held = try fs.openDirectory(root.dir.handle, ".");
     defer fs.closeFd(held);
-    try std.testing.expectEqual(@as(c_int, 0), fs.linux.flock(held, 2 | 4));
+    try std.testing.expectEqual(@as(c_int, 0), fs.flock(held, fs.LOCK.EX | fs.LOCK.NB));
     var cancel: p.Cancellation = .{};
     const terminal = try finalize(owner, a, input, &cancel);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
@@ -755,4 +755,52 @@ test "mixed sources and candidates save only committed safe entries" {
     defer a.free(conflict.content);
     defer a.free(conflict.version);
     try std.testing.expectEqualStrings("existing independent fact", conflict.content);
+}
+
+test "automatic Memory saves every candidate without a total index budget" {
+    const a = std.testing.allocator;
+    var backend = std.Io.Threaded.init(a, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try openRoot(a, io, tmp.dir);
+    defer root.deinit();
+    var config = try fixtureConfig(a);
+    defer cfg.release(&config);
+    // The legacy field must not reject the eighth candidate.
+    config.value.limits.index_bytes = 1;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const owner = try Coordinator.create(a, io, &root, config.value, &env);
+    defer owner.deinit();
+    const Many = struct {
+        fn extract(_: *anyopaque, alloc: std.mem.Allocator, _: k.Material, _: *const p.Cancellation) ![]const k.Candidate {
+            return alloc.dupe(k.Candidate, &.{
+                .{ .category = .project, .topic = "fact-0", .content = "Durable fact zero." },
+                .{ .category = .project, .topic = "fact-1", .content = "Durable fact one." },
+                .{ .category = .project, .topic = "fact-2", .content = "Durable fact two." },
+                .{ .category = .project, .topic = "fact-3", .content = "Durable fact three." },
+                .{ .category = .project, .topic = "fact-4", .content = "Durable fact four." },
+                .{ .category = .project, .topic = "fact-5", .content = "Durable fact five." },
+                .{ .category = .project, .topic = "fact-6", .content = "Durable fact six." },
+                .{ .category = .project, .topic = "fact-7", .content = "Durable fact seven." },
+            });
+        }
+    };
+    var dummy: u8 = 0;
+    owner.service_override = .{ .context = &dummy, .extract_fn = Many.extract };
+    try begin(owner, a, "eight facts");
+    var cancel: p.Cancellation = .{};
+    const terminal = try finalize(owner, a, "eight facts", &cancel);
+    try std.testing.expect(terminal.result == .saved);
+    try std.testing.expectEqual(@as(u32, 8), terminal.saved_count);
+    for (0..8) |i| {
+        const key = try std.fmt.allocPrint(a, "project-fact-{d}", .{i});
+        defer a.free(key);
+        const entry = try owner.store.read(a, key);
+        defer a.free(entry.content);
+        defer a.free(entry.version);
+        try std.testing.expect(std.mem.find(u8, entry.content, "Durable fact") != null);
+    }
 }

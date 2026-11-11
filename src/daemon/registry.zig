@@ -16,7 +16,7 @@ const cli = @import("../app/cli.zig");
 const ids = @import("../app/session_id.zig");
 
 const c = std.c;
-const linux = std.os.linux;
+const metadata = @import("../platform/metadata.zig");
 
 extern "c" fn fsync(c_int) c_int;
 
@@ -61,7 +61,7 @@ pub fn freeRecords(a: std.mem.Allocator, records: []const Record) void {
     a.free(@constCast(records));
 }
 
-/// Kernel-verified `hello` identity. `peer_pid` comes from SO_PEERCRED, so
+/// Kernel-verified `hello` identity. `peer_pid` comes from native credentials, so
 /// `pid == peer_pid` proves the endpoint is served by that very process.
 pub const Hello = struct {
     session: ids.Id,
@@ -313,7 +313,7 @@ pub const Registry = struct {
         var buf: [64]u8 = undefined;
         const name_z = try std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ id[0..], index_suffix }, 0);
         if (c.unlinkat(key_fd, name_z, 0) != 0) {
-            if (std.c._errno().* == 2) return;
+            if (fs.errno() == .NOENT) return;
             return fs.osError();
         }
     }
@@ -435,11 +435,16 @@ pub const Registry = struct {
     fn readOneLocked(self: *Registry, a: std.mem.Allocator, id: ids.Id, key: [32]u8, key_fd: c.fd_t, project: ?[]const u8) !?Record {
         var name_buf: [64]u8 = undefined;
         const name_z = try std.fmt.bufPrintSentinel(&name_buf, "{s}{s}", .{ id[0..], index_suffix }, 0);
-        const fd = fs.linux.openat(key_fd, name_z, fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0);
-        if (fd < 0) return if (std.c._errno().* == 2) null else fs.osError();
+        const fd = fs.openAt(key_fd, name_z, .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        if (fd < 0) return if (fs.errno() == .NOENT) null else fs.osError();
         defer fs.closeFd(fd);
 
         if (!try isRegularFd(fd)) return error.NotRegularFile;
+        const st = try metadata.statFd(fd);
+        if (st.uid != self.uid) return error.NotOwned;
+        if (st.mode & 0o777 != 0o600) return error.InsecurePermissions;
+        if (st.nlink != 1) return error.UnexpectedLinkCount;
+        if (!try fs.sameObjectAt(fd, key_fd, name_z)) return error.IdentityChanged;
         // Read one byte past the limit, so a larger file cannot be accepted
         // merely because its first max_index_bytes form a complete JSON value.
         var buffer: [max_index_bytes + 1]u8 = undefined;
@@ -527,7 +532,7 @@ pub const Registry = struct {
         @memcpy(buf[0..32], &key);
         buf[32] = 0;
         if (create) return ensurePrivateDir(self.allocator, self.index_fd, buf[0..32], self.uid);
-        return fs.openDirectory(self.index_fd, buf[0..32 :0]);
+        return openPrivateDir(self.index_fd, buf[0..32 :0], self.uid, false);
     }
 
     const KeyIterator = struct {
@@ -585,17 +590,8 @@ fn validateAbsolutePath(path: []const u8) !void {
 }
 
 fn isRegularFd(fd: c.fd_t) !bool {
-    var st: linux.Statx = undefined;
-    if (c.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &st) != 0) return fs.osError();
-    return st.mode & linux.S.IFMT == linux.S.IFREG;
-}
-
-fn openExistingDirectory(a: std.mem.Allocator, path: []const u8) !c.fd_t {
-    const z = try a.dupeSentinel(u8, path, 0);
-    defer a.free(z);
-    const st = statAt(-100, z.ptr) catch |err| return err;
-    if (st.mode & linux.S.IFMT != linux.S.IFDIR) return error.NotDirectory;
-    return fs.openDirectory(-100, z.ptr);
+    const st = try metadata.statFd(fd);
+    return st.mode & c.S.IFMT == c.S.IFREG;
 }
 
 const OpenedIndex = struct { fd: c.fd_t, path: []u8 };
@@ -605,47 +601,23 @@ const OpenedIndex = struct { fd: c.fd_t, path: []u8 };
 /// are required to be 0700. Metadata paths are not UNIX socket paths, so the
 /// 107-byte AF_UNIX limit does not apply here.
 fn openHomeIndex(a: std.mem.Allocator, io: std.Io, home: []const u8, uid: u32) !OpenedIndex {
-    var fd = try openExistingDirectory(a, "/");
+    // Preserve HOME's no-dot/no-traversal policy, allowing only known Darwin
+    // /tmp and /var aliases in the shared component-wise nofollow walker.
     var parts = std.mem.tokenizeScalar(u8, home, '/');
     while (parts.next()) |part| {
-        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) {
-            fs.closeFd(fd);
-            return error.InvalidPath;
-        }
-        const z = try a.dupeSentinel(u8, part, 0);
-        defer a.free(z);
-        const next = fs.openDirectory(fd, z.ptr) catch |err| {
-            fs.closeFd(fd);
-            return err;
-        };
-        fs.closeFd(fd);
-        fd = next;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.InvalidPath;
     }
-    const thin_fd = ensurePrivateDir(a, fd, ".thin", uid) catch |err| {
-        fs.closeFd(fd);
-        return err;
-    };
-    fs.closeFd(fd);
-    const index_fd = ensurePrivateDir(a, thin_fd, "session-index", uid) catch |err| {
-        fs.closeFd(thin_fd);
-        return err;
-    };
-    fs.closeFd(thin_fd);
+    const fd = try metadata.openDirectoryPath(a, home);
+    defer fs.closeFd(fd);
+    const thin_fd = try ensurePrivateDir(a, fd, ".thin", uid);
+    defer fs.closeFd(thin_fd);
+    const index_fd = try ensurePrivateDir(a, thin_fd, "session-index", uid);
     errdefer fs.closeFd(index_fd);
 
     const dir: std.Io.Dir = .{ .handle = index_fd };
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const n = dir.realPath(io, &buffer) catch |err| {
-        fs.closeFd(index_fd);
-        return err;
-    };
+    const n = try dir.realPath(io, &buffer);
     return .{ .fd = index_fd, .path = try a.dupe(u8, buffer[0..n]) };
-}
-
-fn statAt(dir_fd: c.fd_t, path_z: [*:0]const u8) !linux.Statx {
-    var result: linux.Statx = undefined;
-    if (c.statx(dir_fd, path_z, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &result) != 0) return fs.osError();
-    return result;
 }
 
 /// Create-if-missing plus verify: real directory, owned by `uid`, exactly 0700.
@@ -658,22 +630,31 @@ fn ensurePrivateDir(a: std.mem.Allocator, parent: c.fd_t, name: []const u8, uid:
     defer a.free(z);
 
     if (c.mkdirat(parent, z.ptr, 0o700) != 0) {
-        const errno = std.c._errno().*;
-        if (errno != 17) return fs.osError();
+        const errno = fs.errno();
+        if (errno != .EXIST) return fs.osError();
     }
-    const fd = try fs.openDirectory(parent, z.ptr);
-    errdefer fs.closeFd(fd);
+    return openPrivateDir(parent, z.ptr, uid, true);
+}
 
-    var st: linux.Statx = undefined;
-    if (c.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &st) != 0) return fs.osError();
-    if (st.mode & linux.S.IFMT != linux.S.IFDIR) return error.NotDirectory;
+fn openPrivateDir(parent: c.fd_t, name: [*:0]const u8, uid: u32, repair_mode: bool) !c.fd_t {
+    const fd = try fs.openDirectory(parent, name);
+    errdefer fs.closeFd(fd);
+    var st = try metadata.statFd(fd);
+    if (st.mode & c.S.IFMT != c.S.IFDIR) return error.NotDirectory;
     if (st.uid != uid) return error.NotOwned;
+    if (!try fs.sameObjectAt(fd, parent, name)) return error.IdentityChanged;
     if (st.mode & 0o777 != 0o700) {
+        if (!repair_mode) return error.InsecurePermissions;
         if (c.fchmod(fd, 0o700) != 0) return fs.osError();
-        if (c.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &st) != 0) return fs.osError();
+        st = try metadata.statFd(fd);
         if (st.mode & 0o777 != 0o700) return error.InsecurePermissions;
     }
+    if (!try fs.sameObjectAt(fd, parent, name)) return error.IdentityChanged;
     return fd;
+}
+
+fn unlinkIfSame(fd: c.fd_t, parent: c.fd_t, name: [*:0]const u8) void {
+    if (fs.sameObjectAt(fd, parent, name) catch false) _ = c.unlinkat(parent, name, 0);
 }
 
 fn atomicReplace(a: std.mem.Allocator, io: std.Io, dir: c.fd_t, name: []const u8, bytes: []const u8) !void {
@@ -686,22 +667,26 @@ fn atomicReplace(a: std.mem.Allocator, io: std.Io, dir: c.fd_t, name: []const u8
         var random: [16]u8 = undefined;
         try io.randomSecure(&random);
         temp = try std.fmt.bufPrintSentinel(&temp_buf, ".tmp-{s}", .{std.fmt.bytesToHex(random, .lower)}, 0);
-        fd = fs.linux.openat(
+        fd = fs.openAt(
             dir,
             temp,
-            1 | fs.linux.create | fs.linux.exclusive | fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true },
             0o600,
         );
         if (fd >= 0) break;
-        if (std.c._errno().* != 17) return fs.osError();
+        if (fs.errno() != .EXIST) return fs.osError();
     }
     if (fd < 0) return error.TempNameExhausted;
     defer fs.closeFd(fd);
-    defer _ = c.unlinkat(dir, temp, 0);
+    defer unlinkIfSame(fd, dir, temp);
 
     try fs.fileFromFd(fd).writePositionalAll(io, bytes, 0);
     if (c.fchmod(fd, 0o600) != 0) return fs.osError();
+    const st = try metadata.statFd(fd);
+    if (st.mode & c.S.IFMT != c.S.IFREG or st.uid != @as(u32, @intCast(c.getuid())) or
+        st.nlink != 1 or st.mode & 0o777 != 0o600) return error.InsecurePermissions;
     try fsyncFd(fd);
+    if (!try fs.sameObjectAt(fd, dir, temp)) return error.IdentityChanged;
     if (c.renameat(
         dir,
         temp,
@@ -715,7 +700,7 @@ fn atomicReplace(a: std.mem.Allocator, io: std.Io, dir: c.fd_t, name: []const u8
 fn fsyncFd(fd: c.fd_t) !void {
     while (true) {
         if (fsync(fd) == 0) return;
-        if (std.c._errno().* == 4) continue; // EINTR
+        if (fs.errno() == .INTR) continue; // EINTR
         return fs.osError();
     }
 }
@@ -872,6 +857,8 @@ const EndpointClient = struct {
         if (pid_value <= 1 or pid_value > std.math.maxInt(u32)) return error.ProtocolError;
         const proto_value = jsonU64(object.get("protocol") orelse return error.ProtocolError);
         if (proto_value != protocol.version) return error.ProtocolError;
+        if (pid_value != conn.peer.pid or conn.peer.pid == 0) return error.PeerPidMismatch;
+        if (conn.peer.uid != self.uid) return error.PeerUidMismatch;
 
         return .{
             .session = session,
@@ -980,6 +967,28 @@ fn testRecord(registry: *const Registry, id: ids.Id, project: []const u8, instan
     };
 }
 
+test "endpoint hello refuses a claimed PID different from kernel peer" {
+    const a = testing.allocator;
+    const fds = try unix.socketPair();
+    const uid: u32 = @intCast(c.geteuid());
+    var client_conn = unix.Connection.init(a, fds[0], .{ .pid = 31415, .uid = uid, .gid = 0 });
+    defer client_conn.close();
+    var responder = unix.Connection.init(a, fds[1], .{ .pid = 31415, .uid = uid, .gid = 0 });
+    defer responder.close();
+    var out = protocol.Out.init(a);
+    defer out.deinit();
+    try out.ok(1);
+    try out.field("session", "0123456789abcdef0123456789abcdef");
+    try out.field("owner", "foreground");
+    try out.field("pid", @as(u32, 31416));
+    try out.field("protocol", protocol.version);
+    const bytes = try out.finish();
+    defer a.free(bytes);
+    const wait: unix.Wait = .{ .io = testing.io, .timeout_ms = 1000 };
+    try responder.writeFrame(bytes, wait);
+    try testing.expectError(error.PeerPidMismatch, EndpointClient.init(a, testing.io, uid).exchangeHello(&client_conn, 1000));
+}
+
 test "registry publishes schema v1 id strings and resolves across projects" {
     const a = testing.allocator;
     var test_env = try TestEnv.init(a);
@@ -989,8 +998,7 @@ test "registry publishes schema v1 id strings and resolves across projects" {
     defer registry.deinit();
 
     {
-        var st: linux.Statx = undefined;
-        try testing.expectEqual(@as(c_int, 0), c.statx(registry.index_fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &st));
+        const st = try metadata.statFd(registry.index_fd);
         try testing.expectEqual(@as(u16, 0o700), @as(u16, @intCast(st.mode & 0o777)));
     }
 
@@ -1009,7 +1017,7 @@ test "registry publishes schema v1 id strings and resolves across projects" {
     defer fs.closeFd(key_fd);
     var file_z_buf: [64]u8 = undefined;
     const file_z = try std.fmt.bufPrintSentinel(&file_z_buf, "{s}.json", .{id[0..]}, 0);
-    const fd = fs.linux.openat(key_fd, file_z, fs.linux.nofollow | fs.linux.nonblock | fs.linux.cloexec, 0);
+    const fd = fs.openAt(key_fd, file_z, .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
     try testing.expect(fd >= 0);
     defer fs.closeFd(fd);
     var raw_buf: [4096]u8 = undefined;
@@ -1066,7 +1074,7 @@ test "registry publishes schema v1 id strings and resolves across projects" {
     }
 }
 
-extern "c" fn mkfifoat(c_int, [*:0]const u8, c_uint) c_int;
+extern "c" fn mkfifoat(c_int, [*:0]const u8, c.mode_t) c_int;
 
 fn expectResolveError(registry: *Registry, id: ids.Id, project: []const u8, expected: anyerror) !void {
     try testing.expectError(expected, registry.resolve(testing.allocator, id, project));
@@ -1179,7 +1187,7 @@ test "registry distinguishes absent entries from invalid or unreadable records" 
     try testing.expectEqual(@as(c_int, 0), c.unlinkat(key_fd, name, 0));
     try testing.expectEqual(@as(c_int, 0), c.mkdirat(key_fd, name, 0o700));
     try expectResolveError(&registry, id, project, error.NotRegularFile);
-    try testing.expectEqual(@as(c_int, 0), c.unlinkat(key_fd, name, 0x200)); // AT_REMOVEDIR
+    try testing.expectEqual(@as(c_int, 0), c.unlinkat(key_fd, name, c.AT.REMOVEDIR));
     try testing.expectEqual(@as(c_int, 0), mkfifoat(key_fd, name, 0o600));
     try expectResolveError(&registry, id, project, error.NotRegularFile);
     try testing.expectEqual(@as(c_int, 0), c.unlinkat(key_fd, name, 0));

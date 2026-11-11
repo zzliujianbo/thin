@@ -2,7 +2,7 @@
 // real HOME/config, public providers or the user's terminal. Capture stays local.
 import http from 'node:http';
 import {createHash} from 'node:crypto';
-import {mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod, lstat} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod, lstat, realpath} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import assert from 'node:assert/strict';
@@ -36,7 +36,8 @@ async function writeCheckpoint(sessionPath, lockPath, snapshot) {
 }
 
 export async function selectionRestoreRegressions({app, pty, execute}) {
-  const root = await mkdtemp(join(tmpdir(), 'thin-selection-restore-'));
+  // Match the application's canonical cwd (Darwin /tmp is /private/tmp).
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'thin-selection-restore-')));
   const home = join(root, 'home'), project = join(root, 'project');
   const id = '0123456789abcdef0123456789abcdef';
   const key = 'fixture-secret-never-log';

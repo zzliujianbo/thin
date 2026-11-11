@@ -1,12 +1,12 @@
-//! Linux AF_UNIX control transport for the optional Thin daemon.
-//! 中文：守护模式的 Linux AF_UNIX 传输基础，只负责私有 runtime 目录、单实例锁、
+//! POSIX AF_UNIX transport for the daemon and instance-owned foreground worker.
+//! 中文：Linux/macOS AF_UNIX 传输基础，只负责私有 runtime 目录、单实例锁、
 //! 有界长度前缀帧与对端 UID 校验；不含业务 DTO、worker、TUI 或服务启动。
 //!
 //! Hard rules encoded here:
 //! - sockets are SOCK_CLOEXEC | SOCK_NONBLOCK; every read/write is bounded by a
 //!   caller deadline and a cancellation token, so an RPC thread never waits
 //!   forever on a silent client.
-//! - both ends verify SO_PEERCRED and compare the *real* kernel UID.
+//! - both ends verify kernel PID/UID (SO_PEERCRED or getpeereid+LOCAL_PEERPID).
 //! - the runtime directory is 0700 and the socket 0600; symlinks, foreign
 //!   owners and permissive modes are rejected, never repaired.
 //! - the single-instance lock is a fixed inode flock and is never unlinked; it
@@ -15,31 +15,34 @@
 //! - stale socket cleanup requires that held lock, verifies the directory and
 //!   the lock inode through the directory fd, and only removes a socket owned by
 //!   this UID inside this directory (no recursion).
-//! - a socket is created and later stat/chmod/unlinked through the same
-//!   directory fd (`/proc/self/fd/<dirfd>/<name>`), so a re-resolved or renamed
-//!   path can neither redirect the bind nor hide the node this instance made.
+//! - sockets are created and stat/chmod/unlinked through the same directory fd:
+//!   Linux uses /proc/self/fd; Darwin uses a C-only bind/SCM_RIGHTS helper.
+//!   Only the real service listens; no Zig or allocator runs in the fork child.
 //! - listener/directory cleanup only removes what this instance actually
 //!   created, after re-checking dev/ino and owner.
 
 const std = @import("std");
 const c = std.c;
 const linux = std.os.linux;
+const builtin = @import("builtin");
 const fs = @import("../platform/filesystem.zig");
+const metadata = @import("../platform/metadata.zig");
+const native = @import("../platform/ipc_native.zig");
 const protocol = @import("../core/protocol.zig");
 
 /// Upper bound of a single frame payload (4-byte big-endian length prefix).
 /// 中文：单帧载荷上限；业务展示快照仍需自行分页/裁剪到更小尺寸。
 pub const max_frame_len: usize = 1024 * 1024;
-/// Longest pathname that fits in `sockaddr_un.sun_path` (108 bytes incl. NUL).
-pub const max_socket_path_len: usize = 107;
+/// Native sun_path capacity minus its terminating NUL (Linux 107, Darwin 103).
+pub const max_socket_path_len = native.max_socket_path_len;
+/// Owned NONBLOCK/CLOEXEC pair; Darwin also configures SO_NOSIGPIPE on both ends.
+pub const socketPair = native.socketPair;
 /// Longest accepted single path component (socket/lock file name).
 pub const max_name_len: usize = 63;
 
 const header_size: usize = 4;
 const poll_slice_ms: i64 = 50;
 const connect_retry_ms: i64 = 10;
-/// AF_UNIX on Linux (std.os.linux.AF.UNIX).
-const af_unix: u32 = 1;
 
 /// Device+inode identity; inode numbers alone are not globally unique.
 pub const Identity = struct {
@@ -51,23 +54,13 @@ pub const Identity = struct {
         return a.dev_major == b.dev_major and a.dev_minor == b.dev_minor and a.ino == b.ino;
     }
 
-    fn from(st: linux.Statx) Identity {
+    fn from(st: metadata.Metadata) Identity {
         return .{ .dev_major = st.dev_major, .dev_minor = st.dev_minor, .ino = st.ino };
     }
 };
 
-/// Kernel-reported peer credentials (`struct ucred`), never client-supplied.
-pub const Credentials = struct {
-    pid: u32,
-    uid: u32,
-    gid: u32,
-};
-
-const Ucred = extern struct {
-    pid: c.pid_t,
-    uid: c.uid_t,
-    gid: c.gid_t,
-};
+/// Kernel-reported PID/UID/GID, never client-supplied (including on Darwin).
+pub const Credentials = native.Credentials;
 
 /// Per-operation bounds. `timeout_ms` is the total budget for the call; 0 means
 /// "do not wait" (returns error.Timeout). There is intentionally no infinite
@@ -132,76 +125,35 @@ const Deadline = struct {
 // ---------------------------------------------------------------------------
 
 /// Read errno of a failed libc call; must run before the next libc call.
-fn libcErrno() linux.E {
-    return @fromBackingInt(@intCast(c._errno().*));
-}
+const libcErrno = native.errno;
 
 fn libcFail() anyerror {
     return mapErrno(libcErrno());
 }
 
-fn mapErrno(e: linux.E) anyerror {
-    return switch (e) {
-        .SUCCESS => error.UnexpectedSystemError,
-        .PERM, .ACCES => error.AccessDenied,
-        .NOENT, .SRCH => error.FileNotFound,
-        .EXIST => error.PathAlreadyExists,
-        .NOTDIR => error.NotDir,
-        .ISDIR => error.IsDir,
-        .LOOP => error.SymlinkNotAllowed,
-        .NAMETOOLONG => error.NameTooLong,
-        .NOSPC => error.NoSpaceLeft,
-        .NOTEMPTY => error.DirectoryNotEmpty,
-        .INTR => error.Interrupted,
-        .AGAIN => error.WouldBlock,
-        .CONNREFUSED => error.ConnectionRefused,
-        .CONNRESET => error.ConnectionReset,
-        .CONNABORTED => error.ConnectionAborted,
-        .PIPE => error.ConnectionClosed,
-        .ADDRINUSE => error.AddressInUse,
-        .ADDRNOTAVAIL => error.AddressNotAvailable,
-        .NOTSOCK => error.NotASocket,
-        .BADF => error.InvalidDescriptor,
-        .MFILE => error.ProcessFdQuotaExceeded,
-        .NFILE => error.SystemFdQuotaExceeded,
-        .NOMEM => error.OutOfMemory,
-        .NOBUFS => error.SystemResources,
-        .OPNOTSUPP => error.OperationNotSupported,
-        else => error.UnexpectedSystemError,
-    };
-}
+const mapErrno = native.mapError;
 
 // ---------------------------------------------------------------------------
 // stat helpers (all libc; errno via libcErrno)
 // ---------------------------------------------------------------------------
 
-fn statAt(dir_fd: c.fd_t, path_z: [*:0]const u8, no_follow: bool) !linux.Statx {
-    var result: linux.Statx = undefined;
-    const flags: u32 = if (no_follow) linux.AT.SYMLINK_NOFOLLOW else 0;
-    if (c.statx(dir_fd, path_z, flags, linux.STATX.BASIC_STATS, &result) != 0) return libcFail();
-    return result;
-}
-
-fn statFd(fd: c.fd_t) !linux.Statx {
-    var result: linux.Statx = undefined;
-    if (c.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &result) != 0) return libcFail();
-    return result;
-}
+const statAt = metadata.statAt;
+const statFd = metadata.statFd;
 
 fn isDir(mode: u16) bool {
-    return mode & linux.S.IFMT == linux.S.IFDIR;
+    return mode & c.S.IFMT == c.S.IFDIR;
 }
 
 fn isSock(mode: u16) bool {
-    return mode & linux.S.IFMT == linux.S.IFSOCK;
+    return mode & c.S.IFMT == c.S.IFSOCK;
 }
 
 fn isReg(mode: u16) bool {
-    return mode & linux.S.IFMT == linux.S.IFREG;
+    return mode & c.S.IFMT == c.S.IFREG;
 }
 
 fn isLink(mode: u16) bool {
-    return mode & linux.S.IFMT == linux.S.IFLNK;
+    return mode & c.S.IFMT == c.S.IFLNK;
 }
 
 fn perms(mode: u16) u16 {
@@ -211,15 +163,21 @@ fn perms(mode: u16) u16 {
 /// 0600/0700 socket permissions are fsck'd without following a swapped symlink
 /// when the kernel offers fchmodat2; the caller re-verifies identity afterwards.
 fn chmodNoFollow(fd: c.fd_t, path_z: [*:0]const u8, mode: u32) !void {
-    const rc = linux.fchmodat2(fd, path_z, mode, linux.AT.SYMLINK_NOFOLLOW);
-    switch (linux.errno(rc)) {
-        .SUCCESS => return,
-        .NOSYS, .OPNOTSUPP, .INVAL => {},
-        else => |e| return mapErrno(e),
+    const permissions = std.math.cast(c.mode_t, mode) orelse return error.InvalidFileMode;
+    if (builtin.os.tag == .macos) {
+        if (c.fchmodat(fd, path_z, permissions, c.AT.SYMLINK_NOFOLLOW) != 0) return libcFail();
+        return;
     }
-    // Pre-6.5 kernels: private 0700 directory plus the post-verification keep
-    // this fallback honest.
-    if (c.fchmodat(fd, path_z, mode, 0) != 0) return libcFail();
+    if (builtin.os.tag == .linux) {
+        const rc = linux.fchmodat2(fd, path_z, mode, linux.AT.SYMLINK_NOFOLLOW);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return,
+            .NOSYS, .OPNOTSUPP, .INVAL => {},
+            else => |e| return mapErrno(e),
+        }
+        // Pre-6.5 Linux: private directory plus post-verification keep fallback honest.
+        if (c.fchmodat(fd, path_z, permissions, 0) != 0) return libcFail();
+    }
 }
 
 fn validateName(name: []const u8) !void {
@@ -235,7 +193,7 @@ fn validateSocketPath(path: []const u8) !void {
     if (std.mem.findScalar(u8, path, 0) != null) return error.InvalidPath;
 }
 
-fn validatePrivateDir(st: linux.Statx, uid: u32) !void {
+fn validatePrivateDir(st: metadata.Metadata, uid: u32) !void {
     if (isLink(st.mode)) return error.SymlinkNotAllowed;
     if (!isDir(st.mode)) return error.NotDirectory;
     if (st.uid != uid) return error.NotOwned;
@@ -279,11 +237,13 @@ pub const Directory = struct {
         if (std.mem.findScalar(u8, base_path, 0) != null) return error.InvalidPath;
         if (base_path.len + "/thin".len > max_socket_path_len) return error.NameTooLong;
 
-        const base_z = try allocator.dupeSentinel(u8, base_path, 0);
-        defer allocator.free(base_z);
-        const base_st = try statAt(linux.AT.FDCWD, base_z, true);
-        try validatePrivateDir(base_st, uid);
-        return createChild(allocator, base_path, "thin", uid);
+        const canonical = try metadata.systemPath(allocator, base_path);
+        defer allocator.free(canonical);
+        if (canonical.len + "/thin".len > max_socket_path_len) return error.NameTooLong;
+        const base_fd = try metadata.openDirectoryPath(allocator, canonical);
+        defer fs.closeFd(base_fd);
+        try validatePrivateDir(try statFd(base_fd), uid);
+        return createChild(allocator, base_fd, canonical, "thin", uid);
     }
 
     /// Low-level: create/verify `<parent_path>/<name>` as a 0700 UID-owned real
@@ -295,25 +255,28 @@ pub const Directory = struct {
         if (std.mem.findScalar(u8, parent_path, 0) != null) return error.InvalidPath;
         if (parent_path.len + 1 + name.len > max_socket_path_len) return error.NameTooLong;
 
-        const parent_z = try allocator.dupeSentinel(u8, parent_path, 0);
-        defer allocator.free(parent_z);
-        const parent_st = try statAt(linux.AT.FDCWD, parent_z, true);
-        if (isLink(parent_st.mode)) return error.SymlinkNotAllowed;
-        if (!isDir(parent_st.mode)) return error.NotDirectory;
-        return createChild(allocator, parent_path, name, uid);
+        const canonical = try metadata.systemPath(allocator, parent_path);
+        defer allocator.free(canonical);
+        if (canonical.len + 1 + name.len > max_socket_path_len) return error.NameTooLong;
+        const parent_fd = try metadata.openDirectoryPath(allocator, canonical);
+        defer fs.closeFd(parent_fd);
+        return createChild(allocator, parent_fd, canonical, name, uid);
     }
 
     /// Fallback when `$XDG_RUNTIME_DIR` is unset: `/tmp/thin-<uid>`.
     pub fn resolveFallback(allocator: std.mem.Allocator, uid: u32) !Directory {
-        const tmp_st = try statAt(linux.AT.FDCWD, "/tmp", true);
-        if (isLink(tmp_st.mode) or !isDir(tmp_st.mode)) return error.InsecureRuntimeBase;
-        if (tmp_st.uid != 0) return error.InsecureRuntimeBase;
-        if (tmp_st.mode & linux.S.ISVTX == 0) return error.InsecureRuntimeBase;
+        const tmp_path = try metadata.systemPath(allocator, "/tmp");
+        defer allocator.free(tmp_path);
+        const tmp_fd = try metadata.openDirectoryPath(allocator, tmp_path);
+        defer fs.closeFd(tmp_fd);
+        const tmp_st = try statFd(tmp_fd);
+        if (!isDir(tmp_st.mode) or tmp_st.uid != 0) return error.InsecureRuntimeBase;
+        if (tmp_st.mode & c.S.ISVTX == 0) return error.InsecureRuntimeBase;
         if (perms(tmp_st.mode) & 0o002 == 0) return error.InsecureRuntimeBase;
 
         var buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&buf, "thin-{d}", .{uid});
-        return resolveUnder(allocator, "/tmp", name, uid);
+        return createChild(allocator, tmp_fd, tmp_path, name, uid);
     }
 
     /// Build `<dir>/<name>` for a socket/lock path, enforcing the AF_UNIX limit.
@@ -336,25 +299,26 @@ pub const Directory = struct {
     /// the same inode, and it is empty. Never recursive; never touches parents.
     pub fn removeIfEmpty(self: *Directory) !void {
         if (!self.created) return;
-        const path_z = try self.allocator.dupeSentinel(u8, self.path, 0);
-        defer self.allocator.free(path_z);
-        const st = statAt(linux.AT.FDCWD, path_z, true) catch |err| switch (err) {
+        const parent = std.fs.path.dirname(self.path) orelse return error.InvalidPath;
+        const parent_fd = metadata.openDirectoryPath(self.allocator, parent) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer fs.closeFd(parent_fd);
+        const name_z = try self.allocator.dupeSentinel(u8, std.fs.path.basename(self.path), 0);
+        defer self.allocator.free(name_z);
+        const st = statAt(parent_fd, name_z, true) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         if (!isDir(st.mode)) return error.NotDirectory;
         if (st.uid != self.uid) return error.NotOwned;
         if (!Identity.from(st).eql(self.identity)) return error.IdentityChanged;
-        if (c.rmdir(path_z) != 0) return libcFail();
+        if (c.unlinkat(parent_fd, name_z, c.AT.REMOVEDIR) != 0) return libcFail();
     }
 };
 
-fn createChild(allocator: std.mem.Allocator, parent_path: []const u8, name: []const u8, uid: u32) !Directory {
-    const parent_z = try allocator.dupeSentinel(u8, parent_path, 0);
-    defer allocator.free(parent_z);
-    const parent_fd = try fs.openDirectory(linux.AT.FDCWD, parent_z);
-    defer fs.closeFd(parent_fd);
-
+fn createChild(allocator: std.mem.Allocator, parent_fd: c.fd_t, parent_path: []const u8, name: []const u8, uid: u32) !Directory {
     const name_z = try allocator.dupeSentinel(u8, name, 0);
     defer allocator.free(name_z);
 
@@ -373,10 +337,14 @@ fn createChild(allocator: std.mem.Allocator, parent_path: []const u8, name: []co
     const fd = try fs.openDirectory(parent_fd, name_z);
     errdefer fs.closeFd(fd);
     const opened = try statFd(fd);
+    try validatePrivateDir(opened, uid);
     if (!Identity.from(opened).eql(Identity.from(st))) return error.IdentityChanged;
+    const entry = try statAt(parent_fd, name_z, true);
+    if (!Identity.from(entry).eql(Identity.from(opened))) return error.IdentityChanged;
 
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent_path, name });
-    return .{
+    errdefer allocator.free(path);
+    const result: Directory = .{
         .allocator = allocator,
         .fd = fd,
         .path = path,
@@ -384,6 +352,8 @@ fn createChild(allocator: std.mem.Allocator, parent_path: []const u8, name: []co
         .identity = Identity.from(opened),
         .created = created,
     };
+    try verifyDirectoryPath(&result);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -426,10 +396,10 @@ pub const Lock = struct {
         defer allocator.free(name_z);
 
         // O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK; no O_TRUNC.
-        const fd = fs.linux.openat(
+        const fd = fs.openAt(
             dir.fd,
             name_z,
-            2 | fs.linux.create | fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock,
+            .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true },
             0o600,
         );
         if (fd < 0) return fs.osError();
@@ -447,7 +417,7 @@ pub const Lock = struct {
         const entry = try statAt(dir.fd, name_z, true);
         if (!Identity.from(entry).eql(file_identity)) return error.IdentityChanged;
 
-        if (fs.linux.flock(fd, 2 | 4) != 0) {
+        if (fs.flock(fd, fs.LOCK.EX | fs.LOCK.NB) != 0) {
             const e = libcErrno();
             if (e == .AGAIN) return error.AlreadyRunning;
             return mapErrno(e);
@@ -472,7 +442,7 @@ pub const Lock = struct {
         if (!self.held) return;
         self.held = false;
         self.name_len = 0;
-        _ = fs.linux.flock(self.fd, 8); // LOCK_UN; the inode stays on disk.
+        _ = fs.flock(self.fd, fs.LOCK.UN); // The inode stays on disk.
         fs.closeFd(self.fd);
         self.fd = -1;
         if (self.path.len != 0) self.allocator.free(self.path);
@@ -532,37 +502,9 @@ pub fn removeStaleSocket(lock: *const Lock, dir: *const Directory, name: []const
 // sockets
 // ---------------------------------------------------------------------------
 
-fn socketFd() !c.fd_t {
-    const rc = linux.socket(af_unix, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
-    switch (linux.errno(rc)) {
-        .SUCCESS => return @intCast(rc),
-        else => |e| return mapErrno(e),
-    }
-}
-
-fn sockAddr(path: []const u8) linux.sockaddr.un {
-    var addr: linux.sockaddr.un = .{ .path = @splat(0) };
-    @memcpy(addr.path[0..path.len], path);
-    return addr;
-}
-
-fn addrLen(path: []const u8) c.socklen_t {
-    return @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len);
-}
-
-/// Kernel SO_PEERCRED lookup; the returned UID is authoritative for both ends.
-pub fn socketCredentials(fd: c.fd_t) !Credentials {
-    var cred: Ucred = undefined;
-    var len: c.socklen_t = @sizeOf(Ucred);
-    const rc = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.PEERCRED, @ptrCast(&cred), &len);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        else => |e| return mapErrno(e),
-    }
-    if (len != @sizeOf(Ucred)) return error.PeerCredentialsUnavailable;
-    if (cred.pid <= 0) return error.PeerCredentialsUnavailable;
-    return .{ .pid = @intCast(cred.pid), .uid = cred.uid, .gid = cred.gid };
-}
+const socketFd = native.socket;
+/// SO_PEERCRED on Linux; getpeereid + LOCAL_PEERPID on Darwin. Fail closed.
+pub const socketCredentials = native.credentials;
 
 fn ensureSocketFile(dir_fd: c.fd_t, name_z: [*:0]const u8, uid: u32, expected: Identity) !void {
     const st = try statAt(dir_fd, name_z, true);
@@ -579,29 +521,20 @@ fn ensureSocketFile(dir_fd: c.fd_t, name_z: [*:0]const u8, uid: u32, expected: I
     }
 }
 
-/// `/proc/self/fd/<dirfd>/<name>`: binding this path makes the kernel create the
-/// socket node inside the directory the descriptor refers to, so the node never
-/// depends on re-resolving (or re-validating) the absolute directory path.
-fn fdAnchoredBindPath(allocator: std.mem.Allocator, dir_fd: c.fd_t, name_z: [*:0]const u8) ![:0]u8 {
-    const joined = try std.fmt.allocPrint(allocator, "/proc/self/fd/{d}/{s}", .{ dir_fd, std.mem.span(name_z) });
-    defer allocator.free(joined);
-    return allocator.dupeSentinel(u8, joined, 0);
-}
-
 /// The exported socket path stays the real directory path, so it must still name
 /// the very directory `dir.fd` refers to; a renamed or replaced directory would
 /// publish a path that leads elsewhere.
 fn verifyDirectoryPath(dir: *const Directory) !void {
     const now = try statFd(dir.fd);
-    if (!isDir(now.mode)) return error.NotDirectory;
+    try validatePrivateDir(now, dir.uid);
     if (!Identity.from(now).eql(dir.identity)) return error.DirectoryMoved;
 
-    const path_z = try dir.allocator.dupeSentinel(u8, dir.path, 0);
-    defer dir.allocator.free(path_z);
-    const on_path = statAt(linux.AT.FDCWD, path_z, true) catch |err| switch (err) {
-        error.FileNotFound => return error.DirectoryMoved,
+    const path_fd = metadata.openDirectoryPath(dir.allocator, dir.path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.SymlinkNotAllowed, error.IdentityChanged => return error.DirectoryMoved,
         else => return err,
     };
+    defer fs.closeFd(path_fd);
+    const on_path = try statFd(path_fd);
     if (!isDir(on_path.mode)) return error.DirectoryMoved;
     if (!Identity.from(on_path).eql(dir.identity)) return error.DirectoryMoved;
 }
@@ -633,7 +566,7 @@ fn waitReady(fd: c.fd_t, events: i16, deadline: *const Deadline) !void {
         if (rc == 0) continue; // re-check cancellation and the deadline
         const revents = fds[0].revents;
         if (revents & events != 0) return;
-        if (revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0) return;
+        if (revents & (c.POLL.ERR | c.POLL.HUP | c.POLL.NVAL) != 0) return;
     }
 }
 
@@ -699,38 +632,23 @@ pub const Listener = struct {
             _ = try removeStaleSocket(lock, dir, name);
         }
 
-        const fd = try socketFd();
+        const bound = try native.bindAt(allocator, dir.fd, name_z);
+        const fd = bound.fd;
         errdefer fs.closeFd(fd);
 
-        const bind_path = try fdAnchoredBindPath(allocator, dir.fd, name_z);
-        defer allocator.free(bind_path);
-        var addr = sockAddr(bind_path);
-        switch (linux.errno(linux.bind(fd, @ptrCast(&addr), addrLen(bind_path)))) {
-            .SUCCESS => {},
-            // The directory fd itself is open, so ENOENT/ENOTDIR here means the
-            // fd-anchored namespace is missing (no procfs), not a missing
-            // directory: refuse rather than fall back to a path-based bind.
-            .NOENT, .NOTDIR => return error.FdAnchoredPathUnavailable,
-            else => |e| return mapErrno(e),
-        }
-
-        // bind() succeeded, so the entry inside this directory is the node this
-        // call created (an existing entry fails with EADDRINUSE above; the fd's
-        // own fstat identity is the sockfs inode, not the filesystem node). Take
-        // the entry's identity and own the cleanup before any further fallible
-        // step, so a later chmod/listen/dup failure removes our own socket and
-        // never a foreign entry.
-        const identity = Identity.from(try statAt(dir.fd, name_z, true));
+        // Own cleanup immediately using the identity captured at bind, including
+        // the helper's original identity on Darwin. Do not adopt a later snapshot
+        // of a replaced name (the socket fd's own identity need not be the node).
+        const identity: Identity = .{ .dev_major = bound.dev_major, .dev_minor = bound.dev_minor, .ino = bound.ino };
         errdefer unlinkIfMatches(dir.fd, name_z, identity, dir.uid);
         if (fault == .after_bind) return error.InjectedBindFailure;
 
         try ensureSocketFile(dir.fd, name_z, dir.uid, identity);
 
-        const listen_rc = linux.listen(fd, std.math.clamp(options.backlog, 1, 4096));
-        switch (linux.errno(listen_rc)) {
-            .SUCCESS => {},
-            else => |e| return mapErrno(e),
-        }
+        // Recheck after helper exit/bind, before publishing a path or listening.
+        try verifyDirectoryPath(dir);
+        if (c.listen(fd, std.math.clamp(options.backlog, 1, 4096)) != 0) return libcFail();
+        try verifyDirectoryPath(dir);
 
         // Anchored "down" lookup: the listener keeps its own descriptor to the
         // same directory even after the caller deinits `Directory`.
@@ -753,37 +671,29 @@ pub const Listener = struct {
     pub fn accept(self: *Listener, wait: Wait) !Connection {
         var deadline = Deadline.init(wait);
         while (true) {
-            try waitReady(self.fd, linux.POLL.IN, &deadline);
-            const rc = linux.accept4(self.fd, null, null, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {
-                    const fd: c.fd_t = @intCast(rc);
-                    errdefer fs.closeFd(fd);
-                    const peer = try socketCredentials(fd);
-                    if (peer.uid != self.uid) return error.PeerUidMismatch;
-                    return Connection.init(self.allocator, fd, peer);
-                },
-                .AGAIN, .INTR, .CONNABORTED => continue,
-                else => |e| return mapErrno(e),
-            }
+            try waitReady(self.fd, c.POLL.IN, &deadline);
+            const fd = native.accept(self.fd) catch |err| switch (err) {
+                error.WouldBlock, error.Interrupted, error.ConnectionAborted => continue,
+                else => return err,
+            };
+            errdefer fs.closeFd(fd);
+            const peer = try socketCredentials(fd);
+            if (peer.uid != self.uid) return error.PeerUidMismatch;
+            return Connection.init(self.allocator, fd, peer);
         }
     }
 
     /// Single nonblocking accept attempt. A quiet listener never waits on the
     /// owner thread; caller readiness polling owns scheduling and deadlines.
     pub fn acceptStep(self: *Listener) !?Connection {
-        const rc = linux.accept4(self.fd, null, null, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {
-                const fd: c.fd_t = @intCast(rc);
-                errdefer fs.closeFd(fd);
-                const peer = try socketCredentials(fd);
-                if (peer.uid != self.uid) return error.PeerUidMismatch;
-                return Connection.init(self.allocator, fd, peer);
-            },
-            .AGAIN, .INTR, .CONNABORTED => return null,
-            else => |err| return mapErrno(err),
-        }
+        const fd = native.accept(self.fd) catch |err| switch (err) {
+            error.WouldBlock, error.Interrupted, error.ConnectionAborted => return null,
+            else => return err,
+        };
+        errdefer fs.closeFd(fd);
+        const peer = try socketCredentials(fd);
+        if (peer.uid != self.uid) return error.PeerUidMismatch;
+        return Connection.init(self.allocator, fd, peer);
     }
 
     /// Close the listening descriptor only; the socket file is left for deinit.
@@ -823,30 +733,44 @@ pub const Listener = struct {
 };
 
 fn connectPath(fd: c.fd_t, path: []const u8, deadline: *const Deadline) !void {
-    var addr = sockAddr(path);
+    var addr = try native.address(path);
     while (true) {
         try deadline.tick();
-        const rc = linux.connect(fd, @ptrCast(&addr), addrLen(path));
-        switch (linux.errno(rc)) {
-            .SUCCESS => return,
+        if (c.connect(fd, @ptrCast(&addr), native.addressLength(path)) == 0) return;
+        switch (libcErrno()) {
+            .ISCONN => return,
             .INTR => continue,
-            // Nonblocking AF_UNIX connect is refused while the backlog is full;
-            // retry within the caller's deadline rather than spinning.
-            .AGAIN, .INPROGRESS, .ALREADY => {},
+            // Linux AF_UNIX returns EAGAIN when backlog is full: retry connect.
+            .AGAIN => try sleepSlice(deadline),
+            .INPROGRESS, .ALREADY => {
+                try waitReady(fd, c.POLL.OUT, deadline);
+                var pending: c_int = 0;
+                var len: c.socklen_t = @sizeOf(c_int);
+                if (c.getsockopt(fd, c.SOL.SOCKET, c.SO.ERROR, &pending, &len) != 0) return libcFail();
+                if (len != @sizeOf(c_int)) return error.UnexpectedSystemError;
+                if (pending != 0) return mapErrno(@fromBackingInt(@intCast(pending)));
+                return;
+            },
             else => |e| return mapErrno(e),
         }
-        try sleepSlice(deadline);
     }
 }
 
-/// Connect to an existing daemon socket and verify SO_PEERCRED. The path entry
+/// Connect to an existing endpoint and verify native kernel PID/UID. The path entry
 /// must be a real socket owned by `expected_uid`; symlinks are refused.
 pub fn connect(allocator: std.mem.Allocator, path: []const u8, expected_uid: u32, wait: Wait) !Connection {
     try validateSocketPath(path);
 
-    const path_z = try allocator.dupeSentinel(u8, path, 0);
-    defer allocator.free(path_z);
-    const st = try statAt(linux.AT.FDCWD, path_z, true);
+    const canonical = try metadata.systemPath(allocator, path);
+    defer allocator.free(canonical);
+    try validateSocketPath(canonical);
+    const parent_path = std.fs.path.dirname(canonical) orelse return error.InvalidPath;
+    const parent_fd = try metadata.openDirectoryPath(allocator, parent_path);
+    defer fs.closeFd(parent_fd);
+    const parent_identity = Identity.from(try statFd(parent_fd));
+    const name_z = try allocator.dupeSentinel(u8, std.fs.path.basename(canonical), 0);
+    defer allocator.free(name_z);
+    const st = try statAt(parent_fd, name_z, true);
     if (isLink(st.mode)) return error.SymlinkNotAllowed;
     if (!isSock(st.mode)) return error.NotASocket;
     if (st.uid != expected_uid) return error.NotOwned;
@@ -855,10 +779,16 @@ pub fn connect(allocator: std.mem.Allocator, path: []const u8, expected_uid: u32
     errdefer fs.closeFd(fd);
 
     var deadline = Deadline.init(wait);
-    try connectPath(fd, path, &deadline);
+    try connectPath(fd, canonical, &deadline);
 
     const peer = try socketCredentials(fd);
     if (peer.uid != expected_uid) return error.PeerUidMismatch;
+    const again = try statAt(parent_fd, name_z, true);
+    if (!Identity.from(again).eql(Identity.from(st)) or !isSock(again.mode) or
+        again.uid != expected_uid) return error.IdentityChanged;
+    const path_fd = try metadata.openDirectoryPath(allocator, parent_path);
+    defer fs.closeFd(path_fd);
+    if (!Identity.from(try statFd(path_fd)).eql(parent_identity)) return error.DirectoryMoved;
     return Connection.init(allocator, fd, peer);
 }
 
@@ -894,7 +824,9 @@ pub const Connection = struct {
     pub const ReadStep = union(enum) { pending, eof, frame: []u8 };
     pub const step_bytes: usize = 64 * 1024;
 
-    /// Takes ownership of `fd`; peer must already be verified.
+    /// Takes ownership of `fd`; peer must already be verified. Native callers
+    /// must supply a NONBLOCK/CLOEXEC fd with Darwin SO_NOSIGPIPE already set;
+    /// use socketPair for fixtures. Never set it lazily after a peer has closed.
     pub fn init(allocator: std.mem.Allocator, fd: c.fd_t, peer: Credentials) Connection {
         return .{ .allocator = allocator, .fd = fd, .peer = peer };
     }
@@ -989,7 +921,7 @@ pub const Connection = struct {
     }
 
     fn receiveStep(self: *Connection, bytes: []u8) !usize {
-        const n = c.recv(self.fd, bytes.ptr, bytes.len, linux.MSG.DONTWAIT);
+        const n = c.recv(self.fd, bytes.ptr, bytes.len, native.recv_flags);
         if (n >= 0) return @intCast(n);
         const err = libcErrno();
         if (err == .AGAIN or err == .INTR) return error.WouldBlock;
@@ -1022,7 +954,7 @@ pub const Connection = struct {
         if (!self.writePending()) return true;
         const end = @min(self.outgoing.len, self.outgoing_offset + step_bytes);
         const bytes = self.outgoing[self.outgoing_offset..end];
-        const n = c.send(self.fd, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT);
+        const n = c.send(self.fd, bytes.ptr, bytes.len, native.step_send_flags);
         if (n < 0) {
             const err = libcErrno();
             if (err == .AGAIN or err == .INTR) return false;
@@ -1090,8 +1022,8 @@ pub const Connection = struct {
     fn writeAll(self: *Connection, bytes: []const u8, deadline: *const Deadline) !void {
         var offset: usize = 0;
         while (offset < bytes.len) {
-            try waitReady(self.fd, linux.POLL.OUT, deadline);
-            const n = c.send(self.fd, bytes.ptr + offset, bytes.len - offset, linux.MSG.NOSIGNAL);
+            try waitReady(self.fd, c.POLL.OUT, deadline);
+            const n = c.send(self.fd, bytes.ptr + offset, bytes.len - offset, native.send_flags);
             if (n < 0) {
                 const e = libcErrno();
                 switch (e) {
@@ -1109,7 +1041,7 @@ pub const Connection = struct {
     /// bounded poll).
     fn readAvailable(self: *Connection, buf: []u8, deadline: *const Deadline) !?usize {
         while (true) {
-            try waitReady(self.fd, linux.POLL.IN, deadline);
+            try waitReady(self.fd, c.POLL.IN, deadline);
             const n = c.read(self.fd, buf.ptr, buf.len);
             if (n > 0) return @intCast(n);
             if (n == 0) return null;
@@ -1155,14 +1087,7 @@ fn testWait() Wait {
 }
 
 fn testPair(allocator: std.mem.Allocator) !struct { a: Connection, b: Connection } {
-    var fds: [2]c.fd_t = undefined;
-    const rc = linux.socketpair(
-        af_unix,
-        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
-        0,
-        &fds,
-    );
-    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fds = try socketPair();
     return .{
         .a = Connection.init(allocator, fds[0], test_peer),
         .b = Connection.init(allocator, fds[1], test_peer),
@@ -1172,7 +1097,7 @@ fn testPair(allocator: std.mem.Allocator) !struct { a: Connection, b: Connection
 fn sendAll(fd: c.fd_t, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
-        const n = c.send(fd, bytes.ptr + offset, bytes.len - offset, linux.MSG.NOSIGNAL);
+        const n = c.send(fd, bytes.ptr + offset, bytes.len - offset, native.send_flags);
         try std.testing.expect(n > 0);
         offset += @intCast(n);
     }
@@ -1193,6 +1118,27 @@ fn testPath(allocator: std.mem.Allocator, parent: []const u8, name: []const u8) 
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent, name });
     defer allocator.free(path);
     return allocator.dupeSentinel(u8, path, 0);
+}
+
+test "native socketPair configures nonblocking close-on-exec and Darwin no-SIGPIPE" {
+    const pair = try socketPair();
+    defer fs.closeFd(pair[0]);
+    defer fs.closeFd(pair[1]);
+    const nonblock: u32 = @bitCast(@as(c.O, .{ .NONBLOCK = true }));
+    for (pair) |fd| {
+        const flags = c.fcntl(fd, c.F.GETFL);
+        try std.testing.expect(flags >= 0);
+        try std.testing.expect(@as(u32, @intCast(flags)) & nonblock != 0);
+        const descriptor = c.fcntl(fd, c.F.GETFD);
+        try std.testing.expect(descriptor >= 0);
+        try std.testing.expect(descriptor & c.FD_CLOEXEC != 0);
+        if (builtin.os.tag == .macos) {
+            var enabled: c_int = 0;
+            var len: c.socklen_t = @sizeOf(c_int);
+            try std.testing.expectEqual(@as(c_int, 0), c.getsockopt(fd, c.SOL.SOCKET, c.SO.NOSIGPIPE, &enabled, &len));
+            try std.testing.expectEqual(@as(c_int, 1), enabled);
+        }
+    }
 }
 
 test "partial frame storage is wiped before discard and close is idempotent" {
@@ -1274,7 +1220,9 @@ test "step writer backpressure preserves the exact frame and another connection 
     defer a.free(quick);
     try std.testing.expectEqualStrings("control-reply", quick);
     var received = false;
-    for (0..128) |_| {
+    const transfer_start = std.Io.Clock.awake.now(std.testing.io);
+    // Socket buffer sizes differ by target; bound time, not Linux-sized steps.
+    while (transfer_start.untilNow(std.testing.io, .awake).toMilliseconds() < 5000) {
         _ = try slow.a.writeStep();
         switch (try slow.b.readStep()) {
             .frame => |frame| {
@@ -1529,7 +1477,7 @@ test "private directory requires 0700, same UID, and no symlink" {
     try std.testing.expect(dir.created);
     const child_z = try allocator.dupeSentinel(u8, dir.path, 0);
     defer allocator.free(child_z);
-    const child_st = try statAt(linux.AT.FDCWD, child_z, true);
+    const child_st = try statAt(c.AT.FDCWD, child_z, true);
     try std.testing.expect(isDir(child_st.mode));
     try std.testing.expectEqual(@as(u16, 0o700), perms(child_st.mode));
 
@@ -1539,8 +1487,21 @@ test "private directory requires 0700, same UID, and no symlink" {
     // A symlinked base is refused rather than followed.
     const link_z = try testPath(allocator, parent, "link");
     defer allocator.free(link_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.symlinkat("rt", linux.AT.FDCWD, link_z));
+    try std.testing.expectEqual(@as(c_int, 0), c.symlinkat("rt", c.AT.FDCWD, link_z));
     try std.testing.expectError(error.SymlinkNotAllowed, Directory.resolveBase(allocator, link_z, me));
+}
+
+test "runtime directory refuses symlinked ancestors as well as leaves" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "real", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "real", "alias", .{});
+    var buf: [4096]u8 = undefined;
+    const parent = try testParent(&tmp, &buf);
+    const alias = try std.fmt.allocPrint(a, "{s}/alias", .{parent});
+    defer a.free(alias);
+    try std.testing.expectError(error.SymlinkNotAllowed, Directory.resolveUnder(a, alias, "rt", @intCast(c.geteuid())));
 }
 
 test "socket names and paths are validated" {
@@ -1574,7 +1535,7 @@ test "created directory cleanup is empty-only and identity checked" {
     defer dir.deinit();
     try std.testing.expect(dir.created);
 
-    const keep_fd = fs.linux.openat(dir.fd, "keep", 2 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec, 0o600);
+    const keep_fd = fs.openAt(dir.fd, "keep", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600);
     try std.testing.expect(keep_fd >= 0);
     fs.closeFd(keep_fd);
     try std.testing.expectError(error.DirectoryNotEmpty, dir.removeIfEmpty());
@@ -1583,7 +1544,7 @@ test "created directory cleanup is empty-only and identity checked" {
     const path_copy = try allocator.dupeSentinel(u8, dir.path, 0);
     defer allocator.free(path_copy);
     try dir.removeIfEmpty();
-    try std.testing.expectError(error.FileNotFound, statAt(linux.AT.FDCWD, path_copy, true));
+    try std.testing.expectError(error.FileNotFound, statAt(c.AT.FDCWD, path_copy, true));
     // Idempotent when the directory is already gone.
     try dir.removeIfEmpty();
 }
@@ -1629,10 +1590,10 @@ test "lock refuses symlinked and permissive lock files" {
     defer allocator.free(link_z);
     try std.testing.expectEqual(@as(c_int, 0), c.symlinkat("daemon.lock", dir.fd, link_z));
 
-    const loose_fd = fs.linux.openat(
+    const loose_fd = fs.openAt(
         dir.fd,
         "loose.lock",
-        2 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true },
         0o600,
     );
     try std.testing.expect(loose_fd >= 0);
@@ -1667,11 +1628,16 @@ test "listener binds a 0600 socket and verifies peer UID on both ends" {
     const wait = testWait();
     var client = try connect(allocator, listener.socketPath(), me, wait);
     defer client.close();
+    // The helper is already reaped. Before accept the kernel must identify the
+    // actual listener, not the process which bound and transferred its fd.
+    try std.testing.expectEqual(@as(u32, @intCast(c.getpid())), client.peer.pid);
     var server = try listener.accept(wait);
     defer server.close();
 
     try std.testing.expectEqual(me, client.peer.uid);
     try std.testing.expectEqual(me, server.peer.uid);
+    try std.testing.expectEqual(@as(u32, @intCast(c.getpid())), server.peer.pid);
+    try std.testing.expectEqual(client.peer.pid, (try socketCredentials(client.fd)).pid);
 
     try client.writeFrame("ping", wait);
     const frame = (try server.readFrame(wait)).?;
@@ -1725,10 +1691,10 @@ test "listener cleanup removes only its own socket inode" {
     // If the entry was replaced by another inode, cleanup leaves it alone.
     var second = try Listener.bind(allocator, &dir, "owned.sock", .{});
     try std.testing.expectEqual(@as(c_int, 0), c.unlinkat(dir.fd, name_z, 0));
-    const other_fd = fs.linux.openat(
+    const other_fd = fs.openAt(
         dir.fd,
         name_z,
-        2 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true },
         0o600,
     );
     try std.testing.expect(other_fd >= 0);
@@ -1761,10 +1727,10 @@ test "stale socket cleanup requires the lock and the owner UID" {
     try std.testing.expect(!(try removeStaleSocket(&lock, &dir, "stale.sock")));
 
     // Regular files are never removed.
-    const file_fd = fs.linux.openat(
+    const file_fd = fs.openAt(
         dir.fd,
         "file.sock",
-        2 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true },
         0o600,
     );
     try std.testing.expect(file_fd >= 0);
@@ -1847,10 +1813,10 @@ test "stale cleanup refuses a lock whose file inode was replaced" {
 
     // Replace the lock path with a fresh inode while the flock stays held.
     try std.testing.expectEqual(@as(c_int, 0), c.unlinkat(dir.fd, lock_z, 0));
-    const other_fd = fs.linux.openat(
+    const other_fd = fs.openAt(
         dir.fd,
         lock_z,
-        2 | fs.linux.create | fs.linux.exclusive | fs.linux.cloexec,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true },
         0o600,
     );
     try std.testing.expect(other_fd >= 0);
@@ -1920,7 +1886,7 @@ test "bind refuses a renamed or replaced runtime directory" {
     const parent = try testParent(&tmp, &buf);
     const parent_z = try allocator.dupeSentinel(u8, parent, 0);
     defer allocator.free(parent_z);
-    const parent_fd = try fs.openDirectory(linux.AT.FDCWD, parent_z);
+    const parent_fd = try fs.openDirectory(c.AT.FDCWD, parent_z);
     defer fs.closeFd(parent_fd);
 
     var dir = try Directory.resolveUnder(allocator, parent, "rt", me);
@@ -1939,10 +1905,7 @@ test "bind refuses a renamed or replaced runtime directory" {
 
     // Move the directory away while its fd is still held: the fd keeps pointing
     // at the same inode, but the published path no longer names it.
-    try std.testing.expectEqual(
-        linux.E.SUCCESS,
-        linux.errno(linux.renameat(parent_fd, "rt", parent_fd, "rt-moved")),
-    );
+    try std.testing.expectEqual(@as(c_int, 0), c.renameat(parent_fd, "rt", parent_fd, "rt-moved"));
     try std.testing.expectError(error.DirectoryMoved, Listener.bind(allocator, &dir, "other.sock", .{}));
 
     // A fresh directory at the old path is a different identity: still refused.
@@ -1969,5 +1932,5 @@ test "connect reports a missing endpoint without creating anything" {
     defer allocator.free(path_z);
     try std.testing.expectError(error.FileNotFound, connect(allocator, path, @intCast(c.geteuid()), testWait()));
     // The failed client must not leave an entry behind.
-    try std.testing.expectError(error.FileNotFound, statAt(linux.AT.FDCWD, path_z, true));
+    try std.testing.expectError(error.FileNotFound, statAt(c.AT.FDCWD, path_z, true));
 }

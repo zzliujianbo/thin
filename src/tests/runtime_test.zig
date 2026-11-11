@@ -252,6 +252,10 @@ const Fake = struct {
     }
 
     /// 宿主事件回调：记录计数、已提交文本与压缩状态；配置了 disconnect 时返回 Disconnected，模拟宿主断开。
+    ///
+    /// 这里不要写 `try assert`：Runtime.emit 会把回调返回的任何错误重新归类为
+    /// Canceled 或 HostDisconnected，断言在回调里失败会被静默吞掉，测试仍然报 OK。
+    /// 需要不变量时在测试体里断言，或使用 context_usage_test.zig 的专用夹具。
     fn event(ctx: ?*anyopaque, ev: r.Event, _: *const p.Cancellation) !void {
         const self: *Fake = @ptrCast(@alignCast(ctx.?));
         switch (ev) {
@@ -264,7 +268,6 @@ const Fake = struct {
             .context_snapshot => |value| {
                 self.snapshots += 1;
                 self.last_context = value;
-                if (self.current_runtime) |runtime| try std.testing.expectEqualDeep(runtime.contextSnapshot(), value);
                 if (self.disconnect_snapshot == self.snapshots) return error.Disconnected;
             },
             .usage => |usage| {
@@ -274,8 +277,6 @@ const Fake = struct {
                     // Like the presentation consumer, update at the usage event,
                     // without adding a new fallible context-event boundary.
                     self.last_context = runtime.contextSnapshot();
-                    try std.testing.expectEqual(self.last_actual_total != null, self.last_context.?.known);
-                    try std.testing.expectEqual(self.last_actual_total orelse 0, self.last_context.?.tokens);
                 }
             },
             .tool_result => |value| {
@@ -290,18 +291,12 @@ const Fake = struct {
                 self.direct_host_echoes += 1;
             },
             .finished => self.terminals += 1,
-            .compacted => {
-                self.compactions += 1;
-                if (self.current_runtime) |runtime| try std.testing.expectEqual(self.last_summary_total, runtime.last_context_tokens);
-            },
+            .compacted => self.compactions += 1,
             // 进入压缩前记录 token 估算值，供后续比较。
             .state => |state| {
                 if (state == .compacting) {
                     self.before_summary_tokens = self.current_runtime.?.estimatedTokens();
                     self.before_summary_context = self.current_runtime.?.contextSnapshot();
-                }
-                if (state == .awaiting_permission or state == .executing_tool) {
-                    if (self.current_runtime) |runtime| try std.testing.expectEqualDeep(runtime.contextSnapshot(), self.last_context.?);
                 }
             },
             // 压缩失败后 token 数应与压缩前一致，说明历史未被破坏。

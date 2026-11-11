@@ -196,7 +196,7 @@ def main(app):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        with tempfile.TemporaryDirectory(prefix='thin-resume-menu-') as tmp:
+        with tempfile.TemporaryDirectory(prefix='thin-resume-menu-', dir='/tmp') as tmp:
             home, project, runtime = (Path(tmp) / n for n in ('home', 'project', 'r'))
             (home / '.thin').mkdir(parents=True)
             project.mkdir()
@@ -333,7 +333,7 @@ def trailing_home_connect(app, server):
     requests.clear()
     selected_ids.clear()
     continuation_sessions.clear()
-    with tempfile.TemporaryDirectory(prefix='thin-resume-connect-') as tmp:
+    with tempfile.TemporaryDirectory(prefix='thin-resume-connect-', dir='/tmp') as tmp:
         home, runtime = (Path(tmp) / name for name in ('home', 'r'))
         (home / '.thin').mkdir(parents=True)
         runtime.mkdir(mode=0o700)

@@ -80,9 +80,9 @@ fn request(config: *const cfg.Config, cancel: ?*const p.Cancellation) p.Request 
 }
 
 fn cancelInBackoff(io: Io, f: *Fault, cancel: *p.Cancellation) anyerror!void {
-    // Wait for the injected refusal, then cancel well inside the 200ms sleep.
+    // Wait for the injected refusal, then cancel well inside its backoff sleep.
     while (f.attempts.load(.acquire) == 0) try Io.sleep(io, .fromMilliseconds(1), .awake);
-    try Io.sleep(io, .fromMilliseconds(30), .awake);
+    try Io.sleep(io, .fromMilliseconds(5), .awake);
     cancel.cancel();
 }
 
@@ -96,6 +96,7 @@ test "connection retry focused: recovery cap cancel timeout and no POST replay" 
         expected_attempts: usize,
         expected_kind: ?p.FailureKind = null,
         timeout_ms: u32 = 3000,
+        retry_delays_ms: [2]u32 = .{ 20, 50 },
         cancel: bool = false,
         serve: bool = true,
     };
@@ -103,10 +104,10 @@ test "connection retry focused: recovery cap cancel timeout and no POST replay" 
         .{ .failures = 1, .expected_attempts = 2 },
         .{ .failures = 2, .expected_attempts = 3 },
         .{ .failures = 99, .expected_attempts = 3, .expected_kind = .transport, .serve = false },
-        .{ .failures = 1, .expected_attempts = 1, .expected_kind = .canceled, .cancel = true, .serve = false },
-        .{ .failures = 1, .expected_attempts = 1, .expected_kind = .timeout, .timeout_ms = 60, .serve = false },
+        .{ .failures = 1, .expected_attempts = 1, .expected_kind = .canceled, .retry_delays_ms = .{ 100, 200 }, .cancel = true, .serve = false },
+        .{ .failures = 1, .expected_attempts = 1, .expected_kind = .timeout, .timeout_ms = 60, .retry_delays_ms = .{ 100, 200 }, .serve = false },
         // Second backoff must not get its own fresh timeout budget.
-        .{ .failures = 2, .expected_attempts = 2, .expected_kind = .timeout, .timeout_ms = 350, .serve = false },
+        .{ .failures = 2, .expected_attempts = 2, .expected_kind = .timeout, .timeout_ms = 60, .serve = false },
         .{ .failures = 99, .err = error.AccessDenied, .expected_attempts = 1, .expected_kind = .transport, .serve = false },
         .{ .mode = .before_head, .expected_attempts = 1, .expected_kind = .transport },
         .{ .mode = .mid_stream, .expected_attempts = 1, .expected_kind = .transport },
@@ -141,6 +142,7 @@ test "connection retry focused: recovery cap cancel timeout and no POST replay" 
         };
         var client = try Client.init(t.allocator, io, &config, "fake-offline-key");
         defer client.deinit();
+        client.retry_delays_ms = case.retry_delays_ms;
         var cancellation: p.Cancellation = .{};
         var cf: ?Io.Future(anyerror!void) = if (case.cancel) try Io.concurrent(real_io, cancelInBackoff, .{ real_io, &f, &cancellation }) else null;
         defer if (cf) |*future| {
@@ -163,11 +165,10 @@ test "connection retry focused: recovery cap cancel timeout and no POST replay" 
         try t.expectEqual(case.expected_attempts, f.attempts.load(.acquire));
         try t.expectEqual(@as(usize, if (case.serve) 1 else 0), server.posts.load(.acquire));
         if (case.cancel or case.timeout_ms == 60) try t.expect(elapsed_ms < 190);
-        if (case.timeout_ms == 350) try t.expect(elapsed_ms < 650);
         if (!case.serve) {
-            // invoke has joined the worker. Crossing both retry deadlines must
-            // not produce a late socket/POST after cancellation/timeout.
-            try Io.sleep(real_io, .fromMilliseconds(750), .awake);
+            // invoke has joined the worker. Crossing both short test retry
+            // deadlines must not produce a late socket/POST.
+            try Io.sleep(real_io, .fromMilliseconds(150), .awake);
             try t.expectEqual(case.expected_attempts, f.attempts.load(.acquire));
             try t.expectEqual(@as(usize, 0), server.posts.load(.acquire));
             try t.expect(client.http.connection_pool.used.first == null);

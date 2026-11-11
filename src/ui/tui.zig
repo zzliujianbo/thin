@@ -9693,6 +9693,7 @@ test "natural entry owns only written rows and tracks a conservative endpoint" {
 }
 
 test "natural partial write promotes staged proof only on complete frame ACK" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // Requires Linux F_SETPIPE_SZ.
     const Pipe = struct {
         extern "c" fn pipe2(*[2]c_int, c_int) c_int;
     };
@@ -13153,7 +13154,9 @@ test "exit blank cleanup drains and restores completed transcript on owned PTY" 
     try std.testing.expectEqual(@as(c_int, 0), abi.openpty(&master, &slave, null, null, null));
     defer _ = std.c.close(master);
     defer _ = std.c.close(slave);
-    _ = std.c.fcntl(master, 4, std.c.fcntl(master, 3) | 0x800);
+    const master_flags = std.c.fcntl(master, std.c.F.GETFL);
+    try std.testing.expect(master_flags >= 0);
+    try std.testing.expect(std.c.fcntl(master, std.c.F.SETFL, master_flags | @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true }))) >= 0);
     _ = std.c.write(slave, "prior-shell-output\r\n", 20);
     var terminal = try terminal_module.Terminal.fromFd(slave, false);
     defer terminal.deinit();
@@ -17587,15 +17590,18 @@ test "shutdown restores terminal and handles signals without announcing identity
         try std.testing.expectEqual(@as(c_int, 0), abi.openpty(&master, &slave, null, null, null));
         defer _ = c.close(master);
         defer _ = c.close(slave);
-        const flags = c.fcntl(slave, 3);
-        try std.testing.expect(c.fcntl(master, 4, c.fcntl(master, 3) | 0x800) >= 0);
+        const flags = c.fcntl(slave, c.F.GETFL);
+        const master_flags = c.fcntl(master, c.F.GETFL);
+        try std.testing.expect(master_flags >= 0);
+        try std.testing.expect(c.fcntl(master, c.F.SETFL, master_flags | @as(c_int, @bitCast(c.O{ .NONBLOCK = true }))) >= 0);
         var terminal = try terminal_module.Terminal.fromFd(slave, false);
         defer terminal.deinit();
         Reader.terminal = &terminal;
         Reader.calls = 0;
         Reader.later = later;
         try std.testing.expectEqual(@as(u8, if (later) 130 else 143), try finishExit(&terminal, 0, Reader.read));
-        try std.testing.expectEqual(flags, c.fcntl(slave, 3));
+        const posix = @import("../platform/posix_terminal.zig");
+        try std.testing.expectEqual(posix.configuredFileFlags(flags), posix.configuredFileFlags(c.fcntl(slave, c.F.GETFL)));
         var bytes: [4096]u8 = undefined;
         const n = c.read(master, &bytes, bytes.len);
         try std.testing.expect(n > 0);

@@ -31,10 +31,10 @@ pub fn append(a: std.mem.Allocator, io: std.Io, home: []const u8, out: *std.Arra
         }
         const z = try t.dupeSentinel(u8, item.name, 0);
         // Follow only this discovered directory, never the document itself.
-        const dirfd = fs.linux.openat(root.handle, z, fs.linux.directory | fs.linux.cloexec, 0);
+        const dirfd = fs.openAt(root.handle, z, .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
         if (dirfd < 0) continue;
         defer fs.closeFd(dirfd);
-        const fd = fs.linux.openat(dirfd, "SKILL.md", fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0);
+        const fd = fs.openAt(dirfd, "SKILL.md", .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
         if (fd < 0) continue;
         defer fs.closeFd(fd);
         const file = fs.fileFromFd(fd);

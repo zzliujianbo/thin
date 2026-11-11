@@ -63,6 +63,7 @@ test {
     _ = anthropic;
     _ = process;
     _ = filesystem;
+    _ = @import("tests/filesystem_portability_test.zig");
     _ = memory;
     _ = @import("core/diagnostics.zig");
     _ = @import("core/knowledge.zig");
@@ -81,8 +82,26 @@ test {
     _ = @import("daemon/protocol.zig");
     _ = @import("daemon/registry.zig");
     _ = @import("daemon/spawn.zig");
-    _ = @import("daemon/supervisor.zig");
-    _ = @import("daemon/ssh.zig");
+    if (@import("builtin").os.tag == .linux) {
+        _ = @import("daemon/supervisor.zig");
+        _ = @import("daemon/ssh.zig");
+    }
+    // These modules are otherwise reached only through transitive imports;
+    // reference them explicitly so filtered test-unit groups always enumerate
+    // every top-level test prefix.
+    _ = @import("core/systemone.zig");
+    _ = @import("core/subagent_status.zig");
+    _ = @import("llm/image_codec.zig");
+    _ = @import("platform/anonymous_input.zig");
+    _ = @import("platform/filesystem_native.zig");
+    _ = @import("platform/interrupt.zig");
+    _ = @import("platform/metadata.zig");
+    _ = @import("platform/posix_terminal.zig");
+    _ = @import("platform/spawn.zig");
+    _ = @import("platform/terminal_abi.zig");
+    _ = @import("platform/terminal_remote.zig");
+    _ = @import("platform/wakeup.zig");
+    _ = @import("platform/capabilities.zig");
     _ = @import("daemon/worker.zig");
     _ = @import("daemon/client.zig");
     _ = @import("app/session_host.zig");
@@ -163,4 +182,39 @@ test {
         if (@import("std").mem.indexOf(u8, test_fn.name, ".test.") != null) return;
     }
     return error.NoMatchingProductTests;
+}
+
+// The fast test-unit step selects disjoint filter groups. This inventory test
+// runs in the full artifact and fails if a new top-level test prefix was not
+// added to build.zig's group list.
+test "unit group filters cover every test name" {
+    const prefixes = [_][]const u8{
+        "ui.",
+        "util.",
+        "presentation.",
+        "tool_metadata_adapter_test.",
+        "app.",
+        "main.",
+        "daemon.",
+        "tests.",
+        "core.",
+        "llm.",
+        "platform.",
+        "tools.",
+        "http_retry_test.",
+        "root.",
+    };
+    for (@import("builtin").test_functions) |test_fn| {
+        var covered = false;
+        for (prefixes) |prefix| {
+            if (@import("std").mem.indexOf(u8, test_fn.name, prefix) != null) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) {
+            @import("std").debug.print("unit test is not covered by a test-unit group: {s}\n", .{test_fn.name});
+            return error.UncoveredUnitTest;
+        }
+    }
 }

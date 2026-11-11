@@ -942,9 +942,9 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
 
 /// Anchored, no-follow, nonblocking open; reject nonregular files before reading.
 pub fn load(root: *fs.Root) !Cache {
-    const fd = fs.linux.openat(root.dir.handle, file_name, fs.linux.nofollow | fs.linux.cloexec | fs.linux.nonblock, 0);
+    const fd = fs.openAt(root.dir.handle, file_name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
     if (fd < 0) {
-        if (std.c._errno().* == 2) return .{};
+        if (fs.errno() == .NOENT) return .{};
         return fs.osError();
     }
     defer fs.closeFd(fd);
@@ -964,9 +964,9 @@ fn lock(root: *fs.Root) !c_int {
     const fd = try fs.openDirectory(root.dir.handle, ".");
     errdefer fs.closeFd(fd);
     for (0..100) |_| {
-        if (fs.linux.flock(fd, 2 | 4) == 0) return fd;
-        const errno = std.c._errno().*;
-        if (errno != 11 and errno != 4) return fs.osError();
+        if (fs.flock(fd, fs.LOCK.EX | fs.LOCK.NB) == 0) return fd;
+        const errno = fs.errno();
+        if (errno != .AGAIN and errno != .INTR) return fs.osError();
         try std.Io.sleep(root.io, .fromMilliseconds(2), .awake);
     }
     return error.MetadataStoreBusy;

@@ -9,14 +9,18 @@
 //! - The endpoint must be exactly `<runtime-dir>/workers/<name>` of this UID;
 //!   the worker binds it through `daemon/unix.zig`, so it never unlinks an
 //!   arbitrary caller-supplied path.
-//! - A parent-death SIGTERM prevents an orphaned worker from keeping a session
-//!   alive after its owner was killed. No cached PID is ever signalled.
+//! - Linux uses parent-death SIGTERM; Darwin foreground workers watch their
+//!   private owner lifetime pipe. No cached PID is ever signalled.
 //! - Several RPC connections are served on the single owner thread. EOF only
 //!   revokes that connection's controller epoch; the task keeps running.
 //! - SIGINT/SIGTERM/HUP/QUIT cancel and join the owned task, save the final
 //!   checkpoint, close the endpoint and exit.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const c = std.c;
+const fs = @import("../platform/filesystem.zig");
+const native_metadata = @import("../platform/metadata.zig");
 const Io = std.Io;
 const cli = @import("../app/cli.zig");
 const ids = @import("../app/session_id.zig");
@@ -72,21 +76,27 @@ fn runInner(a: std.mem.Allocator, io: Io, environ_map: *std.process.Environ.Map,
     const session_id = options.worker_session orelse return error.InvalidArguments;
     if (!std.fs.path.isAbsolute(endpoint)) return error.InvalidArguments;
     if (options.worker_resume and options.worker_restore_selection != null) return error.InvalidArguments;
+    if (builtin.os.tag == .macos and options.worker_owner == .daemon) return error.UnsupportedPlatform;
 
     // The launcher passes its real pid in a private child-only variable; it is
     // not a credential and never reaches the model, config or checkpoints.
     const expected_owner = try expectedOwnerPid(environ_map);
     // Check before creating any session state: a worker whose owner already
     // died must not activate a Runtime, even for a moment.
-    if (std.os.linux.getppid() != expected_owner) return error.ParentGone;
+    if (c.getppid() != expected_owner) return error.ParentGone;
+    // The child owns only this inherited reader, never the parent's writer.
+    // Restore CLOEXEC before any session/tool can spawn; the numeric env value
+    // is not a credential and is validated as an actual read-only pipe.
+    const lifetime_fd = if (builtin.os.tag == .macos) try takeOwnerPipe(environ_map) else -1;
+    defer if (lifetime_fd >= 0) fs.closeFd(lifetime_fd);
+    if (lifetime_fd >= 0 and !try lifetimeAlive(lifetime_fd)) return error.ParentGone;
 
     var guard = try interrupt.Guard.install();
     defer guard.deinit();
 
-    installParentDeath();
-    // prctl cannot help if the owner died between the two checks (and pid 1 is
-    // a legitimate containerized daemon owner).
-    if (std.os.linux.getppid() != expected_owner) return error.ParentGone;
+    if (builtin.os.tag == .linux) installParentDeath();
+    // Cover death during guard/pipe setup. pid 1 remains a valid Linux owner.
+    if (c.getppid() != expected_owner) return error.ParentGone;
 
     // Fixed project root: the startup directory, resolved once.
     var path_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -111,6 +121,10 @@ fn runInner(a: std.mem.Allocator, io: Io, environ_map: *std.process.Environ.Map,
     // Must outlive host.deinit(), which joins every Bridge producer.
     var wake = try Wakeup.init();
     defer wake.deinit();
+    // Last startup check immediately before Runtime activation. A death after
+    // this check is observed independently by the lifetime poll below.
+    if (c.getppid() != expected_owner) return error.ParentGone;
+    if (lifetime_fd >= 0 and !try lifetimeAlive(lifetime_fd)) return error.ParentGone;
     const host = try SessionHost.init(a, io, environ_map, .{
         .project = project,
         .id = session_id,
@@ -139,6 +153,7 @@ fn runInner(a: std.mem.Allocator, io: Io, environ_map: *std.process.Environ.Map,
         // Signals first: a stop must cancel/join, not abandon the session.
         stop_signal = interrupt.signal();
         if (stop_signal != 0) break;
+        if (lifetime_fd >= 0 and !try lifetimeAlive(lifetime_fd)) break;
 
         // Drain notification BEFORE checking real work. A racing producer
         // either has its work pumped now, or leaves a readable wake fd.
@@ -147,10 +162,12 @@ fn runInner(a: std.mem.Allocator, io: Io, environ_map: *std.process.Environ.Map,
         const closing = host.isClosing();
         if (closing and !hasPendingWrites(&slots)) break;
 
-        var descriptors: [max_connections + 2]std.c.pollfd = undefined;
+        var descriptors: [max_connections + 3]c.pollfd = undefined;
         const accept_ready = !closing and freeSlot(&slots) != null and nowMs(io) >= accept_after_ms;
-        descriptors[0] = .{ .fd = if (accept_ready) listener.fd else -1, .events = std.os.linux.POLL.IN, .revents = 0 };
-        descriptors[1] = .{ .fd = wake.fd, .events = std.os.linux.POLL.IN, .revents = 0 };
+        descriptors[0] = .{ .fd = if (accept_ready) listener.fd else -1, .events = c.POLL.IN, .revents = 0 };
+        descriptors[1] = .{ .fd = wake.fd, .events = c.POLL.IN, .revents = 0 };
+        // Separate from every RPC/TUI slot; peer EOF never owns this lifecycle.
+        descriptors[max_connections + 2] = .{ .fd = lifetime_fd, .events = c.POLL.IN, .revents = 0 };
         for (&slots, 0..) |*slot, index| {
             descriptors[index + 2] = .{ .fd = -1, .events = 0, .revents = 0 };
             if (slot.*) |*active| {
@@ -174,21 +191,25 @@ fn runInner(a: std.mem.Allocator, io: Io, environ_map: *std.process.Environ.Map,
                     // A subscribed stream stops reading input while a frame is
                     // still being written: the ACK stays buffered in the peer
                     // socket instead of spinning on POLLOUT|POLLIN.
-                    .events = (if (active.conn.writePending()) @as(i16, std.os.linux.POLL.OUT) else 0) |
+                    .events = (if (active.conn.writePending()) @as(i16, c.POLL.OUT) else 0) |
                         (if (active.watch != null)
-                            (if (!active.conn.writePending()) @as(i16, std.os.linux.POLL.IN) else 0)
+                            (if (!active.conn.writePending()) @as(i16, c.POLL.IN) else 0)
                         else
-                            (if (!closing and !active.conn.writePending()) @as(i16, std.os.linux.POLL.IN) else 0)),
+                            (if (!closing and !active.conn.writePending()) @as(i16, c.POLL.IN) else 0)),
                     .revents = 0,
                 };
             }
         }
         const ready = std.c.poll(&descriptors, descriptors.len, idle_timeout_ms);
         if (ready < 0) {
-            if (std.c._errno().* == @backingInt(std.os.linux.E.INTR)) continue;
+            if (c._errno().* == @backingInt(c.E.INTR)) continue;
             return error.TransportPollFailed;
         }
         if (interrupt.signal() != 0) continue;
+        // Owner loss has priority over accepting or dispatching more work.
+        // Break into the same cancel/save/reap path as an orderly shutdown.
+        if (lifetime_fd >= 0 and descriptors[max_connections + 2].revents != 0 and
+            !try lifetimeAlive(lifetime_fd)) break;
         if (descriptors[0].revents != 0) {
             if (listener.acceptStep()) |maybe| {
                 if (maybe) |connection| {
@@ -223,13 +244,13 @@ fn runInner(a: std.mem.Allocator, io: Io, environ_map: *std.process.Environ.Map,
                 if (descriptors[index + 2].fd != active.conn.fd or descriptors[index + 2].revents == 0) continue;
                 if (active.watch != null) {
                     if (!watchValid(host, &slots, active) or
-                        descriptors[index + 2].revents & (std.os.linux.POLL.HUP | std.os.linux.POLL.ERR | std.os.linux.POLL.NVAL) != 0)
+                        descriptors[index + 2].revents & (c.POLL.HUP | c.POLL.ERR | c.POLL.NVAL) != 0)
                     {
                         // A revoked controller binding closes only this stream.
                         dropSlot(host, slot, active);
                         continue;
                     }
-                    if (descriptors[index + 2].revents & std.os.linux.POLL.IN != 0) {
+                    if (descriptors[index + 2].revents & c.POLL.IN != 0) {
                         // One bounded display ACK. Any other op still closes the
                         // stream, so it never borrows controller mutation rights.
                         serveWatchInput(host, a, io, active, slot, &slots);
@@ -272,7 +293,7 @@ fn closeSlots(host: *SessionHost, slots: *[max_connections]?Active) void {
 
 /// Decode at most one ready frame, then queue one reply without waiting for its
 /// reader. No second request is dispatched until this reply finishes.
-fn serveOne(host: *SessionHost, a: std.mem.Allocator, io: Io, active: *Active, parent_pid: std.os.linux.pid_t, slot: *?Active, slots: *[max_connections]?Active) void {
+fn serveOne(host: *SessionHost, a: std.mem.Allocator, io: Io, active: *Active, parent_pid: c.pid_t, slot: *?Active, slots: *[max_connections]?Active) void {
     const step = active.conn.readStep() catch {
         dropSlot(host, slot, active);
         return;
@@ -549,17 +570,64 @@ fn lockName(a: std.mem.Allocator, name: []const u8) ![]u8 {
 
 /// Strictly parse the launcher-provided owner pid. Reject empty, signed,
 /// zero-padded-and-huge or non-numeric values; pid 1 is accepted.
-fn expectedOwnerPid(environ: *const std.process.Environ.Map) !std.os.linux.pid_t {
+fn expectedOwnerPid(environ: *const std.process.Environ.Map) !c.pid_t {
     const raw = environ.get("THIN_WORKER_OWNER_PID") orelse return error.MissingOwnerPid;
     if (raw.len == 0 or raw.len > 10) return error.InvalidOwnerPid;
     for (raw) |byte| if (byte < '0' or byte > '9') return error.InvalidOwnerPid;
     const value = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOwnerPid;
-    if (value == 0 or value > std.math.maxInt(std.os.linux.pid_t)) return error.InvalidOwnerPid;
+    if (value == 0 or value > std.math.maxInt(c.pid_t)) return error.InvalidOwnerPid;
     return @intCast(value);
 }
 
+/// Adopt only a valid nonblocking read pipe. On failure after parsing, this
+/// function closes it; after success, runInner's defer is the sole owner.
+fn takeOwnerPipe(environ: *const std.process.Environ.Map) !c.fd_t {
+    const raw = environ.get("THIN_WORKER_OWNER_FD") orelse return error.MissingOwnerFd;
+    const fd = try parseOwnerFd(raw);
+    errdefer fs.closeFd(fd);
+    const flags = c.fcntl(fd, c.F.GETFL);
+    if (flags < 0) return error.InvalidOwnerFd;
+    const access: c.O = @bitCast(@as(u32, @intCast(flags)));
+    if (access.ACCMODE != .RDONLY or !access.NONBLOCK) return error.InvalidOwnerFd;
+    const st = native_metadata.statFd(fd) catch return error.InvalidOwnerFd;
+    if (st.mode & c.S.IFMT != c.S.IFIFO) return error.InvalidOwnerFd;
+    const descriptor_flags = c.fcntl(fd, c.F.GETFD);
+    if (descriptor_flags < 0 or c.fcntl(fd, c.F.SETFD, descriptor_flags | c.FD_CLOEXEC) < 0)
+        return error.InvalidOwnerFd;
+    return fd;
+}
+
+fn parseOwnerFd(raw: []const u8) !c.fd_t {
+    if (raw.len == 0 or raw.len > 10) return error.InvalidOwnerFd;
+    for (raw) |byte| if (byte < '0' or byte > '9') return error.InvalidOwnerFd;
+    const value = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOwnerFd;
+    // stdio cannot be a private lifecycle channel.
+    if (value < 3 or value > std.math.maxInt(c.fd_t)) return error.InvalidOwnerFd;
+    return @intCast(value);
+}
+
+/// No data is ever sent on this pipe. EOF/HUP/error (or unexpected input)
+/// revokes the owner; EAGAIN is the only live state. Never waits for data.
+fn lifetimeAlive(fd: c.fd_t) !bool {
+    var descriptors = [_]c.pollfd{.{ .fd = fd, .events = c.POLL.IN, .revents = 0 }};
+    while (c.poll(&descriptors, 1, 0) < 0) {
+        if (c._errno().* != @backingInt(c.E.INTR)) return error.TransportPollFailed;
+    }
+    if (descriptors[0].revents & (c.POLL.HUP | c.POLL.ERR | c.POLL.NVAL) != 0) return false;
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const n = c.read(fd, &byte, byte.len);
+        if (n >= 0) return false;
+        switch (fs.errno()) {
+            .INTR => continue,
+            .AGAIN => return true,
+            else => return false,
+        }
+    }
+}
+
 /// Ask Linux to TERM this process when its owner dies. Best effort: the owner
-/// also joins workers explicitly, and ppid==1 is checked separately.
+/// also joins workers explicitly, and the actual ppid is checked separately.
 fn installParentDeath() void {
     _ = std.os.linux.prctl(
         @backingInt(std.os.linux.PR.SET_PDEATHSIG),
@@ -576,6 +644,7 @@ fn nowMs(io: Io) u64 {
 }
 
 test "watch binds kernel peer and epoch and pushes without events RPC" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // Linux socketpair flags
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -725,7 +794,7 @@ test "watch binds kernel peer and epoch and pushes without events RPC" {
     try std.testing.expect(!host.cancel.isRequested());
 }
 
-test "owner pid rejects values outside Linux signed pid range without trapping" {
+test "owner pid rejects values outside target signed pid range without trapping" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
     for ([_][]const u8{ "2147483648", "4294967295", "4294967296", "00000000000" }) |raw| {
@@ -733,9 +802,54 @@ test "owner pid rejects values outside Linux signed pid range without trapping" 
         try std.testing.expectError(error.InvalidOwnerPid, expectedOwnerPid(&env));
     }
     try env.put("THIN_WORKER_OWNER_PID", "1");
-    try std.testing.expectEqual(@as(std.os.linux.pid_t, 1), try expectedOwnerPid(&env));
+    try std.testing.expectEqual(@as(c.pid_t, 1), try expectedOwnerPid(&env));
     try env.put("THIN_WORKER_OWNER_PID", "2147483647");
-    try std.testing.expectEqual(std.math.maxInt(std.os.linux.pid_t), try expectedOwnerPid(&env));
+    try std.testing.expectEqual(std.math.maxInt(c.pid_t), try expectedOwnerPid(&env));
+}
+
+test "owner fd rejects stdio signed nonnumeric and overflowing values" {
+    for ([_][]const u8{ "", "0", "1", "2", "-7", "+3", "3x", "2147483648", "4294967296", "00000000003" }) |raw| {
+        try std.testing.expectError(error.InvalidOwnerFd, parseOwnerFd(raw));
+    }
+    try std.testing.expectEqual(@as(c.fd_t, 3), try parseOwnerFd("3"));
+    try std.testing.expectEqual(std.math.maxInt(c.fd_t), try parseOwnerFd("2147483647"));
+}
+
+test "Darwin worker rejects daemon owner before activating a session" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectError(error.UnsupportedPlatform, runInner(std.testing.allocator, std.testing.io, &env, .{
+        .mode = .worker,
+        .worker_owner = .daemon,
+        .worker_endpoint = "/tmp/placeholder.sock",
+        .worker_session = std.mem.zeroes([32]u8),
+    }));
+}
+
+test "Darwin owner pipe restores CLOEXEC and EOF ignores retained readers" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    // Wakeup supplies a NONBLOCK/CLOEXEC Darwin pipe for this unit fixture;
+    // production lifetime pipes remain separate from all notification pipes.
+    var pipe = try Wakeup.init();
+    defer pipe.deinit();
+    const reader = pipe.fd;
+    try std.testing.expectEqual(@as(c_int, 0), c.fcntl(reader, c.F.SETFD, @as(c_int, 0)));
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var buf: [16]u8 = undefined;
+    try env.put("THIN_WORKER_OWNER_FD", try std.fmt.bufPrint(&buf, "{d}", .{reader}));
+    pipe.fd = -1; // transfer into takeOwnerPipe, including its failure paths
+    const owned = try takeOwnerPipe(&env);
+    defer fs.closeFd(owned);
+    try std.testing.expect(c.fcntl(owned, c.F.GETFD) & c.FD_CLOEXEC != 0);
+    try std.testing.expect(try lifetimeAlive(owned));
+    const retained = c.fcntl(owned, c.F.DUPFD_CLOEXEC, @as(c_int, 3));
+    try std.testing.expect(retained >= 0);
+    defer fs.closeFd(retained);
+    pipe.deinit(); // close only writer, not either independently owned reader
+    try std.testing.expect(!try lifetimeAlive(owned));
+    try std.testing.expect(!try lifetimeAlive(retained));
 }
 
 test "endpoint validation rejects paths outside the private workers directory" {
@@ -757,24 +871,28 @@ test "worker entry rejects non-worker mode before creating any session state" {
     // A missing or malformed owner pid is refused before any session state.
     try std.testing.expectError(error.MissingOwnerPid, runInner(a, std.testing.io, &env, .{
         .mode = .worker,
+        .worker_owner = .foreground,
         .worker_endpoint = "/tmp/placeholder.sock",
         .worker_session = std.mem.zeroes([32]u8),
     }));
     try env.put("THIN_WORKER_OWNER_PID", "0");
     try std.testing.expectError(error.InvalidOwnerPid, runInner(a, std.testing.io, &env, .{
         .mode = .worker,
+        .worker_owner = .foreground,
         .worker_endpoint = "/tmp/placeholder.sock",
         .worker_session = std.mem.zeroes([32]u8),
     }));
     try env.put("THIN_WORKER_OWNER_PID", "-7");
     try std.testing.expectError(error.InvalidOwnerPid, runInner(a, std.testing.io, &env, .{
         .mode = .worker,
+        .worker_owner = .foreground,
         .worker_endpoint = "/tmp/placeholder.sock",
         .worker_session = std.mem.zeroes([32]u8),
     }));
 }
 
 test "watch ACK retires a full ring past its bound while the control channel stays live" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // Linux socketpair flags
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -901,6 +1019,7 @@ test "watch ACK retires a full ring past its bound while the control channel sta
 }
 
 test "a held CR cannot block selectively acknowledged metadata before its LF" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // Linux socketpair flags
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
