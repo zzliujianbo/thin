@@ -120,7 +120,7 @@ pub const Limits = struct {
     cleanup_timeout_ms: u32 = 5000,
     /// 核心记忆文件的大小上限。
     core_bytes: u32 = 2048,
-    /// 索引文件的大小上限。
+    /// Deprecated compatibility field; Memory no longer enforces a total index budget.
     index_bytes: u32 = 8192,
     /// 单个分片文件的大小上限。
     shard_bytes: u32 = 32768,
@@ -1168,6 +1168,8 @@ fn validateConfig(config: Config, comptime unresolved: bool) !void {
             if (l.max_rounds) |rounds| {
                 if (rounds == 0 or rounds > 4096) return error.InvalidLimit;
             }
+        } else if (comptime std.mem.eql(u8, field, "index_bytes")) {
+            // Deprecated compatibility field; Memory has no total index budget.
         } else if (@TypeOf(@field(l, field)) == bool) {
             // false is an intentional policy, not a zero numeric limit.
         } else if (@field(l, field) == 0) return error.InvalidLimit;
@@ -1179,7 +1181,7 @@ fn validateConfig(config: Config, comptime unresolved: bool) !void {
     // 中文：以下上限是实现层的安全保护，与提供方能力无关。
     const mib = 1024 * 1024;
     if (l.read_bytes > 16 * mib or l.output_bytes > 16 * mib or
-        l.core_bytes > mib or l.index_bytes > 8 * mib or l.shard_bytes > 16 * mib or
+        l.core_bytes > mib or l.shard_bytes > 16 * mib or
         l.max_response_bytes > 64 * mib or l.max_event_bytes > 16 * mib or
         l.max_event_bytes > l.max_response_bytes) return error.InvalidLimit;
 
@@ -1643,6 +1645,7 @@ test "budget ratios and bounded limits" {
 
     // Numeric zero is invalid; false intentionally disables automatic compaction.
     inline for (@typeInfo(Limits).@"struct".field_names) |field| {
+        if (comptime std.mem.eql(u8, field, "index_bytes")) continue;
         c = testConfig();
         if (@TypeOf(@field(c.limits, field)) == bool) {
             @field(c.limits, field) = false;
@@ -1653,12 +1656,16 @@ test "budget ratios and bounded limits" {
         }
     }
 
-    // 超过硬上限的大小字段必须报错。
-    inline for (.{ "core_bytes", "index_bytes", "read_bytes", "shard_bytes", "max_response_bytes" }) |field| {
+    // 超过硬上限的大小字段必须报错。index_bytes is retained only for
+    // configuration compatibility and deliberately has no total budget.
+    inline for (.{ "core_bytes", "read_bytes", "shard_bytes", "max_response_bytes" }) |field| {
         c = testConfig();
         @field(c.limits, field) = std.math.maxInt(u32);
         try std.testing.expectError(error.InvalidLimit, validate(c));
     }
+    c = testConfig();
+    c.limits.index_bytes = std.math.maxInt(u32);
+    try validate(c);
     c = testConfig();
 
     c.limits.command_timeout_ms = c.limits.command_max_timeout_ms + 1;

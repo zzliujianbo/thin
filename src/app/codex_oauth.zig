@@ -159,6 +159,9 @@ pub const Manager = struct {
     wire: Wire = production_wire,
     // Private offline fault injection; production never sets this hook.
     before_refresh_save: ?*const fn (bool) anyerror!void = null,
+    /// Minimum device polling interval. Production keeps the protocol's 1s;
+    /// focused tests use a short interval instead of sleeping.
+    min_poll_interval_ms: u32 = 1000,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, home: []const u8, env: *const std.process.Environ.Map) !*Manager {
         _ = env; // Deliberately do not inspect HOME, Pi credentials or other ambient state.
@@ -296,7 +299,7 @@ pub const Manager = struct {
         if (!std.mem.eql(u8, state.verification_url, verification_url) or !headerValue(state.user_code)) return error.InvalidDevicePrompt;
         try checkCancel(cancel);
         if (sink.pending_fn) |callback| try callback(sink.context, .{ .verification_url = verification_url, .user_code = state.user_code });
-        var interval = @max(state.interval_ms, 1000);
+        var interval = @max(state.interval_ms, self.min_poll_interval_ms);
         while (true) {
             const real_now: i64 = @intCast(std.Io.Clock.real.now(self.io).toMilliseconds());
             if (state.expires_at_ms <= real_now) return error.OAuthDeviceExpired;
@@ -509,6 +512,7 @@ test "login merges latest unrelated settings and refuses competing credentials" 
     defer env.deinit();
     const manager = try Manager.init(a, std.testing.io, home, &env);
     defer manager.deinit();
+    manager.min_poll_interval_ms = 1;
     var initial = try manager.store.loadOrInitialize();
     defer cfg.release(&initial);
     var other = try store_mod.Store.open(a, std.testing.io, home);

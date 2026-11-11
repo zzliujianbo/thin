@@ -774,6 +774,9 @@ pub const Client = struct {
     workers: ?Workers = null,
     dir: ?unix.Directory = null,
     auto_refresh: bool = true,
+    /// Candidate admission waits for the initial snapshot/baseline pages.
+    /// Focused tests shorten this to prove timeout handling without 5s waits.
+    candidate_timeout_ms: u32 = join_timeout_ms,
 
     /// Display cursors for the ordered snapshot+delta stream.
     cursor: u64 = 0,
@@ -2312,7 +2315,7 @@ pub const Client = struct {
     /// are unchanged when the candidate is committed.
     fn completeCandidate(self: *Client, view: *Candidate, endpoint: []const u8, expected_project: []const u8) !void {
         view.stream = try StreamReceiver.startBound(self.a, self.io, endpoint, self.uid, view.epoch, null, view.conn.peer.pid);
-        const frames = try view.stream.?.copyInitial(self.waitFor(join_timeout_ms));
+        const frames = try view.stream.?.copyInitial(self.waitFor(self.candidate_timeout_ms));
         defer for (frames) |bytes| self.a.free(bytes);
         var snapshot = try parseObject(self.a, frames[0]);
         defer snapshot.deinit();
@@ -6865,6 +6868,7 @@ test "record identity and watch admission failures never replace the current vie
         defer fixture.deinit(a);
         const client = try Client.init(a, io, &fixture.env, .connect, fixture.project, fixture.home);
         defer client.deinit();
+        client.candidate_timeout_ms = 250;
         const target: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
         const old_id: ids.Id = "fedcbafedcbafedcbafedcbafedcbafe".*;
         const creds: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };

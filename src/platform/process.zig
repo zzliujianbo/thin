@@ -447,8 +447,10 @@ fn reap(pid: c.pid_t, status: *c_int) c.pid_t {
 }
 
 // Darwin may reject kill(-pgid) for a zombie-only group. Avoid an unnecessary
-// signal ONLY after an independent, complete dead-group proof. Failed queries
-// still signal, and failed signals are never reclassified as success.
+// signal ONLY after an independent, complete dead-group proof. A failed
+// delivery is not proof of a live group either: re-check with the remaining
+// cleanup budget and report an empty group as cleaned. Failed queries stay
+// fail-closed; no signal failure is ever reclassified without a complete proof.
 fn signalOwned(io: std.Io, pid: c.pid_t, group_owned: bool, exited: bool, sig: c.SIG, since: std.Io.Timestamp, budget: u32) bool {
     if (builtin.os.tag == .macos and group_owned and exited) {
         // A pre-signal proof must not spend the TERM/KILL budget enumerating a
@@ -459,7 +461,15 @@ fn signalOwned(io: std.Io, pid: c.pid_t, group_owned: bool, exited: bool, sig: c
         const alive = groupAlive(io, pid, since, proof_budget) catch true;
         if (!alive) return true;
     }
-    return signal(if (group_owned) -pid else pid, sig);
+    if (signal(if (group_owned) -pid else pid, sig)) return true;
+    if (builtin.os.tag == .macos and group_owned) {
+        // EPERM/ESRCH on a zombie-only group is expected here. Only a complete
+        // proof that no live member remains may turn this into success; a
+        // deadline, short scan, or transient query error keeps the failure.
+        const alive = groupAlive(io, pid, since, budget) catch return false;
+        return !alive;
+    }
+    return false;
 }
 
 /// 自 start 起经过的毫秒数，基于 awake 时钟（不受系统挂起或时间调整影响）。
@@ -646,6 +656,11 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
     var cleaning: ?std.Io.Timestamp = null;
     var exited = false;
     var killed = false;
+    // 进程组存活性检查的最近一次失败原因。只在最终清理失败时打印：子进程
+    // 刚退出时 proc_listpgrppids 短暂返回 ESRCH 很常见，下一次轮询即恢复，
+    // 不能把它当成故障刷屏。
+    var last_check_error: ?anyerror = null;
+    var last_check_errno: c_int = 0;
 
     // ownership=false 表示 PID 所有权已丢失（被他人回收），此后绝不再发信号。
     var ownership = true;
@@ -731,14 +746,27 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
             }
             // 子进程已退出且管道已 EOF（或不再读）时，检查进程组是否还有残留后代；全部消失才结束循环。
             if (exited and launch_status != .pending and group_owned and (out.eof or !out_ready) and (err.eof or !err_ready)) {
-                // 无法确认时保守地视为仍存活，继续等待直到预算耗尽。
-                const alive = groupAlive(io, pid, since, options.cleanup_timeout_ms) catch true;
-                if (!alive) break;
+                if (groupAlive(io, pid, since, options.cleanup_timeout_ms)) |alive| {
+                    last_check_error = null;
+                    if (!alive) break;
+                } else |check_err| {
+                    // 无法确认时保守地视为仍存活，继续等待直到预算耗尽。
+                    last_check_error = check_err;
+                    if (comptime builtin.os.tag == .macos) last_check_errno = c._errno().*;
+                }
             }
             // 清理预算耗尽：补发 KILL，报告 cleanup_failed，并放弃等待。
             if (age >= options.cleanup_timeout_ms) {
                 if (!killed and !signalOwned(io, pid, group_owned, exited, .KILL, since, options.cleanup_timeout_ms)) result.cleanup_failed = true;
                 result.cleanup_failed = true;
+                // 只有真正放弃时才记录原因：区分"有活着的后代"和"查不清"。
+                if (last_check_error) |check_err| {
+                    if (comptime builtin.os.tag == .macos) {
+                        std.debug.print("thin: process group {d} liveness unconfirmed ({s}, errno={d})\n", .{ pid, @errorName(check_err), last_check_errno });
+                    } else {
+                        std.debug.print("thin: process group {d} liveness unconfirmed ({s})\n", .{ pid, @errorName(check_err) });
+                    }
+                }
                 break;
             }
         }
@@ -1544,6 +1572,37 @@ test "Darwin process queries fail closed for missing leader and zero deadline" {
     // private boundary, and deadline zero must fail before libproc enumeration.
     try std.testing.expectError(error.ProcUnavailable, darwin.groupAlive(0, 100));
     try std.testing.expectError(error.ProcUnavailable, darwin.groupAlive(2, 0));
+}
+
+test "Darwin zombie-only signal failure is proven clean instead of cleanup failure" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var ctx = try TestContext.init();
+    defer ctx.deinit();
+    const child = try spawn.start(std.testing.allocator, ctx.root, null, "/bin/bash", "exit 0", &ctx.env, .none);
+    defer child.close();
+
+    // Hold the direct child unreaped until it is an observable zombie.
+    const start = std.Io.Clock.awake.now(std.testing.io);
+    while (!try observedExit(child.pid)) {
+        try std.testing.expect(elapsed(std.testing.io, start) < 1000);
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+    }
+
+    // This kernel quirk is the point of the test. Skip where a group signal to
+    // zombies still succeeds, so the post-signal proof would not be exercised.
+    const probe = c.kill(-child.pid, @fromBackingInt(@intCast(0)));
+    if (probe == 0 or std.posix.errno(probe) != .PERM) return error.SkipZigTest;
+
+    // exited=true takes the short pre-signal proof; exited=false forces the
+    // failed-delivery path that must absorb Darwin's EPERM without reporting a
+    // cleanup failure. Both must only succeed on a complete dead-group proof.
+    const since = std.Io.Clock.awake.now(std.testing.io);
+    try std.testing.expect(signalOwned(std.testing.io, child.pid, true, true, .TERM, since, 500));
+    try std.testing.expect(signalOwned(std.testing.io, child.pid, true, false, .TERM, since, 500));
+
+    // No signal after this point: reap the still-owned child exactly once.
+    var status: c_int = 0;
+    try std.testing.expectEqual(child.pid, reap(child.pid, &status));
 }
 
 test "raw output overflow remains bounded and marks whole response truncated" {

@@ -1066,10 +1066,11 @@ pub const SessionHost = struct {
             self.task = null;
         }
         // The task is joined. Instance-owned background commands are stopped
-        // BEFORE any success reply/closing flag: BackgroundService.deinit
-        // cancels all jobs, joins them and panics (fail-stop) when cleanup is
-        // unconfirmed. It is idempotent; App/session deinit may call it again.
-        if (self.session.app) |app| app.background.deinit();
+        // BEFORE any success reply/closing flag: BackgroundService.close
+        // cancels all jobs and joins them, returning error.CleanupUnconfirmed
+        // instead of panicking. Propagate it so the owner reports a failed
+        // stop; App/session deinit may call deinit() again (no panic).
+        if (self.session.app) |app| try app.background.close();
         // Join guarantees no producer remains; only now is Bridge.close safe.
         self.clearPending();
         self.releasePendingDelivery();

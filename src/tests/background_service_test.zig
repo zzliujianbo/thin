@@ -55,6 +55,8 @@ const Fixture = struct {
 
     fn deinit(self: *Fixture) void {
         if (self.service_active) {
+            // close() 失败只打印、不再 panic；需要断言的测试必须先显式
+            // closeService()，否则收尾失败会变成静默遗漏。
             self.service.deinit();
             self.service_active = false;
         }
@@ -64,11 +66,12 @@ const Fixture = struct {
     }
 
     /// Explicitly hand the manager back so owned pid checks can run before the
-    /// rest of the fixture is torn down.
-    fn closeService(self: *Fixture) void {
+    /// rest of the fixture is torn down. Cleanup failure is a normal test
+    /// error (with the offending job id), never a process abort.
+    fn closeService(self: *Fixture) !void {
         if (!self.service_active) return;
-        self.service.deinit();
         self.service_active = false;
+        try self.service.close();
     }
 };
 
@@ -265,7 +268,7 @@ test "twelve cumulative starts, six live services and exact pagination" {
         const service = try statusService(a, response);
         try std.testing.expect(!std.mem.eql(u8, stateOf(service), "running"));
     }
-    fixture.closeService();
+    try fixture.closeService();
     for (live_pids) |pid| try expectProcessGone(pid);
 }
 
@@ -323,7 +326,7 @@ test "handoff survives caller cancellation, one stop leaves siblings running" {
         if (i == 2) continue;
         _ = try controlJson(&fixture, a, .{ .action = .stop, .id = id }, &cancel);
     }
-    fixture.closeService();
+    try fixture.closeService();
     for (pids, 0..) |pid, i| {
         // The stopped sibling may already be reaped; all are gone after deinit.
         _ = i;
@@ -519,7 +522,7 @@ test "receipt allocator OOM leaves no registered job and no dependency leak" {
     try std.testing.expectEqual(@as(i64, 0), listed.object.get("total").?.integer);
     try std.testing.expectEqual(@as(usize, 0), listed.object.get("services").?.array.items.len);
 
-    fixture.closeService();
+    try fixture.closeService();
     try std.testing.expectEqual(@as(usize, 0), fixture.service.jobs.items.len);
 }
 
@@ -558,7 +561,7 @@ test "owned construction failure indices stay leak-free and recoverable" {
         const stopped = try controlJson(&fixture, a, .{ .action = .stop, .id = id }, &cancel);
         try std.testing.expect(!std.mem.eql(u8, stateOf(try statusService(a, stopped)), "running"));
 
-        fixture.closeService();
+        try fixture.closeService();
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
 }
@@ -633,7 +636,7 @@ test "TERM-ignoring service is escalated to KILL without caller cancellation" {
     try std.testing.expectEqual(@as(i64, 9), service.object.get("signal").?.integer);
     try std.testing.expect(!cancel.isRequested());
 
-    fixture.closeService();
+    try fixture.closeService();
 }
 
 test "stopping an already exited job keeps its exit record" {
@@ -703,5 +706,5 @@ test "graceful stop keeps both TERM cleanup streams in the log ring" {
     try std.testing.expectEqual(@as(u64, 12), @as(u64, @intCast(err.get("total_bytes").?.integer)));
     try std.testing.expectEqual(@as(u64, 12), @as(u64, @intCast(err.get("next_offset").?.integer)));
 
-    fixture.closeService();
+    try fixture.closeService();
 }

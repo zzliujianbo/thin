@@ -90,6 +90,8 @@ pub const Journal = struct {
     worker: ?std.Io.Future(void) = null,
     // Tests only: cancellable stall without filesystem I/O.
     test_stall: if (@import("builtin").is_test) std.atomic.Value(bool) else void = if (@import("builtin").is_test) .init(false) else {},
+    /// Tests may shorten the bounded flush deadline; production keeps 1000ms.
+    test_flush_timeout_ms: u32 = 1000,
 
     fn lock(self: *Journal) void {
         std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == .SUCCESS);
@@ -266,7 +268,7 @@ pub const Journal = struct {
 
     fn wait(self: *Journal, finishing: bool) void {
         if (self.worker == null) return;
-        const deadline = std.Io.Clock.awake.now(self.root.io).toMilliseconds() + 1000;
+        const deadline = std.Io.Clock.awake.now(self.root.io).toMilliseconds() + self.test_flush_timeout_ms;
         while (true) {
             self.lock();
             const done = self.done;
@@ -1519,6 +1521,7 @@ test "journal stalled writer notify is independent queue full is sticky and fini
     defer root.deinit();
     var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
     defer journal.deinit();
+    journal.test_flush_timeout_ms = 20;
     journal.test_stall.store(true, .release);
     const observer = journal.observer();
     observer.notify(.{ .submitted = "queued without disk" });
@@ -1552,12 +1555,13 @@ test "journal flush and finish timeouts cancel stalled writer without leaking" {
         defer root.deinit();
         var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
         defer journal.deinit();
+        journal.test_flush_timeout_ms = 20;
         journal.test_stall.store(true, .release);
         journal.observer().notify(.{ .submitted = "queued" });
         const began = std.Io.Clock.awake.now(root.io).toMilliseconds();
         if (finishing) journal.finish() else journal.flush();
         const elapsed = std.Io.Clock.awake.now(root.io).toMilliseconds() - began;
-        try std.testing.expect(elapsed >= 1000 and elapsed < 5000);
+        try std.testing.expect(elapsed >= 20 and elapsed < 1000);
         try std.testing.expectEqual(error.LogFlushTimeout, journal.failure().?);
         try std.testing.expect(journal.done and journal.worker == null);
         try std.testing.expectEqual(@as(usize, 0), journal.bytes);

@@ -698,15 +698,20 @@ pub const App = struct {
     }
 
     /// 按创建的逆序释放资源，最后销毁自身。
-    pub fn deinit(self: *App) void {
+    /// 后台任务清理无法确认时返回 error.CleanupUnconfirmed（已打印具体 Job）；
+    /// 无论成败都会释放自身，调用方只能据此决定退出码，不能继续复用实例。
+    pub fn close(self: *App) !void {
         const a = self.allocator;
+        var cleanup_error: ?anyerror = null;
         self.memory_coordinator.cancelAndJoin();
         self.subagent.deinit();
         self.runtime.deinit();
         // Foreground tasks and delegated children are joined above. Only then
         // notify every background service to cancel and join the whole set, so
         // no worker can borrow a root/environment that is about to be released.
-        self.background.deinit();
+        self.background.close() catch |err| {
+            cleanup_error = err;
+        };
         // Interactive exit/model replacement cancels immediately. Headless
         // success explicitly drains with signal handling before destruction.
         self.memory_coordinator.deinit();
@@ -723,6 +728,12 @@ pub const App = struct {
         a.free(self.auth_path);
         cfg.release(&self.config);
         a.destroy(self);
+        if (cleanup_error) |err| return err;
+    }
+
+    /// teardown 专用：close() 的失败已打印，defer/析构路径不能传播错误。
+    pub fn deinit(self: *App) void {
+        self.close() catch {};
     }
 };
 

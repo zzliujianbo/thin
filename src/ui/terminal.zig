@@ -373,8 +373,10 @@ test "local terminal wait observes borrowed wakeup without consuming it as input
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
     var wake = try @import("../platform/wakeup.zig").Wakeup.init();
@@ -412,8 +414,10 @@ test "entry probe preserves raw suffix and non replies and wipes consumed input"
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var dimensions = std.mem.zeroes(c.winsize);
     dimensions.col = 80;
     dimensions.row = 24;
@@ -443,8 +447,10 @@ test "entry probe timeout and stop are bounded" {
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
     const start = std.Io.Clock.awake.now(std.testing.io);
@@ -473,8 +479,10 @@ test "physical rows require an exact raw PTY size" {
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var size = std.mem.zeroes(c.winsize);
     size.col = 80;
     size.row = 24;
@@ -495,8 +503,10 @@ test "product terminal restores raw attributes and flags on PTY only" {
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var original: abi.Termios = undefined;
     try std.testing.expectEqual(@as(c_int, 0), abi.tcgetattr(slave, &original));
     const flags = c.fcntl(slave, c.F.GETFL);
@@ -561,8 +571,10 @@ test "post restoration stop on a backpressured retry still restores descriptor f
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
     try std.testing.expect(terminal.restore());
@@ -619,8 +631,10 @@ fn captureStartup(output: []u8, columns: u16, screen_rows: u16) ![]const u8 {
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var dimensions = std.mem.zeroes(c.winsize);
     dimensions.col = columns;
     dimensions.row = screen_rows;
@@ -714,8 +728,10 @@ test "backpressured terminal stays nonblocking and reports failed display restor
     var master: c_int = undefined;
     var slave: c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), openpty(&master, &slave, null, null, null));
-    defer _ = c.close(master);
+    // Close the master first so macOS does not wait for unread output on the
+    // slave's close. The terminal restores its leave sequence before this runs.
     defer _ = c.close(slave);
+    defer _ = c.close(master);
     var terminal = try Terminal.fromFd(slave, false);
     defer terminal.deinit();
     const bytes: [4096]u8 = @splat('x');

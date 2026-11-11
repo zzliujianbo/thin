@@ -109,7 +109,7 @@ def run(app):
     server = OwnedServer(('127.0.0.1', 0), Service)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        with tempfile.TemporaryDirectory(prefix='thin-resize-') as root:
+        with tempfile.TemporaryDirectory(prefix='thin-resize-', dir='/tmp') as root:
             home, project = Path(root) / 'home', Path(root) / 'project'
             # The foreground starts its own AF_UNIX worker under
             # $XDG_RUNTIME_DIR/thin. An owned short base keeps every socket

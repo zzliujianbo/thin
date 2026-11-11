@@ -386,7 +386,6 @@ pub const Coordinator = struct {
             error.FileChanged,
             error.CoreTooLarge,
             error.ShardTooLarge,
-            error.IndexTooLarge,
             error.InvalidGeneration,
             error.GenerationOverflow,
             error.NotRegularFile,

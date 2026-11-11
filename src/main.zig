@@ -128,7 +128,9 @@ fn run(init: std.process.Init) !u8 {
         var console = Console{ .allocator = init.gpa };
         defer console.deinit();
         const app = try App.init(init.gpa, init.io, init.environ_map, ".", console.host());
-        defer app.deinit();
+        // A background child we cannot confirm dead must not be reported as a
+        // clean exit. The diagnostic was already printed with the job id.
+        defer app.close() catch std.process.exit(3);
 
         var guard = try interrupt.Guard.install();
         defer guard.deinit();

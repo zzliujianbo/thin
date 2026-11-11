@@ -572,30 +572,37 @@ pub const BackgroundService = struct {
         return .{ .text = out.toOwnedSlice() catch return error.WriteFailed, .truncated = truncated };
     }
 
-    /// 退出：先对所有 Job 请求取消，再统一 join；无法确认收敛时 fail-stop，
-    /// 既不释放容器，也不把清理失败当成普通成功。
-    pub fn deinit(self: *BackgroundService) void {
+    /// 退出：先对所有 Job 请求取消，再统一 join。无法确认收敛时保留完整 Job
+    /// （含 owned/unreaped PID），返回 error.CleanupUnconfirmed，由调用方报告并
+    /// 决定退出码；这里不得 abort 整个进程（会把整个测试二进制一起带走）。
+    pub fn close(self: *BackgroundService) !void {
         const deps = self.deps orelse {
             std.debug.assert(self.jobs.items.len == 0);
             self.* = .{};
             return;
         };
         for (self.jobs.items) |job| job.cancel.cancel();
-        var unclean = false;
+        var first_unclean: ?*Job = null;
         for (self.jobs.items) |job| {
             const out = self.join(job);
             if (out.cleanup_failed or out.unreaped_pid != null) {
-                unclean = true;
+                if (first_unclean == null) first_unclean = job;
                 continue;
             }
             job.destroy();
         }
-        if (unclean) {
-            std.debug.print("thin: background cleanup unconfirmed; failing stop\n", .{});
-            @panic("background job cleanup unconfirmed");
+        if (first_unclean) |job| {
+            std.debug.print("thin: background cleanup unconfirmed for {s}; owned children were not released\n", .{job.id});
+            return error.CleanupUnconfirmed;
         }
         self.jobs.deinit(deps.allocator);
         self.* = .{};
+    }
+
+    /// defer/teardown 用的收尾：close() 已经打印具体 Job；这里只保证不发生 panic。
+    /// 需要错误语义的调用方（例如 SessionHost.shutdown）应使用 close()。
+    pub fn deinit(self: *BackgroundService) void {
+        self.close() catch {};
     }
 };
 

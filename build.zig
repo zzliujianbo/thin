@@ -111,7 +111,27 @@ pub fn build(b: *std.Build) void {
     });
     addRuntime(b, unit.root_module, ssh_include, ssh_library);
     const run_unit = b.addRunArtifact(unit);
-    b.step("test-unit", "Run product unit tests without network or credentials").dependOn(&run_unit.step);
+    b.step("test-unit-full", "Run the complete unit suite in one process").dependOn(&run_unit.step);
+
+    // Filtered artifacts compile and run top-level groups in parallel. Filters
+    // are substring matches, so anonymous test blocks and a few overlapping
+    // names may repeat; test-unit-full remains the coverage gate. Keep this
+    // list in sync with the inventory test in src/root.zig.
+    const unit_groups = [_]struct { name: []const u8, filters: []const []const u8 }{
+        .{ .name = "ui", .filters = &.{ "ui.", "util.", "presentation.", "tool_metadata_adapter_test." } },
+        .{ .name = "app", .filters = &.{ "app.", "main." } },
+        .{ .name = "daemon", .filters = &.{"daemon."} },
+        .{ .name = "tests", .filters = &.{ "tests.", "Runtime rejected prompts" } },
+        .{ .name = "core", .filters = &.{ "core.", "llm.", "platform.", "tools.", "http_retry_test.", "root." } },
+    };
+    const test_unit = b.step("test-unit", "Run product unit tests in parallel groups");
+    for (unit_groups) |group| {
+        const filtered = b.addTest(.{ .use_llvm = platform_llvm, .root_module = unit.root_module, .filters = group.filters });
+        configureStack(filtered);
+        const run = b.addRunArtifact(filtered);
+        test_unit.dependOn(&run.step);
+        b.step(b.fmt("test-unit-{s}", .{group.name}), b.fmt("Run the {s} unit-test group", .{group.name})).dependOn(&run.step);
+    }
 
     // Filters belong to separate compile artifacts, never to the full unit suite.
     const focus_filter = b.option([]const u8, "test-filter", "Nonempty substring for test-focus");
@@ -321,19 +341,21 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_unit.step);
     test_all.dependOn(&run_memory.step);
     test_all.dependOn(&run_memory_app.step);
-    test_all.dependOn(&run_subagent.step);
     test_all.dependOn(&run_background.step);
     if (target.result.os.tag == .linux) {
         test_all.dependOn(&run_daemon.step);
         test_all.dependOn(&run_subscription.step);
         test_all.dependOn(&run_ssh.step);
+        test_all.dependOn(&run_subagent.step);
         test_all.dependOn(&run.step);
     }
     test_all.dependOn(&run_presentation.step);
-    test_all.dependOn(&run_http.step);
-    test_all.dependOn(&run_anthropic.step);
-    test_all.dependOn(&run_systemone.step);
-    test_all.dependOn(&run_proxy.step);
+    if (target.result.os.tag == .linux) {
+        test_all.dependOn(&run_http.step);
+        test_all.dependOn(&run_anthropic.step);
+        test_all.dependOn(&run_systemone.step);
+        test_all.dependOn(&run_proxy.step);
+    }
     test_all.dependOn(&run_app.step);
     test_all.dependOn(&run_idle_enter.step);
     test_all.dependOn(&run_resume_menu.step);
