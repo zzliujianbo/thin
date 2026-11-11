@@ -1,0 +1,2675 @@
+{
+  "version": 1,
+  "files": [
+    {
+      "virtual": "src/anthropic_http_test_root.zig",
+      "production": null,
+      "support": "tests/roots/anthropic_http_test_root.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/anthropic_http_test_root_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/app/app.zig",
+      "production": "src/app/app.zig",
+      "support": "tests/support/app/app.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/app_test.zig",
+          "container": []
+        },
+        {
+          "path": "tests/unit/app/app_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/auth_store.zig",
+      "production": "src/app/auth_store.zig",
+      "support": "tests/support/app/auth_store.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/auth_store_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/background_service.zig",
+      "production": "src/app/background_service.zig",
+      "support": null,
+      "fragments": [],
+      "group": "app",
+      "unit": false
+    },
+    {
+      "virtual": "src/app/cli.zig",
+      "production": "src/app/cli.zig",
+      "support": "tests/support/app/cli.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/cli_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/codex_device.zig",
+      "production": "src/app/codex_device.zig",
+      "support": "tests/support/app/codex_device.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/codex_device_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/codex_oauth.zig",
+      "production": "src/app/codex_oauth.zig",
+      "support": "tests/support/app/codex_oauth.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/codex_oauth_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/console.zig",
+      "production": "src/app/console.zig",
+      "support": null,
+      "fragments": [],
+      "group": "app",
+      "unit": false
+    },
+    {
+      "virtual": "src/app/decision_client.zig",
+      "production": "src/app/decision_client.zig",
+      "support": "tests/support/app/decision_client.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/decision_client_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/decision_model_selection_test.zig",
+      "production": null,
+      "support": "tests/roots/app/decision_model_selection_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/app/decision_model_selection_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/decision_selection.zig",
+      "production": "src/app/decision_selection.zig",
+      "support": null,
+      "fragments": [],
+      "group": "app",
+      "unit": false
+    },
+    {
+      "virtual": "src/app/global_preferences_test.zig",
+      "production": null,
+      "support": "tests/roots/app/global_preferences_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/app/global_preferences_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/image_client.zig",
+      "production": "src/app/image_client.zig",
+      "support": "tests/support/app/image_client.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/image_client_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/image_model_selection_test.zig",
+      "production": null,
+      "support": "tests/roots/app/image_model_selection_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/app/image_model_selection_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/image_selection.zig",
+      "production": "src/app/image_selection.zig",
+      "support": "tests/support/app/image_selection.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/image_selection_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/image_setup.zig",
+      "production": "src/app/image_setup.zig",
+      "support": null,
+      "fragments": [],
+      "group": "app",
+      "unit": false
+    },
+    {
+      "virtual": "src/app/journal.zig",
+      "production": "src/app/journal.zig",
+      "support": "tests/support/app/journal.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/journal_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/json_bound.zig",
+      "production": "src/app/json_bound.zig",
+      "support": "tests/support/app/json_bound.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/json_bound_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/llm_app_test.zig",
+      "production": null,
+      "support": "tests/roots/app/llm_app_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/app/llm_app_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/llm_session_test.zig",
+      "production": null,
+      "support": "tests/roots/app/llm_session_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/app/llm_session_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/log_store.zig",
+      "production": "src/app/log_store.zig",
+      "support": "tests/support/app/log_store.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/log_store_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/memory_app_test.zig",
+      "production": null,
+      "support": "tests/roots/app/memory_app_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/app/memory_app_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/memory_client.zig",
+      "production": "src/app/memory_client.zig",
+      "support": "tests/support/app/memory_client.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/memory_client_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/memory_lifecycle_test.zig",
+      "production": null,
+      "support": "tests/roots/app/memory_lifecycle_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/app/memory_lifecycle_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": false
+    },
+    {
+      "virtual": "src/app/memory_notifications.zig",
+      "production": "src/app/memory_notifications.zig",
+      "support": "tests/support/app/memory_notifications.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/memory_notifications_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/memory_service.zig",
+      "production": "src/app/memory_service.zig",
+      "support": "tests/support/app/memory_service.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/memory_service_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/memory_service_test.zig",
+      "production": null,
+      "support": "tests/roots/app/memory_service_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/app/memory_service_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/model_directory.zig",
+      "production": "src/app/model_directory.zig",
+      "support": "tests/support/app/model_directory.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/model_directory_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/model_metadata.zig",
+      "production": "src/app/model_metadata.zig",
+      "support": "tests/support/app/model_metadata.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/model_metadata_test.zig",
+          "container": []
+        },
+        {
+          "path": "tests/unit/app/model_metadata_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/model_metadata_directory_test.zig",
+      "production": null,
+      "support": "tests/roots/app/model_metadata_directory_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/app/model_metadata_directory_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/model_resolver.zig",
+      "production": "src/app/model_resolver.zig",
+      "support": "tests/support/app/model_resolver.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/model_resolver_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/models_dev.zig",
+      "production": "src/app/models_dev.zig",
+      "support": "tests/support/app/models_dev.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/models_dev_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/provider_catalog.zig",
+      "production": "src/app/provider_catalog.zig",
+      "support": "tests/support/app/provider_catalog.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/provider_catalog_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/proxy_selection.zig",
+      "production": "src/app/proxy_selection.zig",
+      "support": "tests/support/app/proxy_selection.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/proxy_selection_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/reasoning_defaults.zig",
+      "production": "src/app/reasoning_defaults.zig",
+      "support": "tests/support/app/reasoning_defaults.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/reasoning_defaults_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/resume_codec.zig",
+      "production": "src/app/resume_codec.zig",
+      "support": "tests/support/app/resume_codec.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/resume_codec_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/resume_command.zig",
+      "production": "src/app/resume_command.zig",
+      "support": "tests/support/app/resume_command.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/resume_command_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/resume_store.zig",
+      "production": "src/app/resume_store.zig",
+      "support": "tests/support/app/resume_store.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/resume_store_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/selection.zig",
+      "production": "src/app/selection.zig",
+      "support": "tests/support/app/selection.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/selection_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/session.zig",
+      "production": "src/app/session.zig",
+      "support": "tests/support/app/session.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/session_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        },
+        {
+          "path": "tests/unit/app/session_test.zig",
+          "container": []
+        },
+        {
+          "path": "tests/unit/app/session_Session_test.zig",
+          "container": [
+            "Session"
+          ]
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/session_host.zig",
+      "production": "src/app/session_host.zig",
+      "support": "tests/support/app/session_host.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/session_host_test.zig",
+          "container": []
+        },
+        {
+          "path": "tests/unit/app/session_host_SessionHost_test.zig",
+          "container": [
+            "SessionHost"
+          ]
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/session_id.zig",
+      "production": "src/app/session_id.zig",
+      "support": "tests/support/app/session_id.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/session_id_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/settings_preferences_test.zig",
+      "production": null,
+      "support": "tests/roots/app/settings_preferences_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/app/settings_preferences_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/subagent_progress.zig",
+      "production": "src/app/subagent_progress.zig",
+      "support": "tests/support/app/subagent_progress.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/subagent_progress_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/subagent_service.zig",
+      "production": "src/app/subagent_service.zig",
+      "support": "tests/support/app/subagent_service.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/subagent_service_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app/version.zig",
+      "production": "src/app/version.zig",
+      "support": "tests/support/app/version.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/app/version_test.zig",
+          "container": []
+        }
+      ],
+      "group": "app",
+      "unit": true
+    },
+    {
+      "virtual": "src/app_pty_test_root.zig",
+      "production": null,
+      "support": "tests/roots/app_pty_test_root.zig",
+      "fragments": [],
+      "group": "ui",
+      "unit": false
+    },
+    {
+      "virtual": "src/core/background.zig",
+      "production": "src/core/background.zig",
+      "support": "tests/support/core/background.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/background_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/background_status.zig",
+      "production": "src/core/background_status.zig",
+      "support": "tests/support/core/background_status.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/background_status_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/checkpoint.zig",
+      "production": "src/core/checkpoint.zig",
+      "support": "tests/support/core/checkpoint.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/checkpoint_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/codex_auth.zig",
+      "production": "src/core/codex_auth.zig",
+      "support": "tests/support/core/codex_auth.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/codex_auth_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/codex_login.zig",
+      "production": "src/core/codex_login.zig",
+      "support": "tests/support/core/codex_login.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/codex_login_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/config.zig",
+      "production": "src/core/config.zig",
+      "support": "tests/support/core/config.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/config_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        },
+        {
+          "path": "tests/unit/core/config_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/context.zig",
+      "production": "src/core/context.zig",
+      "support": "tests/support/core/context.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/context_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/decision.zig",
+      "production": "src/core/decision.zig",
+      "support": "tests/support/core/decision.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/decision_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/diagnostics.zig",
+      "production": "src/core/diagnostics.zig",
+      "support": "tests/support/core/diagnostics.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/diagnostics_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/image.zig",
+      "production": "src/core/image.zig",
+      "support": "tests/support/core/image.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/image_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/inbox.zig",
+      "production": "src/core/inbox.zig",
+      "support": "tests/support/core/inbox.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/inbox_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/knowledge.zig",
+      "production": "src/core/knowledge.zig",
+      "support": "tests/support/core/knowledge.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/knowledge_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/knowledge_codec.zig",
+      "production": "src/core/knowledge_codec.zig",
+      "support": "tests/support/core/knowledge_codec.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/knowledge_codec_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/llm_config_test.zig",
+      "production": null,
+      "support": "tests/roots/core/llm_config_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/core/llm_config_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/memory_status.zig",
+      "production": "src/core/memory_status.zig",
+      "support": "tests/support/core/memory_status.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/memory_status_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/protocol.zig",
+      "production": "src/core/protocol.zig",
+      "support": "tests/support/core/protocol.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/protocol_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/providers.zig",
+      "production": "src/core/providers.zig",
+      "support": "tests/support/core/providers.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/providers_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/runtime.zig",
+      "production": "src/core/runtime.zig",
+      "support": "tests/support/core/runtime.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/runtime_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/session_context.zig",
+      "production": "src/core/session_context.zig",
+      "support": null,
+      "fragments": [],
+      "group": "core",
+      "unit": false
+    },
+    {
+      "virtual": "src/core/session_failure.zig",
+      "production": "src/core/session_failure.zig",
+      "support": "tests/support/core/session_failure.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/session_failure_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/session_metadata.zig",
+      "production": "src/core/session_metadata.zig",
+      "support": "tests/support/core/session_metadata.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/session_metadata_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/settings.zig",
+      "production": "src/core/settings.zig",
+      "support": null,
+      "fragments": [],
+      "group": "core",
+      "unit": false
+    },
+    {
+      "virtual": "src/core/skill_catalog.zig",
+      "production": "src/core/skill_catalog.zig",
+      "support": null,
+      "fragments": [],
+      "group": "core",
+      "unit": false
+    },
+    {
+      "virtual": "src/core/subagent.zig",
+      "production": "src/core/subagent.zig",
+      "support": null,
+      "fragments": [],
+      "group": "core",
+      "unit": false
+    },
+    {
+      "virtual": "src/core/subagent_status.zig",
+      "production": "src/core/subagent_status.zig",
+      "support": "tests/support/core/subagent_status.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/subagent_status_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/subagent_test.zig",
+      "production": null,
+      "support": "tests/roots/core/subagent_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/core/subagent_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/systemone.zig",
+      "production": "src/core/systemone.zig",
+      "support": "tests/support/core/systemone.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/systemone_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/task.zig",
+      "production": "src/core/task.zig",
+      "support": null,
+      "fragments": [],
+      "group": "core",
+      "unit": false
+    },
+    {
+      "virtual": "src/core/thinking.zig",
+      "production": "src/core/thinking.zig",
+      "support": "tests/support/core/thinking.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/thinking_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/tool_preview.zig",
+      "production": "src/core/tool_preview.zig",
+      "support": "tests/support/core/tool_preview.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/tool_preview_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/tool_stream.zig",
+      "production": "src/core/tool_stream.zig",
+      "support": "tests/support/core/tool_stream.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/tool_stream_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/core/write_preview.zig",
+      "production": "src/core/write_preview.zig",
+      "support": "tests/support/core/write_preview.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/core/write_preview_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/client.zig",
+      "production": "src/daemon/client.zig",
+      "support": "tests/support/daemon/client.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/client_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/communication.zig",
+      "production": "src/daemon/communication.zig",
+      "support": "tests/support/daemon/communication.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/communication_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/entry.zig",
+      "production": "src/daemon/entry.zig",
+      "support": null,
+      "fragments": [],
+      "group": "daemon",
+      "unit": false
+    },
+    {
+      "virtual": "src/daemon/frontend.zig",
+      "production": "src/daemon/frontend.zig",
+      "support": "tests/support/daemon/frontend.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/frontend_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/protocol.zig",
+      "production": "src/daemon/protocol.zig",
+      "support": "tests/support/daemon/protocol.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/protocol_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/registry.zig",
+      "production": "src/daemon/registry.zig",
+      "support": "tests/support/daemon/registry.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/registry_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/spawn.zig",
+      "production": "src/daemon/spawn.zig",
+      "support": "tests/support/daemon/spawn.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/spawn_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/ssh.zig",
+      "production": "src/daemon/ssh.zig",
+      "support": "tests/support/daemon/ssh.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/ssh_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/stream_receiver.zig",
+      "production": "src/daemon/stream_receiver.zig",
+      "support": "tests/support/daemon/stream_receiver.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/stream_receiver_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/supervisor.zig",
+      "production": "src/daemon/supervisor.zig",
+      "support": "tests/support/daemon/supervisor.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/supervisor_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/unix.zig",
+      "production": "src/daemon/unix.zig",
+      "support": "tests/support/daemon/unix.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/unix_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/daemon/worker.zig",
+      "production": "src/daemon/worker.zig",
+      "support": "tests/support/daemon/worker.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/daemon/worker_test.zig",
+          "container": []
+        }
+      ],
+      "group": "daemon",
+      "unit": true
+    },
+    {
+      "virtual": "src/filesystem_test_root.zig",
+      "production": null,
+      "support": "tests/roots/filesystem_test_root.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/filesystem_test_root_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/http_retry_test.zig",
+      "production": null,
+      "support": "tests/roots/http_retry_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/http_retry_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/http_test_root.zig",
+      "production": null,
+      "support": "tests/roots/http_test_root.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/http_test_root_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/llm/anthropic.zig",
+      "production": "src/llm/anthropic.zig",
+      "support": "tests/support/llm/anthropic.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/llm/anthropic_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/llm/anthropic_test.zig",
+      "production": null,
+      "support": "tests/roots/llm/anthropic_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/llm/anthropic_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/llm/chat.zig",
+      "production": "src/llm/chat.zig",
+      "support": "tests/support/llm/chat.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/llm/chat_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/llm/common.zig",
+      "production": "src/llm/common.zig",
+      "support": null,
+      "fragments": [],
+      "group": "core",
+      "unit": false
+    },
+    {
+      "virtual": "src/llm/decision_http.zig",
+      "production": "src/llm/decision_http.zig",
+      "support": "tests/support/llm/decision_http.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/llm/decision_http_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/llm/http.zig",
+      "production": "src/llm/http.zig",
+      "support": "tests/support/llm/http.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/llm/http_test.zig",
+          "container": []
+        },
+        {
+          "path": "tests/unit/llm/http_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/llm/http_pool.zig",
+      "production": "src/llm/http_pool.zig",
+      "support": "tests/support/llm/http_pool.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/llm/http_pool_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/llm/image_codec.zig",
+      "production": "src/llm/image_codec.zig",
+      "support": "tests/support/llm/image_codec.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/llm/image_codec_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/llm/llm.zig",
+      "production": "src/llm/llm.zig",
+      "support": "tests/support/llm/llm.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/llm/llm_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/llm/responses.zig",
+      "production": "src/llm/responses.zig",
+      "support": "tests/support/llm/responses.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/llm/responses_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/llm/sse.zig",
+      "production": "src/llm/sse.zig",
+      "support": "tests/support/llm/sse.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/llm/sse_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/main.zig",
+      "production": "src/main.zig",
+      "support": "tests/support/main.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/main_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/memory_test_root.zig",
+      "production": null,
+      "support": "tests/roots/memory_test_root.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/memory_test_root_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/platform/anonymous_input.zig",
+      "production": "src/platform/anonymous_input.zig",
+      "support": "tests/support/platform/anonymous_input.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/anonymous_input_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/capabilities.zig",
+      "production": "src/platform/capabilities.zig",
+      "support": "tests/support/platform/capabilities.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/capabilities_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/filesystem.zig",
+      "production": "src/platform/filesystem.zig",
+      "support": "tests/support/platform/filesystem.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/filesystem_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/filesystem_native.zig",
+      "production": "src/platform/filesystem_native.zig",
+      "support": "tests/support/platform/filesystem_native.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/filesystem_native_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/interrupt.zig",
+      "production": "src/platform/interrupt.zig",
+      "support": "tests/support/platform/interrupt.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/interrupt_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/ipc_native.zig",
+      "production": "src/platform/ipc_native.zig",
+      "support": null,
+      "fragments": [],
+      "group": "core",
+      "unit": false
+    },
+    {
+      "virtual": "src/platform/metadata.zig",
+      "production": "src/platform/metadata.zig",
+      "support": "tests/support/platform/metadata.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/metadata_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/posix_terminal.zig",
+      "production": "src/platform/posix_terminal.zig",
+      "support": "tests/support/platform/posix_terminal.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/posix_terminal_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/process.zig",
+      "production": "src/platform/process.zig",
+      "support": "tests/support/platform/process.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/process_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/process_darwin.zig",
+      "production": "src/platform/process_darwin.zig",
+      "support": null,
+      "fragments": [],
+      "group": "core",
+      "unit": false
+    },
+    {
+      "virtual": "src/platform/spawn.zig",
+      "production": "src/platform/spawn.zig",
+      "support": "tests/support/platform/spawn.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/spawn_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/terminal_abi.zig",
+      "production": "src/platform/terminal_abi.zig",
+      "support": "tests/support/platform/terminal_abi.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/terminal_abi_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/terminal_remote.zig",
+      "production": "src/platform/terminal_remote.zig",
+      "support": "tests/support/platform/terminal_remote.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/terminal_remote_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/platform/wakeup.zig",
+      "production": "src/platform/wakeup.zig",
+      "support": "tests/support/platform/wakeup.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/platform/wakeup_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/presentation.zig",
+      "production": "src/presentation.zig",
+      "support": "tests/support/presentation.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/presentation_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/presentation/activity.zig",
+      "production": "src/presentation/activity.zig",
+      "support": "tests/support/presentation/activity.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/presentation/activity_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/presentation/answer.zig",
+      "production": "src/presentation/answer.zig",
+      "support": "tests/support/presentation/answer.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/presentation/answer_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/presentation/failure.zig",
+      "production": "src/presentation/failure.zig",
+      "support": "tests/support/presentation/failure.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/presentation/failure_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/presentation/state.zig",
+      "production": "src/presentation/state.zig",
+      "support": "tests/support/presentation/state.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/presentation/state_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/presentation/tools.zig",
+      "production": "src/presentation/tools.zig",
+      "support": "tests/support/presentation/tools.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/presentation/tools_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/proxy_http_test_root.zig",
+      "production": null,
+      "support": "tests/roots/proxy_http_test_root.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/proxy_http_test_root_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/root.zig",
+      "production": "src/root.zig",
+      "support": "tests/support/root.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/root_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        },
+        {
+          "path": "tests/unit/root_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/systemone_http_test_root.zig",
+      "production": null,
+      "support": "tests/roots/systemone_http_test_root.zig",
+      "fragments": [],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/terminal_test_root.zig",
+      "production": null,
+      "support": "tests/roots/terminal_test_root.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/terminal_test_root_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/tests/adapter_integration_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/adapter_integration_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/adapter_integration_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/adapter_test_support.zig",
+      "production": null,
+      "support": "tests/roots/tests/adapter_test_support.zig",
+      "fragments": [],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/tests/adapters_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/adapters_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/adapters_test_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/tests/anthropic_http_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/anthropic_http_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/anthropic_http_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/tests/app_background_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/app_background_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/app_background_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/app_pty_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/app_pty_test.zig",
+      "fragments": [],
+      "group": "ui",
+      "unit": false
+    },
+    {
+      "virtual": "src/tests/automatic_memory_runtime_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/automatic_memory_runtime_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/automatic_memory_runtime_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/background_service_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/background_service_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/background_service_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/compaction_policy_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/compaction_policy_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/compaction_policy_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/context_usage_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/context_usage_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/context_usage_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/filesystem_portability_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/filesystem_portability_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/filesystem_portability_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/headless_integration_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/headless_integration_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/headless_integration_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/http_integration_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/http_integration_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/http_integration_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/tests/input_budget_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/input_budget_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/input_budget_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/local_command_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/local_command_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/local_command_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/markdown_colors_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/markdown_colors_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/markdown_colors_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/output_budget_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/output_budget_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/output_budget_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/proxy_http_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/proxy_http_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/proxy_http_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/tests/regular_screen.zig",
+      "production": null,
+      "support": "tests/roots/tests/regular_screen.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/regular_screen_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/runtime_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/runtime_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/runtime_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/selection_defaults_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/selection_defaults_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/selection_defaults_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/session_context_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/session_context_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/session_context_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/settings_session_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/settings_session_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/settings_session_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/steering_runtime_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/steering_runtime_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/steering_runtime_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/subagent_app_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/subagent_app_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/subagent_app_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/subagent_service_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/subagent_service_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/subagent_service_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/systemone_http_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/systemone_http_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/systemone_http_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/tests/thinking_contract_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/thinking_contract_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/thinking_contract_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/tool_lifecycle_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/tool_lifecycle_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/tool_lifecycle_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/tools_integration_test.zig",
+      "production": null,
+      "support": "tests/roots/tests/tools_integration_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/tools_integration_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tests/ui_bridge_test_root.zig",
+      "production": null,
+      "support": "tests/roots/tests/ui_bridge_test_root.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tests/ui_bridge_test_root_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tool_metadata_adapter_test.zig",
+      "production": null,
+      "support": "tests/roots/tool_metadata_adapter_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tool_metadata_adapter_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tools/command_risk.zig",
+      "production": "src/tools/command_risk.zig",
+      "support": "tests/support/tools/command_risk.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/tools/command_risk_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/tools/image_file.zig",
+      "production": "src/tools/image_file.zig",
+      "support": "tests/support/tools/image_file.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/tools/image_file_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/tools/knowledge_store.zig",
+      "production": "src/tools/knowledge_store.zig",
+      "support": "tests/support/tools/knowledge_store.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/tools/knowledge_store_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        },
+        {
+          "path": "tests/unit/tools/knowledge_store_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/tools/knowledge_store_test.zig",
+      "production": null,
+      "support": "tests/roots/tools/knowledge_store_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tools/knowledge_store_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tools/memory.zig",
+      "production": "src/tools/memory.zig",
+      "support": "tests/support/tools/memory.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/tools/memory_test.zig",
+          "container": []
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/tools/subagent_tool_test.zig",
+      "production": null,
+      "support": "tests/roots/tools/subagent_tool_test.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/tools/subagent_tool_test_test.zig",
+          "container": []
+        }
+      ],
+      "group": "integration",
+      "unit": true
+    },
+    {
+      "virtual": "src/tools/text_edit.zig",
+      "production": "src/tools/text_edit.zig",
+      "support": "tests/support/tools/text_edit.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/tools/text_edit_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/tools/tools.zig",
+      "production": "src/tools/tools.zig",
+      "support": "tests/support/tools/tools.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/tools/tools_test.zig",
+          "container": []
+        },
+        {
+          "path": "tests/unit/tools/tools_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "core",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/activity.zig",
+      "production": "src/ui/activity.zig",
+      "support": "tests/support/ui/activity.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/activity_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/body_stream.zig",
+      "production": "src/ui/body_stream.zig",
+      "support": null,
+      "fragments": [],
+      "group": "ui",
+      "unit": false
+    },
+    {
+      "virtual": "src/ui/bridge.zig",
+      "production": "src/ui/bridge.zig",
+      "support": "tests/support/ui/bridge.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/bridge_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/command_menu.zig",
+      "production": "src/ui/command_menu.zig",
+      "support": "tests/support/ui/command_menu.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/command_menu_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/composer_layout.zig",
+      "production": "src/ui/composer_layout.zig",
+      "support": "tests/support/ui/composer_layout.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/composer_layout_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/decision_picker.zig",
+      "production": "src/ui/decision_picker.zig",
+      "support": "tests/support/ui/decision_picker.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/decision_picker_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/input.zig",
+      "production": "src/ui/input.zig",
+      "support": "tests/support/ui/input.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/input_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/input_history.zig",
+      "production": "src/ui/input_history.zig",
+      "support": "tests/support/ui/input_history.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/input_history_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/local_command_output.zig",
+      "production": "src/ui/local_command_output.zig",
+      "support": "tests/support/ui/local_command_output.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/local_command_output_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/markdown.zig",
+      "production": "src/ui/markdown.zig",
+      "support": null,
+      "fragments": [],
+      "group": "ui",
+      "unit": false
+    },
+    {
+      "virtual": "src/ui/markdown_writer.zig",
+      "production": "src/ui/markdown_writer.zig",
+      "support": "tests/support/ui/markdown_writer.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/markdown_writer_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/model_picker.zig",
+      "production": "src/ui/model_picker.zig",
+      "support": "tests/support/ui/model_picker.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/model_picker_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/plain_tail.zig",
+      "production": "src/ui/plain_tail.zig",
+      "support": "tests/support/ui/plain_tail.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/plain_tail_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/presentation.zig",
+      "production": "src/ui/presentation.zig",
+      "support": "tests/support/ui/presentation.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/presentation_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/provider_picker.zig",
+      "production": "src/ui/provider_picker.zig",
+      "support": "tests/support/ui/provider_picker.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/provider_picker_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/proxy_picker.zig",
+      "production": "src/ui/proxy_picker.zig",
+      "support": "tests/support/ui/proxy_picker.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/proxy_picker_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/remote_action.zig",
+      "production": "src/ui/remote_action.zig",
+      "support": "tests/support/ui/remote_action.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/remote_action_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/resume_picker.zig",
+      "production": "src/ui/resume_picker.zig",
+      "support": "tests/support/ui/resume_picker.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/resume_picker_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/session_client.zig",
+      "production": "src/ui/session_client.zig",
+      "support": "tests/support/ui/session_client.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/session_client_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/settings_menu.zig",
+      "production": "src/ui/settings_menu.zig",
+      "support": "tests/support/ui/settings_menu.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/settings_menu_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/settings_time.zig",
+      "production": "src/ui/settings_time.zig",
+      "support": "tests/support/ui/settings_time.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/settings_time_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/settings_value_picker.zig",
+      "production": "src/ui/settings_value_picker.zig",
+      "support": "tests/support/ui/settings_value_picker.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/settings_value_picker_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/startup.zig",
+      "production": "src/ui/startup.zig",
+      "support": "tests/support/ui/startup.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/startup_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/stream_prefix.zig",
+      "production": "src/ui/stream_prefix.zig",
+      "support": "tests/support/ui/stream_prefix.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/stream_prefix_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/tail_frame.zig",
+      "production": "src/ui/tail_frame.zig",
+      "support": "tests/support/ui/tail_frame.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/tail_frame_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/terminal.zig",
+      "production": "src/ui/terminal.zig",
+      "support": "tests/support/ui/terminal.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/terminal_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/text.zig",
+      "production": "src/ui/text.zig",
+      "support": "tests/support/ui/text.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/text_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/theme.zig",
+      "production": "src/ui/theme.zig",
+      "support": "tests/support/ui/theme.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/theme_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/tool_views.zig",
+      "production": "src/ui/tool_views.zig",
+      "support": "tests/support/ui/tool_views.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/tool_views_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/tui.zig",
+      "production": "src/ui/tui.zig",
+      "support": "tests/support/ui/tui.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/tui_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/whitelist.zig",
+      "production": "src/ui/whitelist.zig",
+      "support": "tests/support/ui/whitelist.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/whitelist_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
+      "virtual": "src/ui/whitelist_render.zig",
+      "production": "src/ui/whitelist_render.zig",
+      "support": null,
+      "fragments": [],
+      "group": "ui",
+      "unit": false
+    },
+    {
+      "virtual": "src/unified_tool_test_root.zig",
+      "production": null,
+      "support": "tests/roots/unified_tool_test_root.zig",
+      "fragments": [
+        {
+          "path": "tests/integration/unified_tool_test_root_discovery.zig",
+          "container": [],
+          "role": "discovery"
+        }
+      ],
+      "group": "integration",
+      "unit": false
+    },
+    {
+      "virtual": "src/util/display_text.zig",
+      "production": "src/util/display_text.zig",
+      "support": "tests/support/util/display_text.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/util/display_text_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/util/json.zig",
+      "production": "src/util/json.zig",
+      "support": null,
+      "fragments": [],
+      "group": "fast",
+      "unit": false
+    },
+    {
+      "virtual": "src/util/line_stats.zig",
+      "production": "src/util/line_stats.zig",
+      "support": "tests/support/util/line_stats.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/util/line_stats_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    },
+    {
+      "virtual": "src/util/stream_text.zig",
+      "production": "src/util/stream_text.zig",
+      "support": "tests/support/util/stream_text.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/util/stream_text_test.zig",
+          "container": []
+        }
+      ],
+      "group": "fast",
+      "unit": true
+    }
+  ],
+  "assets": [
+    {
+      "virtual": "src/app/models_dev_fixture.json",
+      "source": "tests/fixtures/models_dev_fixture.json"
+    },
+    {
+      "virtual": "src/tests/architecture_table.md",
+      "source": "tests/fixtures/architecture_table.md"
+    }
+  ]
+}

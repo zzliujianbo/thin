@@ -12,11 +12,3 @@ pub const View = state.View;
 pub const ContextSnapshot = state.ContextSnapshot;
 pub const ReasoningEffort = activity.ReasoningEffort;
 pub const FileStats = tools.FileStats;
-
-test {
-    _ = tools;
-    _ = answer;
-    _ = activity;
-    _ = state;
-    _ = failure;
-}

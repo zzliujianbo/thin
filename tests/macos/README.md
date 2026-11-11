@@ -1,6 +1,6 @@
 # macOS 分阶段验证（P0 / P1）
 
-这里保存 [macOS 实施方案](../../docs/macos-support.md) 的独立机制探针与平台子集回归，**不是 `thin` 已兼容 macOS 的证明**。正常产品构建仍限制 Linux；不调用真实模型 API，不启动或安装系统服务，不打开 TCP 监听。
+这里保存 [macOS 实施方案](../../docs/macos-support.md) 的独立机制探针与平台子集回归。当前 Intel Mac 本地产品已合并，支持本地 CLI/TUI，不支持 SSH 或常驻服务。下文测量是原 macOS 分支的历史记录，不是本轮测试迁移后的新 Mac 验收；探针本身不替代产品验收。
 
 当前 macOS 目标仅为本地 CLI/TUI、`--print` 和本地会话/工具功能；SSH、常驻 daemon、launchd 不在范围内。前台必需的内部 worker/Unix IPC 仍须适配，Linux 原有 SSH/daemon 及测试不取消。
 
@@ -13,11 +13,12 @@ zig build test-filesystem -Dplatform-tests-only=true --summary all
 zig build test-filesystem -Dplatform-tests-only=true -Doptimize=ReleaseSmall --summary all
 zig build test-presentation -Dplatform-tests-only=true --summary all
 zig build test-presentation -Dplatform-tests-only=true -Doptimize=ReleaseSmall --summary all
+zig build test-terminal -Dplatform-tests-only=true --summary all
 ```
 
-`test-filesystem` 包含文件系统、认证、checkpoint、Memory 及相关纯模块。`src/tests/filesystem_portability_test.zig` 验证受保护名称的元数据比较、硬链接、无读权限、符号链接/FIFO/设备、目录替换、打开标志和 AGENTS/技能策略。它也进入 Linux 完整 unit 根。
+`test-filesystem` 包含文件系统、认证、checkpoint、Memory 及相关纯模块。`tests` 中的文件系统测试验证受保护名称的元数据比较、硬链接、无读权限、符号链接/FIFO/设备、目录替换、打开标志和 AGENTS/技能策略，也进入 Linux 完整 unit 根。测试源由 `tests/layout.json` 映射，在本地缓存中组合后编译；不要直接对业务 `src` 运行 `zig test`，否则可能得到零测试的假成功。
 
-`platform-tests-only` 不创建产品：默认安装和 install/run 都失败，正常 macOS 产品构建也仍失败；构建边界由 `test_build_mode.py` 验证。不要把本入口的成功解释为本地 CLI/worker 已完成 macOS 适配。后续本地产品须不依赖 libssh，并明确拒绝 daemon/SSH 参数；这些能力开关尚待实现。
+`platform-tests-only` 不创建产品：默认安装和 install/run 都失败；构建边界由 `test_build_mode.py` 验证。正常 Intel Mac 本地产品构建已开放，不依赖 libssh，并明确拒绝 daemon/SSH 参数；本平台子集入口仍不替代完整产品验收。
 
 ## P0：独立机制探针
 
@@ -61,33 +62,17 @@ python3 -B -m unittest discover -s tests/macos -p 'test_*.py' -v
 
 本机对 all-zombie 组发送 KILL 可能返回 EPERM。fixture 清理只在其专用完成管道已 EOF、精确 WNOWAIT 也证明组长已退出时接受；该特例不能直接作为生产清理成功的普遍规则。
 
-## 与现有纯 Zig 测试交叉验证
+## 前端中立测试入口
 
-也可直接检查前端中立模块，等价于上面的受限 test-presentation 入口（仍不是完整产品测试）：
+使用上面的 `zig build test-presentation -Dplatform-tests-only=true` 标准入口；测试通过 layout 与缓存组合恢复，不再直接测试业务源文件。
 
-```sh
-cache=$(mktemp -d)
-zig test src/presentation.zig -fllvm --cache-dir "$cache/debug"
-zig test src/presentation.zig -fllvm -O ReleaseSmall --cache-dir "$cache/small"
-rm -rf "$cache"
-```
+历史分支记录中，本机 Zig 0.17.0 的非 LLVM 产物曾被 dyld 以 `__CONST_ZIG` 段顺序错误拒绝加载。当前 Darwin 构建使用 LLVM；后续本地产品验收记录见主方案 P2。
 
-本机 Zig 0.17.0 的 `-fno-llvm` 产物被 dyld 以 `__CONST_ZIG` 段顺序错误拒绝加载；不要把这个未修复后端当作 Darwin 验收路径。当前 Darwin 独立测试已选择 LLVM；完整生产构建仍待后续 P1/P2。
+## 历史交叉构建说明（未执行目标测试）
 
-## 交叉构建（不执行）
+原分支曾对 Linux x86_64 与 Darwin arm64 测试根作生成、链接或语义检查，结果记录在下文。原始测试根现已迁入 `tests`，旧 raw 命令不再适用。产品 `check` 的跨编译也只证明产品编译，不代表目标平台测试已运行；这些历史结果不扩大当前 Intel Mac 范围。
 
-以下只检查生成/链接或语义编译，不能替代目标机器回归。跨架构测试必须带 `--test-no-exec`，不要尝试在 Intel Mac 上执行 arm64 产物：
-
-```sh
-cache=$(mktemp -d)
-zig test src/filesystem_test_root.zig -lc -fno-llvm -target x86_64-linux-gnu --test-no-exec -femit-bin="$cache/fs-linux" --cache-dir "$cache/linux"
-zig test src/root.zig -lc -fno-llvm -target x86_64-linux-gnu -fno-emit-bin --cache-dir "$cache/linux"
-zig test src/memory_test_root.zig -lc -fno-llvm -target x86_64-linux-gnu -fno-emit-bin --cache-dir "$cache/linux"
-zig test src/filesystem_test_root.zig -lc -fllvm -target aarch64-macos.14.0 --test-no-exec -femit-bin="$cache/fs-arm64" --cache-dir "$cache/arm64"
-rm -rf "$cache"
-```
-
-## 本机验证记录
+## 原 macOS 分支本机验证记录（历史）
 
 环境：macOS 26.7.2 x86_64、Zig 0.17.0、Apple clang 21、Python 3.13.1。
 
@@ -101,11 +86,11 @@ rm -rf "$cache"
 
 ## 尚未证明
 
-- 探针结果不代表生产 `spawn`、前台 IPC、Runtime 或 TUI 已完成移植。SSH、常驻 daemon、launchd 已排除在 macOS 范围之外，不是待补齐的验收项。
+- 这些探针结果本身不证明生产 `spawn`、前台 IPC、Runtime 或 TUI 的验收；本地产品已有后续分支验收记录，见主方案 P2。SSH、常驻 daemon、launchd 已排除在 macOS 范围之外，不是待补齐的验收项。
 - `fork` 只是这里创建实验 fixture 的方式，不代表生产后端已选定多线程 fork。
 - 同 UID 的自有连接不代替跨 UID、real/effective credentials 差异及完整攻击面验证。
 - 目录替换是受控注入，不代表完整并发竞态、socket 叶节点替换、恶意 SCM 消息或资源压力已验收。
 - `LOCAL_PEERPID` 和 fd 归属仍需覆盖生产中所有转交路径；不把 audit token 宣称为冻结的连接时身份。
 - 元数据失败注入不代替真实权限/资源错误测试；探针不覆盖所有 `libproc/sysctl` 截断和进程退出竞态，也不证明生产级父进程监测已正确接入取消流程。
 - 当前机器的通过不代表 Apple Silicon 或最低 macOS 版本通过。
-- 正式合并仍须满足主方案缩减后的 P1–P4、本地模式/不支持参数负向验收，以及 Linux 原有功能回归门槛；不要求 macOS SSH/daemon 测试。
+- 本轮测试源码迁移后的 Mac 回归尚未执行；不得把上述历史记录当作本轮验收，不要求 macOS SSH/daemon 测试。

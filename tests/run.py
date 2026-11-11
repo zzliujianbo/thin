@@ -15,7 +15,14 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-GROUPS = {"focus": "test-focus", "render": "test-render", "interaction": "test-interaction", "communication": "test-communication", "streaming": "test-streaming", "app": "test-app", "full": "test"}
+GROUPS = {
+    "focus": "test-focus", "render": "test-render", "interaction": "test-interaction",
+    "communication": "test-communication", "streaming": "test-streaming", "app": "test-app",
+    "unit": "test-unit", "unit-full": "test-unit-full", "unit-sharded": "test-unit-sharded", "fast": "test-fast",
+    **{f"unit-{group}": f"test-unit-{group}" for group in ("ui", "app", "core", "integration", "daemon")},
+    "full": "test",
+}
+COUNTED_GROUPS = {"focus", "render", "unit", "unit-full", "unit-sharded", "fast", "unit-ui", "unit-app", "unit-core", "unit-integration", "unit-daemon"}
 STACK_BYTES = 32 * 1024 * 1024
 CAP_DROP = "--drop=cap_dac_override,cap_dac_read_search"
 
@@ -92,7 +99,7 @@ def set_child_stack():
     resource.setrlimit(resource.RLIMIT_STACK, (STACK_BYTES, hard))
 
 
-def classify(code, text, focus=False):
+def classify(code, text, focus=False, counted=False, required_runs=0):
     text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
     if code != 0:
         if re.search(r"\berror\.NoMatchingProductTests\b", text):
@@ -102,9 +109,29 @@ def classify(code, text, focus=False):
         if re.search(r"(?i)(TestExpectedEqual|test .* failed|assertion.*failed|test failure|\b\d+ tests? failed\b|run test [^\n]*\b[1-9]\d* fail\b)", text):
             return "assertion_failure"
         return "build_or_infrastructure_or_unknown"
-    if focus:
-        counts = re.findall(r"\b(\d+)/(\d+) tests? passed\b", text)
-        if not any(int(passed) > 0 and int(passed) == int(total) for passed, total in counts):
+    # Progress/diagnostic trees may precede the final build summary. Only
+    # that final summary is authoritative evidence for a successful command.
+    evidence = text.rsplit("Build Summary:", 1)[-1]
+    # A cached test result is not evidence that cases actually ran now.
+    nodes = re.findall(r"(?m)^[ \t│|├└─+`\\-]*run test\b([^\n]*)", evidence)
+    if any(re.search(r"\bcached\b", node) for node in nodes):
+        return "no_positive_test_evidence"
+    if focus or counted or required_runs:
+        if any(re.match(r"\s+(?:\[[^]\n]+\]\s+)?0 pass\b", node) for node in nodes):
+            return "no_positive_test_evidence"
+    if required_runs:
+        expected = {"fast", "ui", "app", "core", "integration", "daemon"}
+        executed = set()
+        for node in nodes:
+            result = re.match(r"\s+\[([^]\n]+)\]\s+([1-9]\d*) pass\b", node)
+            if not result or result[1] not in expected or result[1] in executed or re.search(r"\b[1-9]\d* fail\b", node):
+                return "no_positive_test_evidence"
+            executed.add(result[1])
+        if executed != expected or len(executed) != required_runs:
+            return "no_positive_test_evidence"
+    if focus or counted:
+        counts = re.findall(r"\b(\d+)/(\d+) tests? passed\b", evidence)
+        if not any(int(passed) > 0 and (int(passed) == int(total) if focus else int(passed) <= int(total)) for passed, total in counts):
             return "no_positive_test_evidence"
     return "passed"
 
@@ -168,7 +195,7 @@ def run(argv=None, root=ROOT, executor=subprocess.run):
             code, output = stage("normalization", command, failed_normalization)
         else:
             code, output = stage(args.group, command, lambda: execute(command, preexec_fn=set_child_stack))
-        status = classify(code, output, args.group == "focus")
+        status = classify(code, output, args.group == "focus", args.group in COUNTED_GROUPS, required_runs=6 if args.group == "unit-sharded" else 0)
 
     log_path.write_text("\n".join(outputs), encoding="utf-8")
     try:

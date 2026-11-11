@@ -421,7 +421,3 @@ fn counter(v: j.Value, key: []const u8) !?u64 {
     }
     return error.InvalidUsage;
 }
-
-test {
-    _ = @import("anthropic_test.zig");
-}

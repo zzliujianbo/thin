@@ -22,35 +22,43 @@ pub fn build(b: *std.Build) void {
     const ssh_library = if (target.result.os.tag == .linux) b.option([]const u8, "ssh-library", "Absolute libssh shared-library path (otherwise link system ssh)") else null;
 
     // 可供其他前端直接导入；不链接 TTY 或 libc 宽度实现。
-    const presentation = b.addModule("presentation", .{
+    _ = b.addModule("presentation", .{
         .root_source_file = b.path("src/presentation.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const presentation_tests = b.addTest(.{ .use_llvm = platform_llvm, .root_module = presentation });
-    const run_presentation = b.addRunArtifact(presentation_tests);
+    const all = compose(b, "all");
+    const presentation_tests = b.addTest(.{ .use_llvm = platform_llvm, .root_module = b.createModule(.{
+        .root_source_file = all.path(b, "src/presentation.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    presentation_tests.step.dependOn(&all.run.step);
+    const run_presentation = runTest(b, presentation_tests);
     b.step("test-presentation", "Run frontend-neutral presentation tests without terminal or libc").dependOn(&run_presentation.step);
 
     const filesystem_tests = b.addTest(.{
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/filesystem_test_root.zig"),
+            .root_source_file = all.path(b, "src/filesystem_test_root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    b.step("test-filesystem", "Run POSIX file, auth, checkpoint and Memory regressions without SSH or TTY").dependOn(&b.addRunArtifact(filesystem_tests).step);
+    filesystem_tests.step.dependOn(&all.run.step);
+    b.step("test-filesystem", "Run POSIX file, auth, checkpoint and Memory regressions without SSH or TTY").dependOn(&runTest(b, filesystem_tests).step);
 
     const terminal_tests = b.addTest(.{
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/terminal_test_root.zig"),
+            .root_source_file = all.path(b, "src/terminal_test_root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
+    terminal_tests.step.dependOn(&all.run.step);
     addRuntime(b, terminal_tests.root_module, ssh_include, ssh_library);
     const terminal_headers = b.addExecutable(.{
         .name = "thin-terminal-sdk-probe",
@@ -62,8 +70,8 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     const terminal_step = b.step("test-terminal", "Run owned PTY, locale, wakeup and libc-header ABI checks");
-    terminal_step.dependOn(&b.addRunArtifact(terminal_tests).step);
-    terminal_step.dependOn(&b.addRunArtifact(terminal_headers).step);
+    terminal_step.dependOn(&runTest(b, terminal_tests).step);
+    terminal_step.dependOn(&runTest(b, terminal_headers).step);
     for ([_]*std.Build.Step.Compile{ presentation_tests, filesystem_tests, terminal_tests, terminal_headers }) |artifact| configureStack(artifact);
 
     if (platform_only) {
@@ -103,34 +111,58 @@ pub fn build(b: *std.Build) void {
     const unit = b.addTest(.{
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
+            .root_source_file = all.path(b, "src/root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
+    unit.step.dependOn(&all.run.step);
     addRuntime(b, unit.root_module, ssh_include, ssh_library);
-    const run_unit = b.addRunArtifact(unit);
+    const run_unit = runTest(b, unit);
     b.step("test-unit-full", "Run the complete unit suite in one process").dependOn(&run_unit.step);
 
-    // Filtered artifacts compile and run top-level groups in parallel. Filters
-    // are substring matches, so anonymous test blocks and a few overlapping
-    // names may repeat; test-unit-full remains the coverage gate. Keep this
-    // list in sync with the inventory test in src/root.zig.
-    const unit_groups = [_]struct { name: []const u8, filters: []const []const u8 }{
-        .{ .name = "ui", .filters = &.{ "ui.", "util.", "presentation.", "tool_metadata_adapter_test." } },
-        .{ .name = "app", .filters = &.{ "app.", "main." } },
-        .{ .name = "daemon", .filters = &.{"daemon."} },
-        .{ .name = "tests", .filters = &.{ "tests.", "Runtime rejected prompts" } },
-        .{ .name = "core", .filters = &.{ "core.", "llm.", "platform.", "tools.", "http_retry_test.", "root." } },
-    };
-    const test_unit = b.step("test-unit", "Run product unit tests in parallel groups");
-    for (unit_groups) |group| {
-        const filtered = b.addTest(.{ .use_llvm = platform_llvm, .root_module = unit.root_module, .filters = group.filters });
-        configureStack(filtered);
-        const run = b.addRunArtifact(filtered);
-        test_unit.dependOn(&run.step);
-        b.step(b.fmt("test-unit-{s}", .{group.name}), b.fmt("Run the {s} unit-test group", .{group.name})).dependOn(&run.step);
+    b.step("test-unit", "Run the complete unit suite in one process").dependOn(&run_unit.step);
+    const sharded = b.step("test-unit-sharded", "Run Linux unit owner shards with standard runners");
+    if (target.result.os.tag != .linux)
+        sharded.dependOn(&b.addFail("test-unit-sharded is Linux-only; use test-fast or test-unit-full on macOS").step);
+    const shard_inventory: ?*std.Build.Step.Run = if (target.result.os.tag == .linux) guard: {
+        const guard = b.addSystemCommand(&.{"python3"});
+        guard.addFileArg(b.path("tests/tools/verify_shards.py"));
+        guard.addArg("--full");
+        guard.addArtifactArg(unit);
+        guard.has_side_effects = true;
+        guard.setCwd(b.path("."));
+        break :guard guard;
+    } else null;
+    for ([_][]const u8{ "fast", "ui", "app", "core", "integration", "daemon" }) |group| {
+        const variant = compose(b, group);
+        const grouped = b.addTest(.{ .use_llvm = platform_llvm, .root_module = b.createModule(.{
+            .root_source_file = variant.path(b, "src/__test_group_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }) });
+        grouped.step.dependOn(&variant.run.step);
+        if (!std.mem.eql(u8, group, "fast")) addRuntime(b, grouped.root_module, ssh_include, ssh_library);
+        configureStack(grouped);
+        const name = if (std.mem.eql(u8, group, "fast")) "test-fast" else b.fmt("test-unit-{s}", .{group});
+        const run_group = runTest(b, grouped);
+        run_group.step.name = b.fmt("run test [{s}]", .{group});
+        const group_step = b.step(name, b.fmt("Run the {s} test selection", .{group}));
+        if (std.mem.eql(u8, group, "daemon") and target.result.os.tag != .linux) {
+            group_step.dependOn(&b.addFail("test-unit-daemon is Linux-only").step);
+        } else group_step.dependOn(&run_group.step);
+        if (shard_inventory) |guard| {
+            guard.addArgs(&.{ "--shard", group });
+            guard.addArtifactArg(grouped);
+            // Keep inventory/full compilation local to the sharded entry;
+            // individual owner runs must remain independent and lightweight.
+            const guarded_run = runTest(b, grouped);
+            guarded_run.step.name = b.fmt("run test [{s}]", .{group});
+            guarded_run.step.dependOn(&guard.step);
+            sharded.dependOn(&guarded_run.step);
+        }
     }
 
     // Filters belong to separate compile artifacts, never to the full unit suite.
@@ -140,35 +172,39 @@ pub fn build(b: *std.Build) void {
         if (std.mem.trim(u8, filter, " \t\r\n").len != 0) {
             const focused = b.addTest(.{ .use_llvm = platform_llvm, .root_module = unit.root_module, .filters = &.{filter} });
             configureStack(focused);
-            focus_step.dependOn(&b.addRunArtifact(focused).step);
+            focused.step.dependOn(&all.run.step);
+            focus_step.dependOn(&runTest(b, focused).step);
         } else focus_step.dependOn(&b.addFail("test-focus requires a nonempty -Dtest-filter").step);
     } else focus_step.dependOn(&b.addFail("test-focus requires a nonempty -Dtest-filter").step);
     const rendering = b.addTest(.{ .use_llvm = platform_llvm, .root_module = unit.root_module, .filters = &.{ "ui.", "util.display_text." } });
-    b.step("test-render", "Run rendering-related unit tests").dependOn(&b.addRunArtifact(rendering).step);
+    rendering.step.dependOn(&all.run.step);
+    b.step("test-render", "Run rendering-related unit tests").dependOn(&runTest(b, rendering).step);
 
     const memory_tests = b.addTest(.{
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/memory_test_root.zig"),
+            .root_source_file = all.path(b, "src/memory_test_root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
+    memory_tests.step.dependOn(&all.run.step);
     addNative(b, memory_tests.root_module);
-    const run_memory = b.addRunArtifact(memory_tests);
+    const run_memory = runTest(b, memory_tests);
     b.step("test-memory", "Run bounded automatic-memory offline regressions").dependOn(&run_memory.step);
 
     const http_tests = b.addTest(.{
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/http_test_root.zig"),
+            .root_source_file = all.path(b, "src/http_test_root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
 
+    http_tests.step.dependOn(&all.run.step);
     addNative(b, http_tests.root_module);
     // HTTP/SSE 测试需要本地 mock 服务：由 Node 脚本启动服务，并把编译好的测试程序作为参数传入。
     const run_http = fixture(b, "node", "tests/product/http_mock.mjs", &.{http_tests}, &.{});
@@ -177,12 +213,13 @@ pub fn build(b: *std.Build) void {
     const proxy_tests = b.addTest(.{
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/proxy_http_test_root.zig"),
+            .root_source_file = all.path(b, "src/proxy_http_test_root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
+    proxy_tests.step.dependOn(&all.run.step);
     addNative(b, proxy_tests.root_module);
     const run_proxy = fixture(b, "node", "tests/product/proxy_mock.mjs", &.{proxy_tests}, &.{});
     b.step("test-proxy", "Run owned allowlisted HTTP CONNECT and destination TLS fixtures").dependOn(&run_proxy.step);
@@ -190,12 +227,13 @@ pub fn build(b: *std.Build) void {
     const systemone_tests = b.addTest(.{
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/systemone_http_test_root.zig"),
+            .root_source_file = all.path(b, "src/systemone_http_test_root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
+    systemone_tests.step.dependOn(&all.run.step);
     addNative(b, systemone_tests.root_module);
     const run_systemone = fixture(b, "node", "tests/product/systemone_mock.mjs", &.{systemone_tests}, &.{});
     b.step("test-systemone", "Run owned SystemOne/curl HTTP, proxy and TLS fixtures").dependOn(&run_systemone.step);
@@ -203,12 +241,13 @@ pub fn build(b: *std.Build) void {
     const anthropic_tests = b.addTest(.{
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/anthropic_http_test_root.zig"),
+            .root_source_file = all.path(b, "src/anthropic_http_test_root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
+    anthropic_tests.step.dependOn(&all.run.step);
     addNative(b, anthropic_tests.root_module);
     const run_anthropic = fixture(b, "node", "tests/product/anthropic_mock.mjs", &.{anthropic_tests}, &.{});
     b.step("test-anthropic", "Run isolated Anthropic Messages HTTP/SSE fixtures").dependOn(&run_anthropic.step);
@@ -231,18 +270,20 @@ pub fn build(b: *std.Build) void {
     const run = fixture(b, "node", "tests/probes/runner.mjs", &.{probes}, &.{});
     b.step("test-probes", "Run local Linux I/O probes (requires Node and OpenSSL)").dependOn(&run.step);
 
-    // PTY 验收驱动：独立可执行文件，入口见 src/app_pty_test_root.zig。
+    // PTY 验收驱动只恢复测试辅助声明。
+    const driver = compose(b, "driver");
     const pty_driver = b.addExecutable(.{
         .name = "thin-app-pty",
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/app_pty_test_root.zig"),
+            .root_source_file = driver.path(b, "src/app_pty_test_root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
 
+    pty_driver.step.dependOn(&driver.run.step);
     addRuntime(b, pty_driver.root_module, ssh_include, ssh_library);
 
     const run_ssh = fixture(b, "python3", "tests/product/ssh_mock.py", &.{exe}, &.{});
@@ -328,46 +369,84 @@ pub fn build(b: *std.Build) void {
     interaction.dependOn(&run_command.step);
     const communication = b.step("test-communication", "Run subscription, daemon and SSH fixtures");
     if (target.result.os.tag == .linux) {
-        communication.dependOn(&run_subscription.step);
-        communication.dependOn(&run_daemon.step);
-        communication.dependOn(&run_ssh.step);
+        const communication_daemon = fixture(b, "python3", "tests/product/daemon_mock.py", &.{exe}, &.{});
+        communication_daemon.step.dependOn(&run_subscription.step);
+        communication_daemon.step.dependOn(&run_ssh.step);
+        communication.dependOn(&communication_daemon.step);
     } else communication.dependOn(&b.addFail("Daemon/SSH communication fixtures are Linux-only").step);
 
-    // The workflow's own offline unit tests are part of the complete gate.
-    const workflow_tests = b.addSystemCommand(&.{ "python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_workflow.py" });
+    // Root-level offline tooling selftests are part of the complete gate.
+    const workflow_tests = b.addSystemCommand(&.{ "python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py" });
+    workflow_tests.has_side_effects = true;
     // 聚合步骤 `zig build test`：依次挂载所有离线测试（不含需要真实 API 的内容）。
     const test_all = b.step("test", "Run all offline unit, transport, application and foundation tests");
-    test_all.dependOn(&workflow_tests.step);
-    test_all.dependOn(&run_unit.step);
-    test_all.dependOn(&run_memory.step);
-    test_all.dependOn(&run_memory_app.step);
-    test_all.dependOn(&run_background.step);
+    // Isolate the daemon latency gate only within this entry. Individual
+    // targets retain their own lightweight graph, without global scheduling.
+    const full_prerequisites = if (target.result.os.tag == .linux) gate: {
+        const full_daemon = fixture(b, "python3", "tests/product/daemon_mock.py", &.{exe}, &.{});
+        test_all.dependOn(&full_daemon.step);
+        break :gate &full_daemon.step;
+    } else test_all;
+    full_prerequisites.dependOn(&workflow_tests.step);
+    full_prerequisites.dependOn(&run_unit.step);
+    full_prerequisites.dependOn(&run_memory.step);
+    full_prerequisites.dependOn(&run_memory_app.step);
+    full_prerequisites.dependOn(&run_background.step);
     if (target.result.os.tag == .linux) {
-        test_all.dependOn(&run_daemon.step);
-        test_all.dependOn(&run_subscription.step);
-        test_all.dependOn(&run_ssh.step);
-        test_all.dependOn(&run_subagent.step);
-        test_all.dependOn(&run.step);
+        full_prerequisites.dependOn(&run_subscription.step);
+        full_prerequisites.dependOn(&run_ssh.step);
+        full_prerequisites.dependOn(&run_subagent.step);
+        full_prerequisites.dependOn(&run.step);
     }
-    test_all.dependOn(&run_presentation.step);
+    full_prerequisites.dependOn(&run_presentation.step);
     if (target.result.os.tag == .linux) {
-        test_all.dependOn(&run_http.step);
-        test_all.dependOn(&run_anthropic.step);
-        test_all.dependOn(&run_systemone.step);
-        test_all.dependOn(&run_proxy.step);
+        full_prerequisites.dependOn(&run_http.step);
+        full_prerequisites.dependOn(&run_anthropic.step);
+        full_prerequisites.dependOn(&run_systemone.step);
+        full_prerequisites.dependOn(&run_proxy.step);
     }
-    test_all.dependOn(&run_app.step);
-    test_all.dependOn(&run_idle_enter.step);
-    test_all.dependOn(&run_resume_menu.step);
-    test_all.dependOn(&run_memory_background.step);
-    test_all.dependOn(&run_resize.step);
-    test_all.dependOn(viewport_step);
-    test_all.dependOn(&run_settings.step);
-    test_all.dependOn(&run_command.step);
-    test_all.dependOn(&run_approval_cancel.step);
-    test_all.dependOn(&run_tool_preview.step);
-    test_all.dependOn(&run_queued.step);
+    full_prerequisites.dependOn(&run_app.step);
+    full_prerequisites.dependOn(&run_idle_enter.step);
+    full_prerequisites.dependOn(&run_resume_menu.step);
+    full_prerequisites.dependOn(&run_memory_background.step);
+    full_prerequisites.dependOn(&run_resize.step);
+    full_prerequisites.dependOn(viewport_step);
+    full_prerequisites.dependOn(&run_settings.step);
+    full_prerequisites.dependOn(&run_command.step);
+    full_prerequisites.dependOn(&run_approval_cancel.step);
+    full_prerequisites.dependOn(&run_tool_preview.step);
+    full_prerequisites.dependOn(&run_queued.step);
     for ([_]*std.Build.Step.Compile{ exe, unit, rendering, memory_tests, http_tests, proxy_tests, systemone_tests, anthropic_tests, probes, pty_driver }) |artifact| configureStack(artifact);
+}
+
+const Composed = struct {
+    run: *std.Build.Step.Run,
+    directory: std.Build.LazyPath,
+
+    fn path(self: Composed, b: *std.Build, name: []const u8) std.Build.LazyPath {
+        return self.directory.path(b, name);
+    }
+};
+
+fn compose(b: *std.Build, group: []const u8) Composed {
+    const project_root = b.root.root_dir.handle.realPathFileAlloc(b.graph.io, if (b.root.sub_path.len == 0) "." else b.root.sub_path, b.allocator) catch @panic("cannot canonicalize test project root");
+    const project_id = std.hash.Wyhash.hash(0, project_root);
+    const directory = std.Build.LazyPath.cache_root.path(b, b.fmt("generated-tests/{x}/{s}", .{ project_id, group }));
+    const run = b.addSystemCommand(&.{ "python3", "tests/tools/compose.py", "--layout", "tests/layout.json", "--out" });
+    run.addDirectoryArg(directory);
+    run.addArgs(&.{ "--group", group });
+    run.setCwd(b.path("."));
+    // Dynamic manifest and source inputs are read on every invocation. The
+    // composer writes only changed files, preserving compiler cache hits.
+    run.has_side_effects = true;
+    return .{ .run = run, .directory = directory };
+}
+
+fn runTest(b: *std.Build, artifact: *std.Build.Step.Compile) *std.Build.Step.Run {
+    const run = b.addRunArtifact(artifact);
+    // Reuse compiled binaries, not prior test results.
+    run.has_side_effects = true;
+    return run;
 }
 
 fn configureStack(artifact: *std.Build.Step.Compile) void {
@@ -390,6 +469,7 @@ fn fixture(
     args: []const []const u8,
 ) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{runner});
+    run.has_side_effects = true;
     run.addFileArg(b.path(script));
     for (artifacts) |artifact| run.addArtifactArg(artifact);
     for (args) |arg| run.addArg(arg);

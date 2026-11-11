@@ -33,7 +33,7 @@ const watchdogOnly = appArg === '--watchdog-test';
 assert(watchdogOnly || (appArg && ptyArg), 'usage: app_mock.mjs <thin executable> <PTY executable>');
 // 转为绝对路径，避免子进程切换 cwd 后相对路径失效。
 const app = resolve(appArg), pty = resolve(ptyArg ?? appArg);
-const architectureTable = await readFile(new URL('../../src/tests/architecture_table.md', import.meta.url), 'utf8');
+const architectureTable = await readFile(new URL('../fixtures/architecture_table.md', import.meta.url), 'utf8');
 
 // 假 API 密钥：通过 Authorization 头发送给伪造服务，并断言它不会出现在任何捕获的输出中。
 const KEY = 'fixture-secret-never-log';

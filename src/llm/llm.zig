@@ -145,132 +145,16 @@ pub fn hasModelHistory(messages: []const p.Message) bool {
     return false;
 }
 
-/// 测试用假模型：记录每次调用的协议，并可按配置返回协议不支持的失败。
-const Fake = struct {
-    calls: usize = 0,
-    kind: p.FailureKind = .unsupported_protocol,
-    delta: bool = false,
-    fail_chat: bool = false,
-    /// 按调用顺序记录每次请求使用的协议。
-    protocols: [4]p.Protocol = undefined,
+// 测试用假模型：记录每次调用的协议，并可按配置返回协议不支持的失败。
 
-    /// 假调用：protocol 为 responses 或 fail_chat 为真时返回失败，否则返回成功。
-    fn call(context: *anyopaque, _: std.mem.Allocator, request: p.Request, sink: p.ModelSink) !p.Outcome {
-        const self: *Fake = @ptrCast(@alignCast(context));
-        self.protocols[self.calls] = request.scope.protocol;
-        self.calls += 1;
-
-        if (self.delta) try sink.emit(.{ .reasoning_delta = "reason" });
-
-        if (request.scope.protocol == .responses or self.fail_chat) return .{ .failure = .{
-            .kind = self.kind,
-            .message = "fake rejection",
-            .usage = .{ .input_tokens = 7 },
-        } };
-
-        return .{ .success = .{
-            .message = .{ .role = .assistant, .blocks = &.{.{ .text = "ok" }} },
-            .finish = .stop,
-        } };
-    }
-
-    /// 包装成 p.Model 接口供 Selector 调用。
-    fn model(self: *Fake) p.Model {
-        return .{ .context = self, .call_fn = call };
-    }
-};
-
-/// 构造最小测试请求：auto 协议、普通用途、无历史消息。
-fn testRequest() p.Request {
-    return .{
-        .scope = .{ .connection = "http://localhost", .model = "fixture", .protocol = .auto },
-        .system = "fixed",
-        .tools = &.{},
-        .messages = &.{.{ .role = .user, .blocks = &.{.{ .text = "hello" }} }},
-    };
-}
-
-test "SystemOne is never sent to the generative model or fallback" {
-    var selector = Selector.init(.systemone);
-    var fake = Fake{};
-    const result = try selector.call(fake.model(), std.testing.allocator, testRequest(), .{});
-    try std.testing.expectEqual(@as(u8, 0), result.calls);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expect(!result.fallback);
-    try std.testing.expectEqual(p.FailureKind.unsupported_protocol, result.outcome.failure.kind);
-    selector = Selector.init(.auto);
-    var request = testRequest();
-    request.scope.protocol = .systemone;
-    const automatic = try selector.call(fake.model(), std.testing.allocator, request, .{});
-    try std.testing.expectEqual(@as(u8, 0), automatic.calls);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expect(!selector.initial_attempted);
-}
+// 构造最小测试请求：auto 协议、普通用途、无历史消息。
 
 // 验证：auto 首次 Responses 失败后回退 Chat 一次，且即使 Chat 失败也保持 Chat。
-test "auto falls back once and remains pinned even when Chat fails" {
-    var selector = Selector.init(.auto);
-    var fake = Fake{ .fail_chat = true };
-    const first = try selector.call(fake.model(), std.testing.allocator, testRequest(), .{});
-    try std.testing.expect(first.fallback);
-    try std.testing.expectEqual(@as(u8, 2), first.calls);
-    try std.testing.expectEqual(@as(?u64, 7), first.fallback_usage.?.input_tokens);
-    try std.testing.expectEqual(p.Protocol.responses, fake.protocols[0]);
-    try std.testing.expectEqual(p.Protocol.chat, fake.protocols[1]);
-    _ = try selector.call(fake.model(), std.testing.allocator, testRequest(), .{});
-    try std.testing.expectEqual(@as(usize, 3), fake.calls);
-    try std.testing.expectEqual(p.Protocol.chat, fake.protocols[2]);
-}
 
 // 验证：显式协议不回退；已输出内容后不回退。
-test "explicit protocols and content never permit auto fallback" {
-    var explicit = Selector.init(.responses);
-    var fake = Fake{};
-    _ = try explicit.call(fake.model(), std.testing.allocator, testRequest(), .{});
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-
-    var automatic = Selector.init(.auto);
-    fake = .{ .delta = true };
-    _ = try automatic.call(fake.model(), std.testing.allocator, testRequest(), .{});
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(p.Protocol.responses, automatic.selected.?);
-}
 
 // 验证：普通错误（非协议不支持）会关闭首次选择窗口，之后不再回退。
-test "ordinary errors cannot reopen the initial selection window" {
-    var selector = Selector.init(.auto);
-    var fake = Fake{ .kind = .authentication };
-    _ = try selector.call(fake.model(), std.testing.allocator, testRequest(), .{});
-    fake.kind = .unsupported_protocol;
-    const next = try selector.call(fake.model(), std.testing.allocator, testRequest(), .{});
-    try std.testing.expect(!next.fallback);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
-}
 
 // 验证：摘要请求在未选定时报错；已有模型历史时不改变协议选择。
-test "summary and existing model history cannot select a new protocol" {
-    var selector = Selector.init(.auto);
-    var fake = Fake{};
-    var request = testRequest();
-    request.purpose = .summary;
-    try std.testing.expectError(error.ProtocolNotSelected, selector.call(fake.model(), std.testing.allocator, request, .{}));
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    request.purpose = .normal;
-    request.messages = &.{.{ .role = .assistant, .blocks = &.{.{ .text = "prior" }} }};
-    const result = try selector.call(fake.model(), std.testing.allocator, request, .{});
-    try std.testing.expect(!result.fallback);
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-}
 
 // 验证：调用前已取消时不访问模型。
-test "pre-cancelled calls do not use a model" {
-    var selector = Selector.init(.auto);
-    var fake = Fake{};
-    var cancellation = p.Cancellation{};
-    cancellation.cancel();
-    var request = testRequest();
-    request.cancellation = &cancellation;
-    const result = try selector.call(fake.model(), std.testing.allocator, request, .{});
-    try std.testing.expectEqual(@as(u8, 0), result.calls);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-}

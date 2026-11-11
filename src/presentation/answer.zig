@@ -1,5 +1,5 @@
 //! 正文语义分类，不包含标题颜色/Markdown/HTML，也不将显示标签写入协议正文。
-const std = @import("std");
+
 const p = @import("../core/protocol.zig");
 
 pub const Kind = enum { intermediate, final, incomplete };
@@ -9,11 +9,4 @@ pub const Kind = enum { intermediate, final, incomplete };
 pub fn classify(blocks: []const p.Block, blocks_complete: bool) Kind {
     for (blocks) |block| if (block == .tool_call) return .intermediate;
     return if (blocks_complete) .final else .incomplete;
-}
-
-test "shared canonical classification cannot promote truncated tools to final answer" {
-    const text = [_]p.Block{.{ .text = "answer" }};
-    try std.testing.expectEqual(Kind.final, classify(&text, true));
-    try std.testing.expectEqual(Kind.incomplete, classify(&text, false));
-    try std.testing.expectEqual(Kind.intermediate, classify(&.{.{ .tool_call = .{ .id = "id", .name = "bash", .arguments = "{}" } }}, true));
 }

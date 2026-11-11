@@ -1,0 +1,728 @@
+test "pending model has no low price marker while global defaults and explicit optout stay unchanged" {
+    for ([_][]const u8{ "{}", "{\"low_price_input\":true}", "{\"low_price_input\":false}" }) |limits| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [4096]u8 = undefined;
+        const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+        const raw = try std.mem.concat(a, u8, &.{ "{\"llm\":{\"default\":\"local/m\",\"providers\":{\"local\":{\"base_url\":\"https://fixture.invalid/v1\",\"api_key_env\":\"MISSING_LOCAL_FIXTURE_KEY\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":32768}}}}},\"limits\":", limits, "}" });
+        defer a.free(raw);
+        try save(home, raw);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+        defer session.deinit();
+        const state = session.connection().current();
+        try std.testing.expectEqual(std.mem.find(u8, limits, "false") == null, session.global_config.?.value.limits.low_price_input);
+        try std.testing.expect(!state.low_price_input);
+        try std.testing.expect(state.runtime == null); // Still pending, no inference.
+    }
+}
+test "current model marker needs enabled known price step rather than flat unknown or a model name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home,
+        \\{"llm":{"default":"route/fixture","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-local-only","models":{"fixture":{"protocol":"chat","context_tokens":1000000}}}}}}
+    );
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    try std.testing.expect(session.app != null);
+    const active = &session.app.?.config.value;
+    const context = @import("../core/context.zig");
+    const cases = [_]struct { name: []const u8, step: ?u32, flat: ?u32, marker: bool }{
+        .{ .name = "deepseek-flash", .step = null, .flat = 1000000, .marker = false },
+        .{ .name = "claude-haiku-5-5", .step = 100000, .flat = null, .marker = true },
+        .{ .name = "claude-haiku-5-5", .step = null, .flat = null, .marker = false },
+        .{ .name = "unrelated-name", .step = 100000, .flat = null, .marker = true },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |enabled| {
+        // Synthetic resolved capabilities, never written to disk or fetched.
+        active.model.name = case.name;
+        active.model.input_price_threshold = case.step;
+        active.model.input_price_flat_limit = case.flat;
+        active.limits.low_price_input = enabled;
+        const budget = context.inputBudget(active.*);
+        const state = session.connection().current();
+        try std.testing.expectEqual(enabled and case.marker, state.low_price_input);
+        try std.testing.expectEqual(@as(u32, 1000000), state.context_limit);
+        try std.testing.expectEqual(enabled, active.limits.low_price_input);
+        try std.testing.expectEqual(budget, context.inputBudget(active.*));
+        if (enabled and case.step == null and case.flat == null)
+            try std.testing.expectError(error.UnknownInputPriceThreshold, context.validateInputPolicy(active.*));
+    };
+    active.limits.low_price_input = true;
+    active.selection_pending = true;
+    try std.testing.expect(!session.connection().current().low_price_input);
+}
+test "restored known price history has no L without ready runtime for missing key or readonly lease" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const declaration =
+        \\{"llm":{"default":"go/fixture","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key_env":"MARKER_FIXTURE_KEY","models":{"fixture":{"protocol":"chat","context_tokens":65536}}}}}}
+    ;
+    try save(home, declaration);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("MARKER_FIXTURE_KEY", "fake-owned-marker-key");
+    {
+        var store = try Store.openExisting(a, io, home);
+        defer store.deinit();
+        var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"fixture\",\"protocol\":\"chat\",\"context_window\":65536}]}", .opencode_go);
+        listing.dev_done = true;
+        const row = &listing.directory.rows[0];
+        row.dev_present = true;
+        row.dev_protocol = .chat;
+        row.dev_context_tokens = 65536;
+        row.dev_input_price_threshold = 20000;
+        _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+    }
+    var id: @import("session_id.zig").Id = undefined;
+    {
+        var source = try Session.initWithOptions(a, io, &env, home, .{}, .{});
+        defer source.deinit();
+        id = source.session_id;
+        const app = source.app.?;
+        try std.testing.expect(source.connection().current().low_price_input);
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "owned marker history" }} });
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .assistant, .blocks = &.{.{ .text = "owned marker answer" }} });
+        try std.testing.expect(try source.saveOnExit());
+    }
+    {
+        var holder = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id });
+        defer holder.deinit();
+        try std.testing.expect(holder.app != null and holder.resume_lease.?.writable);
+        var readonly = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id });
+        defer readonly.deinit();
+        try expectInactiveHistoryWithoutLowPriceMarker(&readonly, true);
+    }
+    var missing_env = std.process.Environ.Map.init(a);
+    defer missing_env.deinit();
+    try missing_env.put("HOME", home);
+    var missing = try Session.initWithOptions(a, io, &missing_env, home, .{}, .{ .resume_session = id });
+    defer missing.deinit();
+    try expectInactiveHistoryWithoutLowPriceMarker(&missing, false);
+}
+test "publication current capabilities stay isolated by model and route" {
+    const resolver = @import("model_resolver.zig");
+    var parsed = try cfg.parse(a,
+        \\{"llm":{"default":"go/fresh","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","models":{"manual":{"context_tokens":65536},"conflict":{"protocol":"responses","context_tokens":65536},"probe":{"protocol":"auto","context_tokens":65536}}}}}}
+    );
+    defer cfg.release(&parsed);
+    var cache: metadata.Cache = .{};
+    const row = try cache.directory.upsert(.opencode_go, "fresh");
+    row.available = true;
+    row.protocol = .responses;
+    row.tokens = 1000000;
+    row.output_tokens = 128000;
+    row.dev_protocol = .responses;
+    row.dev_context_tokens = 1000000;
+    row.dev_output_tokens = 128000;
+    row.dev_input_price_threshold = 200000;
+    cache.directory_mask = metadata.bit(.opencode_go);
+    const current = try resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "fresh", false);
+    try std.testing.expectEqual(.responses, current.model.protocol);
+    try std.testing.expectEqual(@as(u32, 1000000), current.model.context_tokens);
+    try std.testing.expectEqual(@as(?u32, 128000), current.model.output_tokens);
+    try std.testing.expectEqual(@as(?u32, 200000), current.model.input_price_threshold);
+    // Explicit route/context on another raw ID cannot inherit fresh's capabilities.
+    const isolated = try resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "conflict", false);
+    try std.testing.expectEqual(.responses, isolated.model.protocol);
+    try std.testing.expectEqual(@as(u32, 65536), isolated.model.context_tokens);
+    try std.testing.expect(isolated.model.output_tokens == null);
+    try std.testing.expect(isolated.model.input_price_threshold == null);
+    try std.testing.expectError(error.UnknownModelProtocol, resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "manual", false));
+    const probe = try resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "probe", false);
+    try std.testing.expectEqual(.auto, probe.model.protocol);
+    try std.testing.expect(probe.model.input_price_threshold == null);
+}
+test "publication Session current capability changes do not reject history loading" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home,
+        \\{"llm":{"default":"go/fresh","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key":"fake-route-go"}}}}
+    );
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    {
+        var store = try Store.openExisting(a, std.testing.io, home);
+        defer store.deinit();
+        _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), try metadata.parseListing(a, "{\"data\":[{\"id\":\"fresh\",\"protocol\":\"chat\",\"context_window\":65536}]}", .opencode_go));
+    }
+    var id: @import("session_id.zig").Id = undefined;
+    {
+        var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+        defer source.deinit();
+        id = source.session_id;
+        const app = source.app.?;
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "signed route fixture" }} });
+        try std.testing.expect(try source.saveOnExit());
+        var changed = try metadata.parseListing(a, "{\"data\":[{\"id\":\"fresh\",\"protocol\":\"responses\",\"context_window\":1000000}]}", .opencode_go);
+        changed.directory.rows[0].output_tokens = 128000;
+        _ = try metadata.commit(&source.store.root, metadata.bit(.opencode_go), changed);
+    }
+    var selection_only = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .restore_selection = id });
+    defer selection_only.deinit();
+    try std.testing.expectEqual(@as(usize, 0), if (selection_only.app) |app| app.runtime.messages().len else 0);
+    var full = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .resume_session = id });
+    defer full.deinit();
+    const history = full.connection().initial_history_fn.?(full.connection().context);
+    try std.testing.expectEqual(@as(usize, 1), history.len);
+    try std.testing.expectEqualStrings("signed route fixture", history[0].blocks[0].text);
+}
+test "publication missing alias key isolates claimed official restart and public generations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home,
+        \\{"llm":{"default":"missing/m","providers":{"missing":{"base_url":"https://opencode.ai/zen/go/v1","api_key_env":"MISSING_KEY","models":{"m":{"protocol":"chat","context_tokens":65536}}},"ready":{"base_url":"https://opencode.ai/zen/go/v1","api_key":"fake-go"},"ds":{"base_url":"https://api.deepseek.com","api_key":"fake-ds"}}}}
+    );
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    session.metadata_fetch = PublicationFetch.fetch;
+    session.metadata_dev_fetch = PublicationFetch.dev;
+    session.metadata_wall_ms = 1000;
+    PublicationFetch.public_calls.store(0, .monotonic);
+    for (&PublicationFetch.official) |*count| count.store(0, .monotonic);
+    PublicationFetch.hold_public.store(true, .release);
+    defer PublicationFetch.hold_public.store(false, .release);
+    try PublicationFetch.refresh(&session);
+    PublicationFetch.finishOfficial(&session);
+    try std.testing.expect(PublicationFetch.poll(&session));
+    const public_index = cfg.providers.Id.all.len;
+    const public_generation = session.metadata_job.?.generations[public_index];
+    try std.testing.expectEqual(@as(usize, 0), PublicationFetch.official[1].load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), PublicationFetch.official[0].load(.monotonic));
+    try std.testing.expect(!session.metadata_cache.refresh[1].successful);
+    // Restart only the joined official slot while the public claim is live.
+    session.metadata_login_pending = metadata.bit(.deepseek) | metadata.bit(.opencode_go);
+    try std.testing.expect(PublicationFetch.poll(&session));
+    try std.testing.expectEqual(public_generation, session.metadata_job.?.generations[public_index]);
+    PublicationFetch.finishOfficial(&session);
+    try std.testing.expect(PublicationFetch.poll(&session));
+    try std.testing.expectEqual(@as(usize, 2), PublicationFetch.official[0].load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), PublicationFetch.official[1].load(.monotonic));
+    PublicationFetch.hold_public.store(false, .release);
+    PublicationFetch.finish(&session);
+    try std.testing.expect(PublicationFetch.poll(&session));
+    try std.testing.expect(session.metadata_job == null);
+    try std.testing.expectEqual(@as(usize, 1), PublicationFetch.public_calls.load(.monotonic));
+    try std.testing.expect(session.metadata_cache.refresh[public_index].successful);
+    try std.testing.expectEqual(public_generation, session.metadata_cache.refresh[public_index].generation);
+    // Only public is due: the missing official key must not even be looked up.
+    session.metadata_auto = true;
+    session.metadata_awake_ms = 1000000;
+    session.metadata_wall_ms = 300000;
+    session.metadata_cache.refresh[public_index].last_attempt_ms = null;
+    // Persist the same public-only eligibility used by the owner, with official
+    // claims fresh and still inside cooldown/TTL.
+    const public_claim = try metadata.claimAt(&session.store.root, metadata.dev_bit, true, 0, .{});
+    _ = public_claim;
+    _ = PublicationFetch.poll(&session);
+    try std.testing.expect(session.metadata_job != null);
+    try std.testing.expectEqual(metadata.dev_bit, session.metadata_job.?.requested);
+    PublicationFetch.finish(&session);
+    try std.testing.expect(PublicationFetch.poll(&session));
+}
+test "llm Session custom aliases select complete connections and only empty history persists defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home, custom);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("ALPHA_KEY", "fake-alpha");
+    try env.put("BETA_KEY", "fake-beta");
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    try std.testing.expect(session.app != null);
+    try std.testing.expectEqualStrings("alpha", session.app.?.config.value.selected_provider.?);
+    try std.testing.expectEqualStrings("alpha/org/shared", session.connection().current().selection_name.?);
+    try session.connection().selectModel("beta/org/shared");
+    try std.testing.expectEqualStrings("https://beta.invalid/v1", session.app.?.config.value.provider.base_url);
+    try std.testing.expectEqual(.responses, session.app.?.config.value.model.protocol);
+    try std.testing.expectEqual(@as(?u32, 16384), session.app.?.config.value.model.output_tokens);
+    var disk = try session.store.loadExisting();
+    defer cfg.release(&disk);
+    try std.testing.expectEqualStrings("beta/org/shared", disk.value.registry.?.default);
+    try std.testing.expectEqualStrings("ALPHA_KEY", disk.value.registry.?.find("alpha").?.connection.api_key_env);
+    try std.testing.expectEqual(@as(usize, 1), disk.value.registry.?.find("beta").?.models.len);
+    const app = session.app.?;
+    try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "canonical fixture" }} });
+    try session.connection().selectModel("alpha/other");
+    try std.testing.expectEqualStrings("alpha", session.app.?.config.value.selected_provider.?);
+    try std.testing.expectEqual(@as(?u32, null), session.app.?.config.value.model.output_tokens);
+    var after = try session.store.loadExisting();
+    defer cfg.release(&after);
+    try std.testing.expectEqualStrings("beta/org/shared", after.value.registry.?.default);
+    try std.testing.expectEqual(@as(usize, 1), session.app.?.runtime.messages().len);
+}
+test "llm Session retained inline credential never wipes the independent global baseline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home,
+        \\{"llm":{"default":"alpha/m","providers":{"alpha":{"base_url":"https://alpha.invalid/v1","api_key":"fake-inline-baseline","models":{"m":{"protocol":"chat","context_tokens":65536,"output_tokens":8192}}}}}}
+    );
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    for ([_][]const u8{ "m", "alpha/m", "m" }) |selector| {
+        try session.connection().selectModel(selector);
+        try std.testing.expectEqualStrings("fake-inline-baseline", session.global_config.?.value.registry.?.find("alpha").?.connection.api_key.?);
+        var copy = try cfg.clone(a, session.global_config.?.value);
+        defer cfg.release(&copy);
+        try std.testing.expectEqualStrings("fake-inline-baseline", copy.value.registry.?.find("alpha").?.connection.api_key.?);
+    }
+}
+test "llm Session unresolved defaults stay pending and custom unknown rows never probe" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home,
+        \\{"llm":{"default":"proxy/unknown","providers":{"proxy":{"base_url":"https://proxy.invalid/v1","kind":"opencode_go","api_key_env":"ABSENT_KEY","models":{"unknown":{"context_tokens":65536},"ready":{"protocol":"chat","context_tokens":65536}}}}}}
+    );
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    try std.testing.expect(session.app == null);
+    try std.testing.expect(session.pending.?.value.selection_pending);
+    try std.testing.expect(session.connection().current().settings_notice != null);
+    try std.testing.expectEqual(@as(u32, 0), session.connection().current().context_limit);
+    try std.testing.expect(session.connection().current().initial_context == null);
+    try std.testing.expect(session.connection().current().runtime == null);
+    for (session.connection().current().models, 0..) |model, index| {
+        if (std.mem.eql(u8, model.name, "proxy/unknown")) try std.testing.expect(session.connection().current().model_disabled[index]);
+    }
+    try std.testing.expectError(error.UnknownModelProtocol, session.connection().selectModel("proxy/unknown"));
+    try session.connection().configureProvider(.opencode_go, "fake-official-only");
+    try std.testing.expect(session.app == null);
+    try std.testing.expect(session.global_config.?.value.registry.?.find("proxy").?.connection.api_key == null);
+    try std.testing.expectEqualStrings("ABSENT_KEY", session.global_config.?.value.registry.?.find("proxy").?.connection.api_key_env);
+    try std.testing.expectEqualStrings("proxy/unknown", session.global_config.?.value.registry.?.default);
+    try session.connection().selectModel("proxy/ready");
+    try std.testing.expect(session.app == null);
+    try std.testing.expect(!session.pending.?.value.selection_pending);
+    try std.testing.expectEqualStrings("ready", session.pending.?.value.model.name);
+}
+test "llm Session directory fields merge per alias and auth preserves all declarations and default" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home,
+        \\{"llm":{"default":"go/shared","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key_env":"MISSING_GO","models":{"shared":{"context_tokens":200000}}},"custom":{"base_url":"https://custom.invalid/v1","api_key_env":"CUSTOM_ENV","models":{"shared":{"protocol":"chat","context_tokens":32768}}}}}}
+    );
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
+    const row = try session.metadata_cache.directory.upsert(.opencode_go, "shared");
+    row.available = true;
+    row.tokens = 1000000;
+    row.protocol = .responses;
+    row.dev_protocol = .responses;
+    row.dev_output_tokens = 128000;
+    const extra = try session.metadata_cache.directory.upsert(.opencode_go, "extra");
+    extra.available = true;
+    extra.tokens = 65536;
+    extra.protocol = .chat;
+    try session.connection().selectModel("go/shared");
+    try std.testing.expectEqual(.responses, session.pending.?.value.model.protocol);
+    try std.testing.expectEqual(@as(u32, 200000), session.pending.?.value.model.context_tokens);
+    try std.testing.expectEqual(@as(?u32, 128000), session.pending.?.value.model.output_tokens);
+    var saw_extra = false;
+    var saw_custom = false;
+    for (session.connection().current().models) |model| {
+        if (std.mem.eql(u8, model.name, "go/extra")) saw_extra = true;
+        if (std.mem.eql(u8, model.name, "custom/shared")) {
+            saw_custom = true;
+            try std.testing.expectEqual(.chat, model.protocol);
+            try std.testing.expectEqual(@as(u32, 32768), model.context_tokens);
+        }
+    }
+    try std.testing.expect(saw_extra and saw_custom);
+    try session.connection().configureProvider(.opencode_go, "fake-new-go");
+    try std.testing.expect(session.app != null);
+    var disk = try session.store.loadExisting();
+    defer cfg.release(&disk);
+    try std.testing.expectEqualStrings("go/shared", disk.value.registry.?.default);
+    try std.testing.expectEqual(@as(usize, 2), disk.value.registry.?.providers.len);
+    try std.testing.expectEqualStrings("CUSTOM_ENV", disk.value.registry.?.find("custom").?.connection.api_key_env);
+    try std.testing.expectEqualStrings("fake-new-go", disk.value.registry.?.find("go").?.connection.api_key.?);
+    try std.testing.expect(disk.value.registry.?.find("go").?.models[0].patch.protocol == null);
+}
+test "llm Session resume without login retains history and activates using current capabilities" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home, custom);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("ALPHA_KEY", "fake-alpha");
+    try env.put("BETA_KEY", "fake-beta");
+    var id: @import("session_id.zig").Id = undefined;
+    {
+        var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+        defer source.deinit();
+        try source.connection().selectModel("beta/org/shared");
+        id = source.session_id;
+        const app = source.app.?;
+        app.config.value.model.output_tokens = null;
+        app.config.value.model.context_tokens = 65536;
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "resume canonical fixture" }} });
+        try std.testing.expect(try source.saveOnExit());
+    }
+    env.deinit();
+    env = std.process.Environ.Map.init(a);
+    try env.put("HOME", home);
+    try env.put("ALPHA_KEY", "fake-alpha");
+    var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .resume_session = id });
+    defer restored.deinit();
+    try std.testing.expect(restored.app == null);
+    const connection = restored.connection();
+    const history = connection.initial_history_fn.?(connection.context);
+    try std.testing.expectEqual(@as(usize, 1), history.len);
+    try std.testing.expectEqualStrings("resume canonical fixture", history[0].blocks[0].text);
+    try std.testing.expect(connection.current().settings_notice != null);
+    try connection.configure("fake-beta-new");
+    try std.testing.expect(restored.app != null);
+    try std.testing.expectEqualStrings("beta", restored.app.?.config.value.selected_provider.?);
+    try std.testing.expectEqualStrings("https://beta.invalid/v1", restored.app.?.config.value.provider.base_url);
+    try std.testing.expectEqualStrings("Bearer fake-beta-new", restored.app.?.client.authorization);
+    try std.testing.expectEqual(@as(usize, 1), restored.app.?.runtime.messages().len);
+    try std.testing.expectEqualStrings("resume canonical fixture", restored.app.?.runtime.messages()[0].blocks[0].text);
+    // Archived capabilities are not authority: use the current beta patch.
+    try std.testing.expectEqual(@as(?u32, 16384), restored.app.?.config.value.model.output_tokens);
+    try std.testing.expectEqual(@as(u32, 131072), restored.app.?.config.value.model.context_tokens);
+}
+test "llm Session failed default persistence publishes neither connection nor selection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home, custom);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("ALPHA_KEY", "fake-alpha");
+    try env.put("BETA_KEY", "fake-beta");
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    var external = try Store.openExisting(a, std.testing.io, home);
+    defer external.deinit();
+    var changed = try external.loadExisting();
+    defer cfg.release(&changed);
+    try cfg.setRegistryDefault(changed.arena.allocator(), &changed.value, "alpha", "other");
+    try external.save(changed.value);
+    try std.testing.expectError(error.AuthVersionConflict, session.connection().selectModel("beta/org/shared"));
+    try std.testing.expectEqualStrings("alpha", session.app.?.config.value.selected_provider.?);
+    try std.testing.expectEqualStrings("org/shared", session.app.?.config.value.model.name);
+    try std.testing.expectEqualStrings("alpha/org/shared", session.global_config.?.value.registry.?.default);
+}
+test "llm Session raw IDs keep unconfigured slash prefixes and qualified IDs keep all remaining slashes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home,
+        \\{"llm":{"default":"alpha/start","providers":{"alpha":{"base_url":"https://alpha.invalid/v1","api_key_env":"ALPHA_KEY","models":{"start":{"protocol":"chat","context_tokens":65536},"vendor/new/model":{"protocol":"chat","context_tokens":32768}}},"beta":{"base_url":"https://beta.invalid/v1","api_key_env":"BETA_KEY","models":{"vendor/another/model":{"protocol":"responses","context_tokens":131072}}}}}}
+    );
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("ALPHA_KEY", "fake-alpha");
+    try env.put("BETA_KEY", "fake-beta");
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    try session.connection().selectModel("vendor/new/model");
+    try std.testing.expectEqualStrings("alpha", session.app.?.config.value.selected_provider.?);
+    try std.testing.expectEqualStrings("vendor/new/model", session.app.?.config.value.model.name);
+    try std.testing.expectEqual(@as(u32, 32768), session.app.?.config.value.model.context_tokens);
+    try session.connection().selectModel("beta/vendor/another/model");
+    try std.testing.expectEqualStrings("beta", session.app.?.config.value.selected_provider.?);
+    try std.testing.expectEqualStrings("vendor/another/model", session.app.?.config.value.model.name);
+    try std.testing.expectEqual(.responses, session.app.?.config.value.model.protocol);
+}
+test "llm Session login appends missing official declaration without switching or changing default" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home,
+        \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","api_key_env":"DS_KEY","models":{"deepseek-flash":{"protocol":"chat","context_tokens":131072}}}}}}
+    );
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("DS_KEY", "fake-ds");
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    try session.connection().configureProvider(.opencode_go, "fake-go");
+    try std.testing.expectEqualStrings("deepseek", session.app.?.config.value.selected_provider.?);
+    var disk = try session.store.loadExisting();
+    defer cfg.release(&disk);
+    const registry = disk.value.registry.?;
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", registry.default);
+    try std.testing.expectEqual(@as(usize, 2), registry.providers.len);
+    const ds = registry.find("deepseek").?;
+    try std.testing.expectEqualStrings("DS_KEY", ds.connection.api_key_env);
+    try std.testing.expect(ds.connection.api_key == null);
+    try std.testing.expectEqual(@as(usize, 1), ds.models.len);
+    try std.testing.expectEqual(@as(?u32, 131072), ds.models[0].patch.context_tokens);
+    try std.testing.expectEqual(.chat, ds.models[0].patch.protocol.?);
+    const go = registry.find("opencode-go").?;
+    try std.testing.expectEqualStrings(cfg.providers.Id.opencode_go.baseUrl(), go.connection.base_url);
+    try std.testing.expectEqualStrings("fake-go", go.connection.api_key.?);
+    try std.testing.expectEqual(@as(usize, 0), go.models.len);
+    try session.connection().selectModel("opencode-go/glm-5.3");
+    try std.testing.expectEqualStrings("opencode-go", session.app.?.config.value.selected_provider.?);
+    try std.testing.expectEqualStrings("glm-5.3", session.app.?.config.value.model.name);
+}
+test "llm Session login rejects canonical custom name conflicts and ambiguous official aliases" {
+    const documents = [_][]const u8{
+        \\{"llm":{"default":"proxy/start","providers":{"proxy":{"base_url":"https://proxy.invalid/v1","models":{"start":{"protocol":"chat","context_tokens":65536}}},"opencode-go":{"base_url":"https://custom.invalid/v1"}}}}
+        ,
+        \\{"llm":{"default":"proxy/start","providers":{"proxy":{"base_url":"https://proxy.invalid/v1","models":{"start":{"protocol":"chat","context_tokens":65536}}},"go1":{"base_url":"https://opencode.ai/zen/go/v1"},"go2":{"base_url":"https://opencode.ai/zen/go/v1"}}}}
+        ,
+    };
+    for (documents, 0..) |document, index| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [4096]u8 = undefined;
+        const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+        try save(home, document);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+        defer session.deinit();
+        if (index == 0) try std.testing.expectError(error.ProviderNameConflict, session.connection().configureProvider(.opencode_go, "fake-go")) else try std.testing.expectError(error.AmbiguousProvider, session.connection().configureProvider(.opencode_go, "fake-go"));
+        var disk = try session.store.loadExisting();
+        defer cfg.release(&disk);
+        try std.testing.expectEqualStrings("proxy/start", disk.value.registry.?.default);
+        try std.testing.expectEqual(@as(usize, index + 2), disk.value.registry.?.providers.len);
+    }
+}
+test "llm Session manual effort and resolved metadata map stay frozen across startup effort changes and cache refresh" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    try save(home,
+        \\{"llm":{"default":"go/gpt-5.6-luna","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key_env":"GO_KEY","models":{"gpt-5.6-luna":{"context_tokens":65536,"reasoning_effort":"high"}}}}}}
+    );
+    const catalog = @import("provider_catalog.zig");
+    const preset = for (catalog.entries) |entry| {
+        if (entry.provider == .opencode_go and std.mem.eql(u8, entry.model.name, "gpt-5.6-luna")) break entry;
+    } else unreachable;
+    {
+        var store = try Store.openExisting(a, std.testing.io, home);
+        defer store.deinit();
+        var listing: metadata.Listing = .{};
+        listing.directory_mask = metadata.bit(.opencode_go);
+        const row = try listing.directory.upsert(.opencode_go, "gpt-5.6-luna");
+        row.available = true;
+        row.protocol = preset.model.protocol;
+        listing.dev_done = true;
+        row.dev_present = true;
+        row.dev_protocol = preset.model.protocol;
+        row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .standard, .map = .{ .low = "low", .high = "high" } });
+        _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+    }
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("GO_KEY", "fake-go");
+    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+    defer session.deinit();
+    try std.testing.expectEqualStrings("high", session.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqualStrings("high", session.app.?.config.value.model.reasoning.?.map.high.?);
+    // Owner cache replacement models a completed refresh losing capabilities.
+    // UI/Shift+Tab must still use the accepted owned map, not latest metadata.
+    session.metadata_cache = .{};
+    try std.testing.expect(session.connection().current().effort_levels.contains(.high));
+    try std.testing.expect(session.connection().current().effort_levels.contains(.low));
+    try session.connection().setEffort(.low);
+    try std.testing.expectEqualStrings("low", session.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expectEqualStrings("high", session.app.?.config.value.model.reasoning.?.map.high.?);
+    try session.connection().selectModel("gpt-5.6-luna");
+    try std.testing.expectEqualStrings("low", session.app.?.config.value.model.reasoning_effort.?);
+    try std.testing.expect(session.connection().current().effort_levels.contains(.high));
+    var disk = try session.store.loadExisting();
+    defer cfg.release(&disk);
+    const patch = disk.value.registry.?.find("go").?.patchFor("gpt-5.6-luna").?;
+    try std.testing.expectEqualStrings("high", patch.reasoning_effort.?);
+    try std.testing.expect(patch.reasoning == null);
+}
+test "llm Session dynamic history loads after lost window and delisting without trusting archived capabilities" {
+    for ([_]?u32{ 128000, null }) |output| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buffer: [4096]u8 = undefined;
+        const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+        try save(home,
+            \\{"llm":{"default":"go/cached.protochat","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key":"fake-frozen-go"}}}}
+        );
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HOME", home);
+        {
+            var store = try Store.openExisting(a, std.testing.io, home);
+            defer store.deinit();
+            var listing: metadata.Listing = .{ .directory_mask = metadata.bit(.opencode_go) };
+            const row = try listing.directory.upsert(.opencode_go, "cached.protochat");
+            row.available = true;
+            row.protocol = .chat;
+            row.tokens = 1000000;
+            row.dev_present = true;
+            row.dev_protocol = .chat;
+            row.dev_output_tokens = output;
+            row.dev_input_price_threshold = if (output != null) 200000 else null;
+            listing.dev_done = true;
+            _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+        }
+        var id: @import("session_id.zig").Id = undefined;
+        {
+            var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
+            defer source.deinit();
+            id = source.session_id;
+            const app = source.app.?;
+            try std.testing.expectEqual(@as(u32, 1000000), app.config.value.model.context_tokens);
+            try std.testing.expectEqual(output, app.config.value.model.output_tokens);
+            try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, app.config.value.model.input_price_threshold);
+            try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "frozen dynamic canonical fixture" }} });
+            // Publish an ordinary in-session checkpoint; saveOnExit is a
+            // terminal one-shot and must not be invoked twice on this owner.
+            try source.connection().selectModel("cached.protochat");
+            try std.testing.expect(source.resume_lease != null);
+            // Official refresh removes the context and marks the ID absent.
+            // Keep protocol evidence so empty-chat restore fails specifically
+            // for the unknown window, not an unrelated unavailable route.
+            var listing: metadata.Listing = .{ .directory_mask = metadata.bit(.opencode_go) };
+            const row = try listing.directory.upsert(.opencode_go, "cached.protochat");
+            row.available = false;
+            row.dev_present = true;
+            row.dev_protocol = .chat;
+            row.dev_output_tokens = 4096;
+            row.dev_input_price_threshold = 100000;
+            listing.dev_done = true;
+            _ = try metadata.commit(&source.store.root, metadata.bit(.opencode_go), listing);
+            source.metadata_cache = try metadata.load(&source.store.root);
+            try source.connection().selectModel("cached.protochat");
+            try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, source.app.?.config.value.model.input_price_threshold);
+            try std.testing.expect(try source.saveOnExit());
+            try std.testing.expectEqualStrings("fake-frozen-go", source.global_config.?.value.registry.?.find("go").?.connection.api_key.?);
+        }
+        {
+            var selection_only = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .restore_selection = id });
+            defer selection_only.deinit();
+            try std.testing.expectEqual(@as(usize, 0), if (selection_only.app) |app| app.runtime.messages().len else 0);
+        }
+        {
+            var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .resume_session = id });
+            defer restored.deinit();
+            const connection = restored.connection();
+            const history = connection.initial_history_fn.?(connection.context);
+            try std.testing.expectEqual(@as(usize, 1), history.len);
+            try std.testing.expectEqualStrings("frozen dynamic canonical fixture", history[0].blocks[0].text);
+            try std.testing.expect(restored.app == null); // No current context evidence, no send capability.
+        }
+        {
+            // A later refresh removes the row and every models.dev capability.
+            var store = try Store.openExisting(a, std.testing.io, home);
+            defer store.deinit();
+            const listing: metadata.Listing = .{ .directory_mask = metadata.bit(.opencode_go), .dev_done = true };
+            _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+            var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .resume_session = id });
+            defer restored.deinit();
+            const connection = restored.connection();
+            const history = connection.initial_history_fn.?(connection.context);
+            try std.testing.expectEqual(@as(usize, 1), history.len);
+            try std.testing.expectEqualStrings("frozen dynamic canonical fixture", history[0].blocks[0].text);
+            try std.testing.expect(restored.app == null);
+        }
+        // A damaged history payload is rejected even without authentication.
+        var store = try Store.openExisting(a, std.testing.io, home);
+        defer store.deinit();
+        var parsed = try store.loadExisting();
+        defer cfg.release(&parsed);
+        parsed.value.selected_provider = "go";
+        parsed.value.model = .{ .name = "cached.protochat", .protocol = .chat, .context_tokens = 1000000 };
+        const snapshot = try selections.capture(parsed.value);
+        const payload = try @import("../core/checkpoint.zig").encode(a, .{ .system = "hello", .messages = &.{}, .selector = .{ .configured = .auto, .selected = null }, .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
+        defer a.free(payload);
+        const wire = try codec.encode(a, id, &snapshot, payload);
+        defer a.free(wire);
+        wire[wire.len - 1] = '!';
+        var root = try @import("../platform/filesystem.zig").Root.open(a, std.testing.io, home);
+        defer root.deinit();
+        const resumes = @import("resume_store.zig");
+        var lease = try resumes.Lease.open(&root, id, true);
+        {
+            const previous = try lease.load(&root);
+            defer a.free(previous);
+            try lease.save(&root, wire);
+        }
+        lease.deinit();
+        if (Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .resume_session = id })) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.MalformedHistoryAccepted;
+        } else |_| {}
+        if (Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .restore_selection = id })) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.MalformedHistoryAccepted;
+        } else |_| {}
+    }
+}
+test "llm selection v2 provider name remains owned and rejects legacy metadata" {
+    var parsed = try cfg.parse(a, custom);
+    defer cfg.release(&parsed);
+    parsed.value.selected_provider = "alpha";
+    const snapshot = try selections.capture(parsed.value);
+    try std.testing.expectEqualStrings("alpha", snapshot.providerName().?);
+    var encoded: [selections.max_bytes]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&encoded);
+    const id = "0123456789abcdef0123456789abcdef".*;
+    try selections.encode(&writer, &snapshot);
+    const owned = try selections.parse(a, writer.buffered());
+    @memset(&encoded, 0);
+    try std.testing.expectEqualStrings("alpha", owned.providerName().?);
+    const payload = try @import("../core/checkpoint.zig").encode(a, .{ .system = "", .messages = &.{}, .selector = .{ .configured = .auto, .selected = null }, .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
+    defer a.free(payload);
+    const framed = try codec.encode(a, id, &snapshot, payload);
+    defer a.free(framed);
+    const envelope = try codec.inspect(a, framed, id);
+    try std.testing.expectEqualStrings("alpha", envelope.selection.providerName().?);
+    const legacy = "{\"version\":1,\"session\":\"0123456789abcdef0123456789abcdef\",\"provider\":null,\"endpoint\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"model\":\"legacy\",\"protocol\":\"chat\",\"effort\":null,\"effort_hash\":null}";
+    try std.testing.expectError(error.InvalidSelectionVersion, selections.parse(a, legacy));
+}

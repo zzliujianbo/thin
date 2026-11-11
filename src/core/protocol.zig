@@ -325,42 +325,7 @@ pub fn textMessage(allocator: std.mem.Allocator, role: Role, text: []const u8) !
 }
 
 // 验证：未知用量为 null 时 total 返回 null；reasoning 与 cache 不会被重复计入总量。
-test "usage preserves unknown values and does not double-count reasoning or cache" {
-    const t = std.testing;
-    try t.expectEqual(@as(?u64, null), (Usage{}).total());
-    try t.expectEqual(@as(?u64, 15), (Usage{
-        .input_tokens = 10,
-        .output_tokens = 5,
-        .cached_input_tokens = 8,
-        .reasoning_tokens = 3,
-    }).total());
-}
 
 // 验证：父取消只向下可见，子取消不会写回父令牌。
-test "cancellation reads the parent one way and writes locally only" {
-    var root: Cancellation = .{};
-    var child: Cancellation = .{ .parent = &root };
-    try std.testing.expect(!child.isRequested());
-    child.cancel();
-    try std.testing.expect(child.isRequested());
-    try std.testing.expect(!root.isRequested());
-    var sibling: Cancellation = .{ .parent = &root };
-    try std.testing.expect(!sibling.isRequested());
-    root.cancel();
-    try std.testing.expect(sibling.isRequested());
-    var self_link: Cancellation = .{};
-    self_link.parent = &self_link;
-    try std.testing.expect(!self_link.isRequested());
-}
 
 // 验证：续接兼容性必须同时检查 connection、model 和 protocol 三者。
-test "replay compatibility includes connection, model and protocol" {
-    const a = ReplayScope{ .connection = "https://a/v1", .model = "model", .protocol = .responses };
-    var b = a;
-    try std.testing.expect(a.eql(b));
-    b.protocol = .chat;
-    try std.testing.expect(!a.eql(b));
-    b = a;
-    b.connection = "https://b/v1";
-    try std.testing.expect(!a.eql(b));
-}

@@ -1,0 +1,1477 @@
+test "subagent start returns an id and get collects isolated report usage and no artifacts" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    try fix.root.write("fixture.txt", "child-only-file", false);
+    const parent_arena = fix.parent_runtime.arena.allocator();
+    try fix.parent_runtime.history.append(parent_arena, try p.textMessage(parent_arena, .user, "PARENT_MARKER"));
+    var fake: FakeModel = .{ .io = std.testing.io, .behavior = .tool_then_text };
+    fix.withModel(&fake);
+
+    const id = try fix.start(.{ .task = "inspect fixture", .context = "reference material" });
+    defer a.free(id);
+    try std.testing.expect(fix.active());
+    var parsed = try fix.get(id, true);
+    defer parsed.deinit();
+    const value = parsed.value;
+    try std.testing.expectEqualStrings(id, value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("success", value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("FINAL REPORT", value.object.get("report").?.string);
+    try std.testing.expect(!value.object.get("truncated").?.bool);
+    // Empty message list and progress are still present fields.
+    try std.testing.expectEqual(@as(usize, 0), value.object.get("messages").?.array.items.len);
+    try std.testing.expectEqualStrings("", value.object.get("progress").?.string);
+    const usage = value.object.get("usage").?.object;
+    try std.testing.expectEqual(@as(i64, 2), usage.get("normal_calls").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), usage.get("summary_calls").?.integer);
+    try std.testing.expectEqual(@as(i64, 20), usage.get("normal").?.object.get("input_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), usage.get("normal").?.object.get("output_tokens").?.integer);
+    try std.testing.expect(value.object.get("auxiliary_usage_excluded").?.bool);
+    try std.testing.expect(fake.saw_child_mode);
+    try std.testing.expect(!fake.saw_replay);
+    try std.testing.expect(!fake.saw_steering);
+    try std.testing.expect(!fix.active());
+    // No child Journal, selection record or Memory migration is created.
+    try std.testing.expectError(error.FileNotFound, fs.openDirectory(fix.root.dir.handle, ".thin"));
+}
+test "subagent inherits the parent effective protocol for chat responses and anthropic" {
+    const a = std.testing.allocator;
+    for ([_]p.Protocol{ .chat, .responses, .anthropic }) |protocol| {
+        const fix = try Fixture.create(a, std.testing.io, .auto, protocol, 1_000_000);
+        defer fix.deinit();
+        var fake: FakeModel = .{ .io = std.testing.io };
+        fix.withModel(&fake);
+        const id = try fix.start(.{ .task = "answer briefly" });
+        defer a.free(id);
+        var parsed = try fix.get(id, true);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("success", parsed.value.object.get("status").?.string);
+        try std.testing.expectEqual(protocol, fake.config_protocol);
+        try std.testing.expectEqual(protocol, fake.request_protocol);
+    }
+}
+test "one root starts twelve children and only a bounded collected cache evicts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = io };
+    fix.withModel(&fake);
+
+    // Host-side re-read cache bound; it must never be a start or concurrency
+    // limit, and it never hides an uncollected job.
+    const cached_views: usize = 4;
+    const rounds: usize = 12;
+    var ids: [rounds][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    fix.service.beginTask(&fix.parent_cancel);
+    for (&ids) |*id| {
+        id.* = try fix.runCurrentRoot(.{ .task = "unlimited sibling task" });
+        started += 1;
+        var parsed = try fix.get(id.*, true);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("success", parsed.value.object.get("status").?.string);
+    }
+    // Twelve sequential starts in one accepted root all ran; a quota would have
+    // refused the fifth.
+    try std.testing.expectEqual(@as(usize, rounds), fake.calls);
+    try std.testing.expect(!fix.active());
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    // The most recent collected views are still readable...
+    for (ids[rounds - cached_views ..]) |id| {
+        var again = try fix.getResult(id, true);
+        defer again.deinit(a);
+        try std.testing.expect(!again.is_error);
+    }
+    // ...while an evicted, already-collected id fails closed as unknown instead
+    // of returning a stale sibling view.
+    for (ids[0 .. rounds - cached_views]) |id| {
+        try std.testing.expectError(error.UnknownSubagentId, fix.service.service().get(arena.allocator(), .{ .id = id }, &fix.parent_cancel));
+    }
+
+    // Health is not a quota gate and a start is never refused because an older
+    // sibling ran or was collected.
+    try fix.service.checkReady();
+    const extra = try fix.runCurrentRoot(.{ .task = "still allowed after twelve" });
+    var extra_done = try fix.get(extra, true);
+    defer extra_done.deinit();
+    try std.testing.expectEqualStrings("success", extra_done.value.object.get("status").?.string);
+    a.free(extra);
+
+    // A new accepted root invalidates every id of the previous root.
+    try fix.endTask();
+    fix.service.beginTask(&fix.parent_cancel);
+    try std.testing.expectError(error.UnknownSubagentId, fix.service.service().get(arena.allocator(), .{ .id = ids[rounds - 1] }, &fix.parent_cancel));
+}
+test "subagent long CJK report truncates at a UTF-8 boundary" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var long: [subagent.max_report_bytes + 8]u8 = undefined;
+    var i: usize = 0;
+    while (i + 3 <= long.len) : (i += 3) {
+        long[i] = 0xe4;
+        long[i + 1] = 0xb8;
+        long[i + 2] = 0xad;
+    }
+    while (i < long.len) : (i += 1) long[i] = 'a';
+    try std.testing.expect(std.unicode.utf8ValidateSlice(&long));
+    var fake: FakeModel = .{ .io = std.testing.io, .report_text = &long };
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "long report" });
+    defer a.free(id);
+    var parsed = try fix.get(id, true);
+    defer parsed.deinit();
+    const report = parsed.value.object.get("report").?.string;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(report));
+    try std.testing.expect(report.len <= subagent.max_report_bytes);
+    try std.testing.expect(report.len > 0);
+    try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+}
+test "cleanup failure outranks encoding OOM and retained owner drops job borrows" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = std.testing.io };
+    fix.withModel(&fake);
+    fix.service.deps.test_cleanup_failed = true;
+    fix.service.deps.test_encode_oom = true;
+    const id = try fix.start(.{ .task = "cleanup priority" });
+    defer a.free(id);
+    var result = try fix.getResult(id, true);
+    defer result.deinit(a);
+    // Release the injected fault before any assertion can fail: the fixture's
+    // own deinit fail-stops on a retained owner that still reports failure.
+    defer {
+        if (fix.service.current != null) fix.endTask() catch {};
+        if (fix.service.retained_child) |owner| owner.test_cleanup_failed = false;
+    }
+    try std.testing.expect(result.cleanup_failed);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(result.truncated);
+    // Static fallback: the caller must not free this literal.
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "cleanup failed") != null);
+    // The encoded body, the Result flags and the same-root cache all agree.
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, result.text, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+    try std.testing.expect(parsed.value.object.get("cleanup_failed").?.bool);
+    var cached_result = try fix.getResult(id, true);
+    defer cached_result.deinit(a);
+    try std.testing.expect(cached_result.truncated);
+    try std.testing.expect(cached_result.cleanup_failed);
+    const retained = fix.service.retained_child orelse return error.FixtureMissingOwner;
+    // No worker/job borrow survives the transfer.
+    try std.testing.expect(retained.job == null);
+    try std.testing.expect(retained.cancel.parent == null);
+    try std.testing.expect(retained.tools.parent_channel == null);
+    // A failed close retains the owner while the per-agent snapshot owns a
+    // real cache allocation; retrying cleanup must not invalidate it early.
+    try std.testing.expectEqual(@as(usize, 1), fix.service.view().agents.len);
+    try std.testing.expect(fix.service.aggregate.read_cache.capacity > 0);
+    try std.testing.expectError(error.CleanupFailed, fix.service.checkReady());
+    try std.testing.expectEqual(@as(usize, 1), fix.service.view().agents.len);
+    // Release the injected fault and retry the retained owner.
+    retained.test_cleanup_failed = false;
+    fix.service.deinit();
+    try std.testing.expect(fix.service.retained_child == null);
+    try std.testing.expect(fix.service.aggregate.first == null);
+    try std.testing.expect(fix.service.aggregate.last == null);
+    try std.testing.expectEqual(@as(usize, 0), fix.service.aggregate.read_cache.capacity);
+    try std.testing.expectEqual(@as(usize, 0), fix.service.aggregate.read_view.agents.len);
+    // Fixture.deinit calls Service.deinit again after this explicit retry.
+}
+test "pure encoding OOM is reported as a failure not a success" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = std.testing.io };
+    fix.withModel(&fake);
+    fix.service.deps.test_encode_oom = true;
+    const id = try fix.start(.{ .task = "encoding oom" });
+    defer a.free(id);
+    // Nothing may stay retained after a pure encoding failure; release any
+    // injected fault before the fixture fail-stops in deinit.
+    defer {
+        if (fix.service.current != null) fix.endTask() catch {};
+        if (fix.service.retained_child) |owner| owner.test_cleanup_failed = false;
+    }
+    var parsed = try fix.get(id, true);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("failed", parsed.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("OutOfMemory", parsed.value.object.get("detail").?.string);
+    try std.testing.expect(fix.service.retained_child == null);
+}
+test "parent cancellation reaches the child and only then marks the result canceled" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "wait until canceled" });
+    defer a.free(id);
+    var future = try std.Io.concurrent(io, cancelLater, .{ io, &fix.parent_cancel });
+    var result = try fix.getResult(id, true);
+    defer result.deinit(a);
+    try future.await(io);
+    try std.testing.expect(result.canceled);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(!result.cleanup_failed);
+    // The parent cancel interrupted get, so the worker is joined by endTask.
+    try fix.endTask();
+    try std.testing.expect(fake.parent_was_requested);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, result.text, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("canceled", parsed.value.object.get("status").?.string);
+}
+test "single-child cancellation returns canceled JSON without canceling the parent" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = std.testing.io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "cancel just the child" });
+    defer a.free(id);
+    var result = try fix.cancelJob(id);
+    defer result.deinit(a);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(!result.canceled);
+    try std.testing.expect(!fix.parent_cancel.isRequested());
+    try std.testing.expect(!fix.active());
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, result.text, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(id, parsed.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("canceled", parsed.value.object.get("status").?.string);
+    try std.testing.expect(!parsed.value.object.get("cleanup_failed").?.bool);
+    // Canceling collected the job, so the parent may finish normally.
+    try fix.service.checkReady();
+}
+test "child local timeout fails the child without canceling the parent task" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 20);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = std.testing.io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "outlive the child deadline" });
+    defer a.free(id);
+    var result = try fix.getResult(id, true);
+    defer result.deinit(a);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(!result.canceled);
+    try std.testing.expect(!fix.parent_cancel.isRequested());
+    try std.testing.expect(!fake.parent_was_requested);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, result.text, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const value = parsed.value;
+    // Product semantics: a watchdog timeout is a failed child, not a canceled
+    // one, and it never cancels the parent task.
+    try std.testing.expectEqualStrings("failed", value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("TaskTimeout", value.object.get("detail").?.string);
+    try std.testing.expect(!fix.parent_runtime.poisoned);
+}
+test "parent steering skips an unstarted child tool and reaches the next child request" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    try fix.root.write("sentinel.txt", "SENTINEL-ORIGINAL", false);
+    var fake: FakeModel = .{ .io = io, .behavior = .steer_skip_write };
+    fake.hold.store(true, .release);
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "steer away from the stale write" });
+    defer a.free(id);
+    try waitFlag(io, &fake.entered, 1_000);
+    // The steering is accepted while the child's first model request is still
+    // in flight; it must sit in the child Inbox before the stale call lands.
+    var receipt = try fix.send(id, "STEER-MARKER do not write the target");
+    defer receipt.deinit();
+    try std.testing.expectEqualStrings("delivered", receipt.value.object.get("status").?.string);
+    fake.hold.store(false, .release);
+    var parsed = try fix.get(id, true);
+    defer parsed.deinit();
+    // The unstarted write_file must be skipped, not executed and then explained.
+    try std.testing.expect(fake.saw_skip);
+    try std.testing.expect(fake.saw_steering);
+    const sentinel = try fix.root.readBinary(a, "sentinel.txt", 4096);
+    defer a.free(sentinel);
+    try std.testing.expectEqualStrings("SENTINEL-ORIGINAL", sentinel);
+    try std.testing.expectEqualStrings("success", parsed.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("steered child done", parsed.value.object.get("report").?.string);
+}
+test "child question stays visible until the parent reply commits" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = std.testing.io, .behavior = .ask_parent };
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "ask the parent" });
+    defer a.free(id);
+
+    var question = try fix.get(id, true);
+    defer question.deinit();
+    try std.testing.expectEqualStrings("waiting_for_reply", question.value.object.get("status").?.string);
+    const messages = question.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(messages[0].object.get("requires_reply").?.bool);
+    try std.testing.expectEqualStrings("need direction", messages[0].object.get("message").?.string);
+
+    // Reading again while still unanswered repeats the question, never blocks.
+    var again = try fix.get(id, true);
+    defer again.deinit();
+    try std.testing.expectEqualStrings("waiting_for_reply", again.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 1), again.value.object.get("messages").?.array.items.len);
+
+    var receipt = try fix.send(id, "PARENT-REPLY-MARKER proceed");
+    defer receipt.deinit();
+    try std.testing.expectEqualStrings("reply_delivered", receipt.value.object.get("status").?.string);
+
+    var done = try fix.get(id, true);
+    defer done.deinit();
+    try std.testing.expectEqualStrings("success", done.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 0), done.value.object.get("messages").?.array.items.len);
+    try std.testing.expectEqualStrings("answered", done.value.object.get("report").?.string);
+    try std.testing.expect(fake.saw_reply);
+}
+test "child progress is bounded to eight unread messages and acked after encode" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = std.testing.io, .behavior = .progress_flood };
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "post progress" });
+    defer a.free(id);
+    // Ack nothing until the child has already seen the full queue, so its ninth
+    // post is deterministically rejected instead of racing this loop's acks.
+    try waitFlag(std.testing.io, &fake.progress_flood_checked, 1_000);
+    var total: usize = 0;
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        var snapshot = try fix.get(id, true);
+        defer snapshot.deinit();
+        const delivered = snapshot.value.object.get("messages").?.array.items.len;
+        try std.testing.expect(delivered <= service_mod.max_unread_child_messages);
+        total += delivered;
+        const status = snapshot.value.object.get("status").?.string;
+        if (!std.mem.eql(u8, status, "running") and !std.mem.eql(u8, status, "waiting_for_reply")) break;
+    }
+    try std.testing.expectEqual(service_mod.max_unread_child_messages, total);
+    try std.testing.expect(fake.saw_progress);
+}
+test "steering inbox capacity and invalid input fail explicitly" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "bounded messaging" });
+    defer a.free(id);
+    try waitFlag(io, &fake.entered, 1_000);
+    // The child Inbox is a bounded 16-slot window; overflow is an explicit
+    // failure, never a silent drop, and it does not cancel the parent.
+    var round: usize = 0;
+    while (round < 16) : (round += 1) {
+        var receipt = try fix.send(id, "bounded steering");
+        defer receipt.deinit();
+        try std.testing.expectEqualStrings("delivered", receipt.value.object.get("status").?.string);
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    // A full Inbox must fail without leaking the already-encoded steering
+    // receipt. The caller allocator here is the leak-checking test allocator,
+    // not an arena, so a missing error-path release would be reported.
+    try std.testing.expectError(error.InboxFull, fix.service.service().send(a, .{ .id = id, .message = "seventeenth" }, &fix.parent_cancel));
+    try std.testing.expectError(error.InvalidSubagentMessage, fix.service.service().send(arena.allocator(), .{ .id = id, .message = "" }, &fix.parent_cancel));
+    const too_long: [subagent.max_message_bytes + 1]u8 = @splat('m');
+    try std.testing.expectError(error.InvalidSubagentMessage, fix.service.service().send(arena.allocator(), .{ .id = id, .message = &too_long }, &fix.parent_cancel));
+    const too_long_id: [subagent.max_id_bytes + 1]u8 = @splat('i');
+    try std.testing.expectError(error.InvalidSubagentId, fix.service.service().send(arena.allocator(), .{ .id = &too_long_id, .message = "x" }, &fix.parent_cancel));
+    try std.testing.expectError(error.UnknownSubagentId, fix.service.service().send(arena.allocator(), .{ .id = "subagent_999", .message = "x" }, &fix.parent_cancel));
+    try fix.endTask();
+}
+test "parent message direction cap is 32 successful sends" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    // Each child model round reports progress after the Runtime has consumed
+    // every pending steering entry, so a progress snapshot is a real delivery
+    // barrier (no sleeps) for the next 16-message batch.
+    var fake: FakeModel = .{ .io = io, .behavior = .progress_loop };
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "consume steering" });
+    defer a.free(id);
+    var first = try fix.get(id, true);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("running", first.value.object.get("status").?.string);
+    // Four batches of eight keep the peak Inbox usage bounded even if the
+    // child consumes a prefix of a batch concurrently: leftovers from one batch
+    // plus the next batch can never exceed the 16-slot Inbox.
+    var batch: usize = 0;
+    while (batch < 4) : (batch += 1) {
+        var index: usize = 0;
+        while (index < 8) : (index += 1) {
+            var receipt = try fix.send(id, "STEER-MARKER batch");
+            defer receipt.deinit();
+            try std.testing.expectEqualStrings("delivered", receipt.value.object.get("status").?.string);
+        }
+        var next = try fix.get(id, true);
+        defer next.deinit();
+        try std.testing.expectEqualStrings("running", next.value.object.get("status").?.string);
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.SubagentMessageLimit, fix.service.service().send(arena.allocator(), .{ .id = id, .message = "too many" }, &fix.parent_cancel));
+    try fix.endTask();
+}
+test "old ids from another root fail closed while same-root collected ids stay readable" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = std.testing.io };
+    fix.withModel(&fake);
+    const first = try fix.start(.{ .task = "first root" });
+    defer a.free(first);
+    var parsed = try fix.get(first, true);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("success", parsed.value.object.get("status").?.string);
+    // Same root, already collected: serve the cached terminal view again.
+    var cached = try fix.get(first, true);
+    defer cached.deinit();
+    try std.testing.expectEqualStrings("success", cached.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("child report", cached.value.object.get("report").?.string);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.SubagentFinished, fix.service.service().send(arena.allocator(), .{ .id = first, .message = "late" }, &fix.parent_cancel));
+
+    // A second job in the same accepted root keeps the first id readable.
+    const second = try fix.runCurrentRoot(.{ .task = "second job" });
+    defer a.free(second);
+    var second_done = try fix.get(second, true);
+    defer second_done.deinit();
+    var first_again = try fix.get(first, true);
+    defer first_again.deinit();
+    try std.testing.expectEqualStrings("success", first_again.value.object.get("status").?.string);
+
+    // A new accepted root invalidates both ids.
+    try fix.endTask();
+    fix.service.beginTask(&fix.parent_cancel);
+    try std.testing.expectError(error.UnknownSubagentId, fix.service.service().get(arena.allocator(), .{ .id = first }, &fix.parent_cancel));
+    try std.testing.expectError(error.UnknownSubagentId, fix.service.service().get(arena.allocator(), .{ .id = second }, &fix.parent_cancel));
+}
+test "beforeFinish returns bounded host hints whenever a job is uncollected" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = std.testing.io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "uncollected job" });
+    defer a.free(id);
+    const service = fix.service.service();
+    try std.testing.expect(fix.active());
+    // Runtime owns the reminder budget; the host always answers with a hint.
+    var round: usize = 0;
+    while (round < 4) : (round += 1) {
+        const hint = (try service.beforeFinish(fix.a, &fix.parent_cancel)).?;
+        defer fix.a.free(hint);
+        try std.testing.expect(std.mem.indexOf(u8, hint, id) != null);
+        try std.testing.expect(hint.len < 256);
+    }
+    try fix.endTask();
+    try std.testing.expect(!fix.active());
+    try std.testing.expect((try service.beforeFinish(fix.a, &fix.parent_cancel)) == null);
+}
+test "App child factory resolves independent target credentials protocols and proxy" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    defer fix.deinit();
+    const app = try selectionApp(fix);
+    defer app.deinit();
+    try std.testing.expect(app.environment.get("TARGET_KEY") == null);
+    try fix.env.put("TARGET_KEY", "fake-mutated-source");
+    fix.env.deinit();
+    fix.env = std.process.Environ.Map.init(a);
+    var cancel: p.Cancellation = .{};
+    var target = try cfg.clone(a, app.config.value);
+    defer cfg.release(&target);
+    var client = try selectedClient(app, &target, "target/family/raw", &cancel);
+    defer client.deinit();
+    try std.testing.expectEqualStrings("target", target.value.selected_provider.?);
+    try std.testing.expectEqualStrings("family/raw", target.value.model.name);
+    try std.testing.expectEqual(p.Protocol.responses, target.value.model.protocol);
+    try std.testing.expectEqual(@as(u32, 32768), target.value.model.context_tokens);
+    try std.testing.expectEqualStrings("Bearer fake-target-old", client.authorization);
+    try std.testing.expect(client.proxy_http != null);
+    try std.testing.expect(target.value.model.input_price_threshold == null);
+    try std.testing.expect(target.value.model.input_price_flat_limit == null);
+    try std.testing.expect(target.value.model.reasoning == null);
+    try std.testing.expect(target.value.model.reasoning_effort == null);
+    try std.testing.expect(target.value.limits.low_price_input);
+    var inline_config = try cfg.clone(a, app.config.value);
+    defer cfg.release(&inline_config);
+    var inline_client = try selectedClient(app, &inline_config, "inline/m", &cancel);
+    defer inline_client.deinit();
+    try std.testing.expectEqualStrings("inline", inline_config.value.selected_provider.?);
+    try std.testing.expectEqual(p.Protocol.anthropic, inline_config.value.model.protocol);
+    try std.testing.expectEqual(@as(u32, 49152), inline_config.value.model.context_tokens);
+    try std.testing.expectEqualStrings("Bearer fake-inline", inline_client.authorization);
+    try std.testing.expect(inline_client.proxy_http == null);
+    try std.testing.expectEqualStrings("main", app.config.value.selected_provider.?);
+    try std.testing.expectEqualStrings("main/chat", app.config.value.registry.?.default);
+    try std.testing.expectEqualStrings("chat", app.config.value.model.name);
+    try std.testing.expectEqual(@as(u32, 65536), app.config.value.model.context_tokens);
+    try std.testing.expectEqual(@as(?u32, 20000), app.config.value.model.input_price_threshold);
+    try std.testing.expectEqual(@as(?u32, 50000), app.config.value.model.input_price_flat_limit);
+    try std.testing.expectEqual(p.Protocol.chat, app.runtime.selector.effective());
+    try std.testing.expectEqualStrings("Bearer fake-parent", app.client.authorization);
+    try std.testing.expect(app.client.proxy_http == null and app.client.codex_source == null);
+}
+test "App child freezes effective thinking and explicit target keeps its defaults" {
+    const Recorder = struct {
+        const Effort = enum { none, low, high, other };
+        const Identity = enum { parent, target, other };
+        io: std.Io,
+        effort: Effort = .other,
+        identity: Identity = .other,
+        calls: usize = 0,
+        second_effort: Effort = .other,
+        entered: std.atomic.Value(bool) = .init(false),
+        hold: std.atomic.Value(bool) = .init(false),
+
+        fn classify(value: ?[]const u8) Effort {
+            const text = value orelse return .none;
+            if (std.mem.eql(u8, text, "low")) return .low;
+            if (std.mem.eql(u8, text, "high")) return .high;
+            return .other;
+        }
+        fn make(raw: *anyopaque, _: std.mem.Allocator, config: *const cfg.Config) !p.Model {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.effort = classify(config.model.reasoning_effort);
+            self.identity = if (std.mem.eql(u8, config.model.name, "chat")) .parent else if (std.mem.eql(u8, config.model.name, "family/raw")) .target else .other;
+            return .{ .context = self, .call_fn = call };
+        }
+        fn call(raw: *anyopaque, a: std.mem.Allocator, request: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1 and self.hold.load(.acquire)) {
+                self.entered.store(true, .release);
+                while (self.hold.load(.acquire) and !request.cancellation.?.isRequested())
+                    try std.Io.sleep(self.io, .fromMilliseconds(2), .awake);
+                return .{ .success = .{ .message = try toolCallMessage(a, "frozen-read", "read_file", "{\"path\":\"missing-frozen-file\"}"), .finish = .tool_calls } };
+            }
+            self.second_effort = classify(request.reasoning_effort);
+            return .{ .success = .{ .message = try p.textMessage(a, .assistant, "done"), .finish = .stop } };
+        }
+    };
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    defer fix.deinit();
+    const app = try selectionApp(fix);
+    defer app.deinit();
+    const owned = app.config.arena.allocator();
+    const low = try owned.dupe(u8, "low");
+    const high = try owned.dupe(u8, "high");
+    const declaration = r.ReasoningSelection{ .reasoning_effort = low, .reasoning = .{ .map = .{ .low = low, .high = high } } };
+    try std.testing.expect(app.config.value.model.reasoning_effort == null);
+    app.thinking_control.publish(declaration);
+
+    var old: Recorder = .{ .io = fix.io, .hold = .init(true) };
+    var current: Recorder = .{ .io = fix.io };
+    var explicit: Recorder = .{ .io = fix.io };
+    var cancel: p.Cancellation = .{};
+    app.subagent.beginTask(&cancel);
+    defer app.subagent.service().endTask(&cancel) catch {};
+    defer old.hold.store(false, .release);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const svc = app.subagent.service();
+    app.subagent.deps.model_factory = .{ .context = &old, .make_fn = Recorder.make };
+    const first = try svc.run(arena.allocator(), .{ .task = "frozen child" }, &cancel);
+    var first_receipt = try std.json.parseFromSlice(std.json.Value, a, first.text, .{});
+    defer first_receipt.deinit();
+    const first_id = first_receipt.value.object.get("id").?.string;
+    try waitFlag(fix.io, &old.entered, 5000);
+    app.thinking_control.publish(.{ .reasoning_effort = high, .reasoning = declaration.reasoning });
+    app.subagent.deps.model_factory = .{ .context = &current, .make_fn = Recorder.make };
+    const second = try svc.run(arena.allocator(), .{ .task = "new child" }, &cancel);
+    var second_receipt = try std.json.parseFromSlice(std.json.Value, a, second.text, .{});
+    defer second_receipt.deinit();
+    const second_id = second_receipt.value.object.get("id").?.string;
+    app.subagent.deps.model_factory = .{ .context = &explicit, .make_fn = Recorder.make };
+    const third = try svc.run(arena.allocator(), .{ .task = "explicit target", .model = "target/family/raw" }, &cancel);
+    var third_receipt = try std.json.parseFromSlice(std.json.Value, a, third.text, .{});
+    defer third_receipt.deinit();
+    const third_id = third_receipt.value.object.get("id").?.string;
+    old.hold.store(false, .release);
+    _ = try svc.get(arena.allocator(), .{ .id = first_id, .wait = true }, &cancel);
+    _ = try svc.get(arena.allocator(), .{ .id = second_id, .wait = true }, &cancel);
+    _ = try svc.get(arena.allocator(), .{ .id = third_id, .wait = true }, &cancel);
+    try svc.endTask(&cancel);
+    try std.testing.expectEqual(Recorder.Identity.parent, old.identity);
+    try std.testing.expectEqual(Recorder.Effort.low, old.effort);
+    try std.testing.expectEqual(@as(usize, 2), old.calls);
+    try std.testing.expectEqual(Recorder.Effort.low, old.second_effort);
+    try std.testing.expectEqual(Recorder.Identity.parent, current.identity);
+    try std.testing.expectEqual(Recorder.Effort.high, current.effort);
+    try std.testing.expectEqual(Recorder.Identity.target, explicit.identity);
+    try std.testing.expectEqual(Recorder.Effort.none, explicit.effort);
+    try std.testing.expect(app.config.value.model.reasoning_effort == null);
+}
+test "App child factory fails closed and unknown price pauses actual child runtime" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    defer fix.deinit();
+    const app = try selectionApp(fix);
+    defer app.deinit();
+    var fake: FakeModel = .{ .io = fix.io };
+    app.subagent.deps.model_factory = .{ .context = &fake, .make_fn = FakeModel.make };
+    var cancel: p.Cancellation = .{};
+    app.subagent.beginTask(&cancel);
+    defer app.subagent.service().endTask(&cancel) catch {};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const svc = app.subagent.service();
+    const cases = [_]struct { reference: []const u8, expected: anyerror }{
+        .{ .reference = "unknown/m", .expected = error.DefaultProviderUnavailable },
+        .{ .reference = "target/unknown", .expected = error.DefaultModelUnavailable },
+        .{ .reference = "missing/m", .expected = error.ApiKeyNotFound },
+        .{ .reference = "bad/judge", .expected = error.UnsupportedSubagentProtocol },
+        .{ .reference = "bad/window", .expected = error.UnknownModelContext },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case.expected, svc.run(arena.allocator(), .{ .task = "must not run", .model = case.reference }, &cancel));
+        try std.testing.expect(app.subagent.current == null and app.subagent.retained_child == null);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+    var canceled: p.Cancellation = .{};
+    canceled.cancel();
+    var child = try cfg.clone(a, app.config.value);
+    defer cfg.release(&child);
+    try std.testing.expectError(error.Canceled, selectedClient(app, &child, "target/family/raw", &canceled));
+    try std.testing.expect(app.subagent.current == null and app.subagent.retained_child == null);
+    const started = try svc.run(arena.allocator(), .{ .task = "price protection", .model = "target/family/raw" }, &cancel);
+    var receipt = try std.json.parseFromSlice(std.json.Value, a, started.text, .{});
+    defer receipt.deinit();
+    const id = receipt.value.object.get("id").?.string;
+    const result = try svc.get(arena.allocator(), .{ .id = id, .wait = true }, &cancel);
+    var terminal = try std.json.parseFromSlice(std.json.Value, a, result.text, .{});
+    defer terminal.deinit();
+    try std.testing.expectEqualStrings("paused", terminal.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("UnknownInputPriceThreshold", terminal.value.object.get("detail").?.string);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(app.subagent.retained_child == null);
+}
+test "App staged settings snapshot and non-Codex to Codex child source" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    defer fix.deinit();
+    const app = try selectionApp(fix);
+    defer app.deinit();
+    try fix.env.put("TARGET_KEY", "fake-discarded");
+    var discarded = try app.prepareSettings(app.config.value, &fix.env);
+    discarded.deinit();
+    try expectSelectedKey(app, "Bearer fake-target-old");
+    try fix.env.put("TARGET_KEY", "fake-target-new");
+    var replacement = try app.prepareSettings(app.config.value, &fix.env);
+    defer replacement.deinit();
+    try fix.env.put("TARGET_KEY", "fake-after-prepare");
+    try expectSelectedKey(app, "Bearer fake-target-old");
+    app.installSettings(&replacement);
+    try expectSelectedKey(app, "Bearer fake-target-new");
+    try std.testing.expect(app.environment.get("TARGET_KEY") == null);
+    try std.testing.expectEqualStrings("Bearer fake-parent", app.client.authorization);
+    var codex = try cfg.clone(a, app.config.value);
+    defer cfg.release(&codex);
+    var cancel: p.Cancellation = .{};
+    var client = try selectedClient(app, &codex, "codex/gpt-fixture", &cancel);
+    defer client.deinit();
+    try std.testing.expect(client.codex_source != null and client.authorization.len == 0);
+    try std.testing.expectEqualStrings("codex", codex.value.selected_provider.?);
+    try std.testing.expectEqual(p.Protocol.responses, codex.value.model.protocol);
+    var fake: FakeModel = .{ .io = fix.io };
+    _ = try FakeModel.make(&fake, a, &codex.value);
+    try std.testing.expectEqual(p.Protocol.responses, fake.config_protocol);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(app.client.codex_source == null);
+    try std.testing.expectEqualStrings("Bearer fake-parent", app.client.authorization);
+}
+test "unsupported child protocol fails the start without a child run" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    fix.parent_runtime.selector = .{ .configured = .chat, .selected = .systemone, .initial_attempted = true };
+    var fake: FakeModel = .{ .io = std.testing.io };
+    fix.withModel(&fake);
+    fix.service.beginTask(&fix.parent_cancel);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.UnsupportedSubagentProtocol, fix.service.service().run(arena.allocator(), .{ .task = "no child" }, &fix.parent_cancel));
+    try std.testing.expect(fix.service.retained_child == null);
+    try std.testing.expect(!fix.active());
+}
+test "explicit model without client factory fails before publication" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var fake: FakeModel = .{ .io = std.testing.io };
+    fix.withModel(&fake);
+    fix.service.beginTask(&fix.parent_cancel);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.SubagentModelSelectionUnavailable, fix.service.service().run(arena.allocator(), .{ .task = "no child", .model = "provider/raw/model" }, &fix.parent_cancel));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(fix.service.retained_child == null);
+    try std.testing.expect(!fix.active());
+}
+test "concurrent sibling starts are not refused and endTask is repeatable" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var first: FakeModel = .{ .io = io };
+    var second: FakeModel = .{ .io = io };
+    fix.service.beginTask(&fix.parent_cancel);
+    fix.withModel(&first);
+    const one = try fix.runCurrentRoot(.{ .task = "first sibling" });
+    defer a.free(one);
+    // A second child starts while the first is still uncollected.
+    fix.withModel(&second);
+    const two = try fix.runCurrentRoot(.{ .task = "second sibling" });
+    defer a.free(two);
+    try std.testing.expectEqual(@as(usize, 2), jobCount(fix));
+    var first_done = try fix.get(one, true);
+    defer first_done.deinit();
+    var second_done = try fix.get(two, true);
+    defer second_done.deinit();
+    try std.testing.expectEqualStrings("success", first_done.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("success", second_done.value.object.get("status").?.string);
+    try std.testing.expect(!fix.active());
+    try fix.endTask();
+    try fix.endTask();
+    try std.testing.expect(!fix.active());
+    try std.testing.expect(fix.service.current == null);
+    // A new accepted root may start again.
+    const next = try fix.start(.{ .task = "after end task" });
+    defer a.free(next);
+    var parsed = try fix.get(next, true);
+    defer parsed.deinit();
+    try fix.endTask();
+}
+test "child approval maps into the parent permission domain before authorize" {
+    const a = std.testing.allocator;
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var recorder: ApprovalRecorder = .{ .io = std.testing.io };
+    fix.parent_runtime.host = .{ .context = &recorder, .emit_fn = ApprovalRecorder.emit, .authorize_fn = ApprovalRecorder.authorize };
+    fix.parent_runtime.permission_id = 50;
+    var model: ApprovalModel = .{};
+    fix.service.deps.model_factory = .{ .context = &model, .make_fn = ApprovalModel.make };
+    const id = try fix.start(.{ .task = "try a dangerous command" });
+    defer a.free(id);
+    var parsed = try fix.get(id, true);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recorder.emitted);
+    try std.testing.expectEqual(@as(usize, 1), recorder.authorized);
+    try std.testing.expectEqual(@as(?u64, 51), recorder.id);
+    try std.testing.expect(recorder.saw_source);
+    try std.testing.expect(recorder.saw_operation);
+    try std.testing.expectEqual(@as(u64, 51), fix.parent_runtime.permission_id);
+    try std.testing.expectEqualStrings("success", parsed.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("after denial", parsed.value.object.get("report").?.string);
+}
+test "real child Decision ask brokers both allow and deny without replay or auxiliary usage" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]r.Decision{ .allow_once, .deny }) |approval| {
+        const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var listener = try address.listen(io, .{});
+        defer listener.deinit(io);
+        const text = try std.fmt.allocPrint(a,
+            \\{{"llm":{{"default":"main/chat","providers":{{"main":{{"base_url":"http://127.0.0.1:1/v1","api_key":"fake-main","models":{{"chat":{{"protocol":"chat","context_tokens":32768}}}}}},"aux":{{"base_url":"http://127.0.0.1:{d}/v1","api_key":"fake-reviewer","models":{{"judge":{{"protocol":"chat","context_tokens":16384}}}}}}}}}},"decision":{{"model":"aux/judge"}},"limits":{{"request_timeout_ms":5000}}}}
+        , .{listener.socket.address.getPort()});
+        defer a.free(text);
+        var parsed_config = try cfg.parse(a, text);
+        defer cfg.release(&parsed_config);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        const DecisionClient = @import("../app/decision_client.zig").Client;
+        const parent = (try DecisionClient.create(a, io, parsed_config.value, &env)).?;
+        defer parent.deinit();
+        const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+        defer fix.deinit();
+        fix.decision = parent;
+        try fix.root.write("sentinel.txt", "BASE", false);
+        var recorder: ApprovalRecorder = .{ .io = io, .reply = approval };
+        fix.parent_runtime.host = .{ .context = &recorder, .emit_fn = ApprovalRecorder.emit, .authorize_fn = ApprovalRecorder.authorize };
+        var model: ReviewedBashModel = .{};
+        fix.service.deps.model_factory = .{ .context = &model, .make_fn = ReviewedBashModel.make };
+        var posts = std.atomic.Value(usize).init(0);
+        var server_job = try std.Io.concurrent(io, serveChildReview, .{ io, &listener, &posts });
+        defer server_job.cancel(io) catch {};
+        const id = try fix.start(.{ .task = "review the owned sentinel command" });
+        defer a.free(id);
+        var result = try fix.get(id, true);
+        defer result.deinit();
+        // If the child was not wired, fail before awaiting an idle listener.
+        try std.testing.expectEqual(@as(usize, 1), posts.load(.acquire));
+        try server_job.await(io);
+        try std.testing.expectEqual(@as(u64, 0), parent.calls); // Child never calls the parent client.
+        try std.testing.expectEqual(@as(usize, 1), recorder.emitted);
+        try std.testing.expectEqual(@as(usize, 1), recorder.authorized);
+        try std.testing.expect(recorder.saw_source);
+        try std.testing.expectEqual(@as(usize, 2), model.calls);
+        try std.testing.expect(model.saw_result);
+        try std.testing.expectEqual(approval == .deny, model.saw_denial);
+        try std.testing.expectEqualStrings("success", result.value.object.get("status").?.string);
+        try std.testing.expectEqualStrings("reviewed child done", result.value.object.get("report").?.string);
+        const usage = result.value.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 2), usage.get("normal_calls").?.integer);
+        try std.testing.expectEqual(@as(i64, 20), usage.get("normal").?.object.get("input_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 4), usage.get("normal").?.object.get("output_tokens").?.integer);
+        try std.testing.expect(result.value.object.get("auxiliary_usage_excluded").?.bool);
+        const contents = try fix.root.read(a, "sentinel.txt", 0, 64);
+        defer a.free(contents.data);
+        try std.testing.expectEqualStrings(if (approval == .allow_once) "BASEA" else "BASE", contents.data);
+    }
+}
+test "child local timeout withdraws a pending approval without canceling the parent" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    // The child watchdog fires while the parent is still deciding; a cooperative
+    // host blocks well past the timeout so an early return can only come from
+    // the broker-local cancellation token.
+    const fix = try Fixture.create(a, io, .chat, .chat, 100);
+    defer fix.deinit();
+    var recorder: ApprovalRecorder = .{ .io = io, .delay_ms = 1000 };
+    fix.parent_runtime.host = .{ .context = &recorder, .emit_fn = ApprovalRecorder.emit, .authorize_fn = ApprovalRecorder.authorize };
+    fix.parent_runtime.permission_id = 70;
+    var model: ApprovalModel = .{};
+    fix.service.deps.model_factory = .{ .context = &model, .make_fn = ApprovalModel.make };
+    const id = try fix.start(.{ .task = "approval outlives the child" });
+    defer a.free(id);
+    var result = try fix.getResult(id, true);
+    defer result.deinit(a);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(!result.canceled);
+    try std.testing.expectEqual(@as(usize, 1), recorder.emitted);
+    try std.testing.expectEqual(@as(usize, 1), recorder.authorized);
+    // The broker did not hang for the full host delay: the child's local
+    // timeout canceled the broker-local token and the parent mirror was cleared.
+    try std.testing.expect(recorder.saw_canceled);
+    try std.testing.expectEqual(@as(usize, 1), recorder.cleared);
+    try std.testing.expectEqual(recorder.id, recorder.cleared_id);
+    // A child-local timeout must never cancel or poison the parent task.
+    try std.testing.expect(!fix.parent_cancel.isRequested());
+    try std.testing.expect(!fix.parent_runtime.poisoned);
+    try std.testing.expect(!fix.active());
+}
+test "parent grace expiry injects Io cancellation into a nested async child runtime" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    // 1.5s parent/child watchdog: far above the 20ms grace, far below a hang.
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_500);
+    defer fix.deinit();
+
+    // Real Tools executor and real Service: the tool path itself must reach the
+    // nested child Runtime, not a direct Service call.
+    var store = mem.Store.init(&fix.root, fix.config.limits);
+    var tools: tools_mod.Tools = .{ .root = &fix.root, .memory = &store, .config = &fix.config, .environment = &fix.env };
+    tools.subagent = fix.service.service();
+    fix.parent_runtime.executor = tools.executor();
+
+    var root_model: DelegateModel = .{};
+    fix.parent_runtime.model = .{ .context = &root_model, .call_fn = DelegateModel.call };
+    var child: NestedSleepModel = .{ .io = io };
+    fix.service.deps.model_factory = .{ .context = &child, .make_fn = NestedSleepModel.make };
+    var host: GetStartedHost = .{};
+    host.install(fix);
+
+    var cancel: p.Cancellation = .{};
+    var future = try std.Io.concurrent(io, runRoot, .{ fix, &cancel });
+    defer _ = future.cancel(io) catch {};
+
+    try waitFlag(io, &child.entered, 1_000);
+    // Also wait for the parent's get call to be canonically started: only then
+    // does the cancellation land on that tool result instead of leaving the
+    // earlier start receipt as the last recorded call.
+    try waitFlag(io, &host.get_started, 1_000);
+    // The parent flag alone reaches no cancellation point in the sleeping child.
+    try std.testing.expect(!child.injected_io_cancel.load(.acquire));
+    cancel.cancel();
+    const terminal = try future.await(io);
+
+    try std.testing.expect(child.injected_io_cancel.load(.acquire));
+    try std.testing.expect(!child.returned_late_report);
+    try std.testing.expectEqual(@as(usize, 1), child.calls);
+    try std.testing.expectEqual(@as(usize, 2), root_model.calls);
+    try std.testing.expectEqual(r.Status.canceled, terminal.status);
+    try std.testing.expectEqual(error.Canceled, terminal.detail.?);
+    try std.testing.expect(!fix.parent_runtime.poisoned);
+    try std.testing.expect(fix.service.retained_child == null);
+    try std.testing.expect(!fix.active());
+    // The parent recorded the canceled get outcome, never the late report.
+    const last = fix.parent_runtime.history.items[fix.parent_runtime.history.items.len - 1];
+    try std.testing.expectEqual(p.Role.tool, last.role);
+    const recorded = last.blocks[0].tool_result;
+    try std.testing.expect(recorded.canceled);
+    try std.testing.expect(std.mem.indexOf(u8, recorded.text, "late child report") == null);
+    try fix.service.checkReady();
+}
+test "http clone keeps frozen key CA and route while owning a separate pool" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("CURL_CA_BUNDLE", "/owned/first-ca.pem");
+    try env.put("FROZEN_KEY", "first-key");
+    const parent_config: cfg.Config = .{
+        .provider = .{ .base_url = "https://example.invalid/v1", .api_key_env = "FROZEN_KEY" },
+        .selected_provider = "listed",
+        .model = .{ .name = "fixture/model", .context_tokens = 32768, .protocol = .chat },
+        .proxy = .{ .address = "127.0.0.1", .port = 18973, .models = &.{"listed/fixture/model"} },
+    };
+    var parent = try http.Client.initWithEnv(a, std.testing.io, &parent_config, "first-key", &env);
+    defer parent.deinit();
+    // Ambient changes after creation must never alter the child clone.
+    try env.put("FROZEN_KEY", "later-key");
+    try env.put("CURL_CA_BUNDLE", "/owned/later-ca.pem");
+    const child_config: cfg.Config = .{
+        .provider = parent_config.provider,
+        .selected_provider = parent_config.selected_provider,
+        .model = parent_config.model,
+        .proxy = parent_config.proxy,
+    };
+    var child = try parent.cloneForConfig(a, std.testing.io, &child_config);
+    defer child.deinit();
+    try std.testing.expectEqualStrings("Bearer first-key", child.authorization);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18973", child.proxy_http.?.proxy_url.?);
+    try std.testing.expect(parent.proxy_http.?.proxy_url.?.ptr != child.proxy_http.?.proxy_url.?.ptr);
+    try std.testing.expectEqualStrings("/owned/first-ca.pem", child.proxy_http.?.env.get("CURL_CA_BUNDLE").?);
+    try std.testing.expect(&parent.http != &child.http);
+    // A config whose route no longer matches the frozen transport is refused.
+    const changed_config: cfg.Config = .{
+        .provider = parent_config.provider,
+        .selected_provider = "unlisted",
+        .model = parent_config.model,
+        .proxy = parent_config.proxy,
+    };
+    try std.testing.expectError(error.ProxyRouteChanged, parent.cloneForConfig(a, std.testing.io, &changed_config));
+}
+test "send refuses a finished or canceled job that is not collected yet" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    const service = fix.service.service();
+
+    // Publication is visible under the job lock: here the worker finished
+    // successfully but the parent deliberately did not collect it. A late
+    // message must fail explicitly instead of reporting a delivery no child
+    // will ever read.
+    var fake: FakeModel = .{ .io = io };
+    fix.withModel(&fake);
+    const id = try fix.start(.{ .task = "finish without collecting" });
+    defer a.free(id);
+    try waitUncollectedFinished(fix, service, 1_000);
+    try std.testing.expect(fix.service.current != null);
+    try std.testing.expectError(error.SubagentFinished, service.send(a, .{ .id = id, .message = "late steering" }, &fix.parent_cancel));
+    var done = try fix.get(id, true);
+    defer done.deinit();
+    try std.testing.expectEqualStrings("success", done.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("child report", done.value.object.get("report").?.string);
+
+    // A canceled root leaves the job uncollected. `get` returns the parent
+    // cancellation view immediately, and the job's own cancel token already
+    // follows the root one way: no send may claim success before or after the
+    // worker publishes its canceled terminal.
+    try fix.endTask();
+    var blocking: FakeModel = .{ .io = io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
+    fix.withModel(&blocking);
+    const blocked = try fix.start(.{ .task = "cancel the root then send" });
+    defer a.free(blocked);
+    fix.parent_cancel.cancel();
+    var canceled = try fix.getResult(blocked, true);
+    defer canceled.deinit(a);
+    try std.testing.expect(canceled.canceled);
+    try std.testing.expect(fix.service.current != null);
+    // The call-level token is already requested, so probe the job-level guard
+    // with a fresh call token: the child chained to the canceled root can no
+    // longer accept a message.
+    var live: p.Cancellation = .{};
+    try std.testing.expectError(error.SubagentFinished, service.send(a, .{ .id = blocked, .message = "too late" }, &live));
+    try waitUncollectedFinished(fix, service, 1_000);
+    try std.testing.expectError(error.SubagentFinished, service.send(a, .{ .id = blocked, .message = "still too late" }, &live));
+    try fix.endTask();
+}
+test "per-agent status rows grouped progress four workers without get and ignored events" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var models = [_]GroupProgressModel{
+        .{ .io = io, .kind = .ignored }, .{ .io = io, .kind = .message },
+        .{ .io = io, .kind = .passive }, .{ .io = io, .kind = .ordinary },
+    };
+    defer for (&models) |*model| model.command.store(3, .release);
+    var ids: [4][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    fix.service.beginTask(&fix.parent_cancel);
+    try std.testing.expectEqual(@as(usize, 0), fix.service.view().agents.len);
+    for (&models, 0..) |*model, i| {
+        fix.service.deps.model_factory = .{ .context = model, .make_fn = GroupProgressModel.make };
+        ids[i] = try fix.runCurrentRoot(.{ .task = "grouped worker" });
+        started += 1;
+    }
+    for (&models) |*model| try waitFlag(io, &model.entered, 5000);
+    var view = fix.service.view();
+    const group = view.group_id;
+    try std.testing.expectEqual(@as(u64, 4), view.running);
+    try std.testing.expectEqual(@as(u64, 4), view.total);
+    try std.testing.expectEqual(@as(usize, 4), view.agents.len);
+    for (view.agents, 0..) |row, i| {
+        try std.testing.expectEqual(@as(u64, @intCast(i + 1)), row.id);
+        try std.testing.expect(row.active());
+        try std.testing.expect(row.latestText().len != 0);
+    }
+    models[2].command.store(1, .release);
+    try waitGroupObserved(io, &models[2].observed, 1);
+    view = fix.service.view();
+    try std.testing.expectEqualStrings("THIRD", view.agents[2].latestText());
+    const third_revision = view.agents[2].revision;
+    models[3].command.store(1, .release);
+    try waitGroupObserved(io, &models[3].observed, 1);
+    view = fix.service.view();
+    try std.testing.expectEqualStrings("SECOND", view.latestText());
+    try std.testing.expectEqualStrings("THIRD", view.agents[2].latestText());
+    try std.testing.expectEqual(third_revision, view.agents[2].revision);
+    try std.testing.expectEqualStrings("SECOND", view.agents[3].latestText());
+    const rev = view.revision;
+    const latest = view.latest_id;
+    models[0].command.store(1, .release);
+    try waitGroupObserved(io, &models[0].observed, 1);
+    view = fix.service.view();
+    try std.testing.expectEqual(rev, view.revision);
+    try std.testing.expectEqual(latest, view.latest_id);
+    try std.testing.expectEqualStrings("SECOND", view.latestText());
+    models[1].command.store(2, .release);
+    try waitGroupObserved(io, &models[1].observed, 2);
+    models[0].command.store(3, .release);
+    try waitGroupCompleted(fix, 1);
+    view = fix.service.view();
+    try std.testing.expect(view.active());
+    try std.testing.expectEqual(@as(u64, 4), view.total);
+    try std.testing.expectEqual(.completed, view.agents[0].phase);
+    try std.testing.expect(view.agents[2].active());
+    const stopped_elapsed = view.agents[0].elapsed_ms;
+    const running_elapsed = view.agents[2].elapsed_ms;
+    try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    view = fix.service.view();
+    try std.testing.expectEqual(stopped_elapsed, view.agents[0].elapsed_ms);
+    try std.testing.expect(view.agents[2].elapsed_ms > running_elapsed);
+    var collected = try fix.get(ids[0], false);
+    defer collected.deinit();
+    view = fix.service.view();
+    try std.testing.expectEqual(@as(usize, 4), view.agents.len);
+    try std.testing.expectEqual(.completed, view.agents[0].phase);
+    _ = fix.service.view();
+    _ = fix.service.view();
+    var message = try fix.get(ids[1], false);
+    defer message.deinit();
+    try std.testing.expectEqualStrings("queued message", message.value.object.get("messages").?.array.items[0].object.get("message").?.string);
+    for (&models) |*model| model.command.store(3, .release);
+    try waitGroupCompleted(fix, 4);
+    try std.testing.expect(!fix.service.view().active());
+    try fix.endTask();
+    fix.service.beginTask(&fix.parent_cancel);
+    try std.testing.expectEqual(@as(u64, 0), fix.service.view().group_id);
+    try std.testing.expectEqual(@as(u64, 0), fix.service.view().total);
+    try std.testing.expectEqual(@as(usize, 0), fix.service.view().agents.len);
+    var next: FakeModel = .{ .io = io, .hold = .init(true) };
+    defer next.hold.store(false, .release);
+    fix.withModel(&next);
+    const next_id = try fix.runCurrentRoot(.{ .task = "new group" });
+    defer a.free(next_id);
+    try waitFlag(io, &next.entered, 5000);
+    try std.testing.expect(fix.service.view().group_id != group);
+    next.hold.store(false, .release);
+    try fix.endTask();
+    try std.testing.expect(fix.service.aggregate.read_cache.capacity > 0);
+    fix.service.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fix.service.aggregate.read_view.agents.len);
+    try std.testing.expect(fix.service.aggregate.first == null);
+    try std.testing.expect(fix.service.aggregate.last == null);
+    fix.service.deinit();
+}
+test "six children run at once and every mutation lands through the shared gate" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    fix.service.beginTask(&fix.parent_cancel);
+
+    const children = 6;
+    var barrier: Barrier = .{};
+    var fakes: [children]FakeModel = undefined;
+    var paths: [children][24]u8 = undefined;
+    var tags: [children][16]u8 = undefined;
+    var reports: [children][24]u8 = undefined;
+    var ids: [children][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    for (&fakes, 0..) |*fake, index| {
+        const tag = try std.fmt.bufPrint(&tags[index], "CHILD-{d}", .{index});
+        fake.* = .{
+            .io = io,
+            .behavior = .concurrent_write,
+            .barrier = &barrier,
+            .write_path = try std.fmt.bufPrint(&paths[index], "child-{d}.txt", .{index}),
+            .write_tag = tag,
+            .report_text = try std.fmt.bufPrint(&reports[index], "report-{d}", .{index}),
+        };
+    }
+    // Each start gets its own FakeModel context: the factory is replaced before
+    // every run, and the synchronous `make` inside the parent control path binds
+    // that instance to exactly one child worker.
+    for (&fakes, 0..) |*fake, index| {
+        fix.withModel(fake);
+        ids[index] = try fix.runCurrentRoot(.{ .task = "concurrent mutation" });
+        started = index + 1;
+    }
+    // Every child reached its own model call before any of them proceeds: a host
+    // that serialized sibling jobs could never reach six entries here.
+    const began = std.Io.Clock.awake.now(io);
+    while (barrier.entered.load(.acquire) < children) {
+        if (began.untilNow(io, .awake).toMilliseconds() > 5_000) return error.FixtureTimeout;
+        try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, children), jobCount(fix));
+    try std.testing.expect(fix.active());
+    barrier.release.store(true, .release);
+
+    // Six uncollected jobs with a four-slot re-read cache: none may be hidden.
+    for (ids, 0..) |id, index| {
+        var parsed = try fix.get(id, true);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("success", parsed.value.object.get("status").?.string);
+        try std.testing.expectEqualStrings(fakes[index].report_text, parsed.value.object.get("report").?.string);
+    }
+    try std.testing.expect(!fix.active());
+    // Every file holds exactly the payload of the child that wrote it.
+    for (&fakes) |*fake| {
+        const written = try fix.root.readBinary(a, fake.write_path, 4096);
+        defer a.free(written);
+        try std.testing.expectEqualStrings(fake.write_tag, written);
+    }
+}
+test "sibling jobs keep their questions and replies independent by id" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var first: FakeModel = .{
+        .io = io,
+        .behavior = .ask_parent,
+        .question = "need direction A",
+        .reply_tag = "REPLY-FIRST",
+        .final_text = "first answered",
+    };
+    var second: FakeModel = .{
+        .io = io,
+        .behavior = .ask_parent,
+        .question = "need direction B",
+        .reply_tag = "REPLY-SECOND",
+        .final_text = "second answered",
+    };
+    fix.service.beginTask(&fix.parent_cancel);
+    fix.withModel(&first);
+    const first_id = try fix.runCurrentRoot(.{ .task = "ask as first" });
+    defer a.free(first_id);
+    fix.withModel(&second);
+    const second_id = try fix.runCurrentRoot(.{ .task = "ask as second" });
+    defer a.free(second_id);
+
+    var ask_first = try fix.get(first_id, true);
+    defer ask_first.deinit();
+    try std.testing.expectEqualStrings("waiting_for_reply", ask_first.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("need direction A", ask_first.value.object.get("messages").?.array.items[0].object.get("message").?.string);
+    var ask_second = try fix.get(second_id, true);
+    defer ask_second.deinit();
+    try std.testing.expectEqualStrings("need direction B", ask_second.value.object.get("messages").?.array.items[0].object.get("message").?.string);
+
+    var reply_first = try fix.send(first_id, "REPLY-FIRST proceed");
+    defer reply_first.deinit();
+    try std.testing.expectEqualStrings("reply_delivered", reply_first.value.object.get("status").?.string);
+    // The addressed reply must not consume the sibling's question.
+    var still_second = try fix.get(second_id, true);
+    defer still_second.deinit();
+    try std.testing.expectEqualStrings("waiting_for_reply", still_second.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("need direction B", still_second.value.object.get("messages").?.array.items[0].object.get("message").?.string);
+
+    var first_done = try fix.get(first_id, true);
+    defer first_done.deinit();
+    try std.testing.expectEqualStrings("success", first_done.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("first answered", first_done.value.object.get("report").?.string);
+    // Read only after that worker was joined.
+    try std.testing.expect(first.saw_reply);
+    try std.testing.expect(!second.saw_reply);
+
+    var reply_second = try fix.send(second_id, "REPLY-SECOND go");
+    defer reply_second.deinit();
+    try std.testing.expectEqualStrings("reply_delivered", reply_second.value.object.get("status").?.string);
+    var second_done = try fix.get(second_id, true);
+    defer second_done.deinit();
+    try std.testing.expectEqualStrings("second answered", second_done.value.object.get("report").?.string);
+    try std.testing.expect(second.saw_reply);
+    try std.testing.expect(!fix.active());
+}
+test "canceling one sibling keeps the others running and collectable" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    fix.service.beginTask(&fix.parent_cancel);
+    var fakes: [3]FakeModel = undefined;
+    var ids: [3][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    for (&fakes, 0..) |*fake, index| {
+        fake.* = .{ .io = io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
+        fix.withModel(fake);
+        ids[index] = try fix.runCurrentRoot(.{ .task = "sibling task" });
+        started = index + 1;
+    }
+    // Every worker enters its own model call before anything is canceled: a
+    // worker canceled in the start/call window exits without setting its flag,
+    // so asserting on it later would be a race instead of a result.
+    for (&fakes) |*fake| try waitFlag(io, &fake.entered, 5_000);
+
+    var middle = try fix.cancelJob(ids[1]);
+    defer middle.deinit(a);
+    try std.testing.expect(middle.is_error);
+    // A single job cancel is never a parent cancel.
+    try std.testing.expect(!middle.canceled);
+    try std.testing.expect(!fix.parent_cancel.isRequested());
+    const middle_json = try std.json.parseFromSlice(std.json.Value, a, middle.text, .{ .allocate = .alloc_always });
+    defer middle_json.deinit();
+    try std.testing.expectEqualStrings("canceled", middle_json.value.object.get("status").?.string);
+
+    // The siblings are untouched and still addressable by their own ids.
+    try std.testing.expect(fix.active());
+    try std.testing.expectEqual(@as(usize, 2), jobCount(fix));
+    var alive_first = try fix.get(ids[0], false);
+    defer alive_first.deinit();
+    try std.testing.expectEqualStrings("running", alive_first.value.object.get("status").?.string);
+    var alive_last = try fix.get(ids[2], false);
+    defer alive_last.deinit();
+    try std.testing.expectEqualStrings("running", alive_last.value.object.get("status").?.string);
+
+    try fix.endTask();
+    try std.testing.expect(!fix.active());
+    try std.testing.expect(fix.service.current == null);
+    // Every worker was joined, so its plain flags are safe to read here.
+    try std.testing.expect(fakes[0].saw_cancel);
+    try std.testing.expect(fakes[1].saw_cancel);
+    try std.testing.expect(fakes[2].saw_cancel);
+    try std.testing.expect(!fix.parent_cancel.isRequested());
+}
+test "collecting siblings in any order keeps the job list intact" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    fix.service.beginTask(&fix.parent_cancel);
+    var fakes: [3]FakeModel = undefined;
+    var reports: [3][16]u8 = undefined;
+    var ids: [3][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    for (&fakes, 0..) |*fake, index| {
+        fake.* = .{ .io = io, .report_text = try std.fmt.bufPrint(&reports[index], "report-{d}", .{index}) };
+        fix.withModel(fake);
+        ids[index] = try fix.runCurrentRoot(.{ .task = "ordered collect" });
+        started = index + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), jobCount(fix));
+
+    // The chain is prepended, so the real head is ids[2] and the real tail is
+    // ids[0]. Collect the middle first, then head, then tail: no release may
+    // disturb the chain.
+    var middle = try fix.get(ids[1], true);
+    defer middle.deinit();
+    try std.testing.expectEqualStrings("report-1", middle.value.object.get("report").?.string);
+    try std.testing.expectEqual(@as(usize, 2), jobCount(fix));
+    var head = try fix.get(ids[2], true);
+    defer head.deinit();
+    try std.testing.expectEqualStrings("report-2", head.value.object.get("report").?.string);
+    var tail = try fix.get(ids[0], true);
+    defer tail.deinit();
+    try std.testing.expectEqualStrings("report-0", tail.value.object.get("report").?.string);
+    try std.testing.expect(!fix.active());
+    try std.testing.expect(fix.service.current == null);
+    // All three collected views stay re-readable (within the cache bound).
+    for (ids) |id| {
+        var again = try fix.getResult(id, true);
+        defer again.deinit(a);
+        try std.testing.expect(!again.is_error);
+    }
+}
+test "endTask cancels and joins every sibling and bounds the finish hint" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    // More siblings than the finish hint lists and more than the view cache.
+    const children = 9;
+    fix.service.beginTask(&fix.parent_cancel);
+    var fakes: [children]FakeModel = undefined;
+    var ids: [children][]u8 = undefined;
+    var started: usize = 0;
+    defer for (ids[0..started]) |id| a.free(id);
+    for (&fakes, 0..) |*fake, index| {
+        fake.* = .{ .io = io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
+        fix.withModel(fake);
+        ids[index] = try fix.runCurrentRoot(.{ .task = "join all siblings" });
+        started = index + 1;
+    }
+    // All workers must already be inside their model call, otherwise a canceled
+    // worker that never entered would leave its flag unset for the final
+    // assertions.
+    for (&fakes) |*fake| try waitFlag(io, &fake.entered, 5_000);
+    try std.testing.expectEqual(@as(usize, children), jobCount(fix));
+
+    const service = fix.service.service();
+    var probe: p.Cancellation = .{};
+    const hint = (try service.beforeFinish(a, &probe)).?;
+    defer a.free(hint);
+    // Bounded window over every live job, not an uncollected-job limit. Count
+    // only the per-id status suffix: the header tool name also contains
+    // "subagent_", and every waiting sibling's status is already deterministically
+    // "running" here.
+    try std.testing.expect(std.mem.indexOf(u8, hint, "jobs pending: 9") != null);
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, hint, ":running"));
+    // Head-first listing covers ids[1..]; the oldest sibling (the list tail) is
+    // the one left out. Match `${id}:` so "subagent_1" cannot prefix-match a
+    // longer id.
+    var needle_buffer: [96]u8 = undefined;
+    for (ids[1..]) |id| {
+        const needle = try std.fmt.bufPrint(&needle_buffer, "{s}:", .{id});
+        try std.testing.expect(std.mem.indexOf(u8, hint, needle) != null);
+    }
+    const omitted_id = try std.fmt.bufPrint(&needle_buffer, "{s}:", .{ids[0]});
+    try std.testing.expect(std.mem.indexOf(u8, hint, omitted_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "1 more not listed") != null);
+    try std.testing.expect(hint.len < 1024);
+
+    try fix.endTask();
+    try std.testing.expect(!fix.active());
+    try std.testing.expect(fix.service.current == null);
+    try std.testing.expect(fix.service.retained_child == null);
+    // Cancel-then-join covered every sibling, never just the head.
+    for (&fakes) |*fake| try std.testing.expect(fake.saw_cancel);
+    try std.testing.expect(!fix.parent_cancel.isRequested());
+}
+test "pending sibling approvals are brokered per job id" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    var recorder: ApprovalRecorder = .{ .io = io };
+    fix.parent_runtime.host = .{ .context = &recorder, .emit_fn = ApprovalRecorder.emit, .authorize_fn = ApprovalRecorder.authorize };
+    fix.parent_runtime.permission_id = 100;
+    var first: ApprovalModel = .{};
+    var second: ApprovalModel = .{};
+    fix.service.beginTask(&fix.parent_cancel);
+    fix.service.deps.model_factory = .{ .context = &first, .make_fn = ApprovalModel.make };
+    const first_id = try fix.runCurrentRoot(.{ .task = "dangerous command one" });
+    defer a.free(first_id);
+    fix.service.deps.model_factory = .{ .context = &second, .make_fn = ApprovalModel.make };
+    const second_id = try fix.runCurrentRoot(.{ .task = "dangerous command two" });
+    defer a.free(second_id);
+
+    // Both children hold an identical pending approval at the same time.
+    const service = fix.service.service();
+    const began = std.Io.Clock.awake.now(io);
+    while (true) {
+        var probe: p.Cancellation = .{};
+        const hint = (try service.beforeFinish(a, &probe)) orelse return error.FixtureMissingJob;
+        defer a.free(hint);
+        if (std.mem.count(u8, hint, "waiting_for_approval") == 2) break;
+        if (began.untilNow(io, .awake).toMilliseconds() > 5_000) return error.FixtureTimeout;
+        try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    }
+
+    // A parent get brokers exactly the addressed job's approval, and the source
+    // marker carries that job id so the two prompts stay distinguishable.
+    recorder.expect_source = first_id;
+    var first_done = try fix.get(first_id, true);
+    defer first_done.deinit();
+    try std.testing.expectEqualStrings("success", first_done.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 1), recorder.authorized);
+
+    recorder.expect_source = second_id;
+    var second_done = try fix.get(second_id, true);
+    defer second_done.deinit();
+    try std.testing.expectEqualStrings("success", second_done.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 2), recorder.authorized);
+    try std.testing.expectEqual(@as(usize, 2), recorder.emitted);
+    try std.testing.expect(recorder.saw_source);
+    try std.testing.expect(recorder.saw_operation);
+    try std.testing.expect(!fix.active());
+}
+test "multiple retained cleanup owners are all kept until deinit closes them" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    defer fix.deinit();
+    // Start both before either collect: a retained owner makes `run` refuse with
+    // CleanupFailed, so the second start must already be running.
+    fix.service.deps.test_cleanup_failed = true;
+    var first: FakeModel = .{ .io = io };
+    var second: FakeModel = .{ .io = io };
+    fix.service.beginTask(&fix.parent_cancel);
+    fix.withModel(&first);
+    const first_id = try fix.runCurrentRoot(.{ .task = "cleanup failure one" });
+    defer a.free(first_id);
+    fix.withModel(&second);
+    const second_id = try fix.runCurrentRoot(.{ .task = "cleanup failure two" });
+    defer a.free(second_id);
+
+    // Registered before the first assertion: any failure path leaves no live job
+    // and clears the injected fault on every retained owner, so Fixture.deinit
+    // can close them instead of fail-stopping over the real error.
+    defer {
+        if (fix.service.current != null) fix.endTask() catch {};
+        var retained = fix.service.retained_child;
+        while (retained) |child| : (retained = child.retained_next) child.test_cleanup_failed = false;
+    }
+
+    var first_result = try fix.getResult(first_id, true);
+    defer first_result.deinit(a);
+    try std.testing.expect(first_result.cleanup_failed);
+    var second_result = try fix.getResult(second_id, true);
+    defer second_result.deinit(a);
+    try std.testing.expect(second_result.cleanup_failed);
+
+    // Also clear the fault before the explicit deinit below, which closes every
+    // owner immediately rather than at fixture teardown.
+    var owner = fix.service.retained_child;
+    while (owner) |child| : (owner = child.retained_next) child.test_cleanup_failed = false;
+
+    // Two failures, two owners: the chain never dropped one for the other.
+    var count: usize = 0;
+    owner = fix.service.retained_child;
+    while (owner) |child| : (owner = child.retained_next) {
+        try std.testing.expect(child.job == null);
+        try std.testing.expect(child.cancel.parent == null);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectError(error.CleanupFailed, fix.service.checkReady());
+    fix.service.deinit();
+    try std.testing.expect(fix.service.retained_child == null);
+    try std.testing.expect(fix.service.current == null);
+}

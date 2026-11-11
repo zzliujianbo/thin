@@ -127,68 +127,10 @@ pub const Decoder = struct {
     }
 };
 
-/// 测试用：收集所有被分发的事件名与数据副本。
-const Capture = struct {
-    allocator: std.mem.Allocator,
-    names: std.ArrayList([]const u8) = .empty,
-    values: std.ArrayList([]const u8) = .empty,
-
-    /// 把事件名与数据复制到 arena 中保存，因为 Sink 传入的切片只在回调期间有效。
-    fn emit(context: *anyopaque, event: []const u8, data: []const u8) !void {
-        const self: *Capture = @ptrCast(@alignCast(context));
-        try self.names.append(self.allocator, try self.allocator.dupe(u8, event));
-        try self.values.append(self.allocator, try self.allocator.dupe(u8, data));
-    }
-
-    /// 生成供 Decoder 使用的 Sink。
-    fn sink(self: *Capture) Sink {
-        return .{ .context = self, .emit_fn = emit };
-    }
-};
+// 测试用：收集所有被分发的事件名与数据副本。
 
 // 验证：逐字节输入、UTF-8、CRLF、BOM、注释行与多行 data 都能正确处理。
-test "SSE accepts byte-by-byte UTF8 CRLF BOM comments and multiline data" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var capture = Capture{ .allocator = arena.allocator() };
-    var decoder = Decoder.init(std.testing.allocator, 1024, capture.sink());
-    defer decoder.deinit();
-
-    const bytes = "\xef\xbb\xbf: hello\r\nevent: delta\r\ndata: 中文\r\ndata: two\r\n\r\ndata: [DONE]\n\n";
-    for (bytes) |byte| try decoder.feed(&.{byte});
-    try decoder.finish();
-
-    try std.testing.expectEqual(@as(usize, 2), capture.values.items.len);
-    try std.testing.expectEqualStrings("delta", capture.names.items[0]);
-    try std.testing.expectEqualStrings("中文\ntwo", capture.values.items[0]);
-    try std.testing.expectEqualStrings("message", capture.names.items[1]);
-    try std.testing.expectEqualStrings("[DONE]", capture.values.items[1]);
-}
 
 // 验证：未结束的事件在 finish 时报错且不分发；超出上限时报 EventTooLarge。
-test "SSE rejects oversized and truncated events without dispatching" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var capture = Capture{ .allocator = arena.allocator() };
-    var decoder = Decoder.init(std.testing.allocator, 20, capture.sink());
-    defer decoder.deinit();
-
-    try decoder.feed("data: unfinished");
-    try std.testing.expectError(error.IncompleteSseEvent, decoder.finish());
-    try std.testing.expectEqual(@as(usize, 0), capture.values.items.len);
-    try std.testing.expectError(error.EventTooLarge, decoder.feed(" more and more"));
-}
 
 // 验证：空 data 与单独 CR 作为行结束符都是合法的。
-test "SSE empty data and lone CR delimiters are valid" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var capture = Capture{ .allocator = arena.allocator() };
-    var decoder = Decoder.init(std.testing.allocator, 20, capture.sink());
-    defer decoder.deinit();
-
-    try decoder.feed("data\r\r");
-    try decoder.finish();
-    try std.testing.expectEqual(@as(usize, 1), capture.values.items.len);
-    try std.testing.expectEqualStrings("", capture.values.items[0]);
-}

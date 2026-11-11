@@ -67,7 +67,7 @@
 
 #### 已验证的工具链约束
 
-在 macOS 26.7.2 x86_64、Zig 0.17.0 上直接测试 `src/presentation.zig`（绕过产品构建的平台限制）：
+历史分支在 macOS 26.7.2 x86_64、Zig 0.17.0 上直接测试当时的 presentation 测试源（绕过当时产品构建的平台限制；现应使用 `zig build test-presentation -Dplatform-tests-only=true`，不能直接测试已迁出测试块的业务源）：
 
 - `-fllvm` Debug：213/213 通过。
 - `-fllvm -O ReleaseSmall`：213/213 通过。
@@ -115,11 +115,11 @@
 - 移除 `fs.linux` 接口及调用方的 Linux 文件打开位、锁位和错误编号。保留原 flags 和策略，包括技能目录发现允许的符号链接，不顺便放宽或收紧业务权限。
 - 移除只适用于 Linux 的公开 `openPath`：工具保护检查改用 `sameObjectAt(candidate_fd, parent_fd, leaf)`。候选 fd 全程保持打开，固定其 inode；受保护名称只做无跟随元数据查询，不读取内容、不打开 FIFO/设备、不缓存结果，也不承诺锁住未来的命名空间变更。
 - 不能使用 `O_EVTONLY` 冒充 O_PATH：核查 XNU 后确认仍可能进入 VNOP_OPEN/设备驱动 open。此次实现通过避免打开受保护叶节点解决需求，而不是模拟元数据句柄。
-- `src/tests/filesystem_portability_test.zig` 覆盖硬链接、无读权限文件、符号链接/FIFO/设备元数据、目录/叶节点替换、flags，以及 AGENTS/技能发现策略；同时进入完整 Linux unit 根。
-- `src/filesystem_test_root.zig` 独立组合文件、认证、checkpoint、Memory 和相关纯模块测试，不导入 TTY、SSH、worker 传输。
+- `tests` 中的文件系统测试覆盖硬链接、无读权限文件、符号链接/FIFO/设备元数据、目录/叶节点替换、flags，以及 AGENTS/技能发现策略；同时进入完整 Linux unit 根。
+- `test-filesystem` 通过 `tests/layout.json` 在本地缓存中组合独立测试根，覆盖文件、认证、checkpoint、Memory 和相关纯模块，不导入 TTY、SSH、worker 传输；旧业务目录内的测试根已迁出。
 - 日志测试的 fd 计数在 Darwin 使用 `/dev/fd`，仅用于测试，不是 IPC 的 fd 锚定绑定替代方案。
 
-运行入口：
+当前运行入口（通过 `tests/layout.json` 与缓存组合加载外置测试源，不直接 `zig test` 业务 `src`）：
 
 ```sh
 zig build test-filesystem -Dplatform-tests-only=true --summary all
@@ -183,7 +183,7 @@ P1a 当时只迁移通用文件/锁调用；`daemon/unix.zig`、registry 的其�
 | `memory_auto_mock.mjs`（`test-memory-app`） | 通过 | 通过 | 每模式 primary=7、helper=5；先答后辅助、drain、保存/检索、Off、日志、无旧 jobs、interrupt |
 | `memory_background_mock.py`（`test-memory-background`） | 通过 | 通过 | 每模式 3 个独占 PTY，primary=7、helper=7；运行中下一轮输入、FIFO、已保存事实、退出取消及原 slave 恢复 |
 | `background_mock.py`（`test-background`） | 通过 | 通过 | 每模式 CLI 6 个并发真实 loopback 服务及退出回收；单 TUI 跨两任务保持同一服务、显式 stop、退出及原 slave 恢复 |
-| 完整 `src/root.zig` 单元回归 | 1903 通过 / 9 跳过 / 0 失败 | 1903 通过 / 9 跳过 / 0 失败 | 包含本轮系统别名与 nofollow 回归；9 项为 Linux 专属 |
+| 完整单元回归（当时的 root；现使用 `test-unit-full` 组合入口） | 1903 通过 / 9 跳过 / 0 失败 | 1903 通过 / 9 跳过 / 0 失败 | 包含本轮系统别名与 nofollow 回归；9 项为 Linux 专属 |
 
 本机产物及日志目录：`/tmp/thin-macos-e2e.30XEQI`（临时证据，不是仓库产物）。最终文件为 `app-{debug,small}.log`、`memory-cli-{debug,small}.log`、`memory-tui-{debug,small}.log`、`background-{debug,small}.log`、`unit-{debug,small}.log`，产品与驱动在 `bin/`。完整 unit 根编译后直接运行，避免构建协议掩盖崩溃进度；Linux 最终语义检查见 `linux-semantic.log`。
 
